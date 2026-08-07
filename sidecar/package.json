@@ -7,6 +7,6 @@
   "main": "server.js",
   "engines": { "node": ">=18" },
   "dependencies": {
-    "playwright": "^1.48.0"
+    "playwright": "^1.62.1"
   }
 }
