@@ -285,11 +285,7 @@ impl Registry {
     pub fn records(&self) -> Vec<SessionRecord> {
         let mut records: Vec<SessionRecord> = self.records.values().cloned().collect();
         for record in &mut records {
-            if let Some(session) = self.sessions.get(&record.id.0) {
-                let view = session.view();
-                record.status = view.status;
-                record.needs_input = view.needs_input;
-            }
+            self.fold_live(record);
         }
         records.sort_by(|a, b| a.id.0.cmp(&b.id.0));
         records
@@ -298,12 +294,46 @@ impl Registry {
     /// One record with live status folded in, without cloning the whole table.
     pub fn record(&self, id: &str) -> Option<SessionRecord> {
         let mut record = self.records.get(id)?.clone();
-        if let Some(session) = self.sessions.get(id) {
+        self.fold_live(&mut record);
+        Some(record)
+    }
+
+    /// Folds what only the live session knows into a stored record: its real
+    /// status, and the resumability that follows from it.
+    fn fold_live(&self, record: &mut SessionRecord) {
+        if let Some(session) = self.sessions.get(&record.id.0) {
             let view = session.view();
             record.status = view.status;
             record.needs_input = view.needs_input;
         }
-        Some(record)
+        // `Live` only records that the agent named its conversation while it
+        // was running. Once the session is gone the question every Resume
+        // affordance asks is a different one — can that conversation be
+        // re-entered — so answer it here rather than leaving a stale `Live`
+        // that reads as "not resumable" to each of them.
+        if matches!(record.status, SessionStatus::Exited(_))
+            && record.resumability == diri_proto::Resumability::Live
+        {
+            record.resumability = if self.can_reenter(record) {
+                diri_proto::Resumability::Resumable
+            } else {
+                diri_proto::Resumability::NotResumable
+            };
+        }
+    }
+
+    /// Whether this record's agent can be relaunched back into its own
+    /// conversation — a known conversation id plus a manifest that declares
+    /// how to resume one.
+    fn can_reenter(&self, record: &SessionRecord) -> bool {
+        let Some(agent_session_id) = record.agent_session_id.as_deref() else {
+            return false;
+        };
+        self.engine
+            .manifest(record.kind.id())
+            .and_then(|manifest| manifest.agent.as_ref())
+            .and_then(|agent| agent.resume_args(Some(agent_session_id)))
+            .is_some()
     }
 
     /// Diffs live sessions' state versions against `published` (updating it in
@@ -765,6 +795,75 @@ mod tests {
         let mut reloaded = Registry::new(engine(), &state_file);
         assert_eq!(reloaded.load().expect("load"), 1);
         assert_eq!(reloaded.records()[0].id.0, "s_1");
+    }
+
+    /// An exited record whose agent had named its conversation is the case
+    /// every Resume affordance gates on, and each of them checks for
+    /// `Resumable` — a record left on `Live` reads to all of them as "cannot
+    /// be resumed" and the button is never drawn.
+    #[test]
+    fn a_conversation_that_outlived_its_session_reports_resumable() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+
+        let mut dead = record("s_dead");
+        dead.kind = AgentKind::CLAUDE_CODE;
+        dead.agent_session_id = Some("conv-1".into());
+        dead.resumability = Resumability::Live;
+        dead.status = SessionStatus::Exited(diri_proto::ExitInfo {
+            reason: diri_proto::ExitReason::Exited,
+            code: Some(255),
+            signal: None,
+        });
+        registry.records.insert("s_dead".into(), dead);
+
+        assert_eq!(
+            registry.record("s_dead").expect("record").resumability,
+            Resumability::Resumable
+        );
+    }
+
+    /// Without a conversation id there is nothing to re-enter, and offering
+    /// Resume would only produce an agent that fails to launch.
+    #[test]
+    fn an_exited_session_with_no_conversation_id_is_not_resumable() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+
+        let mut dead = record("s_dead");
+        dead.kind = AgentKind::CLAUDE_CODE;
+        dead.resumability = Resumability::Live;
+        dead.status = SessionStatus::Exited(diri_proto::ExitInfo {
+            reason: diri_proto::ExitReason::Exited,
+            code: Some(0),
+            signal: None,
+        });
+        registry.records.insert("s_dead".into(), dead);
+
+        assert_eq!(
+            registry.record("s_dead").expect("record").resumability,
+            Resumability::NotResumable
+        );
+    }
+
+    /// A running session keeps saying `Live`: resumability only becomes a
+    /// question once the agent is gone.
+    #[test]
+    fn a_running_session_keeps_reporting_live() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+
+        let mut running = record("s_live");
+        running.kind = AgentKind::CLAUDE_CODE;
+        running.agent_session_id = Some("conv-1".into());
+        running.resumability = Resumability::Live;
+        running.status = SessionStatus::Idle;
+        registry.records.insert("s_live".into(), running);
+
+        assert_eq!(
+            registry.record("s_live").expect("record").resumability,
+            Resumability::Live
+        );
     }
 
     /// Interop against the state file the Swift daemon actually maintains.
