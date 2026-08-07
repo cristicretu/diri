@@ -1351,10 +1351,19 @@ impl ControlServer {
             .into_iter()
             .find(|record| record.id.0 == p.session_id.0)
             .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+        let exited = matches!(record.status, diri_proto::SessionStatus::Exited(_));
         if registry.get(&p.session_id.0).is_some() {
-            // Already live: resuming is a no-op, not an error.
-            return serde_json::to_value(&record)
-                .map_err(|error| ControlError::internal(error.to_string()));
+            if !exited {
+                // Already live: resuming is a no-op, not an error.
+                return serde_json::to_value(&record)
+                    .map_err(|error| ControlError::internal(error.to_string()));
+            }
+            // An agent that died on its own leaves its session behind: only an
+            // explicit kill takes one out of the registry, so presence alone
+            // does not mean alive. Evicting the corpse — which also releases
+            // the holder still owning this id — is what keeps resume from
+            // silently handing back the dead record it was asked to revive.
+            let _ = registry.terminate(&p.session_id.0, std::time::Duration::from_millis(500));
         }
         if let Some(host_id) = record.host.clone() {
             // Remote revive: the same tmux name reattaches the live remote
@@ -2177,6 +2186,104 @@ mod tests {
         assert!(
             command.contains("; exec "),
             "the shell must survive: {command}"
+        );
+    }
+
+    /// An agent that dies on its own — a dropped ssh, a crash — leaves its
+    /// session in the registry, because only an explicit kill takes one out.
+    /// Resume used to read that presence as "already live", call itself a
+    /// no-op and hand the corpse straight back, which left a dead session
+    /// with no way at all to restart it.
+    #[test]
+    fn resume_relaunches_a_session_whose_agent_died_on_its_own() {
+        let temp = tempfile::tempdir().expect("temp");
+        // A manifest that resumes by flag, onto a binary that outlives the
+        // call: `sh -c 'read line'` blocks on the PTY instead of exiting.
+        let manifests = temp.path().join("manifests");
+        std::fs::create_dir_all(&manifests).expect("manifests dir");
+        std::fs::write(
+            manifests.join("probe.json"),
+            json!({
+                "schemaVersion": 2,
+                "id": "probe",
+                "version": "test",
+                "statusModel": "full",
+                "agent": {
+                    "binary": "/bin/sh",
+                    "spawnArgs": ["-c", "read line"],
+                    "resume": { "style": "flag", "token": "--resume" },
+                },
+                "rules": [],
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+        let (probe, _) = ManifestEngine::load_dir(&manifests).expect("load");
+        let probe = Arc::new(probe);
+
+        let registry = Arc::new(Mutex::new(Registry::new(
+            Arc::clone(&probe),
+            temp.path().join("state.json"),
+        )));
+        {
+            let mut guard = registry.lock().expect("registry");
+            let mut record = test_record("s_dead");
+            record.kind = diri_proto::AgentKind::new("probe");
+            record.agent_session_id = Some("conv-1".into());
+            // `true` exits the moment it is spawned, standing in for the agent
+            // that went away while the daemon kept its session.
+            guard
+                .spawn(
+                    crate::session::SessionSpec {
+                        id: "s_dead".into(),
+                        pty: crate::pty::PtySpec::new(vec!["/usr/bin/true".into()], "/tmp"),
+                        manifest_id: "probe".into(),
+                        authority: crate::session::authority_for("probe", &probe),
+                        logs_dir: temp.path().join("logs"),
+                        holder: None,
+                        defer_launch: false,
+                    },
+                    record,
+                )
+                .expect("spawn");
+        }
+        for _ in 0..100 {
+            let exited = registry
+                .lock()
+                .expect("registry")
+                .record("s_dead")
+                .is_some_and(|record| {
+                    matches!(record.status, diri_proto::SessionStatus::Exited(_))
+                });
+            if exited {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            registry.lock().expect("registry").get("s_dead").is_some(),
+            "the premise: a dead agent's session stays in the registry"
+        );
+
+        let server = ControlServer::new(Arc::clone(&registry), temp.path().join("daemon.sock"));
+        let result = ok_of(call(
+            &server,
+            "session.resume",
+            Some(json!({ "sessionID": "s_dead" })),
+        ));
+
+        assert!(
+            result["status"].get("exited").is_none(),
+            "resume handed back the corpse instead of relaunching: {}",
+            result["status"]
+        );
+        assert!(
+            registry
+                .lock()
+                .expect("registry")
+                .get("s_dead")
+                .is_some_and(|session| !session.view().exited),
+            "the resumed session must be a live one"
         );
     }
 
