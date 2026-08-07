@@ -1,6 +1,20 @@
 Dirijor — third-party attributions
 ==================================
 
+GPUI (https://github.com/zed-industries/zed)
+--------------------------------------------
+The GPUI crates used by Diri are pinned to a specific Zed revision. Crates
+marked Apache-2.0 by upstream remain under that license. Zed describes its
+repository as primarily GPL-3.0-or-later with Apache-2.0 components where
+marked; the dependency inventory is checked by `scripts/check-licenses.sh`.
+
+Diri replaces GPUI's disabled, no-op `ztracing` profiling surface with a small
+independent Apache-2.0 compatibility implementation in `diri/vendor/` so the
+unused GPL logging/profiling implementation is not linked into release builds.
+
+The vendored `gpui_macos` renderer is an Apache-2.0 component from the same
+pinned revision, with the local changes described in `diri/Cargo.toml`.
+
 herdr (https://github.com/herdrdev/herdr)
 -----------------------------------------
 Licensed under the Apache License, Version 2.0.

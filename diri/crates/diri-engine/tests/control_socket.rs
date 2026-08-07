@@ -174,10 +174,7 @@ fn spawning_a_shell_over_the_socket_produces_a_watched_session() {
     let id = match spawned {
         ControlMessage::Response {
             result: Ok(result), ..
-        } => result["id"]
-            .as_str()
-            .expect("a session id")
-            .to_string(),
+        } => result["id"].as_str().expect("a session id").to_string(),
         other => panic!("spawn failed: {other:?}"),
     };
     assert!(id.starts_with("s_"), "id follows the daemon format: {id}");
@@ -380,7 +377,10 @@ fn events_flow_to_a_subscribed_connection() {
             result: Ok(result), ..
         } => {
             assert_eq!(result["timedOut"], false, "{result}");
-            assert!(result["session"]["status"].get("exited").is_some(), "{result}");
+            assert!(
+                result["session"]["status"].get("exited").is_some(),
+                "{result}"
+            );
         }
         other => panic!("wait failed: {other:?}"),
     }

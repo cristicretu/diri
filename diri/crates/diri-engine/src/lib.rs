@@ -31,8 +31,8 @@ pub mod governor;
 pub mod history;
 #[cfg(unix)]
 pub mod holder;
-pub mod hosts;
 pub mod hooks;
+pub mod hosts;
 pub mod inject;
 pub mod log;
 pub mod mcp;

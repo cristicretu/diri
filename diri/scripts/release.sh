@@ -12,12 +12,12 @@
 #   SKIP_GATES=1        skip cargo test/clippy (for re-running a failed publish)
 #   SKIP_PERF_GATE=1   skip packaged app memory/idle-CPU probe
 #
-# This publishes TWO artifacts per release, both notarized and stapled:
+# This publishes TWO application artifacts per release, both notarized and stapled:
 #   diri-<version>-universal.dmg  what people download by hand
 #   diri-<version>-universal.zip  what the in-app updater fetches
-# plus appcast.json, the feed the updater reads. All three are attached to a
-# GitHub Release, so `releases/latest/download/appcast.json` is a stable feed
-# URL. See diri/UPDATING.md for the trust model and one-time setup.
+# plus appcast.json, SHA256SUMS, and the reviewed dependency-license inventory.
+# All are attached to a GitHub Release, so the updater feed has a stable URL.
+# See diri/UPDATING.md for the trust model and one-time setup.
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
@@ -46,6 +46,8 @@ GH_REPO="${GH_REPO:-cristicretu/diri}"
 TAP_DIR="${TAP_DIR:-$ROOT/../homebrew-diri}"
 TAG="v$VERSION"
 FEED="$DIST/appcast.json"
+CHECKSUMS="$DIST/SHA256SUMS"
+INVENTORY="$DIST/THIRD-PARTY-LICENSES.json"
 MINIMUM_SYSTEM="15.0"
 # Old builds stay downloadable but the repo should not grow without bound.
 KEEP_RELEASES=5
@@ -101,23 +103,47 @@ EOF
 fi
 
 # ----------------------------------------------------------------------------
-# 1. Version bump
+# 1. Source provenance
 # ----------------------------------------------------------------------------
 # The updater compares against CARGO_PKG_VERSION, so the manifest is the single
-# source of truth for what version this build claims to be.
+# source of truth for what version this build claims to be. Version bumps go
+# through a normal pull request; a release must build the exact remote main
+# commit rather than creating an unpushed release-only commit.
 CURRENT="$(sed -n 's/^version = "\(.*\)"/\1/p' "$MANIFEST" | head -1)"
 if [ "$CURRENT" != "$VERSION" ]; then
-    if [ -n "$(git -C "$ROOT" status --porcelain --untracked-files=no)" ]; then
-        echo "error: uncommitted changes; commit them before bumping to $VERSION" >&2
+    cat >&2 <<EOF
+error: diri-app is $CURRENT, not $VERSION
+
+Open and merge a version-bump pull request first, then run this script from the
+clean main checkout. Release artifacts must map to a reviewed source commit.
+EOF
+    exit 1
+fi
+if [ -n "$(git -C "$ROOT" status --porcelain --untracked-files=no)" ]; then
+    echo "error: tracked files are dirty; release from a clean main checkout" >&2
+    exit 1
+fi
+git -C "$ROOT" fetch --quiet origin main --tags
+SOURCE_COMMIT="$(git -C "$ROOT" rev-parse HEAD)"
+REMOTE_MAIN="$(git -C "$ROOT" rev-parse origin/main)"
+if [ "$SOURCE_COMMIT" != "$REMOTE_MAIN" ]; then
+    cat >&2 <<EOF
+error: release source is not the current origin/main
+  local:  $SOURCE_COMMIT
+  remote: $REMOTE_MAIN
+
+Merge the source and version bump first, then check out and pull main.
+EOF
+    exit 1
+fi
+if git -C "$ROOT" rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
+    TAG_COMMIT="$(git -C "$ROOT" rev-list -n 1 "$TAG")"
+    if [ "$TAG_COMMIT" != "$SOURCE_COMMIT" ]; then
+        echo "error: $TAG points to $TAG_COMMIT, not release source $SOURCE_COMMIT" >&2
         exit 1
     fi
-    echo "==> Bumping diri-app $CURRENT -> $VERSION"
-    sed -i '' -E "1,/^version = /s/^version = \".*\"/version = \"$VERSION\"/" "$MANIFEST"
-    cargo update --workspace --offline >/dev/null 2>&1 || cargo update --workspace >/dev/null
-    git -C "$ROOT" add "$MANIFEST" "$WORKSPACE/Cargo.lock"
-    git -C "$ROOT" commit -m "diri: release $VERSION" >/dev/null
-    echo "    committed the bump"
 fi
+echo "    source commit : $SOURCE_COMMIT"
 
 # ----------------------------------------------------------------------------
 # 2. Gates
@@ -240,6 +266,22 @@ feed_path.write_text(json.dumps(feed, indent=2) + "\n")
 print(f"    {len(feed['releases'])} release(s) in the feed, newest {feed['releases'][0]['version']}")
 PYFEED
 
+if [ ! -f "$INVENTORY" ]; then
+    echo "error: packaging did not produce $INVENTORY" >&2
+    exit 1
+fi
+
+echo "==> Writing $CHECKSUMS"
+(
+    cd "$DIST"
+    shasum -a 256 \
+        "$(basename "$DMG")" \
+        "$(basename "$ZIP")" \
+        "$(basename "$FEED")" \
+        "$(basename "$INVENTORY")" > "$(basename "$CHECKSUMS")"
+    shasum -a 256 -c "$(basename "$CHECKSUMS")"
+)
+
 # ----------------------------------------------------------------------------
 # 5. Publish the GitHub Release
 # ----------------------------------------------------------------------------
@@ -260,9 +302,9 @@ NOTES
 fi
 
 echo "==> Publishing $TAG to $GH_REPO"
-GH_REPO="$GH_REPO" \
+GH_REPO="$GH_REPO" SOURCE_COMMIT="$SOURCE_COMMIT" \
     "$WORKSPACE/scripts/publish-github-release.sh" \
-    "$VERSION" "$NOTES_FILE" "$DMG" "$ZIP" "$FEED"
+    "$VERSION" "$NOTES_FILE" "$DMG" "$ZIP" "$FEED" "$CHECKSUMS" "$INVENTORY"
 
 # ----------------------------------------------------------------------------
 # 6. Bump the Homebrew cask
@@ -289,12 +331,13 @@ cat <<EOF
   Update zip : $ZIP
   DMG sha256 : $DMG_SHA256
   ZIP sha256 : $SHA256
+  Checksums   : $CHECKSUMS
+  Licenses    : $INVENTORY
+  Source      : $SOURCE_COMMIT
   Release    : https://github.com/$GH_REPO/releases/tag/$TAG
   Feed       : https://github.com/$GH_REPO/releases/latest/download/appcast.json
 
   Next steps:
-    1. Push the source and tag it:
-         git -C "$ROOT" push && git tag diri-v$VERSION && git push origin diri-v$VERSION
-    2. Confirm an old build updates itself (diri/UPDATING.md → "Verifying a release")
+    1. Confirm an old build updates itself (diri/UPDATING.md → "Verifying a release")
 ============================================================
 EOF

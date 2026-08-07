@@ -191,7 +191,10 @@ impl AgentDescriptor {
                 .find(|(key, _)| key == "PATH")
                 .map(|(_, value)| value.clone())
                 .or_else(|| std::env::var("PATH").ok());
-            if let Some(resolved) = path.as_deref().and_then(|path| resolve_on_path(first, path)) {
+            if let Some(resolved) = path
+                .as_deref()
+                .and_then(|path| resolve_on_path(first, path))
+            {
                 *first = resolved;
             }
         }
@@ -336,8 +339,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod");
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         }
         let gemini = descriptor("gemini");
         let inherited = [(
@@ -421,8 +423,15 @@ mod tests {
         let output = child.wait_with_output().expect("wait");
         let stdout = String::from_utf8_lossy(&output.stdout);
 
-        assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
-        assert!(stdout.contains("agent-finished"), "agent did not run: {stdout:?}");
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("agent-finished"),
+            "agent did not run: {stdout:?}"
+        );
         assert!(
             stdout.contains("shell-ready"),
             "the session did not accept shell input after agent exit: {stdout:?}"

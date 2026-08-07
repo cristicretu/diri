@@ -285,11 +285,11 @@ fn handle(shared: &Shared, request: &HolderRequest) -> HolderResult<HolderRespon
                 .data
                 .as_deref()
                 .and_then(|encoded| {
-                    base64::engine::general_purpose::STANDARD.decode(encoded).ok()
+                    base64::engine::general_purpose::STANDARD
+                        .decode(encoded)
+                        .ok()
                 })
-                .ok_or_else(|| {
-                    HolderError::InvalidRequest("write requires base64 data".into())
-                })?;
+                .ok_or_else(|| HolderError::InvalidRequest("write requires base64 data".into()))?;
             write_pty(shared, &data)?;
             Ok(HolderResponse::success())
         }
@@ -310,9 +310,9 @@ fn handle(shared: &Shared, request: &HolderRequest) -> HolderResult<HolderRespon
         }
 
         HolderOperation::Signal => {
-            let signal = request.sig.ok_or_else(|| {
-                HolderError::InvalidRequest("signal requires a valid sig".into())
-            })?;
+            let signal = request
+                .sig
+                .ok_or_else(|| HolderError::InvalidRequest("signal requires a valid sig".into()))?;
             if signal <= 0 || signal >= MAX_SIGNAL {
                 return Err(HolderError::InvalidRequest(
                     "signal requires a valid sig".into(),
@@ -345,13 +345,8 @@ fn write_pty(shared: &Shared, data: &[u8]) -> HolderResult<()> {
     let mut written = 0;
     while written < data.len() {
         // SAFETY: plain write(2) on an owned fd with an in-bounds slice.
-        let count = unsafe {
-            libc::write(
-                fd,
-                data[written..].as_ptr().cast(),
-                data.len() - written,
-            )
-        };
+        let count =
+            unsafe { libc::write(fd, data[written..].as_ptr().cast(), data.len() - written) };
         if count > 0 {
             written += count as usize;
             continue;
@@ -384,10 +379,7 @@ fn current_stat(shared: &Shared) -> HolderStat {
     let pty = shared.pty.lock().expect("pty");
     // SAFETY: kill with signal 0 only checks existence.
     let child_alive = unsafe { libc::kill(shared.child_pid, 0) } == 0;
-    let master_fd = pty
-        .writer()
-        .map(|stream| stream.as_raw_fd())
-        .unwrap_or(-1);
+    let master_fd = pty.writer().map(|stream| stream.as_raw_fd()).unwrap_or(-1);
     // SAFETY: tcgetpgrp on the master; -1 fd yields an error, mapped to None.
     let foreground = unsafe { libc::tcgetpgrp(master_fd) };
     let size = pty.size().ok();

@@ -208,7 +208,8 @@ impl Registry {
             .flatten()
             .map(|entry| entry.path())
             .filter(|path| {
-                path.extension().is_some_and(|extension| extension == "sock")
+                path.extension()
+                    .is_some_and(|extension| extension == "sock")
                     && !HolderManagerPaths::is_manager_socket(path)
             })
             .filter_map(|path| {

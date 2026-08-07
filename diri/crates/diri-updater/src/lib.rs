@@ -300,8 +300,8 @@ mod tests {
     #[ignore = "requires network access and downloads a release"]
     fn the_published_release_downloads_and_verifies() {
         let http = Http::new();
-        let feed = Feed::parse(&http.fetch_text(DEFAULT_FEED_URL).expect("feed"))
-            .expect("feed parses");
+        let feed =
+            Feed::parse(&http.fetch_text(DEFAULT_FEED_URL).expect("feed")).expect("feed parses");
         let release = feed
             .releases
             .iter()

@@ -120,11 +120,13 @@ pub fn normalize(raw: &str) -> Option<String> {
         return None;
     }
     let lower = url.to_lowercase();
-    Some(if lower.starts_with("http://") || lower.starts_with("https://") {
-        url.to_string()
-    } else {
-        format!("https://{url}")
-    })
+    Some(
+        if lower.starts_with("http://") || lower.starts_with("https://") {
+            url.to_string()
+        } else {
+            format!("https://{url}")
+        },
+    )
 }
 
 #[cfg(test)]
@@ -161,12 +163,12 @@ mod tests {
 
     #[test]
     fn existing_artifacts_keep_their_first_seen_time() {
-        let first = scan(
-            "https://github.com/o/r/pull/1",
-            &[],
-            DateMillis(500.0),
+        let first = scan("https://github.com/o/r/pull/1", &[], DateMillis(500.0));
+        let merged = scan(
+            "https://github.com/o/r/pull/1 again",
+            &first,
+            DateMillis(900.0),
         );
-        let merged = scan("https://github.com/o/r/pull/1 again", &first, DateMillis(900.0));
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].first_seen_at, DateMillis(500.0));
     }
@@ -183,7 +185,11 @@ mod tests {
         }
         let result = scan("https://example.com/newest", &existing, DateMillis(9999.0));
         assert_eq!(result.len(), MAX_ARTIFACTS);
-        assert!(result.iter().any(|artifact| artifact.url.ends_with("newest")));
+        assert!(
+            result
+                .iter()
+                .any(|artifact| artifact.url.ends_with("newest"))
+        );
         assert!(
             !result.iter().any(|artifact| artifact.url.ends_with("/0")),
             "the oldest entry is the one dropped"

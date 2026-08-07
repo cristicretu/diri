@@ -440,10 +440,9 @@ impl RegistryHost {
                     )
                 })?
             }
-            (None, None) => host
-                .default_cwd
-                .clone()
-                .ok_or("local cwd has no git origin and the host has no defaultCwd; pass remote_cwd")?,
+            (None, None) => host.default_cwd.clone().ok_or(
+                "local cwd has no git origin and the host has no defaultCwd; pass remote_cwd",
+            )?,
         };
 
         // Code handoff: the caller's exact tree state lands on the host
@@ -453,14 +452,9 @@ impl RegistryHost {
         let mut branch = None;
         let mut spawn_cwd = remote_root.clone();
         if sync_code && origin.is_some() {
-            let prepared = crate::migrate::prepare(
-                cwd,
-                None,
-                Some(&host),
-                &remote_root,
-                host.display_name(),
-            )
-            .map_err(|error| format!("code sync failed: {error}"))?;
+            let prepared =
+                crate::migrate::prepare(cwd, None, Some(&host), &remote_root, host.display_name())
+                    .map_err(|error| format!("code sync failed: {error}"))?;
             synced = true;
             branch = Some(prepared.branch.clone());
             spawn_cwd = prepared.target_repo_root;

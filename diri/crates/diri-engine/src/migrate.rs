@@ -530,13 +530,19 @@ mod tests {
         std::fs::create_dir_all(&origin).unwrap();
         git(&origin, &["init", "-q", "--bare", "-b", "main"]);
         let source = temp.path().join("source");
-        git(temp.path(), &["clone", "-q", origin.to_str().unwrap(), "source"]);
+        git(
+            temp.path(),
+            &["clone", "-q", origin.to_str().unwrap(), "source"],
+        );
         std::fs::write(source.join("file.txt"), "v1\n").unwrap();
         git(&source, &["add", "."]);
         git(&source, &["commit", "-q", "-m", "root"]);
         git(&source, &["push", "-q", "-u", "origin", "main"]);
         let target = temp.path().join("target");
-        git(temp.path(), &["clone", "-q", origin.to_str().unwrap(), "target"]);
+        git(
+            temp.path(),
+            &["clone", "-q", origin.to_str().unwrap(), "target"],
+        );
 
         // Dirty the source; prepare must WIP-commit, push, and sync target.
         std::fs::write(source.join("file.txt"), "wip changes\n").unwrap();
@@ -589,13 +595,19 @@ mod tests {
         std::fs::create_dir_all(&origin).unwrap();
         git(&origin, &["init", "-q", "--bare", "-b", "main"]);
         let source = temp.path().join("source");
-        git(temp.path(), &["clone", "-q", origin.to_str().unwrap(), "source"]);
+        git(
+            temp.path(),
+            &["clone", "-q", origin.to_str().unwrap(), "source"],
+        );
         std::fs::write(source.join("f"), "x").unwrap();
         git(&source, &["add", "."]);
         git(&source, &["commit", "-q", "-m", "root"]);
         git(&source, &["push", "-q", "-u", "origin", "main"]);
         let target = temp.path().join("target");
-        git(temp.path(), &["clone", "-q", origin.to_str().unwrap(), "target"]);
+        git(
+            temp.path(),
+            &["clone", "-q", origin.to_str().unwrap(), "target"],
+        );
         std::fs::write(target.join("f"), "target work in progress").unwrap();
 
         let error = prepare(
@@ -606,9 +618,6 @@ mod tests {
             "local",
         )
         .expect_err("dirty target must refuse");
-        assert!(
-            error.to_string().contains("uncommitted changes"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("uncommitted changes"), "{error}");
     }
 }

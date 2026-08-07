@@ -528,7 +528,6 @@ impl HeadlessScreen {
         hasher.finish()
     }
 
-
     /// Extracts `ESC ] 9 ; 4 ; state ; value` progress reports.
     ///
     /// Agents use this to say "I am working, 40% through"; the emulator has no
@@ -799,10 +798,7 @@ mod tests {
         assert!(!restored.is_alt_screen());
         assert_eq!(restored.cursor(), original.cursor());
         // Attribute fidelity, not just text: the restored grid's cells match.
-        assert_eq!(
-            restored.full_snapshot().changed_rows,
-            snapshot.changed_rows
-        );
+        assert_eq!(restored.full_snapshot().changed_rows, snapshot.changed_rows);
     }
 
     #[test]

@@ -65,10 +65,7 @@ impl Control {
 }
 
 fn start_server(temp: &Path) -> Arc<ControlServer> {
-    let registry = Arc::new(Mutex::new(Registry::new(
-        engine(),
-        temp.join("state.json"),
-    )));
+    let registry = Arc::new(Mutex::new(Registry::new(engine(), temp.join("state.json"))));
     let server = Arc::new(
         ControlServer::new(Arc::clone(&registry), temp.join("daemon.sock"))
             .with_logs_dir(temp.join("logs")),

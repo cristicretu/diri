@@ -59,3 +59,9 @@ unicode-segmentation = "1"
 # path/MSAA targets on every resize. Keep our renderer patch local and pinned to
 # the exact Zed revision used by `gpui`.
 gpui_macos = { path = "vendor/gpui_macos" }
+# GPUI's sum_tree currently imports Zed's GPL-licensed profiling shim even
+# though profiling is disabled and the attribute is a no-op in normal builds.
+# Keep the same tiny, no-op API in an Apache-licensed compatibility crate so an
+# unused profiler does not change the licensing of Diri's distributed binary.
+ztracing = { path = "vendor/ztracing" }
+ztracing_macro = { path = "vendor/ztracing_macro" }

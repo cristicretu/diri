@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 
 use super::client::HolderClient;
 use super::paths::{HolderManagerPaths, HolderPaths, MANAGER_PROTOCOL_VERSION};
-use super::protocol::{HolderLaunchSpec, HolderManagerOperation, HolderManagerRequest, HolderManagerResponse};
+use super::protocol::{
+    HolderLaunchSpec, HolderManagerOperation, HolderManagerRequest, HolderManagerResponse,
+};
 use super::server::HolderServer;
 use super::socket;
 use super::{HolderError, HolderResult};
@@ -76,15 +78,13 @@ impl HolderManagerServer {
         loop {
             match socket::accept_raw(listen_fd, || state.shutting_down.load(Ordering::SeqCst)) {
                 Ok(Some(mut client)) => {
-                    let response =
-                        match socket::read_json_line::<HolderManagerRequest>(&mut client) {
-                            Ok(request) => self
-                                .handle(&state, &request)
-                                .unwrap_or_else(|error| {
-                                    HolderManagerResponse::failure(error.to_string())
-                                }),
-                            Err(error) => HolderManagerResponse::failure(error.to_string()),
-                        };
+                    let response = match socket::read_json_line::<HolderManagerRequest>(&mut client)
+                    {
+                        Ok(request) => self.handle(&state, &request).unwrap_or_else(|error| {
+                            HolderManagerResponse::failure(error.to_string())
+                        }),
+                        Err(error) => HolderManagerResponse::failure(error.to_string()),
+                    };
                     let _ = socket::write_json_line(&mut client, &response);
                 }
                 Ok(None) => break, // the watchdog closed the listener

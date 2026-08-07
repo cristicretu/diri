@@ -378,9 +378,12 @@ mod tests {
 
     #[test]
     fn requests_spell_operations_the_swift_way() {
-        let kill = serde_json::to_string(&HolderRequest::op(HolderOperation::KillTree))
-            .expect("encode");
-        assert_eq!(kill, r#"{"op":"kill-tree"}"#, "hyphenated, optionals omitted");
+        let kill =
+            serde_json::to_string(&HolderRequest::op(HolderOperation::KillTree)).expect("encode");
+        assert_eq!(
+            kill, r#"{"op":"kill-tree"}"#,
+            "hyphenated, optionals omitted"
+        );
 
         let decoded: HolderRequest =
             serde_json::from_str(r#"{"op":"write","data":"aGk="}"#).expect("decode");
@@ -397,8 +400,7 @@ mod tests {
             serde_json::from_str(r#"{"ok":true,"managerPID":4242}"#).expect("decode");
         assert_eq!(response.manager_pid, Some(4242));
 
-        let encoded =
-            serde_json::to_string(&HolderManagerResponse::success(7)).expect("encode");
+        let encoded = serde_json::to_string(&HolderManagerResponse::success(7)).expect("encode");
         assert!(encoded.contains(r#""managerPID":7"#), "{encoded}");
     }
 

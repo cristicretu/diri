@@ -121,7 +121,10 @@ impl BrowserPool {
                 inner.pending.remove(&id);
                 return Err("sidecar not running".into());
             };
-            if let Err(error) = stdin.write_all(line.as_bytes()).and_then(|()| stdin.flush()) {
+            if let Err(error) = stdin
+                .write_all(line.as_bytes())
+                .and_then(|()| stdin.flush())
+            {
                 inner.pending.remove(&id);
                 return Err(format!("sidecar write failed: {error}"));
             }
@@ -174,9 +177,7 @@ impl BrowserPool {
                         if let Some(sender) = inner.pending.remove(&id) {
                             let outcome = match message.get("error").and_then(Value::as_str) {
                                 Some(error) => Err(error.to_string()),
-                                None => {
-                                    Ok(message.get("result").cloned().unwrap_or(Value::Null))
-                                }
+                                None => Ok(message.get("result").cloned().unwrap_or(Value::Null)),
                             };
                             let _ = sender.send(outcome);
                         }

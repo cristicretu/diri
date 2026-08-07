@@ -693,7 +693,8 @@ impl TerminalPane {
                 continue;
             }
             self.parked_grids.retain(|(parked, _)| parked != id);
-            self.parked_grids.push((id.clone(), resident.element.buffer()));
+            self.parked_grids
+                .push((id.clone(), resident.element.buffer()));
         }
         if self.parked_grids.len() > PARKED_GRID_CAP {
             let excess = self.parked_grids.len() - PARKED_GRID_CAP;

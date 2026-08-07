@@ -259,11 +259,7 @@ impl DeferredLaunch {
                 return Some(state.pending.unwrap_or(fallback));
             }
             let wait = state.deadline - now;
-            state = self
-                .cond
-                .wait_timeout(state, wait)
-                .expect("deferred")
-                .0;
+            state = self.cond.wait_timeout(state, wait).expect("deferred").0;
         }
     }
 
@@ -323,9 +319,7 @@ impl Session {
     /// spec carries a [`HolderConfig`], directly otherwise.
     pub fn spawn(spec: SessionSpec, engine: Arc<ManifestEngine>) -> std::io::Result<Self> {
         match spec.holder.clone() {
-            Some(holder) if spec.defer_launch => {
-                Self::spawn_held_deferred(spec, &holder, engine)
-            }
+            Some(holder) if spec.defer_launch => Self::spawn_held_deferred(spec, &holder, engine),
             Some(holder) => Self::spawn_held(spec, &holder, engine),
             None => Self::spawn_direct(spec, engine),
         }
@@ -335,9 +329,7 @@ impl Session {
         let pty = Pty::spawn(&spec.pty)?;
         let log = OutputLog::writer(&spec.logs_dir, &spec.id)?;
         let shared = new_shared(&spec, log);
-        shared
-            .child_pid
-            .store(pty.pid() as i32, Ordering::SeqCst);
+        shared.child_pid.store(pty.pid() as i32, Ordering::SeqCst);
 
         let reader = pty.reader()?;
         let pty = Arc::new(Mutex::new(pty));
@@ -391,8 +383,7 @@ impl Session {
             rows: spec.pty.rows.max(2),
             disk_capacity: crate::holder::protocol::DEFAULT_DISK_CAPACITY,
         };
-        HolderLauncher::launch(&holder.executable, &paths, &launch)
-            .map_err(holder_io_error)?;
+        HolderLauncher::launch(&holder.executable, &paths, &launch).map_err(holder_io_error)?;
 
         let client = HolderClient::new(paths.socket());
         let floor = wait_for_holder(&client, &spec.logs_dir, &spec.id, pre_spawn_tail)
@@ -429,8 +420,7 @@ impl Session {
             std::thread::Builder::new()
                 .name(format!("diri-session-{}", spec.id))
                 .spawn(move || {
-                    let Some((cols, rows)) =
-                        deferred.wait_for_launch_size((pty.cols, pty.rows))
+                    let Some((cols, rows)) = deferred.wait_for_launch_size((pty.cols, pty.rows))
                     else {
                         return; // cancelled before ever launching
                     };
@@ -466,8 +456,7 @@ impl Session {
                         mark_launch_failed(&shared);
                         return;
                     }
-                    let Ok(floor) = wait_for_holder(&client, &logs_dir, &id, pre_spawn_tail)
-                    else {
+                    let Ok(floor) = wait_for_holder(&client, &logs_dir, &id, pre_spawn_tail) else {
                         mark_launch_failed(&shared);
                         return;
                     };
@@ -568,9 +557,7 @@ impl Session {
             let manifest_id = spec.manifest_id.clone();
             std::thread::Builder::new()
                 .name(format!("diri-session-{}", spec.id))
-                .spawn(move || {
-                    pump_held(shared, engine, client, exit_marker_floor, manifest_id)
-                })?
+                .spawn(move || pump_held(shared, engine, client, exit_marker_floor, manifest_id))?
         };
 
         Ok(Self {
@@ -1377,7 +1364,9 @@ fn pump_held(
 
         // The floor is an incarnation boundary, so no marker straddles it:
         // markers wholly below are stripped but their statuses ignored.
-        let honored_from = exit_marker_floor.saturating_sub(start).min(chunk.len() as u64) as usize;
+        let honored_from = exit_marker_floor
+            .saturating_sub(start)
+            .min(chunk.len() as u64) as usize;
         let mut output = Vec::new();
         if honored_from > 0 {
             marker_buffer.extend_from_slice(&chunk[..honored_from]);
@@ -1568,8 +1557,7 @@ mod log_watch {
                 unsafe { libc::close(self.fd) };
                 self.fd = -1;
             }
-            let Ok(cpath) = std::ffi::CString::new(self.path.as_os_str().as_encoded_bytes())
-            else {
+            let Ok(cpath) = std::ffi::CString::new(self.path.as_os_str().as_encoded_bytes()) else {
                 return;
             };
             // SAFETY: O_EVTONLY opens for watching without inhibiting unmount.

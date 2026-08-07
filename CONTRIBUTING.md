@@ -29,19 +29,31 @@ changing what a session *does*, you are probably in `Sources/`.
 
 ## Build and test
 
+The one-command contributor check runs shell/release guards, the Swift suite,
+Rust formatting, Clippy, Rust tests, and the dependency-license policy:
+
+```sh
+./scripts/check.sh
+```
+
+Pass `--browser` to also install the sidecar dependencies and run Playwright's
+browser integration tests. The default stays self-contained after toolchains and
+dependencies have been fetched once.
+
+To run one half while iterating:
+
 ```sh
 swift build && swift test          # engine
-cd diri && cargo build && cargo test   # app
+(cd diri && cargo build && cargo test)   # app
 ```
 
 Before opening a pull request, run what CI runs:
 
 ```sh
 swift test
-cd diri
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+(cd diri && cargo fmt --all -- --check)
+(cd diri && cargo clippy --workspace --all-targets -- -D warnings)
+(cd diri && cargo test --workspace)
 ```
 
 To try your change in the real app, `diri/scripts/package.sh` builds the bundle
@@ -75,3 +87,8 @@ without a manifest still runs as a plain terminal.
 Keep the change focused, explain why in the description, and say how you tested
 it. If it changes behavior the daemon owns, mention whether existing sessions
 survive it — that property matters more than almost anything else here.
+
+CI must be green before merge. Maintainers may ask for a design issue first when
+a change creates a new trust boundary, persistent format, or compatibility
+commitment. See [GOVERNANCE.md](GOVERNANCE.md) for how decisions are made and
+[SECURITY.md](SECURITY.md) for private vulnerability reports.

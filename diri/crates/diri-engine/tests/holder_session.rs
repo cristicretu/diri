@@ -43,13 +43,10 @@ fn holder_config(root: &Path) -> HolderConfig {
 fn shell_spec(id: &str, script: &str, logs: &Path, holder: Option<HolderConfig>) -> SessionSpec {
     SessionSpec {
         id: id.into(),
-        pty: PtySpec::new(
-            vec!["/bin/sh".into(), "-c".into(), script.into()],
-            "/tmp",
-        )
-        .env("PATH", "/usr/bin:/bin")
-        .env("TERM", "xterm-256color")
-        .size(80, 24),
+        pty: PtySpec::new(vec!["/bin/sh".into(), "-c".into(), script.into()], "/tmp")
+            .env("PATH", "/usr/bin:/bin")
+            .env("TERM", "xterm-256color")
+            .size(80, 24),
         manifest_id: "shell".into(),
         authority: Authority::ProcessOnly,
         logs_dir: logs.to_path_buf(),
@@ -76,9 +73,7 @@ fn log_contains(logs: &Path, id: &str, needle: &[u8]) -> bool {
     log.refresh_from_disk();
     let tail = log.tail_offset();
     let (_, bytes) = log.read(0, tail as usize);
-    bytes
-        .windows(needle.len())
-        .any(|window| window == needle)
+    bytes.windows(needle.len()).any(|window| window == needle)
 }
 
 #[test]

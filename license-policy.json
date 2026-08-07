@@ -1,0 +1,62 @@
+{
+  "schema": 1,
+  "project_license": "Apache-2.0",
+  "rust_missing_metadata": [
+    {
+      "name": "gpui_shared_string",
+      "version": "0.1.0",
+      "source_contains": "zed-industries/zed.git?rev=dc2a339d5d043da448a3f7ddc7c0a85c63864aad",
+      "conservative_license": "GPL-3.0-or-later",
+      "reason": "The crate does not declare a license; Zed says repository code is primarily GPL-3.0-or-later unless an Apache-2.0 component is marked."
+    },
+    {
+      "name": "gpui_util",
+      "version": "0.1.0",
+      "source_contains": "zed-industries/zed.git?rev=dc2a339d5d043da448a3f7ddc7c0a85c63864aad",
+      "conservative_license": "GPL-3.0-or-later",
+      "reason": "The crate does not declare a license; Zed says repository code is primarily GPL-3.0-or-later unless an Apache-2.0 component is marked."
+    }
+  ],
+  "manually_reviewed_non_rust": [
+    {
+      "name": "SwiftTerm",
+      "ecosystem": "SwiftPM",
+      "version": "1.13.0",
+      "license": "MIT",
+      "source": "https://github.com/migueldeicaza/SwiftTerm"
+    },
+    {
+      "name": "swift-argument-parser",
+      "ecosystem": "SwiftPM",
+      "version": "1.8.2",
+      "license": "Apache-2.0",
+      "source": "https://github.com/apple/swift-argument-parser"
+    },
+    {
+      "name": "playwright",
+      "ecosystem": "npm",
+      "version": "1.61.1",
+      "license": "Apache-2.0",
+      "source": "https://github.com/microsoft/playwright"
+    },
+    {
+      "name": "playwright-core",
+      "ecosystem": "npm",
+      "version": "1.61.1",
+      "license": "Apache-2.0",
+      "source": "https://github.com/microsoft/playwright"
+    },
+    {
+      "name": "fsevents",
+      "ecosystem": "npm",
+      "version": "2.3.2",
+      "license": "MIT",
+      "source": "https://github.com/fsevents/fsevents"
+    }
+  ],
+  "notes": [
+    "Diri's original code remains Apache-2.0; distributed builds are also subject to dependency licenses.",
+    "The GPL-marked zlog/ztracing packages are replaced by the Apache-2.0 no-op compatibility crates under diri/vendor.",
+    "This inventory is an engineering control, not legal advice. Re-review it when the pinned Zed revision changes."
+  ]
+}

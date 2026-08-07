@@ -80,6 +80,20 @@ cargo packager \
     --binaries-dir "${universal_dir}" \
     --out-dir "${dist_dir}"
 
+# Ship the same reviewed dependency disclosure that CI validates. The JSON is
+# also attached to GitHub Releases so users can inspect it without mounting the
+# app bundle.
+third_party_inventory="${dist_dir}/THIRD-PARTY-LICENSES.json"
+echo "==> Generating third-party license inventory"
+python3 "${workspace_dir}/../scripts/check-licenses.py" --output "${third_party_inventory}"
+license_dir="${app_path}/Contents/Resources/licenses"
+mkdir -p "${license_dir}"
+cp "${workspace_dir}/../LICENSE" "${license_dir}/Apache-2.0.txt"
+cp "${workspace_dir}/../NOTICE" "${license_dir}/NOTICE.txt"
+cp "${workspace_dir}/../license-policy.json" "${license_dir}/license-policy.json"
+cp "${workspace_dir}/../LICENSES/"*.txt "${license_dir}/"
+cp "${third_party_inventory}" "${license_dir}/THIRD-PARTY-LICENSES.json"
+
 # --------------------------------------------------------------------------
 # Bundle the Swift daemon inside diri.app so diri is self-contained and can
 # replace the retired Dirijor.app. diri launches dirijord from here; dirijord

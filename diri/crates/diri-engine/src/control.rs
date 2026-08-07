@@ -64,9 +64,7 @@ impl ControlServer {
             attach: crate::attach::AttachHub::new(),
             pr_monitor_wake: crate::pr_monitor::PrMonitorWake::default(),
             injection: None,
-            governor: std::sync::Arc::new(Mutex::new(
-                crate::governor::GovernorConfig::default(),
-            )),
+            governor: std::sync::Arc::new(Mutex::new(crate::governor::GovernorConfig::default())),
             browser: std::sync::OnceLock::new(),
         }
     }
@@ -179,9 +177,7 @@ impl ControlServer {
             }
             if first {
                 first = false;
-                if let Ok(attach) =
-                    serde_json::from_slice::<diri_proto::AttachRequest>(&line)
-                {
+                if let Ok(attach) = serde_json::from_slice::<diri_proto::AttachRequest>(&line) {
                     // Attaching means this session is visible. Record that
                     // before waking the PR monitor so its immediate pass sees
                     // the session as foreground/recent even if registration
@@ -269,7 +265,9 @@ impl ControlServer {
     ) -> Result<JsonValue, ControlError> {
         let p: diri_proto::EventsSubscribeParams = decode(params).unwrap_or_default();
         if let Some(previous) = subscription.take() {
-            previous.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            previous
+                .stop
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
         let stream = self.events.subscribe(
             p.since_seq,
@@ -287,9 +285,7 @@ impl ControlServer {
                 .name("diri-control-events".into())
                 .spawn(move || {
                     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-                        let Some(event) =
-                            stream.recv(std::time::Duration::from_millis(250))
-                        else {
+                        let Some(event) = stream.recv(std::time::Duration::from_millis(250)) else {
                             continue;
                         };
                         let frame = ControlMessage::Event {
@@ -346,8 +342,7 @@ impl ControlServer {
 
         let mut latest = {
             let registry = self.registry.lock().map_err(poisoned)?;
-            current(&registry)
-                .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?
+            current(&registry).ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?
         };
         loop {
             if matches(&latest) {
@@ -356,8 +351,7 @@ impl ControlServer {
                     timed_out: false,
                 });
             }
-            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now())
-            else {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
                 return encode(&diri_proto::EventsWaitResult {
                     session: latest,
                     timed_out: true,
@@ -489,12 +483,9 @@ impl ControlServer {
         let mut worktree_path = None;
         let mut git_branch = None;
         if p.new_worktree.unwrap_or(false) {
-            let info = crate::git::create_worktree(
-                Path::new(&p.cwd),
-                p.worktree_branch.as_deref(),
-                None,
-            )
-            .map_err(io_control_error)?;
+            let info =
+                crate::git::create_worktree(Path::new(&p.cwd), p.worktree_branch.as_deref(), None)
+                    .map_err(io_control_error)?;
             git_branch.clone_from(&info.branch);
             cwd.clone_from(&info.path);
             worktree_path = Some(info.path);
@@ -572,10 +563,8 @@ impl ControlServer {
         // contains the complete command.
         if descriptor.binary.is_some() {
             if let Some(injection) = &self.injection {
-                pty.env.push((
-                    crate::inject::SESSION_ID_ENV.into(),
-                    id.clone(),
-                ));
+                pty.env
+                    .push((crate::inject::SESSION_ID_ENV.into(), id.clone()));
                 pty.env.push((
                     crate::inject::SOCKET_ENV.into(),
                     self.socket_path.to_string_lossy().into_owned(),
@@ -838,7 +827,10 @@ impl ControlServer {
             )
         };
         for record in &records {
-            let path = record.worktree_path.clone().unwrap_or_else(|| record.cwd.clone());
+            let path = record
+                .worktree_path
+                .clone()
+                .unwrap_or_else(|| record.cwd.clone());
             match session_by_path.get(&path) {
                 Some(existing) if running(existing) || !running(record) => {}
                 _ => {
@@ -853,9 +845,10 @@ impl ControlServer {
                 .current_dir(dir)
                 .output()
                 .ok()?;
-            output.status.success().then(|| {
-                String::from_utf8_lossy(&output.stdout).trim().to_string()
-            })
+            output
+                .status
+                .success()
+                .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
         };
 
         let mut entries = Vec::new();
@@ -894,12 +887,9 @@ impl ControlServer {
                 let is_main = worktree.path == root;
                 let dirty = run_git(&["status", "--porcelain"], &worktree.path)
                     .is_some_and(|output| !output.is_empty());
-                let merged = worktree
-                    .branch
-                    .as_ref()
-                    .is_some_and(|branch| {
-                        branch != &default_branch && merged_branches.contains(branch)
-                    });
+                let merged = worktree.branch.as_ref().is_some_and(|branch| {
+                    branch != &default_branch && merged_branches.contains(branch)
+                });
                 let age_days = std::fs::metadata(&worktree.path)
                     .ok()
                     .and_then(|meta| meta.created().or_else(|_| meta.modified()).ok())
@@ -917,7 +907,11 @@ impl ControlServer {
                     dirty,
                     merged,
                     age_days,
-                    stale_suggestion: !is_main && !session_alive && merged && !dirty && age_days > 7,
+                    stale_suggestion: !is_main
+                        && !session_alive
+                        && merged
+                        && !dirty
+                        && age_days > 7,
                 });
             }
         }
@@ -965,8 +959,8 @@ impl ControlServer {
             .map_err(|_| ControlError::internal("HOME is not set"))?;
 
         // Locate the target checkout by origin (shared with host.locate_repo).
-        let origin = crate::hosts::origin_of_cwd(&record.cwd, source_host.as_ref())
-            .ok_or_else(|| {
+        let origin =
+            crate::hosts::origin_of_cwd(&record.cwd, source_host.as_ref()).ok_or_else(|| {
                 ControlError::bad_request(format!(
                     "session cwd is not inside a git repository with an 'origin' remote: {}",
                     record.cwd
@@ -1091,7 +1085,11 @@ impl ControlServer {
     /// derived from a session's cwd + host).
     fn host_locate_repo(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::HostLocateRepoParams = decode(params)?;
-        let target = p.host.as_deref().map(|id| self.resolve_host(id)).transpose()?;
+        let target = p
+            .host
+            .as_deref()
+            .map(|id| self.resolve_host(id))
+            .transpose()?;
 
         let mut origin = p.origin_url.clone();
         if origin.is_none()
@@ -1209,7 +1207,10 @@ impl ControlServer {
         })
     }
 
-    fn session_read_scrollback(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+    fn session_read_scrollback(
+        &self,
+        params: Option<JsonValue>,
+    ) -> Result<JsonValue, ControlError> {
         let p: diri_proto::SessionIdParams = decode(params)?;
         let registry = self.registry.lock().map_err(poisoned)?;
         let session = registry
@@ -1429,9 +1430,10 @@ impl ControlServer {
             .manifest(kind)
             .ok_or_else(|| ControlError::not_found(format!("no manifest for agent {kind}")))?;
         let descriptor = manifest.agent.clone().unwrap_or_default();
-        descriptor.binary.as_ref().ok_or_else(|| {
-            ControlError::bad_request(format!("agent {kind} declares no binary"))
-        })?;
+        descriptor
+            .binary
+            .as_ref()
+            .ok_or_else(|| ControlError::bad_request(format!("agent {kind} declares no binary")))?;
         let tail = descriptor.resume_args(agent_session_id).ok_or_else(|| {
             ControlError::bad_request(format!("agent {kind} does not support resume"))
         })?;
@@ -1539,8 +1541,8 @@ impl ControlServer {
                 .map(|record| record.cwd)
                 .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?
         };
-        let result = crate::git::working_diff(Path::new(&cwd), p.base.as_ref())
-            .map_err(io_control_error)?;
+        let result =
+            crate::git::working_diff(Path::new(&cwd), p.base.as_ref()).map_err(io_control_error)?;
         encode(&result)
     }
 
@@ -1606,11 +1608,8 @@ impl ControlServer {
             .into_iter()
             .find(|record| record.id.0 == id)
         {
-            self.events.publish_encoded(
-                diri_proto::EventName::SESSION_UPDATED,
-                &record,
-                Some(id),
-            );
+            self.events
+                .publish_encoded(diri_proto::EventName::SESSION_UPDATED, &record, Some(id));
         }
     }
 
@@ -1730,10 +1729,7 @@ struct SubscriptionHandle {
 
 /// Serializes one message onto the shared write half. Responses and event
 /// frames interleave here; the mutex keeps each line whole.
-fn write_message(
-    writer: &Arc<Mutex<UnixStream>>,
-    message: &ControlMessage,
-) -> std::io::Result<()> {
+fn write_message(writer: &Arc<Mutex<UnixStream>>, message: &ControlMessage) -> std::io::Result<()> {
     let mut bytes = serde_json::to_vec(message)?;
     bytes.push(b'\n');
     let mut stream = writer
@@ -1762,9 +1758,7 @@ fn encode<T: serde::Serialize>(value: &T) -> Result<JsonValue, ControlError> {
 /// Resolves a binary on the daemon's PATH, as the readiness check needs.
 fn resolve_on_path(binary: &str) -> Option<String> {
     if binary.contains('/') {
-        return Path::new(binary)
-            .exists()
-            .then(|| binary.to_string());
+        return Path::new(binary).exists().then(|| binary.to_string());
     }
     let path = std::env::var("PATH").ok()?;
     for dir in path.split(':') {
@@ -1788,7 +1782,6 @@ fn resolve_on_path(binary: &str) -> Option<String> {
     }
     None
 }
-
 
 /// Resolves a spec's bare argv[0] to an absolute path against its own env
 /// PATH (daemon PATH as fallback). The process that execs it may be a
@@ -1898,9 +1891,9 @@ fn inject_initial_prompt(registry: &Arc<Mutex<Registry>>, session_id: &str, prom
         if view.exited {
             return;
         }
-        let Some(before) =
-            with_session(registry, session_id, |session| session.screen_lines().join("\n"))
-        else {
+        let Some(before) = with_session(registry, session_id, |session| {
+            session.screen_lines().join("\n")
+        }) else {
             return;
         };
         let sent = with_session(registry, session_id, |session| {
@@ -2181,7 +2174,10 @@ mod tests {
             command.contains("'claude' '--resume' 'uuid-1'"),
             "the complete resume command must run inside the shell: {command}"
         );
-        assert!(command.contains("; exec "), "the shell must survive: {command}");
+        assert!(
+            command.contains("; exec "),
+            "the shell must survive: {command}"
+        );
     }
 
     #[test]

@@ -25,7 +25,8 @@ use diri_engine::holder::{
 
 /// The Swift holder binary, if the outer package has been built.
 fn swift_holder() -> Option<PathBuf> {
-    let candidate = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.build/debug/dirijord-holder");
+    let candidate =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.build/debug/dirijord-holder");
     match candidate.canonicalize() {
         Ok(path) => Some(path),
         Err(_) => {
@@ -58,7 +59,10 @@ fn spec(paths: &HolderPaths, logs: &Path, argv: &[&str]) -> HolderLaunchSpec {
         argv: argv.iter().map(|word| word.to_string()).collect(),
         cwd: "/tmp".into(),
         environment: HashMap::from([
-            ("PATH".to_string(), std::env::var("PATH").unwrap_or_default()),
+            (
+                "PATH".to_string(),
+                std::env::var("PATH").unwrap_or_default(),
+            ),
             ("TERM".to_string(), "xterm-256color".to_string()),
         ]),
         cols: 100,
@@ -147,7 +151,10 @@ fn the_rust_client_drives_a_live_swift_holder() {
     let exit = exit.expect("swift wrote an exit marker rust can read");
     assert!(exit.signal.is_some(), "killed, so signaled: {exit:?}");
 
-    assert!(!paths.socket().exists(), "swift cleaned up its control files");
+    assert!(
+        !paths.socket().exists(),
+        "swift cleaned up its control files"
+    );
 }
 
 /// Rust launcher ⇄ Swift manager: the Rust daemon bootstraps the SWIFT

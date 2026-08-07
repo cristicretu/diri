@@ -140,11 +140,12 @@ fn an_attach_is_seeded_then_streams_diffs_and_answers_input() {
     data.write_all(&attach_line).expect("attach");
 
     let mut frames = FrameReader::new(data.try_clone().expect("clone data"));
-    let seed = frames.until("the seed grid", |frame| {
-        frame.frame_type == FrameType::Grid
-    });
+    let seed = frames.until("the seed grid", |frame| frame.frame_type == FrameType::Grid);
     let update = seed.grid_payload().expect("decode").expect("grid");
-    assert!(update.is_full_snapshot, "a fresh sink gets the whole screen");
+    assert!(
+        update.is_full_snapshot,
+        "a fresh sink gets the whole screen"
+    );
     assert!(
         grid_text(&update).contains("seeded-screen"),
         "the seed carries what the child already painted"
@@ -156,8 +157,10 @@ fn an_attach_is_seeded_then_streams_diffs_and_answers_input() {
 
     // Typing through the data channel: cat echoes, and the echo comes back
     // as a grid DIFF (not a full snapshot).
-    data.write_all(&FrameCodec::encode(&Frame::input(b"typed-over-attach\n".to_vec())).expect("encode"))
-        .expect("send input");
+    data.write_all(
+        &FrameCodec::encode(&Frame::input(b"typed-over-attach\n".to_vec())).expect("encode"),
+    )
+    .expect("send input");
     let diff = frames.until("the echo diff", |frame| {
         frame.frame_type == FrameType::Grid
             && frame
@@ -175,9 +178,7 @@ fn an_attach_is_seeded_then_streams_diffs_and_answers_input() {
     // Ping answers pong on the same channel.
     data.write_all(&FrameCodec::encode(&Frame::ping()).expect("encode"))
         .expect("send ping");
-    frames.until("pong", |frame| {
-        frame.frame_type == FrameType::Pong
-    });
+    frames.until("pong", |frame| frame.frame_type == FrameType::Pong);
 
     // A resize through the data channel reshapes the PTY; the next grid
     // carries the new geometry.

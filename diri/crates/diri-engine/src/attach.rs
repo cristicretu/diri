@@ -69,7 +69,9 @@ impl AttachHub {
         // instantly from the emulator, and the live program resumes
         // underneath — the Swift attach() behavior.
         {
-            let Ok(mut guard) = registry.lock() else { return };
+            let Ok(mut guard) = registry.lock() else {
+                return;
+            };
             let _ = guard.wake_session(session_id);
         }
         // Seed before registering: the full snapshot must be the sink's first
@@ -144,12 +146,8 @@ impl AttachHub {
             }
             FrameType::Scroll => {
                 if let Some((direction, lines, col, row)) = frame.scroll_payload() {
-                    let _ = session.scroll(
-                        direction == 0,
-                        lines as usize,
-                        col as usize,
-                        row as usize,
-                    );
+                    let _ =
+                        session.scroll(direction == 0, lines as usize, col as usize, row as usize);
                 }
             }
             FrameType::Ping => {
@@ -216,7 +214,10 @@ impl AttachHub {
             let observed = {
                 let Ok(guard) = registry.lock() else { break };
                 guard.get(session_id).map(|session| {
-                    (session.grid_update_if_changed(&mut signature), session.modes())
+                    (
+                        session.grid_update_if_changed(&mut signature),
+                        session.modes(),
+                    )
                 })
             };
 
@@ -284,8 +285,8 @@ impl AttachHub {
 }
 
 fn write_frame(writer: &Arc<Mutex<UnixStream>>, frame: &Frame) -> std::io::Result<()> {
-    let bytes = FrameCodec::encode(frame)
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let bytes =
+        FrameCodec::encode(frame).map_err(|error| std::io::Error::other(error.to_string()))?;
     let mut stream = writer
         .lock()
         .map_err(|_| std::io::Error::other("writer poisoned"))?;

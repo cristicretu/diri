@@ -223,52 +223,28 @@ mod tests {
 
     #[test]
     fn accepts_a_release_url_on_the_pinned_host() {
-        assert!(
-            validated_download_url(
-                "https://github.com/diri/diri-0.2.0.zip",
-                HOST
-            )
-            .is_ok()
-        );
+        assert!(validated_download_url("https://github.com/diri/diri-0.2.0.zip", HOST).is_ok());
     }
 
     #[test]
     fn rejects_other_hosts_and_schemes() {
         assert!(validated_download_url("https://evil.test/diri.zip", HOST).is_err());
-        assert!(
-            validated_download_url(
-                "http://github.com/diri.zip",
-                HOST
-            )
-            .is_err()
-        );
+        assert!(validated_download_url("http://github.com/diri.zip", HOST).is_err());
         assert!(validated_download_url("file:///tmp/diri.zip", HOST).is_err());
     }
 
     #[test]
     fn rejects_userinfo_that_would_fake_the_host() {
-        assert!(
-            validated_download_url(
-                "https://github.com@evil.test/diri.zip",
-                HOST
-            )
-            .is_err()
-        );
+        assert!(validated_download_url("https://github.com@evil.test/diri.zip", HOST).is_err());
     }
 
     #[test]
     fn rejects_urls_that_could_inject_curl_options() {
         assert!(
-            validated_download_url(
-                "https://github.com/a\"\nupload-file = \"/etc/passwd",
-                HOST
-            )
-            .is_err()
-        );
-        assert!(
-            validated_download_url("https://github.com/a\\b", HOST)
+            validated_download_url("https://github.com/a\"\nupload-file = \"/etc/passwd", HOST)
                 .is_err()
         );
+        assert!(validated_download_url("https://github.com/a\\b", HOST).is_err());
     }
 
     #[test]

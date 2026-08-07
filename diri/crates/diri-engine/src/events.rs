@@ -448,7 +448,10 @@ mod tests {
         let bus = EventBus::new();
         let stream = bus.subscribe(
             None,
-            Filter::new(Some(vec!["s_1".into()]), Some(vec!["session.updated".into()])),
+            Filter::new(
+                Some(vec!["s_1".into()]),
+                Some(vec!["session.updated".into()]),
+            ),
         );
         bus.publish("session.updated", json!({}), Some("s_1"));
         bus.publish("session.updated", json!({}), Some("s_2")); // other session
@@ -464,8 +467,7 @@ mod tests {
             bus.publish("burst", json!({ "n": n }), None);
         }
         // Queue of 2: events 1..=3 were evicted; the newest two remain.
-        let survivors: Vec<Event> =
-            std::iter::from_fn(|| stream.try_recv()).collect();
+        let survivors: Vec<Event> = std::iter::from_fn(|| stream.try_recv()).collect();
         assert_eq!(survivors.len(), 2);
         assert_eq!(survivors[0].seq, 4);
         assert_eq!(survivors[1].seq, 5);

@@ -16,7 +16,5 @@
     <string>alert</string>
     <key>NSUserNotificationUsageDescription</key>
     <string>diri uses notifications to tell you when an agent needs input or finishes work.</string>
-    <key>NSCalendarsFullAccessUsageDescription</key>
-    <string>diri needs access to your calendars so tools you run can read and update events when you ask them to.</string>
 </dict>
 </plist>

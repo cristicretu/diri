@@ -33,10 +33,7 @@ fn engine() -> Arc<ManifestEngine> {
 /// One daemon in miniature: control server on a private socket, holder-backed
 /// spawns — the exact shape `dirijord-rs` runs in production.
 fn start_server(temp: &Path) -> Arc<ControlServer> {
-    let registry = Arc::new(Mutex::new(Registry::new(
-        engine(),
-        temp.join("state.json"),
-    )));
+    let registry = Arc::new(Mutex::new(Registry::new(engine(), temp.join("state.json"))));
     let server = Arc::new(
         ControlServer::new(Arc::clone(&registry), temp.join("daemon.sock"))
             .with_logs_dir(temp.join("logs"))
@@ -111,12 +108,15 @@ fn spawn_cat(control: &mut Control) -> String {
         }),
     );
     let id = spawned["id"].as_str().expect("session id").to_string();
-    wait_until("the child painted its banner", Duration::from_secs(10), || {
-        control
-            .request("session.read_screen", json!({ "sessionID": id }))["text"]
-            .as_str()
-            .is_some_and(|text| text.contains("cat-ready"))
-    });
+    wait_until(
+        "the child painted its banner",
+        Duration::from_secs(10),
+        || {
+            control.request("session.read_screen", json!({ "sessionID": id }))["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("cat-ready"))
+        },
+    );
     id
 }
 
@@ -130,7 +130,10 @@ fn ps_states(pids: &[i64]) -> Vec<(i64, String)> {
                 .args(["-o", "state=", "-p", &pid.to_string()])
                 .output()
                 .expect("ps");
-            (*pid, String::from_utf8_lossy(&output.stdout).trim().to_string())
+            (
+                *pid,
+                String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            )
         })
         .collect()
 }
@@ -212,8 +215,7 @@ fn send_text_wakes_a_hibernated_tree_and_delivers_the_text() {
     });
     // …the text reaches the child (cat echoes it back to the screen)…
     wait_until("the echo to land", Duration::from_secs(10), || {
-        control
-            .request("session.read_screen", json!({ "sessionID": id }))["text"]
+        control.request("session.read_screen", json!({ "sessionID": id }))["text"]
             .as_str()
             .is_some_and(|text| text.contains("typed-into-a-frozen-session"))
     });
@@ -244,11 +246,15 @@ fn a_data_channel_attach_wakes_a_hibernated_tree() {
     data.write_all(&attach_line).expect("attach");
 
     // The attach itself is the wake trigger.
-    wait_until("the tree to resume on attach", Duration::from_secs(5), || {
-        ps_states(&pids)
-            .iter()
-            .all(|(_, state)| !state.is_empty() && !state.starts_with('T'))
-    });
+    wait_until(
+        "the tree to resume on attach",
+        Duration::from_secs(5),
+        || {
+            ps_states(&pids)
+                .iter()
+                .all(|(_, state)| !state.is_empty() && !state.starts_with('T'))
+        },
+    );
     assert!(
         hibernation_cleared(&mut control, &id),
         "an attach must clear the hibernation record"
@@ -292,7 +298,10 @@ fn a_data_channel_attach_wakes_a_hibernated_tree() {
             }
         }
     }
-    assert!(echoed, "input typed over the data channel never echoed back");
+    assert!(
+        echoed,
+        "input typed over the data channel never echoed back"
+    );
 
     control.request("session.kill", json!({ "sessionID": id }));
 }

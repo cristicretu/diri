@@ -91,7 +91,10 @@ fn main() {
 
     let (engine, failed) = load_manifests(&exe_dir, &app_support);
     if !failed.is_empty() {
-        eprintln!("dirijord-rs: {} manifest file(s) failed to parse: {failed:?}", failed.len());
+        eprintln!(
+            "dirijord-rs: {} manifest file(s) failed to parse: {failed:?}",
+            failed.len()
+        );
     }
     let engine = Arc::new(engine);
     if engine.ids().is_empty() {
@@ -169,10 +172,7 @@ fn main() {
         Arc::new(AtomicBool::new(false)),
     );
 
-    eprintln!(
-        "dirijord-rs: serving {}",
-        server.socket_path().display()
-    );
+    eprintln!("dirijord-rs: serving {}", server.socket_path().display());
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {

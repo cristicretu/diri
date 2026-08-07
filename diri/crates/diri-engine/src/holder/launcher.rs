@@ -199,7 +199,11 @@ fn spawn_manager(executable_path: &Path, directory: &Path) -> HolderResult<()> {
 }
 
 fn read_pid_file(path: &Path) -> Option<i32> {
-    let pid = std::fs::read_to_string(path).ok()?.trim().parse::<i32>().ok()?;
+    let pid = std::fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse::<i32>()
+        .ok()?;
     (pid > 1).then_some(pid)
 }
 

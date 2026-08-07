@@ -14,6 +14,7 @@ artifacts=("$@")
 gh_repo="${GH_REPO:-cristicretu/diri}"
 gh_bin="${GH_BIN:-gh}"
 tag="v${version}"
+source_commit="${SOURCE_COMMIT:-}"
 
 if ! [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     echo "error: version '${version}' is not X.Y.Z" >&2
@@ -65,7 +66,11 @@ if "${gh_bin}" release view "${tag}" --repo "${gh_repo}" >/dev/null 2>&1; then
     verify_published_artifacts
     echo "    ${tag} already exists with identical artifacts; leaving it immutable"
 else
-    "${gh_bin}" release create "${tag}" "${artifacts[@]}" \
+    create_args=(release create "${tag}" "${artifacts[@]}")
+    if [[ -n "${source_commit}" ]]; then
+        create_args+=(--target "${source_commit}")
+    fi
+    "${gh_bin}" "${create_args[@]}" \
         --repo "${gh_repo}" \
         --title "diri ${version}" \
         --notes-file "${notes_file}"

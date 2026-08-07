@@ -119,8 +119,7 @@ fn sweep(
                     None,
                 );
             } else {
-                total_footprint =
-                    total_footprint.wrapping_add(record.memory_bytes.unwrap_or(0));
+                total_footprint = total_footprint.wrapping_add(record.memory_bytes.unwrap_or(0));
             }
             continue;
         }
@@ -161,7 +160,12 @@ fn sweep(
         // frozen out from under the user.
         if let Some(idle_since) = idle_since(record, attached) {
             if footprint > config.hard_memory_bytes {
-                let _ = hibernate(registry, events, &id, diri_proto::HibernationReason::MemoryPressure);
+                let _ = hibernate(
+                    registry,
+                    events,
+                    &id,
+                    diri_proto::HibernationReason::MemoryPressure,
+                );
                 continue;
             }
             idle_candidates.push((id, idle_since, footprint));
@@ -212,7 +216,9 @@ fn apply_sample(
     artifacts: Option<Vec<diri_proto::SessionArtifact>>,
 ) {
     let event = {
-        let Ok(mut guard) = registry.lock() else { return };
+        let Ok(mut guard) = registry.lock() else {
+            return;
+        };
         guard.apply_resource_sample(id, memory, ports, artifacts)
     };
     if let Some(event) = event {
@@ -235,10 +241,7 @@ fn hibernate(
         };
         guard.hibernate(id, reason)?;
         let _ = guard.persist();
-        guard
-            .records()
-            .into_iter()
-            .find(|record| record.id.0 == id)
+        guard.records().into_iter().find(|record| record.id.0 == id)
     };
     if let Some(record) = record {
         events.publish_encoded(diri_proto::EventName::SESSION_UPDATED, &record, Some(id));
@@ -392,13 +395,31 @@ pub fn listening_ports(pids: &[i32], timeout: Duration) -> Option<Vec<PortInfo>>
         .collect::<Vec<_>>()
         .join(",");
     let mut child = Command::new("/usr/sbin/lsof")
-        .args(["-a", "-iTCP", "-sTCP:LISTEN", "-p", &joined, "-Fpcn", "-n", "-P"])
+        .args([
+            "-a",
+            "-iTCP",
+            "-sTCP:LISTEN",
+            "-p",
+            &joined,
+            "-Fpcn",
+            "-n",
+            "-P",
+        ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
         .or_else(|_| {
             Command::new("lsof")
-                .args(["-a", "-iTCP", "-sTCP:LISTEN", "-p", &joined, "-Fpcn", "-n", "-P"])
+                .args([
+                    "-a",
+                    "-iTCP",
+                    "-sTCP:LISTEN",
+                    "-p",
+                    &joined,
+                    "-Fpcn",
+                    "-n",
+                    "-P",
+                ])
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
                 .spawn()
