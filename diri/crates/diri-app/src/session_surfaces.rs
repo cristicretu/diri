@@ -964,7 +964,7 @@ impl SessionSurfaces {
         } else if !has_selection {
             thumbnail = thumbnail.child(
                 div()
-                    .id(SharedString::from(format!("close-card-{}", &close_id.0)))
+                    .id(SharedString::from(format!("close-card-{}", close_id.0)))
                     .absolute()
                     .top(px(6.0))
                     .left(px(6.0))
@@ -998,8 +998,8 @@ impl SessionSurfaces {
         }
 
         div()
-            .id(SharedString::from(format!("overview-card-{}", &id.0)))
-            .debug_selector(|| format!("OVERVIEW_CARD_{}", &id.0))
+            .id(SharedString::from(format!("overview-card-{}", id.0)))
+            .debug_selector(|| format!("OVERVIEW_CARD_{}", id.0))
             .group("overview-card")
             .flex()
             .flex_none()
@@ -1094,7 +1094,7 @@ impl SessionSurfaces {
         let close_id = id.clone();
         let status = self.status_glyph(session, 16.0, colors, window, cx);
         div()
-            .id(SharedString::from(format!("overview-row-{}", &id.0)))
+            .id(SharedString::from(format!("overview-row-{}", id.0)))
             .flex()
             .flex_none()
             .items_center()
@@ -1192,7 +1192,7 @@ impl SessionSurfaces {
             )
             .child(
                 div()
-                    .id(SharedString::from(format!("close-row-{}", &close_id.0)))
+                    .id(SharedString::from(format!("close-row-{}", close_id.0)))
                     .size(px(24.0))
                     .flex()
                     .items_center()
