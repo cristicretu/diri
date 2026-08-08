@@ -9,7 +9,7 @@ contributions are Apache 2.0, same as the project.
 - Xcode command-line tools (Swift 6)
 - Rust — the toolchain is pinned in `diri/rust-toolchain.toml` and rustup will
   fetch it for you
-- Node, only if you touch the browser sidecar
+- Node 20 or newer, only if you touch the browser sidecar
 
 The first Rust build compiles GPUI from a pinned Zed revision and takes a while.
 Later builds are incremental.

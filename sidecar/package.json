@@ -5,7 +5,7 @@
   "description": "Playwright browser pool driven by the Dirijor daemon over a unix socket.",
   "type": "commonjs",
   "main": "server.js",
-  "engines": { "node": ">=18" },
+  "engines": { "node": ">=20" },
   "dependencies": {
     "playwright": "^1.62.1"
   }
