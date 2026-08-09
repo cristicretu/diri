@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use diri_proto::SessionId;
-use diri_ui::{FloatingSurface, Radius, SemanticColors, Typo};
+use diri_ui::{FloatingSurface, Ink, Radius, SemanticColors, Typo};
 use gpui::{
     AnyElement, App, Context, CursorStyle, DragMoveEvent, Entity, FocusHandle, Focusable,
     FontWeight, KeyDownEvent, KeyUpEvent, Modifiers, ModifiersChangedEvent, MouseButton, Render,
@@ -1933,8 +1933,46 @@ impl Render for RootView {
         if let Some(status) = self.status_banner(colors, cx) {
             root = root.child(status);
         }
+        if let Some(build) = &self.services.dev_build {
+            root = root.child(dev_build_marker(build.marker_label(), colors));
+        }
         root
     }
+}
+
+fn dev_build_marker(label: &str, colors: SemanticColors) -> AnyElement {
+    div()
+        .absolute()
+        .top(px(10.0))
+        .left_0()
+        .right_0()
+        .flex()
+        .justify_center()
+        .child(
+            div()
+                .h(px(22.0))
+                .px(px(7.0))
+                .flex()
+                .items_center()
+                .gap(px(5.0))
+                .rounded(px(Radius::CHIP))
+                .border_1()
+                .border_color(Ink::ATTENTION.alpha(0.22))
+                .bg(colors.floating_surface())
+                .text_size(px(Typo::META.size))
+                .font_weight(Typo::META.weight)
+                .text_color(colors.secondary)
+                .child(
+                    div()
+                        .size(px(5.0))
+                        .rounded_full()
+                        .bg(Ink::ATTENTION.alpha(0.88)),
+                )
+                .child(div().text_color(Ink::ATTENTION.alpha(0.88)).child("DEV"))
+                .child("·")
+                .child(label.to_owned()),
+        )
+        .into_any_element()
 }
 
 fn preview_control(label: &str, value: &str, colors: SemanticColors) -> AnyElement {
