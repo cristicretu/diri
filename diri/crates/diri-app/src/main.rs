@@ -1,17 +1,25 @@
 mod clipboard_transfer;
+mod code_intelligence;
+mod code_viewer;
 #[cfg(unix)]
 mod daemon_launch;
-mod diff;
+mod dev_build;
+pub mod diff;
 pub mod fonts;
 pub mod fuzzy;
+mod git_review;
 pub mod history;
 mod inspector;
+mod launcher;
+pub mod markdown;
+mod markdown_view;
 pub mod navigation;
 pub mod notifications;
 pub mod palette;
 pub mod query_editor;
 pub mod quick_open;
 mod remote_access;
+pub mod review_prompt;
 pub mod root;
 pub mod seam;
 mod session_surfaces;
@@ -34,6 +42,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use dev_build::DevBuildIdentity;
 use diri_client::DaemonClient;
 use gpui::{
     App, AppContext as _, Bounds, KeyBinding, Menu, MenuItem, OsAction, SystemMenuType,
@@ -80,6 +89,7 @@ fn install_app_menus(cx: &mut App) {
         }
     });
     cx.bind_keys([
+        KeyBinding::new("cmd-n", root::OpenLauncher, None),
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-h", HideApp, None),
         KeyBinding::new("cmd-w", root::CloseSession, None),
@@ -93,6 +103,7 @@ fn install_app_menus(cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("Quit diri", Quit),
         ]),
+        Menu::new("File").items([MenuItem::action("New Session", root::OpenLauncher)]),
         Menu::new("Edit").items([
             MenuItem::os_action("Copy", terminal_pane::CopySelection, OsAction::Copy),
             MenuItem::os_action("Paste", terminal_pane::Paste, OsAction::Paste),
@@ -111,6 +122,7 @@ pub(crate) struct AppServices {
     pub(crate) usage_tx: tokio::sync::watch::Sender<UsageSnapshot>,
     pub(crate) updates: UpdateHandle,
     pub(crate) tokio: Arc<Runtime>,
+    pub(crate) dev_build: Option<DevBuildIdentity>,
 }
 
 fn main() {
@@ -126,6 +138,11 @@ fn main() {
         .ok()
         .or_else(|| preview_value.filter(|value| value != "1"));
     let scenario = PreviewScenario::from_env(scenario_value.as_deref());
+    #[cfg(target_os = "macos")]
+    let bundle_id = macos::bundle_identifier();
+    #[cfg(not(target_os = "macos"))]
+    let bundle_id = None;
+    let dev_build = DevBuildIdentity::from_process_environment(bundle_id.as_deref());
 
     // The client runtime multiplexes one daemon socket plus a handful of
     // event-driven housekeeping tasks. The default Tokio constructor creates
@@ -280,6 +297,7 @@ fn main() {
         usage_tx,
         updates,
         tokio,
+        dev_build,
     });
 
     let app = application().with_assets(diri_ui::IconAssets);
@@ -371,6 +389,14 @@ fn open_main_window(
                 None,
             )
         });
+    let app_id = services.dev_build.as_ref().map_or_else(
+        || "com.dirijor.diri".to_owned(),
+        |build| build.bundle_id().to_owned(),
+    );
+    let title = services
+        .dev_build
+        .as_ref()
+        .map(|build| build.window_title().into());
     cx.open_window(
         WindowOptions {
             window_bounds: Some(window_bounds),
@@ -380,9 +406,9 @@ fn open_main_window(
             // blurred forces WindowServer/Metal to retain full-size backdrop
             // surfaces even though only the sidebar used that material.
             window_background: WindowBackgroundAppearance::Opaque,
-            app_id: Some("com.dirijor.diri".to_owned()),
+            app_id: Some(app_id),
             titlebar: Some(TitlebarOptions {
-                title: None,
+                title,
                 appears_transparent: true,
                 // GPUI uses top/left insets here: AppKit's native 8 pt origin plus the
                 // spec's +12 x / -6 frame-origin nudge maps to 20 pt left and 14 pt top.

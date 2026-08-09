@@ -51,6 +51,20 @@ const HOT_WINDOW_SECS: u64 = 30;
 /// Maximum raw log tail replayed when starting or adopting a held session.
 /// The same hard startup-work bound the Swift daemon enforced.
 const REPLAY_BUDGET: usize = 256 << 10;
+const MAX_REPLAY_BUDGET: usize = 32 << 20;
+
+/// The normal startup bound is intentionally small, but an old checkpoint
+/// format can require a one-time raw-log migration to rebuild scrollback.
+/// Operators can raise the bound for that restart without changing the
+/// steady-state cost; malformed values fall back to the default.
+fn replay_budget() -> usize {
+    std::env::var("DIRIJOR_REPLAY_BUDGET_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map_or(REPLAY_BUDGET, |value| {
+            value.clamp(REPLAY_BUDGET, MAX_REPLAY_BUDGET)
+        })
+}
 
 /// Quiet time after the last output before a screen checkpoint is written,
 /// the Swift daemon's `checkpointSettleDelay`. Bursts coalesce into one
@@ -1239,6 +1253,7 @@ fn pump_held(
     exit_marker_floor: u64,
     manifest_id: String,
 ) {
+    let replay_budget = replay_budget();
     let (checkpoint_path, mut offset, mut watcher, mut marker_buffer) = {
         let mut log = shared.log.lock().expect("log");
         log.refresh_from_disk();
@@ -1253,10 +1268,11 @@ fn pump_held(
         let restored = crate::checkpoint::ScreenCheckpoint::load(&checkpoint_path)
             .filter(|checkpoint| {
                 checkpoint.log_offset <= tail
-                    && tail - checkpoint.log_offset <= REPLAY_BUDGET as u64
+                    && tail - checkpoint.log_offset <= replay_budget as u64
             })
             .filter(|checkpoint| {
                 shared.screen.lock().expect("screen").restore(
+                    &checkpoint.history,
                     &checkpoint.grid,
                     checkpoint.alt_screen,
                     checkpoint.bracketed_paste,
@@ -1272,7 +1288,7 @@ fn pump_held(
             ),
             None => (
                 checkpoint_path,
-                log.preferred_replay_start(REPLAY_BUDGET),
+                log.preferred_replay_start(replay_budget),
                 watcher,
                 Vec::new(),
             ),
@@ -1325,9 +1341,18 @@ fn pump_held(
             // holder appends — the tick interval is only the ceiling for
             // reducer timers and the liveness probe. Attached or Working
             // sessions keep the fast ceiling; idle background ones stretch it.
-            match watcher.as_mut() {
+            let log_replaced = match watcher.as_mut() {
                 Some(watcher) => watcher.wait(shared.quiet_tick()),
-                None => std::thread::sleep(shared.quiet_tick()),
+                None => {
+                    std::thread::sleep(shared.quiet_tick());
+                    false
+                }
+            };
+            if log_replaced {
+                // The watcher's descriptor followed the retired inode through
+                // rotation. Make the cached payload reader reopen the path as
+                // well, matching the Swift daemon's logDidChange(rearm:).
+                shared.log.lock().expect("log").invalidate_read_handle();
             }
             let outcome = shared
                 .reducer
@@ -1485,9 +1510,10 @@ fn persist_checkpoint(
     marker_buffer: &[u8],
     last_key: &mut Option<CheckpointKey>,
 ) {
-    let (grid, alt_screen, bracketed_paste, mouse_reporting, content_seq) = {
+    let (history, grid, alt_screen, bracketed_paste, mouse_reporting, content_seq) = {
         let screen = shared.screen.lock().expect("screen");
         (
+            screen.history_snapshot(),
             screen.full_snapshot(),
             screen.is_alt_screen(),
             screen.bracketed_paste(),
@@ -1508,6 +1534,7 @@ fn persist_checkpoint(
     }
     let checkpoint = crate::checkpoint::ScreenCheckpoint {
         log_offset: offset,
+        history,
         grid,
         marker_buffer: marker_buffer.to_vec(),
         alt_screen,
@@ -1592,12 +1619,14 @@ mod log_watch {
 
         /// Blocks until the log changes or `timeout` passes. EV_CLEAR keeps
         /// writes that land between waits queued, so wakeups are never lost.
-        pub fn wait(&mut self, timeout: Duration) {
+        /// Returns true when rotation replaced the watched file, so the
+        /// caller can invalidate any other descriptors for the old inode.
+        pub fn wait(&mut self, timeout: Duration) -> bool {
             if self.fd < 0 {
                 self.arm();
                 if self.fd < 0 {
                     std::thread::sleep(timeout);
-                    return;
+                    return false;
                 }
             }
             let spec = libc::timespec {
@@ -1610,7 +1639,9 @@ mod log_watch {
             if woke > 0 && out.fflags & (libc::NOTE_DELETE | libc::NOTE_RENAME) != 0 {
                 // Rotation replaced the file: track the new incarnation.
                 self.arm();
+                return true;
             }
+            false
         }
     }
 
@@ -1621,6 +1652,35 @@ mod log_watch {
                 unsafe { libc::close(self.fd) };
             }
             unsafe { libc::close(self.kq) };
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::log::OutputLog;
+
+        #[test]
+        fn replacement_tells_the_log_reader_to_reopen() {
+            let root = tempfile::tempdir().expect("temp dir");
+            let mut writer = OutputLog::open(root.path(), "s", 1 << 20, 64, false).expect("writer");
+            writer.append(&[b'a'; 32]).expect("initial append");
+            let mut reader = OutputLog::reader(root.path(), "s").expect("reader");
+            let mut watcher = LogWatcher::new(reader.path()).expect("watcher");
+
+            writer.append(&[b'b'; 40]).expect("rotating append");
+            writer.append(b"after").expect("post-rotation append");
+            writer.flush().expect("flush");
+
+            assert!(
+                watcher.wait(Duration::from_secs(1)),
+                "rename/delete notification identifies the replacement"
+            );
+            reader.invalidate_read_handle();
+            assert!(reader.refresh_from_disk());
+            assert_eq!(reader.tail_offset(), 77);
+            let (_, data) = reader.read(72, 16);
+            assert_eq!(data, b"after");
         }
     }
 }
@@ -1639,8 +1699,9 @@ mod log_watch {
             None
         }
 
-        pub fn wait(&mut self, timeout: Duration) {
+        pub fn wait(&mut self, timeout: Duration) -> bool {
             std::thread::sleep(timeout);
+            false
         }
     }
 }

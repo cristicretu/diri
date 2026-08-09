@@ -92,11 +92,26 @@ impl QueryEditor {
     /// that to avoid re-ranking on a keystroke that did nothing.
     pub fn insert(&mut self, insertion: &str) -> bool {
         let filtered: String = insertion.chars().filter(|c| !c.is_control()).collect();
+        self.replace_selection(&filtered)
+    }
+
+    /// Insert composer text while preserving line breaks. Search fields call
+    /// [`Self::insert`] and stay strictly single-line; prompt composers use
+    /// this variant so Shift-Return and pasted paragraphs retain their shape.
+    pub fn insert_multiline(&mut self, insertion: &str) -> bool {
+        let filtered: String = insertion
+            .chars()
+            .filter(|character| !character.is_control() || *character == '\n')
+            .collect();
+        self.replace_selection(&filtered)
+    }
+
+    fn replace_selection(&mut self, filtered: &str) -> bool {
         if filtered.is_empty() && self.selection().is_none() {
             return false;
         }
         let range = self.selection().unwrap_or(self.cursor..self.cursor);
-        self.text.replace_range(range.clone(), &filtered);
+        self.text.replace_range(range.clone(), filtered);
         self.cursor = range.start + filtered.len();
         self.anchor = self.cursor;
         true
@@ -363,6 +378,13 @@ mod tests {
         assert_eq!(editor.text(), "diri");
         assert_eq!(editor.cursor(), 4);
         assert!(editor.selection().is_none());
+    }
+
+    #[test]
+    fn multiline_insert_preserves_paragraphs_without_admitting_other_controls() {
+        let mut editor = QueryEditor::default();
+        assert!(editor.insert_multiline("first\nsecond\tthird"));
+        assert_eq!(editor.text(), "first\nsecondthird");
     }
 
     #[test]

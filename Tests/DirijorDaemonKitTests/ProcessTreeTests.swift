@@ -106,6 +106,42 @@ import Testing
     try await waitUntil(timeout: .seconds(5)) { await session.isRunning == false }
 }
 
+/// A holder can outlive the daemon that stopped it while the persisted
+/// hibernation marker is stale or missing. Attaching must reconcile the real
+/// process state; otherwise the UI looks live and accepts bytes into a PTY
+/// whose child can never read them.
+@Test func sessionAttachRecoversStoppedTreeWithStaleMetadata() async throws {
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("dirijor-stale-stop-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+
+    let session = AgentSession(
+        id: SessionID(rawValue: "s_stale_stop"), kind: .shell, logDirectory: dir)
+    try await session.start(argv: ["/bin/cat"], cwd: "/tmp", extraEnv: [:]) { _, _ in }
+    defer { Task { await session.terminate(graceSeconds: 0.2) } }
+
+    try await waitUntil(timeout: .seconds(5)) { await session.pid > 0 }
+    let pid = await session.pid
+    let stopped = ProcessTree.stopAll(root: pid)
+    #expect(!stopped.isEmpty)
+    #expect(ProcessTree.status(pid) == UInt32(SSTOP))
+    #expect(await session.isHibernated == false)
+
+    await session.attach(CollectingSink(), fromOffset: nil)
+    await session.write(Data("typed into stale stop\r".utf8))
+
+    try await waitUntil(timeout: .seconds(5)) {
+        ProcessTree.status(pid) != UInt32(SSTOP)
+    }
+    try await waitUntil(timeout: .seconds(5)) {
+        await session.screenText().contains("typed into stale stop")
+    }
+
+    await session.terminate(graceSeconds: 0.2)
+    try await waitUntil(timeout: .seconds(5)) { await session.isRunning == false }
+}
+
 @Test func processTreeStartTimeGuardsAgainstPidReuse() {
     // A sample whose start time can't match (future) must never be signalled;
     // killAll on it is a no-op rather than a kill of an innocent pid.

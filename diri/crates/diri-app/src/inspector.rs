@@ -4,8 +4,9 @@
 //! This module owns selection tracking, session/PR/artifact projections,
 //! background Git refreshes, unified-diff snapshots, and diff virtualization.
 
+use std::collections::HashMap;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -17,16 +18,24 @@ use diri_ui::{
     AgentKind, AgentLogo, Fill, FloatingSurface, Ink, Metrics, Radius, SemanticColors, Typo,
 };
 use gpui::{
-    Animation, AnimationExt, AnyElement, Context, DragMoveEvent, EventEmitter, FontWeight,
-    ListHorizontalSizingBehavior, MouseButton, Render, SharedString, StatefulInteractiveElement,
-    Task, UniformListScrollHandle, Window, div, ease_out_quint, point, prelude::*, px, rgba,
+    Animation, AnimationExt, AnyElement, App, Context, DragMoveEvent, Entity, EventEmitter,
+    FocusHandle, Focusable, FontWeight, KeyDownEvent, ListHorizontalSizingBehavior, MouseButton,
+    Render, ScrollStrategy, SharedString, StatefulInteractiveElement, Task,
+    UniformListScrollHandle, Window, div, ease_out_quint, point, prelude::*, px, rgba,
     uniform_list,
 };
 
+use crate::code_viewer::CodeViewer;
 use crate::diff::{
-    DiffRow, DiffRowKind, DiffSnapshot, load_worktree_diff_against, snapshot_from_read_diff,
+    DiffFile, DiffHunk, DiffLayer, DiffRow, DiffRowKind, DiffSnapshot, load_local_diff,
+    snapshot_from_read_diff,
 };
+use crate::git_review::{GitRepository, GitReviewError, PatchMutation, ReviewStatus};
 use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
+use crate::markdown::MarkdownDocument;
+use crate::markdown_view::render_markdown;
+use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
+use crate::review_prompt::{ReviewEvidence, ReviewLayer, ReviewPrompt};
 use crate::store::{InspectorTab, StoreRuntime};
 
 const DIFF_ROW_HEIGHT: f32 = 20.0;
@@ -64,12 +73,13 @@ pub enum InspectorEvent {
 }
 
 impl InspectorTab {
-    const ALL: [Self; 3] = [Self::Info, Self::Changes, Self::Artifacts];
+    const ALL: [Self; 4] = [Self::Info, Self::Changes, Self::Code, Self::Artifacts];
 
     const fn label(self) -> &'static str {
         match self {
             Self::Info => "Info",
-            Self::Changes => "Changes",
+            Self::Changes => "Review",
+            Self::Code => "Code",
             Self::Artifacts => "Artifacts",
         }
     }
@@ -78,7 +88,8 @@ impl InspectorTab {
         match self {
             Self::Info => 0,
             Self::Changes => 1,
-            Self::Artifacts => 2,
+            Self::Code => 2,
+            Self::Artifacts => 3,
         }
     }
 
@@ -86,6 +97,7 @@ impl InspectorTab {
         match self {
             Self::Info => "INSPECTOR_TAB_INFO",
             Self::Changes => "INSPECTOR_TAB_CHANGES",
+            Self::Code => "INSPECTOR_TAB_CODE",
             Self::Artifacts => "INSPECTOR_TAB_ARTIFACTS",
         }
     }
@@ -106,16 +118,63 @@ enum LoadState {
     Error(String),
 }
 
+#[derive(Clone, Debug)]
+enum ReviewLoadState {
+    NoSession,
+    Remote,
+    Loading,
+    Ready(Arc<ReviewStatus>),
+    Error(String),
+}
+
+#[derive(Clone, Debug)]
+enum ReviewAction {
+    Stage(Vec<PathBuf>),
+    Unstage(Vec<PathBuf>),
+    Discard(Vec<PathBuf>),
+    Patch {
+        patch: Vec<u8>,
+        mutation: PatchMutation,
+    },
+    Commit(String),
+}
+
+#[derive(Clone, Debug)]
+struct AskDraft {
+    evidence: Vec<ReviewEvidence>,
+    label: String,
+}
+
 pub struct WorkbenchInspector {
     runtime: Arc<StoreRuntime>,
     _tokio_owner: Arc<tokio::runtime::Runtime>,
     tokio: tokio::runtime::Handle,
+    code_viewer: Entity<CodeViewer>,
+    markdown_cache: HashMap<String, Arc<MarkdownDocument>>,
+    focus: FocusHandle,
     visible: bool,
     selected_tab: InspectorTab,
     tab_direction: f32,
     tab_transition_generation: u64,
     context: Option<DiffContext>,
     state: LoadState,
+    review_state: ReviewLoadState,
+    review_generation: u64,
+    review_task: Option<Task<()>>,
+    review_action_task: Option<Task<()>>,
+    review_action_busy: bool,
+    review_feedback: Option<(bool, String)>,
+    ask_draft: Option<AskDraft>,
+    ask_query: QueryEditor,
+    ask_task: Option<Task<()>>,
+    ask_busy: bool,
+    ask_feedback: Option<(bool, String)>,
+    commit_open: bool,
+    commit_query: QueryEditor,
+    discard_armed: bool,
+    armed_hunk: Option<u64>,
+    diff_layer: DiffLayer,
+    files_open: bool,
     comparison: SessionDiffBase,
     comparison_menu_open: bool,
     loading: bool,
@@ -130,6 +189,12 @@ pub struct WorkbenchInspector {
 
 impl EventEmitter<InspectorEvent> for WorkbenchInspector {}
 
+impl Focusable for WorkbenchInspector {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
 impl WorkbenchInspector {
     pub fn new(
         runtime: Arc<StoreRuntime>,
@@ -137,6 +202,8 @@ impl WorkbenchInspector {
         cx: &mut Context<Self>,
     ) -> Self {
         let tokio = tokio_owner.handle().clone();
+        let code_viewer = cx.new(|cx| CodeViewer::new(tokio.clone(), cx));
+        let focus = cx.focus_handle();
         let poll_task = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(REFRESH_INTERVAL).await;
@@ -178,12 +245,32 @@ impl WorkbenchInspector {
             runtime,
             _tokio_owner: tokio_owner,
             tokio,
+            code_viewer,
+            markdown_cache: HashMap::new(),
+            focus,
             visible: false,
             selected_tab,
             tab_direction: 1.0,
             tab_transition_generation: 0,
             context: None,
             state: LoadState::NoSession,
+            review_state: ReviewLoadState::NoSession,
+            review_generation: 0,
+            review_task: None,
+            review_action_task: None,
+            review_action_busy: false,
+            review_feedback: None,
+            ask_draft: None,
+            ask_query: QueryEditor::default(),
+            ask_task: None,
+            ask_busy: false,
+            ask_feedback: None,
+            commit_open: false,
+            commit_query: QueryEditor::default(),
+            discard_armed: false,
+            armed_hunk: None,
+            diff_layer: DiffLayer::Branch,
+            files_open: false,
             comparison: SessionDiffBase::DefaultBranch,
             comparison_menu_open: false,
             loading: false,
@@ -206,8 +293,29 @@ impl WorkbenchInspector {
             self.refresh(true, cx);
         } else {
             self.comparison_menu_open = false;
+            self.files_open = false;
+            self.ask_draft = None;
+            self.ask_feedback = None;
+            self.ask_query.clear();
         }
         cx.notify();
+    }
+
+    /// Opens a terminal or diff-shaped file reference in the native code tab.
+    /// The viewer owns resolution and loading; the inspector only preserves
+    /// the workbench's spatial context and selects the destination tab.
+    pub fn open_file_reference(
+        &mut self,
+        cwd: impl Into<PathBuf>,
+        reference: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let cwd = cwd.into();
+        let reference = reference.into();
+        self.code_viewer.update(cx, |viewer, cx| {
+            viewer.open_reference(cwd, reference, cx);
+        });
+        self.select_tab(InspectorTab::Code, cx);
     }
 
     fn selected_context(&self) -> Option<DiffContext> {
@@ -277,6 +385,28 @@ impl WorkbenchInspector {
         self.refresh(true, cx);
     }
 
+    fn select_diff_layer(&mut self, layer: DiffLayer, cx: &mut Context<Self>) {
+        self.files_open = false;
+        self.armed_hunk = None;
+        self.discard_armed = false;
+        self.commit_open = false;
+        if self.diff_layer == layer {
+            cx.notify();
+            return;
+        }
+        self.diff_layer = layer;
+        self.scroll = UniformListScrollHandle::new();
+        self.scrollbar_interaction = ScrollbarInteraction::default();
+        self.scrollbar_layout_primed = false;
+        self.refresh(true, cx);
+    }
+
+    fn jump_to_diff_row(&mut self, row: usize, cx: &mut Context<Self>) {
+        self.files_open = false;
+        self.scroll.scroll_to_item(row, ScrollStrategy::Top);
+        cx.notify();
+    }
+
     fn refresh(&mut self, force: bool, cx: &mut Context<Self>) {
         if !self.visible || (self.loading && !force) {
             return;
@@ -284,6 +414,9 @@ impl WorkbenchInspector {
         let Some(context) = self.selected_context() else {
             self.context = None;
             self.state = LoadState::NoSession;
+            self.review_state = ReviewLoadState::NoSession;
+            self.code_viewer
+                .update(cx, |viewer, cx| viewer.set_workspace(None, cx));
             cx.notify();
             return;
         };
@@ -292,8 +425,17 @@ impl WorkbenchInspector {
             self.scroll = UniformListScrollHandle::new();
             self.scrollbar_interaction = ScrollbarInteraction::default();
             self.scrollbar_layout_primed = false;
+            self.files_open = false;
+            self.armed_hunk = None;
+            self.ask_draft = None;
+            self.ask_feedback = None;
+            self.ask_query.clear();
+            let workspace = (!context.remote).then(|| context.cwd.clone());
+            self.code_viewer
+                .update(cx, |viewer, cx| viewer.set_workspace(workspace, cx));
         }
         self.context = Some(context.clone());
+        self.refresh_review(&context, force, cx);
         if !force && !context_changed && matches!(self.state, LoadState::NoSession) {
             return;
         }
@@ -309,6 +451,7 @@ impl WorkbenchInspector {
         let session_id = context.id;
         let remote = context.remote;
         let comparison = self.comparison;
+        let layer = self.diff_layer;
         let client = Arc::clone(self.runtime.client());
         let tokio = self.tokio.clone();
         self.refresh_task = Some(cx.spawn(async move |this, cx| {
@@ -322,7 +465,7 @@ impl WorkbenchInspector {
                     .map(Arc::new)
             } else {
                 tokio
-                    .spawn_blocking(move || load_worktree_diff_against(&cwd, comparison))
+                    .spawn_blocking(move || load_local_diff(&cwd, layer))
                     .await
                     .map_err(|error| format!("Diff worker stopped: {error}"))
                     .and_then(|result| result.map_err(|error| error.to_string()))
@@ -346,6 +489,194 @@ impl WorkbenchInspector {
         }));
     }
 
+    fn refresh_review(&mut self, context: &DiffContext, force: bool, cx: &mut Context<Self>) {
+        if context.remote {
+            self.review_state = ReviewLoadState::Remote;
+            return;
+        }
+        if self.review_action_busy && !force {
+            return;
+        }
+        self.review_generation = self.review_generation.wrapping_add(1);
+        let generation = self.review_generation;
+        let cwd = context.cwd.clone();
+        if !matches!(self.review_state, ReviewLoadState::Ready(_)) {
+            self.review_state = ReviewLoadState::Loading;
+        }
+        let tokio = self.tokio.clone();
+        self.review_task = Some(cx.spawn(async move |this, cx| {
+            let result = tokio
+                .spawn_blocking(move || {
+                    let repository = GitRepository::discover(&cwd)?;
+                    repository.status()
+                })
+                .await
+                .map_err(|error| format!("Git status worker stopped: {error}"))
+                .and_then(|result| result.map_err(|error| error.to_string()));
+            let _ = this.update(cx, |this, cx| {
+                if this.review_generation != generation {
+                    return;
+                }
+                this.review_state = match result {
+                    Ok(status) => ReviewLoadState::Ready(Arc::new(status)),
+                    Err(error) => ReviewLoadState::Error(error),
+                };
+                cx.notify();
+            });
+        }));
+    }
+
+    fn run_review_action(&mut self, action: ReviewAction, cx: &mut Context<Self>) {
+        if self.review_action_busy {
+            return;
+        }
+        let Some(context) = self.context.clone().filter(|context| !context.remote) else {
+            return;
+        };
+        self.review_action_busy = true;
+        self.review_feedback = None;
+        self.discard_armed = false;
+        self.armed_hunk = None;
+        cx.notify();
+        let tokio = self.tokio.clone();
+        self.review_action_task = Some(cx.spawn(async move |this, cx| {
+            let result = tokio
+                .spawn_blocking(move || -> Result<String, GitReviewError> {
+                    let repository = GitRepository::discover(&context.cwd)?;
+                    match action {
+                        ReviewAction::Stage(paths) => {
+                            repository.stage_paths(&paths)?;
+                            Ok("Changes staged".to_owned())
+                        }
+                        ReviewAction::Unstage(paths) => {
+                            repository.unstage_paths(&paths)?;
+                            Ok("Changes moved back to the working tree".to_owned())
+                        }
+                        ReviewAction::Discard(paths) => {
+                            repository.discard_unstaged(&paths)?;
+                            Ok("Unstaged edits discarded".to_owned())
+                        }
+                        ReviewAction::Patch { patch, mutation } => {
+                            repository.apply_patch(&patch, mutation)?;
+                            Ok(match mutation {
+                                PatchMutation::Stage => "Hunk staged",
+                                PatchMutation::Unstage => "Hunk moved back to the working tree",
+                                PatchMutation::Discard => "Hunk discarded",
+                            }
+                            .to_owned())
+                        }
+                        ReviewAction::Commit(message) => {
+                            let commit = repository.commit(&message)?;
+                            Ok(format!("Committed {} · {}", commit.oid, commit.summary))
+                        }
+                    }
+                })
+                .await
+                .map_err(|error| format!("Git action worker stopped: {error}"))
+                .and_then(|result| result.map_err(|error| error.to_string()));
+            let _ = this.update(cx, |this, cx| {
+                this.review_action_busy = false;
+                match result {
+                    Ok(message) => {
+                        this.review_feedback = Some((true, message));
+                        this.commit_open = false;
+                        this.commit_query.clear();
+                    }
+                    Err(message) => this.review_feedback = Some((false, message)),
+                }
+                this.refresh(true, cx);
+                cx.notify();
+            });
+        }));
+    }
+
+    fn submit_commit(&mut self, cx: &mut Context<Self>) {
+        let message = self.commit_query.text().trim().to_owned();
+        if message.is_empty() {
+            self.review_feedback = Some((false, "Write a commit message first".to_owned()));
+            cx.notify();
+            return;
+        }
+        self.run_review_action(ReviewAction::Commit(message), cx);
+    }
+
+    fn open_ask(
+        &mut self,
+        evidence: Vec<ReviewEvidence>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let label = if evidence.len() == 1 {
+            evidence[0].label()
+        } else {
+            format!("{} review contexts", evidence.len())
+        };
+        self.ask_draft = Some(AskDraft { evidence, label });
+        self.ask_feedback = None;
+        self.ask_query.clear();
+        self.ask_query
+            .insert("Review this for correctness, regressions, and missing tests.");
+        self.ask_query.select_all();
+        self.commit_open = false;
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    fn set_ask_question(&mut self, question: &str, cx: &mut Context<Self>) {
+        self.ask_query.clear();
+        self.ask_query.insert(question);
+        self.ask_query.select_all();
+        cx.notify();
+    }
+
+    fn submit_ask(&mut self, cx: &mut Context<Self>) {
+        if self.ask_busy {
+            return;
+        }
+        let Some(draft) = self.ask_draft.clone() else {
+            return;
+        };
+        let question = self.ask_query.text().trim().to_owned();
+        let prompt = match ReviewPrompt::compose(&draft.evidence, &question) {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                self.ask_feedback = Some((false, error.to_string()));
+                cx.notify();
+                return;
+            }
+        };
+        let Some(session) = self.selected_session() else {
+            self.ask_feedback = Some((false, "Select an agent first".to_owned()));
+            cx.notify();
+            return;
+        };
+
+        self.ask_busy = true;
+        self.ask_feedback = None;
+        let subject = prompt.subject_label.clone();
+        let session_id = session.id;
+        let client = Arc::clone(self.runtime.client());
+        let tokio = self.tokio.clone();
+        self.ask_task = Some(cx.spawn(async move |this, cx| {
+            let result = tokio
+                .spawn(async move { client.send_text(&session_id, prompt.text, true).await })
+                .await
+                .map_err(|error| format!("Agent send stopped: {error}"))
+                .and_then(|result| result.map_err(|error| error.to_string()));
+            let _ = this.update(cx, |this, cx| {
+                this.ask_busy = false;
+                match result {
+                    Ok(()) => {
+                        this.ask_feedback = Some((true, format!("Sent · {subject}")));
+                        this.ask_query.clear();
+                    }
+                    Err(error) => this.ask_feedback = Some((false, error)),
+                }
+                cx.notify();
+            });
+        }));
+    }
+
     fn selected_session(&self) -> Option<SessionRecord> {
         self.runtime
             .store
@@ -353,6 +684,19 @@ impl WorkbenchInspector {
             .expect("session store lock poisoned")
             .selected_session()
             .cloned()
+    }
+
+    fn markdown_document(&mut self, source: &str) -> Arc<MarkdownDocument> {
+        if let Some(document) = self.markdown_cache.get(source) {
+            return Arc::clone(document);
+        }
+        if self.markdown_cache.len() >= 24 {
+            self.markdown_cache.clear();
+        }
+        let document = Arc::new(MarkdownDocument::parse(source));
+        self.markdown_cache
+            .insert(source.to_owned(), Arc::clone(&document));
+        document
     }
 
     fn render_header(
@@ -378,6 +722,7 @@ impl WorkbenchInspector {
             let count = match tab {
                 InspectorTab::Info => None,
                 InspectorTab::Changes => changes_count,
+                InspectorTab::Code => None,
                 InspectorTab::Artifacts => artifacts_count,
             };
             let active = tab == selected_tab;
@@ -386,7 +731,7 @@ impl WorkbenchInspector {
                     .id(SharedString::from(format!("inspector-tab-{}", tab.label())))
                     .debug_selector(move || tab.debug_selector().to_owned())
                     .h(px(28.0))
-                    .px(px(9.0))
+                    .px(px(6.0))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -413,7 +758,10 @@ impl WorkbenchInspector {
                         colors.secondary
                     })
                     .child(tab.label())
-                    .when_some(count, |tab, count| {
+                    // Counts are useful context once a destination is open,
+                    // but four always-visible badges make the 300pt compact
+                    // inspector overlap its close control.
+                    .when_some(count.filter(|_| active), |tab, count| {
                         tab.child(
                             div()
                                 .min_w(px(16.0))
@@ -476,7 +824,7 @@ impl WorkbenchInspector {
     }
 
     fn render_info(
-        &self,
+        &mut self,
         session: Option<&SessionRecord>,
         colors: SemanticColors,
         cx: &mut Context<Self>,
@@ -648,8 +996,19 @@ impl WorkbenchInspector {
                 },
                 colors,
             ));
+            let inspector = cx.entity();
             for pull_request in pull_requests.iter().take(2) {
-                content = content.child(render_pull_request(pull_request, colors));
+                let body = pull_request
+                    .body
+                    .as_deref()
+                    .filter(|body| !body.trim().is_empty())
+                    .map(|body| self.markdown_document(body));
+                content = content.child(render_pull_request(
+                    pull_request,
+                    colors,
+                    inspector.clone(),
+                    body,
+                ));
             }
         }
 
@@ -816,9 +1175,10 @@ impl WorkbenchInspector {
     }
 
     fn render_artifacts(
-        &self,
+        &mut self,
         session: Option<&SessionRecord>,
         colors: SemanticColors,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
         let Some(session) = session else {
             return self
@@ -854,8 +1214,19 @@ impl WorkbenchInspector {
             .overflow_y_scroll();
 
         if let Some(pull_requests) = session.pull_requests.as_deref() {
+            let inspector = cx.entity();
             for pull_request in pull_requests {
-                content = content.child(render_pull_request(pull_request, colors));
+                let body = pull_request
+                    .body
+                    .as_deref()
+                    .filter(|body| !body.trim().is_empty())
+                    .map(|body| self.markdown_document(body));
+                content = content.child(render_pull_request(
+                    pull_request,
+                    colors,
+                    inspector.clone(),
+                    body,
+                ));
             }
         }
         if let Some(artifacts) = session.artifacts.as_deref() {
@@ -1059,8 +1430,19 @@ impl WorkbenchInspector {
         let row_count = snapshot.rows.len();
         let content_width =
             (GUTTER_WIDTH + 28.0 + snapshot.max_text_columns as f32 * 7.1).clamp(320.0, 3700.0);
+        let inspector = cx.entity();
+        let repo_root = snapshot.repo_root.clone();
+        let armed_hunk = self.armed_hunk;
         let list = uniform_list("inspector-diff", row_count, move |range, _, _| {
-            render_rows(&snapshot, range, content_width, colors)
+            render_rows(
+                &snapshot,
+                range,
+                content_width,
+                colors,
+                inspector.clone(),
+                &repo_root,
+                armed_hunk,
+            )
         })
         .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
         .track_scroll(&self.scroll)
@@ -1172,6 +1554,626 @@ impl WorkbenchInspector {
             .into_any_element()
     }
 
+    fn render_layer_option(
+        &self,
+        layer: DiffLayer,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (label, selector) = match layer {
+            DiffLayer::Branch => ("Branch", "INSPECTOR_LAYER_BRANCH"),
+            DiffLayer::Working => ("Working", "INSPECTOR_LAYER_WORKING"),
+            DiffLayer::Staged => ("Staged", "INSPECTOR_LAYER_STAGED"),
+        };
+        let selected = self.diff_layer == layer;
+        div()
+            .id(SharedString::from(format!("review-layer-{label}")))
+            .debug_selector(move || selector.to_owned())
+            .h(px(25.0))
+            .px(px(8.0))
+            .flex()
+            .items_center()
+            .rounded(px(Radius::CHIP))
+            .bg(if selected {
+                colors.primary.alpha(0.11)
+            } else {
+                colors.primary.alpha(0.0)
+            })
+            .cursor_pointer()
+            .hover(move |button| button.bg(colors.primary.alpha(0.085)))
+            .text_size(px(9.5))
+            .font_weight(if selected {
+                FontWeight::SEMIBOLD
+            } else {
+                FontWeight::MEDIUM
+            })
+            .text_color(if selected {
+                colors.primary
+            } else {
+                colors.tertiary
+            })
+            .child(label)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.select_diff_layer(layer, cx);
+                cx.stop_propagation();
+            }))
+            .into_any_element()
+    }
+
+    fn render_file_navigator(
+        &self,
+        snapshot: Arc<DiffSnapshot>,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut files = div()
+            .id("review-file-navigator-list")
+            .max_h(px(390.0))
+            .py(px(4.0))
+            .overflow_y_scroll();
+        for (index, file) in snapshot.file_diffs.iter().enumerate() {
+            let row = file.row_range.start;
+            files = files.child(
+                div()
+                    .id(("review-file-navigator-row", index))
+                    .debug_selector(move || format!("INSPECTOR_REVIEW_FILE_{index}"))
+                    .min_h(px(38.0))
+                    .px(px(10.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .cursor_pointer()
+                    .hover(move |item| item.bg(colors.primary.alpha(0.065)))
+                    .child(sf_symbol(
+                        "chevron.left.forwardslash.chevron.right",
+                        11.5,
+                        colors.tertiary,
+                    ))
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .flex_1()
+                            .truncate()
+                            .font_family(crate::fonts::mono_family())
+                            .text_size(px(10.0))
+                            .text_color(colors.secondary)
+                            .child(file.path.to_string_lossy().into_owned()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(9.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(Ink::FRESH)
+                            .child(format!("+{}", file.additions)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(9.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(Ink::DANGER)
+                            .child(format!("−{}", file.deletions)),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.jump_to_diff_row(row, cx);
+                        cx.stop_propagation();
+                    })),
+            );
+        }
+
+        div()
+            .absolute()
+            .inset_0()
+            .child(div().absolute().inset_0().occlude().on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.files_open = false;
+                    cx.notify();
+                    cx.stop_propagation();
+                }),
+            ))
+            .child(
+                div()
+                    .id("review-file-navigator")
+                    .debug_selector(|| "INSPECTOR_FILE_NAVIGATOR".to_owned())
+                    .absolute()
+                    .top(px(40.0))
+                    .right(px(9.0))
+                    .w(px(330.0))
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        this.files_open = false;
+                        cx.notify();
+                    }))
+                    .child(FloatingSurface::new(colors, files)),
+            )
+            .into_any_element()
+    }
+
+    fn render_review_controls(
+        &mut self,
+        colors: SemanticColors,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let ReviewLoadState::Ready(status) = &self.review_state else {
+            let (symbol, label) = match &self.review_state {
+                ReviewLoadState::NoSession => ("minus.circle", "Select an agent to review"),
+                ReviewLoadState::Remote => (
+                    "network",
+                    "Remote changes are view-only until Git actions move into the daemon",
+                ),
+                ReviewLoadState::Loading => ("ellipsis", "Reading index and working tree…"),
+                ReviewLoadState::Error(error) => {
+                    return div()
+                        .px(px(10.0))
+                        .py(px(7.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(7.0))
+                        .border_b_1()
+                        .border_color(colors.primary.alpha(0.06))
+                        .text_size(px(Typo::META.size))
+                        .text_color(Ink::ATTENTION)
+                        .child(sf_symbol("exclamationmark.triangle", 11.0, Ink::ATTENTION))
+                        .child(error.clone())
+                        .into_any_element();
+                }
+                ReviewLoadState::Ready(_) => unreachable!(),
+            };
+            return div()
+                .h(px(36.0))
+                .flex_none()
+                .px(px(10.0))
+                .flex()
+                .items_center()
+                .gap(px(7.0))
+                .border_b_1()
+                .border_color(colors.primary.alpha(0.06))
+                .text_size(px(Typo::META.size))
+                .text_color(colors.tertiary)
+                .child(sf_symbol(symbol, 11.0, colors.tertiary))
+                .child(label)
+                .into_any_element();
+        };
+        let status = Arc::clone(status);
+        let staged_paths: Vec<_> = status
+            .staged
+            .iter()
+            .map(|change| change.path.clone())
+            .collect();
+        // Conflicted paths are deliberately excluded. `git add` on a file that
+        // still carries conflict markers both stages the markers and collapses
+        // index stages 1/2/3, after which `git checkout --merge` can no longer
+        // reconstruct the conflict. Resolving stays an explicit, per-file act.
+        let mut stage_paths: Vec<_> = status
+            .unstaged
+            .iter()
+            .chain(status.untracked.iter())
+            .map(|change| change.path.clone())
+            .collect();
+        stage_paths.sort();
+        stage_paths.dedup();
+        let discard_paths: Vec<_> = status
+            .unstaged
+            .iter()
+            .map(|change| change.path.clone())
+            .collect();
+        let staged_count = status.staged.len();
+        let working_count = status.unstaged.len() + status.untracked.len();
+        let conflicted_count = status.conflicted.len();
+        let branch = status
+            .branch
+            .name
+            .clone()
+            .unwrap_or_else(|| "Detached HEAD".to_owned());
+        let busy = self.review_action_busy;
+        let commit_open = self.commit_open;
+        let discard_armed = self.discard_armed;
+
+        let mut actions = div().flex().items_center().gap(px(5.0));
+        if self.diff_layer == DiffLayer::Working && !stage_paths.is_empty() {
+            let paths = stage_paths;
+            actions = actions.child(
+                div()
+                    .id("review-stage-all")
+                    .h(px(25.0))
+                    .px(px(8.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .rounded(px(Radius::BADGE))
+                    .bg(if staged_count == 0 {
+                        rgba(0xd9775724)
+                    } else {
+                        colors.primary.alpha(0.055)
+                    })
+                    .text_size(px(10.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(if staged_count == 0 {
+                        rgba(0xe89a7cff)
+                    } else {
+                        colors.secondary
+                    })
+                    .when(!busy, |button| {
+                        button
+                            .cursor_pointer()
+                            .hover(move |button| button.bg(colors.primary.alpha(0.10)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.run_review_action(ReviewAction::Stage(paths.clone()), cx);
+                                cx.stop_propagation();
+                            }))
+                    })
+                    .child(sf_symbol("plus", 9.0, colors.secondary))
+                    .child("Stage all"),
+            );
+        }
+        if self.diff_layer == DiffLayer::Staged && !staged_paths.is_empty() {
+            let paths = staged_paths;
+            actions = actions.child(
+                div()
+                    .id("review-unstage-all")
+                    .h(px(25.0))
+                    .px(px(8.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(Radius::BADGE))
+                    .text_size(px(10.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(colors.tertiary)
+                    .when(!busy, |button| {
+                        button
+                            .cursor_pointer()
+                            .hover(move |button| button.bg(colors.primary.alpha(0.07)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.run_review_action(ReviewAction::Unstage(paths.clone()), cx);
+                                cx.stop_propagation();
+                            }))
+                    })
+                    .child("Unstage"),
+            );
+            actions = actions.child(
+                div()
+                    .id("review-open-commit")
+                    .h(px(25.0))
+                    .px(px(9.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .rounded(px(Radius::BADGE))
+                    .bg(rgba(0xd9775730))
+                    .text_size(px(10.5))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgba(0xf0aa8fff))
+                    .when(!busy, |button| {
+                        button
+                            .cursor_pointer()
+                            .hover(|button| button.bg(rgba(0xd9775744)))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.commit_open = !this.commit_open;
+                                this.discard_armed = false;
+                                this.ask_draft = None;
+                                this.ask_feedback = None;
+                                this.ask_query.clear();
+                                if this.commit_open {
+                                    window.focus(&this.focus, cx);
+                                }
+                                cx.notify();
+                                cx.stop_propagation();
+                            }))
+                    })
+                    .child(sf_symbol("checkmark", 9.5, rgba(0xf0aa8fff)))
+                    .child(if commit_open { "Cancel" } else { "Commit" }),
+            );
+        }
+        if self.diff_layer == DiffLayer::Working && !discard_paths.is_empty() {
+            let paths = discard_paths;
+            actions = actions.child(
+                div()
+                    .id("review-discard-all")
+                    .h(px(25.0))
+                    .px(px(7.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .rounded(px(Radius::BADGE))
+                    .text_size(px(10.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(if discard_armed {
+                        Ink::DANGER
+                    } else {
+                        colors.tertiary
+                    })
+                    .when(!busy, |button| {
+                        button
+                            .cursor_pointer()
+                            .hover(move |button| button.bg(Ink::DANGER.alpha(0.09)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if this.discard_armed {
+                                    this.run_review_action(
+                                        ReviewAction::Discard(paths.clone()),
+                                        cx,
+                                    );
+                                } else {
+                                    this.discard_armed = true;
+                                    this.commit_open = false;
+                                    cx.notify();
+                                }
+                                cx.stop_propagation();
+                            }))
+                    })
+                    .child(sf_symbol(
+                        "trash",
+                        9.5,
+                        if discard_armed {
+                            Ink::DANGER
+                        } else {
+                            colors.tertiary
+                        },
+                    ))
+                    .child(if discard_armed { "Discard?" } else { "Discard" }),
+            );
+        }
+
+        let branch_detail = match (status.branch.ahead, status.branch.behind) {
+            (0, 0) => None,
+            (ahead, 0) => Some(format!("↑{ahead}")),
+            (0, behind) => Some(format!("↓{behind}")),
+            (ahead, behind) => Some(format!("↑{ahead} ↓{behind}")),
+        };
+        let counts = format!(
+            "{staged_count} staged · {working_count} working{}",
+            if conflicted_count > 0 {
+                format!(" · {conflicted_count} conflicted")
+            } else {
+                String::new()
+            }
+        );
+        let mut panel = div()
+            .flex_none()
+            .px(px(10.0))
+            .py(px(7.0))
+            .flex()
+            .flex_col()
+            .gap(px(7.0))
+            .border_b_1()
+            .border_color(colors.primary.alpha(0.06))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(7.0))
+                    .child(sf_symbol("arrow.branch", 11.0, colors.secondary))
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .flex_1()
+                            .truncate()
+                            .font_family(crate::fonts::mono_family())
+                            .text_size(px(10.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(colors.secondary)
+                            .child(branch),
+                    )
+                    .when_some(branch_detail, |row, detail| {
+                        row.child(
+                            div()
+                                .font_family(crate::fonts::mono_family())
+                                .text_size(px(9.5))
+                                .text_color(colors.tertiary)
+                                .child(detail),
+                        )
+                    })
+                    .child(
+                        div()
+                            .text_size(px(9.5))
+                            .text_color(if conflicted_count > 0 {
+                                Ink::DANGER
+                            } else {
+                                colors.tertiary
+                            })
+                            .child(counts),
+                    ),
+            )
+            .when(self.diff_layer != DiffLayer::Branch, |panel| {
+                panel.child(actions)
+            })
+            .when(self.diff_layer == DiffLayer::Branch, |panel| {
+                panel.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .text_size(px(9.5))
+                        .text_color(colors.tertiary)
+                        .child(sf_symbol("scope", 9.5, colors.tertiary))
+                        .child("Overview only · choose Working or Staged to mutate hunks"),
+                )
+            });
+
+        if self.commit_open {
+            let empty = self.commit_query.is_empty();
+            panel = panel.child(
+                div()
+                    .p(px(8.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(7.0))
+                    .rounded(px(Radius::ROW))
+                    .bg(colors.primary.alpha(0.035))
+                    .border_1()
+                    .border_color(colors.primary.alpha(0.08))
+                    .child(
+                        div()
+                            .id("review-commit-message")
+                            .min_w(px(0.0))
+                            .h(px(27.0))
+                            .flex_1()
+                            .px(px(8.0))
+                            .flex()
+                            .items_center()
+                            .rounded(px(Radius::CHIP))
+                            .bg(colors.background)
+                            .border_1()
+                            .border_color(colors.primary.alpha(0.10))
+                            .cursor_text()
+                            .font_family(crate::fonts::mono_family())
+                            .text_size(px(10.5))
+                            .text_color(colors.primary)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    window.focus(&this.focus, cx);
+                                    cx.stop_propagation();
+                                }),
+                            )
+                            .child(if empty {
+                                div()
+                                    .text_color(colors.tertiary)
+                                    .child("Commit message…")
+                                    .into_any_element()
+                            } else {
+                                crate::navigation::query_label(&self.commit_query)
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("review-submit-commit")
+                            .h(px(27.0))
+                            .px(px(9.0))
+                            .flex()
+                            .items_center()
+                            .rounded(px(Radius::CHIP))
+                            .bg(if empty {
+                                colors.primary.alpha(0.035)
+                            } else {
+                                rgba(0xd9775730)
+                            })
+                            .text_size(px(10.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(if empty {
+                                colors.primary.alpha(0.25)
+                            } else {
+                                rgba(0xf0aa8fff)
+                            })
+                            .when(!empty && !busy, |button| {
+                                button
+                                    .cursor_pointer()
+                                    .hover(|button| button.bg(rgba(0xd9775744)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.submit_commit(cx);
+                                        cx.stop_propagation();
+                                    }))
+                            })
+                            .child("Commit"),
+                    ),
+            );
+        }
+        if let Some((success, message)) = &self.review_feedback {
+            let accent = if *success { Ink::FRESH } else { Ink::DANGER };
+            panel = panel.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .text_size(px(10.0))
+                    .text_color(accent)
+                    .child(sf_symbol(
+                        if *success {
+                            "checkmark.circle.fill"
+                        } else {
+                            "exclamationmark.circle.fill"
+                        },
+                        10.5,
+                        accent,
+                    ))
+                    .child(message.clone()),
+            );
+        }
+        let _ = window;
+        panel.into_any_element()
+    }
+
+    fn handle_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.ask_draft.is_some() {
+            match event.keystroke.key.as_str() {
+                "escape" => {
+                    self.ask_draft = None;
+                    self.ask_feedback = None;
+                    self.ask_query.clear();
+                    cx.notify();
+                }
+                "enter" => self.submit_ask(cx),
+                _ => {
+                    let Some(edit) = query_editor::edit_for(&event.keystroke) else {
+                        return;
+                    };
+                    match edit {
+                        Edit::Local(local) => {
+                            self.ask_query.apply(local);
+                        }
+                        Edit::Clipboard(ClipboardEdit::Copy) => {
+                            query_editor::copy_selection(&self.ask_query, cx);
+                        }
+                        Edit::Clipboard(ClipboardEdit::Cut) => {
+                            query_editor::cut_selection(&mut self.ask_query, cx);
+                        }
+                        Edit::Clipboard(ClipboardEdit::Paste) => {
+                            if let Some(text) =
+                                cx.read_from_clipboard().and_then(|item| item.text())
+                            {
+                                self.ask_query.insert(&text);
+                            }
+                        }
+                    }
+                    cx.notify();
+                }
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if !self.commit_open {
+            return;
+        }
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                self.commit_open = false;
+                cx.notify();
+            }
+            "enter" => self.submit_commit(cx),
+            _ => {
+                let Some(edit) = query_editor::edit_for(&event.keystroke) else {
+                    return;
+                };
+                match edit {
+                    Edit::Local(local) => {
+                        self.commit_query.apply(local);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Copy) => {
+                        query_editor::copy_selection(&self.commit_query, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Cut) => {
+                        query_editor::cut_selection(&mut self.commit_query, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Paste) => {
+                        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                            self.commit_query.insert(&text);
+                        }
+                    }
+                }
+                cx.notify();
+            }
+        }
+        cx.stop_propagation();
+    }
+
     fn render_changes(
         &mut self,
         colors: SemanticColors,
@@ -1179,7 +2181,12 @@ impl WorkbenchInspector {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let label = self.comparison_label();
-        let empty_detail = format!("This branch matches {label}.");
+        let remote = self.context.as_ref().is_some_and(|context| context.remote);
+        let empty_detail = match self.diff_layer {
+            DiffLayer::Branch => format!("This branch matches {label}."),
+            DiffLayer::Working => "The working tree matches the index.".to_owned(),
+            DiffLayer::Staged => "The index matches HEAD.".to_owned(),
+        };
         let body = match self.state.clone() {
             LoadState::Ready(snapshot) if snapshot.rows.is_empty() => self
                 .render_message(colors, "checkmark.circle", "No changes", empty_detail)
@@ -1212,8 +2219,17 @@ impl WorkbenchInspector {
                 )
                 .into_any_element(),
         };
-        let menu_open = self.comparison_menu_open;
-        let menu = if menu_open {
+        let comparison_open = remote && self.comparison_menu_open;
+        let snapshot = match &self.state {
+            LoadState::Ready(snapshot) => Some(Arc::clone(snapshot)),
+            _ => None,
+        };
+        let file_count = snapshot
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.file_diffs.len());
+        let menu = if !remote && self.files_open {
+            snapshot.map(|snapshot| self.render_file_navigator(snapshot, colors, cx))
+        } else if comparison_open {
             Some(
                 div()
                     .absolute()
@@ -1263,63 +2279,363 @@ impl WorkbenchInspector {
             None
         };
 
+        let toolbar = if remote {
+            div()
+                .h(px(38.0))
+                .flex_none()
+                .px(px(10.0))
+                .flex()
+                .items_center()
+                .justify_between()
+                .border_b_1()
+                .border_color(colors.primary.alpha(0.06))
+                .child(
+                    div()
+                        .text_size(px(Typo::META.size))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(colors.tertiary)
+                        .child("Remote branch"),
+                )
+                .child(
+                    div()
+                        .id("inspector-comparison-button")
+                        .debug_selector(|| "INSPECTOR_COMPARE_BUTTON".to_owned())
+                        .max_w(px(184.0))
+                        .h(px(26.0))
+                        .px(px(8.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(5.0))
+                        .rounded(px(Radius::BADGE))
+                        .bg(colors
+                            .primary
+                            .alpha(if comparison_open { 0.10 } else { 0.055 }))
+                        .cursor_pointer()
+                        .hover(move |button| button.bg(colors.primary.alpha(0.10)))
+                        .child(sf_symbol("arrow.branch", 11.0, colors.secondary))
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .text_size(px(Typo::META.size))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(colors.secondary)
+                                .child(format!("vs {label}")),
+                        )
+                        .child(sf_symbol("chevron.down", 9.0, colors.tertiary))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.comparison_menu_open = !this.comparison_menu_open;
+                            cx.notify();
+                            cx.stop_propagation();
+                        })),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .h(px(38.0))
+                .flex_none()
+                .px(px(9.0))
+                .flex()
+                .items_center()
+                .gap(px(7.0))
+                .border_b_1()
+                .border_color(colors.primary.alpha(0.06))
+                .child(
+                    div()
+                        .h(px(29.0))
+                        .p(px(2.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(1.0))
+                        .rounded(px(Radius::BADGE))
+                        .bg(colors.primary.alpha(0.035))
+                        .border_1()
+                        .border_color(colors.primary.alpha(0.055))
+                        .child(self.render_layer_option(DiffLayer::Branch, colors, cx))
+                        .child(self.render_layer_option(DiffLayer::Working, colors, cx))
+                        .child(self.render_layer_option(DiffLayer::Staged, colors, cx)),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .id("review-files-button")
+                        .debug_selector(|| "INSPECTOR_REVIEW_FILES".to_owned())
+                        .h(px(26.0))
+                        .px(px(8.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(5.0))
+                        .rounded(px(Radius::BADGE))
+                        .bg(colors
+                            .primary
+                            .alpha(if self.files_open { 0.10 } else { 0.045 }))
+                        .text_size(px(9.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(if file_count > 0 {
+                            colors.secondary
+                        } else {
+                            colors.primary.alpha(0.28)
+                        })
+                        .when(file_count > 0, |button| {
+                            button
+                                .cursor_pointer()
+                                .hover(move |button| button.bg(colors.primary.alpha(0.09)))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.files_open = !this.files_open;
+                                    cx.notify();
+                                    cx.stop_propagation();
+                                }))
+                        })
+                        .child(sf_symbol("list.bullet", 10.5, colors.tertiary))
+                        .child(format!("{file_count} files"))
+                        .child(sf_symbol("chevron.down", 8.5, colors.tertiary)),
+                )
+                .into_any_element()
+        };
+
         div()
             .relative()
             .size_full()
             .flex()
             .flex_col()
+            .child(toolbar)
+            .child(self.render_review_controls(colors, window, cx))
+            .child(div().min_h(px(0.0)).flex_1().overflow_hidden().child(body))
+            .when_some(menu, |panel, menu| panel.child(menu))
+            .into_any_element()
+    }
+
+    fn render_ask_preset(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        question: &'static str,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .id(id)
+            .h(px(21.0))
+            .px(px(7.0))
+            .flex()
+            .items_center()
+            .rounded_full()
+            .bg(colors.primary.alpha(0.045))
+            .border_1()
+            .border_color(colors.primary.alpha(0.065))
+            .cursor_pointer()
+            .hover(move |button| button.bg(colors.primary.alpha(0.085)))
+            .text_size(px(9.5))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(colors.secondary)
+            .child(label)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.set_ask_question(question, cx);
+                cx.stop_propagation();
+            }))
+            .into_any_element()
+    }
+
+    fn render_ask_composer(
+        &self,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let draft = self.ask_draft.as_ref()?;
+        let empty = self.ask_query.text().trim().is_empty();
+        let busy = self.ask_busy;
+        let label = draft.label.clone();
+
+        let mut composer = div()
+            .id("inspector-ask-composer")
+            .debug_selector(|| "INSPECTOR_ASK_COMPOSER".to_owned())
+            .flex_none()
+            .px(px(11.0))
+            .py(px(9.0))
+            .flex()
+            .flex_col()
+            .gap(px(7.0))
+            .border_t_1()
+            .border_color(colors.primary.alpha(0.09))
+            .bg(rgba(0x17191ef8))
             .child(
                 div()
-                    .h(px(38.0))
-                    .flex_none()
-                    .px(px(10.0))
                     .flex()
                     .items_center()
-                    .justify_between()
-                    .border_b_1()
-                    .border_color(colors.primary.alpha(0.06))
+                    .gap(px(7.0))
+                    .child(sf_symbol_weighted(
+                        "sparkles",
+                        11.5,
+                        SymbolWeight::Semibold,
+                        rgba(0xe9a381ff),
+                    ))
                     .child(
                         div()
-                            .text_size(px(Typo::META.size))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(colors.tertiary)
-                            .child("Compare changes"),
+                            .text_size(px(10.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(colors.primary)
+                            .child("Ask active agent"),
                     )
                     .child(
                         div()
-                            .id("inspector-comparison-button")
-                            .debug_selector(|| "INSPECTOR_COMPARE_BUTTON".to_owned())
-                            .max_w(px(184.0))
-                            .h(px(26.0))
-                            .px(px(8.0))
+                            .min_w(px(0.0))
+                            .flex_1()
+                            .truncate()
+                            .text_size(px(9.5))
+                            .text_color(colors.tertiary)
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .id("inspector-ask-close")
+                            .size(px(20.0))
+                            .flex_none()
                             .flex()
                             .items_center()
-                            .gap(px(5.0))
-                            .rounded(px(Radius::BADGE))
-                            .bg(colors.primary.alpha(if menu_open { 0.10 } else { 0.055 }))
+                            .justify_center()
+                            .rounded(px(Radius::CHIP))
                             .cursor_pointer()
-                            .hover(move |button| button.bg(colors.primary.alpha(0.10)))
-                            .child(sf_symbol("arrow.branch", 11.0, colors.secondary))
-                            .child(
-                                div()
-                                    .min_w(px(0.0))
-                                    .truncate()
-                                    .text_size(px(Typo::META.size))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(colors.secondary)
-                                    .child(format!("vs {label}")),
-                            )
-                            .child(sf_symbol("chevron.down", 9.0, colors.tertiary))
+                            .hover(move |button| button.bg(colors.primary.alpha(0.07)))
+                            .child(sf_symbol("xmark", 9.5, colors.tertiary))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.comparison_menu_open = !this.comparison_menu_open;
+                                this.ask_draft = None;
+                                this.ask_feedback = None;
+                                this.ask_query.clear();
                                 cx.notify();
                                 cx.stop_propagation();
                             })),
                     ),
             )
-            .child(div().min_h(px(0.0)).flex_1().overflow_hidden().child(body))
-            .when_some(menu, |panel, menu| panel.child(menu))
-            .into_any_element()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .child(self.render_ask_preset(
+                        "ask-preset-review",
+                        "Review",
+                        "Review this for correctness, regressions, and missing tests.",
+                        colors,
+                        cx,
+                    ))
+                    .child(self.render_ask_preset(
+                        "ask-preset-risks",
+                        "Find risks",
+                        "Find the highest-risk behavior changes and explain why they matter.",
+                        colors,
+                        cx,
+                    ))
+                    .child(self.render_ask_preset(
+                        "ask-preset-tests",
+                        "Suggest tests",
+                        "Identify missing tests and propose concrete cases for this context.",
+                        colors,
+                        cx,
+                    )),
+            )
+            .child(
+                div()
+                    .h(px(34.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(7.0))
+                    .child(
+                        div()
+                            .id("inspector-ask-input")
+                            .min_w(px(0.0))
+                            .h_full()
+                            .flex_1()
+                            .px(px(9.0))
+                            .flex()
+                            .items_center()
+                            .rounded(px(Radius::BADGE))
+                            .bg(colors.primary.alpha(0.045))
+                            .border_1()
+                            .border_color(colors.primary.alpha(0.075))
+                            .text_size(px(10.5))
+                            .text_color(colors.primary)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    window.focus(&this.focus, cx);
+                                    cx.stop_propagation();
+                                }),
+                            )
+                            .child(if empty {
+                                div()
+                                    .text_color(colors.tertiary)
+                                    .child("Ask a follow-up…")
+                                    .into_any_element()
+                            } else {
+                                crate::navigation::query_label(&self.ask_query)
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("inspector-ask-send")
+                            .debug_selector(|| "INSPECTOR_ASK_SEND".to_owned())
+                            .h_full()
+                            .px(px(11.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap(px(5.0))
+                            .rounded(px(Radius::BADGE))
+                            .bg(if empty || busy {
+                                colors.primary.alpha(0.04)
+                            } else {
+                                rgba(0xd97757d9)
+                            })
+                            .text_size(px(10.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(if empty || busy {
+                                colors.primary.alpha(0.28)
+                            } else {
+                                rgba(0xffffffff)
+                            })
+                            .when(!empty && !busy, |button| {
+                                button
+                                    .cursor_pointer()
+                                    .hover(|button| button.bg(rgba(0xe38563ff)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.submit_ask(cx);
+                                        cx.stop_propagation();
+                                    }))
+                            })
+                            .child(if busy { "Sending…" } else { "Send" })
+                            .child(sf_symbol(
+                                "arrow.up",
+                                9.0,
+                                if empty || busy {
+                                    colors.primary.alpha(0.28)
+                                } else {
+                                    rgba(0xffffffff)
+                                },
+                            )),
+                    ),
+            );
+        if let Some((success, message)) = &self.ask_feedback {
+            let accent = if *success { Ink::FRESH } else { Ink::DANGER };
+            composer = composer.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .text_size(px(9.5))
+                    .text_color(accent)
+                    .child(sf_symbol(
+                        if *success {
+                            "checkmark.circle.fill"
+                        } else {
+                            "exclamationmark.circle.fill"
+                        },
+                        10.0,
+                        accent,
+                    ))
+                    .child(message.clone()),
+            );
+        }
+        Some(composer.into_any_element())
     }
 
     fn render_message(
@@ -1362,20 +2678,24 @@ impl Render for WorkbenchInspector {
         let session = self.selected_session();
         let body = match self.selected_tab {
             InspectorTab::Info => self.render_info(session.as_ref(), colors, cx),
-            InspectorTab::Artifacts => self.render_artifacts(session.as_ref(), colors),
+            InspectorTab::Artifacts => self.render_artifacts(session.as_ref(), colors, cx),
             InspectorTab::Changes => self.render_changes(colors, window, cx),
+            InspectorTab::Code => self.code_viewer.clone().into_any_element(),
         };
         let transition_id = SharedString::from(format!(
             "inspector-tab-transition-{}",
             self.tab_transition_generation
         ));
         let direction = self.tab_direction;
+        let ask_composer = self.render_ask_composer(colors, cx);
         div()
             .id("workbench-inspector")
             .size_full()
             .flex()
             .flex_col()
             .overflow_hidden()
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(Self::handle_key_down))
             .bg(colors.sidebar_surface())
             .text_color(colors.primary)
             .child(self.render_header(session.as_ref(), colors, cx))
@@ -1389,6 +2709,7 @@ impl Render for WorkbenchInspector {
                     },
                 ),
             ))
+            .when_some(ask_composer, |panel, composer| panel.child(composer))
     }
 }
 
@@ -1443,7 +2764,12 @@ fn detail_row(
         .into_any_element()
 }
 
-fn render_pull_request(pull_request: &PullRequestStatus, colors: SemanticColors) -> AnyElement {
+fn render_pull_request(
+    pull_request: &PullRequestStatus,
+    colors: SemanticColors,
+    inspector: Entity<WorkbenchInspector>,
+    body: Option<Arc<MarkdownDocument>>,
+) -> AnyElement {
     let number = if pull_request.number > 0 {
         format!("PR #{}", pull_request.number)
     } else {
@@ -1460,11 +2786,14 @@ fn render_pull_request(pull_request: &PullRequestStatus, colors: SemanticColors)
     let merge_url = pull_request.url.clone();
     let checks = sorted_pr_checks(pull_request);
     let discussion = pull_request.discussion.as_deref().unwrap_or_default();
-    let body = pull_request
-        .body
-        .as_deref()
-        .map(compact_markdown)
-        .filter(|body| !body.is_empty());
+    let ask_evidence = ReviewEvidence::PullRequest {
+        url: pull_request.url.clone(),
+        title: title.clone(),
+        body: body.as_ref().map(|document| document.plain_text()),
+        base: pull_request.base_ref_name.clone(),
+        head: pull_request.head_ref_name.clone(),
+    };
+    let ask_inspector = inspector.clone();
 
     let mut surface = div()
         .id(SharedString::from(format!(
@@ -1528,6 +2857,35 @@ fn render_pull_request(pull_request: &PullRequestStatus, colors: SemanticColors)
                                         .text_color(colors.tertiary)
                                         .child(format!("{author} opened {number}")),
                                 ),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "inspector-pr-ask-{}",
+                                    pull_request.number
+                                )))
+                                .debug_selector(|| "INSPECTOR_PR_ASK".to_owned())
+                                .h(px(24.0))
+                                .px(px(8.0))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap(px(5.0))
+                                .rounded(px(Radius::CHIP))
+                                .bg(rgba(0xd9775717))
+                                .cursor_pointer()
+                                .hover(|button| button.bg(rgba(0xd9775728)))
+                                .text_size(px(9.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgba(0xe9a381ff))
+                                .child(sf_symbol("sparkles", 9.5, rgba(0xe9a381ff)))
+                                .child("Ask")
+                                .on_click(move |_, window, cx| {
+                                    ask_inspector.update(cx, |inspector, cx| {
+                                        inspector.open_ask(vec![ask_evidence.clone()], window, cx);
+                                    });
+                                    cx.stop_propagation();
+                                }),
                         )
                         .child(
                             div()
@@ -1630,13 +2988,12 @@ fn render_pull_request(pull_request: &PullRequestStatus, colors: SemanticColors)
                     header.child(
                         div()
                             .mt(px(1.0))
-                            .p(px(9.0))
+                            .p(px(11.0))
                             .rounded(px(Radius::BADGE))
                             .bg(colors.primary.alpha(0.035))
-                            .line_height(px(16.0))
-                            .text_size(px(Typo::META.size))
-                            .text_color(colors.secondary)
-                            .child(body),
+                            .border_1()
+                            .border_color(colors.primary.alpha(0.055))
+                            .child(render_markdown(&body, colors)),
                     )
                 }),
         );
@@ -1655,6 +3012,7 @@ fn render_pull_request(pull_request: &PullRequestStatus, colors: SemanticColors)
                 checks.len(),
                 pull_request.number,
                 colors,
+                inspector.clone(),
             ));
         }
         surface = surface.child(
@@ -1831,6 +3189,7 @@ fn render_pr_check(
     total: usize,
     pr_number: i64,
     colors: SemanticColors,
+    inspector: Entity<WorkbenchInspector>,
 ) -> AnyElement {
     let (symbol, color, status) = match check.result.as_str() {
         "pass" => ("checkmark.circle.fill", Ink::FRESH, "Passed"),
@@ -1845,6 +3204,11 @@ fn render_pr_check(
         .filter(|detail| detail != status)
         .unwrap_or_else(|| status.to_owned());
     let url = check.url.clone();
+    let ask_evidence = ReviewEvidence::Check {
+        name: check.name.clone(),
+        result: check.result.clone(),
+        detail: check.detail.clone(),
+    };
     div()
         .id(SharedString::from(format!(
             "inspector-pr-{pr_number}-check-{index}"
@@ -1886,6 +3250,25 @@ fn render_pr_check(
                 .text_color(color)
                 .child(detail),
         )
+        .child(
+            div()
+                .id(("ask-pr-check", index))
+                .size(px(20.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(Radius::CHIP))
+                .cursor_pointer()
+                .hover(move |button| button.bg(rgba(0xd9775722)))
+                .child(sf_symbol("sparkles", 8.5, rgba(0xe9a381ff)))
+                .on_click(move |_, window, cx| {
+                    inspector.update(cx, |inspector, cx| {
+                        inspector.open_ask(vec![ask_evidence.clone()], window, cx);
+                    });
+                    cx.stop_propagation();
+                }),
+        )
         .when_some(url, |row, url| {
             row.child(sf_symbol("arrow.up.right", 9.0, colors.tertiary))
                 .on_click(move |_, _, cx| cx.open_url(&url))
@@ -1908,13 +3291,13 @@ fn render_discussion_item(
         .unwrap_or_else(|| "?".to_owned());
     let is_review = item.kind == "review";
     let (review_label, review_color) = discussion_state(item, colors);
-    let compact_body = compact_markdown(&item.body);
-    let body = if compact_body.is_empty() {
+    let body = MarkdownDocument::parse(&item.body);
+    let body_fallback = if item.body.trim().is_empty() {
         review_label
             .clone()
             .unwrap_or_else(|| "Commented".to_owned())
     } else {
-        compact_body
+        String::new()
     };
     let time = item.created_at.as_ref().map(|date| relative_time(date.0));
     let url = item.url.clone();
@@ -2028,10 +3411,15 @@ fn render_discussion_item(
                     div()
                         .px(px(9.0))
                         .py(px(8.0))
-                        .line_height(px(16.0))
-                        .text_size(px(Typo::META.size))
-                        .text_color(colors.secondary)
-                        .child(body),
+                        .child(if body_fallback.is_empty() {
+                            render_markdown(&body, colors)
+                        } else {
+                            div()
+                                .text_size(px(Typo::META.size))
+                                .text_color(colors.secondary)
+                                .child(body_fallback)
+                                .into_any_element()
+                        }),
                 )
                 .when_some(url, |card, url| {
                     card.on_click(move |_, _, cx| cx.open_url(&url))
@@ -2150,10 +3538,6 @@ fn merge_blocker_label(pull_request: &PullRequestStatus) -> &'static str {
     } else {
         "GitHub is blocking the merge"
     }
-}
-
-fn compact_markdown(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn humanize_github_state(value: &str) -> String {
@@ -2432,23 +3816,85 @@ fn relative_time(milliseconds: f64) -> String {
     }
 }
 
+#[derive(Clone)]
+struct DiffRowRenderContext {
+    content_width: f32,
+    colors: SemanticColors,
+    inspector: Entity<WorkbenchInspector>,
+    repo_root: PathBuf,
+    layer: DiffLayer,
+    armed_hunk: Option<u64>,
+}
+
 fn render_rows(
     snapshot: &DiffSnapshot,
     range: Range<usize>,
     content_width: f32,
     colors: SemanticColors,
+    inspector: Entity<WorkbenchInspector>,
+    repo_root: &Path,
+    armed_hunk: Option<u64>,
 ) -> Vec<AnyElement> {
+    let context = DiffRowRenderContext {
+        content_width,
+        colors,
+        inspector,
+        repo_root: repo_root.to_path_buf(),
+        layer: snapshot.layer,
+        armed_hunk,
+    };
     range
-        .map(|index| render_row(index, &snapshot.rows[index], content_width, colors))
+        .map(|index| {
+            let owning_file = snapshot
+                .file_diffs
+                .iter()
+                .find(|file| file.row_range.contains(&index));
+            let file = (snapshot.rows[index].kind == DiffRowKind::File)
+                .then(|| owning_file.cloned())
+                .flatten();
+            let hunk = (snapshot.rows[index].kind == DiffRowKind::Hunk)
+                .then(|| {
+                    owning_file.and_then(|file| {
+                        file.hunks
+                            .iter()
+                            .find(|hunk| hunk.row_range.start == index)
+                            .cloned()
+                            .map(|hunk| (file.path.clone(), hunk))
+                    })
+                })
+                .flatten();
+            render_row(index, &snapshot.rows[index], &context, file, hunk)
+        })
         .collect()
+}
+
+fn prompt_layer(layer: DiffLayer) -> ReviewLayer {
+    match layer {
+        DiffLayer::Branch => ReviewLayer::Branch,
+        DiffLayer::Staged => ReviewLayer::Staged,
+        DiffLayer::Working => ReviewLayer::Working,
+    }
+}
+
+fn patch_creates_file(patch: &[u8]) -> bool {
+    patch
+        .windows(b"--- /dev/null".len())
+        .any(|window| window == b"--- /dev/null")
 }
 
 fn render_row(
     index: usize,
     row: &DiffRow,
-    content_width: f32,
-    colors: SemanticColors,
+    context: &DiffRowRenderContext,
+    file: Option<DiffFile>,
+    hunk: Option<(PathBuf, DiffHunk)>,
 ) -> AnyElement {
+    let content_width = context.content_width;
+    let colors = context.colors;
+    let inspector = context.inspector.clone();
+    let repo_root = &context.repo_root;
+    let layer = context.layer;
+    let armed_hunk = context.armed_hunk;
     let (background, foreground, marker) = match row.kind {
         DiffRowKind::Addition => (rgba(0x2f7d4a24), rgba(0xc7ebd2ff), "+"),
         DiffRowKind::Deletion => (rgba(0x9f3a4424), rgba(0xf0c4c8ff), "−"),
@@ -2464,8 +3910,265 @@ fn render_row(
         SharedString::from(format!("{marker}{}", row.text))
     };
 
+    let reference = row.text.clone();
+    let cwd = repo_root.to_path_buf();
+    let open_inspector = inspector.clone();
+    let mut actions = div()
+        .absolute()
+        .right(px(6.0))
+        .top(px(2.0))
+        .h(px(16.0))
+        .flex()
+        .items_center()
+        .gap(px(2.0))
+        .rounded(px(Radius::CHIP))
+        .bg(colors.background.alpha(0.96))
+        .border_1()
+        .border_color(colors.primary.alpha(0.10));
+
+    if let Some(file) = file.as_ref() {
+        let ask_inspector = inspector.clone();
+        let evidence = ReviewEvidence::File {
+            path: file.path.clone(),
+            layer: prompt_layer(layer),
+            patch: file
+                .hunks
+                .iter()
+                .map(|hunk| String::from_utf8_lossy(&hunk.patch))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        };
+        actions = actions.child(
+            div()
+                .id(("ask-diff-file", index))
+                .h_full()
+                .px(px(5.0))
+                .flex()
+                .items_center()
+                .gap(px(3.0))
+                .rounded(px(Radius::CHIP))
+                .cursor_pointer()
+                .hover(move |button| button.bg(rgba(0xd9775722)))
+                .text_size(px(8.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgba(0xe9a381ff))
+                .child(sf_symbol("sparkles", 8.0, rgba(0xe9a381ff)))
+                .child("Ask")
+                .on_click(move |_, window, cx| {
+                    ask_inspector.update(cx, |inspector, cx| {
+                        inspector.open_ask(vec![evidence.clone()], window, cx);
+                    });
+                    cx.stop_propagation();
+                }),
+        );
+        match layer {
+            DiffLayer::Working => {
+                let stage_inspector = inspector.clone();
+                let path = file.path.clone();
+                actions = actions.child(
+                    div()
+                        .id(("stage-diff-file", index))
+                        .h_full()
+                        .px(px(5.0))
+                        .flex()
+                        .items_center()
+                        .rounded(px(Radius::CHIP))
+                        .cursor_pointer()
+                        .hover(move |button| button.bg(colors.primary.alpha(0.09)))
+                        .text_size(px(8.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(colors.secondary)
+                        .child("Stage")
+                        .on_click(move |_, _, cx| {
+                            stage_inspector.update(cx, |inspector, cx| {
+                                inspector
+                                    .run_review_action(ReviewAction::Stage(vec![path.clone()]), cx);
+                            });
+                            cx.stop_propagation();
+                        }),
+                );
+            }
+            DiffLayer::Staged => {
+                let unstage_inspector = inspector.clone();
+                let path = file.path.clone();
+                actions = actions.child(
+                    div()
+                        .id(("unstage-diff-file", index))
+                        .h_full()
+                        .px(px(5.0))
+                        .flex()
+                        .items_center()
+                        .rounded(px(Radius::CHIP))
+                        .cursor_pointer()
+                        .hover(move |button| button.bg(colors.primary.alpha(0.09)))
+                        .text_size(px(8.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(colors.tertiary)
+                        .child("Unstage")
+                        .on_click(move |_, _, cx| {
+                            unstage_inspector.update(cx, |inspector, cx| {
+                                inspector.run_review_action(
+                                    ReviewAction::Unstage(vec![path.clone()]),
+                                    cx,
+                                );
+                            });
+                            cx.stop_propagation();
+                        }),
+                );
+            }
+            DiffLayer::Branch => {}
+        }
+    }
+
+    if let Some((path, hunk)) = hunk.as_ref() {
+        let ask_inspector = inspector.clone();
+        let evidence = ReviewEvidence::Hunk {
+            path: path.clone(),
+            layer: prompt_layer(layer),
+            header: hunk.header.clone(),
+            patch: String::from_utf8_lossy(&hunk.patch).into_owned(),
+        };
+        actions = actions.child(
+            div()
+                .id(("ask-diff-hunk", index))
+                .h_full()
+                .px(px(5.0))
+                .flex()
+                .items_center()
+                .gap(px(3.0))
+                .rounded(px(Radius::CHIP))
+                .cursor_pointer()
+                .hover(move |button| button.bg(rgba(0xd9775722)))
+                .text_size(px(8.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgba(0xe9a381ff))
+                .child(sf_symbol("sparkles", 8.0, rgba(0xe9a381ff)))
+                .child("Ask")
+                .on_click(move |_, window, cx| {
+                    ask_inspector.update(cx, |inspector, cx| {
+                        inspector.open_ask(vec![evidence.clone()], window, cx);
+                    });
+                    cx.stop_propagation();
+                }),
+        );
+        let patch = hunk.patch.clone();
+        match layer {
+            DiffLayer::Working => {
+                let stage_inspector = inspector.clone();
+                let stage_patch = patch.clone();
+                actions = actions.child(
+                    div()
+                        .id(("stage-diff-hunk", index))
+                        .h_full()
+                        .px(px(5.0))
+                        .flex()
+                        .items_center()
+                        .rounded(px(Radius::CHIP))
+                        .cursor_pointer()
+                        .hover(move |button| button.bg(colors.primary.alpha(0.09)))
+                        .text_size(px(8.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(colors.secondary)
+                        .child("Stage")
+                        .on_click(move |_, _, cx| {
+                            stage_inspector.update(cx, |inspector, cx| {
+                                inspector.run_review_action(
+                                    ReviewAction::Patch {
+                                        patch: stage_patch.clone(),
+                                        mutation: PatchMutation::Stage,
+                                    },
+                                    cx,
+                                );
+                            });
+                            cx.stop_propagation();
+                        }),
+                );
+                if !patch_creates_file(&patch) {
+                    let discard_inspector = inspector.clone();
+                    let discard_patch = patch;
+                    let fingerprint = hunk.fingerprint;
+                    let armed = armed_hunk == Some(fingerprint);
+                    actions = actions.child(
+                        div()
+                            .id(("discard-diff-hunk", index))
+                            .h_full()
+                            .px(px(5.0))
+                            .flex()
+                            .items_center()
+                            .rounded(px(Radius::CHIP))
+                            .cursor_pointer()
+                            .bg(if armed {
+                                Ink::DANGER.alpha(0.12)
+                            } else {
+                                colors.primary.alpha(0.0)
+                            })
+                            .hover(move |button| button.bg(Ink::DANGER.alpha(0.13)))
+                            .text_size(px(8.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(Ink::DANGER)
+                            .child(if armed { "Confirm" } else { "Discard" })
+                            .on_click(move |_, _, cx| {
+                                discard_inspector.update(cx, |inspector, cx| {
+                                    if inspector.armed_hunk == Some(fingerprint) {
+                                        inspector.run_review_action(
+                                            ReviewAction::Patch {
+                                                patch: discard_patch.clone(),
+                                                mutation: PatchMutation::Discard,
+                                            },
+                                            cx,
+                                        );
+                                    } else {
+                                        inspector.armed_hunk = Some(fingerprint);
+                                        inspector.review_feedback = Some((
+                                            false,
+                                            "Click Confirm to discard this hunk".to_owned(),
+                                        ));
+                                        cx.notify();
+                                    }
+                                });
+                                cx.stop_propagation();
+                            }),
+                    );
+                }
+            }
+            DiffLayer::Staged => {
+                let unstage_inspector = inspector.clone();
+                actions = actions.child(
+                    div()
+                        .id(("unstage-diff-hunk", index))
+                        .h_full()
+                        .px(px(5.0))
+                        .flex()
+                        .items_center()
+                        .rounded(px(Radius::CHIP))
+                        .cursor_pointer()
+                        .hover(move |button| button.bg(colors.primary.alpha(0.09)))
+                        .text_size(px(8.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(colors.tertiary)
+                        .child("Unstage")
+                        .on_click(move |_, _, cx| {
+                            unstage_inspector.update(cx, |inspector, cx| {
+                                inspector.run_review_action(
+                                    ReviewAction::Patch {
+                                        patch: patch.clone(),
+                                        mutation: PatchMutation::Unstage,
+                                    },
+                                    cx,
+                                );
+                            });
+                            cx.stop_propagation();
+                        }),
+                );
+            }
+            DiffLayer::Branch => {}
+        }
+    }
+
+    let has_actions = file.is_some() || hunk.is_some();
     div()
         .id(index)
+        .relative()
         .h(px(DIFF_ROW_HEIGHT))
         .min_w(px(content_width))
         .w_full()
@@ -2473,7 +4176,16 @@ fn render_row(
         .items_center()
         .bg(background)
         .when(row.kind == DiffRowKind::File, |line| {
-            line.border_t_1().border_color(colors.primary.alpha(0.08))
+            line.border_t_1()
+                .border_color(colors.primary.alpha(0.08))
+                .cursor_pointer()
+                .hover(move |line| line.bg(colors.primary.alpha(0.07)))
+                .on_click(move |_, _, cx| {
+                    open_inspector.update(cx, |inspector, cx| {
+                        inspector.open_file_reference(cwd.clone(), reference.clone(), cx);
+                    });
+                    cx.stop_propagation();
+                })
         })
         .child(
             div()
@@ -2521,6 +4233,7 @@ fn render_row(
                 })
                 .child(text),
         )
+        .when(has_actions, |line| line.child(actions))
         .into_any_element()
 }
 
@@ -2548,7 +4261,8 @@ mod tests {
     #[test]
     fn inspector_tabs_have_stable_spatial_order() {
         assert!(InspectorTab::Info.index() < InspectorTab::Changes.index());
-        assert!(InspectorTab::Changes.index() < InspectorTab::Artifacts.index());
+        assert!(InspectorTab::Changes.index() < InspectorTab::Code.index());
+        assert!(InspectorTab::Code.index() < InspectorTab::Artifacts.index());
     }
 
     #[test]
@@ -2647,13 +4361,15 @@ mod tests {
         let changes = cx
             .debug_bounds("INSPECTOR_TAB_CHANGES")
             .expect("Changes tab");
+        let code = cx.debug_bounds("INSPECTOR_TAB_CODE").expect("Code tab");
         let artifacts = cx
             .debug_bounds("INSPECTOR_TAB_ARTIFACTS")
             .expect("Artifacts tab");
         let close = cx.debug_bounds("INSPECTOR_CLOSE").expect("close button");
 
         assert!(info.right() <= changes.left());
-        assert!(changes.right() <= artifacts.left());
+        assert!(changes.right() <= code.left());
+        assert!(code.right() <= artifacts.left());
         assert!(artifacts.right() <= close.left());
         assert!(close.right() <= px(300.0));
 
@@ -2665,22 +4381,18 @@ mod tests {
         );
         cx.run_until_parked();
 
-        let compare = cx
-            .debug_bounds("INSPECTOR_COMPARE_BUTTON")
-            .expect("comparison button");
+        let working = cx
+            .debug_bounds("INSPECTOR_LAYER_WORKING")
+            .expect("working-tree layer");
         assert_eq!(
-            inspector.read_with(cx, |inspector, _| inspector.comparison),
-            SessionDiffBase::DefaultBranch
+            inspector.read_with(cx, |inspector, _| inspector.diff_layer),
+            DiffLayer::Branch
         );
-        cx.simulate_click(compare.center(), Modifiers::none());
+        cx.simulate_click(working.center(), Modifiers::none());
         cx.run_until_parked();
-        let head = cx
-            .debug_bounds("INSPECTOR_COMPARE_HEAD")
-            .expect("HEAD comparison option");
-        cx.simulate_click(head.center(), Modifiers::none());
         assert_eq!(
-            inspector.read_with(cx, |inspector, _| inspector.comparison),
-            SessionDiffBase::Head
+            inspector.read_with(cx, |inspector, _| inspector.diff_layer),
+            DiffLayer::Working
         );
 
         cx.simulate_click(artifacts.center(), Modifiers::none());
@@ -2702,5 +4414,10 @@ mod tests {
         assert!(cx.debug_bounds("INSPECTOR_PR_MERGE").is_some());
         assert!(cx.debug_bounds("INSPECTOR_PR_CHECK_0").is_some());
         assert!(cx.debug_bounds("INSPECTOR_PR_COMMENT_0").is_some());
+        let ask = cx.debug_bounds("INSPECTOR_PR_ASK").expect("PR ask action");
+        cx.simulate_click(ask.center(), Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("INSPECTOR_ASK_COMPOSER").is_some());
+        assert!(cx.debug_bounds("INSPECTOR_ASK_SEND").is_some());
     }
 }

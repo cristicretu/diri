@@ -25,6 +25,16 @@ static NEXT_ELEMENT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub type SharedGridBuffer = Arc<RwLock<GridBuffer>>;
 
+/// A command-clickable reference rendered in a terminal row.
+///
+/// Web URLs stay distinct so hosts can preserve their normal external-opening
+/// behavior while routing paths and `file://` references into an editor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TerminalReference {
+    Url(String),
+    File(String),
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RendererStats {
     pub frames: u64,
@@ -71,15 +81,18 @@ struct ElementSharedState {
     history_lines: Mutex<HistoryLineCache>,
 }
 
-/// Shaped lines for history rows, keyed by absolute row. Fetched history rows
-/// never change, so their shaping survives across scrolled frames instead of
-/// being redone per frame; the map follows the viewport's fetch cache for
-/// content invalidation.
+/// Shaped lines for history rows, keyed by absolute row and content-addressed
+/// by a digest of the row's cells, so shaping survives across scrolled frames
+/// instead of being redone per frame.
+///
+/// The digest replaces following the viewport's `content_seq`: that sequence
+/// advances on *any* visible change — a spinner in the live grid was enough —
+/// which dumped the shaping of history rows that had not moved a pixel.
+/// Comparing the cells cannot go stale, and costs a hash against a reshape.
 #[derive(Default)]
 struct HistoryLineCache {
     key: Option<HistoryShapeKey>,
-    cache_seq: Option<u64>,
-    lines: HashMap<i64, ShapedLine>,
+    lines: HashMap<i64, (u64, ShapedLine)>,
 }
 
 /// Everything shaping depends on besides the cells themselves. Row position is
@@ -97,14 +110,44 @@ struct HistoryShapeKey {
 impl HistoryLineCache {
     const MAX_ROWS: usize = 1024;
 
-    fn validate(&mut self, key: HistoryShapeKey, cache_seq: Option<u64>) {
-        if self.key != Some(key) || self.cache_seq != cache_seq || self.lines.len() > Self::MAX_ROWS
-        {
+    /// Rows within this distance of the window survive an overflow eviction.
+    const RETAINED_RADIUS: i64 = (Self::MAX_ROWS / 2) as i64;
+
+    fn validate(&mut self, key: HistoryShapeKey, anchor_row: i64) {
+        if self.key != Some(key) {
             self.lines.clear();
             self.key = Some(key);
-            self.cache_seq = cache_seq;
+            return;
+        }
+        if self.lines.len() > Self::MAX_ROWS {
+            // Evict by distance rather than clearing: dumping the whole map
+            // re-shaped the entire window on the very next frame, and deep
+            // scrollback now reaches far enough past MAX_ROWS to hit this
+            // repeatedly while scrolling.
+            self.lines
+                .retain(|row, _| row.abs_diff(anchor_row) <= Self::RETAINED_RADIUS as u64);
         }
     }
+
+    /// The shaped line for `absolute_row`, only if it was shaped from exactly
+    /// these cells.
+    fn get(&self, absolute_row: i64, digest: u64) -> Option<&ShapedLine> {
+        self.lines
+            .get(&absolute_row)
+            .filter(|(cached, _)| *cached == digest)
+            .map(|(_, line)| line)
+    }
+
+    fn insert(&mut self, absolute_row: i64, digest: u64, line: ShapedLine) {
+        self.lines.insert(absolute_row, (digest, line));
+    }
+}
+
+fn digest_cells(cells: &[GridCell]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    cells.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[derive(Clone)]
@@ -370,13 +413,26 @@ impl TerminalElement {
         mutex_lock(&self.shared.selection).clear();
     }
 
-    /// The http(s) URL whose text spans the given window cell, if any.
+    /// The web URL whose text spans the given window cell, if any.
     /// Wrapped multi-row URLs are out of scope: the scan is per logical row.
     #[must_use]
     pub fn link_at(&self, col: usize, window_row: usize) -> Option<String> {
+        match self.reference_at(col, window_row) {
+            Some(TerminalReference::Url(url)) => Some(url),
+            Some(TerminalReference::File(_)) | None => None,
+        }
+    }
+
+    /// The command-clickable URL or file reference spanning a window cell.
+    ///
+    /// The full whitespace-delimited row run is inspected, so clicking a line
+    /// number or punctuation wrapper resolves the same reference as clicking
+    /// the path itself. Multi-row references are deliberately out of scope.
+    #[must_use]
+    pub fn reference_at(&self, col: usize, window_row: usize) -> Option<TerminalReference> {
         let viewport = mutex_lock(&self.shared.viewport).clone();
         let buffer = read_lock(&self.buffer);
-        let absolute_row = mutex_lock(&self.shared.viewport).absolute_row(window_row);
+        let absolute_row = viewport.absolute_row(window_row);
         let row = viewport.row_at_absolute(&buffer, absolute_row);
         let chars: Vec<char> = row
             .iter()
@@ -386,20 +442,20 @@ impl TerminalElement {
         if col >= chars.len() {
             return None;
         }
-        let is_url_char = |c: char| !c.is_whitespace() && c != '\0';
-        if !is_url_char(chars[col]) {
+        let is_reference_char = |c: char| !c.is_whitespace() && c != '\0';
+        if !is_reference_char(chars[col]) {
             return None;
         }
         let mut start = col;
-        while start > 0 && is_url_char(chars[start - 1]) {
+        while start > 0 && is_reference_char(chars[start - 1]) {
             start -= 1;
         }
         let mut end = col + 1;
-        while end < chars.len() && is_url_char(chars[end]) {
+        while end < chars.len() && is_reference_char(chars[end]) {
             end += 1;
         }
         let candidate: String = chars[start..end].iter().collect();
-        url_from_run(&candidate)
+        reference_from_run(&candidate)
     }
 
     #[must_use]
@@ -674,7 +730,7 @@ impl Element for TerminalElement {
                 visible_cols,
             };
             let mut history = mutex_lock(&self.shared.history_lines);
-            history.validate(key, viewport.cache_seq());
+            history.validate(key, viewport.absolute_row(0));
             let mut hits = 0u64;
             for row_index in 0..visible_rows {
                 let absolute = viewport.absolute_row(row_index);
@@ -697,18 +753,20 @@ impl Element for TerminalElement {
                     &mut decoration_quads,
                 );
                 let is_history = absolute < viewport.live_start_row();
+                let digest = digest_cells(&cells);
                 let line = if let Some(line) =
-                    is_history.then(|| history.lines.get(&absolute)).flatten()
+                    is_history.then(|| history.get(absolute, digest)).flatten()
                 {
                     hits += 1;
                     line.clone()
                 } else {
                     let line = self.shape_row(&cells, metrics, window);
                     // A row the viewport has not fetched yet composes as
-                    // blank; caching that would pin the blank on screen after
+                    // blank. Caching it is safe now that entries are content
+                    // addressed: the blank's digest stops matching the moment
                     // the fetch lands.
-                    if is_history && viewport.cached_row(absolute).is_some() {
-                        history.lines.insert(absolute, line.clone());
+                    if is_history {
+                        history.insert(absolute, digest, line.clone());
                     }
                     line
                 };
@@ -1162,12 +1220,10 @@ fn render_char(cell: GridCell, visible: bool) -> char {
         .unwrap_or(' ')
 }
 
-/// Extracts an http(s) URL from a whitespace-delimited run of characters,
+/// Extracts a URL from a whitespace-delimited run of characters,
 /// shedding the punctuation that wraps prose-embedded links.
 fn url_from_run(run: &str) -> Option<String> {
-    let stripped = run
-        .trim_start_matches(['(', '[', '{', '<', '\'', '"'])
-        .trim_end_matches(['.', ',', ';', ':', ')', ']', '}', '\'', '"', '>', '!', '?']);
+    let stripped = trim_reference_run(run);
     if stripped.starts_with("http://") || stripped.starts_with("https://") {
         Some(stripped.to_owned())
     } else if stripped.starts_with("www.") && stripped["www.".len()..].contains('.') {
@@ -1175,6 +1231,103 @@ fn url_from_run(run: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+fn trim_reference_run(run: &str) -> &str {
+    run.trim()
+        .trim_start_matches(['(', '[', '{', '<', '\'', '"'])
+        .trim_end_matches(['.', ',', ';', ':', ')', ']', '}', '\'', '"', '>', '!', '?'])
+}
+
+fn reference_from_run(run: &str) -> Option<TerminalReference> {
+    if let Some(url) = url_from_run(run) {
+        return Some(TerminalReference::Url(url));
+    }
+
+    file_reference_from_run(run).map(TerminalReference::File)
+}
+
+/// Recognizes common compiler/test output locations without promoting every
+/// terminal token to a file. Slash-containing paths and names with a plausible
+/// extension are accepted; ordinary words and numeric positions are not.
+fn file_reference_from_run(run: &str) -> Option<String> {
+    let candidate = trim_file_reference_run(run);
+    if candidate.is_empty() {
+        return None;
+    }
+    let path_candidate = if let Some(path) = candidate.strip_prefix("file://") {
+        path
+    } else if candidate.contains("://") {
+        return None;
+    } else {
+        candidate
+    };
+
+    // Ignore up to the conventional `:line:column` suffix while deciding
+    // whether the preceding text looks like a path. The original candidate is
+    // returned so the host can retain the navigation position.
+    let mut path = parenthesized_location_path(path_candidate).unwrap_or(path_candidate);
+    for _ in 0..2 {
+        let Some((prefix, position)) = path.rsplit_once(':') else {
+            break;
+        };
+        if prefix.is_empty()
+            || position.is_empty()
+            || !position.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            break;
+        }
+        path = prefix;
+    }
+
+    let has_separator = path.contains('/') || path.contains('\\');
+    let file_name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let has_extension = file_name.rsplit_once('.').is_some_and(|(stem, extension)| {
+        (!stem.is_empty() || file_name.starts_with('.'))
+            && !extension.is_empty()
+            && extension
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    });
+
+    (path != "/" && path != "\\" && (has_separator || has_extension)).then(|| candidate.to_owned())
+}
+
+/// Trims prose punctuation while retaining compiler locations such as
+/// `src/main.rs(42,7)`. A closing parenthesis is only preserved when it closes
+/// one or two comma-separated numeric positions; other closing parentheses
+/// continue to behave as ordinary wrappers.
+fn trim_file_reference_run(run: &str) -> &str {
+    let mut candidate = run
+        .trim()
+        .trim_start_matches(['(', '[', '{', '<', '\'', '"'])
+        .trim_end_matches(['.', ',', ';', ':', ']', '}', '\'', '"', '>', '!', '?']);
+    while candidate.ends_with(')') && parenthesized_location_path(candidate).is_none() {
+        candidate = candidate[..candidate.len() - 1]
+            .trim_end_matches(['.', ',', ';', ':', ']', '}', '\'', '"', '>', '!', '?']);
+    }
+    candidate
+}
+
+fn parenthesized_location_path(candidate: &str) -> Option<&str> {
+    let without_close = candidate.strip_suffix(')')?;
+    let (path, location) = without_close.rsplit_once('(')?;
+    if path.is_empty() {
+        return None;
+    }
+    let mut positions = location.split(',');
+    let line = positions.next()?;
+    let column = positions.next();
+    if positions.next().is_some()
+        || line.is_empty()
+        || !line.bytes().all(|byte| byte.is_ascii_digit())
+        || column.is_some_and(|column| {
+            column.is_empty() || !column.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    {
+        return None;
+    }
+    Some(path)
 }
 
 fn mutex_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1195,7 +1348,7 @@ fn write_lock<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
 
 #[cfg(test)]
 mod link_tests {
-    use super::url_from_run;
+    use super::{TerminalReference, file_reference_from_run, reference_from_run, url_from_run};
 
     #[test]
     fn terminal_renderer_never_creates_autonomous_frame_tasks() {
@@ -1242,5 +1395,137 @@ mod link_tests {
         assert_eq!(url_from_run("not-a-url"), None);
         assert_eq!(url_from_run("www."), None);
         assert_eq!(url_from_run("http:/broken"), None);
+    }
+
+    #[test]
+    fn routes_file_urls_as_local_file_references() {
+        assert_eq!(
+            reference_from_run("<file:///tmp/foo.swift>"),
+            Some(TerminalReference::File("file:///tmp/foo.swift".to_owned()))
+        );
+        assert_eq!(
+            file_reference_from_run("file:///tmp/foo.swift"),
+            Some("file:///tmp/foo.swift".to_owned())
+        );
+    }
+
+    #[test]
+    fn extracts_punctuation_wrapped_file_locations() {
+        assert_eq!(
+            file_reference_from_run("[src/main.rs:42:7],"),
+            Some("src/main.rs:42:7".to_owned())
+        );
+        assert_eq!(
+            file_reference_from_run("(/tmp/foo.swift:9)."),
+            Some("/tmp/foo.swift:9".to_owned())
+        );
+        assert_eq!(
+            reference_from_run("src/main.rs:42"),
+            Some(TerminalReference::File("src/main.rs:42".to_owned()))
+        );
+        assert_eq!(
+            reference_from_run("[src/main.rs(42,7)],"),
+            Some(TerminalReference::File("src/main.rs(42,7)".to_owned()))
+        );
+        assert_eq!(
+            file_reference_from_run("(src/main.rs(42))."),
+            Some("src/main.rs(42)".to_owned())
+        );
+    }
+
+    #[test]
+    fn rejects_plain_terminal_words_as_file_references() {
+        assert_eq!(file_reference_from_run("Finished"), None);
+        assert_eq!(file_reference_from_run("warning"), None);
+        assert_eq!(file_reference_from_run("42:7"), None);
+        assert_eq!(file_reference_from_run("warning(42,7)"), None);
+    }
+}
+
+#[cfg(test)]
+mod history_cache_tests {
+    use diri_proto::grid::{GridCell, TermColor, TermStyle};
+    use gpui::{FontId, ShapedLine};
+
+    use super::{HistoryLineCache, HistoryShapeKey, digest_cells};
+
+    fn key() -> HistoryShapeKey {
+        HistoryShapeKey {
+            theme_signature: 1,
+            font_id: FontId(0),
+            font_size_bits: 13f32.to_bits(),
+            cell_width_bits: 8f32.to_bits(),
+            visible_cols: 80,
+        }
+    }
+
+    fn row(text: &str) -> Vec<GridCell> {
+        text.chars()
+            .map(|ch| {
+                GridCell::new(
+                    u32::from(ch),
+                    TermColor::Default,
+                    TermColor::DefaultInverted,
+                    TermStyle::empty(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn shaping_survives_churn_that_leaves_the_row_alone() {
+        let cells = row("cargo build --release");
+        let digest = digest_cells(&cells);
+        let mut cache = HistoryLineCache::default();
+        cache.validate(key(), 0);
+        cache.insert(42, digest, ShapedLine::default());
+
+        // A spinner repaints the live grid many times over. The history row is
+        // untouched, so its shaping must still be there.
+        for _ in 0..100 {
+            cache.validate(key(), 0);
+        }
+        assert!(cache.get(42, digest).is_some());
+    }
+
+    #[test]
+    fn a_row_whose_cells_changed_is_reshaped() {
+        let mut cache = HistoryLineCache::default();
+        cache.validate(key(), 0);
+        cache.insert(7, digest_cells(&row("       ")), ShapedLine::default());
+
+        // The blank placeholder was cached before the fetch landed; the real
+        // cells must not hit it.
+        assert!(cache.get(7, digest_cells(&row("error[E0499]"))).is_none());
+    }
+
+    #[test]
+    fn a_changed_font_drops_everything() {
+        let digest = digest_cells(&row("x"));
+        let mut cache = HistoryLineCache::default();
+        cache.validate(key(), 0);
+        cache.insert(1, digest, ShapedLine::default());
+
+        let mut resized = key();
+        resized.font_size_bits = 16f32.to_bits();
+        cache.validate(resized, 0);
+        assert!(cache.get(1, digest).is_none());
+    }
+
+    #[test]
+    fn overflow_keeps_the_rows_around_the_window() {
+        let digest = digest_cells(&row("x"));
+        let mut cache = HistoryLineCache::default();
+        cache.validate(key(), 0);
+        for absolute in 0..(HistoryLineCache::MAX_ROWS as i64 + 200) {
+            cache.insert(absolute, digest, ShapedLine::default());
+        }
+
+        // Evicting by distance, not by clearing: the window keeps its shaping.
+        let anchor = 1_000;
+        cache.validate(key(), anchor);
+        assert!(cache.get(anchor, digest).is_some(), "the window survives");
+        assert!(cache.get(0, digest).is_none(), "distant rows are dropped");
+        assert!(cache.lines.len() <= HistoryLineCache::MAX_ROWS);
     }
 }

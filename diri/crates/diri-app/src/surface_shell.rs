@@ -19,8 +19,8 @@ use diri_ui::{
 };
 use gpui::{
     AnyElement, App, ClipboardItem, Context, CursorStyle, FocusHandle, Focusable, FontWeight,
-    IntoElement, KeyDownEvent, MouseButton, Render, Rgba, SharedString, Window, actions, deferred,
-    div, prelude::*, px, rgba,
+    IntoElement, KeyDownEvent, MouseButton, Render, Rgba, SharedString, Task, Window, actions,
+    deferred, div, prelude::*, px, rgba,
 };
 use tokio::runtime::Runtime;
 
@@ -181,6 +181,8 @@ pub struct UtilitySurfaces {
     runtime: Arc<Runtime>,
     updates: UpdateHandle,
     activity: String,
+    _update_changes: Task<()>,
+    _store_changes: Task<()>,
 }
 
 impl UtilitySurfaces {
@@ -215,7 +217,7 @@ impl UtilitySurfaces {
         };
         // The Settings pane renders update state it does not own, so it has to
         // be woken when that state moves.
-        {
+        let update_changes = {
             let mut states = updates.subscribe();
             cx.spawn(async move |this, cx| {
                 while states.changed().await.is_ok() {
@@ -224,11 +226,10 @@ impl UtilitySurfaces {
                     }
                 }
             })
-            .detach();
-        }
+        };
         // This view is `.cached()` in RootView, so ambient window redraws no
         // longer reach it: store changes must notify it directly.
-        {
+        let store_changes = {
             let mut changes = store_runtime.changes();
             cx.spawn(async move |this, cx| {
                 loop {
@@ -242,8 +243,7 @@ impl UtilitySurfaces {
                     }
                 }
             })
-            .detach();
-        }
+        };
         Self {
             focus,
             surface: if settings_preview.is_some() {
@@ -272,6 +272,8 @@ impl UtilitySurfaces {
             runtime,
             updates,
             activity: "Connected client · shared daemon remains untouched".to_owned(),
+            _update_changes: update_changes,
+            _store_changes: store_changes,
         }
     }
 
@@ -2461,12 +2463,19 @@ impl Render for UtilitySurfaces {
             .on_action(cx.listener(|this, _: &MoveDown, _, cx| this.move_history(1, cx)))
             .on_action(cx.listener(|this, _: &Activate, _, cx| this.activate_history(cx)))
             .absolute()
+            // Cached entity roots are laid out independently, so insets alone
+            // leave this absolute root without a definite size: its height
+            // collapses to its in-flow content, which is nothing. The backdrop
+            // then paints no dim at all and the dialog centers on the window's
+            // top edge, putting its tab list and close control off-window.
+            .size_full()
             .text_color(COLORS.primary);
         if let Some(overlay) = overlay {
             root.inset_0().child(
                 div()
                     .absolute()
                     .inset_0()
+                    .debug_selector(|| "surface-backdrop".into())
                     // The modal backdrop dismisses the topmost surface while
                     // still protecting terminal selection and scrollback.
                     .occlude()
@@ -3001,8 +3010,27 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use gpui::{
-        Entity, Modifiers, MouseDownEvent, ScrollDelta, ScrollWheelEvent, TestAppContext, point,
+        Entity, Modifiers, MouseDownEvent, ScrollDelta, ScrollWheelEvent, StyleRefinement,
+        TestAppContext, point, size,
     };
+
+    /// RootView paints the utility surfaces through a cached wrapper. A cached
+    /// entity root is laid out independently of its content, so mount the
+    /// surfaces the way the app does -- not bare -- and a root that cannot size
+    /// itself fails here instead of on screen.
+    struct CachedOverlayHarness {
+        surfaces: Entity<UtilitySurfaces>,
+    }
+
+    impl Render for CachedOverlayHarness {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                self.surfaces
+                    .clone()
+                    .cached(StyleRefinement::default().absolute().inset_0()),
+            )
+        }
+    }
 
     struct SettingsModalHarness {
         surfaces: Entity<UtilitySurfaces>,
@@ -3129,6 +3157,49 @@ mod tests {
             Surface::Settings
         );
         assert_eq!(background_events.load(Ordering::Relaxed), 0);
+    }
+
+    #[gpui::test]
+    fn settings_dialog_centers_in_the_window_through_the_cached_wrapper(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let updates = crate::updates::inert();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let surfaces = cx.new(|cx| {
+                let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
+                surfaces.open_settings(cx);
+                surfaces
+            });
+            CachedOverlayHarness { surfaces }
+        });
+
+        let viewport = size(px(1200.0), px(800.0));
+        cx.simulate_resize(viewport);
+
+        // The backdrop must cover the window. A collapsed root leaves it
+        // 1200x0, which dims nothing and blocks nothing.
+        let backdrop = cx
+            .debug_bounds("surface-backdrop")
+            .expect("modal backdrop should render");
+        assert_eq!(backdrop.size, viewport);
+
+        let dialog = cx
+            .debug_bounds("settings-dialog")
+            .expect("settings dialog should render");
+        assert_eq!(dialog.size.width, px(SETTINGS_WIDTH));
+        assert_eq!(dialog.size.height, px(SETTINGS_HEIGHT));
+
+        // The dialog is taller than a collapsed root, so a zero-height root
+        // parks it half above the window instead of in the middle.
+        let center = dialog.center();
+        assert_eq!(center.x, viewport.width / 2.0);
+        assert_eq!(center.y, viewport.height / 2.0);
+        assert!(dialog.top() > px(0.0), "dialog hangs above the window top");
     }
 
     #[gpui::test]

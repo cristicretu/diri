@@ -176,6 +176,17 @@ fn wait_until(what: &str, timeout: Duration, mut check: impl FnMut() -> bool) {
     panic!("timed out waiting for {what}");
 }
 
+fn eventually(timeout: Duration, mut check: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if check() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    false
+}
+
 /// Freezes the session over the socket and proves the tree really stopped.
 fn hibernate_and_verify_stopped(control: &mut Control, id: &str) -> Vec<i64> {
     control.request("session.hibernate", json!({ "sessionID": id }));
@@ -304,4 +315,72 @@ fn a_data_channel_attach_wakes_a_hibernated_tree() {
     );
 
     control.request("session.kill", json!({ "sessionID": id }));
+}
+
+/// A daemon can adopt a holder whose process tree is already SIGSTOPped while
+/// its persisted hibernation marker is stale or missing. That inconsistent
+/// state used to look live in the UI, but attaching and typing only wrote into
+/// a stopped PTY forever. The attach boundary must reconcile the real process
+/// state instead of trusting the record blindly.
+#[test]
+fn a_data_channel_attach_recovers_a_stopped_tree_with_stale_metadata() {
+    let temp = tempfile::tempdir().expect("temp");
+    let server = start_server(temp.path());
+    let mut control = Control::connect(&server);
+
+    let id = spawn_cat(&mut control);
+    let pids = hibernate_and_verify_stopped(&mut control, &id);
+    control.request("session.wake", json!({ "sessionID": id }));
+    wait_until("the normal wake to finish", Duration::from_secs(5), || {
+        hibernation_cleared(&mut control, &id)
+            && ps_states(&pids)
+                .iter()
+                .all(|(_, state)| !state.is_empty() && !state.starts_with('T'))
+    });
+
+    // Recreate the production inconsistency: the whole tree is stopped, but
+    // neither the record nor Session's in-memory flag knows it is hibernated.
+    for pid in &pids {
+        // SAFETY: these are live child pids returned by the private test
+        // holder, and the test terminates the session before returning.
+        unsafe { libc::kill(*pid as i32, libc::SIGSTOP) };
+    }
+    wait_until(
+        "the externally stopped tree",
+        Duration::from_secs(5),
+        || {
+            ps_states(&pids)
+                .iter()
+                .all(|(_, state)| state.starts_with('T'))
+        },
+    );
+    assert!(
+        hibernation_cleared(&mut control, &id),
+        "the premise: process state and persisted metadata disagree"
+    );
+
+    let mut data = UnixStream::connect(server.socket_path()).expect("connect data");
+    let mut attach_line = serde_json::to_vec(&json!({ "attach": id })).expect("encode");
+    attach_line.push(b'\n');
+    data.write_all(&attach_line).expect("attach");
+    data.write_all(
+        &FrameCodec::encode(&Frame::input(b"typed-into-a-stale-stop\n".to_vec())).expect("encode"),
+    )
+    .expect("send input");
+
+    let resumed = eventually(Duration::from_secs(2), || {
+        ps_states(&pids)
+            .iter()
+            .all(|(_, state)| !state.is_empty() && !state.starts_with('T'))
+    });
+    let echoed = resumed
+        && eventually(Duration::from_secs(2), || {
+            control.request("session.read_screen", json!({ "sessionID": id }))["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("typed-into-a-stale-stop"))
+        });
+
+    control.request("session.kill", json!({ "sessionID": id }));
+    assert!(resumed, "attach left the stale-stopped process tree frozen");
+    assert!(echoed, "input never reached the stale-stopped session");
 }
