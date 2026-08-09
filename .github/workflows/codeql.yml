@@ -12,32 +12,49 @@ permissions:
   contents: read
   security-events: write
 
+# Rust and Swift used to share one matrix. They are split because they belong on
+# different schedules, and a matrix cannot express that: `matrix` is not in
+# scope for a job-level `if`, so the condition has to sit on a job of its own.
 jobs:
-  analyze:
-    name: CodeQL (${{ matrix.language }})
-    runs-on: ${{ matrix.os }}
+  rust:
+    name: CodeQL (rust)
+    runs-on: ubuntu-latest
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - language: rust
-            build_mode: none
-            os: ubuntu-latest
-          - language: swift
-            build_mode: manual
-            os: macos-15
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
       - name: Initialize CodeQL
         uses: github/codeql-action/init@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
         with:
-          languages: ${{ matrix.language }}
-          build-mode: ${{ matrix.build_mode }}
+          languages: rust
+          build-mode: none
+      - name: Analyze
+        uses: github/codeql-action/analyze@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
+        with:
+          category: /language:rust
+
+  swift:
+    name: CodeQL (swift)
+    # Swift has no `build-mode: none`, so this analysis pays for a full
+    # `swift build` on a macos runner and lands minutes after the rest of the
+    # gate has gone green -- long enough that it was routinely the last thing
+    # holding up a merge. Rust analyses without building at all and stays on
+    # pull requests; Swift runs on the weekly cron instead, which keeps the
+    # coverage without putting a package build in front of every merge. Drop
+    # `CodeQL (swift)` from the required checks on main to match, or PRs wait
+    # for a run that no longer happens.
+    if: github.event_name == 'schedule'
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
+        with:
+          languages: swift
+          build-mode: manual
       - name: Build Swift
-        if: matrix.language == 'swift'
         run: swift build
       - name: Analyze
         uses: github/codeql-action/analyze@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
         with:
-          category: /language:${{ matrix.language }}
+          category: /language:swift
