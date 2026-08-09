@@ -8,12 +8,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use diri_engine::OutputLog;
 use diri_engine::holder::protocol::DEFAULT_DISK_CAPACITY;
 use diri_engine::holder::{
     HolderClient, HolderExitMarker, HolderLaunchSpec, HolderLauncher, HolderManagerClient,
     HolderManagerPaths, HolderManagerServer, HolderPaths, HolderServer,
 };
-use diri_engine::OutputLog;
 
 fn spec(paths: &HolderPaths, logs: &Path, argv: &[&str]) -> HolderLaunchSpec {
     HolderLaunchSpec {
@@ -27,7 +27,10 @@ fn spec(paths: &HolderPaths, logs: &Path, argv: &[&str]) -> HolderLaunchSpec {
         argv: argv.iter().map(|word| word.to_string()).collect(),
         cwd: "/tmp".into(),
         environment: HashMap::from([
-            ("PATH".to_string(), std::env::var("PATH").unwrap_or_default()),
+            (
+                "PATH".to_string(),
+                std::env::var("PATH").unwrap_or_default(),
+            ),
             ("TERM".to_string(), "xterm-256color".to_string()),
         ]),
         cols: 80,
@@ -284,9 +287,7 @@ fn the_launcher_bootstraps_a_real_manager_process() {
     });
 
     fresh.kill_tree().expect("kill");
-    wait_until("session gone", Duration::from_secs(5), || {
-        !fresh.is_alive()
-    });
+    wait_until("session gone", Duration::from_secs(5), || !fresh.is_alive());
 
     // The detached manager idles out shortly after its last session ends.
     // Watch passively — a ping would re-arm the idle timer (by design: a

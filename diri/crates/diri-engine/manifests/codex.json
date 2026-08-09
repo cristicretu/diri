@@ -1,0 +1,75 @@
+{
+  "schemaVersion": 1,
+  "id": "codex",
+  "version": "rust-1",
+  "statusModel": "full",
+  "agent": {
+    "id": "codex",
+    "displayName": "Codex",
+    "shortLabel": "Codex",
+    "glyph": "terminal",
+    "aliases": ["codex"],
+    "firstClass": true,
+    "statusAuthority": "screen",
+    "binary": "codex",
+    "injection": { "codexNotify": true, "codexMCP": true },
+    "resume": { "style": "flag", "token": "resume" },
+    "envScrubPrefixes": ["CODEX_", "DIRI_", "DIRIJOR_"],
+    "approve": { "text": "", "submit": true },
+    "deny": { "text": "\u001b", "submit": false }
+  },
+  "rules": [
+    {
+      "id": "permission-confirmation",
+      "state": "blockedPermission",
+      "priority": 900,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 14,
+      "when": {
+        "any": [
+          { "contains": "Would you like to run the following command?" },
+          { "contains": "Do you want to allow" },
+          { "contains": "Press enter to confirm" }
+        ]
+      },
+      "capture": { "region": "bottom_non_empty_lines", "regionLines": 14, "maxChars": 700 }
+    },
+    {
+      "id": "question-options",
+      "state": "blockedQuestion",
+      "priority": 800,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 12,
+      "when": {
+        "all": [
+          { "lineRegex": "^[[:space:]]*[❯>]?[[:space:]]*1\\.[[:space:]]+" },
+          { "lineRegex": "^[[:space:]]*[❯>]?[[:space:]]*2\\.[[:space:]]+" }
+        ]
+      }
+    },
+    {
+      "id": "interrupt-hint-working",
+      "state": "working",
+      "priority": 500,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 6,
+      "when": { "contains": "esc to interrupt" }
+    },
+    {
+      "id": "working-status",
+      "state": "working",
+      "priority": 400,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 5,
+      "when": { "lineRegex": "^[[:space:]]*(Working|Thinking|Running)[.… ]" }
+    },
+    {
+      "id": "composer-idle",
+      "state": "idle",
+      "priority": 100,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 5,
+      "when": { "any": [{ "contains": "Ask Codex" }, { "contains": "Type your request" }] }
+    }
+  ]
+}

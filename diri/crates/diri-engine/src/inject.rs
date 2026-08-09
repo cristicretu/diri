@@ -30,7 +30,10 @@ pub fn uuid_v4() -> String {
     bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
     bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122 variant
     let h = |range: std::ops::Range<usize>| {
-        bytes[range].iter().map(|b| format!("{b:02x}")).collect::<String>()
+        bytes[range]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
     };
     format!(
         "{}-{}-{}-{}-{}",

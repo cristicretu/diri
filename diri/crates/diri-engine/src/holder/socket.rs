@@ -68,7 +68,10 @@ pub fn write_json_line<T: Serialize>(stream: &mut impl Write, value: &T) -> Hold
 /// wakes an `accept(2)` blocked on an AF_UNIX listener via `shutdown` alone —
 /// the fd must also be closed, which means the accept loop cannot hold a safe
 /// owner of it. The Swift holder shipped this exact shape.
-pub fn accept_raw(listen_fd: i32, finished: impl Fn() -> bool) -> HolderResult<Option<std::os::unix::net::UnixStream>> {
+pub fn accept_raw(
+    listen_fd: i32,
+    finished: impl Fn() -> bool,
+) -> HolderResult<Option<std::os::unix::net::UnixStream>> {
     loop {
         // SAFETY: accept(2) on a listening fd; the addr out-params are unused.
         let client = unsafe { libc::accept(listen_fd, std::ptr::null_mut(), std::ptr::null_mut()) };

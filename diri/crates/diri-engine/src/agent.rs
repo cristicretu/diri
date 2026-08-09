@@ -191,9 +191,46 @@ impl AgentDescriptor {
                 .find(|(key, _)| key == "PATH")
                 .map(|(_, value)| value.clone())
                 .or_else(|| std::env::var("PATH").ok());
-            if let Some(resolved) = path.as_deref().and_then(|path| resolve_on_path(first, path)) {
+            if let Some(resolved) = path
+                .as_deref()
+                .and_then(|path| resolve_on_path(first, path))
+            {
                 *first = resolved;
             }
+        }
+        Some(spec)
+    }
+
+    /// Builds the same exact argv/environment tuple for a remote Helper.
+    /// Executable lookup is deliberately left to the remote Holder against
+    /// the captured remote PATH; no local filesystem probe can answer it.
+    /// `return_to_login_shell` is not synthesized as a shell command: remote
+    /// Agent launches remain structured and the session exits with Agent.
+    pub fn remote_spawn_spec(
+        &self,
+        cwd: &std::path::Path,
+        inherited: impl IntoIterator<Item = (String, String)>,
+        extra_args: &[String],
+    ) -> Option<PtySpec> {
+        let binary = self.binary.clone()?;
+        let mut spec = PtySpec::new(
+            std::iter::once(binary)
+                .chain(extra_args.iter().cloned())
+                .collect(),
+            cwd,
+        );
+        for (key, value) in inherited {
+            if !self.should_scrub(&key) {
+                spec.env.push((key, value));
+            }
+        }
+        spec.env
+            .retain(|(key, _)| !matches!(key.as_str(), "NO_COLOR" | "TERM" | "COLORTERM"));
+        spec.env.push(("TERM".into(), "xterm-256color".into()));
+        spec.env.push(("COLORTERM".into(), "truecolor".into()));
+        for (key, value) in &self.env {
+            spec.env.retain(|(existing, _)| existing != key);
+            spec.env.push((key.clone(), value.clone()));
         }
         Some(spec)
     }
@@ -264,8 +301,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     fn manifest_dir() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../Sources/DirijorCore/Resources/manifests")
+        crate::detect::bundled_manifest_dir()
             .canonicalize()
             .expect("manifests")
     }
@@ -336,8 +372,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod");
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         }
         let gemini = descriptor("gemini");
         let inherited = [(
@@ -355,8 +390,9 @@ mod tests {
     }
 
     #[test]
-    fn return_to_login_shell_keeps_the_session_alive_after_the_agent_exits() {
+    fn shipped_agents_exit_their_pty_when_the_agent_exits() {
         let codex = descriptor("codex");
+        assert!(!codex.return_to_login_shell);
         let spec = codex
             .spawn_spec(
                 Path::new("/tmp"),
@@ -368,20 +404,7 @@ mod tests {
             )
             .expect("codex has a binary");
 
-        assert_eq!(
-            &spec.argv[..4],
-            &["/bin/sh", "-i", "-l", "-c"],
-            "the login shell must remain the PTY's top-level process"
-        );
-        let command = &spec.argv[4];
-        assert!(
-            command.starts_with("'codex' '--version'"),
-            "the agent should run inside the shell: {command}"
-        );
-        assert!(
-            command.ends_with("; exec '/bin/sh' -i -l"),
-            "exiting the agent should land at an interactive prompt: {command}"
-        );
+        assert_eq!(spec.argv, ["codex", "--version"]);
     }
 
     #[cfg(unix)]
@@ -421,8 +444,15 @@ mod tests {
         let output = child.wait_with_output().expect("wait");
         let stdout = String::from_utf8_lossy(&output.stdout);
 
-        assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
-        assert!(stdout.contains("agent-finished"), "agent did not run: {stdout:?}");
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("agent-finished"),
+            "agent did not run: {stdout:?}"
+        );
         assert!(
             stdout.contains("shell-ready"),
             "the session did not accept shell input after agent exit: {stdout:?}"

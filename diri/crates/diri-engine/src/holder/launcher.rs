@@ -98,10 +98,7 @@ impl HolderLauncher {
             .ok()
             .and_then(|exe| exe.canonicalize().ok())
             .and_then(|exe| exe.parent().map(Path::to_path_buf));
-        let candidates: Vec<PathBuf> = beside
-            .iter()
-            .flat_map(|dir| ["diri-holder", "dirijord-holder"].map(|name| dir.join(name)))
-            .collect();
+        let candidates: Vec<PathBuf> = beside.iter().map(|dir| dir.join("diri-holder")).collect();
         candidates
             .iter()
             .find(|candidate| is_executable(candidate))
@@ -199,7 +196,11 @@ fn spawn_manager(executable_path: &Path, directory: &Path) -> HolderResult<()> {
 }
 
 fn read_pid_file(path: &Path) -> Option<i32> {
-    let pid = std::fs::read_to_string(path).ok()?.trim().parse::<i32>().ok()?;
+    let pid = std::fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse::<i32>()
+        .ok()?;
     (pid > 1).then_some(pid)
 }
 

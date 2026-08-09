@@ -413,12 +413,14 @@ pub fn fetch(url: &str, gh: &str, include_threads: bool) -> Option<PullRequestSt
     const FIELDS: &str = "number,title,author,body,baseRefName,headRefName,state,isDraft,\
         reviewDecision,mergeable,mergeStateStatus,additions,deletions,changedFiles,\
         comments,reviews,statusCheckRollup";
-    let data = run_gh(gh, &["pr", "view", url, "--json", FIELDS], Duration::from_secs(15))?;
+    let data = run_gh(
+        gh,
+        &["pr", "view", url, "--json", FIELDS],
+        Duration::from_secs(15),
+    )?;
     let mut status = parse(&data, url, now())?;
 
-    if include_threads
-        && let Some((owner, repo, number)) = pr_coordinates(url)
-    {
+    if include_threads && let Some((owner, repo, number)) = pr_coordinates(url) {
         let query = "query=query($owner:String!,$name:String!,$number:Int!){\
             repository(owner:$owner,name:$name){pullRequest(number:$number){\
             reviewThreads(first:100){totalCount nodes{isResolved}}}}}";
@@ -489,7 +491,11 @@ pub fn pr_coordinates(url: &str) -> Option<(String, String, i64)> {
         .collect::<String>()
         .parse()
         .ok()?;
-    Some((parts[pull - 2].to_string(), parts[pull - 1].to_string(), number))
+    Some((
+        parts[pull - 2].to_string(),
+        parts[pull - 1].to_string(),
+        number,
+    ))
 }
 
 /// Decodes the reviewThreads GraphQL response into (resolved, total).
@@ -565,9 +571,7 @@ pub fn parse(data: &[u8], url: &str, fetched_at: DateMillis) -> Option<PullReque
         } else {
             None
         },
-        created_at: entry[created_key]
-            .as_str()
-            .and_then(parse_github_date),
+        created_at: entry[created_key].as_str().and_then(parse_github_date),
         url: string(&entry["url"]),
     };
     let comments: Vec<PrDiscussionItem> = view["comments"]
@@ -632,9 +636,7 @@ fn parse_github_date(value: &str) -> Option<DateMillis> {
     if bytes.len() < 20 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
         return None;
     }
-    let number = |range: std::ops::Range<usize>| -> Option<i64> {
-        value.get(range)?.parse().ok()
-    };
+    let number = |range: std::ops::Range<usize>| -> Option<i64> { value.get(range)?.parse().ok() };
     let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
     let (hour, minute, second) = (number(11..13)?, number(14..16)?, number(17..19)?);
     // Days since epoch via the civil-days algorithm.
@@ -729,12 +731,7 @@ mod tests {
             },
         )]);
         assert_eq!(
-            next_refresh_delay(
-                &targets,
-                &refresh,
-                &HashSet::from([url]),
-                Instant::now(),
-            ),
+            next_refresh_delay(&targets, &refresh, &HashSet::from([url]), Instant::now(),),
             Duration::ZERO
         );
     }
@@ -792,7 +789,11 @@ mod tests {
         assert_eq!(status.author.as_deref(), Some("shawn"));
         assert_eq!(status.review_decision, None, "empty string means none");
         assert_eq!(
-            (status.checks_passed, status.checks_failed, status.checks_pending),
+            (
+                status.checks_passed,
+                status.checks_failed,
+                status.checks_pending
+            ),
             (1, 1, 1)
         );
         let checks = status.checks.expect("checks");
@@ -816,9 +817,6 @@ mod tests {
                 "nodes": [{"isResolved": true}, {"isResolved": false}, {"isResolved": true}]
             }}}}
         });
-        assert_eq!(
-            parse_threads(payload.to_string().as_bytes()),
-            Some((2, 5))
-        );
+        assert_eq!(parse_threads(payload.to_string().as_bytes()), Some((2, 5)));
     }
 }

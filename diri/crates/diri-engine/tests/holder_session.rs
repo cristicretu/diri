@@ -18,8 +18,7 @@ use diri_engine::{Authority, ManifestEngine, OutputLog, PtySpec, Registry};
 use diri_proto::SessionStatus;
 
 fn engine() -> Arc<ManifestEngine> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../Sources/DirijorCore/Resources/manifests")
+    let dir = diri_engine::detect::bundled_manifest_dir()
         .canonicalize()
         .expect("manifests");
     let (engine, _) = ManifestEngine::load_dir(&dir).expect("load");
@@ -43,17 +42,15 @@ fn holder_config(root: &Path) -> HolderConfig {
 fn shell_spec(id: &str, script: &str, logs: &Path, holder: Option<HolderConfig>) -> SessionSpec {
     SessionSpec {
         id: id.into(),
-        pty: PtySpec::new(
-            vec!["/bin/sh".into(), "-c".into(), script.into()],
-            "/tmp",
-        )
-        .env("PATH", "/usr/bin:/bin")
-        .env("TERM", "xterm-256color")
-        .size(80, 24),
+        pty: PtySpec::new(vec!["/bin/sh".into(), "-c".into(), script.into()], "/tmp")
+            .env("PATH", "/usr/bin:/bin")
+            .env("TERM", "xterm-256color")
+            .size(80, 24),
         manifest_id: "shell".into(),
         authority: Authority::ProcessOnly,
         logs_dir: logs.to_path_buf(),
         holder,
+        remote: None,
         defer_launch: false,
     }
 }
@@ -76,9 +73,7 @@ fn log_contains(logs: &Path, id: &str, needle: &[u8]) -> bool {
     log.refresh_from_disk();
     let tail = log.tail_offset();
     let (_, bytes) = log.read(0, tail as usize);
-    bytes
-        .windows(needle.len())
-        .any(|window| window == needle)
+    bytes.windows(needle.len()).any(|window| window == needle)
 }
 
 #[test]
@@ -224,8 +219,8 @@ fn record(id: &str) -> diri_proto::SessionRecord {
         last_seen_at: None,
         pinned: false,
         archived_at: None,
-        remote_active: false,
         host: None,
+        remote_persistence: None,
         hibernation: None,
         memory_bytes: None,
         artifacts: None,

@@ -66,7 +66,8 @@ impl HolderManagerPaths {
     /// Whether a directory entry is a manager socket rather than a session's.
     /// Registry adoption scans use this to skip the manager endpoint.
     pub fn is_manager_socket(path: &Path) -> bool {
-        path.extension().is_some_and(|extension| extension == "sock")
+        path.extension()
+            .is_some_and(|extension| extension == "sock")
             && path
                 .file_stem()
                 .and_then(|stem| stem.to_str())

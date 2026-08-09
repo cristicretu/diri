@@ -182,7 +182,7 @@ pub fn permission_summary(tool: Option<&str>, input_summary: Option<&str>) -> St
 
 /// A title from the first prompt: one line, trimmed to something a sidebar row
 /// can show.
-fn title_from_prompt(prompt: &str) -> String {
+pub(crate) fn title_from_prompt(prompt: &str) -> String {
     let first_line = prompt
         .lines()
         .map(str::trim)

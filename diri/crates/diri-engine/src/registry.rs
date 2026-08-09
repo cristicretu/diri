@@ -1,9 +1,8 @@
 //! The set of live sessions, and their persisted records.
 //!
 //! The registry is what a control channel talks to: spawn, list, write, kill.
-//! It also owns persistence, in the same `state.json` shape the Swift daemon
-//! writes — `{ version, projects, sessions }` — so the two engines can read
-//! each other's state file and a switch does not lose anybody's session list.
+//! It also owns the additive `{ version, projects, sessions }` persistence
+//! envelope. Unknown project fields survive a read/write cycle.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -14,10 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::detect::ManifestEngine;
 use crate::holder::{HolderClient, HolderManagerPaths, HolderPaths};
-use crate::session::{HolderConfig, Session, SessionSpec, SessionView};
+use crate::session::{HolderConfig, RemoteAdoptSpec, Session, SessionSpec, SessionView};
 
-/// The on-disk snapshot. Field names and the version match the Swift
-/// `PersistedState` exactly.
+/// The versioned on-disk snapshot.
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct PersistedState {
     pub version: i64,
@@ -42,8 +40,8 @@ pub struct Registry {
     sessions: HashMap<String, Session>,
     /// Records for sessions that are no longer live but still listed.
     records: HashMap<String, SessionRecord>,
-    /// Carried through untouched: this engine has no project model yet, and
-    /// dropping the key would erase the Swift daemon's projects on first write.
+    /// Project records are kept as additive JSON so fields outside the
+    /// Engine's minimal id/root/name model survive persistence.
     projects: Vec<serde_json::Value>,
     /// Sessions the user closed, newest last — the "reopen closed tab" stack.
     recently_closed: Vec<SessionRecord>,
@@ -115,8 +113,32 @@ impl Registry {
         match serde_json::from_slice::<PersistedState>(&bytes) {
             Ok(state) => {
                 self.projects = state.projects;
-                for record in state.sessions {
+                let project_roots = self
+                    .projects
+                    .iter()
+                    .filter_map(|project| {
+                        Some((
+                            project.get("id")?.as_str()?.to_owned(),
+                            project.get("root")?.as_str()?.to_owned(),
+                        ))
+                    })
+                    .collect::<HashMap<_, _>>();
+                let mut locations = Vec::with_capacity(state.sessions.len());
+                for mut record in state.sessions {
+                    repair_persisted_agent_title(&mut record);
+                    // Resolve the owning project before repairing its
+                    // location namespace. In particular, a linked worktree's
+                    // cwd is not its first-level project root.
+                    let project_root = project_roots
+                        .get(&record.project_id.0)
+                        .cloned()
+                        .unwrap_or_else(|| record.cwd.clone());
+                    record.project_id = session_project_id(&project_root, record.host.as_deref());
+                    locations.push((project_root, record.host.clone()));
                     self.records.insert(record.id.0.clone(), record);
+                }
+                for (root, host) in locations {
+                    self.ensure_session_project(&root, host.as_deref());
                 }
                 Ok(self.records.len())
             }
@@ -159,7 +181,7 @@ impl Registry {
 
     /// Writes the current state atomically, unconditionally.
     fn persist_now(&mut self) -> std::io::Result<()> {
-        let state = PersistedState::current(self.records(), self.projects.clone());
+        let state = PersistedState::current(self.records_for_persistence(), self.projects.clone());
         let bytes = serde_json::to_vec(&state)?;
         let temp = self.state_file.with_extension("json.tmp");
         if let Some(parent) = self.state_file.parent() {
@@ -171,6 +193,17 @@ impl Registry {
         self.dirty = false;
         self.last_persist = Some(std::time::Instant::now());
         Ok(())
+    }
+
+    fn records_for_persistence(&self) -> Vec<SessionRecord> {
+        let mut records: Vec<SessionRecord> = self.records.values().cloned().collect();
+        for record in &mut records {
+            if let Some(session) = self.sessions.get(&record.id.0) {
+                fold_session_status(record, &session.view());
+            }
+        }
+        records.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+        records
     }
 
     /// Adds (or replaces) a record without a live session — restores,
@@ -186,6 +219,30 @@ impl Registry {
         let id = spec.id.clone();
         let session = Session::spawn(spec, Arc::clone(&self.engine))?;
         self.records.insert(id.clone(), record);
+        self.sessions.insert(id.clone(), session);
+        Ok(id)
+    }
+
+    pub fn adopt_remote(
+        &mut self,
+        spec: SessionSpec,
+        remote: RemoteAdoptSpec,
+    ) -> std::io::Result<String> {
+        let id = spec.id.clone();
+        if !self.records.contains_key(&id) {
+            return Err(not_found(&id));
+        }
+        let initial_status = self
+            .records
+            .get(&id)
+            .filter(|record| !matches!(record.status, SessionStatus::Exited(_)))
+            .map(|record| (record.status.clone(), record.needs_input.clone()));
+        let session = Session::adopt_remote_with_status(
+            spec,
+            remote,
+            Arc::clone(&self.engine),
+            initial_status,
+        )?;
         self.sessions.insert(id.clone(), session);
         Ok(id)
     }
@@ -208,7 +265,8 @@ impl Registry {
             .flatten()
             .map(|entry| entry.path())
             .filter(|path| {
-                path.extension().is_some_and(|extension| extension == "sock")
+                path.extension()
+                    .is_some_and(|extension| extension == "sock")
                     && !HolderManagerPaths::is_manager_socket(path)
             })
             .filter_map(|path| {
@@ -245,6 +303,7 @@ impl Registry {
                 authority: crate::session::authority_for(&manifest_id, &self.engine),
                 logs_dir: logs_dir.to_path_buf(),
                 holder: Some(holder.clone()),
+                remote: None,
                 defer_launch: false,
             };
             let seeded = (!matches!(record_status, SessionStatus::Exited(_)))
@@ -280,14 +339,14 @@ impl Registry {
         views
     }
 
-    /// Session records with live status folded in.
+    /// Session records with live status and a provisional Agent-provided PTY
+    /// title folded in. Structured titles persisted by hooks remain
+    /// authoritative; the PTY fallback exists for Agents without hooks.
     pub fn records(&self) -> Vec<SessionRecord> {
         let mut records: Vec<SessionRecord> = self.records.values().cloned().collect();
         for record in &mut records {
             if let Some(session) = self.sessions.get(&record.id.0) {
-                let view = session.view();
-                record.status = view.status;
-                record.needs_input = view.needs_input;
+                fold_session_view(record, &session.view());
             }
         }
         records.sort_by(|a, b| a.id.0.cmp(&b.id.0));
@@ -298,9 +357,7 @@ impl Registry {
     pub fn record(&self, id: &str) -> Option<SessionRecord> {
         let mut record = self.records.get(id)?.clone();
         if let Some(session) = self.sessions.get(id) {
-            let view = session.view();
-            record.status = view.status;
-            record.needs_input = view.needs_input;
+            fold_session_view(&mut record, &session.view());
         }
         Some(record)
     }
@@ -311,20 +368,36 @@ impl Registry {
     /// second — is one integer compare per live session: no clones, no
     /// serialization.
     pub fn changed_since(
-        &self,
+        &mut self,
         published: &mut HashMap<String, u64>,
     ) -> Vec<(String, SessionRecord)> {
         published.retain(|id, _| self.sessions.contains_key(id));
         let mut changed = Vec::new();
-        for (id, session) in &self.sessions {
-            let version = session.state_version();
-            if published.get(id) == Some(&version) {
-                continue;
-            }
+        let changed_views = self
+            .sessions
+            .iter()
+            .filter_map(|(id, session)| {
+                let version = session.state_version();
+                (published.get(id) != Some(&version)).then(|| (id.clone(), version, session.view()))
+            })
+            .collect::<Vec<_>>();
+        let mut title_changed = false;
+        for (id, version, view) in changed_views {
             published.insert(id.clone(), version);
-            if let Some(record) = self.record(id) {
-                changed.push((id.clone(), record));
+            if let Some(record) = self.records.get_mut(&id) {
+                let previous_title = (record.title.clone(), record.title_source);
+                fold_session_view(record, &view);
+                let record_title_changed =
+                    previous_title != (record.title.clone(), record.title_source);
+                if record_title_changed {
+                    record.updated_at = DateMillis::from(std::time::SystemTime::now());
+                    title_changed = true;
+                }
+                changed.push((id, record.clone()));
             }
+        }
+        if title_changed {
+            self.dirty = true;
         }
         changed
     }
@@ -434,10 +507,26 @@ impl Registry {
 
     /// Folds identity a hook payload carried into the record: the agent-side
     /// conversation id (what makes resume possible), the live transcript path
-    /// (it MOVES when the agent enters a worktree), and a first-prompt title
-    /// when nothing better has been assigned. Returns whether anything
-    /// changed.
+    /// (it MOVES when the agent enters a worktree), a first-prompt fallback,
+    /// and Claude's generated `ai-title` when it becomes available. Returns
+    /// whether anything changed.
     pub fn apply_hook_metadata(&mut self, id: &str, meta: &crate::hooks::HookMetadata) -> bool {
+        let generated_title = self.records.get(id).and_then(|record| {
+            let accepts_generated_title = record.kind == diri_proto::AgentKind::CLAUDE_CODE
+                && matches!(
+                    record.title_source,
+                    TitleSource::Placeholder | TitleSource::FirstPrompt | TitleSource::Unknown
+                );
+            accepts_generated_title
+                .then(|| {
+                    meta.transcript_path
+                        .as_deref()
+                        .or(record.transcript_path.as_deref())
+                })
+                .flatten()
+                .and_then(|path| crate::history::latest_claude_ai_title(Path::new(path)))
+                .and_then(|title| normalize_agent_title(&title))
+        });
         let Some(record) = self.records.get_mut(id) else {
             return false;
         };
@@ -460,6 +549,13 @@ impl Registry {
         {
             record.title = title.clone();
             record.title_source = TitleSource::FirstPrompt;
+            changed = true;
+        }
+        if let Some(title) = generated_title
+            && (record.title != title || record.title_source != TitleSource::AgentProvided)
+        {
+            record.title = title;
+            record.title_source = TitleSource::AgentProvided;
             changed = true;
         }
         if changed {
@@ -585,11 +681,16 @@ impl Registry {
         }
     }
 
-    /// Upserts a project by its deterministic root-derived id and returns it
-    /// as wire JSON. The id rule matches Swift's `ProjectID(root:)` FNV-1a,
-    /// so re-adding a folder either engine already listed never duplicates.
+    /// Upserts a local project by its deterministic root-derived id.
     pub fn add_project(&mut self, root: &str) -> serde_json::Value {
-        let id = project_id(root);
+        self.ensure_session_project(root, None)
+    }
+
+    /// Ensures every Session has a concrete first-level Project record. The
+    /// host remains an execution property of Sessions; the project id carries
+    /// the location namespace and prevents cross-host path collisions.
+    pub fn ensure_session_project(&mut self, root: &str, host: Option<&str>) -> serde_json::Value {
+        let id = session_project_id(root, host).0;
         if let Some(existing) = self
             .projects
             .iter()
@@ -661,8 +762,7 @@ impl Registry {
             .collect()
     }
 
-    /// The project list, verbatim as loaded — this engine does not model
-    /// projects yet, but the list response carries them.
+    /// The additive project list exposed through the control protocol.
     pub fn projects_raw(&self) -> &[serde_json::Value] {
         &self.projects
     }
@@ -680,14 +780,93 @@ impl Registry {
     }
 }
 
+fn fold_session_view(record: &mut SessionRecord, view: &SessionView) {
+    fold_session_status(record, view);
+    if record.kind == diri_proto::AgentKind::SHELL
+        || matches!(
+            record.title_source,
+            TitleSource::AgentProvided | TitleSource::DirijorAssigned | TitleSource::UserRename
+        )
+    {
+        return;
+    }
+    let Some(title) = view
+        .title
+        .as_deref()
+        .and_then(normalize_agent_title)
+        .filter(|title| !is_generic_terminal_title(title, record))
+    else {
+        return;
+    };
+    record.title = title;
+    record.title_source = view.title_source.unwrap_or(TitleSource::AgentProvided);
+}
+
+/// Removes terminal-brand decorations accidentally persisted as conversation
+/// titles by older builds. User and Diri-assigned names are intentionally
+/// untouched; only titles attributed to the Agent/PTY are safe to repair.
+fn repair_persisted_agent_title(record: &mut SessionRecord) -> bool {
+    if record.title_source != TitleSource::AgentProvided {
+        return false;
+    }
+    match normalize_agent_title(&record.title)
+        .filter(|title| !is_generic_terminal_title(title, record))
+    {
+        Some(title) if title != record.title => {
+            record.title = title;
+            true
+        }
+        Some(_) => false,
+        None => {
+            record.title = record.kind.id().to_owned();
+            record.title_source = TitleSource::Placeholder;
+            true
+        }
+    }
+}
+
+fn fold_session_status(record: &mut SessionRecord, view: &SessionView) {
+    record.status.clone_from(&view.status);
+    record.needs_input.clone_from(&view.needs_input);
+}
+
+fn normalize_agent_title(title: &str) -> Option<String> {
+    let line = title.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let line = line.trim_start_matches(|character: char| {
+        character.is_whitespace() || (!character.is_alphanumeric() && character != '_')
+    });
+    let normalized = line
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(160)
+        .collect::<String>();
+    let normalized = normalized.trim();
+    (!normalized.is_empty()).then(|| normalized.to_owned())
+}
+
+fn is_generic_terminal_title(title: &str, record: &SessionRecord) -> bool {
+    let title = title.trim().to_ascii_lowercase();
+    let compact_title = title
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .collect::<String>();
+    let cwd = record.cwd.trim_end_matches('/').to_ascii_lowercase();
+    let directory = cwd.rsplit('/').next().unwrap_or(&cwd);
+    title == cwd
+        || title == directory
+        || matches!(
+            compact_title.as_str(),
+            "claude" | "claudecode" | "codex" | "cursor" | "gemini" | "terminal" | "shell"
+        )
+}
+
 fn not_found(id: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::NotFound, format!("no session {id}"))
 }
 
-/// Swift's `ProjectID(root:)`: FNV-1a-shaped hash over the root, low 48 bits
-/// as hex. The multiplier is Swift's literal `0x1000_0000_01b3` — NOT the
-/// classic FNV prime (one extra zero) — and must stay byte-identical or the
-/// same folder gets a second project id after an engine switch.
+/// Stable FNV-1a-shaped hash over a project location, truncated to 48 bits.
+/// The historical multiplier is intentionally retained so existing local
+/// project ids remain stable.
 fn project_id(root: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in root.bytes() {
@@ -695,6 +874,14 @@ fn project_id(root: &str) -> String {
         hash = hash.wrapping_mul(0x0000_1000_0000_01B3);
     }
     format!("p_{:012x}", hash & 0xFFFF_FFFF_FFFF)
+}
+
+/// Stable project identity for the directory and machine that own a Session.
+/// Local IDs remain compatible with `project.add`; remote IDs are namespaced
+/// by host id so identical paths on different machines never share a node.
+pub(crate) fn session_project_id(root: &str, host: Option<&str>) -> diri_proto::ProjectId {
+    let location = host.map_or_else(|| root.to_owned(), |host| format!("ssh\0{host}\0{root}"));
+    diri_proto::ProjectId(project_id(&location))
 }
 
 #[cfg(test)]
@@ -724,8 +911,8 @@ mod tests {
             last_seen_at: None,
             pinned: false,
             archived_at: None,
-            remote_active: false,
             host: None,
+            remote_persistence: None,
             hibernation: None,
             memory_bytes: None,
             artifacts: None,
@@ -736,8 +923,7 @@ mod tests {
     }
 
     fn engine() -> Arc<ManifestEngine> {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../Sources/DirijorCore/Resources/manifests")
+        let dir = crate::detect::bundled_manifest_dir()
             .canonicalize()
             .expect("manifests");
         let (engine, _) = ManifestEngine::load_dir(&dir).expect("load");
@@ -764,6 +950,53 @@ mod tests {
         let mut reloaded = Registry::new(engine(), &state_file);
         assert_eq!(reloaded.load().expect("load"), 1);
         assert_eq!(reloaded.records()[0].id.0, "s_1");
+    }
+
+    #[test]
+    fn loading_repairs_same_path_sessions_into_host_scoped_projects() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state_file = temp.path().join("state.json");
+        let mut forge = record("forge");
+        forge.cwd = "/srv/app".into();
+        forge.host = Some("forge".into());
+        let mut build = record("build");
+        build.cwd = "/srv/app".into();
+        build.host = Some("build".into());
+        let state = PersistedState::current(vec![forge, build], Vec::new());
+        std::fs::write(&state_file, serde_json::to_vec(&state).expect("encode")).expect("write");
+
+        let mut registry = Registry::new(engine(), &state_file);
+        registry.load().expect("load");
+        let records = registry.records();
+        assert_ne!(records[0].project_id, records[1].project_id);
+        assert_eq!(registry.projects_raw().len(), 2);
+    }
+
+    #[test]
+    fn loading_keeps_a_linked_worktree_under_its_project_root() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state_file = temp.path().join("state.json");
+        let project_root = "/workspace/app";
+        let project_id = session_project_id(project_root, None);
+        let mut worktree = record("worktree");
+        worktree.cwd = "/workspace/app-feature".into();
+        worktree.worktree_path = Some(worktree.cwd.clone());
+        worktree.project_id = project_id.clone();
+        let state = PersistedState::current(
+            vec![worktree],
+            vec![serde_json::json!({
+                "id": project_id.0,
+                "root": project_root,
+                "name": "app"
+            })],
+        );
+        std::fs::write(&state_file, serde_json::to_vec(&state).expect("encode")).expect("write");
+
+        let mut registry = Registry::new(engine(), &state_file);
+        registry.load().expect("load");
+        let loaded = registry.records().pop().expect("record");
+        assert_eq!(loaded.project_id, session_project_id(project_root, None));
+        assert_eq!(registry.projects_raw().len(), 1);
     }
 
     /// Interop against the state file the Swift daemon actually maintains.
@@ -844,8 +1077,7 @@ mod tests {
 
     #[test]
     fn unknown_projects_survive_a_write() {
-        // This engine has no project model yet. Dropping the key would erase
-        // the Swift daemon's projects the first time the Rust one persisted.
+        // Additive fields outside the minimal Project model are not discarded.
         let temp = tempfile::tempdir().expect("temp");
         let state_file = temp.path().join("state.json");
         std::fs::write(
@@ -861,5 +1093,114 @@ mod tests {
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&state_file).expect("read")).expect("parse");
         assert_eq!(raw["projects"][0]["name"], "keep me");
+    }
+
+    #[test]
+    fn project_identity_includes_the_execution_host() {
+        let local = session_project_id("/workspace/app", None);
+        let forge = session_project_id("/workspace/app", Some("forge"));
+        let build = session_project_id("/workspace/app", Some("build"));
+        assert_ne!(local, forge);
+        assert_ne!(forge, build);
+        assert_eq!(forge, session_project_id("/workspace/app", Some("forge")));
+    }
+
+    #[test]
+    fn live_claude_metadata_promotes_the_generated_conversation_title() {
+        let temp = tempfile::tempdir().expect("temp");
+        let transcript = temp.path().join("conversation.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"user\",\"message\":{\"content\":\"vague prompt\"}}\n\
+             {\"type\":\"ai-title\",\"aiTitle\":\"Repair remote session recovery\"}\n",
+        )
+        .expect("write transcript");
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let mut session = record("claude");
+        session.kind = AgentKind::CLAUDE_CODE;
+        session.title = "vague prompt".to_owned();
+        session.title_source = TitleSource::FirstPrompt;
+        registry.insert_record(session);
+
+        assert!(registry.apply_hook_metadata(
+            "claude",
+            &crate::hooks::HookMetadata {
+                transcript_path: Some(transcript.to_string_lossy().into_owned()),
+                ..crate::hooks::HookMetadata::default()
+            }
+        ));
+
+        let updated = registry.record("claude").expect("record");
+        assert_eq!(updated.title, "Repair remote session recovery");
+        assert_eq!(updated.title_source, TitleSource::AgentProvided);
+    }
+
+    #[test]
+    fn pty_titles_are_filtered_fallbacks_and_never_override_user_renames() {
+        let view = SessionView {
+            id: "claude".to_owned(),
+            status: SessionStatus::Working,
+            needs_input: None,
+            title: Some("Repair remote attach".to_owned()),
+            title_source: Some(TitleSource::AgentProvided),
+            tail_offset: 0,
+            exited: false,
+        };
+        let mut provisional = record("claude");
+        provisional.kind = AgentKind::CLAUDE_CODE;
+        fold_session_view(&mut provisional, &view);
+        assert_eq!(provisional.title, "Repair remote attach");
+        assert_eq!(provisional.title_source, TitleSource::AgentProvided);
+
+        let mut renamed = record("renamed");
+        renamed.kind = AgentKind::CLAUDE_CODE;
+        renamed.title = "My fixed title".to_owned();
+        renamed.title_source = TitleSource::UserRename;
+        fold_session_view(&mut renamed, &view);
+        assert_eq!(renamed.title, "My fixed title");
+
+        let mut first_prompt = record("first-prompt");
+        first_prompt.kind = AgentKind::CODEX;
+        first_prompt.title = "Initial vague request".to_owned();
+        first_prompt.title_source = TitleSource::FirstPrompt;
+        fold_session_view(&mut first_prompt, &view);
+        assert_eq!(first_prompt.title, "Repair remote attach");
+        assert_eq!(first_prompt.title_source, TitleSource::AgentProvided);
+
+        let mut captured_prompt = record("captured-prompt");
+        captured_prompt.kind = AgentKind::CODEX;
+        let prompt_view = SessionView {
+            title: Some("Implement terminal IME".to_owned()),
+            title_source: Some(TitleSource::FirstPrompt),
+            ..view.clone()
+        };
+        fold_session_view(&mut captured_prompt, &prompt_view);
+        assert_eq!(captured_prompt.title, "Implement terminal IME");
+        assert_eq!(captured_prompt.title_source, TitleSource::FirstPrompt);
+
+        let mut generic = record("generic");
+        generic.kind = AgentKind::CODEX;
+        generic.cwd = "/work/diri".to_owned();
+        let generic_view = SessionView {
+            title: Some("diri".to_owned()),
+            ..view
+        };
+        fold_session_view(&mut generic, &generic_view);
+        assert_eq!(generic.title_source, TitleSource::Placeholder);
+
+        let mut decorated = record("decorated");
+        decorated.kind = AgentKind::CLAUDE_CODE;
+        let decorated_view = SessionView {
+            title: Some("✳ Claude Code".to_owned()),
+            ..generic_view
+        };
+        fold_session_view(&mut decorated, &decorated_view);
+        assert_eq!(decorated.title_source, TitleSource::Placeholder);
+
+        decorated.title = "✳ Claude Code".to_owned();
+        decorated.title_source = TitleSource::AgentProvided;
+        assert!(repair_persisted_agent_title(&mut decorated));
+        assert_eq!(decorated.title, AgentKind::CLAUDE_CODE_ID);
+        assert_eq!(decorated.title_source, TitleSource::Placeholder);
     }
 }

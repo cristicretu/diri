@@ -236,6 +236,39 @@ fn startup_grace_holds_starting_until_something_definitive() {
 }
 
 #[test]
+fn an_idle_snapshot_inside_startup_grace_is_reconsidered_after_the_grace() {
+    for authority in [Authority::ScreenPrimary, Authority::HooksPrimary] {
+        let mut reducer = StatusReducer::new(authority, t0());
+
+        reducer.reduce(
+            StatusSignal::Screen(observation(ManifestState::Idle, 1)),
+            t0() + Duration::from_millis(100),
+        );
+        assert_eq!(*reducer.status(), SessionStatus::Starting);
+
+        let outcome = reducer.reduce(StatusSignal::Tick, t0() + Duration::from_secs(4));
+        assert_eq!(
+            outcome.status_change,
+            Some(SessionStatus::Idle),
+            "a reconnect snapshot may be the only screen frame after startup"
+        );
+    }
+}
+
+#[test]
+fn an_adopted_session_honors_its_first_snapshot_without_launch_grace() {
+    let mut reducer = StatusReducer::new(Authority::ScreenPrimary, t0());
+    reducer.finish_startup_grace(t0());
+
+    let outcome = reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::Idle, 1)),
+        t0(),
+    );
+
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+}
+
+#[test]
 fn a_working_screen_ends_startup_early_for_screen_primary_agents() {
     // Codex has no hooks, so a working screen is the definitive signal.
     let mut reducer = StatusReducer::new(Authority::ScreenPrimary, t0());

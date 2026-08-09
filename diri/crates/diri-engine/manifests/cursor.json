@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "id": "cursor",
+  "version": "rust-1",
+  "statusModel": "full",
+  "agent": {
+    "id": "cursor",
+    "displayName": "Cursor Agent",
+    "shortLabel": "Cursor",
+    "glyph": "cursorarrow",
+    "aliases": ["agent", "cursor-agent"],
+    "firstClass": true,
+    "statusAuthority": "screen",
+    "binary": "agent",
+    "resume": { "style": "flag", "token": "--resume" },
+    "envScrubPrefixes": ["CURSOR_", "DIRI_", "DIRIJOR_"],
+    "approve": { "text": "y", "submit": false },
+    "deny": { "text": "n", "submit": false }
+  },
+  "rules": [
+    {
+      "id": "command-approval",
+      "state": "blockedPermission",
+      "priority": 900,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 12,
+      "when": { "lineRegex": "(?i)(approve|allow|run).*(\\[y/n\\]|\\(y/n\\)|yes/no)" }
+    },
+    {
+      "id": "interrupt-hint-working",
+      "state": "working",
+      "priority": 500,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 5,
+      "when": { "contains": "esc to interrupt" }
+    },
+    {
+      "id": "composer-idle",
+      "state": "idle",
+      "priority": 100,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 5,
+      "when": { "any": [{ "contains": "Add a follow-up" }, { "contains": "Type a message" }] }
+    }
+  ]
+}

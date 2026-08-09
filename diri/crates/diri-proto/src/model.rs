@@ -671,12 +671,14 @@ pub struct SessionRecord {
     pub pinned: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<DateMillis>,
-    #[serde(default)]
-    pub remote_active: bool,
-    /// `HostEntry.id` when this session runs on a remote host (ssh+tmux);
+    /// `HostEntry.id` when this session runs through a remote PTY Holder;
     /// absent ⇒ local.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    /// Measured logout-survival mode for a remote Holder. It is never inferred
+    /// from platform alone; `non-persistent` is surfaced to callers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_persistence: Option<crate::remote_pty::PersistenceCapability>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hibernation: Option<HibernationInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]

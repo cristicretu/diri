@@ -13,9 +13,8 @@ use std::time::Duration;
 
 use diri_proto::HostEntry;
 
-use crate::hosts::{SSH_OPTIONS, run_shell};
+use crate::hosts::{SSH_OPTIONS, run_shell, shell_quote, shell_quote_path};
 use crate::inject::{claude_project_slug, claude_transcript_path};
-use crate::remote::{remote_tmux_session_name, shell_quote, shell_quote_path};
 
 /// A migrate failure the user can act on (preconditions, dirty trees) versus
 /// one they can't (plumbing).
@@ -358,27 +357,6 @@ pub fn shuttle_transcript(
     }
 }
 
-/// Best-effort: end the source-side tmux session after a remote→local
-/// migration so the host doesn't keep a zombie agent. Never fatal.
-pub fn kill_remote_tmux(host: &HostEntry, session_id: &str) -> Option<String> {
-    let name = remote_tmux_session_name(session_id);
-    let result = run_shell(
-        Some(host),
-        &format!(
-            "tmux kill-session -t {} 2>/dev/null || true",
-            shell_quote(&name)
-        ),
-        Duration::from_secs(15),
-    );
-    if result.map(|result| result.ok) != Some(true) {
-        return Some(format!(
-            "could not stop the tmux session on {} ({name}) — it may still be running there",
-            host.display_name()
-        ));
-    }
-    None
-}
-
 fn local_transcript(
     record_cwd: &str,
     recorded_path: Option<&str>,
@@ -530,13 +508,19 @@ mod tests {
         std::fs::create_dir_all(&origin).unwrap();
         git(&origin, &["init", "-q", "--bare", "-b", "main"]);
         let source = temp.path().join("source");
-        git(temp.path(), &["clone", "-q", origin.to_str().unwrap(), "source"]);
+        git(
+            temp.path(),
+            &["clone", "-q", origin.to_str().unwrap(), "source"],
+        );
         std::fs::write(source.join("file.txt"), "v1\n").unwrap();
         git(&source, &["add", "."]);
         git(&source, &["commit", "-q", "-m", "root"]);
         git(&source, &["push", "-q", "-u", "origin", "main"]);
         let target = temp.path().join("target");
-        git(temp.path(), &["clone", "-q", origin.to_str().unwrap(), "target"]);
+        git(
+            temp.path(),
+            &["clone", "-q", origin.to_str().unwrap(), "target"],
+        );
 
         // Dirty the source; prepare must WIP-commit, push, and sync target.
         std::fs::write(source.join("file.txt"), "wip changes\n").unwrap();
@@ -589,13 +573,19 @@ mod tests {
         std::fs::create_dir_all(&origin).unwrap();
         git(&origin, &["init", "-q", "--bare", "-b", "main"]);
         let source = temp.path().join("source");
-        git(temp.path(), &["clone", "-q", origin.to_str().unwrap(), "source"]);
+        git(
+            temp.path(),
+            &["clone", "-q", origin.to_str().unwrap(), "source"],
+        );
         std::fs::write(source.join("f"), "x").unwrap();
         git(&source, &["add", "."]);
         git(&source, &["commit", "-q", "-m", "root"]);
         git(&source, &["push", "-q", "-u", "origin", "main"]);
         let target = temp.path().join("target");
-        git(temp.path(), &["clone", "-q", origin.to_str().unwrap(), "target"]);
+        git(
+            temp.path(),
+            &["clone", "-q", origin.to_str().unwrap(), "target"],
+        );
         std::fs::write(target.join("f"), "target work in progress").unwrap();
 
         let error = prepare(
@@ -606,9 +596,6 @@ mod tests {
             "local",
         )
         .expect_err("dirty target must refuse");
-        assert!(
-            error.to_string().contains("uncommitted changes"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("uncommitted changes"), "{error}");
     }
 }

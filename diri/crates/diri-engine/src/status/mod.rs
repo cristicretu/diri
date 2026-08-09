@@ -207,6 +207,15 @@ impl StatusReducer {
         self.state.active_subagents.len()
     }
 
+    /// A Holder adoption is not a process launch. Its first authoritative
+    /// snapshot describes an already-running terminal and must not be delayed
+    /// by the new-process startup grace.
+    pub fn finish_startup_grace(&mut self, now: SystemTime) {
+        self.state.spawned_at = now
+            .checked_sub(self.timing.startup_grace)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+    }
+
     /// Folds one signal into the session's status.
     pub fn reduce(&mut self, signal: StatusSignal, now: SystemTime) -> ReducerOutcome {
         let mut outcome = ReducerOutcome::default();
@@ -580,6 +589,30 @@ impl StatusReducer {
     // MARK: Tick
 
     fn handle_tick(&mut self, now: SystemTime, outcome: &mut ReducerOutcome) {
+        // A reconnect/full snapshot can arrive entirely inside startup grace.
+        // `handle_screen` remembers that belief but intentionally does not
+        // publish it yet. If the screen then stays unchanged there is no
+        // second frame to revisit, so the session used to remain Starting
+        // forever. Reconsider the remembered non-blocker once grace expires.
+        if self.status == SessionStatus::Starting
+            && !self.state.skip_active
+            && now
+                .duration_since(self.state.spawned_at)
+                .unwrap_or_default()
+                >= self.timing.startup_grace
+        {
+            match self.state.screen_belief {
+                Some(ManifestState::Working) => self.go_working(now, false, outcome),
+                Some(ManifestState::Idle) => self.set_status(SessionStatus::Idle, outcome),
+                Some(
+                    ManifestState::BlockedPermission
+                    | ManifestState::BlockedQuestion
+                    | ManifestState::Skip,
+                )
+                | None => {}
+            }
+        }
+
         // Running but unreadable for long enough becomes unknown rather than a
         // confident lie.
         if self.status == SessionStatus::Working {

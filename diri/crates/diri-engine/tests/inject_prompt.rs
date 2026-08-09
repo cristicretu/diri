@@ -17,8 +17,7 @@ use diri_proto::ControlMessage;
 use serde_json::json;
 
 fn engine() -> Arc<ManifestEngine> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../Sources/DirijorCore/Resources/manifests")
+    let dir = diri_engine::detect::bundled_manifest_dir()
         .canonicalize()
         .expect("manifests");
     let (engine, _) = ManifestEngine::load_dir(&dir).expect("load");
@@ -65,10 +64,7 @@ impl Control {
 }
 
 fn start_server(temp: &Path) -> Arc<ControlServer> {
-    let registry = Arc::new(Mutex::new(Registry::new(
-        engine(),
-        temp.join("state.json"),
-    )));
+    let registry = Arc::new(Mutex::new(Registry::new(engine(), temp.join("state.json"))));
     let server = Arc::new(
         ControlServer::new(Arc::clone(&registry), temp.join("daemon.sock"))
             .with_logs_dir(temp.join("logs")),

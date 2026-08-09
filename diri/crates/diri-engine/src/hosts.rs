@@ -10,8 +10,6 @@ use std::time::Duration;
 
 use diri_proto::{HostEntry, HostSyncPrefsResult, PrefsSyncToolReport};
 
-use crate::remote::{shell_quote, shell_quote_path};
-
 pub const SSH_OPTIONS: [&str; 6] = [
     "-o",
     "BatchMode=yes",
@@ -20,6 +18,25 @@ pub const SSH_OPTIONS: [&str; 6] = [
     "-o",
     "StrictHostKeyChecking=accept-new",
 ];
+
+/// Single-quotes one value for a fixed POSIX-shell command.
+///
+/// Agent argv never passes through this helper. It exists only for the
+/// bounded host-maintenance commands in this module and `migrate`.
+pub(crate) fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// Quotes a path while keeping a leading `~` expandable by the remote shell.
+pub(crate) fn shell_quote_path(path: &str) -> String {
+    if path == "~" {
+        return path.to_string();
+    }
+    match path.strip_prefix("~/") {
+        Some(rest) => format!("~/{}", shell_quote(rest)),
+        None => shell_quote(path),
+    }
+}
 
 pub struct ShellOutput {
     pub ok: bool,
@@ -30,7 +47,11 @@ pub struct ShellOutput {
 
 /// Runs `command` on the host (or locally when `host` is None) with a hard
 /// timeout; the process is killed at the deadline.
-pub fn run_shell(host: Option<&HostEntry>, command: &str, timeout: Duration) -> Option<ShellOutput> {
+pub fn run_shell(
+    host: Option<&HostEntry>,
+    command: &str,
+    timeout: Duration,
+) -> Option<ShellOutput> {
     let mut argv: Vec<String> = match host {
         Some(host) => {
             let mut argv = vec!["ssh".to_string()];
@@ -179,12 +200,7 @@ fn sync_tool(spec: &ToolSpec, host: &HostEntry) -> PrefsSyncToolReport {
         .chain(SSH_OPTIONS)
         .collect::<Vec<_>>()
         .join(" ");
-    let mut args: Vec<String> = vec![
-        "-a".into(),
-        "--timeout=60".into(),
-        "-e".into(),
-        transport,
-    ];
+    let mut args: Vec<String> = vec!["-a".into(), "--timeout=60".into(), "-e".into(), transport];
     args.extend(
         present
             .iter()
@@ -269,10 +285,7 @@ pub fn normalize_git_url(url: &str) -> String {
 /// The origin URL of the repository containing `cwd` on `host` (None host =
 /// local). None when cwd isn't in a git repo or the repo has no origin.
 pub fn origin_of_cwd(cwd: &str, host: Option<&HostEntry>) -> Option<String> {
-    let command = format!(
-        "cd {} && git remote get-url origin",
-        shell_quote_path(cwd)
-    );
+    let command = format!("cd {} && git remote get-url origin", shell_quote_path(cwd));
     let result = run_shell(host, &command, Duration::from_secs(20))?;
     if !result.ok {
         return None;
@@ -393,6 +406,11 @@ mod tests {
             empty.path(),
         );
         assert_eq!(result.tools.len(), 2);
-        assert!(result.tools.iter().all(|tool| tool.ok && tool.synced.is_empty()));
+        assert!(
+            result
+                .tools
+                .iter()
+                .all(|tool| tool.ok && tool.synced.is_empty())
+        );
     }
 }

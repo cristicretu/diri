@@ -8,11 +8,10 @@ pub mod methods;
 pub mod model;
 pub mod node;
 pub mod paths;
-pub mod remote;
+pub mod remote_pty;
 
 pub use control::{ControlError, ControlMessage, JsonValue, WIRE_VERSION};
 pub use hosts::{HostEntry, HostNodeConfig, HostsConfig};
 pub use methods::*;
 pub use model::*;
 pub use node::*;
-pub use remote::RemoteConfig;

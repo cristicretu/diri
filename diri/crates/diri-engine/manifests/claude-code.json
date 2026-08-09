@@ -1,0 +1,90 @@
+{
+  "schemaVersion": 1,
+  "id": "claude-code",
+  "version": "rust-1",
+  "statusModel": "full",
+  "agent": {
+    "id": "claude-code",
+    "displayName": "Claude Code",
+    "shortLabel": "Claude",
+    "glyph": "sparkles",
+    "aliases": ["claude"],
+    "firstClass": true,
+    "statusAuthority": "hooks",
+    "binary": "claude",
+    "sessionIDFlag": "--session-id",
+    "injection": { "claudeHooks": true, "claudeMCP": true },
+    "resume": { "style": "flag", "token": "--resume" },
+    "env": { "CLAUDE_CODE_NO_FLICKER": "1" },
+    "envScrubPrefixes": ["CLAUDE_", "CLAUDECODE", "DIRI_", "DIRIJOR_"],
+    "approve": { "text": "1", "submit": true },
+    "deny": { "text": "\u001b", "submit": false }
+  },
+  "rules": [
+    {
+      "id": "transcript-viewer",
+      "state": "skip",
+      "priority": 1000,
+      "region": "whole_recent",
+      "regionLines": 30,
+      "when": { "contains": "Showing detailed transcript" }
+    },
+    {
+      "id": "permission-confirmation",
+      "state": "blockedPermission",
+      "priority": 900,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 12,
+      "when": {
+        "any": [
+          { "contains": "Do you want to proceed?" },
+          { "contains": "Allow this tool" },
+          { "contains": "Yes, and don't ask again" }
+        ]
+      },
+      "capture": { "region": "prompt_box_body", "regionLines": 10, "maxChars": 600 }
+    },
+    {
+      "id": "question-options",
+      "state": "blockedQuestion",
+      "priority": 800,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 12,
+      "when": {
+        "all": [
+          { "lineRegex": "^[[:space:]│]*[❯>]?[[:space:]]*1\\.[[:space:]]+" },
+          { "lineRegex": "^[[:space:]│]*[❯>]?[[:space:]]*2\\.[[:space:]]+" }
+        ]
+      },
+      "capture": { "region": "prompt_box_body", "regionLines": 10, "maxChars": 600 }
+    },
+    {
+      "id": "osc-working",
+      "state": "working",
+      "priority": 500,
+      "region": "osc_progress",
+      "when": { "progress": { "state": 1 } }
+    },
+    {
+      "id": "interrupt-hint-working",
+      "state": "working",
+      "priority": 400,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 5,
+      "when": { "contains": "esc to interrupt" }
+    },
+    {
+      "id": "composer-idle",
+      "state": "idle",
+      "priority": 100,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 5,
+      "when": {
+        "any": [
+          { "contains": "? for shortcuts" },
+          { "contains": "bypass permissions on" }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "id": "gemini",
+  "version": "rust-1",
+  "statusModel": "full",
+  "agent": {
+    "id": "gemini",
+    "displayName": "Gemini CLI",
+    "shortLabel": "Gemini",
+    "glyph": "sparkle",
+    "aliases": ["gemini"],
+    "firstClass": true,
+    "statusAuthority": "screen",
+    "binary": "gemini",
+    "resume": { "style": "flag", "token": "--resume" },
+    "envScrubPrefixes": ["GEMINI_", "DIRI_", "DIRIJOR_"],
+    "approve": { "text": "", "submit": true },
+    "deny": { "text": "\u001b", "submit": false }
+  },
+  "rules": [
+    {
+      "id": "tool-confirmation",
+      "state": "blockedPermission",
+      "priority": 900,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 14,
+      "when": {
+        "any": [
+          { "contains": "requires confirmation" },
+          { "contains": "Do you want to allow" },
+          { "contains": "Allow execution" }
+        ]
+      }
+    },
+    {
+      "id": "interrupt-hint-working",
+      "state": "working",
+      "priority": 500,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 5,
+      "when": { "any": [{ "contains": "esc to cancel" }, { "contains": "esc to interrupt" }] }
+    },
+    {
+      "id": "composer-idle",
+      "state": "idle",
+      "priority": 100,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 5,
+      "when": { "any": [{ "contains": "Type your message" }, { "contains": "gemini>" }] }
+    }
+  ]
+}

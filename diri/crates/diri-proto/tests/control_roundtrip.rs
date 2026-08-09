@@ -1,8 +1,9 @@
 use diri_proto::{
     AgentKind, AgentReadinessResult, AttachRequest, ClientRole, ControlMessage, DateMillis,
-    EventName, EventsSubscribeParams, ExitReason, Method, ReadScrollbackCellsResult,
-    SessionDiffBase, SessionId, SessionListResult, SessionReadDiffParams, SessionReadDiffResult,
-    SessionStatus, StateSnapshotResult, WorktreeListResult,
+    EventName, EventsSubscribeParams, ExitReason, HostInitializeParams, Method,
+    ReadScrollbackCellsResult, SessionDiffBase, SessionId, SessionListResult,
+    SessionReadDiffParams, SessionReadDiffResult, SessionStatus, StateSnapshotResult,
+    WorktreeListResult,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -132,6 +133,21 @@ fn additive_unknown_variants_fall_back_and_unknown_fields_are_ignored() {
 }
 
 #[test]
+fn host_initialization_defaults_to_non_destructive_version_ensure() {
+    let compatible: HostInitializeParams =
+        serde_json::from_value(json!({ "host": "forge" })).expect("old request shape");
+    assert_eq!(compatible.host, "forge");
+    assert!(!compatible.force_reinstall);
+
+    let reinstall: HostInitializeParams = serde_json::from_value(json!({
+        "host": "forge",
+        "forceReinstall": true
+    }))
+    .expect("reinstall request");
+    assert!(reinstall.force_reinstall);
+}
+
+#[test]
 fn epoch_milliseconds_and_swift_data_base64_round_trip() {
     let date: DateMillis = serde_json::from_str("1784728215930.502").unwrap();
     assert_eq!(
@@ -168,7 +184,6 @@ fn method_name_set_is_complete() {
         Method::SESSION_RESUME,
         Method::SESSION_SEND_TEXT,
         Method::SESSION_RESIZE,
-        Method::SESSION_SET_OWNER,
         Method::SESSION_READ_SCREEN,
         Method::SESSION_READ_SCROLLBACK,
         Method::SESSION_READ_SCROLLBACK_CELLS,
@@ -195,11 +210,12 @@ fn method_name_set_is_complete() {
         Method::TEST_RUN,
         Method::STATE_SNAPSHOT,
         Method::DAEMON_PREPARE_SHUTDOWN,
+        Method::DAEMON_SHUTDOWN_IF_IDLE,
         Method::DAEMON_SHUTDOWN,
     ];
     assert_eq!(methods.len(), 37);
     assert_eq!(methods[0], "hello");
-    assert_eq!(methods[36], "daemon.shutdown");
+    assert_eq!(methods.last().copied(), Some("daemon.shutdown"));
 }
 
 #[test]

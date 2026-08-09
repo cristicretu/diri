@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use diri_proto::frames::{Frame, FrameCodec, FrameType};
 
 use crate::registry::Registry;
-use crate::session::GridSignature;
+use crate::session::{AttachmentSeed, GridSignature};
 
 /// Burst ceiling for grid emission, matching the client pacer and the Swift
 /// daemon's flush interval. The first frame after quiet goes immediately.
@@ -69,28 +69,31 @@ impl AttachHub {
         // instantly from the emulator, and the live program resumes
         // underneath — the Swift attach() behavior.
         {
-            let Ok(mut guard) = registry.lock() else { return };
+            let Ok(mut guard) = registry.lock() else {
+                return;
+            };
             let _ = guard.wake_session(session_id);
         }
         // Seed before registering: the full snapshot must be the sink's first
         // frame, ahead of any diff the pump broadcasts.
-        {
+        let seed = {
             let Ok(guard) = registry.lock() else { return };
             let Some(session) = guard.get(session_id) else {
                 return; // unknown session: close, as the Swift daemon does
             };
-            let (full, (alt_screen, mouse)) = session.full_grid();
-            let Ok(grid_frame) = Frame::grid(&full) else {
+            let seed = session.attachment_seed();
+            let Ok(grid_frame) = Frame::grid(&seed.grid) else {
                 return;
             };
             if write_frame(&writer, &grid_frame).is_err() {
                 return;
             }
-            let _ = write_frame(&writer, &Frame::modes(alt_screen, mouse));
-        }
+            let _ = write_frame(&writer, &Frame::modes(seed.modes.0, seed.modes.1));
+            seed
+        };
 
         let sink_id = self.next_sink.fetch_add(1, Ordering::SeqCst);
-        self.register(registry, session_id, sink_id, Arc::clone(&writer));
+        self.register(registry, session_id, sink_id, Arc::clone(&writer), seed);
 
         // The read loop is this connection's thread. A feed error means a
         // corrupt stream; a false from handle_frame means the peer's write
@@ -144,12 +147,8 @@ impl AttachHub {
             }
             FrameType::Scroll => {
                 if let Some((direction, lines, col, row)) = frame.scroll_payload() {
-                    let _ = session.scroll(
-                        direction == 0,
-                        lines as usize,
-                        col as usize,
-                        row as usize,
-                    );
+                    let _ =
+                        session.scroll(direction == 0, lines as usize, col as usize, row as usize);
                 }
             }
             FrameType::Ping => {
@@ -167,6 +166,7 @@ impl AttachHub {
         session_id: &str,
         sink_id: u64,
         writer: Arc<Mutex<UnixStream>>,
+        seed: AttachmentSeed,
     ) {
         let mut sessions = self.sessions.lock().expect("attach hub");
         let entry = sessions.entry(session_id.to_string()).or_default();
@@ -181,7 +181,7 @@ impl AttachHub {
             let session_id = session_id.to_string();
             let _ = std::thread::Builder::new()
                 .name(format!("diri-attach-{session_id}"))
-                .spawn(move || hub.pump(&registry, &session_id));
+                .spawn(move || hub.pump(&registry, &session_id, seed));
         }
     }
 
@@ -202,22 +202,58 @@ impl AttachHub {
         }
     }
 
-    /// The per-session broadcast loop. Leading-edge paced: a change after
-    /// quiet is sent on the next 16ms tick; sustained output coalesces to the
-    /// same cadence. Ends when the last sink leaves.
-    fn pump(&self, registry: &Arc<Mutex<Registry>>, session_id: &str) {
-        let mut signature = GridSignature::default();
-        let mut last_modes: Option<(bool, bool)> = None;
+    /// The per-session broadcast loop. Grid writers wake it on change; bursts
+    /// coalesce to 16 ms, while a quiet attached terminal performs no Registry
+    /// or Screen polling. Ends within one bounded wait after the last sink.
+    fn pump(&self, registry: &Arc<Mutex<Registry>>, session_id: &str, seed: AttachmentSeed) {
+        let mut signature = seed.signature;
+        let mut last_modes = Some(seed.modes);
+        let mut wake = seed.wake;
+        let mut wake_generation = seed.wake_generation;
+        let mut last_emission = Instant::now()
+            .checked_sub(GRID_FLUSH_INTERVAL)
+            .unwrap_or_else(Instant::now);
         let stop = AtomicBool::new(false);
         loop {
-            let tick_started = Instant::now();
+            let next_generation = wake.wait_for_change(wake_generation, Duration::from_secs(1));
+            let mut changed = next_generation != wake_generation;
+            wake_generation = next_generation;
+
+            // A restart can replace the Session (and therefore its wake
+            // source) while sinks remain connected. The bounded wait above is
+            // the recovery ceiling; re-seed from the replacement immediately.
+            let replacement_wake = {
+                let Ok(guard) = registry.lock() else { break };
+                guard.get(session_id).map(|session| session.grid_wake())
+            };
+            if let Some(replacement) = replacement_wake
+                && !wake.same_source(&replacement)
+            {
+                wake = replacement;
+                wake_generation = wake.generation();
+                signature = GridSignature::default();
+                last_modes = None;
+                changed = true;
+            }
+
+            if changed {
+                let elapsed = last_emission.elapsed();
+                if elapsed < GRID_FLUSH_INTERVAL {
+                    std::thread::sleep(GRID_FLUSH_INTERVAL - elapsed);
+                }
+            }
             // The session may be briefly absent mid-restart adoption: keep
             // the sinks, send nothing until it is back.
-            let observed = {
+            let observed = if changed {
                 let Ok(guard) = registry.lock() else { break };
                 guard.get(session_id).map(|session| {
-                    (session.grid_update_if_changed(&mut signature), session.modes())
+                    (
+                        session.grid_update_if_changed(&mut signature),
+                        session.modes(),
+                    )
                 })
+            } else {
+                None
             };
 
             let mut frames: Vec<Frame> = Vec::with_capacity(2);
@@ -238,6 +274,7 @@ impl AttachHub {
             }
 
             if !frames.is_empty() {
+                last_emission = Instant::now();
                 let sinks: Vec<(u64, Arc<Mutex<UnixStream>>)> = {
                     let sessions = self.sessions.lock().expect("attach hub");
                     match sessions.get(session_id) {
@@ -274,18 +311,13 @@ impl AttachHub {
             if stop.load(Ordering::SeqCst) {
                 break;
             }
-
-            let elapsed = tick_started.elapsed();
-            if elapsed < GRID_FLUSH_INTERVAL {
-                std::thread::sleep(GRID_FLUSH_INTERVAL - elapsed);
-            }
         }
     }
 }
 
 fn write_frame(writer: &Arc<Mutex<UnixStream>>, frame: &Frame) -> std::io::Result<()> {
-    let bytes = FrameCodec::encode(frame)
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let bytes =
+        FrameCodec::encode(frame).map_err(|error| std::io::Error::other(error.to_string()))?;
     let mut stream = writer
         .lock()
         .map_err(|_| std::io::Error::other("writer poisoned"))?;

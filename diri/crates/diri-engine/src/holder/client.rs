@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use base64::Engine as _;
 
 use super::protocol::{
-    HolderLaunchSpec, HolderManagerRequest, HolderManagerResponse, HolderOperation, HolderProcessSample,
-    HolderRequest, HolderResponse, HolderStat,
+    HolderLaunchSpec, HolderManagerRequest, HolderManagerResponse, HolderOperation,
+    HolderProcessSample, HolderRequest, HolderResponse, HolderStat,
 };
 use super::socket;
 use super::{HolderError, HolderResult};
@@ -104,6 +104,12 @@ impl HolderManagerClient {
         self.request(&HolderManagerRequest::launch(spec.clone()))
     }
 
+    /// Stops the manager only after it has confirmed that no Holder thread is
+    /// active. A refusal is safe and leaves its normal 30-second grace intact.
+    pub fn shutdown_if_idle(&self) -> HolderResult<i32> {
+        self.request(&HolderManagerRequest::shutdown_if_idle())
+    }
+
     pub fn is_alive(&self) -> bool {
         self.ping().is_ok()
     }
@@ -114,12 +120,16 @@ impl HolderManagerClient {
         let response: HolderManagerResponse = socket::read_json_line(&mut stream)?;
         if !response.ok {
             return Err(HolderError::Rejected(
-                response.error.unwrap_or_else(|| "unknown manager error".into()),
+                response
+                    .error
+                    .unwrap_or_else(|| "unknown manager error".into()),
             ));
         }
         match response.manager_pid {
             Some(pid) if pid > 1 => Ok(pid),
-            _ => Err(HolderError::Transport("manager response omitted pid".into())),
+            _ => Err(HolderError::Transport(
+                "manager response omitted pid".into(),
+            )),
         }
     }
 }
