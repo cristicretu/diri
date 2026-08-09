@@ -1113,7 +1113,7 @@ const fn row_child_index(row: usize, first_section: Option<usize>) -> usize {
 /// A static caret. Blinking would need an autonomous frame timer, which is
 /// exactly what PERF.md's idle-CPU budget forbids; the terminal cursor is
 /// static for the same reason.
-const CARET: &str = "▏";
+pub(crate) const CARET: &str = "▏";
 
 /// Draw a query field's contents: caret at the cursor, or the selection washed
 /// in the brand accent. Shared by the palette, Quick Open, and the find bar so

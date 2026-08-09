@@ -16,7 +16,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use diri_proto::control::MAX_CONTROL_LINE_BYTES;
 use diri_proto::{ControlError, ControlMessage, JsonValue, Method, WIRE_VERSION};
@@ -2518,38 +2518,213 @@ fn is_claude_workspace_trust_screen(screen: &str) -> bool {
         && (normalized.contains("1.") || normalized.contains("1 "))
 }
 
-/// Types an initial prompt into a freshly spawned agent, gated on the TUI
-/// actually being ready and verified afterward. Ported from the Swift
-/// `AgentSession.injectInitialPrompt`: up to three attempts, each abandoned
-/// only when the screen shows no evidence at all that input landed — a
-/// changed screen means it did, and a second submit would duplicate it.
+/// Types an initial prompt into a freshly spawned agent.
+///
+/// The old shape of this — paste-and-Enter in one go, then call it settled
+/// the moment the screen changed at all — lost the prompt outright against
+/// Claude Code: its banner and tips repaint for seconds after bracketed-paste
+/// mode comes on, so the "screen changed" tell fired on a repaint while the
+/// composer had quietly discarded the keystrokes. The user typed a prompt,
+/// got a bare agent, and the prompt was gone.
+///
+/// So the Enter is no longer sent blind, and "it landed" is no longer
+/// inferred from the screen merely moving. Each attempt TYPES the prompt
+/// without submitting and watches for it to echo into the composer; if it
+/// does, the Enter follows a prompt we can see. If it does not — which also
+/// describes a line-mode reader that paints nothing before a newline — the
+/// Enter goes out anyway and the prompt itself must then appear on screen.
+/// Only when neither happens is the attempt treated as swallowed, and only
+/// then is anything retyped.
+///
+/// And it keeps trying. A first-run agent can sit on a trust dialog or a
+/// login for a minute before it has a composer at all (Codex asks whether it
+/// trusts the directory), which the old three-quick-tries shape treated as
+/// "prompt lost". The prompt is held rather than fired: a dialog does not
+/// echo what it is handed, so those attempts simply fail their check and come
+/// back a moment later, and the first attempt after the dialog closes is the
+/// one that lands. Nothing here consults the session's status — Codex reads
+/// as `Working` even at an idle composer, so the echo is the only tell worth
+/// trusting.
 fn inject_initial_prompt(registry: &Arc<Mutex<Registry>>, session_id: &str, prompt: &str) {
     if !wait_until_ready(registry, session_id) {
         return;
     }
-    let probe = verification_probe(prompt);
-    for _attempt in 0..3 {
-        let Some(view) = with_session(registry, session_id, |session| session.view()) else {
+    let give_up_at = Instant::now() + PROMPT_INJECTION_WINDOW;
+    loop {
+        let Some(before) = screen_text(registry, session_id) else {
             return;
         };
-        if view.exited {
+        // A word already on screen (a path in the banner, a word from the
+        // tips panel) proves nothing, so the probe is chosen against the
+        // pre-typing screen.
+        let probe = verification_probe(prompt, &before);
+        if with_session(registry, session_id, |session| session.paste_text(prompt)).is_none() {
             return;
         }
-        let Some(before) = with_session(registry, session_id, |session| {
-            session.screen_lines().join("\n")
-        }) else {
-            return;
-        };
-        let sent = with_session(registry, session_id, |session| {
-            session.send_text(prompt, true)
-        });
-        if sent.is_none() {
+        match wait_for_echo(registry, session_id, probe.as_deref(), &before, ECHO_WINDOW) {
+            EchoOutcome::Gone => return,
+            // The composer is holding our text: the Enter is safe.
+            EchoOutcome::Visible => {
+                submit_typed_prompt(registry, session_id, probe.as_deref());
+                return;
+            }
+            EchoOutcome::Missing => {}
+        }
+
+        // Nothing came back. Either the keystrokes were discarded, or this is
+        // a reader that paints nothing until it sees a newline (a line-mode
+        // shell with echo off). Submitting tells the two apart: the prompt
+        // shows up when it landed, and nothing shows up when it did not.
+        //
+        // This Enter is a keypress into something we cannot see, and some of
+        // those things are questions — Codex's "do you trust this directory?"
+        // reads Enter as yes. Nothing here can tell a line-mode reader from a
+        // dialog: both swallow a paste without repainting, and the difference
+        // is canonical vs raw mode, which lives in the holder's pty and not
+        // here. The old code sent this same blind Enter on every attempt, so
+        // the exposure is unchanged; narrowing it would need the holder to
+        // report termios.
+        if with_session(registry, session_id, |session| session.submit_input()).is_none() {
             return;
         }
-        if prompt_settled(registry, session_id, &probe, &before) {
+        match wait_for_echo(
+            registry,
+            session_id,
+            probe.as_deref(),
+            &before,
+            LANDED_WINDOW,
+        ) {
+            EchoOutcome::Gone | EchoOutcome::Visible => return,
+            EchoOutcome::Missing => {}
+        }
+
+        // Truly swallowed. Empty the composer before retyping so a late echo
+        // cannot concatenate with the retry.
+        if with_session(registry, session_id, |session| session.clear_input_line()).is_none() {
             return;
+        }
+        if !sleep_until(give_up_at, PROMPT_RETRY_DELAY) {
+            break;
         }
     }
+    eprintln!(
+        "dirijord: {session_id} never accepted its initial prompt within \
+         {}s — left untyped rather than submitted blind",
+        PROMPT_INJECTION_WINDOW.as_secs()
+    );
+}
+
+/// How long a prompt waits for a composer that will take it. Long enough to
+/// outlast a trust dialog or a first-run login, short enough that a session
+/// abandoned at a wall does not hold a thread forever.
+const PROMPT_INJECTION_WINDOW: Duration = Duration::from_secs(180);
+
+/// Quiet time between delivery attempts.
+const PROMPT_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Sleeps for `delay`, or reports false when that would pass `deadline`.
+fn sleep_until(deadline: Instant, delay: Duration) -> bool {
+    if Instant::now() + delay >= deadline {
+        return false;
+    }
+    std::thread::sleep(delay);
+    true
+}
+
+/// What the screen said about a prompt we just typed.
+enum EchoOutcome {
+    /// The prompt is visibly sitting in the composer: safe to submit.
+    Visible,
+    /// Nothing arrived; the composer can be cleared and the prompt retyped.
+    Missing,
+    /// The session exited or vanished — stop touching it.
+    Gone,
+}
+
+/// How long to watch for the prompt to echo back as it is typed, and how long
+/// to watch for it after submitting. The first is short because a TUI that
+/// renders its composer does so immediately; the second is longer because it
+/// covers a round trip through the agent.
+const ECHO_WINDOW: Duration = Duration::from_millis(1500);
+const LANDED_WINDOW: Duration = Duration::from_millis(2500);
+
+/// Polls for the typed prompt to appear on screen. With no usable probe —
+/// every word of the prompt was already on screen — any change from `before`
+/// is taken as the echo, which is the best signal available in that case.
+fn wait_for_echo(
+    registry: &Arc<Mutex<Registry>>,
+    session_id: &str,
+    probe: Option<&str>,
+    before: &str,
+    window: Duration,
+) -> EchoOutcome {
+    let polls = (window.as_millis() / 100).max(1);
+    for _ in 0..polls {
+        std::thread::sleep(Duration::from_millis(100));
+        let Some((exited, now)) = with_session(registry, session_id, |session| {
+            (session.view().exited, session.screen_lines().join("\n"))
+        }) else {
+            return EchoOutcome::Gone;
+        };
+        if exited {
+            return EchoOutcome::Gone;
+        }
+        let echoed = probe.map_or_else(|| now != before, |probe| now.contains(probe));
+        if echoed {
+            return EchoOutcome::Visible;
+        }
+    }
+    EchoOutcome::Missing
+}
+
+/// Presses Enter on a prompt already verified to be in the composer, and
+/// confirms the composer let go of it. A prompt still sitting there after the
+/// first Enter gets exactly one more — never a retype, which is what would
+/// double-send.
+fn submit_typed_prompt(registry: &Arc<Mutex<Registry>>, session_id: &str, probe: Option<&str>) {
+    for _ in 0..2 {
+        if with_session(registry, session_id, |session| session.submit_input()).is_none() {
+            return;
+        }
+        let Some(probe) = probe else {
+            return;
+        };
+        // Submitting moves the prompt out of the composer and into the
+        // transcript above it; either way the agent now owns it. Only a
+        // screen that never moved at all means the Enter was swallowed.
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(100));
+            match screen_text(registry, session_id) {
+                None => return,
+                Some(now)
+                    if !now.contains(probe) || agent_started_working(registry, session_id) =>
+                {
+                    return;
+                }
+                Some(_) => {}
+            }
+        }
+    }
+}
+
+/// True once the session's own status reducer says the agent is doing
+/// something — the prompt was received even if its text is still echoed in
+/// the transcript above the composer.
+fn agent_started_working(registry: &Arc<Mutex<Registry>>, session_id: &str) -> bool {
+    with_session(registry, session_id, |session| {
+        matches!(
+            session.view().status,
+            diri_proto::SessionStatus::Working | diri_proto::SessionStatus::NeedsInput(_)
+        )
+    })
+    .unwrap_or(false)
+}
+
+fn screen_text(registry: &Arc<Mutex<Registry>>, session_id: &str) -> Option<String> {
+    with_session(registry, session_id, |session| {
+        (!session.view().exited).then(|| session.screen_lines().join("\n"))
+    })
+    .flatten()
 }
 
 /// Waits until the agent can actually receive typed input. First for the
@@ -2586,9 +2761,12 @@ fn wait_until_ready(registry: &Arc<Mutex<Registry>>, session_id: &str) -> bool {
             return false;
         }
         if paste {
-            // One more frame so the composer finishes painting.
-            std::thread::sleep(Duration::from_millis(80));
-            return true;
+            // Paste mode says the input line exists; it does NOT say the TUI
+            // has stopped repainting over it. Claude Code turns paste mode on
+            // while its banner and tips panel are still landing, and anything
+            // typed into that window is discarded. Wait for the screen to
+            // hold still before treating the composer as real.
+            return screen_settled(registry, session_id);
         }
         if !text.trim().is_empty() && text == last_text {
             stable_ticks += 1;
@@ -2604,46 +2782,59 @@ fn wait_until_ready(registry: &Arc<Mutex<Registry>>, session_id: &str) -> bool {
     true
 }
 
-/// Polls the screen (≤ ~2s) for evidence the prompt was received. True as
-/// soon as the probe is visible OR the screen diverged from `before` —
-/// either means input landed, and a retry would duplicate the prompt. Only
-/// an entirely unchanged screen returns false → safe to retype.
-fn prompt_settled(
-    registry: &Arc<Mutex<Registry>>,
-    session_id: &str,
-    probe: &str,
-    before: &str,
-) -> bool {
-    for _ in 0..20 {
-        std::thread::sleep(Duration::from_millis(100));
-        let Some((exited, now)) = with_session(registry, session_id, |session| {
+/// Waits (≤ ~5s) for the screen to stop changing, so the prompt is typed into
+/// a composer that has finished being drawn over. True unless the session
+/// exited or vanished; a TUI that simply never goes quiet (an animated
+/// spinner in the banner) still gets its prompt, verified by the echo.
+fn screen_settled(registry: &Arc<Mutex<Registry>>, session_id: &str) -> bool {
+    let mut last = String::new();
+    let mut stable_ticks = 0;
+    for _ in 0..50 {
+        let Some((exited, text)) = with_session(registry, session_id, |session| {
             (session.view().exited, session.screen_lines().join("\n"))
         }) else {
-            return true; // session gone: don't retype into it
+            return false;
         };
         if exited {
-            return true; // dead pty: don't retype into it
+            return false;
         }
-        if !probe.is_empty() && now.contains(probe) {
-            return true;
+        if text == last {
+            stable_ticks += 1;
+            if stable_ticks >= 3 {
+                return true;
+            }
+        } else {
+            stable_ticks = 0;
+            last = text;
         }
-        if now != before {
-            return true;
-        }
+        std::thread::sleep(Duration::from_millis(100));
     }
-    false
+    true
 }
 
-/// A distinctive slice of the prompt to look for on screen: the first
-/// non-empty line, trimmed and capped short enough to survive composer
-/// wrapping or a transcript truncating a long prompt when it echoes back.
-fn verification_probe(prompt: &str) -> String {
-    let first_line = prompt
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or(prompt);
-    first_line.trim().chars().take(24).collect()
+/// A fragment of the prompt whose presence on screen means the composer
+/// received it.
+///
+/// It has to be a WHOLE word, not a leading slice: composers soft-wrap, and
+/// wrapping happens at word boundaries, so any prefix of the prompt can be
+/// split across two screen lines while a single word survives intact. It also
+/// has to be absent from `before`, or a word the banner already displays
+/// would read as an echo the instant we looked. `None` when the prompt offers
+/// nothing that qualifies — a prompt made entirely of words already on
+/// screen, or of words too long to escape wrapping.
+fn verification_probe(prompt: &str, before: &str) -> Option<String> {
+    prompt
+        .split_whitespace()
+        .filter(|word| (MIN_PROBE_CHARS..=MAX_PROBE_CHARS).contains(&word.chars().count()))
+        .filter(|word| !before.contains(*word))
+        .max_by_key(|word| word.chars().count())
+        .map(str::to_owned)
 }
+
+/// Short words appear by coincidence; long ones are the ones a narrow
+/// composer breaks mid-word.
+const MIN_PROBE_CHARS: usize = 4;
+const MAX_PROBE_CHARS: usize = 20;
 
 #[cfg(test)]
 mod tests {

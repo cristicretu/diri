@@ -1265,15 +1265,40 @@ impl Session {
         if !submit {
             return self.write_input(text.as_bytes());
         }
+        self.paste_text(text)?;
+        std::thread::sleep(Duration::from_millis(30));
+        self.submit_input()
+    }
+
+    /// Types `text` into the composer WITHOUT submitting it, framed as a
+    /// bracketed paste when the child has that mode on. Separated from
+    /// [`Self::send_text`] so a caller that cannot see the composer — the
+    /// initial-prompt injector — can watch the text echo back before it
+    /// commits to an Enter it can never take back.
+    ///
+    /// Titling happens here rather than at submit, so a prompt the injector
+    /// types names its session the same way one the user types does. It is
+    /// idempotent, which matters because the injector may retype.
+    pub fn paste_text(&self, text: &str) -> std::io::Result<()> {
         self.capture_prompt_title(text);
         let framed = if self.bracketed_paste() {
             format!("\x1b[200~{text}\x1b[201~")
         } else {
-            text.to_string()
+            text.to_owned()
         };
-        self.write_input(framed.as_bytes())?;
-        std::thread::sleep(Duration::from_millis(30));
+        self.write_input(framed.as_bytes())
+    }
+
+    /// The Enter that submits whatever is in the composer.
+    pub fn submit_input(&self) -> std::io::Result<()> {
         self.write_input(b"\r")
+    }
+
+    /// Kill-line (⌃U): what every one of these TUIs uses to empty its
+    /// composer. Sent before a retyped prompt so a half-landed first attempt
+    /// cannot concatenate with the second.
+    pub fn clear_input_line(&self) -> std::io::Result<()> {
+        self.write_input(b"\x15")
     }
 
     /// Sends bytes to the child, as if typed.
