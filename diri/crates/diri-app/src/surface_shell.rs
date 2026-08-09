@@ -19,8 +19,8 @@ use diri_ui::{
 };
 use gpui::{
     AnyElement, App, ClipboardItem, Context, CursorStyle, FocusHandle, Focusable, FontWeight,
-    IntoElement, KeyDownEvent, MouseButton, Render, Rgba, SharedString, Window, actions, deferred,
-    div, prelude::*, px, rgba,
+    IntoElement, KeyDownEvent, MouseButton, Render, Rgba, SharedString, Task, Window, actions,
+    deferred, div, prelude::*, px, rgba,
 };
 use tokio::runtime::Runtime;
 
@@ -181,6 +181,8 @@ pub struct UtilitySurfaces {
     runtime: Arc<Runtime>,
     updates: UpdateHandle,
     activity: String,
+    _update_changes: Task<()>,
+    _store_changes: Task<()>,
 }
 
 impl UtilitySurfaces {
@@ -215,7 +217,7 @@ impl UtilitySurfaces {
         };
         // The Settings pane renders update state it does not own, so it has to
         // be woken when that state moves.
-        {
+        let update_changes = {
             let mut states = updates.subscribe();
             cx.spawn(async move |this, cx| {
                 while states.changed().await.is_ok() {
@@ -224,11 +226,10 @@ impl UtilitySurfaces {
                     }
                 }
             })
-            .detach();
-        }
+        };
         // This view is `.cached()` in RootView, so ambient window redraws no
         // longer reach it: store changes must notify it directly.
-        {
+        let store_changes = {
             let mut changes = store_runtime.changes();
             cx.spawn(async move |this, cx| {
                 loop {
@@ -242,8 +243,7 @@ impl UtilitySurfaces {
                     }
                 }
             })
-            .detach();
-        }
+        };
         Self {
             focus,
             surface: if settings_preview.is_some() {
@@ -272,6 +272,8 @@ impl UtilitySurfaces {
             runtime,
             updates,
             activity: "Connected client · shared daemon remains untouched".to_owned(),
+            _update_changes: update_changes,
+            _store_changes: store_changes,
         }
     }
 
