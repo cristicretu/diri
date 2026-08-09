@@ -1048,7 +1048,11 @@ impl Render for NavigationOverlay {
             .on_action(cx.listener(Self::toggle_command_palette))
             .on_action(cx.listener(Self::toggle_quick_open))
             .on_key_down(cx.listener(Self::on_key_down))
-            .absolute();
+            .absolute()
+            // Cached entity roots are laid out independently, so insets alone
+            // leave this absolute root without a definite size and its height
+            // collapses to its in-flow content, which is nothing.
+            .size_full();
         if let Some(overlay) = overlay {
             root.inset_0().child(overlay)
         } else {
