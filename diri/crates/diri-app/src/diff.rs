@@ -144,8 +144,7 @@ pub fn load_worktree_diff_against(
         let path = OsString::from_vec(path.to_vec());
         #[cfg(not(unix))]
         let path = OsString::from(String::from_utf8_lossy(path).into_owned());
-        let output = Command::new("git")
-            .current_dir(&repo_root)
+        let output = git_command(&repo_root)
             .args([
                 "diff",
                 "--no-index",
@@ -350,11 +349,22 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    Command::new("git")
-        .current_dir(cwd)
+    git_command(cwd)
         .args(args)
         .output()
         .map_err(|error| DiffError::Git(error.to_string()))
+}
+
+fn git_command(cwd: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .current_dir(cwd)
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .env("LANGUAGE", "C")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    command
 }
 
 fn append_output(patch: &mut Vec<u8>, output: std::process::Output) -> Result<(), DiffError> {
@@ -452,6 +462,17 @@ mod tests {
             snapshot.rows.last().unwrap().text,
             "Diff truncated by the daemon"
         );
+    }
+
+    #[test]
+    fn internal_git_commands_pin_the_machine_readable_locale() {
+        let command = git_command(Path::new("/tmp"));
+        let environment = command
+            .get_envs()
+            .filter_map(|(key, value)| Some((key.to_str()?, value?.to_str()?)))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(environment.get("LC_ALL"), Some(&"C"));
+        assert_eq!(environment.get("LANG"), Some(&"C"));
     }
 
     #[test]

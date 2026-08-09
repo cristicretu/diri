@@ -2,6 +2,7 @@
 //!
 //! The behavior and per-agent answers carry over from the retired Swift client.
 
+use diri_proto::remote_pty::PersistenceCapability;
 use diri_proto::{
     AgentDescriptor, AgentKind, AttentionLevel, HibernationReason, NeedsInputKind, SessionId,
     SessionRecord,
@@ -288,6 +289,20 @@ pub fn transitions_for_update(
 ) -> Vec<StatusTransition> {
     let mut transitions = Vec::with_capacity(2);
 
+    let became_non_persistent = previous.and_then(|session| session.remote_persistence)
+        != Some(PersistenceCapability::NonPersistent)
+        && current.remote_persistence == Some(PersistenceCapability::NonPersistent);
+    if became_non_persistent {
+        let host = current.host.as_deref().unwrap_or("the remote host");
+        transitions.push(plain_banner(
+            "remote-non-persistent",
+            "Remote session cannot survive disconnects".to_owned(),
+            format!(
+                "{host} does not preserve detached user processes. Keep SSH connected or the Agent may exit."
+            ),
+        ));
+    }
+
     let was_memory_frozen = previous.is_some_and(|session| {
         session
             .hibernation
@@ -448,6 +463,25 @@ fn blocker_identity(detail: &diri_proto::NeedsInputDetail) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_persistent_remote_capability_is_user_visible_once() {
+        let mut current = session(AgentKind::CODEX, SessionStatus::Working);
+        current.host = Some("forge".to_owned());
+        current.remote_persistence = Some(PersistenceCapability::NonPersistent);
+
+        let first = transitions_for_update(None, &current, None, true, false, None);
+        let banner = first
+            .iter()
+            .find_map(|transition| transition.in_app_banner.as_ref())
+            .expect("non-persistent warning");
+        assert!(banner.title.contains("cannot survive"));
+        assert!(banner.body.contains("forge"));
+
+        assert!(
+            transitions_for_update(Some(&current), &current, None, true, false, None).is_empty()
+        );
+    }
     use diri_proto::{
         AgentKeystroke, DateMillis, NeedsInputDetail, NeedsInputSource, ProjectId, Resumability,
         RiskHint, SessionStatus, TitleSource,
@@ -484,8 +518,8 @@ mod tests {
             last_seen_at: None,
             pinned: false,
             archived_at: None,
-            remote_active: false,
             host: None,
+            remote_persistence: None,
             hibernation: None,
             memory_bytes: None,
             artifacts: None,

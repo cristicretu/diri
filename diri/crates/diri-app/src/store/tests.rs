@@ -46,8 +46,8 @@ fn session(value: &str, project: &str, created: f64) -> SessionRecord {
         last_seen_at: None,
         pinned: false,
         archived_at: None,
-        remote_active: false,
         host: None,
+        remote_persistence: None,
         hibernation: None,
         memory_bytes: None,
         artifacts: None,
@@ -590,6 +590,86 @@ fn close_confirmation_only_gates_running_sessions() {
 }
 
 #[test]
+fn a_real_process_exit_immediately_detaches_and_removes_the_agent() {
+    let (mut store, mut effects) = hydrated(
+        vec![session("one", "p", 1.0)],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    drain(&mut effects);
+
+    let mut exited = session("one", "p", 1.0);
+    exited.status = SessionStatus::Exited(ExitInfo {
+        reason: ExitReason::Exited,
+        code: Some(0),
+        signal: None,
+    });
+    store.upsert_session(exited);
+
+    let emitted = drain(&mut effects);
+    assert!(emitted.contains(&StoreEffect::DetachAttachment(id("one"))));
+    assert!(emitted.contains(&StoreEffect::Remove(id("one"))));
+    assert!(store.ordered_sessions().is_empty());
+}
+
+#[test]
+fn daemon_restart_exit_remains_available_for_automatic_resume() {
+    let (mut store, mut effects) = hydrated(
+        vec![session("one", "p", 1.0)],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    drain(&mut effects);
+
+    let mut restart = session("one", "p", 1.0);
+    restart.status = SessionStatus::Exited(ExitInfo {
+        reason: ExitReason::DaemonRestart,
+        code: None,
+        signal: None,
+    });
+    restart.resumability = Resumability::Resumable;
+    store.upsert_session(restart);
+
+    assert!(
+        !drain(&mut effects)
+            .iter()
+            .any(|effect| matches!(effect, StoreEffect::Remove(_)))
+    );
+}
+
+#[test]
+fn stale_directory_responses_cannot_overwrite_newer_navigation() {
+    let (mut store, mut effects) = SessionStore::headless(Prefs::default());
+    store.request_directory_listing(Some("forge".into()), "/srv".into());
+    let first = drain(&mut effects)
+        .into_iter()
+        .find_map(|effect| match effect {
+            StoreEffect::ListDirectories { request_id, .. } => Some(request_id),
+            _ => None,
+        })
+        .expect("first request");
+    store.request_directory_listing(Some("forge".into()), "/srv/app".into());
+    let second = drain(&mut effects)
+        .into_iter()
+        .find_map(|effect| match effect {
+            StoreEffect::ListDirectories { request_id, .. } => Some(request_id),
+            _ => None,
+        })
+        .expect("second request");
+
+    store.finish_directory_listing(first, Err("stale".into()));
+    assert_eq!(
+        store.directory_listing(Some("forge"), "/srv/app"),
+        Some(&super::DirectoryListingState::Loading)
+    );
+    store.finish_directory_listing(second, Err("latest".into()));
+    assert_eq!(
+        store.directory_listing(Some("forge"), "/srv/app"),
+        Some(&super::DirectoryListingState::Error("latest".into()))
+    );
+}
+
+#[test]
 fn a_closing_row_leaves_at_once_and_ignores_further_clicks() {
     let (mut store, mut effects) = hydrated(
         vec![session("one", "p", 2.0), session("two", "p", 1.0)],
@@ -646,7 +726,7 @@ fn prefs_round_trip_and_zoom_clamp() {
     let path = directory.path().join("nested/prefs.json");
     let prefs = Prefs {
         default_agent: DefaultAgent::Gemini,
-        last_spawn_host: Some("forge".to_owned()),
+        default_spawn_host: Some("forge".to_owned()),
         terminal_font_size: 19.5,
         window_placement: Some(WindowPlacement {
             display_uuid: Some("display-one".to_owned()),
@@ -676,6 +756,12 @@ fn prefs_round_trip_and_zoom_clamp() {
     assert_eq!(store.prefs.terminal_font_size, 10.0);
     store.reset_terminal_zoom().unwrap();
     assert_eq!(Prefs::load(&path).unwrap().terminal_font_size, 13.0);
+}
+
+#[test]
+fn legacy_last_spawn_host_migrates_to_the_explicit_default() {
+    let prefs: Prefs = serde_json::from_str(r#"{"lastSpawnHost":"forge"}"#).unwrap();
+    assert_eq!(prefs.default_spawn_host.as_deref(), Some("forge"));
 }
 
 #[test]
@@ -945,11 +1031,14 @@ fn remote_spawn_uses_host_default_cwd_and_drops_worktree() {
 }
 
 #[test]
-fn new_agent_target_remembers_the_last_spawn_instead_of_the_selected_session() {
+fn new_agent_target_uses_the_configured_default_instead_of_the_selected_session() {
     let (mut store, mut effects) = hydrated(
         vec![session("local", "p", 1.0)],
         vec![project("p", "P")],
-        Prefs::default(),
+        Prefs {
+            default_spawn_host: Some("forge".into()),
+            ..Prefs::default()
+        },
     );
     store.set_hosts(vec![diri_proto::HostEntry {
         id: "forge".into(),
@@ -961,24 +1050,44 @@ fn new_agent_target_remembers_the_last_spawn_instead_of_the_selected_session() {
     store.select(id("local"));
     drain(&mut effects);
 
-    store.spawn_kind(
-        AgentKind::CLAUDE_CODE,
-        super::SpawnOptions {
-            host: Some("forge".into()),
-            ..super::SpawnOptions::default()
-        },
-    );
-    drain(&mut effects);
-
     assert_eq!(
         store.begin_repo_targeting().as_deref(),
         Some("forge"),
-        "the + picker should remember where the last agent was opened"
+        "the picker should use the configured shortcut destination"
     );
 }
 
 #[test]
-fn spawning_persists_the_last_target_across_store_reloads() {
+fn top_level_shortcuts_spawn_on_the_configured_default_host() {
+    let (mut store, mut effects) = hydrated(
+        vec![session("local", "p", 1.0)],
+        vec![project("p", "P")],
+        Prefs {
+            default_spawn_host: Some("forge".into()),
+            ..Prefs::default()
+        },
+    );
+    store.set_hosts(vec![diri_proto::HostEntry {
+        id: "forge".into(),
+        name: Some("Forge".into()),
+        ssh: "cristi@forge".into(),
+        default_cwd: None,
+        node: None,
+    }]);
+    drain(&mut effects);
+
+    store.spawn_default(super::SpawnOptions::default());
+
+    let params = match effects.try_recv() {
+        Ok(StoreEffect::Spawn(params)) => params,
+        other => panic!("expected spawn effect, got {other:?}"),
+    };
+    assert_eq!(params.host.as_deref(), Some("forge"));
+    assert_eq!(params.cwd, "~");
+}
+
+#[test]
+fn selecting_a_default_host_persists_across_store_reloads() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("prefs.json");
     Prefs::default().save(&path).unwrap();
@@ -991,16 +1100,10 @@ fn spawning_persists_the_last_target_across_store_reloads() {
         node: None,
     }]);
 
-    store.spawn_kind(
-        AgentKind::CLAUDE_CODE,
-        super::SpawnOptions {
-            host: Some("forge".into()),
-            ..super::SpawnOptions::default()
-        },
-    );
+    store.set_default_spawn_host(Some("forge".into()));
 
     assert_eq!(
-        Prefs::load(&path).unwrap().last_spawn_host.as_deref(),
+        Prefs::load(&path).unwrap().default_spawn_host.as_deref(),
         Some("forge")
     );
 }
@@ -1087,7 +1190,7 @@ fn repo_targeting_tracks_the_selected_session_and_dedupes_requests() {
         vec![remote, session("two", "p", 1.0)],
         vec![project("p", "P")],
         Prefs {
-            last_spawn_host: Some("forge".into()),
+            default_spawn_host: Some("forge".into()),
             ..Prefs::default()
         },
     );
