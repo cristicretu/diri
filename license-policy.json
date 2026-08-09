@@ -21,7 +21,7 @@
     {
       "name": "SwiftTerm",
       "ecosystem": "SwiftPM",
-      "version": "1.13.0",
+      "version": "1.15.0",
       "license": "MIT",
       "source": "https://github.com/migueldeicaza/SwiftTerm"
     },
