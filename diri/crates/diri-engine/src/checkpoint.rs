@@ -15,13 +15,18 @@
 
 use std::path::Path;
 
-use diri_proto::grid::GridUpdate;
+use diri_proto::grid::{GridCell, GridRowCodec, GridUpdate};
 
-const CURRENT_VERSION: u64 = 1;
+// Version 1 persisted only the visible grid. Restoring it silently collapsed
+// every adopted session to at most one line of history, so it is deliberately
+// treated as a cache miss and rebuilt from the authoritative raw log.
+const CURRENT_VERSION: u64 = 2;
 
 /// A decoded checkpoint, grid already validated.
 pub struct ScreenCheckpoint {
     pub log_offset: u64,
+    /// Rows above the visible grid, oldest first.
+    pub history: Vec<Vec<GridCell>>,
     pub grid: GridUpdate,
     /// Partial exit-marker bytes that were pending when the checkpoint was
     /// taken; replaying resumes with them so a marker split across the
@@ -48,8 +53,24 @@ impl ScreenCheckpoint {
             return None;
         }
         let grid = GridUpdate::decode(as_data(dict.get("gridPayload")?)?).ok()?;
+        let history_payload = as_data(dict.get("historyPayload")?)?;
+        let history_row_count =
+            usize::try_from(dict.get("historyRowCount")?.as_unsigned_integer()?).ok()?;
+        // Every encoded row has at least its two-byte run count. Validate
+        // before the codec allocates from an untrusted plist integer.
+        if history_row_count > history_payload.len() / 2 {
+            return None;
+        }
+        let history = GridRowCodec::decode_rows(history_payload, history_row_count).ok()?;
+        if history
+            .iter()
+            .any(|row| row.len() != usize::from(grid.cols))
+        {
+            return None;
+        }
         Some(Self {
             log_offset: dict.get("logOffset")?.as_unsigned_integer()?,
+            history,
             grid,
             marker_buffer: as_data(dict.get("markerBuffer")?)?.to_vec(),
             alt_screen: dict.get("altScreen")?.as_boolean()?,
@@ -73,6 +94,20 @@ impl ScreenCheckpoint {
         dict.insert(
             "gridPayload".into(),
             plist::Value::Data(self.grid.encode().map_err(std::io::Error::other)?),
+        );
+        dict.insert(
+            "historyRowCount".into(),
+            plist::Value::Integer(
+                u64::try_from(self.history.len())
+                    .map_err(std::io::Error::other)?
+                    .into(),
+            ),
+        );
+        dict.insert(
+            "historyPayload".into(),
+            plist::Value::Data(
+                GridRowCodec::encode_rows(&self.history).map_err(std::io::Error::other)?,
+            ),
         );
         dict.insert(
             "markerBuffer".into(),
@@ -112,6 +147,7 @@ mod tests {
         let cells = vec![GridCell::BLANK; 4];
         ScreenCheckpoint {
             log_offset: 12345,
+            history: vec![vec![GridCell::BLANK; 4]],
             grid: GridUpdate {
                 cols: 4,
                 rows: 2,
@@ -136,6 +172,7 @@ mod tests {
 
         let loaded = ScreenCheckpoint::load(&path).expect("load");
         assert_eq!(loaded.log_offset, 12345);
+        assert_eq!(loaded.history, sample().history);
         assert_eq!(loaded.grid, sample().grid);
         assert_eq!(loaded.marker_buffer, vec![0x1b, b']']);
         assert!(loaded.alt_screen);
@@ -177,16 +214,20 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp");
         let path = dir.path().join("s_swift.screen.plist");
         let payload = sample().grid.encode().expect("encode");
+        let history_payload = GridRowCodec::encode_rows(&sample().history).expect("history");
         use base64::Engine as _;
         let base64 = base64::engine::general_purpose::STANDARD.encode(&payload);
+        let history_base64 = base64::engine::general_purpose::STANDARD.encode(&history_payload);
         let xml = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>version</key><integer>1</integer>
+    <key>version</key><integer>2</integer>
     <key>logOffset</key><integer>777</integer>
     <key>gridPayload</key><data>{base64}</data>
+    <key>historyRowCount</key><integer>1</integer>
+    <key>historyPayload</key><data>{history_base64}</data>
     <key>markerBuffer</key><data></data>
     <key>altScreen</key><false/>
     <key>bracketedPaste</key><true/>
@@ -208,6 +249,7 @@ mod tests {
 
         let loaded = ScreenCheckpoint::load(&path).expect("load Swift-shaped plist");
         assert_eq!(loaded.log_offset, 777);
+        assert_eq!(loaded.history, sample().history);
         assert_eq!(loaded.grid, sample().grid);
         assert!(loaded.bracketed_paste);
     }
@@ -232,7 +274,7 @@ mod tests {
             .expect("read back")
             .into_dictionary()
             .expect("dict");
-        dict.insert("version".into(), plist::Value::Integer(2.into()));
+        dict.insert("version".into(), plist::Value::Integer(3.into()));
         plist::Value::Dictionary(dict)
             .to_file_binary(&path)
             .expect("rewrite");
@@ -245,9 +287,11 @@ mod tests {
         future.grid.changed_rows.clear();
         future.grid.is_full_snapshot = true;
         let mut dict = plist::Dictionary::new();
-        dict.insert("version".into(), plist::Value::Integer(1.into()));
+        dict.insert("version".into(), plist::Value::Integer(2.into()));
         dict.insert("logOffset".into(), plist::Value::Integer(1.into()));
         dict.insert("gridPayload".into(), plist::Value::Data(vec![0xde, 0xad]));
+        dict.insert("historyRowCount".into(), plist::Value::Integer(0.into()));
+        dict.insert("historyPayload".into(), plist::Value::Data(Vec::new()));
         dict.insert("markerBuffer".into(), plist::Value::Data(Vec::new()));
         dict.insert("altScreen".into(), plist::Value::Boolean(false));
         dict.insert("bracketedPaste".into(), plist::Value::Boolean(false));
