@@ -36,6 +36,7 @@ pub enum InspectorTab {
     #[default]
     Info,
     Changes,
+    Code,
     Artifacts,
 }
 

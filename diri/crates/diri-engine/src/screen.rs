@@ -19,9 +19,9 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Term, TermMode};
-use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
+use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
 use diri_proto::grid::{ChangedRow, GridCell, GridRowCodec, GridUpdate, TermColor, TermStyle};
 
 use crate::detect::ScreenSnapshot;
@@ -287,6 +287,25 @@ impl HeadlessScreen {
         }
     }
 
+    /// Styled rows above the visible grid, oldest first. Checkpoints persist
+    /// these alongside the visible snapshot so adoption does not collapse a
+    /// long session to a single scrollback row.
+    pub fn history_snapshot(&self) -> Vec<Vec<GridCell>> {
+        let grid = self.term.grid();
+        let history = grid.history_size();
+        let cols = self.geometry.cols;
+        let mut rows = Vec::with_capacity(history);
+        for index in 0..history {
+            let line = Line(index as i32 - history as i32);
+            let mut row = Vec::with_capacity(cols);
+            for x in 0..cols {
+                row.push(wire_cell(&grid[line][Column(x)]));
+            }
+            rows.push(row);
+        }
+        rows
+    }
+
     /// Restores a persisted visible grid into a fresh emulator by
     /// synthesizing the byte stream that would have painted it. Ported from
     /// the Swift `HeadlessScreen.restore(checkpoint:)`: each non-blank cell
@@ -295,6 +314,7 @@ impl HeadlessScreen {
     /// cell — a naive row string would shift everything after it.
     pub fn restore(
         &mut self,
+        history: &[Vec<GridCell>],
         update: &GridUpdate,
         alt_screen: bool,
         bracketed_paste: bool,
@@ -306,8 +326,28 @@ impl HeadlessScreen {
             || update.cols as usize != cols
             || update.rows as usize != rows
             || update.changed_rows.len() != rows
+            || history.len() > history_line_limit(cols)
+            || history.iter().any(|row| row.len() != cols)
         {
             return false;
+        }
+
+        // Allocate scrollback in the emulator, then replace those rows with
+        // the persisted cells. The visible grid is painted below; CSI 2 J
+        // clears only that viewport and deliberately leaves history intact.
+        if !history.is_empty() {
+            let grid = self.term.grid_mut();
+            grid.scroll_up(&(Line(0)..Line(rows as i32)), history.len());
+            let restored_history = grid.history_size();
+            if restored_history != history.len() {
+                return false;
+            }
+            for (index, row) in history.iter().enumerate() {
+                let line = Line(index as i32 - restored_history as i32);
+                for (x, cell) in row.iter().enumerate() {
+                    grid[line][Column(x)] = emulator_cell(*cell);
+                }
+            }
         }
 
         let mut bytes = Vec::with_capacity(cols * rows * 2);
@@ -625,6 +665,52 @@ fn wire_style(flags: Flags) -> TermStyle {
     style
 }
 
+/// Inverse of [`wire_cell`] for checkpointed history rows. Grid history is
+/// not writable through terminal escape sequences without also perturbing the
+/// visible viewport, so restoring it directly is both exact and cheap.
+fn emulator_cell(cell: GridCell) -> Cell {
+    let mut flags = Flags::empty();
+    if cell.style.contains(TermStyle::BOLD) {
+        flags.insert(Flags::BOLD);
+    }
+    if cell.style.contains(TermStyle::UNDERLINE) {
+        flags.insert(Flags::UNDERLINE);
+    }
+    if cell.style.contains(TermStyle::INVERSE) {
+        flags.insert(Flags::INVERSE);
+    }
+    if cell.style.contains(TermStyle::INVISIBLE) {
+        flags.insert(Flags::HIDDEN);
+    }
+    if cell.style.contains(TermStyle::DIM) {
+        flags.insert(Flags::DIM);
+    }
+    if cell.style.contains(TermStyle::ITALIC) {
+        flags.insert(Flags::ITALIC);
+    }
+    if cell.style.contains(TermStyle::CROSSED_OUT) {
+        flags.insert(Flags::STRIKEOUT);
+    }
+    Cell {
+        c: char::from_u32(cell.scalar)
+            .filter(|_| cell.scalar != 0)
+            .unwrap_or(' '),
+        fg: emulator_color(cell.fg),
+        bg: emulator_color(cell.bg),
+        flags,
+        extra: None,
+    }
+}
+
+fn emulator_color(color: TermColor) -> Color {
+    match color {
+        TermColor::Default => Color::Named(NamedColor::Foreground),
+        TermColor::DefaultInverted => Color::Named(NamedColor::Background),
+        TermColor::Ansi(index) => Color::Indexed(index),
+        TermColor::Rgb(r, g, b) => Color::Spec(Rgb { r, g, b }),
+    }
+}
+
 /// The SGR sequence that reproduces a cell's attributes, mirroring the Swift
 /// `HeadlessScreen.sgr(for:)`.
 fn sgr(cell: &GridCell) -> String {
@@ -791,7 +877,10 @@ mod tests {
         let snapshot = original.full_snapshot();
 
         let mut restored = HeadlessScreen::new(40, 10);
-        assert!(restored.restore(&snapshot, false, true, true), "restorable");
+        assert!(
+            restored.restore(&[], &snapshot, false, true, true),
+            "restorable"
+        );
         assert_eq!(restored.lines(), original.lines());
         assert!(restored.bracketed_paste(), "bracketed paste mode carried");
         assert!(restored.mouse_reporting(), "mouse mode carried");
@@ -809,9 +898,25 @@ mod tests {
 
         let mut smaller = HeadlessScreen::new(39, 10);
         assert!(
-            !smaller.restore(&snapshot, false, false, false),
+            !smaller.restore(&[], &snapshot, false, false, false),
             "a checkpoint from another geometry is a cache miss"
         );
+    }
+
+    #[test]
+    fn a_restored_checkpoint_preserves_scrollback_history() {
+        let mut original = HeadlessScreen::new(12, 2);
+        original.feed(b"oldest\r\nmiddle\r\nvisible\r\n");
+        let history = original.history_snapshot();
+        let snapshot = original.full_snapshot();
+        assert_eq!(history.len(), 2, "the minimized repro has two history rows");
+
+        let mut restored = HeadlessScreen::new(12, 2);
+        assert!(
+            restored.restore(&history, &snapshot, false, false, false),
+            "restorable"
+        );
+        assert_eq!(restored.scrollback(), original.scrollback());
     }
 
     #[test]

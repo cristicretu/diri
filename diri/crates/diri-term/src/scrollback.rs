@@ -133,6 +133,17 @@ impl From<GridCodecError> for ScrollbackApplyError {
 #[derive(Clone, Debug, Default)]
 pub struct ScrollbackViewport {
     view_offset: i64,
+    /// Absolute row pinned to the top of the window while scrolled back.
+    ///
+    /// `view_offset` alone anchors the view to the *live edge*, so history
+    /// growing under a scrolled reader slid the window forward onto rows it
+    /// had not fetched — the view crawled while you were reading it, and every
+    /// response landed stale by however much output arrived during the round
+    /// trip. Past one screen per round trip that never converged: each
+    /// completion queued the next window and pumped it, forever, with the
+    /// wheel untouched. Pinning content instead makes `view_offset` a derived
+    /// value that grows as the live edge moves away.
+    anchor: Option<i64>,
     live_start_row: i64,
     total_rows: i64,
     geometry_known: bool,
@@ -203,8 +214,16 @@ impl ScrollbackViewport {
             return false;
         }
         self.view_offset = clamped;
+        self.sync_anchor();
         self.queue_missing_window(visible_rows);
         true
+    }
+
+    /// Re-pins the anchor to whatever content the window now shows. Returning
+    /// to live drops the anchor so the view follows the bottom again.
+    fn sync_anchor(&mut self) {
+        self.anchor =
+            (self.view_offset > 0).then(|| self.live_start_row.saturating_sub(self.view_offset));
     }
 
     pub fn scroll_by(&mut self, lines: i64, visible_rows: usize) -> bool {
@@ -347,7 +366,15 @@ impl ScrollbackViewport {
         self.live_start_row = live_start_row;
         self.total_rows = total_rows.max(0);
         self.geometry_known = true;
+        // Output that scrolls lines into history moves the live edge, not the
+        // content being read: hold the anchored row in place and let the
+        // distance to live grow instead. Without this the window slides onto
+        // unfetched rows and refetches for as long as output keeps flowing.
+        if let Some(anchor) = self.anchor {
+            self.view_offset = self.live_start_row.saturating_sub(anchor);
+        }
         self.view_offset = self.view_offset.clamp(0, self.max_offset(visible_rows));
+        self.sync_anchor();
         self.cap_cache_near_viewport();
         // Recompute rather than replaying a range queued against old geometry
         // or rows the just-completed request may already have filled.
@@ -381,6 +408,7 @@ impl ScrollbackViewport {
             return false;
         }
         self.view_offset = 0;
+        self.anchor = None;
         self.queued = None;
         true
     }
@@ -630,6 +658,116 @@ mod tests {
             546,
             "scrolling clamps at the oldest retained row"
         );
+    }
+
+    /// Drives fetch → complete → fetch with the wheel untouched, while the
+    /// session scrolls `lines_per_trip` new lines into history during each
+    /// round trip. Returns how many fetches it took to settle.
+    fn fetches_until_settled(lines_per_trip: i64, visible_rows: usize) -> usize {
+        const LIMIT: usize = 200;
+        let mut viewport = ScrollbackViewport::default();
+        let mut live_start = 2_000i64;
+        let mut seq = 1u64;
+        viewport.apply_geometry(
+            live_start,
+            live_start + visible_rows as i64,
+            seq,
+            visible_rows,
+        );
+        viewport.set_view_offset(300, visible_rows);
+
+        let mut fetches = 0;
+        while let Some(request) = viewport.begin_fetch(visible_rows) {
+            fetches += 1;
+            if fetches > LIMIT {
+                return fetches;
+            }
+            live_start += lines_per_trip;
+            seq += 1;
+            let total = live_start + visible_rows as i64;
+            let start = request.first_row.max(0).min(total);
+            let end = (start + request.max_rows.max(0)).min(total);
+            let rows: Vec<_> = (start..end).map(|_| row("history", 8)).collect();
+            viewport
+                .complete_fetch(
+                    ReadScrollbackCellsResult {
+                        payload: GridRowCodec::encode_rows(&rows).unwrap(),
+                        first_row: start,
+                        row_count: i64::try_from(rows.len()).unwrap(),
+                        total_rows: total,
+                        live_start_row: live_start,
+                        cols: 8,
+                        content_seq: seq,
+                    },
+                    visible_rows,
+                )
+                .unwrap();
+        }
+        fetches
+    }
+
+    #[test]
+    fn heavy_output_does_not_chain_fetches_under_a_still_finger() {
+        // Anchored to the live edge, any session emitting more than one screen
+        // per round trip left every response stale by more than its prefetch
+        // margin: the completion queued the next window and pumped it, without
+        // end. The cliff sat exactly at visible_rows.
+        for lines_per_trip in [0, 40, 77, 78, 200, 5_000] {
+            let fetches = fetches_until_settled(lines_per_trip, 77);
+            assert!(
+                fetches <= 2,
+                "{lines_per_trip} new lines per round trip chained {fetches} fetches"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scrolled_view_holds_its_content_as_the_live_edge_moves_away() {
+        let mut viewport = ScrollbackViewport::default();
+        viewport.apply_geometry(1_000, 1_040, 1, 40);
+        viewport.set_view_offset(100, 40);
+        let anchored = viewport.absolute_row(0);
+        assert_eq!(anchored, 900);
+
+        // 500 lines of build log land while the reader sits still.
+        viewport.apply_rows(Vec::new(), 0, 1_500, 1_540, 2, 40);
+
+        assert_eq!(
+            viewport.absolute_row(0),
+            anchored,
+            "the anchored row stays under the window"
+        );
+        assert_eq!(
+            viewport.view_offset(),
+            600,
+            "distance to live grows instead of the content sliding"
+        );
+    }
+
+    #[test]
+    fn returning_to_live_resumes_following_the_bottom() {
+        let mut viewport = ScrollbackViewport::default();
+        viewport.apply_geometry(1_000, 1_040, 1, 40);
+        viewport.set_view_offset(100, 40);
+        assert!(viewport.scroll_to_live(40));
+
+        viewport.apply_rows(Vec::new(), 0, 1_500, 1_540, 2, 40);
+        assert_eq!(viewport.view_offset(), 0, "live view still follows output");
+        assert_eq!(viewport.absolute_row(0), 1_500);
+    }
+
+    #[test]
+    fn an_anchor_older_than_retained_history_clamps_to_the_oldest_row() {
+        let mut viewport = ScrollbackViewport::default();
+        viewport.apply_geometry(1_000, 1_040, 1, 40);
+        viewport.set_view_offset(1_000, 40);
+        assert_eq!(viewport.absolute_row(0), 0);
+
+        // History is full: the live edge stops moving and old rows are evicted
+        // beneath the anchor. The view must stay inside what is retained.
+        viewport.apply_rows(Vec::new(), 0, 1_000, 1_040, 2, 40);
+        assert_eq!(viewport.view_offset(), 1_000);
+        assert!(viewport.view_offset() <= viewport.max_offset(40));
     }
 
     #[test]

@@ -14,7 +14,7 @@ use diri_proto::{
     Resumability, RiskHint, SessionArtifact, SessionId, SessionRecord, SessionStatus,
 };
 use diri_term::buffer::GridBuffer;
-use diri_term::element::{SharedGridBuffer, TerminalElement};
+use diri_term::element::{SharedGridBuffer, TerminalElement, TerminalReference};
 use diri_term::find::{FindSnapshot, SearchRequest, TerminalFindModel};
 use diri_term::keys::{
     Key as TermKey, KeyEvent as TermKeyEvent, Modifiers as TermModifiers, NamedKey, TermInputModes,
@@ -107,10 +107,15 @@ actions!(
     ]
 );
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalPaneEvent {
     ToggleSidebar,
     ToggleInspector,
+    OpenFileReference {
+        reference: String,
+        cwd: String,
+        session_id: SessionId,
+    },
 }
 
 pub fn bind_terminal_keys(cx: &mut App) {
@@ -2060,8 +2065,19 @@ impl TerminalPane {
                         return;
                     };
                     if event.modifiers.platform {
-                        if let Some(url) = resident.element.link_at(col, row) {
-                            cx.open_url(&url);
+                        match resident.element.reference_at(col, row) {
+                            Some(TerminalReference::Url(url)) => cx.open_url(&url),
+                            Some(TerminalReference::File(reference)) => {
+                                let Some(session) = this.selected_session() else {
+                                    return;
+                                };
+                                cx.emit(TerminalPaneEvent::OpenFileReference {
+                                    reference,
+                                    cwd: session.cwd.clone(),
+                                    session_id: session.id.clone(),
+                                });
+                            }
+                            None => {}
                         }
                         return;
                     }

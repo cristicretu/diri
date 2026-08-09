@@ -1,18 +1,25 @@
 mod clipboard_transfer;
+mod code_intelligence;
+mod code_viewer;
 #[cfg(unix)]
 mod daemon_launch;
 mod dev_build;
-mod diff;
+pub mod diff;
 pub mod fonts;
 pub mod fuzzy;
+mod git_review;
 pub mod history;
 mod inspector;
+mod launcher;
+pub mod markdown;
+mod markdown_view;
 pub mod navigation;
 pub mod notifications;
 pub mod palette;
 pub mod query_editor;
 pub mod quick_open;
 mod remote_access;
+pub mod review_prompt;
 pub mod root;
 pub mod seam;
 mod session_surfaces;
@@ -82,6 +89,7 @@ fn install_app_menus(cx: &mut App) {
         }
     });
     cx.bind_keys([
+        KeyBinding::new("cmd-n", root::OpenLauncher, None),
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-h", HideApp, None),
         KeyBinding::new("cmd-w", root::CloseSession, None),
@@ -95,6 +103,7 @@ fn install_app_menus(cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("Quit diri", Quit),
         ]),
+        Menu::new("File").items([MenuItem::action("New Session", root::OpenLauncher)]),
         Menu::new("Edit").items([
             MenuItem::os_action("Copy", terminal_pane::CopySelection, OsAction::Copy),
             MenuItem::os_action("Paste", terminal_pane::Paste, OsAction::Paste),

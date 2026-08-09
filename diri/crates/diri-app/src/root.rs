@@ -12,6 +12,7 @@ use gpui::{
 
 use crate::AppServices;
 use crate::inspector::{InspectorEvent, WorkbenchInspector};
+use crate::launcher::{LauncherEvent, LauncherOverlay};
 use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::{
     NavigationEvent, NavigationOverlay, ToggleCommandPalette, ToggleQuickOpen,
@@ -32,7 +33,7 @@ const WINDOW_BOUNDS_SAVE_DELAY: Duration = Duration::from_millis(150);
 #[cfg(target_os = "macos")]
 use crate::macos::{menu_bar::NativeMenuBar, notifier::NativeNotifier};
 
-actions!(diri, [CloseSession, ReopenSession]);
+actions!(diri, [CloseSession, ReopenSession, OpenLauncher]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NewSessionShortcut {
@@ -132,6 +133,7 @@ pub struct RootView {
     navigation: Option<Entity<NavigationOverlay>>,
     session_surfaces: Option<Entity<SessionSurfaces>>,
     utility_surfaces: Option<Entity<UtilitySurfaces>>,
+    launcher: Entity<LauncherOverlay>,
     inspector: Option<Entity<WorkbenchInspector>>,
     services: Arc<AppServices>,
     focus: FocusHandle,
@@ -214,6 +216,7 @@ impl RootView {
             let updates = services.updates.clone();
             cx.new(|cx| UtilitySurfaces::new(runtime, tokio, updates, window, cx))
         });
+        let launcher = cx.new(|cx| LauncherOverlay::new(Arc::clone(&services), preview, cx));
         let inspector = (!preview || preview_scenario == PreviewScenario::Artifacts).then(|| {
             let runtime = Arc::clone(&services.store);
             let tokio = Arc::clone(&services.tokio);
@@ -240,6 +243,15 @@ impl RootView {
                     this.sidebar.update(cx, |sidebar, cx| sidebar.toggle(cx));
                 }
                 TerminalPaneEvent::ToggleInspector => this.toggle_inspector(cx),
+                TerminalPaneEvent::OpenFileReference { reference, cwd, .. } => {
+                    let inspector = this.inspector.clone();
+                    this.reveal_inspector(cx);
+                    if let Some(inspector) = inspector {
+                        inspector.update(cx, |inspector, cx| {
+                            inspector.open_file_reference(cwd.clone(), reference.clone(), cx);
+                        });
+                    }
+                }
             })
             .detach();
         }
@@ -263,6 +275,21 @@ impl RootView {
             }
             cx.notify();
         })
+        .detach();
+        cx.subscribe_in(
+            &launcher,
+            window,
+            |this, _, _: &LauncherEvent, window, cx| {
+                if let Some(terminal) = &this.terminal {
+                    terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+                } else {
+                    window.focus(&this.focus, cx);
+                }
+                // The launcher is a main-pane destination, so closing it must
+                // make RootView swap the terminal branch back into the row.
+                cx.notify();
+            },
+        )
         .detach();
         if let Some(navigation) = &navigation {
             cx.subscribe(navigation, |this, _, event, cx| match event {
@@ -489,6 +516,7 @@ impl RootView {
             navigation,
             session_surfaces,
             utility_surfaces,
+            launcher,
             inspector,
             services,
             focus: cx.focus_handle(),
@@ -571,6 +599,18 @@ impl RootView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.launcher.read(cx).is_open() {
+            let reopen = event.keystroke.modifiers.platform
+                && event.keystroke.key == "n"
+                && !event.keystroke.modifiers.shift;
+            self.launcher.update(cx, |launcher, cx| {
+                launcher.handle_key_down(event, _window, cx);
+            });
+            if !reopen {
+                cx.stop_propagation();
+            }
+            return;
+        }
         if let Some(surfaces) = &self.utility_surfaces
             && surfaces.read(cx).is_open()
         {
@@ -968,6 +1008,19 @@ impl RootView {
             .update(cx, |sidebar, cx| sidebar.reopen_last(cx));
     }
 
+    fn open_launcher(&mut self, _: &OpenLauncher, window: &mut Window, cx: &mut Context<Self>) {
+        self.launcher
+            .update(cx, |launcher, cx| launcher.open(window, cx));
+        // Opening changes which main-pane branch RootView renders.
+        cx.notify();
+        // The launcher was not mounted while the terminal branch was active.
+        // Focus it on the next frame, after GPUI has installed its focus node.
+        let launcher = self.launcher.clone();
+        cx.defer_in(window, move |_, window, cx| {
+            launcher.update(cx, |launcher, cx| launcher.focus(window, cx));
+        });
+    }
+
     fn on_key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(surfaces) = &self.session_surfaces {
             surfaces.update(cx, |surfaces, cx| {
@@ -1221,6 +1274,13 @@ impl RootView {
 
     fn toggle_inspector(&mut self, cx: &mut Context<Self>) {
         self.set_inspector_open(!self.inspector_open, cx);
+    }
+
+    /// Source navigation is an explicit destination, so it must not be lost
+    /// behind the short debounce that protects repeated panel toggles.
+    fn reveal_inspector(&mut self, cx: &mut Context<Self>) {
+        self.inspector_toggled_at = None;
+        self.set_inspector_open(true, cx);
     }
 
     fn inspector_resize_handle(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1777,6 +1837,7 @@ impl RootView {
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = Self::colors(window);
+        let launcher_open = self.launcher.read(cx).is_open();
         let sidebar_visible = self.sidebar.read(cx).is_visible();
         let sidebar_width = self.sidebar.read(cx).width();
         let window_width = f32::from(window.inner_window_bounds().get_bounds().size.width);
@@ -1786,7 +1847,7 @@ impl Render for RootView {
         // The inspector's own width, whether or not it is currently shown --
         // the panel keeps painting at full width while it slides away.
         let inspector_panel_width = self.inspector_width.min(self.inspector_max_width);
-        let inspector_width = if self.inspector_open {
+        let inspector_width = if self.inspector_open && !launcher_open {
             inspector_panel_width
         } else {
             0.0
@@ -1841,6 +1902,7 @@ impl Render for RootView {
             .capture_key_up(cx.listener(Self::on_key_up))
             .on_action(cx.listener(Self::close_selected_session))
             .on_action(cx.listener(Self::reopen_last_session))
+            .on_action(cx.listener(Self::open_launcher))
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             // Fires for every move once the seam drag starts, wherever the
             // pointer wanders -- unlike hover-gated move listeners.
@@ -1860,8 +1922,26 @@ impl Render for RootView {
                 },
             ))
             .child(sidebar_wrapper)
-            .when(seam > 0.0, |root| root.child(self.resize_handle(cx)))
-            .child(self.terminal_card(
+            .when(seam > 0.0, |root| root.child(self.resize_handle(cx)));
+        if launcher_open {
+            // Command-N behaves like an unsaved new tab: preserve the app
+            // shell, but replace the live session pane instead of floating a
+            // dialog above it or manufacturing another session/tab up front.
+            root = root.child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .h_full()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .child(
+                        self.launcher
+                            .clone()
+                            .cached(StyleRefinement::default().size_full()),
+                    ),
+            );
+        } else {
+            root = root.child(self.terminal_card(
                 sidebar_visible,
                 seam,
                 inspector_width,
@@ -1869,6 +1949,7 @@ impl Render for RootView {
                 window,
                 cx,
             ));
+        }
         if inspector_seam > 0.0 {
             root = root.child(self.inspector_resize_handle(cx));
             if let Some(inspector) = &self.inspector {
