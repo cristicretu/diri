@@ -443,8 +443,9 @@ impl Registry {
     }
 
     /// SIGCONTs a hibernated session's tree, flushes any input queued while
-    /// it was frozen, and clears the record. A no-op for awake sessions, so
-    /// every input path can call it unconditionally.
+    /// it was frozen, and clears the record. A no-op for sessions whose
+    /// metadata and in-memory state both say awake, so hot input paths can
+    /// call it unconditionally.
     pub fn wake_session(&mut self, id: &str) -> std::io::Result<()> {
         let hibernated = self
             .records
@@ -454,12 +455,28 @@ impl Registry {
         if !hibernated {
             return Ok(());
         }
+        self.ensure_session_awake(id)
+    }
+
+    /// Reconciles a user-visible session with the OS process state even when
+    /// its hibernation metadata is stale or missing. Fresh data-channel
+    /// attaches call this once: SIGCONT is harmless for a running tree, and
+    /// it repairs the otherwise permanent "live record, stopped process"
+    /// state without putting a process-tree walk on every keystroke.
+    pub fn ensure_session_awake(&mut self, id: &str) -> std::io::Result<()> {
+        let known_hibernated = self
+            .records
+            .get(id)
+            .is_some_and(|record| record.hibernation.is_some())
+            || self.sessions.get(id).is_some_and(Session::is_hibernated);
         if let Some(session) = self.sessions.get(id) {
             session.signal_tree(libc::SIGCONT)?;
             // Flush AFTER the CONT so the tree is drinking again.
             let _ = session.set_hibernated(false);
         }
-        self.set_hibernation(id, None);
+        if known_hibernated {
+            self.set_hibernation(id, None);
+        }
         Ok(())
     }
 

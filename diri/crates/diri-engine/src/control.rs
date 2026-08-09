@@ -178,11 +178,16 @@ impl ControlServer {
             if first {
                 first = false;
                 if let Ok(attach) = serde_json::from_slice::<diri_proto::AttachRequest>(&line) {
-                    // Attaching means this session is visible. Record that
-                    // before waking the PR monitor so its immediate pass sees
-                    // the session as foreground/recent even if registration
-                    // has not completed yet.
+                    // Attaching means this session is visible. Reconcile the
+                    // actual process first: an adopted holder can be stopped
+                    // even when stale persisted metadata says it is awake.
+                    // This cold-boundary SIGCONT is harmless for a running
+                    // tree and keeps process-tree work off the keystroke path.
+                    // Recording visibility before waking the PR monitor keeps
+                    // its immediate pass seeing a foreground/recent session
+                    // even if registration has not completed yet.
                     if let Ok(mut registry) = self.registry.lock() {
+                        let _ = registry.ensure_session_awake(&attach.attach.0);
                         let _ = registry.mark_seen(&attach.attach.0);
                         let _ = registry.persist();
                         self.publish_updated(&registry, &attach.attach.0);

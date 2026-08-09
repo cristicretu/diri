@@ -904,6 +904,19 @@ public actor AgentSession {
         Task { await onHibernationChange(id, info) }
     }
 
+    /// A holder and its child outlive daemon restarts, so the process can be
+    /// stopped even when an old or partially-written record says it is awake.
+    /// A fresh attach is a cold boundary where one harmless SIGCONT tree walk
+    /// repairs that mismatch without adding work to every keystroke.
+    private func ensureAwakeForAttach() {
+        if lifeState == .hibernated {
+            wake()
+            return
+        }
+        guard lifeState == .running, exitInfo == nil, launched, let holder else { return }
+        _ = try? holder.signal(SIGCONT)
+    }
+
     /// ~120ms after wake, shrink the PTY one column and restore it: two
     /// SIGWINCHes that force a full TUI repaint (tmux-style reattach nudge).
     /// The emulator keeps its real geometry; only the kernel winsize wiggles.
@@ -1303,9 +1316,10 @@ public actor AgentSession {
         // Send the current modes to the newly attached sink (broadcasts only fire
         // on change, so a fresh sink would otherwise not learn the initial state).
         sink.deliver(.modes(altScreen: screen.isAltScreen, mouseReporting: screen.mouseReporting))
-        // Selecting a hibernated session paints instantly from the snapshot
-        // above; the live program resumes underneath.
-        if lifeState == .hibernated { wake() }
+        // Selecting reconciles the live process tree even if its persisted
+        // hibernation marker was lost; the program resumes underneath the
+        // snapshot painted above.
+        ensureAwakeForAttach()
         // Recompute geometry for the new ownership and publish any remoteActive flip.
         applyOwnership()
     }
