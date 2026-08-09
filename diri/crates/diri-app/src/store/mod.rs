@@ -31,7 +31,7 @@ use crate::switcher::{
 };
 
 pub use prefs::{DefaultAgent, InspectorTab, Prefs, WindowMode, WindowPlacement};
-pub use projection::{SidebarProject, SidebarProjection};
+pub use projection::{SidebarProject, SidebarProjection, SidebarRow};
 pub use residency::{ResidencyUpdate, TerminalResidency};
 
 pub const AUXILIARY_TERMINAL_TITLE: &str = "Terminal";
@@ -647,6 +647,114 @@ impl SessionStore {
         self.persist_preferences()
     }
 
+    /// Brings the persisted sidebar order back in line with what actually
+    /// exists: dead ids are dropped, and anything new is appended.
+    ///
+    /// This is what makes the order a *total* one. Before it existed the
+    /// comparator split rows into "manually ordered" and "everything else",
+    /// which had two visible costs: a new session sorted into the middle of
+    /// the list rather than the end, and a row dragged to the bottom of a
+    /// group snapped back above its unordered siblings on the next frame.
+    ///
+    /// New ids are appended in arrival order — the same order the projection
+    /// falls back to — so materialising the order never moves a single row.
+    /// Runs on membership changes only, and reports whether it wrote anything.
+    fn reconcile_sidebar_order(&mut self) -> bool {
+        let live_sessions: HashSet<&SessionId> = self.sessions.keys().collect();
+        let live_projects: HashSet<&ProjectId> = self.projects.keys().collect();
+        let mut arrivals: Vec<(f64, &SessionId)> = self
+            .sessions
+            .values()
+            .map(|session| (session.created_at.0, &session.id))
+            .collect();
+        arrivals.sort_by(|(left, left_id), (right, right_id)| {
+            left.total_cmp(right)
+                .then_with(|| left_id.0.cmp(&right_id.0))
+        });
+
+        // A project arrives with its oldest session, matching the projection.
+        let mut project_arrivals: HashMap<&ProjectId, f64> = HashMap::new();
+        for session in self.sessions.values() {
+            let arrival = project_arrivals
+                .entry(&session.project_id)
+                .or_insert(f64::INFINITY);
+            *arrival = arrival.min(session.created_at.0);
+        }
+        let mut projects: Vec<(f64, &ProjectId)> = self
+            .projects
+            .keys()
+            .map(|id| {
+                (
+                    project_arrivals.get(id).copied().unwrap_or(f64::INFINITY),
+                    id,
+                )
+            })
+            .collect();
+        projects.sort_by(|(left, left_id), (right, right_id)| {
+            left.total_cmp(right)
+                .then_with(|| left_id.0.cmp(&right_id.0))
+        });
+
+        let sessions = reconcile_order(
+            &self.prefs.sidebar_session_order,
+            &live_sessions,
+            arrivals.into_iter().map(|(_, id)| id),
+        );
+        let ordered_projects = reconcile_order(
+            &self.prefs.sidebar_project_order,
+            &live_projects,
+            projects.into_iter().map(|(_, id)| id),
+        );
+        // Collapse and pin state for rows that no longer exist would otherwise
+        // accumulate in prefs.json forever and reattach to a recycled id.
+        let collapsed_sessions =
+            retain_live(&self.prefs.sidebar_collapsed_sessions, &live_sessions);
+        let pinned_sessions = retain_live(&self.prefs.sidebar_pinned_sessions, &live_sessions);
+
+        let mut changed = false;
+        if let Some(order) = sessions {
+            self.prefs.sidebar_session_order = order;
+            changed = true;
+        }
+        if let Some(order) = ordered_projects {
+            self.prefs.sidebar_project_order = order;
+            changed = true;
+        }
+        if let Some(collapsed) = collapsed_sessions {
+            self.prefs.sidebar_collapsed_sessions = collapsed;
+            changed = true;
+        }
+        if let Some(pinned) = pinned_sessions {
+            self.prefs.sidebar_pinned_sessions = pinned;
+            changed = true;
+        }
+        if changed {
+            self.invalidate_projection();
+        }
+        changed
+    }
+
+    /// [`Self::reconcile_sidebar_order`] plus the one prefs write it earns.
+    /// Session membership changes at human speed, so this is not hot.
+    fn sync_sidebar_order(&mut self) {
+        if self.reconcile_sidebar_order() {
+            let _ = self.persist_preferences();
+        }
+    }
+
+    /// The manual session order, guaranteed to name every live session, for a
+    /// caller about to move one row within it.
+    pub fn sidebar_session_order(&mut self) -> Vec<SessionId> {
+        self.reconcile_sidebar_order();
+        self.prefs.sidebar_session_order.clone()
+    }
+
+    /// See [`Self::sidebar_session_order`].
+    pub fn sidebar_project_order(&mut self) -> Vec<ProjectId> {
+        self.reconcile_sidebar_order();
+        self.prefs.sidebar_project_order.clone()
+    }
+
     pub fn set_project_order(&mut self, order: Vec<ProjectId>) -> io::Result<()> {
         self.update_preferences(|prefs| prefs.sidebar_project_order = order)
     }
@@ -692,6 +800,43 @@ impl SessionStore {
         self.update_preferences(|prefs| {
             toggle_vec_member(&mut prefs.sidebar_collapsed_projects, id)
         })
+    }
+
+    /// Folds or unfolds a session's spawned children. Collapsing the ancestor
+    /// of the current selection would hide it, so the selection moves up to
+    /// the row doing the folding rather than disappearing under it.
+    pub fn toggle_session_collapsed(&mut self, id: SessionId) -> io::Result<()> {
+        let collapsing = !self.prefs.sidebar_collapsed_sessions.contains(&id);
+        if collapsing
+            && let Some(selected) = self.selected_session_id.clone()
+            && self.is_descendant_of(&selected, &id)
+        {
+            self.select(id.clone());
+        }
+        self.update_preferences(|prefs| {
+            toggle_vec_member(&mut prefs.sidebar_collapsed_sessions, id)
+        })
+    }
+
+    fn is_descendant_of(&self, candidate: &SessionId, ancestor: &SessionId) -> bool {
+        let mut seen = HashSet::from([candidate.clone()]);
+        let mut cursor = self
+            .sessions
+            .get(candidate)
+            .and_then(|session| session.parent.clone());
+        while let Some(node) = cursor {
+            if &node == ancestor {
+                return true;
+            }
+            if !seen.insert(node.clone()) {
+                return false;
+            }
+            cursor = self
+                .sessions
+                .get(&node)
+                .and_then(|session| session.parent.clone());
+        }
+        false
     }
 
     pub fn toggle_archive_expanded(&mut self, id: ProjectId) -> io::Result<()> {
@@ -770,6 +915,7 @@ impl SessionStore {
             self.selected_session_id = None;
         }
         self.invalidate_projection();
+        self.sync_sidebar_order();
         self.auto_select_if_needed();
         // A restored selection did not travel through `focus_session`, so it
         // still needs terminal residency before the pane can attach.
@@ -864,6 +1010,7 @@ impl SessionStore {
                     }
                     self.projects.insert(project.id.clone(), project);
                     self.invalidate_projection();
+                    self.sync_sidebar_order();
                     return StoreEventChange::Model;
                 }
             }
@@ -919,6 +1066,11 @@ impl SessionStore {
             }
         }
         self.invalidate_projection();
+        // Only membership moves the order, and a session record is republished
+        // on every title, status, and resource tick.
+        if is_new {
+            self.sync_sidebar_order();
+        }
         for transition in transitions {
             self.emit(StoreEffect::StatusTransition(transition));
         }
@@ -954,6 +1106,7 @@ impl SessionStore {
             self.emit(StoreEffect::DetachAttachment(id.clone()));
         }
         self.invalidate_projection();
+        self.sync_sidebar_order();
         self.reconcile_navigation();
     }
 
@@ -1559,8 +1712,7 @@ impl SessionStore {
             &self.closing,
         );
         projection
-            .ordered_sessions
-            .first()
+            .first_active()
             .map(|session| session.cwd.clone())
             .or_else(|| {
                 projection
@@ -1583,7 +1735,8 @@ impl SessionStore {
     fn focus_session(&mut self, id: SessionId) {
         let selection_changed = self.selected_session_id.as_ref() != Some(&id);
         self.selected_session_id = Some(id.clone());
-        if selection_changed || self.prefs.last_selected_session.as_ref() != Some(&id) {
+        let revealed = self.reveal(&id);
+        if selection_changed || revealed || self.prefs.last_selected_session.as_ref() != Some(&id) {
             self.prefs.last_selected_session = Some(id.clone());
             if let Err(error) = self.persist_preferences() {
                 eprintln!("diri: could not remember the selected session: {error}");
@@ -1636,8 +1789,7 @@ impl SessionStore {
         }
         let first = self
             .sidebar_projection()
-            .ordered_sessions
-            .first()
+            .first_active()
             .map(|session| session.id.clone());
         self.set_selected_survivor(first);
     }
@@ -1670,6 +1822,61 @@ impl SessionStore {
         self.overview.reconcile(&sessions);
     }
 
+    /// Unfolds whatever is hiding `id` so the selected row is on screen: its
+    /// project, every session up its spawn chain, and the archive bucket when
+    /// the row is parked. Reports whether anything actually moved.
+    ///
+    /// This is the invariant that keeps collapse honest. Without it ⌘J, the
+    /// switcher, and an MCP focus can all land on a row the user cannot see,
+    /// and the sidebar shows no selection at all while the workbench shows a
+    /// session — which reads as the app losing track of itself.
+    fn reveal(&mut self, id: &SessionId) -> bool {
+        let Some(session) = self.sessions.get(id).cloned() else {
+            return false;
+        };
+        let mut changed = false;
+        let project = session.project_id.clone();
+        if let Some(index) = self
+            .prefs
+            .sidebar_collapsed_projects
+            .iter()
+            .position(|candidate| candidate == &project)
+        {
+            self.prefs.sidebar_collapsed_projects.remove(index);
+            changed = true;
+        }
+        if session.is_archived() && !self.prefs.sidebar_expanded_archives.contains(&project) {
+            self.prefs.sidebar_expanded_archives.push(project);
+            changed = true;
+        }
+        // Walk up the spawn chain. `seen` guards against a cycle the daemon
+        // should never produce but which would spin here if it did.
+        let mut seen = HashSet::from([id.clone()]);
+        let mut cursor = session.parent.clone();
+        while let Some(ancestor) = cursor {
+            if !seen.insert(ancestor.clone()) {
+                break;
+            }
+            if let Some(index) = self
+                .prefs
+                .sidebar_collapsed_sessions
+                .iter()
+                .position(|candidate| candidate == &ancestor)
+            {
+                self.prefs.sidebar_collapsed_sessions.remove(index);
+                changed = true;
+            }
+            cursor = self
+                .sessions
+                .get(&ancestor)
+                .and_then(|record| record.parent.clone());
+        }
+        if changed {
+            self.invalidate_projection();
+        }
+        changed
+    }
+
     fn sidebar_visible_order(&mut self) -> Vec<SessionId> {
         let expanded: HashSet<_> = self
             .prefs
@@ -1681,14 +1888,14 @@ impl SessionStore {
             .projects
             .iter()
             .flat_map(|group| {
-                group.sessions.iter().chain(
+                group.sessions.iter().map(|row| row.id().clone()).chain(
                     group
                         .archived
                         .iter()
-                        .filter(|_| expanded.contains(&group.project.id)),
+                        .filter(|_| expanded.contains(&group.project.id))
+                        .map(|session| session.id.clone()),
                 )
             })
-            .map(|session| session.id.clone())
             .collect()
     }
 
@@ -1710,6 +1917,47 @@ fn attention_rank(attention: &AttentionLevel) -> u8 {
         AttentionLevel::DoneUnseen => 3,
         AttentionLevel::NeedsInput => 4,
     }
+}
+
+/// Drops ids that no longer exist and appends the ones the order has not seen,
+/// in `arriving` order. Returns `None` when the order already agreed, so a
+/// caller can skip a prefs write on the overwhelmingly common no-op.
+fn reconcile_order<'a, T>(
+    order: &[T],
+    live: &HashSet<&T>,
+    arriving: impl Iterator<Item = &'a T>,
+) -> Option<Vec<T>>
+where
+    T: Clone + Eq + std::hash::Hash + 'a,
+{
+    let mut next: Vec<T> = order
+        .iter()
+        .filter(|id| live.contains(id))
+        .cloned()
+        .collect();
+    let known: HashSet<&T> = order.iter().collect();
+    let appended: Vec<T> = arriving
+        .filter(|id| !known.contains(*id))
+        .cloned()
+        .collect();
+    if next.len() == order.len() && appended.is_empty() {
+        return None;
+    }
+    next.extend(appended);
+    Some(next)
+}
+
+/// Prunes ids that no longer exist, or `None` when there was nothing to prune.
+fn retain_live<T: Clone + Eq + std::hash::Hash>(
+    values: &[T],
+    live: &HashSet<&T>,
+) -> Option<Vec<T>> {
+    let kept: Vec<T> = values
+        .iter()
+        .filter(|id| live.contains(id))
+        .cloned()
+        .collect();
+    (kept.len() != values.len()).then_some(kept)
 }
 
 fn toggle_vec_member<T: PartialEq>(values: &mut Vec<T>, value: T) {

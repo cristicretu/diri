@@ -13,6 +13,10 @@ pub enum DragItem {
     Session {
         id: SessionId,
         project: ProjectId,
+        /// The session that spawned this one, so a drop can tell a sibling
+        /// from a cousin. Reordering only ever moves a row inside its own
+        /// sibling run; re-parenting is the daemon's business, not a drag's.
+        parent: Option<SessionId>,
         archived: bool,
     },
     Sessions(Vec<SessionId>),

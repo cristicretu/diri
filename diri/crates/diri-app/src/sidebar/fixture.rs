@@ -198,6 +198,9 @@ tokio::spawn(async move { clone_repository(request).await });
             occurred_at: DateMillis(now - 45_000.0),
         })
         .into();
+        // Two agents the Codex session spawned for itself, so the preview
+        // exercises the indent rail with one continuing and one terminating
+        // segment, plus a second level under the first child.
         let cursor: SessionRecord = session(
             "preview-cursor",
             AgentKind::CURSOR,
@@ -207,8 +210,32 @@ tokio::spawn(async move { clone_repository(request).await });
             Some("fix/focus-neighbor"),
             now - minutes(68.0),
         )
+        .child_of(&codex.id)
         .completed(now - 90_000.0)
         .seen(now - minutes(12.0))
+        .into();
+        let spawned_review: SessionRecord = session(
+            "preview-spawned-review",
+            AgentKind::CLAUDE_CODE,
+            &dirijor,
+            "Review the projection tests",
+            SessionStatus::Working,
+            Some("sidebar-craft"),
+            now - minutes(6.0),
+        )
+        .child_of(&codex.id)
+        .into();
+        let spawned_deep: SessionRecord = session(
+            "preview-spawned-deep",
+            AgentKind::CODEX,
+            &dirijor,
+            "Check the rail geometry",
+            SessionStatus::Idle,
+            Some("sidebar-craft"),
+            now - minutes(3.0),
+        )
+        .child_of(&cursor.id)
+        .seen(now - minutes(1.0))
         .into();
         let shell: SessionRecord = session(
             "preview-shell",
@@ -292,6 +319,8 @@ tokio::spawn(async move { clone_repository(request).await });
             codex.clone(),
             claude.clone(),
             cursor.clone(),
+            spawned_review,
+            spawned_deep,
             shell,
             gemini,
             question,
@@ -341,7 +370,7 @@ tokio::spawn(async move { clone_repository(request).await });
         let mut prefs = Prefs {
             sidebar_project_order: vec![dirijor.id.clone(), anara.id.clone(), settings.id.clone()],
             sidebar_session_order: sessions.iter().map(|session| session.id.clone()).collect(),
-            sidebar_pinned_sessions: vec![claude.id.clone(), cursor.id.clone()],
+            sidebar_pinned_sessions: vec![claude.id.clone()],
             sidebar_collapsed_projects: vec![anara.id.clone()],
             sidebar_expanded_archives: vec![settings.id.clone()],
             ..Prefs::default()
@@ -418,6 +447,13 @@ impl SessionBuilder {
         self.0.listening_ports = Some(ports);
         self
     }
+
+    /// Marks this session as spawned by another through the MCP tools, which
+    /// is what nests it under that row in the sidebar.
+    fn child_of(mut self, parent: &SessionId) -> Self {
+        self.0.parent = Some(parent.clone());
+        self
+    }
 }
 
 impl From<SessionBuilder> for SessionRecord {
@@ -491,8 +527,8 @@ mod tests {
     fn typical_fixture_matches_swift_counts_and_preferences() {
         let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
         assert_eq!(fixture.list.projects.len(), 3);
-        assert_eq!(fixture.list.sessions.len(), 8);
-        assert_eq!(fixture.prefs.sidebar_pinned_sessions.len(), 2);
+        assert_eq!(fixture.list.sessions.len(), 10);
+        assert_eq!(fixture.prefs.sidebar_pinned_sessions.len(), 1);
         assert_eq!(fixture.prefs.sidebar_collapsed_projects.len(), 1);
         assert_eq!(fixture.prefs.sidebar_expanded_archives.len(), 1);
     }
@@ -500,13 +536,40 @@ mod tests {
     #[test]
     fn stress_fixture_adds_three_edge_cases() {
         let fixture = SidebarPreviewFixture::make(PreviewScenario::Stress);
-        assert_eq!(fixture.list.sessions.len(), 11);
+        assert_eq!(fixture.list.sessions.len(), 13);
         assert!(
             fixture
                 .list
                 .sessions
                 .iter()
                 .any(|session| { session.title.starts_with("Investigate why exceptionally") })
+        );
+    }
+
+    #[test]
+    fn typical_fixture_carries_a_two_level_spawn_tree() {
+        let mut store = SidebarPreviewFixture::make(PreviewScenario::Typical).into_store();
+        let projection = store.sidebar_projection();
+        let group = projection
+            .projects
+            .iter()
+            .find(|group| group.project.id == ProjectId::new("preview-dirijor"))
+            .expect("the dirijor group");
+        let nested: Vec<_> = group
+            .sessions
+            .iter()
+            .map(|row| (row.id().0.as_str(), row.depth))
+            .collect();
+        assert_eq!(
+            nested,
+            vec![
+                ("preview-claude", 0),
+                ("preview-codex", 0),
+                ("preview-cursor", 1),
+                ("preview-spawned-deep", 2),
+                ("preview-spawned-review", 1),
+                ("preview-shell", 0),
+            ]
         );
     }
 
@@ -536,6 +599,6 @@ mod tests {
             store.selected_session_id(),
             Some(&SessionId::new("preview-codex"))
         );
-        assert_eq!(store.sessions().len(), 8);
+        assert_eq!(store.sessions().len(), 10);
     }
 }
