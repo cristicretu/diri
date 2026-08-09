@@ -13,6 +13,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::accounts::{AccountStore, now_seconds};
+use crate::config::hex_encode;
 use crate::error::{NodeError, NodeResult};
 
 pub struct UsageLedger {
@@ -424,7 +425,7 @@ fn transcript_event_id(path: &Path, offset: u64, value: &Value) -> String {
     if let Some(provider_id) = provider_id {
         digest.update(provider_id.as_bytes());
     }
-    format!("transcript:{:x}", digest.finalize())
+    format!("transcript:{}", hex_encode(&digest.finalize()))
 }
 
 fn event_timestamp(value: &Value) -> Option<i64> {

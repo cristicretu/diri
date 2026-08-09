@@ -606,7 +606,7 @@ fn sha256_file(path: &Path) -> NodeResult<String> {
         }
         digest.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(hex_encode(&digest.finalize()))
 }
 
 fn find_provider_state(
