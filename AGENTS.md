@@ -4,18 +4,19 @@
 
 These instructions apply to the whole repository. The active architecture decision baseline for remote work is `diri/REMOTE_PORT.md`; read it before changing remote session behavior, SSH handling, PTYs, holders, terminal state, or packaging.
 
-## Remote refactor baseline
+## Completed remote architecture baseline
 
-- Implement the remote refactor entirely in the Rust workspace under `diri/`.
+- The remote refactor is complete. Maintain the bootstrapped Remote PTY Holder as Diri's only remote session transport; future remote work extends this architecture rather than reopening the transport migration.
+- Implement and maintain remote behavior entirely in the Rust workspace under `diri/`.
 - For remote-refactor decisions, treat `Sources/`, `Package.swift`, and Swift tests as nonexistent. Do not inspect them for behavior, port from them, modify them, add Swift compatibility adapters, or use Swift build/test results as evidence.
 - Existing Rust behavior is the implementation baseline. Historical comments about Swift compatibility do not create new requirements.
-- Delete the current Rust SSH + `tmux` transport during phase zero. Do not preserve it as `legacy_tmux`, a feature flag, or a runtime fallback. Until the new transport passes acceptance, remote operations must fail explicitly with `remote_transport_unavailable`.
+- The former Rust SSH + `tmux` transport has been deleted. Never reintroduce it as `legacy_tmux`, a feature flag, a migration path, or a runtime fallback. Missing, corrupt, unsupported, or capability-incompatible Helper artifacts must fail closed with a structured error; an unavailable packaged transport reports `remote_transport_unavailable`.
 - When implementation and `diri/REMOTE_PORT.md` disagree, stop and resolve the design mismatch explicitly instead of silently choosing one.
 
 ## Rust workspace map
 
-- `diri/crates/diri-engine`: authoritative local session engine, PTY/holder lifecycle, status reduction, host orchestration, and the new remote bootstrap/SSH seam. The legacy remote transport has been removed.
-- `diri/crates/diri-proto`: shared Rust data models and wire codecs. Put the new Helper protocol in a dedicated `remote_pty` module; the existing `remote` module is companion-access configuration.
+- `diri/crates/diri-engine`: authoritative local session engine, PTY/holder lifecycle, status reduction, host orchestration, and remote bootstrap/SSH seam.
+- `diri/crates/diri-proto`: shared Rust data models and wire codecs. `remote_pty` is the authoritative versioned Remote Helper protocol; companion access is not part of the current remote transport.
 - `diri/crates/diri-client`: local app-to-engine client. It should not execute SSH directly.
 - `diri/crates/diri-term`: GPUI terminal renderer and client-side terminal interaction.
 - `diri/crates/diri-app`: desktop UI. It requests remote actions through the local Engine.
@@ -28,7 +29,7 @@ The Rust toolchain is pinned by `diri/rust-toolchain.toml` to Rust 1.95.0, editi
 ## Remote architecture invariants
 
 - SSH is the authenticated encrypted byte transport. Use `ssh -T` for Helper protocol channels; SSH must not own the Agent PTY.
-- The new baseline must not require remote `tmux`, `screen`, `zellij`, Node.js, Python, `socat`, `nc`, `curl`, `wget`, or a preinstalled Diri service.
+- The current baseline must not require remote `tmux`, `screen`, `zellij`, Node.js, Python, `socat`, `nc`, `curl`, `wget`, or a preinstalled Diri service.
 - Reuse OpenSSH configuration and a finite-lived ControlMaster for performance only. A ControlMaster must never be required for session survival.
 - Bootstrap is idempotent: probe platform, select an exact local artifact, upload to a nonce temp path, verify, then atomically rename. Versioned binaries coexist by protocol and Build ID.
 - Never overwrite a live Helper version in place. GC must retain every Build ID referenced by a session.
@@ -37,16 +38,16 @@ The Rust toolchain is pinned by `diri/rust-toolchain.toml` to Rust 1.95.0, editi
 - Capture the remote login/cwd environment on the remote host. Do not copy the local process environment wholesale or propagate local secrets and socket paths.
 - The remote Holder owns only the PTY, Agent process tree, current terminal grid/modes/cursor, bounded output, exit facts, and controller lease.
 - The local Rust Engine owns `SessionRecord`, manifests, status reduction, project/worktree state, GUI events, orchestration, lifecycle policy, and host management.
-- Use exactly one independent Holder process and Unix socket per Session; do not add a multi-session Diri Supervisor in phase one.
+- Use exactly one independent Holder process and Unix socket per Session; do not add a multi-session Diri Supervisor to the current baseline.
 - A Holder may spawn one minimal liveness guard for its Agent process group. The guard may only wait for Holder pipe closure and kill that one process group; it must not own a PTY, socket, state, or orchestration.
 - The app and client must verify the local Engine's explicit Rust identity during `Hello`; fail closed on missing, old, or unknown daemon identities.
 - Agent manifests used by the Rust Engine are Rust-owned resources under `diri-engine`; remote launch must not load Swift resource bundles or fall back to a Swift Holder.
 - Share terminal parsing through a minimal `diri-terminal-state` crate; do not make `diri-remote` depend on the full Engine or create a second parser implementation.
 - PTY reads must never block on the attached client. Bound the connection queue; when it falls behind, discard stale diffs and reseed it with a Full Snapshot.
-- Phase one permits exactly one live attach/controller. A new attach atomically increments the controller epoch and revokes the old attach. Multiple read-only observers are deferred.
+- The completed baseline permits exactly one live attach/controller. A new attach atomically increments the controller epoch and revokes the old attach. Multiple read-only observers are deferred enhancements.
 - Full Snapshot contains only the visible grid, cursor, modes, dimensions, and sequence. Bound scrollback to 4 MiB and serve it on demand with `Scroll`.
 - Reject incompatible protocol majors, missing required capabilities, wrong session incarnations, oversized frames, and stale controller epochs with structured errors.
-- `diri-remote` must remain a Helper, not a second Diri Engine. Phase-one work excludes hooks, MCP forwarding, artifacts, ports, usage, handoff, checkpoints, and resource governance unless the proposal is explicitly revised.
+- `diri-remote` must remain a Helper, not a second Diri Engine. Hooks, MCP forwarding, artifacts, ports, usage, handoff, checkpoints, resource governance, and multiple observers remain separate enhancements unless `diri/REMOTE_PORT.md` is explicitly revised.
 
 ## Performance and stability
 
@@ -93,11 +94,12 @@ Remote tests should be deterministic and not require a developer's real SSH host
 
 Any test requiring a real remote host must be opt-in and document its environment variables and cleanup behavior.
 
-CI must also build and execute `diri-remote probe` natively on Linux x86_64/aarch64 and macOS arm64, and run a disposable ordinary-user OpenSSH detach/reconnect soak. macOS x86_64 is not a supported remote Helper target.
+CI must also build and execute `diri-remote probe` natively on Linux x86_64/aarch64 and macOS arm64, and run a disposable ordinary-user OpenSSH detach/reconnect soak. These are release gates for the completed transport. macOS x86_64 and Rosetta are not supported Remote Helper targets.
 
 ## Change discipline
 
-- Keep protocol and on-disk changes versioned and additive for live Helper sessions. There is no legacy `tmux` compatibility boundary.
+- Keep protocol and on-disk changes versioned and additive for live Helper sessions. There is no legacy `tmux` compatibility boundary and no transport migration still in progress.
 - Update `diri/REMOTE_PORT.md` when a design decision, phase boundary, dependency, platform matrix, or acceptance condition changes.
+- Do not describe deferred product enhancements as prerequisites for completion of the remote transport refactor.
 - Keep unrelated user changes intact. Do not rewrite historical port documents merely to make them match the new remote direction.
 - Add production dependencies only when they materially reduce protocol, terminal, platform, or security risk; explain the tradeoff in the change.
