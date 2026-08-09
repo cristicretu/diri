@@ -277,6 +277,26 @@ impl GitRepository {
             .and_then(|output| parse_status(&self.root, &output.stdout))
     }
 
+    /// Every requested path, plus the source of any staged rename whose
+    /// destination was requested. Order is preserved and sources are appended
+    /// without duplicating a path the caller already named.
+    fn with_rename_sources(&self, paths: &[PathBuf]) -> Result<Vec<PathBuf>, GitReviewError> {
+        let mut resolved = paths.to_vec();
+        let renames: Vec<_> = self
+            .status()?
+            .staged
+            .into_iter()
+            .filter(|change| matches!(change.kind, ChangeKind::Renamed | ChangeKind::Copied))
+            .filter_map(|change| change.original_path.map(|source| (change.path, source)))
+            .collect();
+        for (destination, source) in renames {
+            if paths.iter().any(|path| path == &destination) && !resolved.contains(&source) {
+                resolved.push(source);
+            }
+        }
+        Ok(resolved)
+    }
+
     /// Stages the complete current contents of each path, including deletions.
     pub fn stage_paths(&self, paths: &[PathBuf]) -> Result<(), GitReviewError> {
         let paths = validate_paths(paths)?;
@@ -288,8 +308,16 @@ impl GitRepository {
 
     /// Restores paths in the index from HEAD. On an unborn branch, removes
     /// them from the index while preserving their worktree contents.
+    ///
+    /// A staged rename occupies two index entries, and callers only know the
+    /// destination — the diff row and the file list both name the new path.
+    /// Resetting that path alone leaves the source staged as a deletion, so
+    /// the next commit removes the file's content entirely. Rename sources are
+    /// resolved here, where the porcelain format is already understood, rather
+    /// than asking every caller to carry them.
     pub fn unstage_paths(&self, paths: &[PathBuf]) -> Result<(), GitReviewError> {
-        let paths = validate_paths(paths)?;
+        let paths = self.with_rename_sources(paths)?;
+        let paths = validate_paths(&paths)?;
         let head = run_git(
             &self.root,
             ["rev-parse", "--verify", "--quiet", "HEAD"],
@@ -1049,6 +1077,41 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    /// Unstaging a staged rename by its destination alone used to leave the
+    /// source staged as a deletion, so the next commit dropped the file's
+    /// content. Both index entries must come back together.
+    #[test]
+    fn unstaging_a_rename_by_its_destination_restores_the_source() {
+        let Some(repo) = TestRepo::new() else { return };
+        repo.write("old.txt", "content worth keeping\n");
+        repo.commit_all("base");
+        repo.git(["mv", "old.txt", "new.txt"]);
+
+        let review = repo.review();
+        let staged = review.status().unwrap().staged;
+        assert_eq!(staged.len(), 1, "expected one staged rename: {staged:?}");
+        assert_eq!(staged[0].kind, ChangeKind::Renamed);
+
+        review
+            .unstage_paths(&[PathBuf::from("new.txt")])
+            .expect("unstage the rename destination");
+
+        let status = review.status().unwrap();
+        assert!(
+            status.staged.is_empty(),
+            "nothing should remain staged, found {:?}",
+            status.staged
+        );
+        assert!(
+            repo.path.join("new.txt").exists(),
+            "the renamed file must survive in the worktree"
+        );
+        // The original content is still reachable from HEAD, which is what a
+        // staged deletion would have destroyed on the next commit.
+        let head = repo.git(["show", "HEAD:old.txt"]);
+        assert_eq!(String::from_utf8_lossy(&head), "content worth keeping\n");
     }
 
     #[test]

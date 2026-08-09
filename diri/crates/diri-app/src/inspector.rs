@@ -1744,11 +1744,14 @@ impl WorkbenchInspector {
             .iter()
             .map(|change| change.path.clone())
             .collect();
+        // Conflicted paths are deliberately excluded. `git add` on a file that
+        // still carries conflict markers both stages the markers and collapses
+        // index stages 1/2/3, after which `git checkout --merge` can no longer
+        // reconstruct the conflict. Resolving stays an explicit, per-file act.
         let mut stage_paths: Vec<_> = status
             .unstaged
             .iter()
             .chain(status.untracked.iter())
-            .chain(status.conflicted.iter())
             .map(|change| change.path.clone())
             .collect();
         stage_paths.sort();
