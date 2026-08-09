@@ -270,7 +270,14 @@ fn build_matches(query: &str, snapshot: &FindSnapshot, live: &GridBuffer) -> Vec
             if absolute_row >= snapshot.visible_start_row {
                 continue;
             }
-            append_matches(line, None, absolute_row, &needle, &mut scratch, &mut matches);
+            append_matches(
+                line,
+                None,
+                absolute_row,
+                &needle,
+                &mut scratch,
+                &mut matches,
+            );
             if matches.len() >= MATCH_CAP {
                 matches.truncate(MATCH_CAP);
                 return matches;

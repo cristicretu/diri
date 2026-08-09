@@ -29,6 +29,10 @@ use crate::workbench::WorkbenchLayout;
 
 const WINDOW_BOUNDS_SAVE_DELAY: Duration = Duration::from_millis(150);
 
+pub(crate) fn cached_window_overlay<T: Render>(view: Entity<T>) -> impl IntoElement {
+    view.cached(StyleRefinement::default().absolute().inset_0())
+}
+
 #[cfg(target_os = "macos")]
 use crate::macos::{menu_bar::NativeMenuBar, notifier::NativeNotifier};
 
@@ -257,6 +261,13 @@ impl RootView {
                 && let Some(surfaces) = &this.utility_surfaces
             {
                 surfaces.update(cx, |surfaces, cx| surfaces.open_settings(cx));
+            }
+            if matches!(event, SidebarEvent::AddRemoteHost)
+                && let Some(surfaces) = &this.utility_surfaces
+            {
+                surfaces.update(cx, |surfaces, cx| {
+                    surfaces.open_add_remote_host(window, cx);
+                });
             }
             if matches!(event, SidebarEvent::VisibilityChanged) {
                 this.begin_sidebar_slide(cx);
@@ -566,8 +577,14 @@ impl RootView {
         }));
     }
 
-    fn colors(window: &Window) -> SemanticColors {
-        SemanticColors::new(diri_ui::Appearance::from_window(window.appearance()))
+    fn colors(&self) -> SemanticColors {
+        let store = self
+            .services
+            .store
+            .store
+            .read()
+            .expect("session store lock poisoned");
+        crate::app_theme::colors(&store.preferences().terminal_theme)
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -751,7 +768,16 @@ impl RootView {
             .write()
             .expect("session store lock poisoned");
         match agent {
-            Some(agent) => store.spawn_kind(agent.kind(), SpawnOptions::default()),
+            Some(agent) => {
+                let host = store.default_spawn_host();
+                store.spawn_kind(
+                    agent.kind(),
+                    SpawnOptions {
+                        host,
+                        ..SpawnOptions::default()
+                    },
+                );
+            }
             None => store.spawn_shell(SpawnOptions::default()),
         }
         true
@@ -1350,7 +1376,7 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let terminal = SemanticColors::dark();
+        let terminal = self.colors();
         let bounds = window.inner_window_bounds().get_bounds();
         let sidebar_width = if visible_sidebar {
             self.sidebar.read(cx).width()
@@ -1776,7 +1802,7 @@ impl RootView {
 
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = Self::colors(window);
+        let colors = self.colors();
         let sidebar_visible = self.sidebar.read(cx).is_visible();
         let sidebar_width = self.sidebar.read(cx).width();
         let window_width = f32::from(window.inner_window_bounds().get_bounds().size.width);
@@ -1910,25 +1936,13 @@ impl Render for RootView {
         // store changes itself, so the only thing these wrappers must do is
         // stay out of the root flex row (absolute, zero-size at rest).
         if let Some(surfaces) = &self.session_surfaces {
-            root = root.child(
-                surfaces
-                    .clone()
-                    .cached(StyleRefinement::default().absolute().inset_0()),
-            );
+            root = root.child(cached_window_overlay(surfaces.clone()));
         }
         if let Some(surfaces) = &self.utility_surfaces {
-            root = root.child(
-                surfaces
-                    .clone()
-                    .cached(StyleRefinement::default().absolute().inset_0()),
-            );
+            root = root.child(cached_window_overlay(surfaces.clone()));
         }
         if let Some(navigation) = &self.navigation {
-            root = root.child(
-                navigation
-                    .clone()
-                    .cached(StyleRefinement::default().absolute().inset_0()),
-            );
+            root = root.child(cached_window_overlay(navigation.clone()));
         }
         if let Some(status) = self.status_banner(colors, cx) {
             root = root.child(status);

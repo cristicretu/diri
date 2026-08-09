@@ -100,6 +100,8 @@ pub struct SemanticColors {
     pub secondary: Rgba,
     pub tertiary: Rgba,
     pub background: Rgba,
+    sidebar_surface: Rgba,
+    floating_surface: Rgba,
 }
 
 impl SemanticColors {
@@ -111,6 +113,8 @@ impl SemanticColors {
             secondary: rgba_f32(0.0, 0.0, 0.0, 0.60),
             tertiary: rgba_f32(0.0, 0.0, 0.0, 0.30),
             background: rgba_f32(1.0, 1.0, 1.0, 1.0),
+            sidebar_surface: rgba_f32(0.949, 0.953, 0.941, 0.89),
+            floating_surface: rgba_f32(0.949, 0.953, 0.941, 1.0),
         }
     }
 
@@ -122,6 +126,8 @@ impl SemanticColors {
             secondary: rgba_f32(1.0, 1.0, 1.0, 0.60),
             tertiary: rgba_f32(1.0, 1.0, 1.0, 0.30),
             background: rgba_f32(0.071, 0.075, 0.094, 1.0),
+            sidebar_surface: rgba_f32(0.141, 0.161, 0.196, 0.89),
+            floating_surface: rgba_f32(0.141, 0.161, 0.196, 1.0),
         }
     }
 
@@ -150,6 +156,31 @@ impl SemanticColors {
         }
     }
 
+    /// Builds the semantic application palette from a concrete product theme.
+    ///
+    /// Diri's selectable themes are currently dark themes, but the surface
+    /// colors are explicit so application chrome and terminal content can use
+    /// the same palette without coupling `diri-ui` to the terminal crate.
+    pub const fn themed(
+        background: Rgba,
+        foreground: Rgba,
+        sidebar_surface: Rgba,
+        floating_surface: Rgba,
+        sidebar_tones: bool,
+    ) -> Self {
+        let secondary_alpha = if sidebar_tones { 0.70 } else { 0.60 };
+        let tertiary_alpha = if sidebar_tones { 0.44 } else { 0.30 };
+        Self {
+            appearance: Appearance::Dark,
+            primary: foreground,
+            secondary: rgba_f32(foreground.r, foreground.g, foreground.b, secondary_alpha),
+            tertiary: rgba_f32(foreground.r, foreground.g, foreground.b, tertiary_alpha),
+            background,
+            sidebar_surface,
+            floating_surface,
+        }
+    }
+
     pub fn text(self, tone: TextTone) -> Rgba {
         let alpha = match tone {
             TextTone::Selected => 1.0,
@@ -171,18 +202,12 @@ impl SemanticColors {
     /// Menus, popovers, and dialogs need stronger separation than persistent
     /// sidebars so text and controls never compete with the content beneath.
     pub const fn floating_surface(self) -> Rgba {
-        match self.appearance {
-            Appearance::Dark => rgba_f32(0.141, 0.161, 0.196, 1.0),
-            Appearance::Light => rgba_f32(0.949, 0.953, 0.941, 1.0),
-        }
+        self.floating_surface
     }
 
     /// Shared translucent material for the leading and trailing sidebars.
     pub const fn sidebar_surface(self) -> Rgba {
-        match self.appearance {
-            Appearance::Dark => rgba_f32(0.141, 0.161, 0.196, 0.89),
-            Appearance::Light => rgba_f32(0.949, 0.953, 0.941, 0.89),
-        }
+        self.sidebar_surface
     }
 }
 
