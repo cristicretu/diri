@@ -62,7 +62,10 @@ impl ScreenCheckpoint {
     /// Swift's `PropertyListEncoder` emits.
     pub fn write_atomically(&self, path: &Path) -> std::io::Result<()> {
         let mut dict = plist::Dictionary::new();
-        dict.insert("version".into(), plist::Value::Integer(CURRENT_VERSION.into()));
+        dict.insert(
+            "version".into(),
+            plist::Value::Integer(CURRENT_VERSION.into()),
+        );
         dict.insert(
             "logOffset".into(),
             plist::Value::Integer(self.log_offset.into()),
@@ -116,10 +119,7 @@ mod tests {
                 cursor_row: 1,
                 cursor_visible: true,
                 is_full_snapshot: true,
-                changed_rows: vec![
-                    ChangedRow::new(0, cells.clone()),
-                    ChangedRow::new(1, cells),
-                ],
+                changed_rows: vec![ChangedRow::new(0, cells.clone()), ChangedRow::new(1, cells)],
             },
             marker_buffer: vec![0x1b, b']'],
             alt_screen: true,
@@ -223,10 +223,7 @@ mod tests {
         );
 
         std::fs::write(&path, b"not a plist at all").expect("write");
-        assert!(
-            ScreenCheckpoint::load(&path).is_none(),
-            "garbage is a miss"
-        );
+        assert!(ScreenCheckpoint::load(&path).is_none(), "garbage is a miss");
 
         let mut future = sample();
         future.write_atomically(&path).expect("write");

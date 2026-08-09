@@ -25,14 +25,15 @@ pub mod browser;
 pub mod checkpoint;
 pub mod control;
 pub mod detect;
+pub mod directories;
 pub mod events;
 pub mod git;
 pub mod governor;
 pub mod history;
 #[cfg(unix)]
 pub mod holder;
-pub mod hosts;
 pub mod hooks;
+pub mod hosts;
 pub mod inject;
 pub mod log;
 pub mod mcp;
@@ -51,5 +52,7 @@ pub use log::OutputLog;
 pub use pty::{Exit, Pty, PtySpec};
 pub use registry::Registry;
 pub use screen::HeadlessScreen;
-pub use session::{HolderConfig, Session, SessionSpec, SessionView};
+pub use session::{
+    HolderConfig, RemoteAdoptSpec, RemoteSessionSpec, Session, SessionSpec, SessionView,
+};
 pub use status::{Authority, ReducerOutcome, StatusReducer, StatusSignal};

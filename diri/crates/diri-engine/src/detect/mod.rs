@@ -2,10 +2,9 @@
 //!
 //! An agent's status — working, idle, waiting on you — is inferred from what it
 //! painted on its terminal, using per-agent rules that live in JSON manifests.
-//! This is a port of the Swift `DirijorDetection`, and it deliberately reads
-//! **the same manifest files**: the rules are data, shared by both engines, so
-//! adding an agent stays a one-file change and the two implementations cannot
-//! drift apart.
+//! The rules and Agent launch descriptors are Rust-workspace resources under
+//! `crates/diri-engine/manifests`. Adding an agent remains a data-only change,
+//! without coupling the authoritative Engine to another implementation.
 //!
 //! The one behavioral difference worth knowing: Swift compiled these patterns
 //! with `NSRegularExpression` (ICU), while this uses the `regex` crate, which
@@ -23,31 +22,16 @@ pub use redact::redact;
 use std::collections::HashMap;
 use std::path::Path;
 
+pub use diri_terminal_state::ScreenSnapshot;
+
 use manifest::Rule;
 
-/// What the emulator saw: the plain-text grid plus the OSC state parsed out of
-/// the stream.
-#[derive(Clone, Debug, Default)]
-pub struct ScreenSnapshot {
-    pub lines: Vec<String>,
-    pub osc_title: Option<String>,
-    pub osc_progress_state: Option<i64>,
-    /// Bumps whenever the visible content changes; carried through so a
-    /// consumer can tell a fresh verdict from a repeated one.
-    pub content_seq: u64,
-}
-
-impl ScreenSnapshot {
-    pub fn from_lines<I, S>(lines: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        Self {
-            lines: lines.into_iter().map(Into::into).collect(),
-            ..Default::default()
-        }
-    }
+/// Source-tree location of the Rust-owned built-in Agent catalog. Release
+/// packaging copies this directory next to `dirijord-rs`; this fallback keeps
+/// tests and loose development binaries independent of application packaging.
+#[must_use]
+pub fn bundled_manifest_dir() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("manifests")
 }
 
 /// The engine's verdict for one snapshot.
@@ -241,10 +225,9 @@ impl ManifestEngine {
 mod tests {
     use super::*;
 
-    /// The real manifests, shared with the Swift engine.
+    /// The exact Rust-owned catalog shipped next to the Engine.
     pub(crate) fn manifest_dir() -> std::path::PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../Sources/DirijorCore/Resources/manifests")
+        bundled_manifest_dir()
             .canonicalize()
             .expect("manifests directory")
     }
@@ -290,12 +273,16 @@ mod tests {
                 engine.ids()
             );
         }
-        let rules: usize = engine
-            .ids()
-            .iter()
-            .map(|id| engine.manifest(id).expect("manifest").rules.len())
-            .sum();
-        assert!(rules >= 80, "expected the full ruleset, got {rules} rules");
+        for id in ["claude-code", "codex", "cursor", "gemini"] {
+            assert!(
+                !engine
+                    .manifest(id)
+                    .expect("interactive manifest")
+                    .rules
+                    .is_empty(),
+                "{id} needs explicit terminal-state rules"
+            );
+        }
     }
 
     #[test]

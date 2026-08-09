@@ -14,8 +14,7 @@ use diri_engine::{ManifestEngine, OutputLog, Registry};
 use diri_proto::grid::{ChangedRow, GridCell, GridUpdate, TermColor, TermStyle};
 
 fn engine() -> Arc<ManifestEngine> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../Sources/DirijorCore/Resources/manifests")
+    let dir = diri_engine::detect::bundled_manifest_dir()
         .canonicalize()
         .expect("manifests");
     let (engine, _) = ManifestEngine::load_dir(&dir).expect("load");
@@ -44,17 +43,15 @@ fn shell_spec(
 ) -> diri_engine::session::SessionSpec {
     diri_engine::session::SessionSpec {
         id: id.into(),
-        pty: diri_engine::PtySpec::new(
-            vec!["/bin/sh".into(), "-c".into(), script.into()],
-            "/tmp",
-        )
-        .env("PATH", "/usr/bin:/bin")
-        .env("TERM", "xterm-256color")
-        .size(80, 24),
+        pty: diri_engine::PtySpec::new(vec!["/bin/sh".into(), "-c".into(), script.into()], "/tmp")
+            .env("PATH", "/usr/bin:/bin")
+            .env("TERM", "xterm-256color")
+            .size(80, 24),
         manifest_id: "shell".into(),
         authority: diri_engine::Authority::ProcessOnly,
         logs_dir: logs.to_path_buf(),
         holder,
+        remote: None,
         defer_launch: false,
     }
 }
@@ -82,8 +79,8 @@ fn record(id: &str) -> diri_proto::SessionRecord {
         last_seen_at: None,
         pinned: false,
         archived_at: None,
-        remote_active: false,
         host: None,
+        remote_persistence: None,
         hibernation: None,
         memory_bytes: None,
         artifacts: None,
@@ -171,10 +168,14 @@ fn the_held_pump_writes_a_checkpoint_once_output_settles() {
     });
     // The settle delay means the write happens after output went quiet, so
     // by load time the offset covers everything the child said.
-    wait_until("the checkpoint to cover the tail", Duration::from_secs(10), || {
-        ScreenCheckpoint::load(&path)
-            .is_some_and(|checkpoint| checkpoint.log_offset == log_tail(&logs, "s_ck"))
-    });
+    wait_until(
+        "the checkpoint to cover the tail",
+        Duration::from_secs(10),
+        || {
+            ScreenCheckpoint::load(&path)
+                .is_some_and(|checkpoint| checkpoint.log_offset == log_tail(&logs, "s_ck"))
+        },
+    );
     let checkpoint = ScreenCheckpoint::load(&path).expect("checkpoint");
     let text = checkpoint
         .grid
@@ -253,7 +254,11 @@ fn adoption_seeds_from_the_checkpoint_not_the_raw_tail() {
             .join("\n")
             .contains("PAINTED-FROM-CHECKPOINT")
     });
-    let screen = registry.get("s_ad").expect("adopted").screen_lines().join("\n");
+    let screen = registry
+        .get("s_ad")
+        .expect("adopted")
+        .screen_lines()
+        .join("\n");
     assert!(
         !screen.contains("hello-from-the-log"),
         "replay from the checkpoint offset must not re-feed old bytes: {screen:?}"
@@ -320,7 +325,11 @@ fn a_stale_checkpoint_falls_back_to_tail_replay() {
             .join("\n")
             .contains("the-log-is-truth")
     });
-    let screen = registry.get("s_fb").expect("adopted").screen_lines().join("\n");
+    let screen = registry
+        .get("s_fb")
+        .expect("adopted")
+        .screen_lines()
+        .join("\n");
     assert!(
         !screen.contains("GEOMETRY-MISMATCH"),
         "a refused checkpoint must not leak onto the screen: {screen:?}"

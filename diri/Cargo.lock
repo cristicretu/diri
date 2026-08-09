@@ -1325,7 +1325,6 @@ dependencies = [
  "diri-ui",
  "diri-updater",
  "diri-usage",
- "getrandom 0.3.4",
  "gpui",
  "gpui_platform",
  "image",
@@ -1337,6 +1336,7 @@ dependencies = [
  "objc2-user-notifications",
  "serde",
  "serde_json",
+ "sha2",
  "smallvec",
  "tempfile",
  "tokio",
@@ -1363,12 +1363,18 @@ dependencies = [
  "alacritty_terminal",
  "base64",
  "diri-proto",
+ "diri-pty",
+ "diri-terminal-state",
  "getrandom 0.3.4",
  "libc",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
  "plist",
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
@@ -1395,6 +1401,30 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "zeroize",
+]
+
+[[package]]
+name = "diri-pty"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "diri-remote"
+version = "0.1.0"
+dependencies = [
+ "diri-engine",
+ "diri-proto",
+ "diri-pty",
+ "diri-terminal-state",
+ "getrandom 0.3.4",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -1404,6 +1434,14 @@ dependencies = [
  "diri-proto",
  "gpui",
  "gpui_platform",
+]
+
+[[package]]
+name = "diri-terminal-state"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "diri-proto",
 ]
 
 [[package]]
