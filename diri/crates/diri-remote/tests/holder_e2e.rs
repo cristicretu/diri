@@ -678,7 +678,58 @@ fn grid_text(grid: &diri_proto::grid::GridUpdate) -> String {
 }
 
 #[test]
-fn environment_capture_uses_a_dedicated_channel_and_scrubs_ssh_state() {
+fn environment_capture_survives_an_interactive_login_bash() {
+    // A login shell is started interactively so rc-file toolchain setup runs,
+    // and GNU bash marks every descriptor from 3 through 19 close-on-exec in
+    // exactly that mode (shell.c, "some systems have the bad habit of starting
+    // login shells with lots of open file descriptors"). Any return to an
+    // inherited descriptor for the payload fails here with EBADF, which is how
+    // the Linux/bash remote soak broke while macOS/zsh stayed green.
+    let bash = std::path::Path::new("/bin/bash");
+    if !bash.is_file() {
+        eprintln!("skipping: /bin/bash is unavailable on this host");
+        return;
+    }
+    let temporary = tempfile::tempdir().expect("temp");
+    let state_dir = temporary.path().join("state");
+    let request = EnvironmentCaptureRequest {
+        cwd: Some("/".into()),
+        timeout_millis: 10_000,
+    };
+    let mut child = Command::new(helper())
+        .args(["__environment-test-shell", "/bin/bash"])
+        .env("DIRI_REMOTE_STATE_DIR", &state_dir)
+        .env("SSH_CONNECTION", "must-not-propagate")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn login bash capture");
+    serde_json::to_writer(child.stdin.as_mut().expect("stdin"), &request).expect("request");
+    drop(child.stdin.take());
+    let output = child.wait_with_output().expect("capture output");
+    assert!(
+        output.status.success(),
+        "login bash capture failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let captured: EnvironmentCaptureResult =
+        serde_json::from_slice(&output.stdout).expect("capture JSON");
+    assert_eq!(captured.shell, "/bin/bash");
+    assert_eq!(captured.cwd, "/");
+    assert!(
+        captured
+            .environment
+            .iter()
+            .any(|variable| variable.name == "PATH")
+    );
+    assert!(captured.environment.iter().all(|variable| {
+        !variable.name.starts_with("SSH_") && !variable.name.starts_with("DIRI_")
+    }));
+}
+
+#[test]
+fn environment_capture_frames_its_payload_and_scrubs_ssh_state() {
     let temporary = tempfile::tempdir().expect("temp");
     let state_dir = temporary.path().join("state");
     let request = EnvironmentCaptureRequest {

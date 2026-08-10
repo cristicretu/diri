@@ -173,7 +173,7 @@ pub fn execute<W: Write + Send>(
         Invocation::HiddenProcessGuard { process_pid } => {
             holder::run_process_guard(stdin, process_pid)
         }
-        Invocation::HiddenDumpEnvironment => environment::dump(),
+        Invocation::HiddenDumpEnvironment => environment::dump(stdout),
         Invocation::HiddenEnvironmentTestShell(shell) => {
             holder::read_limited_json::<_, EnvironmentCaptureRequest>(stdin, 64 * 1024)
                 .and_then(|request| environment::capture_with_shell(&request, executable, &shell))

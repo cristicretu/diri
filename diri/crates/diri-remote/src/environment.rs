@@ -1,12 +1,17 @@
-//! Login-shell environment capture over a dedicated inherited descriptor.
+//! Login-shell environment capture over a marker-framed stdout payload.
+//!
+//! An inherited descriptor cannot carry this payload: GNU bash closes every
+//! descriptor from 3 through 19 across `exec` whenever it starts as an
+//! interactive login shell (`shell.c`, "some systems have the bad habit of
+//! starting login shells with lots of open file descriptors"). stdout is the
+//! only stream a login shell is guaranteed to hand to the command it execs, so
+//! the payload travels there behind a marker and an explicit length that
+//! separate it from rc-file chatter.
 
 use std::ffi::{CStr, OsStr};
-use std::fs::File;
 use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;
-use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -17,8 +22,9 @@ use diri_proto::remote_pty::{
     MAX_ENVIRONMENT_VALUE_BYTES, MAX_ENVIRONMENT_VARIABLES, MAX_LAUNCH_BYTES,
 };
 
-const ENVIRONMENT_FD: libc::c_int = 9;
 const MARKER: &[u8] = b"DIRIENV1\0";
+const LENGTH_BYTES: usize = 8;
+const PAYLOAD_LIMIT: usize = MARKER.len() + LENGTH_BYTES + MAX_LAUNCH_BYTES;
 const DIAGNOSTIC_LIMIT: usize = 64 * 1024;
 const LOGIN_COMMAND: &str = "exec \"$DIRI_REMOTE_SELF\" __dump-environment";
 const WORKING_DIRECTORY_COMMAND: &str =
@@ -88,13 +94,11 @@ fn capture_layer(
     target_cwd: Option<&Path>,
     timeout: Duration,
 ) -> io::Result<LayerCapture> {
-    let (environment_reader, environment_writer) = UnixStream::pair()?;
-    let inherited_fd = environment_writer.as_raw_fd();
     let mut command = Command::new(shell);
     command.arg("-l");
     // Full user shells need interactive startup for zshrc/bashrc toolchain
-    // setup. Minimal POSIX `sh`/dash closes inherited descriptors in
-    // interactive no-TTY mode, so its portable login startup is used instead.
+    // setup. Minimal POSIX `sh`/dash misbehaves in interactive no-TTY mode, so
+    // its portable login startup is used instead.
     let shell_name = shell.file_name().and_then(|name| name.to_str());
     if !matches!(shell_name, Some("sh" | "dash")) {
         command.arg("-i");
@@ -117,28 +121,20 @@ fn capture_layer(
         command.env("DIRI_REMOTE_CWD", cwd);
     }
     command.env("DIRI_REMOTE_SELF", executable);
-    command.env("DIRI_ENV_FD", ENVIRONMENT_FD.to_string());
+    command.env("DIRI_ENV_CAPTURE", "1");
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
-    // SAFETY: the closure only duplicates/updates integer descriptors with
-    // async-signal-safe libc calls. `inherited_fd` is held open by the parent
-    // until after spawn, and fd 9 is reserved solely for this child protocol.
+    // SAFETY: the closure only calls `setsid`, which is async-signal-safe and
+    // touches no memory shared with the forking parent.
     unsafe {
-        command.pre_exec(move || {
+        command.pre_exec(|| {
             if libc::setsid() < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            if inherited_fd != ENVIRONMENT_FD && libc::dup2(inherited_fd, ENVIRONMENT_FD) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            if libc::fcntl(ENVIRONMENT_FD, libc::F_SETFD, 0) < 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
         });
     }
     let mut child = command.spawn()?;
-    drop(environment_writer);
 
     let stdout = child
         .stdout
@@ -148,9 +144,7 @@ fn capture_layer(
         .stderr
         .take()
         .ok_or_else(|| io::Error::other("login shell stderr is unavailable"))?;
-    let environment_thread =
-        std::thread::spawn(move || drain_bounded(environment_reader, MAX_LAUNCH_BYTES));
-    let stdout_thread = std::thread::spawn(move || drain_bounded(stdout, DIAGNOSTIC_LIMIT));
+    let stdout_thread = std::thread::spawn(move || drain_framed(stdout));
     let stderr_thread = std::thread::spawn(move || drain_bounded(stderr, DIAGNOSTIC_LIMIT));
 
     let deadline = Instant::now() + timeout;
@@ -168,8 +162,7 @@ fn capture_layer(
                 }
             }
             let _ = child.wait();
-            let _ = join_reader(environment_thread);
-            let _ = join_reader(stdout_thread);
+            let _ = join_framed(stdout_thread);
             let _ = join_reader(stderr_thread);
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -178,27 +171,26 @@ fn capture_layer(
         }
         std::thread::sleep(Duration::from_millis(10));
     };
-    let (environment_bytes, environment_truncated) = join_reader(environment_thread)?;
-    let (stdout, stdout_truncated) = join_reader(stdout_thread)?;
+    let framed = join_framed(stdout_thread)?;
     let (stderr, stderr_truncated) = join_reader(stderr_thread)?;
     if !status.success() {
         return Err(io::Error::other(format!(
             "login shell exited with {status}: {}",
-            bounded_diagnostics(&stdout, &stderr)
+            bounded_diagnostics(&framed.noise, &stderr)
         )));
     }
-    if environment_truncated {
+    if framed.payload_truncated {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "captured environment exceeds 1 MiB",
         ));
     }
-    let (cwd, environment) = parse_environment(&environment_bytes)?;
+    let (cwd, environment) = parse_environment(&framed.payload)?;
     Ok(LayerCapture {
         cwd,
         environment,
-        diagnostics: bounded_diagnostics(&stdout, &stderr),
-        diagnostics_truncated: stdout_truncated || stderr_truncated,
+        diagnostics: bounded_diagnostics(&framed.noise, &stderr),
+        diagnostics_truncated: framed.noise_truncated || stderr_truncated,
     })
 }
 
@@ -218,32 +210,36 @@ fn expand_home(cwd: &str) -> io::Result<PathBuf> {
 }
 
 /// Hidden child operation invoked only by a login shell. It serializes the
-/// already-initialized shell environment onto fd 9, never stdout.
-pub fn dump() -> io::Result<()> {
-    if std::env::var("DIRI_ENV_FD").ok().as_deref() != Some("9") {
+/// already-initialized shell environment onto stdout, framed by a marker and
+/// an explicit length so that rc-file output before it and any background
+/// startup job writing after it stay outside the payload.
+pub fn dump(stdout: &mut dyn Write) -> io::Result<()> {
+    if std::env::var("DIRI_ENV_CAPTURE").ok().as_deref() != Some("1") {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "environment descriptor was not provisioned",
+            "environment capture was not requested",
         ));
     }
-    // SAFETY: the capture parent exclusively provisions fd 9 for this exec;
-    // this child takes ownership exactly once and closes it on drop.
-    let mut output = unsafe { File::from_raw_fd(ENVIRONMENT_FD) };
-    output.write_all(MARKER)?;
-    output.write_all(std::env::current_dir()?.as_os_str().as_bytes())?;
-    output.write_all(&[0])?;
+    let mut body = Vec::new();
+    body.extend_from_slice(std::env::current_dir()?.as_os_str().as_bytes());
+    body.push(0);
     for (name, value) in std::env::vars_os() {
         let name = name.as_os_str().as_bytes();
         let value = value.as_os_str().as_bytes();
         if name.contains(&0) || name.contains(&b'=') || value.contains(&0) {
             continue;
         }
-        output.write_all(name)?;
-        output.write_all(b"=")?;
-        output.write_all(value)?;
-        output.write_all(&[0])?;
+        body.extend_from_slice(name);
+        body.push(b'=');
+        body.extend_from_slice(value);
+        body.push(0);
     }
-    output.flush()
+    let length = u64::try_from(body.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "environment is too large"))?;
+    stdout.write_all(MARKER)?;
+    stdout.write_all(&length.to_be_bytes())?;
+    stdout.write_all(&body)?;
+    stdout.flush()
 }
 
 fn account_shell() -> io::Result<PathBuf> {
@@ -307,10 +303,38 @@ fn account_shell() -> io::Result<PathBuf> {
     }
 }
 
-fn parse_environment(bytes: &[u8]) -> io::Result<(String, Vec<EnvironmentVariable>)> {
-    let payload = bytes.strip_prefix(MARKER).ok_or_else(|| {
+/// Unwraps the marker/length frame the dump child wrote. `bytes` begins at the
+/// marker; the length header decides where the payload ends, so trailing shell
+/// output can never be read back as environment entries.
+fn frame_body(bytes: &[u8]) -> io::Result<&[u8]> {
+    let framed = bytes.strip_prefix(MARKER).ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidData, "environment marker is missing")
     })?;
+    let (header, body) = framed.split_at_checked(LENGTH_BYTES).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "environment length header is incomplete",
+        )
+    })?;
+    let length = usize::try_from(u64::from_be_bytes(
+        header.try_into().expect("length header is eight bytes"),
+    ))
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "captured environment exceeds 1 MiB",
+        )
+    })?;
+    body.get(..length).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "captured environment is incomplete",
+        )
+    })
+}
+
+fn parse_environment(bytes: &[u8]) -> io::Result<(String, Vec<EnvironmentVariable>)> {
+    let payload = frame_body(bytes)?;
     let mut fields = payload.split(|byte| *byte == 0);
     let cwd = fields
         .next()
@@ -369,6 +393,99 @@ fn should_scrub(name: &str) -> bool {
         || matches!(name, "_" | "PWD" | "OLDPWD" | "SHLVL")
 }
 
+#[derive(Default)]
+struct FramedCapture {
+    noise: Vec<u8>,
+    noise_truncated: bool,
+    payload: Vec<u8>,
+    payload_truncated: bool,
+    framed: bool,
+}
+
+/// Splits the login shell's stdout into the chatter that precedes the payload
+/// and the payload itself. The split happens while draining, so a talkative rc
+/// file is bounded as a diagnostic without ever pushing the payload out of the
+/// capture.
+fn drain_framed(mut reader: impl Read) -> io::Result<FramedCapture> {
+    let mut capture = FramedCapture::default();
+    let mut pending = Vec::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        let chunk = &buffer[..count];
+        if capture.framed {
+            // Once the frame is whole, anything still arriving is a startup
+            // job that outlived the shell; it is diagnostic, not payload.
+            if frame_body(&capture.payload).is_ok() {
+                push_bounded(
+                    &mut capture.noise,
+                    &mut capture.noise_truncated,
+                    chunk,
+                    DIAGNOSTIC_LIMIT,
+                );
+            } else {
+                push_bounded(
+                    &mut capture.payload,
+                    &mut capture.payload_truncated,
+                    chunk,
+                    PAYLOAD_LIMIT,
+                );
+            }
+            continue;
+        }
+        pending.extend_from_slice(chunk);
+        match pending
+            .windows(MARKER.len())
+            .position(|window| window == MARKER)
+        {
+            Some(position) => {
+                let payload = pending.split_off(position);
+                push_bounded(
+                    &mut capture.noise,
+                    &mut capture.noise_truncated,
+                    &pending,
+                    DIAGNOSTIC_LIMIT,
+                );
+                push_bounded(
+                    &mut capture.payload,
+                    &mut capture.payload_truncated,
+                    &payload,
+                    PAYLOAD_LIMIT,
+                );
+                pending.clear();
+                capture.framed = true;
+            }
+            None => {
+                // Retain the bytes a marker could still straddle across reads.
+                let settled = pending.len().saturating_sub(MARKER.len() - 1);
+                push_bounded(
+                    &mut capture.noise,
+                    &mut capture.noise_truncated,
+                    &pending[..settled],
+                    DIAGNOSTIC_LIMIT,
+                );
+                pending.drain(..settled);
+            }
+        }
+    }
+    push_bounded(
+        &mut capture.noise,
+        &mut capture.noise_truncated,
+        &pending,
+        DIAGNOSTIC_LIMIT,
+    );
+    Ok(capture)
+}
+
+fn push_bounded(target: &mut Vec<u8>, truncated: &mut bool, bytes: &[u8], limit: usize) {
+    let stored = limit.saturating_sub(target.len()).min(bytes.len());
+    target.extend_from_slice(&bytes[..stored]);
+    *truncated |= stored != bytes.len();
+}
+
 fn drain_bounded(mut reader: impl Read, limit: usize) -> io::Result<(Vec<u8>, bool)> {
     let mut captured = Vec::with_capacity(limit.min(64 * 1024));
     let mut truncated = false;
@@ -394,6 +511,14 @@ fn join_reader(
         .map_err(|_| io::Error::other("environment reader thread panicked"))?
 }
 
+fn join_framed(
+    thread: std::thread::JoinHandle<io::Result<FramedCapture>>,
+) -> io::Result<FramedCapture> {
+    thread
+        .join()
+        .map_err(|_| io::Error::other("environment reader thread panicked"))?
+}
+
 fn bounded_diagnostics(stdout: &[u8], stderr: &[u8]) -> String {
     let mut combined = Vec::with_capacity((stdout.len() + stderr.len()).min(DIAGNOSTIC_LIMIT));
     combined.extend_from_slice(&stdout[..stdout.len().min(DIAGNOSTIC_LIMIT)]);
@@ -406,11 +531,17 @@ fn bounded_diagnostics(stdout: &[u8], stderr: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn framed(body: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::from(MARKER);
+        bytes.extend_from_slice(&(body.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
     #[test]
     fn parser_accepts_nul_values_and_scrubs_ssh_session_state() {
-        let bytes =
-            b"DIRIENV1\0/tmp/project\0PATH=/bin:/usr/bin\0SSH_CONNECTION=secret\0VALUE=a b\0";
-        let (cwd, environment) = parse_environment(bytes).expect("parse");
+        let bytes = framed(b"/tmp/project\0PATH=/bin:/usr/bin\0SSH_CONNECTION=secret\0VALUE=a b\0");
+        let (cwd, environment) = parse_environment(&bytes).expect("parse");
         assert_eq!(cwd, "/tmp/project");
         assert_eq!(
             environment,
@@ -425,6 +556,49 @@ mod tests {
                 }
             ]
         );
+    }
+
+    struct ChunkedReader(std::collections::VecDeque<Vec<u8>>);
+
+    impl Read for ChunkedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let Some(chunk) = self.0.pop_front() else {
+                return Ok(0);
+            };
+            let count = chunk.len().min(buffer.len());
+            buffer[..count].copy_from_slice(&chunk[..count]);
+            if count < chunk.len() {
+                self.0.push_front(chunk[count..].to_vec());
+            }
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn framed_drain_separates_chatter_from_a_payload_split_across_reads() {
+        let payload = framed(b"/tmp/project\0PATH=/bin\0");
+        let mut chunks = vec![b"motd line\n".to_vec(), payload[..3].to_vec()];
+        chunks.push(payload[3..].to_vec());
+        chunks.push(b"background job output".to_vec());
+        let capture = drain_framed(ChunkedReader(chunks.into())).expect("drain");
+        // Chatter on either side of the frame stays a diagnostic.
+        assert_eq!(capture.noise, b"motd line\nbackground job output");
+        assert!(!capture.noise_truncated);
+        assert!(!capture.payload_truncated);
+        let (cwd, environment) = parse_environment(&capture.payload).expect("parse");
+        assert_eq!(cwd, "/tmp/project");
+        assert_eq!(environment.len(), 1);
+    }
+
+    #[test]
+    fn framed_drain_keeps_the_payload_behind_chatter_that_exceeds_the_diagnostic_bound() {
+        let payload = framed(b"/tmp/project\0PATH=/bin\0");
+        let chunks = vec![vec![b'x'; DIAGNOSTIC_LIMIT * 2], payload];
+        let capture = drain_framed(ChunkedReader(chunks.into())).expect("drain");
+        assert_eq!(capture.noise.len(), DIAGNOSTIC_LIMIT);
+        assert!(capture.noise_truncated);
+        let (cwd, _) = parse_environment(&capture.payload).expect("parse");
+        assert_eq!(cwd, "/tmp/project");
     }
 
     #[test]
