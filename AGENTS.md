@@ -8,7 +8,8 @@ These instructions apply to the whole repository. The active architecture decisi
 
 - The remote refactor is complete. Maintain the bootstrapped Remote PTY Holder as Diri's only remote session transport; future remote work extends this architecture rather than reopening the transport migration.
 - Implement and maintain remote behavior entirely in the Rust workspace under `diri/`.
-- For remote-refactor decisions, treat `Sources/`, `Package.swift`, and Swift tests as nonexistent. Do not inspect them for behavior, port from them, modify them, add Swift compatibility adapters, or use Swift build/test results as evidence.
+- For remote-refactor *design* decisions, treat `Sources/`, `Package.swift`, and Swift tests as nonexistent: do not derive architecture from them, modify them, add Swift compatibility adapters, or cite Swift build/test results as evidence.
+- That rule is about design, not about data the product still ships. `Sources/DirijorCore/Resources/manifests` remains the reference for **Agent catalog completeness** until the Rust catalog is proven at parity. Reading it to check coverage is required, not forbidden. Writing a Rust catalog from memory instead of porting is how the catalog silently shrank from 20 Agents to 7 — a missing manifest does not error, it spawns a bare login shell, and that has shipped to users before.
 - Existing Rust behavior is the implementation baseline. Historical comments about Swift compatibility do not create new requirements.
 - The former Rust SSH + `tmux` transport has been deleted. Never reintroduce it as `legacy_tmux`, a feature flag, a migration path, or a runtime fallback. Missing, corrupt, unsupported, or capability-incompatible Helper artifacts must fail closed with a structured error; an unavailable packaged transport reports `remote_transport_unavailable`.
 - When implementation and `diri/REMOTE_PORT.md` disagree, stop and resolve the design mismatch explicitly instead of silently choosing one.
