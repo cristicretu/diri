@@ -1111,7 +1111,13 @@ impl ControlServer {
                 .find(|record| record.id.0 == id)
                 .ok_or_else(|| ControlError::not_found(id.clone()))?
         };
-        if record.host.is_some() || p.target_host.is_some() {
+        // Handoff needs no terminal multiplexer of its own. Its phases are
+        // git preparation over `hosts::run_shell`, stopping the source through
+        // the session's own transport (which signals the remote Agent via its
+        // Holder), the transcript shuttle, and a normal resume on the target.
+        // Refuse only when a leg is remote and no Helper transport exists to
+        // carry it, rather than refusing every call.
+        if (record.host.is_some() || p.target_host.is_some()) && self.remote.is_none() {
             return Err(crate::remote::transport_unavailable());
         }
         if record.kind.id() != diri_proto::AgentKind::CLAUDE_CODE_ID {

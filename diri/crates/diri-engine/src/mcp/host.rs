@@ -383,9 +383,16 @@ impl RegistryHost {
         }))
     }
 
-    /// Remote spawning is deliberately unavailable while the Rust PTY Holder
-    /// transport is being introduced. Fail before resolving a host or syncing
-    /// code so this path has no external side effects.
+    /// Remote spawning is not offered by this host. The previous
+    /// implementation built a local `ssh … tmux` argv, which the Holder
+    /// transport replaced; the equivalent now needs the Helper manager and
+    /// binding store that `ControlServer::session_spawn_remote` owns and this
+    /// host is not constructed with. Failing here — before a host is resolved
+    /// or any code is synced — keeps the path free of external side effects.
+    ///
+    /// This is a gap, not a removal: `session.spawn` over the control socket
+    /// still spawns remotely. Wiring it up means giving `RegistryHost` the
+    /// same manager/binding-store dependencies.
     fn spawn_agent_remote(
         &self,
         _arguments: &Value,
