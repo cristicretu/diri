@@ -17,6 +17,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.0.0
       - name: Validate shell scripts
         run: bash -n scripts/*.sh diri/scripts/*.sh
+      - name: Verify reviewed regressions stay fixed
+        run: diri/scripts/verify-remote-refactor.sh
       - name: Test release publishing guards
         run: |
           bash diri/scripts/test-publish-github-release.sh
