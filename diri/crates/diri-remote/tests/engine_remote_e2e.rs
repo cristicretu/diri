@@ -459,16 +459,25 @@ fn attach_ssh_disconnect_reconnects_and_flushes_queued_input() {
     session
         .write_input(b"after-ssh-reconnect\n")
         .expect("queued input");
+    // Wait for the echo itself, not for the exit. `exited` flips when the
+    // remote process is reaped, which can beat the last of its output through
+    // the Holder, the frame queue and the terminal parser — so asserting the
+    // screen right after it raced the flush and failed on a loaded CI runner
+    // while passing locally.
+    wait_until(
+        "the queued input to echo after reconnect",
+        Duration::from_secs(10),
+        || {
+            session
+                .screen_lines()
+                .join("\n")
+                .contains("attach-bye:after-ssh-reconnect")
+        },
+    );
     wait_until(
         "remote exit after reconnect",
         Duration::from_secs(10),
         || session.view().exited,
-    );
-    assert!(
-        session
-            .screen_lines()
-            .join("\n")
-            .contains("attach-bye:after-ssh-reconnect")
     );
     session
         .terminate(Duration::from_millis(200))
