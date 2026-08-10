@@ -76,8 +76,9 @@ import Testing
 ///
 /// Rather than weaken the assertion into something a headless shell can pass,
 /// run it where a developer shell exists and skip it where one does not. Set
-/// `CI=` (empty) to force it on locally.
-@Test(.enabled(if: ProcessInfo.processInfo.environment["CI"] == nil))
+/// `CI=` (empty) to force it on locally, or `DIRIJOR_RUN_HANGING_TESTS=1` to
+/// force it on a runner — see `HangingTestGate` and the `hang-repro` workflow.
+@Test(.enabled(if: HangingTestGate.isEnabled))
 func codexWrapperReentersShellAndResolvesFreshInteractivePath() throws {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("dirijor-codex-wrapper-\(UUID().uuidString)")
