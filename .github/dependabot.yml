@@ -1,0 +1,48 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /diri
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      rust-dependencies:
+        patterns: ["*"]
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: swift
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      swift-dependencies:
+        patterns: ["*"]
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: npm
+    directory: /sidecar
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      sidecar-dependencies:
+        patterns: ["*"]
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ["*"]
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: rust-toolchain
+    directory: /diri
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2

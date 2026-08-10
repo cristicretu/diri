@@ -62,9 +62,25 @@ The git revision is intentionally exact. Upgrade it deliberately and update this
 ```sh
 cargo build
 cargo clippy --workspace -- -D warnings
-cargo run -p diri-app
 ./scripts/build.sh
 ```
+
+Run the app under development through `dev.sh`, which builds a throwaway app
+bundle with a commit-specific name, bundle id, window title, Dock icon, and
+in-window build marker. It also removes agent-session environment variables
+that would otherwise stop diri from finding or launching the shared daemon:
+
+```sh
+./scripts/dev.sh
+./scripts/dev.sh --release
+./scripts/dev.sh --settings remote
+./scripts/dev.sh -- --features audio-playback
+```
+
+The dev and installed apps deliberately share the daemon, socket, sessions,
+preferences, and Application Support directory. That makes the dev build useful
+against real sessions, but do not focus the same session in both apps at
+different terminal sizes: each client can resize the shared PTY.
 
 The app uses blurred window backing, a translucent persistent-width sidebar, an opaque Dirijor Dark terminal card, full-size content under transparent titlebar chrome, adjusted traffic lights, and a 900×560 minimum size.
 
@@ -73,10 +89,10 @@ The app uses blurred window backing, a translucent persistent-width sidebar, an 
 Deterministic sidebar fixtures render without connecting to the daemon. Run any scenario with:
 
 ```sh
-DIRIJOR_SIDEBAR_PREVIEW=1 DIRIJOR_SIDEBAR_SCENARIO=typical cargo run -p diri-app
-DIRIJOR_SIDEBAR_PREVIEW=1 DIRIJOR_SIDEBAR_SCENARIO=stress cargo run -p diri-app
-DIRIJOR_SIDEBAR_PREVIEW=1 DIRIJOR_SIDEBAR_SCENARIO=empty cargo run -p diri-app
-DIRIJOR_SIDEBAR_PREVIEW=1 DIRIJOR_SIDEBAR_SCENARIO=artifacts cargo run -p diri-app
+env DIRIJOR_SIDEBAR_PREVIEW=1 DIRIJOR_SIDEBAR_SCENARIO=typical ./scripts/dev.sh
+env DIRIJOR_SIDEBAR_PREVIEW=1 DIRIJOR_SIDEBAR_SCENARIO=stress ./scripts/dev.sh
+env DIRIJOR_SIDEBAR_PREVIEW=1 DIRIJOR_SIDEBAR_SCENARIO=empty ./scripts/dev.sh
+env DIRIJOR_SIDEBAR_PREVIEW=1 DIRIJOR_SIDEBAR_SCENARIO=artifacts ./scripts/dev.sh
 ```
 
 Preview mode uses deterministic mock dates, account identity, and usage values. It never opens a daemon connection or reads local account/transcript data.

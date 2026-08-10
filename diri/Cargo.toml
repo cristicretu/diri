@@ -23,7 +23,7 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 alacritty_terminal = { version = "0.26", default-features = false }
-base64 = "0.22"
+base64 = "0.23"
 diri-client = { path = "crates/diri-client" }
 diri-engine = { path = "crates/diri-engine" }
 diri-node = { path = "crates/diri-node" }
@@ -42,12 +42,12 @@ notify = "8.2"
 plist = "1"
 smallvec = { version = "1.6", features = ["union", "const_new"] }
 futures-core = "0.3"
-getrandom = "0.3"
+getrandom = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 regex = "1"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
-sha2 = "0.10"
+sha2 = "0.11"
 tempfile = "3"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 unicode-segmentation = "1"
@@ -65,3 +65,9 @@ zeroize = { version = "1", features = ["derive"] }
 # path/MSAA targets on every resize. Keep our renderer patch local and pinned to
 # the exact Zed revision used by `gpui`.
 gpui_macos = { path = "vendor/gpui_macos" }
+# GPUI's sum_tree currently imports Zed's GPL-licensed profiling shim even
+# though profiling is disabled and the attribute is a no-op in normal builds.
+# Keep the same tiny, no-op API in an Apache-licensed compatibility crate so an
+# unused profiler does not change the licensing of Diri's distributed binary.
+ztracing = { path = "vendor/ztracing" }
+ztracing_macro = { path = "vendor/ztracing_macro" }

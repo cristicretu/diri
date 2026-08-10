@@ -8,16 +8,16 @@
 #   NOTARY_PROFILE      notarytool keychain profile (default: dirijor-notary)
 #   GH_REPO             GitHub repo to publish to (default: cristicretu/diri)
 #   TAP_DIR             Homebrew tap checkout (default: ../../homebrew-diri)
-#   SKIP_CASK=1         don't bump the Homebrew cask
+#   SKIP_CASK=1         explicitly publish without updating the Homebrew cask
 #   SKIP_GATES=1        skip cargo test/clippy (for re-running a failed publish)
 #   SKIP_PERF_GATE=1   skip packaged app memory/idle-CPU probe
 #
-# This publishes TWO artifacts per release, both notarized and stapled:
+# This publishes TWO application artifacts per release, both notarized and stapled:
 #   diri-<version>-universal.dmg  what people download by hand
 #   diri-<version>-universal.zip  what the in-app updater fetches
-# plus appcast.json, the feed the updater reads. All three are attached to a
-# GitHub Release, so `releases/latest/download/appcast.json` is a stable feed
-# URL. See diri/UPDATING.md for the trust model and one-time setup.
+# plus appcast.json, SHA256SUMS, and the reviewed dependency-license inventory.
+# All are attached to a GitHub Release, so the updater feed has a stable URL.
+# See diri/UPDATING.md for the trust model and one-time setup.
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
@@ -46,6 +46,8 @@ GH_REPO="${GH_REPO:-cristicretu/diri}"
 TAP_DIR="${TAP_DIR:-$ROOT/../homebrew-diri}"
 TAG="v$VERSION"
 FEED="$DIST/appcast.json"
+CHECKSUMS="$DIST/SHA256SUMS"
+INVENTORY="$DIST/THIRD-PARTY-LICENSES.json"
 MINIMUM_SYSTEM="15.0"
 # Old builds stay downloadable but the repo should not grow without bound.
 KEEP_RELEASES=5
@@ -89,25 +91,59 @@ if ! command -v gh >/dev/null 2>&1; then
     echo "error: the GitHub CLI (gh) is required to publish" >&2
     exit 1
 fi
+if [ "${SKIP_CASK:-0}" != "1" ] && [ ! -f "$TAP_DIR/Casks/diri.rb" ]; then
+    cat >&2 <<EOF
+error: Homebrew tap checkout is missing Casks/diri.rb: $TAP_DIR
+
+Set TAP_DIR to a clean cristicretu/homebrew-diri checkout. The release cannot
+claim success unless its cask is pushed and verified. Use SKIP_CASK=1 only when
+you intentionally do not want this release offered through Homebrew.
+EOF
+    exit 1
+fi
 
 # ----------------------------------------------------------------------------
-# 1. Version bump
+# 1. Source provenance
 # ----------------------------------------------------------------------------
 # The updater compares against CARGO_PKG_VERSION, so the manifest is the single
-# source of truth for what version this build claims to be.
+# source of truth for what version this build claims to be. Version bumps go
+# through a normal pull request; a release must build the exact remote main
+# commit rather than creating an unpushed release-only commit.
 CURRENT="$(sed -n 's/^version = "\(.*\)"/\1/p' "$MANIFEST" | head -1)"
 if [ "$CURRENT" != "$VERSION" ]; then
-    if [ -n "$(git -C "$ROOT" status --porcelain --untracked-files=no)" ]; then
-        echo "error: uncommitted changes; commit them before bumping to $VERSION" >&2
+    cat >&2 <<EOF
+error: diri-app is $CURRENT, not $VERSION
+
+Open and merge a version-bump pull request first, then run this script from the
+clean main checkout. Release artifacts must map to a reviewed source commit.
+EOF
+    exit 1
+fi
+if [ -n "$(git -C "$ROOT" status --porcelain --untracked-files=no)" ]; then
+    echo "error: tracked files are dirty; release from a clean main checkout" >&2
+    exit 1
+fi
+git -C "$ROOT" fetch --quiet origin main --tags
+SOURCE_COMMIT="$(git -C "$ROOT" rev-parse HEAD)"
+REMOTE_MAIN="$(git -C "$ROOT" rev-parse origin/main)"
+if [ "$SOURCE_COMMIT" != "$REMOTE_MAIN" ]; then
+    cat >&2 <<EOF
+error: release source is not the current origin/main
+  local:  $SOURCE_COMMIT
+  remote: $REMOTE_MAIN
+
+Merge the source and version bump first, then check out and pull main.
+EOF
+    exit 1
+fi
+if git -C "$ROOT" rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
+    TAG_COMMIT="$(git -C "$ROOT" rev-list -n 1 "$TAG")"
+    if [ "$TAG_COMMIT" != "$SOURCE_COMMIT" ]; then
+        echo "error: $TAG points to $TAG_COMMIT, not release source $SOURCE_COMMIT" >&2
         exit 1
     fi
-    echo "==> Bumping diri-app $CURRENT -> $VERSION"
-    sed -i '' -E "1,/^version = /s/^version = \".*\"/version = \"$VERSION\"/" "$MANIFEST"
-    cargo update --workspace --offline >/dev/null 2>&1 || cargo update --workspace >/dev/null
-    git -C "$ROOT" add "$MANIFEST" "$WORKSPACE/Cargo.lock"
-    git -C "$ROOT" commit -m "diri: release $VERSION" >/dev/null
-    echo "    committed the bump"
 fi
+echo "    source commit : $SOURCE_COMMIT"
 
 # ----------------------------------------------------------------------------
 # 2. Gates
@@ -173,6 +209,7 @@ fi
 BASE_URL="https://github.com/$GH_REPO/releases/download/$TAG"
 SIZE="$(stat -f%z "$ZIP")"
 SHA256="$(shasum -a 256 "$ZIP" | awk '{print $1}')"
+DMG_SHA256="$(shasum -a 256 "$DMG" | awk '{print $1}')"
 PUBLISHED="$(date -u +%Y-%m-%d)"
 
 # Start from the published feed so releases people skipped stay offerable.
@@ -229,6 +266,22 @@ feed_path.write_text(json.dumps(feed, indent=2) + "\n")
 print(f"    {len(feed['releases'])} release(s) in the feed, newest {feed['releases'][0]['version']}")
 PYFEED
 
+if [ ! -f "$INVENTORY" ]; then
+    echo "error: packaging did not produce $INVENTORY" >&2
+    exit 1
+fi
+
+echo "==> Writing $CHECKSUMS"
+(
+    cd "$DIST"
+    shasum -a 256 \
+        "$(basename "$DMG")" \
+        "$(basename "$ZIP")" \
+        "$(basename "$FEED")" \
+        "$(basename "$INVENTORY")" > "$(basename "$CHECKSUMS")"
+    shasum -a 256 -c "$(basename "$CHECKSUMS")"
+)
+
 # ----------------------------------------------------------------------------
 # 5. Publish the GitHub Release
 # ----------------------------------------------------------------------------
@@ -249,50 +302,24 @@ NOTES
 fi
 
 echo "==> Publishing $TAG to $GH_REPO"
-if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
-    echo "    release exists — replacing its assets"
-    gh release upload "$TAG" "$DMG" "$ZIP" "$FEED" --repo "$GH_REPO" --clobber
-else
-    gh release create "$TAG" "$DMG" "$ZIP" "$FEED" \
-        --repo "$GH_REPO" \
-        --title "diri $VERSION" \
-        --notes-file "$NOTES_FILE"
-fi
+GH_REPO="$GH_REPO" SOURCE_COMMIT="$SOURCE_COMMIT" \
+    "$WORKSPACE/scripts/publish-github-release.sh" \
+    "$VERSION" "$NOTES_FILE" "$DMG" "$ZIP" "$FEED" "$CHECKSUMS" "$INVENTORY"
 
 # ----------------------------------------------------------------------------
 # 6. Bump the Homebrew cask
 # ----------------------------------------------------------------------------
-# The cask pins the DMG's sha256, so it is wrong the moment a release ships and
-# has to move in lockstep. Skipped silently when the tap is not checked out —
-# a missing tap must not fail a release that already published.
-CASK_FILE="$TAP_DIR/Casks/diri.rb"
+# The cask pins the DMG's sha256, so it has to move in lockstep. The publisher
+# verifies the local DMG against GitHub first, pushes even if the correct commit
+# already existed locally, then reads the remote branch back to prove the cask
+# users receive matches the immutable release asset.
 if [ "${SKIP_CASK:-0}" = "1" ]; then
     echo "==> Skipping the Homebrew cask (SKIP_CASK=1)"
-elif [ ! -f "$CASK_FILE" ]; then
-    echo "    (no cask at $CASK_FILE — skipping the Homebrew bump)"
 else
-    # The cask downloads the DMG; the feed's SHA256 is the zip's.
-    DMG_SHA256="$(shasum -a 256 "$DMG" | awk '{print $1}')"
-    echo "==> Bumping the Homebrew cask to $VERSION"
-    /usr/bin/sed -i '' -E \
-        -e "s|^  version \".*\"$|  version \"$VERSION\"|" \
-        -e "s|^  sha256 \".*\"$|  sha256 \"$DMG_SHA256\"|" \
-        "$CASK_FILE"
-
-    # Prove the edit produced what we intended rather than trusting sed.
-    if ! grep -q "^  version \"$VERSION\"$" "$CASK_FILE" \
-        || ! grep -q "^  sha256 \"$DMG_SHA256\"$" "$CASK_FILE"; then
-        echo "error: the cask bump did not apply cleanly; fix $CASK_FILE by hand" >&2
-        exit 1
-    fi
-
-    if git -C "$TAP_DIR" diff --quiet -- Casks/diri.rb; then
-        echo "    cask already at $VERSION"
-    else
-        git -C "$TAP_DIR" add Casks/diri.rb
-        git -C "$TAP_DIR" commit -q -m "diri $VERSION"
-        echo "    committed (push with: git -C \"$TAP_DIR\" push)"
-    fi
+    echo "==> Publishing the Homebrew cask for $VERSION"
+    GH_REPO="$GH_REPO" \
+        "$WORKSPACE/scripts/publish-homebrew-cask.sh" \
+        "$VERSION" "$DMG" "$TAP_DIR"
 fi
 
 cat <<EOF
@@ -302,13 +329,15 @@ cat <<EOF
 ============================================================
   DMG        : $DMG
   Update zip : $ZIP
-  sha256     : $SHA256
+  DMG sha256 : $DMG_SHA256
+  ZIP sha256 : $SHA256
+  Checksums   : $CHECKSUMS
+  Licenses    : $INVENTORY
+  Source      : $SOURCE_COMMIT
   Release    : https://github.com/$GH_REPO/releases/tag/$TAG
   Feed       : https://github.com/$GH_REPO/releases/latest/download/appcast.json
 
   Next steps:
-    1. Push the source and tag it:
-         git -C "$ROOT" push && git tag diri-v$VERSION && git push origin diri-v$VERSION
-    2. Confirm an old build updates itself (diri/UPDATING.md → "Verifying a release")
+    1. Confirm an old build updates itself (diri/UPDATING.md → "Verifying a release")
 ============================================================
 EOF

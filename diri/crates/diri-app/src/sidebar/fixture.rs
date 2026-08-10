@@ -89,7 +89,27 @@ impl SidebarPreviewFixture {
                 title: Some("Move repository cloning into the background".into()),
                 author: Some("antfu".into()),
                 body: Some(
-                    "Repository cloning now leaves the foreground path immediately while progress and failures remain visible to the active session."
+                    r#"## What changed
+
+Repository cloning now leaves the foreground path immediately while progress and failures remain visible to the active session.
+
+- The checkout starts in a background worker.
+- Progress stays attached to the active agent.
+- Failures include a **retryable** explanation instead of blocking the UI.
+
+> The foreground path no longer waits for network I/O.
+
+### Verification
+
+- [x] Existing repositories still open immediately
+- [x] Clone failures remain visible
+- [ ] Add a slow-network integration case
+
+```rust
+tokio::spawn(async move { clone_repository(request).await });
+```
+
+[Open the implementation notes](https://github.com/acme/dirijor/pull/63)"#
                         .into(),
                 ),
                 base_ref_name: Some("main".into()),

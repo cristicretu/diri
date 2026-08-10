@@ -78,16 +78,36 @@ If the app sits somewhere the user cannot write, the writability check fails
 One-time setup is the Developer ID cert and notary profile described in
 [PACKAGING.md](PACKAGING.md). No Sparkle keys.
 
+First open and merge a normal pull request that updates the `diri-app` version
+and lockfile. Then check out the clean, current `main` branch and run:
+
 ```sh
 diri/scripts/release.sh 0.4.1
 ```
 
-Which bumps `crates/diri-app/Cargo.toml` (and commits the bump), runs clippy +
-tests, builds a universal binary, bundles the Swift daemon, signs it,
+The script refuses to release a version that does not match the manifest, a
+dirty checkout, or a commit other than the current `origin/main`. It runs
+clippy + tests, builds a universal binary, bundles the Swift daemon, signs it,
 **notarizes and staples the .app first**, then builds and notarizes the DMG
 from that stapled bundle, produces the update zip, rebuilds `appcast.json` from
-the currently published feed, and creates the GitHub Release with all three
-attached.
+the currently published feed, generates `SHA256SUMS` and a reviewed dependency
+license inventory, and creates the GitHub Release at that exact source commit.
+It then updates, commits, **pushes, and reads back** the Homebrew cask;
+the release does not report success until the remote cask checksum matches the
+published DMG.
+
+Published asset bytes are immutable. If a rebuilt artifact differs from an
+asset already attached to that version, cut a new patch version instead; the
+script refuses to replace it under the old tag. If only the cask publish failed,
+recover without rebuilding the release:
+
+```sh
+diri/scripts/publish-homebrew-cask.sh \
+  0.4.1 diri/dist/diri-0.4.1-universal.dmg ../homebrew-diri
+```
+
+That recovery command accepts the DMG only if its checksum matches GitHub,
+pushes the tap branch, and reads the remote cask back before succeeding.
 
 Release notes come from `dist/notes-<version>.md`. The script writes a default
 one if it is missing, so writing that file first — and re-running — is how you
@@ -103,11 +123,9 @@ running from the replaced bundle, so a release that changes `dirijord` does not
 take effect until that daemon is restarted by other means. The app half updates
 immediately; the daemon half waits.
 
-It does not push the source. Finish with:
-
-```sh
-git push && git tag diri-v0.4.1 && git push origin diri-v0.4.1
-```
+The canonical release tag is `v<version>`. `gh release create` creates that tag
+at the verified `origin/main` commit; do not create a second `diri-v<version>`
+tag. Source is merged before release rather than pushed after binary publication.
 
 ### Why the .app is notarized before the DMG
 
@@ -121,6 +139,8 @@ bundle itself, which then goes into both the DMG and the update zip.
 - `DIRI_SIGN_IDENTITY` — Developer ID identity (default: auto-detected).
 - `NOTARY_PROFILE` — notarytool profile (default `dirijor-notary`).
 - `GH_REPO` — repository to publish to (default `cristicretu/diri`).
+- `TAP_DIR` — clean Homebrew tap checkout (default `../../homebrew-diri`).
+- `SKIP_CASK=1` — explicitly publish without offering the release via Homebrew.
 - `SKIP_GATES=1` — skip clippy/tests when re-running a failed publish.
 
 ## Verifying a release

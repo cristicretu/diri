@@ -18,9 +18,9 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Term, TermMode};
-use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
+use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
 use diri_proto::grid::{ChangedRow, GridCell, GridRowCodec, GridUpdate, TermColor, TermStyle};
 
 /// Receiver-side authority for a remote terminal stream. A mirror accepts a
@@ -496,8 +496,34 @@ impl HeadlessScreen {
     /// cursor-addressed independently, because a wide glyph consumes two
     /// terminal columns while the grid also carries its blank continuation
     /// cell — a naive row string would shift everything after it.
+    /// Styled rows above the visible grid, oldest first. Checkpoints persist
+    /// these alongside the visible snapshot so adoption does not collapse a
+    /// long session to a single scrollback row.
+    pub fn history_snapshot(&self) -> Vec<Vec<GridCell>> {
+        let grid = self.term.grid();
+        let history = grid.history_size();
+        let cols = self.geometry.cols;
+        let mut rows = Vec::with_capacity(history);
+        for index in 0..history {
+            let line = Line(index as i32 - history as i32);
+            let mut row = Vec::with_capacity(cols);
+            for x in 0..cols {
+                row.push(wire_cell(&grid[line][Column(x)]));
+            }
+            rows.push(row);
+        }
+        rows
+    }
+
+    /// Restores a persisted visible grid into a fresh emulator by
+    /// synthesizing the byte stream that would have painted it. Ported from
+    /// the Swift `HeadlessScreen.restore(checkpoint:)`: each non-blank cell
+    /// is cursor-addressed independently, because a wide glyph consumes two
+    /// terminal columns while the grid also carries its blank continuation
+    /// cell — a naive row string would shift everything after it.
     pub fn restore(
         &mut self,
+        history: &[Vec<GridCell>],
         update: &GridUpdate,
         alt_screen: bool,
         bracketed_paste: bool,
@@ -509,8 +535,318 @@ impl HeadlessScreen {
             || update.cols as usize != cols
             || update.rows as usize != rows
             || update.changed_rows.len() != rows
+            || history.len() > history_line_limit(cols)
+            || history.iter().any(|row| row.len() != cols)
         {
             return false;
+        }
+
+        // Allocate scrollback in the emulator, then replace those rows with
+        // the persisted cells. The visible grid is painted below; CSI 2 J
+        // clears only that viewport and deliberately leaves history intact.
+        if !history.is_empty() {
+            let grid = self.term.grid_mut();
+            grid.scroll_up(&(Line(0)..Line(rows as i32)), history.len());
+            let restored_history = grid.history_size();
+            if restored_history != history.len() {
+                return false;
+            }
+            for (index, row) in history.iter().enumerate() {
+                let line = Line(index as i32 - restored_history as i32);
+                for (x, cell) in row.iter().enumerate() {
+                    grid[line][Column(x)] = emulator_cell(*cell);
+                }
+            }
+        }
+
+        let mut bytes = Vec::with_capacity(cols * rows * 2);
+        if alt_screen {
+            bytes.extend_from_slice(b"\x1b[?1049h");
+        }
+        bytes.extend_from_slice(b"\x1b[H\x1b[2J");
+
+        let mut sorted: Vec<&ChangedRow> = update.changed_rows.iter().collect();
+        sorted.sort_by_key(|row| row.y);
+        for row in sorted {
+            if row.y as usize >= rows || row.cells.len() != cols {
+                return false;
+            }
+            let mut previous: Option<&GridCell> = None;
+            for (x, cell) in row.cells.iter().enumerate() {
+                // The initial clear already produced true blank cells;
+                // leaving them untouched keeps sparse checkpoints cheap.
+                if *cell == GridCell::BLANK {
+                    continue;
+                }
+                bytes.extend_from_slice(format!("\x1b[{};{}H", row.y + 1, x + 1).as_bytes());
+                if previous.is_none_or(|prev| {
+                    prev.fg != cell.fg || prev.bg != cell.bg || prev.style != cell.style
+                }) {
+                    bytes.extend_from_slice(sgr(cell).as_bytes());
+                }
+                match char::from_u32(cell.scalar) {
+                    Some(glyph) if cell.scalar != 0 => {
+                        let mut buffer = [0u8; 4];
+                        bytes.extend_from_slice(glyph.encode_utf8(&mut buffer).as_bytes());
+                    }
+                    _ => bytes.push(b' '),
+                }
+                previous = Some(cell);
+            }
+        }
+
+        bytes.extend_from_slice(b"\x1b[0m");
+        if bracketed_paste {
+            bytes.extend_from_slice(b"\x1b[?2004h");
+        }
+        if mouse_reporting {
+            bytes.extend_from_slice(b"\x1b[?1000h\x1b[?1006h");
+        }
+        bytes.extend_from_slice(if update.cursor_visible {
+            b"\x1b[?25h"
+        } else {
+            b"\x1b[?25l"
+        });
+        bytes.extend_from_slice(
+            format!(
+                "\x1b[{};{}H",
+                (update.cursor_row as usize + 1).min(rows),
+                (update.cursor_col as usize + 1).min(cols)
+            )
+            .as_bytes(),
+        );
+        self.feed(&bytes);
+        // Force the next grid_update to be a full frame: the diff baseline
+        // predates the restore.
+        self.last_grid_cols = 0;
+        self.last_grid_rows = 0;
+        true
+    }
+
+    /// Encodes a wheel event for the child, when it asked for mouse
+    /// reporting. Returns the bytes to write to the PTY — empty means the
+    /// child doesn't care and the client should scroll its own scrollback.
+    pub fn mouse_wheel(&self, up: bool, lines: usize, col: usize, row: usize) -> Vec<u8> {
+        if !self.mouse_reporting() || lines == 0 {
+            return Vec::new();
+        }
+        let x = col.min(self.geometry.cols.saturating_sub(1));
+        let y = row.min(self.geometry.rows.saturating_sub(1));
+        let button = if up { 64 } else { 65 }; // X11 wheel buttons 4/5, wheel-flagged
+        let mut out = Vec::new();
+        for _ in 0..lines {
+            if self.term.mode().contains(TermMode::SGR_MOUSE) {
+                out.extend_from_slice(format!("\x1b[<{button};{};{}M", x + 1, y + 1).as_bytes());
+            } else {
+                // Legacy X10 encoding: 32 + button, 32 + 1-based coordinate.
+                out.push(0x1b);
+                out.extend_from_slice(b"[M");
+                out.push(32 + button as u8);
+                out.push((32 + x + 1).min(255) as u8);
+                out.push((32 + y + 1).min(255) as u8);
+            }
+        }
+        out
+    }
+
+    /// Scrollback plus the visible screen as plain text, for search.
+    ///
+    /// Row indices are relative to the oldest line this emulator still
+    /// retains. Unlike SwiftTerm's scroll-invariant index they slide once the
+    /// history budget evicts — a client caching deep scrollback across heavy
+    /// output may refetch; the visible region and recent history are exact.
+    pub fn scrollback(&self) -> diri_proto::ReadScrollbackResult {
+        let grid = self.term.grid();
+        let history = grid.history_size();
+        let rows = self.geometry.rows;
+        let cols = self.geometry.cols;
+        let total = history + rows;
+        let mut lines = Vec::with_capacity(total);
+        for index in 0..total {
+            let line = Line(index as i32 - history as i32);
+            let mut text = String::with_capacity(cols);
+            for x in 0..cols {
+                let c = grid[line][Column(x)].c;
+                text.push(if c < ' ' && c != '\t' { ' ' } else { c });
+            }
+            lines.push(text.trim_end().to_string());
+        }
+        diri_proto::ReadScrollbackResult {
+            lines,
+            first_row: 0,
+            visible_start_row: history as i64,
+            cols: cols as i64,
+            rows: rows as i64,
+            content_seq: self.content_seq,
+            is_alt_screen: self.is_alt_screen(),
+        }
+    }
+
+    /// A window of scrollback rows as encoded cells, clamped to what exists.
+    pub fn scrollback_cells(
+        &self,
+        first_row: i64,
+        max_rows: i64,
+    ) -> diri_proto::ReadScrollbackCellsResult {
+        let grid = self.term.grid();
+        let history = grid.history_size();
+        let cols = self.geometry.cols;
+        let total = history + self.geometry.rows;
+
+        let start = first_row.max(0).min(total as i64) as usize;
+        let end = (start + max_rows.max(0) as usize).min(total);
+        let mut rows = Vec::with_capacity(end.saturating_sub(start));
+        for index in start..end {
+            let line = Line(index as i32 - history as i32);
+            let mut row = Vec::with_capacity(cols);
+            for x in 0..cols {
+                row.push(wire_cell(&grid[line][Column(x)]));
+            }
+            rows.push(row);
+        }
+        diri_proto::ReadScrollbackCellsResult {
+            payload: GridRowCodec::encode_rows(&rows).unwrap_or_default(),
+            first_row: start as i64,
+            row_count: rows.len() as i64,
+            total_rows: total as i64,
+            live_start_row: history as i64,
+            cols: cols as i64,
+            content_seq: self.content_seq,
+        }
+    }
+
+    /// The visible grid as plain text, trailing blank lines removed.
+    pub fn lines(&self) -> Vec<String> {
+        let grid = self.term.grid();
+        let mut lines: Vec<String> = Vec::with_capacity(self.geometry.rows);
+        for row in 0..self.geometry.rows {
+            let line = Line(row as i32);
+            let mut text = String::with_capacity(self.geometry.cols);
+            for column in 0..self.geometry.cols {
+                text.push(grid[line][Column(column)].c);
+            }
+            lines.push(text.trim_end().to_string());
+        }
+        while lines.last().is_some_and(|line| line.trim().is_empty()) {
+            lines.pop();
+        }
+        lines
+    }
+
+    /// A snapshot for the detection engine.
+    pub fn snapshot(&self) -> ScreenSnapshot {
+        ScreenSnapshot {
+            lines: self.lines(),
+            osc_title: self.title.clone(),
+            osc_progress_state: self.progress_state,
+            content_seq: self.content_seq,
+        }
+    }
+
+    pub fn progress(&self) -> Option<(i64, i64)> {
+        Some((self.progress_state?, self.progress_value.unwrap_or(0)))
+    }
+
+    fn drain_events(&mut self) {
+        while let Ok(event) = self.events.try_recv() {
+            if let Event::Title(title) = event {
+                self.title = Some(title);
+            } else if matches!(event, Event::ResetTitle) {
+                self.title = None;
+            }
+        }
+    }
+
+    // (cell mapping lives at module level; see `wire_cell`)
+
+    /// Content fingerprint hashed straight off the grid cells, so
+    /// `content_seq` only advances when the visible screen actually changed.
+    /// Detection uses that to skip re-evaluating a frame it has already
+    /// judged.
+    fn digest_cells(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let grid = self.term.grid();
+        for row in 0..self.geometry.rows {
+            let line = Line(row as i32);
+            for column in 0..self.geometry.cols {
+                grid[line][Column(column)].c.hash(&mut hasher);
+            }
+        }
+        self.title.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Extracts `ESC ] 9 ; 4 ; state ; value` progress reports.
+    ///
+    /// Agents use this to say "I am working, 40% through"; the emulator has no
+    /// concept of it and would silently drop the sequence.
+    fn scan_progress(&mut self, bytes: &[u8]) {
+        const PREFIX: &[u8] = b"\x1b]9;4;";
+        let mut haystack = std::mem::take(&mut self.progress_carry);
+        haystack.extend_from_slice(bytes);
+
+        let mut search_from = 0;
+        while let Some(found) = find(&haystack[search_from..], PREFIX) {
+            let start = search_from + found + PREFIX.len();
+            // Terminated by BEL or ST (ESC \).
+            let Some(end) = haystack[start..]
+                .iter()
+                .position(|&b| b == 0x07 || b == 0x1b)
+                .map(|offset| start + offset)
+            else {
+                // Truncated: keep it for the next chunk.
+                break;
+            };
+            let payload = String::from_utf8_lossy(&haystack[start..end]);
+            let mut parts = payload.split(';');
+            self.progress_state = parts.next().and_then(|value| value.trim().parse().ok());
+            self.progress_value = parts.next().and_then(|value| value.trim().parse().ok());
+            search_from = end;
+        }
+
+        // Keep a tail long enough to rejoin a sequence split across reads.
+        let keep = haystack.len().saturating_sub(64);
+        self.progress_carry = haystack[keep..].to_vec();
+    }
+}
+
+    pub fn restore(
+        &mut self,
+        history: &[Vec<GridCell>],
+        update: &GridUpdate,
+        alt_screen: bool,
+        bracketed_paste: bool,
+        mouse_reporting: bool,
+    ) -> bool {
+        let cols = self.geometry.cols;
+        let rows = self.geometry.rows;
+        if !update.is_full_snapshot
+            || update.cols as usize != cols
+            || update.rows as usize != rows
+            || update.changed_rows.len() != rows
+            || history.len() > history_line_limit(cols)
+            || history.iter().any(|row| row.len() != cols)
+        {
+            return false;
+        }
+
+        // Allocate scrollback in the emulator, then replace those rows with
+        // the persisted cells. The visible grid is painted below; CSI 2 J
+        // clears only that viewport and deliberately leaves history intact.
+        if !history.is_empty() {
+            let grid = self.term.grid_mut();
+            grid.scroll_up(&(Line(0)..Line(rows as i32)), history.len());
+            let restored_history = grid.history_size();
+            if restored_history != history.len() {
+                return false;
+            }
+            for (index, row) in history.iter().enumerate() {
+                let line = Line(index as i32 - restored_history as i32);
+                for (x, cell) in row.iter().enumerate() {
+                    grid[line][Column(x)] = emulator_cell(*cell);
+                }
+            }
         }
 
         let mut bytes = Vec::with_capacity(cols * rows * 2);
@@ -1059,5 +1395,48 @@ mod tests {
                 actual: 12
             })
         ));
+    }
+}
+
+fn emulator_cell(cell: GridCell) -> Cell {
+    let mut flags = Flags::empty();
+    if cell.style.contains(TermStyle::BOLD) {
+        flags.insert(Flags::BOLD);
+    }
+    if cell.style.contains(TermStyle::UNDERLINE) {
+        flags.insert(Flags::UNDERLINE);
+    }
+    if cell.style.contains(TermStyle::INVERSE) {
+        flags.insert(Flags::INVERSE);
+    }
+    if cell.style.contains(TermStyle::INVISIBLE) {
+        flags.insert(Flags::HIDDEN);
+    }
+    if cell.style.contains(TermStyle::DIM) {
+        flags.insert(Flags::DIM);
+    }
+    if cell.style.contains(TermStyle::ITALIC) {
+        flags.insert(Flags::ITALIC);
+    }
+    if cell.style.contains(TermStyle::CROSSED_OUT) {
+        flags.insert(Flags::STRIKEOUT);
+    }
+    Cell {
+        c: char::from_u32(cell.scalar)
+            .filter(|_| cell.scalar != 0)
+            .unwrap_or(' '),
+        fg: emulator_color(cell.fg),
+        bg: emulator_color(cell.bg),
+        flags,
+        extra: None,
+    }
+}
+
+fn emulator_color(color: TermColor) -> Color {
+    match color {
+        TermColor::Default => Color::Named(NamedColor::Foreground),
+        TermColor::DefaultInverted => Color::Named(NamedColor::Background),
+        TermColor::Ansi(index) => Color::Indexed(index),
+        TermColor::Rgb(r, g, b) => Color::Spec(Rgb { r, g, b }),
     }
 }
