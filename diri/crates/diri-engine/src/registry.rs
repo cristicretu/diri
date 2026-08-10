@@ -1023,6 +1023,47 @@ mod tests {
     }
 
     #[test]
+    /// Older records stored `projectID` as the raw directory path instead of a
+    /// hashed id. Load recomputes identity, so those are repaired in place
+    /// rather than left as a second, path-shaped namespace — and records that
+    /// already carry a hashed id keep it, so an existing sidebar does not
+    /// fragment into duplicate project rows.
+    #[test]
+    fn loading_repairs_path_shaped_project_ids_and_leaves_hashed_ones_alone() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state_file = temp.path().join("state.json");
+        let root = "/workspace/app";
+
+        let mut legacy = record("legacy");
+        legacy.cwd = root.into();
+        legacy.project_id = ProjectId(root.to_owned());
+        let mut hashed = record("hashed");
+        hashed.cwd = root.into();
+        hashed.project_id = session_project_id(root, None);
+        let expected = hashed.project_id.clone();
+
+        let state = PersistedState::current(vec![legacy, hashed], Vec::new());
+        std::fs::write(&state_file, serde_json::to_vec(&state).expect("encode")).expect("write");
+
+        let mut registry = Registry::new(engine(), &state_file);
+        registry.load().expect("load");
+        let records = registry.records();
+        assert!(
+            records.iter().all(|record| record.project_id == expected),
+            "both records should share one repaired project identity: {:?}",
+            records
+                .iter()
+                .map(|record| &record.project_id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            registry.projects_raw().len(),
+            1,
+            "the repair must not leave a second project row behind"
+        );
+    }
+
+    #[test]
     fn loading_keeps_a_linked_worktree_under_its_project_root() {
         let temp = tempfile::tempdir().expect("temp");
         let state_file = temp.path().join("state.json");
