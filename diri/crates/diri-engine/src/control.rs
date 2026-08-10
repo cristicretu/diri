@@ -1282,7 +1282,6 @@ impl ControlServer {
     fn host_sync_prefs(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::HostSyncPrefsParams = decode(params)?;
         let entry = self.resolve_host(&p.host)?;
-        self.ensure_remote_host_ready(&entry)?;
         let home = std::env::var("HOME")
             .map(PathBuf::from)
             .map_err(|_| ControlError::internal("HOME is not set"))?;
@@ -1374,9 +1373,6 @@ impl ControlServer {
                 .as_deref()
                 .map(|id| self.resolve_host(id))
                 .transpose()?;
-            if let Some(source) = source.as_ref() {
-                self.ensure_remote_host_ready(source)?;
-            }
             origin = crate::hosts::origin_of_cwd(&cwd, source.as_ref());
         }
         let Some(origin) = origin else {
@@ -1395,9 +1391,6 @@ impl ControlServer {
                 .map(str::to_string)
                 .collect()
         };
-        if let Some(target) = target.as_ref() {
-            self.ensure_remote_host_ready(target)?;
-        }
         let path = crate::hosts::locate(&origin, target.as_ref(), &local_roots);
         encode(&diri_proto::HostLocateRepoResult {
             path,
@@ -1420,15 +1413,6 @@ impl ControlServer {
     /// Applies the current application build's remote environment gate before
     /// a stateless SSH action. Live Holder operations deliberately use their
     /// session binding's creation-time Helper instead.
-    fn ensure_remote_host_ready(&self, host: &diri_proto::HostEntry) -> Result<(), ControlError> {
-        self.remote
-            .as_ref()
-            .ok_or_else(crate::remote::transport_unavailable)?
-            .ensure_helper(host)
-            .map_err(io_control_error)?;
-        Ok(())
-    }
-
     fn hosts_file(&self) -> PathBuf {
         self.socket_path
             .parent()

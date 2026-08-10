@@ -276,11 +276,11 @@ impl WorkbenchInspector {
         }
         self.visible = visible;
         if visible {
-            if self.selected_tab == InspectorTab::Changes {
-                self.refresh(true, cx);
-            } else {
-                self.context = self.selected_context();
-            }
+            // One-shot, every tab. Info renders the Git summary and the header
+            // renders the Changes badge, so becoming visible always needs one
+            // settled read of the working tree — what stays tab-gated is the
+            // *periodic* poll below, not this edge-triggered refresh.
+            self.refresh(true, cx);
         } else {
             self.comparison_menu_open = false;
             self.files_open = false;
@@ -355,11 +355,10 @@ impl WorkbenchInspector {
         if !self.visible {
             return;
         }
-        if self.selected_tab != InspectorTab::Changes {
-            self.context = self.selected_context();
-            cx.notify();
-            return;
-        }
+        // Edge-triggered on a real context change, on every tab: a store change
+        // that moves the selection must not leave Info showing the previous
+        // session's counts. This is not periodic work — an idle Info tab makes
+        // no Git calls because `reconcile_diff_polling` installs no timer.
         if self.selected_context() != self.context {
             self.refresh(true, cx);
         } else {
@@ -4346,6 +4345,83 @@ mod tests {
             true,
             &LoadState::Error("old project".to_owned())
         ));
+    }
+
+    /// The Info tab renders the Git summary, so it must be refreshed when it
+    /// becomes visible and whenever the selected session changes — but it must
+    /// never install the periodic diff poll, which stays exclusive to Changes.
+    #[gpui::test]
+    fn info_refreshes_on_context_change_without_a_periodic_poll(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let ids: Vec<SessionId> = fixture
+            .list
+            .sessions
+            .iter()
+            .map(|session| session.id.clone())
+            .collect();
+        assert!(ids.len() >= 2, "fixture must offer two sessions to switch");
+        {
+            let mut store = runtime.store.write().expect("session store lock poisoned");
+            store.hydrate(fixture.list);
+            store.select(ids[0].clone());
+        }
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let inspector_runtime = Arc::clone(&runtime);
+        let (harness, cx) = cx.add_window_view(move |_window, cx| {
+            let inspector = cx.new(|cx| WorkbenchInspector::new(inspector_runtime, tokio, cx));
+            InspectorHarness { inspector }
+        });
+        let inspector = harness.read_with(cx, |harness, _| harness.inspector.clone());
+
+        // Shipping defaults: the inspector opens visible on Info.
+        assert_eq!(
+            inspector.read_with(cx, |inspector, _| inspector.selected_tab),
+            InspectorTab::Info
+        );
+        inspector.update(cx, |inspector, cx| inspector.set_visible(true, cx));
+
+        let (generation, context, polling) = inspector.read_with(cx, |inspector, _| {
+            (
+                inspector.generation,
+                inspector.context.clone(),
+                inspector.poll_task.is_some(),
+            )
+        });
+        assert!(generation > 0, "becoming visible on Info must read Git once");
+        assert_eq!(context.map(|context| context.id), Some(ids[0].clone()));
+        assert!(!polling, "Info must not install a periodic diff poll");
+
+        {
+            let mut store = runtime.store.write().expect("session store lock poisoned");
+            store.select(ids[1].clone());
+        }
+        inspector.update(cx, |inspector, cx| inspector.refresh_if_context_changed(cx));
+
+        let (next_generation, next_context, still_polling) = inspector.read_with(cx, |i, _| {
+            (i.generation, i.context.clone(), i.poll_task.is_some())
+        });
+        assert!(
+            next_generation > generation,
+            "a session change on Info must refresh instead of stranding stale counts"
+        );
+        assert_eq!(next_context.map(|context| context.id), Some(ids[1].clone()));
+        assert!(!still_polling, "Info must still hold no periodic poll");
+
+        // Contrast: Changes owns the timer, and leaving it disposes of it.
+        inspector.update(cx, |inspector, cx| {
+            inspector.select_tab(InspectorTab::Changes, cx);
+        });
+        assert!(inspector.read_with(cx, |inspector, _| inspector.poll_task.is_some()));
+        inspector.update(cx, |inspector, cx| {
+            inspector.select_tab(InspectorTab::Info, cx);
+        });
+        assert!(inspector.read_with(cx, |inspector, _| inspector.poll_task.is_none()));
     }
 
     #[test]
