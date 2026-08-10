@@ -2064,7 +2064,14 @@ impl Sidebar {
             .child(header)
             .child(HairlineDivider::horizontal(colors));
         // Host selector — only when hosts.json configures remote hosts:
-        // "Local" plus one row per host, checkmark on the selection.
+        // "This Mac" plus one row per host, checkmark on the selection.
+        //
+        // This list is the single surface that owns the persisted shortcut
+        // destination, so it must always be able to undo itself: "This Mac" is
+        // the first row and is a real target, not just the absence of one, and
+        // it is worded exactly like the destination printed on the always-
+        // visible New Agent row ("Claude Code · This Mac · ⌘T") so the label a
+        // user reads is the label they come here to change.
         if !hosts.is_empty() {
             content = content.child(
                 div()
@@ -2077,7 +2084,7 @@ impl Sidebar {
                     .child("Run shortcuts on"),
             );
             let mut targets: Vec<(Option<String>, String, &'static str)> =
-                vec![(None, "Local".to_owned(), "desktopcomputer")];
+                vec![(None, "This Mac".to_owned(), "desktopcomputer")];
             for entry in &hosts {
                 targets.push((
                     Some(entry.id.clone()),
@@ -2114,6 +2121,16 @@ impl Sidebar {
                             } else {
                                 directory.clone()
                             };
+                            // Choosing a row here is an explicit, persistent
+                            // setting, not last-used memory: one destination
+                            // drives this spawn, ⌘T, ⌥⌘T and the palette, so
+                            // the checkmark never disagrees with where a
+                            // shortcut lands. Persisting is only defensible
+                            // because the choice stays visible (the New Agent
+                            // row and every palette title name the target) and
+                            // reversible (the "This Mac" row above sets it
+                            // back, and a host deleted from hosts.json is
+                            // repaired to local on load).
                             this.store
                                 .write()
                                 .expect("session store lock poisoned")

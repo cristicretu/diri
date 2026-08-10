@@ -413,4 +413,53 @@ mod tests {
                 .all(|tool| tool.ok && tool.synced.is_empty())
         );
     }
+
+    /// Quoting the whole path would send a literal tilde and land the session
+    /// in a directory named `~`, so the prefix is deliberately left bare.
+    #[test]
+    fn a_tilde_path_stays_expandable() {
+        assert_eq!(shell_quote_path("~/code/app"), "~/'code/app'");
+        assert_eq!(shell_quote_path("~"), "~");
+        assert_eq!(shell_quote_path("/abs/path"), "'/abs/path'");
+    }
+
+    /// These two functions build every remote shell command the Engine sends,
+    /// so this is the injection guard. It travelled here from the deleted
+    /// `remote` module and would otherwise have been lost with it — `hosts`
+    /// shipped no coverage for either.
+    #[test]
+    fn a_path_with_a_quote_cannot_break_out() {
+        let quoted = shell_quote_path("~/it's here");
+        assert_eq!(quoted, r"~/'it'\''s here'");
+
+        // What a shell actually sees: '…' + escaped quote + '…' → one word.
+        let echoed = std::process::Command::new("/bin/sh")
+            .args(["-c", &format!("printf %s {quoted}")])
+            .env("HOME", "/tmp")
+            .output()
+            .expect("sh");
+        assert_eq!(
+            String::from_utf8_lossy(&echoed.stdout),
+            "/tmp/it's here",
+            "the quoting must round-trip through a real shell"
+        );
+    }
+
+    #[test]
+    fn a_command_substitution_cannot_escape_shell_quote() {
+        let quoted = shell_quote("$(touch /tmp/diri-injection-canary)");
+        let echoed = std::process::Command::new("/bin/sh")
+            .args(["-c", &format!("printf %s {quoted}")])
+            .output()
+            .expect("sh");
+        assert_eq!(
+            String::from_utf8_lossy(&echoed.stdout),
+            "$(touch /tmp/diri-injection-canary)",
+            "the substitution must arrive as literal text, not run"
+        );
+        assert!(
+            !std::path::Path::new("/tmp/diri-injection-canary").exists(),
+            "the quoted command substitution must not have executed"
+        );
+    }
 }

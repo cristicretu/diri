@@ -1101,6 +1101,25 @@ mod tests {
         );
     }
 
+    /// The extracted crate forked before checkpoints carried scrollback, so
+    /// this travelled with the implementation. Without it, adopting a session
+    /// after a daemon restart silently collapses its history to one row.
+    #[test]
+    fn a_restored_checkpoint_preserves_scrollback_history() {
+        let mut original = HeadlessScreen::new(12, 2);
+        original.feed(b"oldest\r\nmiddle\r\nvisible\r\n");
+        let history = original.history_snapshot();
+        let snapshot = original.full_snapshot();
+        assert_eq!(history.len(), 2, "the minimized repro has two history rows");
+
+        let mut restored = HeadlessScreen::new(12, 2);
+        assert!(
+            restored.restore(&history, &snapshot, false, false, false),
+            "restorable"
+        );
+        assert_eq!(restored.scrollback(), original.scrollback());
+    }
+
     #[test]
     fn a_boxed_prompt_survives_emulation_intact() {
         // What detection actually consumes, end to end.

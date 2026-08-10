@@ -4393,7 +4393,10 @@ mod tests {
                 inspector.poll_task.is_some(),
             )
         });
-        assert!(generation > 0, "becoming visible on Info must read Git once");
+        assert!(
+            generation > 0,
+            "becoming visible on Info must read Git once"
+        );
         assert_eq!(context.map(|context| context.id), Some(ids[0].clone()));
         assert!(!polling, "Info must not install a periodic diff poll");
 
