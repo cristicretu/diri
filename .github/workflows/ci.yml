@@ -146,6 +146,12 @@ jobs:
           # sshd refuses to start without its privilege separation directory,
           # which the package does not create on a fresh runner image.
           sudo mkdir -p /run/sshd
+          # The runner account ships with no password, which leaves it locked
+          # ("!" in shadow) and makes sshd reject it before it ever considers
+          # the key. Unlock it without setting one; password and
+          # keyboard-interactive auth stay disabled below, so keys remain the
+          # only way in on this throwaway host.
+          sudo usermod -p '*' "${USER}"
           mkdir -p "${HOME}/.ssh" "${RUNNER_TEMP}/sshd"
           chmod 700 "${HOME}/.ssh"
           ssh-keygen -q -t ed25519 -N '' -f "${RUNNER_TEMP}/diri_ci_key"

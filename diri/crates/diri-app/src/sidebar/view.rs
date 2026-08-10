@@ -4250,4 +4250,64 @@ mod tests {
             Some("forge".into())
         );
     }
+
+    /// The picker persists the shortcut destination, so the same picker has to
+    /// be able to take it back: one click on the "This Mac" row must return
+    /// ⌘T / ⌥⌘T / the palette to local, with nothing else to undo.
+    #[gpui::test]
+    fn the_new_agent_picker_can_send_shortcuts_back_to_this_mac(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| {
+                let mut sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                {
+                    let mut store = sidebar.store.write().expect("session store lock poisoned");
+                    store.set_hosts(vec![diri_proto::HostEntry {
+                        id: "forge".into(),
+                        name: Some("Forge".into()),
+                        ssh: "you@forge".into(),
+                        default_cwd: None,
+                        node: None,
+                    }]);
+                    // Start from the regressed state: shortcuts already point
+                    // at a remote host, as they would after an earlier click.
+                    store.set_default_spawn_host(Some("forge".into()));
+                }
+                sidebar.ui.popover = Some(Popover::NewAgent {
+                    directory: None,
+                    host: Some("forge".into()),
+                });
+                sidebar
+            });
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .default_spawn_host()),
+            Some("forge".into())
+        );
+
+        let local = cx.debug_bounds("HOST_OPTION_0").expect("this-mac row");
+        cx.simulate_click(local.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .default_spawn_host()),
+            None
+        );
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.ui.popover.clone()),
+            Some(Popover::NewAgent {
+                directory: None,
+                host: None,
+            })
+        );
+    }
 }

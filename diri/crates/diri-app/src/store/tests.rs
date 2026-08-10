@@ -1193,6 +1193,41 @@ fn selecting_a_default_host_persists_across_store_reloads() {
     );
 }
 
+/// A persisted shortcut destination is only acceptable if it is reversible:
+/// picking "This Mac" again must clear it on disk, survive a reload, and put
+/// the top-level shortcuts back on this machine.
+#[test]
+fn a_remote_default_host_round_trips_back_to_local() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("prefs.json");
+    Prefs::default().save(&path).unwrap();
+    let (mut store, mut effects) = SessionStore::load(&path).unwrap();
+    store.set_hosts(vec![diri_proto::HostEntry {
+        id: "forge".into(),
+        name: Some("Forge".into()),
+        ssh: "cristi@forge".into(),
+        default_cwd: Some("~/code".into()),
+        node: None,
+    }]);
+    store.set_default_spawn_host(Some("forge".into()));
+    assert_eq!(store.default_spawn_host().as_deref(), Some("forge"));
+
+    store.set_default_spawn_host(None);
+
+    assert_eq!(store.default_spawn_host(), None);
+    assert_eq!(Prefs::load(&path).unwrap().default_spawn_host, None);
+    drain(&mut effects);
+    store.spawn_default(super::SpawnOptions::default());
+    let params = match effects.try_recv() {
+        Ok(StoreEffect::Spawn(params)) => params,
+        other => panic!("expected spawn effect, got {other:?}"),
+    };
+    assert_eq!(params.host, None, "⌘T must be local again after a reset");
+
+    let (reloaded, _effects) = SessionStore::load(&path).unwrap();
+    assert_eq!(reloaded.default_spawn_host(), None);
+}
+
 #[test]
 fn migrate_session_guards_kind_target_and_reentry() {
     let mut remote = session("two", "p", 2.0);
