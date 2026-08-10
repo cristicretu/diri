@@ -1,0 +1,129 @@
+{
+  "_notice": "Screen-detection predicates adapted from the herdr project (https://github.com/herdrdev/herdr, src/detect/manifests/*.toml), licensed Apache-2.0. Translated from herdr's TOML rule schema into Dirijor's JSON predicate schema and re-prioritised for this engine; the agent capability block is Dirijor's own.",
+  "schemaVersion": 2,
+  "id": "amp",
+  "version": "2026.07.31.1",
+  "statusModel": "full",
+  "agent": {
+    "id": "amp",
+    "displayName": "Amp",
+    "shortLabel": "amp",
+    "glyph": "\u23fb",
+    "aliases": [
+      "amp",
+      "amp-local",
+      "sourcegraph-amp"
+    ],
+    "firstClass": true,
+    "statusAuthority": "screen",
+    "binary": "amp",
+    "returnToLoginShell": true,
+    "foregroundExecNames": [
+      "amp"
+    ],
+    "envScrubPrefixes": [
+      "DIRI_",
+      "DIRIJOR_"
+    ]
+  },
+  "rules": [
+    {
+      "id": "blocked-osc-title",
+      "state": "blockedPermission",
+      "priority": 1100,
+      "region": "osc_title",
+      "when": {
+        "contains": "plugin confirmation needed"
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "working-osc-spinner",
+      "state": "working",
+      "priority": 1050,
+      "region": "osc_title",
+      "when": {
+        "regex": "^[\\u2800-\\u28FF]"
+      }
+    },
+    {
+      "id": "blocked-approval",
+      "state": "blockedPermission",
+      "priority": 300,
+      "region": "whole_recent",
+      "when": {
+        "any": [
+          {
+            "contains": "waiting for approval"
+          },
+          {
+            "contains": "invoke tool"
+          },
+          {
+            "contains": "run this command?"
+          },
+          {
+            "contains": "allow editing file:"
+          },
+          {
+            "contains": "allow creating file:"
+          },
+          {
+            "contains": "confirm tool call"
+          },
+          {
+            "contains": "allow all for this session"
+          },
+          {
+            "contains": "allow all for every session"
+          },
+          {
+            "contains": "deny with feedback"
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "working-status-rail",
+      "state": "working",
+      "priority": 200,
+      "region": "whole_recent",
+      "when": {
+        "lineRegex": "(?i)^\\s*\u2570\\s+\\S+\\s+(thinking|streaming|running tools|waiting)\\s+\u2500"
+      }
+    },
+    {
+      "id": "working-esc-cancel",
+      "state": "working",
+      "priority": 100,
+      "region": "whole_recent",
+      "when": {
+        "contains": "esc to cancel"
+      }
+    },
+    {
+      "id": "idle-osc-title",
+      "state": "idle",
+      "priority": 50,
+      "region": "osc_title",
+      "when": {
+        "contains": " - amp - "
+      }
+    }
+  ]
+}

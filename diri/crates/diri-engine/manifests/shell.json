@@ -1,15 +1,18 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "id": "shell",
-  "version": "rust-1",
+  "version": "1",
   "statusModel": "processOnly",
   "agent": {
     "id": "shell",
     "displayName": "Shell",
-    "shortLabel": "Shell",
-    "glyph": "terminal",
-    "aliases": ["shell"],
-    "firstClass": true,
+    "shortLabel": "shell",
+    "glyph": "$",
+    "aliases": [
+      "terminal",
+      "sh"
+    ],
+    "firstClass": false,
     "statusAuthority": "process"
   },
   "rules": []

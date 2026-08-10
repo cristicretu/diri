@@ -259,28 +259,77 @@ mod tests {
             engine.ids()
         );
 
-        for expected in [
-            "claude-code",
-            "codex",
-            "cursor",
-            "gemini",
-            "shell",
-            "generic",
-        ] {
-            assert!(
-                engine.manifest(expected).is_some(),
-                "{expected} is missing; loaded {:?}",
-                engine.ids()
+        // The whole catalog, by name. A shrunken catalog does not error: a
+        // missing agent just spawns as a bare login shell, which is how this
+        // shipped broken once already. Spelling out all twenty ids means a
+        // dropped manifest fails here instead of in someone's terminal.
+        let mut ids = engine.ids();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            [
+                "aider",
+                "amp",
+                "antigravity",
+                "claude-code",
+                "codex",
+                "copilot",
+                "cursor",
+                "devin",
+                "droid",
+                "gemini",
+                "generic",
+                "grok",
+                "hermes",
+                "kilo",
+                "kimi",
+                "kiro",
+                "opencode",
+                "pi",
+                "qoder",
+                "shell",
+            ]
+        );
+
+        // Every id but the two command-less ones detects state from the
+        // screen, and the rules are the substance of that. Counting them is
+        // what catches a manifest that survives as a stub: `pi` alone ships
+        // zero rules, deliberately, because it is process-only.
+        let rules: usize = engine
+            .ids()
+            .into_iter()
+            .map(|id| engine.manifest(id).expect("manifest").rules.len())
+            .sum();
+        assert_eq!(rules, 85, "the shipped ruleset lost rules");
+
+        for id in engine.ids() {
+            let expected_empty = matches!(id, "shell" | "generic" | "pi");
+            assert_eq!(
+                engine.manifest(id).expect("manifest").rules.is_empty(),
+                expected_empty,
+                "{id}: unexpected rule coverage"
             );
         }
-        for id in ["claude-code", "codex", "cursor", "gemini"] {
+    }
+
+    /// `agent.readiness` hands the raw `agent` object to the client, which
+    /// decodes it as `diri_proto::AgentDescriptor`. That type needs `id` and
+    /// `displayName`, and a single manifest missing either fails the *whole*
+    /// response — leaving the client with no catalog and every agent spawning
+    /// as a bare shell. Decode all twenty the way the client will.
+    #[test]
+    fn every_shipped_descriptor_decodes_the_way_the_client_decodes_it() {
+        let engine = engine();
+        for id in engine.ids() {
+            let raw = engine
+                .raw_agent(id)
+                .unwrap_or_else(|| panic!("{id} carries no agent object"));
+            let descriptor: diri_proto::AgentDescriptor = serde_json::from_value(raw.clone())
+                .unwrap_or_else(|error| panic!("{id} is not a client descriptor: {error}"));
+            assert_eq!(descriptor.id, id, "{id} declares a mismatched agent id");
             assert!(
-                !engine
-                    .manifest(id)
-                    .expect("interactive manifest")
-                    .rules
-                    .is_empty(),
-                "{id} needs explicit terminal-state rules"
+                !descriptor.display_name.is_empty(),
+                "{id} has no display name"
             );
         }
     }

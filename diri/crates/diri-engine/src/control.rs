@@ -2750,13 +2750,14 @@ mod tests {
         let spec = server
             .resume_spec(&registry, "s_resume", "claude-code", "/tmp", Some("uuid-1"))
             .expect("resume spec");
-        assert_eq!(
-            Path::new(&spec.pty.argv[0])
-                .file_name()
-                .and_then(|name| name.to_str()),
-            Some("claude")
+        // Claude declares `returnToLoginShell`, so the agent runs inside the
+        // PTY's login shell rather than as its argv[0]; the resume flags still
+        // have to reach the agent itself.
+        let command = spec.pty.argv.last().expect("argv");
+        assert!(
+            command.contains("'claude'") && command.contains("'--resume' 'uuid-1'"),
+            "resume flags must reach the agent: {command:?}"
         );
-        assert_eq!(&spec.pty.argv[1..], &["--resume", "uuid-1"]);
     }
 
     /// An agent that dies on its own — a dropped ssh, a crash — leaves its

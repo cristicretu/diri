@@ -149,10 +149,18 @@ rm -rf "${remote_helpers_dir}"
 # Rust-owned Agent catalog used by local and remote session orchestration.
 rm -rf "${app_bin_dir}/manifests"
 cp -R "${workspace_dir}/crates/diri-engine/manifests" "${app_bin_dir}/manifests"
-if [[ ! -f "${app_bin_dir}/manifests/codex.json" ]]; then
-    echo "error: Rust Agent manifests missing from the app bundle" >&2
+# Count, not just presence. A catalog that is merely SMALLER never errors at
+# runtime: each missing manifest silently downgrades that agent to a bare login
+# shell, which looks like a working session. That shipped once. The source
+# directory is the reference, so any shrink between it and the bundle is a
+# packaging bug worth failing the release over.
+source_manifests="$(find "${workspace_dir}/crates/diri-engine/manifests" -name '*.json' -type f | wc -l | tr -d ' ')"
+bundled_manifests="$(find "${app_bin_dir}/manifests" -name '*.json' -type f | wc -l | tr -d ' ')"
+if [[ ! -f "${app_bin_dir}/manifests/codex.json" || "${bundled_manifests}" != "${source_manifests}" || "${bundled_manifests}" -lt 20 ]]; then
+    echo "error: bundled Agent catalog is incomplete: ${bundled_manifests} manifest(s) bundled, ${source_manifests} in source (expected at least 20)" >&2
     exit 1
 fi
+echo "==> Bundled ${bundled_manifests} Agent manifests"
 
 # Inside-out signing: sign the nested daemon binaries FIRST (their own hardened
 # runtime + timestamp), then the app LAST WITHOUT --deep. A --deep sign would

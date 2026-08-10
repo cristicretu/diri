@@ -1,52 +1,114 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "id": "gemini",
-  "version": "rust-1",
+  "version": "2026.07.10",
   "statusModel": "full",
   "agent": {
     "id": "gemini",
-    "displayName": "Gemini CLI",
-    "shortLabel": "Gemini",
-    "glyph": "sparkle",
-    "aliases": ["gemini"],
+    "displayName": "Gemini",
+    "shortLabel": "gemini",
+    "glyph": "\u2726",
+    "aliases": [
+      "gemini",
+      "gemini-cli"
+    ],
     "firstClass": true,
     "statusAuthority": "screen",
     "binary": "gemini",
-    "resume": { "style": "flag", "token": "--resume" },
-    "envScrubPrefixes": ["GEMINI_", "DIRI_", "DIRIJOR_"],
-    "approve": { "text": "", "submit": true },
-    "deny": { "text": "\u001b", "submit": false }
+    "sessionIDFlag": "--session-id",
+    "resume": {
+      "style": "flag",
+      "token": "--resume"
+    },
+    "envScrubPrefixes": [
+      "GEMINI_CLI",
+      "DIRI_",
+      "DIRIJOR_"
+    ],
+    "foregroundExecNames": [
+      "gemini"
+    ],
+    "approve": {
+      "text": "",
+      "submit": true
+    },
+    "deny": {
+      "text": "\u001b",
+      "submit": false
+    }
   },
   "rules": [
     {
-      "id": "tool-confirmation",
+      "id": "confirm-dialog",
       "state": "blockedPermission",
-      "priority": 900,
-      "region": "bottom_non_empty_lines",
-      "regionLines": 14,
+      "priority": 1000,
+      "region": "whole_recent",
       "when": {
         "any": [
-          { "contains": "requires confirmation" },
-          { "contains": "Do you want to allow" },
-          { "contains": "Allow execution" }
+          {
+            "contains": "apply this change?"
+          },
+          {
+            "contains": "allow execution of"
+          },
+          {
+            "contains": "do you want to proceed?"
+          }
         ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
       }
     },
     {
-      "id": "interrupt-hint-working",
-      "state": "working",
-      "priority": 500,
-      "region": "bottom_non_empty_lines",
-      "regionLines": 5,
-      "when": { "any": [{ "contains": "esc to cancel" }, { "contains": "esc to interrupt" }] }
+      "id": "waiting-for-confirmation",
+      "state": "blockedQuestion",
+      "priority": 950,
+      "region": "whole_recent",
+      "when": {
+        "contains": "waiting for user confirmation"
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
     },
     {
-      "id": "composer-idle",
-      "state": "idle",
-      "priority": 100,
+      "id": "working-cancel-timer",
+      "state": "working",
+      "priority": 900,
       "region": "bottom_non_empty_lines",
-      "regionLines": 5,
-      "when": { "any": [{ "contains": "Type your message" }, { "contains": "gemini>" }] }
+      "regionLines": 6,
+      "when": {
+        "contains": "esc to cancel"
+      }
+    },
+    {
+      "id": "idle-prompt-box",
+      "state": "idle",
+      "priority": 500,
+      "region": "prompt_box_body",
+      "when": {
+        "lineRegex": "^\\s*>"
+      }
+    },
+    {
+      "id": "idle-placeholder",
+      "state": "idle",
+      "priority": 450,
+      "region": "whole_recent",
+      "when": {
+        "contains": "type your message or @path/to/file"
+      }
     }
   ]
 }

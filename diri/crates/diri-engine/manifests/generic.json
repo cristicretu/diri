@@ -1,14 +1,13 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "id": "generic",
-  "version": "rust-1",
+  "version": "1",
   "statusModel": "processOnly",
   "agent": {
     "id": "generic",
-    "displayName": "Command",
-    "shortLabel": "Command",
-    "glyph": "terminal",
-    "aliases": [],
+    "displayName": "Agent",
+    "shortLabel": "agent",
+    "glyph": "\u25b8",
     "firstClass": false,
     "statusAuthority": "process"
   },

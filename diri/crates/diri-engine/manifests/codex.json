@@ -1,75 +1,121 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "id": "codex",
-  "version": "rust-1",
+  "version": "2026.07.07",
   "statusModel": "full",
   "agent": {
     "id": "codex",
     "displayName": "Codex",
-    "shortLabel": "Codex",
-    "glyph": "terminal",
-    "aliases": ["codex"],
+    "shortLabel": "codex",
+    "glyph": "\u25c7",
+    "aliases": [
+      "codex",
+      "openai-codex"
+    ],
     "firstClass": true,
     "statusAuthority": "screen",
     "binary": "codex",
-    "injection": { "codexNotify": true, "codexMCP": true },
-    "resume": { "style": "flag", "token": "resume" },
-    "envScrubPrefixes": ["CODEX_", "DIRI_", "DIRIJOR_"],
-    "approve": { "text": "", "submit": true },
-    "deny": { "text": "\u001b", "submit": false }
+    "returnToLoginShell": true,
+    "resume": {
+      "style": "flag",
+      "token": "resume"
+    },
+    "envScrubPrefixes": [
+      "CODEX",
+      "DIRI_",
+      "DIRIJOR_"
+    ],
+    "injection": {
+      "codexNotify": true,
+      "codexMCP": true
+    },
+    "foregroundExecNames": [
+      "codex"
+    ],
+    "approve": {
+      "text": "",
+      "submit": true
+    },
+    "_resumeStyleNotice": "Swift's \"subcommand\" style has no implementation in Rust's AgentDescriptor::resume_args. Declared as \"flag\": with no id it emits `codex resume`, and once a notify payload supplies a thread-id it emits `codex resume <thread-id>` \u2014 both are valid codex invocations.",
+    "deny": {
+      "text": "\u001b",
+      "submit": false
+    }
   },
   "rules": [
     {
-      "id": "permission-confirmation",
+      "id": "action-required-title",
       "state": "blockedPermission",
-      "priority": 900,
-      "region": "bottom_non_empty_lines",
-      "regionLines": 14,
+      "priority": 1100,
+      "region": "osc_title",
       "when": {
-        "any": [
-          { "contains": "Would you like to run the following command?" },
-          { "contains": "Do you want to allow" },
-          { "contains": "Press enter to confirm" }
-        ]
+        "contains": "action required"
       },
-      "capture": { "region": "bottom_non_empty_lines", "regionLines": 14, "maxChars": 700 }
-    },
-    {
-      "id": "question-options",
-      "state": "blockedQuestion",
-      "priority": 800,
-      "region": "bottom_non_empty_lines",
-      "regionLines": 12,
-      "when": {
-        "all": [
-          { "lineRegex": "^[[:space:]]*[❯>]?[[:space:]]*1\\.[[:space:]]+" },
-          { "lineRegex": "^[[:space:]]*[❯>]?[[:space:]]*2\\.[[:space:]]+" }
-        ]
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
       }
     },
     {
-      "id": "interrupt-hint-working",
-      "state": "working",
-      "priority": 500,
-      "region": "bottom_non_empty_lines",
-      "regionLines": 6,
-      "when": { "contains": "esc to interrupt" }
+      "id": "confirm-prompt",
+      "state": "blockedPermission",
+      "priority": 1000,
+      "region": "whole_recent",
+      "when": {
+        "any": [
+          {
+            "contains": "press enter to confirm or esc to cancel"
+          },
+          {
+            "contains": "allow command?"
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "prompt_box_body",
+        "maxChars": 400
+      }
     },
     {
-      "id": "working-status",
-      "state": "working",
-      "priority": 400,
-      "region": "bottom_non_empty_lines",
-      "regionLines": 5,
-      "when": { "lineRegex": "^[[:space:]]*(Working|Thinking|Running)[.… ]" }
+      "id": "submit-answer",
+      "state": "blockedQuestion",
+      "priority": 950,
+      "region": "whole_recent",
+      "when": {
+        "contains": "enter to submit answer"
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "prompt_box_body",
+        "maxChars": 400
+      }
     },
     {
-      "id": "composer-idle",
+      "id": "working-spinner",
+      "state": "working",
+      "priority": 900,
+      "region": "osc_title",
+      "when": {
+        "regex": "^[\u2800-\u28ff]"
+      }
+    },
+    {
+      "id": "idle-prompt-box",
       "state": "idle",
-      "priority": 100,
-      "region": "bottom_non_empty_lines",
-      "regionLines": 5,
-      "when": { "any": [{ "contains": "Ask Codex" }, { "contains": "Type your request" }] }
+      "priority": 500,
+      "region": "prompt_box_body",
+      "when": {
+        "lineRegex": "^\\s*[\u276f\u203a]"
+      }
     }
   ]
 }

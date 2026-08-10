@@ -1,0 +1,144 @@
+{
+  "_notice": "Screen-detection predicates adapted from the herdr project (https://github.com/herdrdev/herdr, src/detect/manifests/*.toml), licensed Apache-2.0. Translated from herdr's TOML rule schema into Dirijor's JSON predicate schema and re-prioritised for this engine; the agent capability block is Dirijor's own.",
+  "schemaVersion": 2,
+  "id": "devin",
+  "version": "2026.07.31.1",
+  "statusModel": "full",
+  "agent": {
+    "id": "devin",
+    "displayName": "Devin",
+    "shortLabel": "devin",
+    "glyph": "\u25d0",
+    "aliases": [
+      "devin",
+      "devin-cli"
+    ],
+    "firstClass": true,
+    "statusAuthority": "screen",
+    "binary": "devin",
+    "resume": {
+      "style": "flag",
+      "token": "--continue"
+    },
+    "returnToLoginShell": true,
+    "foregroundExecNames": [
+      "devin"
+    ],
+    "_resumeNotice": "Verified against Devin's command reference: '--continue | -c | Resume the most recent session in the current directory'. https://docs.devin.ai/cli/reference/commands. --resume requires a session ID, so it cannot work without an id source.",
+    "_resumeStyleNotice": "Rust's AgentDescriptor::resume_args implements only \"flag\" and \"sessionIDFlag\"; Swift's \"latest\" has no implementation there and would silently resume nothing. Declared as \"flag\": this agent has no sessionIDFlag, so it never carries a caller-minted id and resume_args emits the bare token \u2014 exactly the semantics the token was chosen for.",
+    "envScrubPrefixes": [
+      "DIRI_",
+      "DIRIJOR_"
+    ]
+  },
+  "rules": [
+    {
+      "id": "blocked-workspace-trust",
+      "state": "blockedPermission",
+      "priority": 300,
+      "region": "whole_recent",
+      "when": {
+        "all": [
+          {
+            "contains": "do you trust the authors of this directory?"
+          },
+          {
+            "contains": "yes, trust "
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "blocked-approve-once",
+      "state": "blockedPermission",
+      "priority": 290,
+      "region": "whole_recent",
+      "when": {
+        "all": [
+          {
+            "contains": "approve once"
+          },
+          {
+            "contains": "confirm"
+          },
+          {
+            "any": [
+              {
+                "contains": "esc cancel"
+              },
+              {
+                "contains": "esc to cancel"
+              }
+            ]
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "working-running-tools",
+      "state": "working",
+      "priority": 200,
+      "region": "whole_recent",
+      "when": {
+        "all": [
+          {
+            "contains": "running tools"
+          },
+          {
+            "contains": "esc to interrupt"
+          }
+        ]
+      }
+    },
+    {
+      "id": "working-guide-hint",
+      "state": "working",
+      "priority": 190,
+      "region": "whole_recent",
+      "when": {
+        "contains": "guide devin while it works"
+      }
+    },
+    {
+      "id": "idle-empty-prompt",
+      "state": "idle",
+      "priority": 120,
+      "region": "whole_recent",
+      "when": {
+        "lineRegex": "^\\s*\u276d Ask Devin to build"
+      }
+    },
+    {
+      "id": "idle-prompt-context",
+      "state": "idle",
+      "priority": 100,
+      "region": "whole_recent",
+      "when": {
+        "all": [
+          {
+            "lineRegex": "^\\s*\u276d"
+          },
+          {
+            "contains": "context:"
+          }
+        ]
+      }
+    }
+  ]
+}
