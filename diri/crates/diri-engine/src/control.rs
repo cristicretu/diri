@@ -132,15 +132,38 @@ impl ControlServer {
     /// Enables the SSH-bootstrapped remote Holder transport. The local app
     /// still talks only to this Engine; it never executes SSH itself.
     pub fn with_remote(mut self, manager: Arc<crate::remote::manager::RemoteManager>) -> Self {
-        let adopted = self.restore_remote_bindings(&manager);
-        if !adopted.is_empty() {
-            eprintln!(
-                "diri-engine: adopted {} remote Holder session(s): {adopted:?}",
-                adopted.len()
-            );
-        }
         self.remote = Some(manager);
         self
+    }
+
+    /// Re-adopts remote Holder sessions in the background.
+    ///
+    /// Every binding costs at least one SSH round trip, and each carries a
+    /// two-minute timeout. Doing that before `bind()` meant the control socket
+    /// did not exist until the last host answered: one reachable-but-hung host
+    /// kept the whole app disconnected, and because the executor forces
+    /// `SSH_ASKPASS_REQUIRE`, a host needing a passphrase could raise a modal
+    /// from a daemon with no UI behind it. Local sessions are served
+    /// immediately now, and remote ones join as they are verified.
+    pub fn spawn_remote_restore(self: &Arc<Self>) {
+        let Some(manager) = self.remote.clone() else {
+            return;
+        };
+        let server = Arc::clone(self);
+        if let Err(error) = std::thread::Builder::new()
+            .name("diri-remote-restore".into())
+            .spawn(move || {
+                let adopted = server.restore_remote_bindings(&manager);
+                if !adopted.is_empty() {
+                    eprintln!(
+                        "diri-engine: adopted {} remote Holder session(s): {adopted:?}",
+                        adopted.len()
+                    );
+                }
+            })
+        {
+            eprintln!("diri-engine: could not start remote session restore: {error}");
+        }
     }
 
     fn restore_remote_bindings(

@@ -143,6 +143,10 @@ fn main() {
         }
     };
 
+    // Only once the socket is accepting: remote adoption is SSH-bound and must
+    // never be what a client waits behind.
+    server.spawn_remote_restore();
+
     let _watcher = diri_engine::events::spawn_registry_watcher(
         Arc::clone(&registry),
         server.events(),

@@ -59,6 +59,15 @@ impl RemoteBindingStore {
         result
     }
 
+    /// Every readable, well-formed, owner-only binding in the store.
+    ///
+    /// One unreadable file is not allowed to strand the others. These describe
+    /// independent live sessions, so rejecting the whole set over a single
+    /// truncated write or a stray mode would orphan every remote Holder the
+    /// Engine could otherwise have re-adopted. Per-file checks are unchanged
+    /// and still refuse anything not owner-only, oversized, symlinked or
+    /// malformed — the offender is skipped and named instead of poisoning the
+    /// batch. Only failing to read the directory itself is fatal.
     pub fn load_all(&self) -> io::Result<Vec<RemoteBinding>> {
         let mut bindings = Vec::new();
         for entry in fs::read_dir(&self.root)? {
@@ -67,26 +76,36 @@ impl RemoteBindingStore {
             if path.extension().and_then(|value| value.to_str()) != Some("json") {
                 continue;
             }
-            reject_symlink(&path)?;
-            let metadata = fs::metadata(&path)?;
-            if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "remote binding file is not owner-only",
-                ));
+            match Self::load_one(&path) {
+                Ok(binding) => bindings.push(binding),
+                Err(error) => eprintln!(
+                    "diri-engine: skipping unusable remote binding {}: {error}",
+                    path.display()
+                ),
             }
-            if metadata.len() > 64 * 1024 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "remote binding file exceeds 64 KiB",
-                ));
-            }
-            let binding: RemoteBinding = serde_json::from_slice(&fs::read(&path)?)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-            validate_identifier(&binding.session_id)?;
-            bindings.push(binding);
         }
         Ok(bindings)
+    }
+
+    fn load_one(path: &Path) -> io::Result<RemoteBinding> {
+        reject_symlink(path)?;
+        let metadata = fs::metadata(path)?;
+        if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "remote binding file is not owner-only",
+            ));
+        }
+        if metadata.len() > 64 * 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "remote binding file exceeds 64 KiB",
+            ));
+        }
+        let binding: RemoteBinding = serde_json::from_slice(&fs::read(path)?)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        validate_identifier(&binding.session_id)?;
+        Ok(binding)
     }
 
     pub fn update_output_offset(&self, session_id: &str, offset: u64) -> io::Result<()> {
@@ -172,6 +191,39 @@ fn random_hex() -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bindings describe independent live sessions. Rejecting the whole set
+    /// over one truncated write would orphan every remote Holder the Engine
+    /// could still have re-adopted.
+    #[test]
+    fn one_unusable_binding_does_not_strand_the_others() {
+        let temporary = tempfile::tempdir().expect("temp");
+        let store = RemoteBindingStore::new(temporary.path().join("bindings")).expect("store");
+        let good = RemoteBinding {
+            session_id: "session-good".into(),
+            host_id: "host-1".into(),
+            helper_build_id: "build-1".into(),
+            protocol: ProtocolVersion::CURRENT,
+            session_token: SessionToken::new("0123456789abcdef").expect("token"),
+            session_incarnation: "incarnation-1".into(),
+            last_output_offset: 0,
+        };
+        store.save(&good).expect("save");
+        std::fs::write(
+            temporary
+                .path()
+                .join("bindings")
+                .join("session-broken.json"),
+            b"{ this is not json",
+        )
+        .expect("write malformed binding");
+
+        let loaded = store
+            .load_all()
+            .expect("a malformed file must not fail the batch");
+        assert_eq!(loaded.len(), 1, "the readable binding must survive");
+        assert_eq!(loaded[0].session_id, "session-good");
+    }
 
     #[test]
     fn binding_is_owner_only_and_redacts_the_bearer_from_debug() {
