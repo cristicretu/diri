@@ -885,14 +885,21 @@ impl SessionStore {
             self.agents.descriptor(session.effective_kind()),
         );
         let arriving_archived = session.is_archived();
+        // Closing the tab also drops the Engine record and deletes the
+        // session's output log, so it may only happen where nothing is lost.
+        // A clean `exit 0` from something with no conversation to return to —
+        // a shell — is that case. A crash, a signal (macOS memory pressure
+        // kills agents with SIGTERM), or anything resumable stays listed with
+        // its exit pill and Resume button: that is the whole point of deriving
+        // resumability for exited sessions, and the scrollback is the only
+        // record of what went wrong.
         let should_auto_close = !self.closing.contains(&id)
             && matches!(
                 &session.status,
                 SessionStatus::Exited(info)
-                    if matches!(
-                        info.reason,
-                        ExitReason::Exited | ExitReason::Signaled | ExitReason::External
-                    )
+                    if info.reason == ExitReason::Exited
+                        && info.code == Some(0)
+                        && session.resumability != Resumability::Resumable
             )
             && previous
                 .as_deref()

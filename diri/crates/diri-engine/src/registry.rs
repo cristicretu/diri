@@ -1022,7 +1022,6 @@ mod tests {
         assert_eq!(registry.projects_raw().len(), 2);
     }
 
-    #[test]
     /// Older records stored `projectID` as the raw directory path instead of a
     /// hashed id. Load recomputes identity, so those are repaired in place
     /// rather than left as a second, path-shaped namespace — and records that

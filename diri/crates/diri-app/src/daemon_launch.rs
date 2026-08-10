@@ -75,12 +75,33 @@ pub fn ensure_daemon_running(socket_path: &Path) {
             }
         }
         Ok(hello) => {
+            // An older release left its own daemon owning this socket, and it
+            // deliberately outlives the app that started it. Refusing here
+            // would strand every upgrading user: the socket stays held, no
+            // Engine is ever spawned, and the app comes up empty with the
+            // explanation on a stderr a bundled app never shows. Retire it the
+            // same way an outdated Rust Engine is retired — `daemon.shutdown`
+            // persists state first, and holder-owned sessions outlive it and
+            // are re-adopted.
             eprintln!(
-                "diri: refusing non-Rust daemon build {:?} at {}; stop the incompatible process before launching Diri",
+                "diri: replacing non-Rust daemon build {:?} at {} with the bundled Rust Engine",
                 hello.build,
                 socket_path.display()
             );
-            return;
+            if daemon.is_none() {
+                eprintln!(
+                    "diri: no bundled Engine to replace it with; leaving {} alone",
+                    socket_path.display()
+                );
+                return;
+            }
+            if let Err(error) = stop_daemon_for_upgrade(socket_path) {
+                eprintln!(
+                    "diri: could not stop the previous daemon at {}: {error}",
+                    socket_path.display()
+                );
+                return;
+            }
         }
         Err(error)
             if matches!(

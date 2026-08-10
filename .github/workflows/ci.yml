@@ -143,6 +143,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes openssh-server
+          # sshd refuses to start without its privilege separation directory,
+          # which the package does not create on a fresh runner image.
+          sudo mkdir -p /run/sshd
           mkdir -p "${HOME}/.ssh" "${RUNNER_TEMP}/sshd"
           chmod 700 "${HOME}/.ssh"
           ssh-keygen -q -t ed25519 -N '' -f "${RUNNER_TEMP}/diri_ci_key"

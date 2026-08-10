@@ -612,6 +612,91 @@ fn a_real_process_exit_immediately_detaches_and_removes_the_agent() {
     assert!(store.ordered_sessions().is_empty());
 }
 
+/// Closing the tab deletes the Engine record and the session's output log.
+/// A signalled death is exactly when that log matters most: macOS kills agents
+/// with SIGTERM under memory pressure, and silently deleting the row plus its
+/// scrollback leaves nothing to explain where the session went.
+#[test]
+fn a_signalled_agent_keeps_its_row_and_its_scrollback() {
+    let (mut store, mut effects) = hydrated(
+        vec![session("one", "p", 1.0)],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    drain(&mut effects);
+
+    let mut killed = session("one", "p", 1.0);
+    killed.status = SessionStatus::Exited(ExitInfo {
+        reason: ExitReason::Signaled,
+        code: None,
+        signal: Some(15),
+    });
+    store.upsert_session(killed);
+
+    let emitted = drain(&mut effects);
+    assert!(
+        !emitted.contains(&StoreEffect::Remove(id("one"))),
+        "a signalled exit must not delete the session or its log"
+    );
+    assert_eq!(store.ordered_sessions().len(), 1);
+}
+
+/// A conversation that can be re-entered is the case every Resume affordance
+/// exists for. Removing the row on exit makes the exit pill, the resume card
+/// and the sidebar entry unreachable.
+#[test]
+fn an_exited_but_resumable_agent_stays_listed_for_resume() {
+    let (mut store, mut effects) = hydrated(
+        vec![session("one", "p", 1.0)],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    drain(&mut effects);
+
+    let mut exited = session("one", "p", 1.0);
+    exited.status = SessionStatus::Exited(ExitInfo {
+        reason: ExitReason::Exited,
+        code: Some(0),
+        signal: None,
+    });
+    exited.resumability = Resumability::Resumable;
+    store.upsert_session(exited);
+
+    let emitted = drain(&mut effects);
+    assert!(
+        !emitted.contains(&StoreEffect::Remove(id("one"))),
+        "a resumable conversation must stay listed"
+    );
+    assert_eq!(store.ordered_sessions().len(), 1);
+}
+
+/// A crash is not a tidy exit: the non-zero status and the scrollback are the
+/// only record of what happened.
+#[test]
+fn a_nonzero_exit_keeps_its_row() {
+    let (mut store, mut effects) = hydrated(
+        vec![session("one", "p", 1.0)],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    drain(&mut effects);
+
+    let mut crashed = session("one", "p", 1.0);
+    crashed.status = SessionStatus::Exited(ExitInfo {
+        reason: ExitReason::Exited,
+        code: Some(1),
+        signal: None,
+    });
+    store.upsert_session(crashed);
+
+    let emitted = drain(&mut effects);
+    assert!(
+        !emitted.contains(&StoreEffect::Remove(id("one"))),
+        "a failed exit must not delete the session or its log"
+    );
+    assert_eq!(store.ordered_sessions().len(), 1);
+}
+
 #[test]
 fn daemon_restart_exit_remains_available_for_automatic_resume() {
     let (mut store, mut effects) = hydrated(

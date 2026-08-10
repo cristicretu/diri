@@ -2415,6 +2415,16 @@ fn prepare_agent_input(
     }
 }
 
+/// Answers Claude Code's "do you trust this folder?" picker on the user's
+/// behalf so a spawn does not stall behind it and swallow the initial prompt.
+///
+/// This is a deliberate trade: it auto-grants workspace trust for whatever
+/// directory the session was pointed at. That is defensible when the user
+/// picked the directory in the UI, and weaker when they did not — an
+/// orchestrator spawning into a freshly cloned repository gets trust without
+/// anyone affirming it. The window is bounded (20s, and it stops at the first
+/// non-matching screen), but a session whose own output contains the matched
+/// phrases inside that window would also receive the keystroke.
 fn accept_claude_workspace_trust(registry: &Arc<Mutex<Registry>>, session_id: &str) {
     for _ in 0..200 {
         let Some((exited, screen)) = with_session(registry, session_id, |session| {
