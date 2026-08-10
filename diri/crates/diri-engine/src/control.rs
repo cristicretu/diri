@@ -1613,8 +1613,15 @@ impl ControlServer {
                 .into_iter()
                 .find(|record| record.id.0 == p.session_id.0)
                 .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
-            if registry.get(&p.session_id.0).is_some() {
-                // Already live: resuming is a no-op, not an error.
+            // Presence in the registry is not liveness: only an explicit kill
+            // removes a session, so an agent that died on its own is still in
+            // the map. Returning here on presence alone would hand back the
+            // corpse this call was asked to revive; the exited case falls
+            // through to the eviction path below.
+            if registry.get(&p.session_id.0).is_some()
+                && !matches!(record.status, diri_proto::SessionStatus::Exited(_))
+            {
+                // Genuinely live: resuming is a no-op, not an error.
                 return serde_json::to_value(&record)
                     .map_err(|error| ControlError::internal(error.to_string()));
             }
@@ -2164,7 +2171,13 @@ fn process_executable_hash() -> Option<&'static str> {
             }
             digest.update(&buffer[..read]);
         }
-        Some(format!("{:x}", digest.finalize()))
+        Some(
+            digest
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+        )
     })
     .as_deref()
 }
@@ -2792,6 +2805,7 @@ mod tests {
                         authority: crate::session::authority_for("probe", &probe),
                         logs_dir: temp.path().join("logs"),
                         holder: None,
+                        remote: None,
                         defer_launch: false,
                     },
                     record,

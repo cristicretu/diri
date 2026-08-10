@@ -144,7 +144,11 @@ fn executable_sha256(path: &Path) -> io::Result<String> {
         }
         digest.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 /// True when something is listening on the daemon socket right now.

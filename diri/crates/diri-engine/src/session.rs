@@ -1990,6 +1990,9 @@ fn apply_remote_snapshot(
             usize::from(snapshot.grid.rows),
         );
         if !screen.restore(
+            // A remote Full Snapshot carries only the visible grid; scrollback
+            // is fetched on demand through `Scroll`, never replayed here.
+            &[],
             &snapshot.grid,
             snapshot.alt_screen,
             snapshot.bracketed_paste,

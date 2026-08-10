@@ -304,7 +304,7 @@ fn append_untracked_diffs(repo_root: &Path, patch: &mut Vec<u8>) -> Result<(), D
         let path = OsString::from_vec(path.to_vec());
         #[cfg(not(unix))]
         let path = OsString::from(String::from_utf8_lossy(path).into_owned());
-        let output = git_command(&repo_root)
+        let output = git_command(repo_root)
             .args([
                 "diff",
                 "--no-index",

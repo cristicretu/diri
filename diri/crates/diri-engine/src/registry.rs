@@ -1047,6 +1047,8 @@ mod tests {
         let loaded = registry.records().pop().expect("record");
         assert_eq!(loaded.project_id, session_project_id(project_root, None));
         assert_eq!(registry.projects_raw().len(), 1);
+    }
+
     /// An exited record whose agent had named its conversation is the case
     /// every Resume affordance gates on, and each of them checks for
     /// `Resumable` — a record left on `Live` reads to all of them as "cannot

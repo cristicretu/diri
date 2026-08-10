@@ -40,7 +40,7 @@ fn source_build_id() -> String {
     let mut digest = Sha256::new();
     for name in ["TARGET", "PROFILE", "OPT_LEVEL"] {
         digest.update(name.as_bytes());
-        digest.update([b'=']);
+        digest.update(*b"=");
         digest.update(std::env::var(name).unwrap_or_default().as_bytes());
         digest.update([0]);
     }
