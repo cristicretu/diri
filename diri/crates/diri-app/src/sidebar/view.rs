@@ -30,8 +30,6 @@ use crate::store::{
 use crate::updates::{UpdateCommand, UpdatePhase, UpdateState};
 use crate::usage::{UsageFormat, UsageSnapshot};
 
-const STATUS_ANIMATION_INTERVAL: Duration = Duration::from_millis(100);
-
 use super::{
     DragItem, Popover, PreviewScenario, SidebarPreviewFixture, SidebarUiState, move_before,
     move_to_end,
@@ -111,12 +109,6 @@ pub struct Sidebar {
     /// one-level directory browser. The listing payload itself lives in the
     /// Store so the daemon adapter can complete it asynchronously.
     directory_picker_open: bool,
-    /// One shared low-frequency clock for every animated status mark in this
-    /// sidebar. It remains active while the window is inactive, unlike GPUI's
-    /// compositor-driven animation frames, and stops completely when no live
-    /// status needs motion.
-    status_animation_running: bool,
-    status_animation: Option<Task<()>>,
 }
 
 impl EventEmitter<SidebarEvent> for Sidebar {}
@@ -191,8 +183,6 @@ impl Sidebar {
             last_toggle: None,
             preview,
             directory_picker_open: false,
-            status_animation_running: false,
-            status_animation: None,
         };
         sidebar.ui.preview_account = preview;
         // Preview-only hook so headless screenshots can verify popover layout.
@@ -3165,43 +3155,6 @@ impl Sidebar {
         entity
     }
 
-    fn reconcile_status_animation(&mut self, should_animate: bool, cx: &mut Context<Self>) {
-        if !should_animate {
-            self.status_animation_running = false;
-            self.status_animation = None;
-            return;
-        }
-        if self.status_animation_running {
-            return;
-        }
-        self.status_animation_running = true;
-        self.status_animation = Some(cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(STATUS_ANIMATION_INTERVAL)
-                    .await;
-                let keep_running = this
-                    .update(cx, |this, cx| {
-                        if !this.status_animation_running {
-                            return false;
-                        }
-                        for glyph in this.glyphs.values() {
-                            glyph.update(cx, |glyph, cx| {
-                                if glyph.needs_animation() {
-                                    cx.notify();
-                                }
-                            });
-                        }
-                        true
-                    })
-                    .unwrap_or(false);
-                if !keep_running {
-                    return;
-                }
-            }
-        }));
-    }
-
     /// ⌘1–⌘8 address the first eight rows; ⌘9 always jumps to the last one,
     /// so the hint follows the same rule rather than labelling row nine.
     fn shortcut_for(&mut self, id: &SessionId) -> Option<usize> {
@@ -3487,18 +3440,10 @@ impl Sidebar {
 impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.colors();
-        let (projection, migration_active) = {
+        let projection = {
             let mut store = self.store.write().expect("session store lock poisoned");
-            let projection = store.sidebar_projection();
-            (projection, !store.migrating().is_empty())
+            store.sidebar_projection()
         };
-        let should_animate = !cx.reduce_motion()
-            && (migration_active
-                || projection
-                    .ordered_sessions
-                    .iter()
-                    .any(|session| status_needs_animation(status_state(session, false))));
-        self.reconcile_status_animation(should_animate, cx);
         self.shortcut_ranks.clear();
         let session_count = projection.ordered_sessions.len();
         for (index, session) in projection.ordered_sessions.iter().enumerate() {
@@ -3833,10 +3778,6 @@ fn status_state(session: &SessionRecord, migrating: bool) -> StatusState {
     }
 }
 
-fn status_needs_animation(state: StatusState) -> bool {
-    matches!(state, StatusState::Working | StatusState::NeedsInput { .. })
-}
-
 /// Rows for the new-agent picker: the hand-branded agents in their pinned
 /// order, then every OTHER catalog agent whose CLI is actually installed.
 ///
@@ -4108,23 +4049,26 @@ mod tests {
         assert_eq!(status_state(session, true), StatusState::Working);
     }
 
+    /// A sidebar full of working Agents is diri's normal resting state, so a
+    /// repeating timer here is a permanent wake, not an occasional one. The
+    /// 10 Hz status ticker this replaces measured ~3% idle CPU and held
+    /// ~240 MB of GPU memory that an idle window returns within seconds of its
+    /// last frame. `diri-ui`'s `status_marks_never_sample_a_clock_while_rendering`
+    /// guards the other half: a glyph that needs repainting to look right.
     #[test]
-    fn only_live_motion_states_keep_the_shared_sidebar_clock_running() {
-        assert!(status_needs_animation(StatusState::Working));
-        assert!(status_needs_animation(StatusState::NeedsInput {
-            destructive: false,
-        }));
-        assert!(!status_needs_animation(StatusState::DoneUnseen));
-        assert!(!status_needs_animation(StatusState::IdleSeen));
-        assert!(!status_needs_animation(StatusState::None));
-        assert!(!status_needs_animation(StatusState::Hibernated));
-
+    fn the_sidebar_owns_no_repeating_clock() {
         let source = include_str!("view.rs");
-        let timer_call = [".timer(STATUS_", "ANIMATION_INTERVAL)"].concat();
-        assert_eq!(
-            source.matches(&timer_call).count(),
-            1,
-            "all Sidebar glyphs must share one invalidation clock"
+        let periodic_timer = ["background_executor()", ".timer("].concat();
+        let frame_request = ["request_animation", "_frame("].concat();
+
+        assert!(
+            !source.contains(&periodic_timer),
+            "the sidebar must stay event-driven; a status clock here never stops, because \
+             sessions are usually working"
+        );
+        assert!(
+            !source.contains(&frame_request),
+            "the sidebar must not drive the compositor from a render pass"
         );
     }
 

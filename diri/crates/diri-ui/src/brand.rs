@@ -123,7 +123,6 @@ pub struct BrandMark {
     solid: Option<gpui::Rgba>,
     inset_ratio: f32,
     visual_scale: f32,
-    rotation_turns: f32,
 }
 
 impl BrandMark {
@@ -135,7 +134,6 @@ impl BrandMark {
             solid: None,
             inset_ratio: 0.0,
             visual_scale: 1.0,
-            rotation_turns: 0.0,
         }
     }
 
@@ -148,7 +146,6 @@ impl BrandMark {
             solid: Some(color),
             inset_ratio: 0.0,
             visual_scale: 1.0,
-            rotation_turns: 0.0,
         }
     }
 
@@ -161,18 +158,12 @@ impl BrandMark {
         self.visual_scale = scale;
         self
     }
-
-    pub fn rotation_turns(mut self, turns: f32) -> Self {
-        self.rotation_turns = turns;
-        self
-    }
 }
 
 impl RenderOnce for BrandMark {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
         if let (Some(color), Some(rasterize)) = (self.solid, MARK_RASTERIZER.get().copied())
             && (self.visual_scale - 1.0).abs() < 0.001
-            && self.rotation_turns.abs() < 0.001
             && let Some(element) = rasterize(self.kind, self.size, self.inset_ratio, color)
         {
             return element;
@@ -181,9 +172,8 @@ impl RenderOnce for BrandMark {
         let fill = self.fill;
         let inset = self.inset_ratio;
         let visual_scale = self.visual_scale;
-        let rotation_turns = self.rotation_turns;
         canvas(
-            move |bounds, _, _| build_path(&commands, bounds, inset, visual_scale, rotation_turns),
+            move |bounds, _, _| build_path(&commands, bounds, inset, visual_scale),
             move |_, path, window, _| {
                 if let Some(path) = path {
                     window.paint_path(path, fill);
@@ -200,7 +190,6 @@ fn build_path(
     bounds: gpui::Bounds<Pixels>,
     inset_ratio: f32,
     visual_scale: f32,
-    rotation_turns: f32,
 ) -> Option<gpui::Path<Pixels>> {
     let width = f32::from(bounds.size.width);
     let height = f32::from(bounds.size.height);
@@ -210,12 +199,7 @@ fn build_path(
     let drawn_size = 24.0 * scale;
     let origin_x = f32::from(bounds.origin.x) + (width - drawn_size) / 2.0;
     let origin_y = f32::from(bounds.origin.y) + (height - drawn_size) / 2.0;
-    let radians = rotation_turns * std::f32::consts::TAU;
-    let (sin, cos) = radians.sin_cos();
     let map = |source: (f32, f32)| {
-        let dx = source.0 - 12.0;
-        let dy = source.1 - 12.0;
-        let source = (12.0 + dx * cos - dy * sin, 12.0 + dx * sin + dy * cos);
         point(
             px(origin_x + source.0 * scale),
             px(origin_y + source.1 * scale),

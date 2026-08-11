@@ -78,8 +78,20 @@ pub fn wall_clock_seconds() -> f64 {
 }
 
 /// Stateful status mark. Construct with `cx.new(|cx| StatusGlyph::new(...))`.
-/// Motion is derived from an absolute clock; the host supplies one shared
-/// invalidation cadence instead of creating one animation task per glyph.
+///
+/// Status marks are deliberately static. State changes invalidate the entity,
+/// but leaving a working or needs-input glyph on screen never schedules
+/// another frame.
+///
+/// This is a performance contract, not a style preference. A glyph that moves
+/// has to be invalidated by somebody, and the only cadence that reads as
+/// motion also keeps the window rendering for as long as any Agent is
+/// working — which is most of the time this app is open. Measured on the
+/// packaged app in preview mode, a 10 Hz status ticker cost ~3% idle CPU and
+/// held ~240 MB of GPU memory that an idle window otherwise returns within
+/// seconds of the last frame. `status_glyphs_never_create_autonomous_frame_tasks`
+/// and `status_marks_never_sample_a_clock_while_rendering` below are what keep
+/// it that way.
 pub struct StatusGlyph {
     kind: AgentKind,
     state: StatusState,
@@ -118,40 +130,13 @@ impl StatusGlyph {
         }
     }
 
-    /// Whether a shared host clock should invalidate this glyph. Keeping this
-    /// decision on the glyph prevents a single animated Agent from repainting
-    /// every static status mark in a large sidebar.
-    pub const fn needs_animation(&self) -> bool {
-        matches!(
-            self.state,
-            StatusState::Working | StatusState::NeedsInput { .. }
+    fn rendered_mark(&self) -> gpui::AnyElement {
+        static_mark(
+            self.kind,
+            self.size,
+            static_status_color(self.kind, self.state, self.colors),
+            1.0,
         )
-    }
-
-    fn rendered_mark(&self, phase: AnimationPhase) -> gpui::AnyElement {
-        let mut color = static_status_color(self.kind, self.state, self.colors);
-        let mut visual_scale = 1.0;
-        let mut rotation_turns = 0.0;
-        match self.state {
-            StatusState::Working => {
-                visual_scale = phase.breathe_scale;
-                let direction = if self.kind == AgentKind::Codex {
-                    -1.0
-                } else {
-                    1.0
-                };
-                rotation_turns = direction * phase.sweep_turns;
-            }
-            StatusState::NeedsInput { .. } => {
-                visual_scale = phase.waiting_scale;
-                color = color.opacity(phase.needs_input_opacity);
-            }
-            StatusState::DoneUnseen
-            | StatusState::IdleSeen
-            | StatusState::None
-            | StatusState::Hibernated => {}
-        }
-        static_mark(self.kind, self.size, color, visual_scale, rotation_turns)
     }
 
     pub fn entity(
@@ -179,11 +164,10 @@ fn static_status_color(kind: AgentKind, state: StatusState, colors: SemanticColo
 
 impl Render for StatusGlyph {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let phase = AnimationPhase::at(wall_clock_seconds());
         div()
             .flex_none()
             .size(px(self.size))
-            .child(self.rendered_mark(phase))
+            .child(self.rendered_mark())
     }
 }
 
@@ -192,13 +176,11 @@ fn static_mark(
     size: f32,
     color: gpui::Rgba,
     visual_scale: f32,
-    rotation_turns: f32,
 ) -> gpui::AnyElement {
     if let Some(mark) = kind.brand_mark() {
         BrandMark::solid(mark, size, color)
             .inset(0.08)
             .visual_scale(visual_scale)
-            .rotation_turns(rotation_turns)
             .into_any_element()
     } else {
         shell_caret(size, color, visual_scale)
@@ -324,18 +306,6 @@ mod tests {
     }
 
     #[test]
-    fn only_motion_states_request_shared_clock_invalidations() {
-        let colors = SemanticColors::dark();
-        for state in StatusState::ALL {
-            let glyph = StatusGlyph::new(AgentKind::Codex, state, 16.0, colors);
-            assert_eq!(
-                glyph.needs_animation(),
-                matches!(state, StatusState::Working | StatusState::NeedsInput { .. })
-            );
-        }
-    }
-
-    #[test]
     fn status_glyphs_never_create_autonomous_frame_tasks() {
         let source = include_str!("status.rs");
         let window_task = ["spawn", "_in(window"].concat();
@@ -351,13 +321,36 @@ mod tests {
         );
     }
 
+    /// The companion to `status_glyphs_never_create_autonomous_frame_tasks`:
+    /// that one stops a glyph from scheduling its own frames, this one stops a
+    /// glyph from *needing* somebody else to schedule them. A mark whose
+    /// appearance depends on the current time is only correct if something
+    /// repaints it, so sampling a clock here silently re-creates the 10 Hz
+    /// wake even when the timer lives in another crate.
     #[test]
-    fn working_status_render_uses_the_absolute_shared_phase() {
+    fn status_marks_never_sample_a_clock_while_rendering() {
+        // Only the shipped half of the file: the tests below deliberately
+        // evaluate `AnimationPhase` at fixed instants to check its math, which
+        // costs nothing at runtime.
         let source = include_str!("status.rs");
-        let shared_phase = ["AnimationPhase::at", "(wall_clock_seconds())"].concat();
+        let test_module = ["#[cfg", "(test)]"].concat();
+        let shipped = source
+            .split_once(&test_module)
+            .map_or(source, |(shipped, _)| shipped);
+        let phase_sample = ["AnimationPhase", "::at("].concat();
+        let clock_sample = ["wall_clock_seconds", "()"].concat();
+
         assert!(
-            source.contains(&shared_phase),
-            "status motion must resume at the current phase after inactive-window throttling"
+            !shipped.contains(&phase_sample),
+            "a status mark that reads an animation phase has to be repainted to stay correct"
+        );
+        // `wall_clock_seconds` is declared here for other animated surfaces;
+        // only its own declaration may name it.
+        assert_eq!(
+            shipped.matches(&clock_sample).count(),
+            1,
+            "status marks must not sample the wall clock; only the shared helper's own \
+             declaration may name it"
         );
     }
 }
