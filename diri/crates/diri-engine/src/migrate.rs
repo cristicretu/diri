@@ -512,6 +512,14 @@ mod tests {
             temp.path(),
             &["clone", "-q", origin.to_str().unwrap(), "source"],
         );
+        // `prepare` invokes git in a separate shell and must not inherit a
+        // developer machine's global identity. Give this fixture repository
+        // its own author, just as a real configured checkout has one.
+        git(&source, &["config", "user.name", "Diri Test"]);
+        git(
+            &source,
+            &["config", "user.email", "diri-test@example.invalid"],
+        );
         std::fs::write(source.join("file.txt"), "v1\n").unwrap();
         git(&source, &["add", "."]);
         git(&source, &["commit", "-q", "-m", "root"]);
