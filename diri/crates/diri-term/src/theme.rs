@@ -30,11 +30,31 @@ pub struct ResolvedCellStyle {
     pub visible: bool,
 }
 
+/// Broad appearance used by application chrome and theme pickers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThemeAppearance {
+    Dark,
+    Light,
+}
+
+impl ThemeAppearance {
+    pub const ALL: [Self; 2] = [Self::Dark, Self::Light];
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Dark => "Dark",
+            Self::Light => "Light",
+        }
+    }
+}
+
 /// Renderer-facing terminal color theme.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TermTheme {
     pub id: &'static str,
     pub name: &'static str,
+    pub appearance: ThemeAppearance,
     pub background: Rgba,
     pub foreground: Rgba,
     pub cursor: Rgba,
@@ -49,6 +69,7 @@ impl TermTheme {
     pub const DIRIJOR_DARK: Self = Self {
         id: "dirijor-dark",
         name: "Dirijor Dark",
+        appearance: ThemeAppearance::Dark,
         background: rgba_f32(0.071, 0.075, 0.094, 1.0),
         foreground: rgba_f32(0.90, 0.90, 0.90, 1.0),
         cursor: rgba_f32(0.90, 0.90, 0.90, 0.85),
@@ -148,7 +169,115 @@ impl TermTheme {
         ],
     );
 
-    pub const CATALOG: [Self; 7] = [
+    pub const NORD: Self = dark_theme(
+        "nord",
+        "Nord",
+        0x2e3440,
+        0xd8dee9,
+        0x4c566a,
+        [
+            0x3b4252, 0xbf616a, 0xa3be8c, 0xebcb8b, 0x81a1c1, 0xb48ead, 0x88c0d0, 0xe5e9f0,
+            0x4c566a, 0xbf616a, 0xa3be8c, 0xebcb8b, 0x81a1c1, 0xb48ead, 0x8fbcbb, 0xeceff4,
+        ],
+    );
+
+    pub const ROSE_PINE: Self = dark_theme(
+        "rose-pine",
+        "Rosé Pine",
+        0x191724,
+        0xe0def4,
+        0x403d52,
+        [
+            0x26233a, 0xeb6f92, 0x31748f, 0xf6c177, 0x9ccfd8, 0xc4a7e7, 0xe0def4, 0xe0def4,
+            0x6e6a86, 0xeb6f92, 0x31748f, 0xf6c177, 0x9ccfd8, 0xc4a7e7, 0xe0def4, 0xffffff,
+        ],
+    );
+
+    pub const KANAGAWA_WAVE: Self = dark_theme(
+        "kanagawa-wave",
+        "Kanagawa Wave",
+        0x1f1f28,
+        0xdcd7ba,
+        0x2d4f67,
+        [
+            0x16161d, 0xc34043, 0x76946a, 0xc0a36e, 0x7e9cd8, 0x957fb8, 0x6a9589, 0xc8c093,
+            0x727169, 0xe82424, 0x98bb6c, 0xe6c384, 0x7fb4ca, 0x938aa9, 0x7aa89f, 0xdcd7ba,
+        ],
+    );
+
+    pub const EVERFOREST_DARK: Self = dark_theme(
+        "everforest-dark",
+        "Everforest Dark",
+        0x2d353b,
+        0xd3c6aa,
+        0x475258,
+        [
+            0x475258, 0xe67e80, 0xa7c080, 0xdbbc7f, 0x7fbbb3, 0xd699b6, 0x83c092, 0xd3c6aa,
+            0x859289, 0xe67e80, 0xa7c080, 0xdbbc7f, 0x7fbbb3, 0xd699b6, 0x83c092, 0xffffff,
+        ],
+    );
+
+    pub const DIRIJOR_LIGHT: Self = light_theme(
+        "dirijor-light",
+        "Dirijor Light",
+        0xf7f5f0,
+        0x25221d,
+        0xb8d1e8,
+        [
+            0x2b2a27, 0xb34234, 0x4d7c3f, 0x9b6a18, 0x356c9a, 0x8a4f8d, 0x2f7d79, 0xe8e4dc,
+            0x6d6860, 0xd05a47, 0x669955, 0xc18426, 0x4b83b5, 0xa467a6, 0x449793, 0xffffff,
+        ],
+    );
+
+    pub const SOLARIZED_LIGHT: Self = light_theme(
+        "solarized-light",
+        "Solarized Light",
+        0xfdf6e3,
+        0x657b83,
+        0xeee8d5,
+        [
+            0x073642, 0xdc322f, 0x859900, 0xb58900, 0x268bd2, 0xd33682, 0x2aa198, 0xeee8d5,
+            0x002b36, 0xcb4b16, 0x586e75, 0x657b83, 0x839496, 0x6c71c4, 0x93a1a1, 0xfdf6e3,
+        ],
+    );
+
+    pub const GITHUB_LIGHT: Self = light_theme(
+        "github-light",
+        "GitHub Light",
+        0xffffff,
+        0x24292f,
+        0xbddfff,
+        [
+            0x24292f, 0xcf222e, 0x116329, 0x4d2d00, 0x0969da, 0x8250df, 0x1b7c83, 0x6e7781,
+            0x57606a, 0xa40e26, 0x1a7f37, 0x633c01, 0x218bff, 0xa475f9, 0x3192aa, 0xffffff,
+        ],
+    );
+
+    pub const GRUVBOX_LIGHT: Self = light_theme(
+        "gruvbox-light",
+        "Gruvbox Light",
+        0xfbf1c7,
+        0x3c3836,
+        0xd5c4a1,
+        [
+            0x3c3836, 0xcc241d, 0x98971a, 0xd79921, 0x458588, 0xb16286, 0x689d6a, 0x7c6f64,
+            0x928374, 0x9d0006, 0x79740e, 0xb57614, 0x076678, 0x8f3f71, 0x427b58, 0xffffff,
+        ],
+    );
+
+    pub const CATPPUCCIN_LATTE: Self = light_theme(
+        "catppuccin-latte",
+        "Catppuccin Latte",
+        0xeff1f5,
+        0x4c4f69,
+        0xacb0be,
+        [
+            0x5c5f77, 0xd20f39, 0x40a02b, 0xdf8e1d, 0x1e66f5, 0x8839ef, 0x179299, 0xacb0be,
+            0x6c6f85, 0xd20f39, 0x40a02b, 0xdf8e1d, 0x1e66f5, 0xea76cb, 0x179299, 0xffffff,
+        ],
+    );
+
+    pub const CATALOG: [Self; 16] = [
         Self::DIRIJOR_DARK,
         Self::SOLARIZED_DARK,
         Self::DRACULA,
@@ -156,6 +285,15 @@ impl TermTheme {
         Self::GRUVBOX_DARK,
         Self::TOKYO_NIGHT,
         Self::CATPPUCCIN_MOCHA,
+        Self::NORD,
+        Self::ROSE_PINE,
+        Self::KANAGAWA_WAVE,
+        Self::EVERFOREST_DARK,
+        Self::DIRIJOR_LIGHT,
+        Self::SOLARIZED_LIGHT,
+        Self::GITHUB_LIGHT,
+        Self::GRUVBOX_LIGHT,
+        Self::CATPPUCCIN_LATTE,
     ];
 
     #[must_use]
@@ -256,10 +394,50 @@ const fn dark_theme(
     selection: u32,
     ansi_values: [u32; 16],
 ) -> TermTheme {
+    palette_theme(
+        ThemeAppearance::Dark,
+        id,
+        name,
+        background,
+        foreground,
+        selection,
+        ansi_values,
+    )
+}
+
+const fn light_theme(
+    id: &'static str,
+    name: &'static str,
+    background: u32,
+    foreground: u32,
+    selection: u32,
+    ansi_values: [u32; 16],
+) -> TermTheme {
+    palette_theme(
+        ThemeAppearance::Light,
+        id,
+        name,
+        background,
+        foreground,
+        selection,
+        ansi_values,
+    )
+}
+
+const fn palette_theme(
+    appearance: ThemeAppearance,
+    id: &'static str,
+    name: &'static str,
+    background: u32,
+    foreground: u32,
+    selection: u32,
+    ansi_values: [u32; 16],
+) -> TermTheme {
     let fg = hex(foreground);
     TermTheme {
         id,
         name,
+        appearance,
         background: hex(background),
         foreground: fg,
         cursor: with_alpha(fg, 0.85),
@@ -323,14 +501,34 @@ mod tests {
     }
 
     #[test]
-    fn catalog_ports_all_seven_swift_themes() {
-        assert_eq!(TermTheme::CATALOG.len(), 7);
+    fn catalog_keeps_original_themes_and_adds_light_and_dark_choices() {
+        assert_eq!(TermTheme::CATALOG.len(), 16);
         assert_eq!(TermTheme::CATALOG[0].id, "dirijor-dark");
-        assert_eq!(TermTheme::CATALOG[6].id, "catppuccin-mocha");
+        assert!(
+            TermTheme::CATALOG
+                .iter()
+                .any(|theme| theme.id == "catppuccin-mocha")
+        );
+        assert!(
+            TermTheme::CATALOG
+                .iter()
+                .any(|theme| theme.appearance == ThemeAppearance::Light)
+        );
+        assert!(
+            TermTheme::CATALOG
+                .iter()
+                .any(|theme| theme.appearance == ThemeAppearance::Dark)
+        );
+        let unique_ids = TermTheme::CATALOG
+            .iter()
+            .map(|theme| theme.id)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique_ids.len(), TermTheme::CATALOG.len());
         assert_rgba(
             TermTheme::DIRIJOR_DARK.background,
             rgba_f32(0.071, 0.075, 0.094, 1.0),
         );
+        assert_rgba(TermTheme::GITHUB_LIGHT.background, hex(0xffffff));
     }
 
     #[test]

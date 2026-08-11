@@ -158,10 +158,11 @@ impl SemanticColors {
 
     /// Builds the semantic application palette from a concrete product theme.
     ///
-    /// Diri's selectable themes are currently dark themes, but the surface
-    /// colors are explicit so application chrome and terminal content can use
-    /// the same palette without coupling `diri-ui` to the terminal crate.
+    /// Surface colors are explicit so application chrome and terminal content
+    /// can use the same light or dark palette without coupling `diri-ui` to the
+    /// terminal crate.
     pub const fn themed(
+        appearance: Appearance,
         background: Rgba,
         foreground: Rgba,
         sidebar_surface: Rgba,
@@ -171,7 +172,7 @@ impl SemanticColors {
         let secondary_alpha = if sidebar_tones { 0.70 } else { 0.60 };
         let tertiary_alpha = if sidebar_tones { 0.44 } else { 0.30 };
         Self {
-            appearance: Appearance::Dark,
+            appearance,
             primary: foreground,
             secondary: rgba_f32(foreground.r, foreground.g, foreground.b, secondary_alpha),
             tertiary: rgba_f32(foreground.r, foreground.g, foreground.b, tertiary_alpha),
