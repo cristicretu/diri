@@ -87,6 +87,11 @@ fn swift_associated_value_shapes_match_real_data() {
         serde_json::from_value::<AgentKind>(json!({"agent": {"id": "amp"}})).unwrap(),
         amp
     );
+    // The Rust Engine's live manifest catalog uses the manifest id directly.
+    assert_eq!(
+        serde_json::from_value::<AgentKind>(json!("amp")).unwrap(),
+        amp
+    );
 
     let exited: SessionStatus = serde_json::from_value(json!({
         "exited": {"_0": {"reason": "daemonRestart"}}

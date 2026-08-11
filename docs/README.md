@@ -6,7 +6,7 @@
 - [Remote nodes](../diri/NODE.md) — run sessions over SSH and tmux.
 - [Packaging](../diri/PACKAGING.md) — build, signing, and notarization.
 - [Updates and releases](../diri/UPDATING.md) — updater design and release flow.
-- [Rust engine port](../diri/PORT.md) — status of the cross-platform engine.
+- [Engine port history](../diri/PORT.md) — record of the completed Rust migration.
 - [Performance](../diri/PERF.md) — budgets and measurement workflow.
 
 Project policies live at the repository root: [contributing](../CONTRIBUTING.md),

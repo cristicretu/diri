@@ -1520,7 +1520,11 @@ version = "0.1.0"
 name = "dirijor-mcp"
 version = "0.1.0"
 dependencies = [
+ "diri-proto",
+ "libc",
+ "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

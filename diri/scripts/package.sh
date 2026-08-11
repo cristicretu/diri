@@ -21,6 +21,7 @@ entitlements="${workspace_dir}/assets/diri.entitlements"
 target_dir="${CARGO_TARGET_DIR:-${workspace_dir}/target}"
 universal_dir="${target_dir}/universal-apple-darwin/release"
 universal_binary="${universal_dir}/diri"
+universal_cli_binary="${universal_dir}/dirijor"
 universal_mcp_binary="${universal_dir}/dirijor-mcp"
 universal_engine_binary="${universal_dir}/dirijord-rs"
 universal_holder_binary="${universal_dir}/diri-holder"
@@ -55,11 +56,13 @@ cd "${workspace_dir}"
 
 echo "==> Building diri for Apple silicon"
 cargo build --release --package diri-app --bin diri --target aarch64-apple-darwin
-cargo build --release --package dirijor-mcp --bin dirijor-mcp --target aarch64-apple-darwin
+cargo build --release --package dirijor-mcp --bin dirijor --bin dirijor-mcp \
+    --target aarch64-apple-darwin
 
 echo "==> Building diri for Intel"
 cargo build --release --package diri-app --bin diri --target x86_64-apple-darwin
-cargo build --release --package dirijor-mcp --bin dirijor-mcp --target x86_64-apple-darwin
+cargo build --release --package dirijor-mcp --bin dirijor --bin dirijor-mcp \
+    --target x86_64-apple-darwin
 
 echo "==> Creating universal executable"
 mkdir -p "${universal_dir}" "${dist_dir}"
@@ -68,6 +71,11 @@ lipo -create \
     "${target_dir}/x86_64-apple-darwin/release/diri" \
     -output "${universal_binary}"
 lipo "${universal_binary}" -verify_arch arm64 x86_64
+lipo -create \
+    "${target_dir}/aarch64-apple-darwin/release/dirijor" \
+    "${target_dir}/x86_64-apple-darwin/release/dirijor" \
+    -output "${universal_cli_binary}"
+lipo "${universal_cli_binary}" -verify_arch arm64 x86_64
 lipo -create \
     "${target_dir}/aarch64-apple-darwin/release/dirijor-mcp" \
     "${target_dir}/x86_64-apple-darwin/release/dirijor-mcp" \
@@ -97,26 +105,11 @@ cp "${workspace_dir}/../license-policy.json" "${license_dir}/license-policy.json
 cp "${workspace_dir}/../LICENSES/"*.txt "${license_dir}/"
 cp "${third_party_inventory}" "${license_dir}/THIRD-PARTY-LICENSES.json"
 
-# The Rust Engine is authoritative. The existing CLI remains packaged for
-# local automation/hooks, but no daemon, Holder, Agent manifest, or remote
-# transport artifact is sourced from a Swift product.
-repo_root="$(cd "${workspace_dir}/.." && pwd)"
-echo "==> Building the local automation CLI"
-swift build --package-path "${repo_root}" -c release --product dirijor
-daemon_bin="$(swift build --package-path "${repo_root}" -c release --show-bin-path)"
 app_bin_dir="${app_path}/Contents/Resources/bin"
-echo "==> Bundling CLI and lightweight MCP proxy into Resources/bin"
+echo "==> Bundling Rust CLI and MCP frontend into Resources/bin"
 mkdir -p "${app_bin_dir}"
-cp "${daemon_bin}/dirijor" "${app_bin_dir}/dirijor"
+cp "${universal_cli_binary}" "${app_bin_dir}/dirijor"
 cp "${universal_mcp_binary}" "${app_bin_dir}/dirijor-mcp"
-core_bundle="${daemon_bin}/dirijor_DirijorCore.bundle"
-if [[ ! -d "${core_bundle}" ]]; then
-    echo "error: Swift CLI resource bundle is missing: ${core_bundle}" >&2
-    exit 1
-fi
-rm -rf "${app_bin_dir}/dirijor_DirijorCore.bundle"
-cp -R "${core_bundle}" "${app_bin_dir}/dirijor_DirijorCore.bundle"
-
 # The Rust Engine is the authoritative daemon launched by diri. The remote
 # Helper catalog below is consumed by this executable directly.
 echo "==> Building the authoritative Rust Engine (universal)"

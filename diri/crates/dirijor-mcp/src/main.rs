@@ -1,8 +1,6 @@
-use std::env;
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
 
+use dirijor_mcp::Bridge;
 use serde_json::{Value, json};
 
 trait ToolBackend {
@@ -10,92 +8,39 @@ trait ToolBackend {
     fn call(&mut self, name: &str, arguments: &Value) -> Result<Value, String>;
 }
 
-struct ProcessBackend {
-    cli: PathBuf,
+struct DirectBackend {
+    bridge: Bridge,
     cached_tools: Option<Value>,
 }
 
-impl ProcessBackend {
-    fn discover() -> Self {
-        let cli = env::var_os("DIRIJOR_CLI")
-            .map(PathBuf::from)
-            .filter(|path| is_executable(path))
-            .or_else(|| {
-                env::current_exe()
-                    .ok()
-                    .and_then(|path| path.parent().map(|parent| parent.join("dirijor")))
-                    .filter(|path| is_executable(path))
-            })
-            .or_else(|| {
-                env::var_os("HOME").and_then(|home| {
-                    let path =
-                        PathBuf::from(home).join("Library/Application Support/Dirijor/bin/dirijor");
-                    is_executable(&path).then_some(path)
-                })
-            })
-            .unwrap_or_else(|| PathBuf::from("dirijor"));
+impl DirectBackend {
+    fn new() -> Self {
         Self {
-            cli,
+            bridge: Bridge::default(),
             cached_tools: None,
         }
     }
-
-    fn invoke(&self, args: &[&str], input: Option<&Value>) -> Result<Value, String> {
-        let mut child = Command::new(&self.cli)
-            .args(args)
-            .stdin(if input.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| format!("could not launch {}: {error}", self.cli.display()))?;
-        if let Some(input) = input {
-            let mut stdin = child
-                .stdin
-                .take()
-                .ok_or("tool backend stdin was unavailable")?;
-            serde_json::to_writer(&mut stdin, input).map_err(|error| error.to_string())?;
-            stdin.write_all(b"\n").map_err(|error| error.to_string())?;
-        }
-        let output = child
-            .wait_with_output()
-            .map_err(|error| error.to_string())?;
-        if !output.status.success() {
-            return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
-        }
-        serde_json::from_slice(&output.stdout).map_err(|error| {
-            format!(
-                "invalid response from {}: {error}: {}",
-                self.cli.display(),
-                String::from_utf8_lossy(&output.stdout).trim()
-            )
-        })
-    }
 }
 
-impl ToolBackend for ProcessBackend {
+impl ToolBackend for DirectBackend {
     fn tools(&mut self) -> Result<Value, String> {
         if let Some(tools) = &self.cached_tools {
             return Ok(tools.clone());
         }
-        let tools = self.invoke(&["mcp-tools"], None)?;
+        let tools = json!({
+            "tools": self
+                .bridge
+                .tool_definitions()?
+                .iter()
+                .map(|tool| tool.wire_value())
+                .collect::<Vec<_>>()
+        });
         self.cached_tools = Some(tools.clone());
         Ok(tools)
     }
 
     fn call(&mut self, name: &str, arguments: &Value) -> Result<Value, String> {
-        let envelope = self.invoke(&["mcp-call", "--tool", name], Some(arguments))?;
-        if let Some(error) = envelope.get("error").and_then(Value::as_str) {
-            Err(error.to_owned())
-        } else {
-            envelope
-                .get("ok")
-                .cloned()
-                .ok_or_else(|| "tool backend omitted both 'ok' and 'error'".to_owned())
-        }
+        self.bridge.call(name, arguments)
     }
 }
 
@@ -124,7 +69,7 @@ fn initialize(params: &Value) -> Value {
         .get("protocolVersion")
         .and_then(Value::as_str)
         .unwrap_or("2025-06-18");
-    let browser = if env::var_os("DIRIJOR_TEST_RUN_AVAILABLE").is_some() {
+    let browser = if std::env::var_os("DIRIJOR_TEST_RUN_AVAILABLE").is_some() {
         " To test a web feature, use test_run with a preview URL from get_artifacts."
     } else {
         ""
@@ -187,24 +132,10 @@ fn handle_message(message: Value, backend: &mut impl ToolBackend) -> Option<Valu
     }
 }
 
-fn is_executable(path: &std::path::Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path)
-            .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        path.exists()
-    }
-}
-
 fn main() {
     let stdin = io::stdin();
     let mut stdout = io::BufWriter::new(io::stdout().lock());
-    let mut backend = ProcessBackend::discover();
+    let mut backend = DirectBackend::new();
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
@@ -243,7 +174,7 @@ mod tests {
     }
 
     #[test]
-    fn serves_mcp_without_a_resident_swift_runtime() {
+    fn serves_mcp_through_a_rust_backend() {
         let mut backend = Fake;
         let listed = handle_message(
             json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),

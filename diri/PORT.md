@@ -7,6 +7,10 @@ sessions, detection and the control socket.
 
 This is the record of replacing it with `crates/diri-engine`.
 
+> **Completed 2026-08-11.** The app now ships only the Rust engine, holder,
+> automation CLI, and MCP server. The legacy `Sources/` implementation and its
+> build pipeline have been removed. The notes below preserve the port's history.
+
 ## Rules this port follows
 
 1. **Additive.** The Swift daemon keeps running and serving live sessions
@@ -48,8 +52,8 @@ This is the record of replacing it with `crates/diri-engine`.
 | Held sessions + adoption | **done** | `Session::spawn` goes through a holder when a `HolderConfig` is present; `Registry::restore` scans the holders directory and adopts live holders after a restart. Tested: a session survives its session object being dropped and a brand-new registry picks it up mid-flight |
 | History / resume | **done** | Claude and Codex transcript stores; verified against the real ones — 500 conversations in 0.9s |
 | Remote hosts (ssh + tmux) | **done** | argv, reattach naming, shell quoting verified through a real shell, scp handoff |
-| Rust daemon binary | **done** | `dirijord-rs`: same socket, lock singleton, state file, boot-log stamp, holder adoption, manifest bundle + overrides loading. Ships in `Resources/bin` beside the Swift daemon; opt in per machine with `DIRIJORD_PATH=…/Resources/bin/dirijord-rs`. Verified live: the Swift `dirijor` CLI spawned, typed into, read, waited on, and archived a session served entirely by the Rust engine |
-| Swift daemon retirement | in soak | Opt-in flag exists; flip the default (and delete `Sources/`) once the Rust daemon has parity on the remaining gaps below and soak time under real use |
+| Rust daemon binary | **done** | `dirijord-rs`: same socket, lock singleton, state file, boot-log stamp, holder adoption, manifest bundle + overrides loading. It is the only engine shipped in `Resources/bin`. |
+| Legacy daemon retirement | **done** | The app launcher, holder, automation CLI, MCP server, packaging, and CI all use the Rust workspace; `Sources/` and the SwiftPM package have been removed. |
 
 Since ported into `dirijord-rs` (2026-08-07 second pass): artifacts scanning
 + PR enrichment + listening ports, the full resource governor with all three

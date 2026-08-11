@@ -167,8 +167,8 @@ fi
 
 # The Rust app fail-closes unless Hello reports engineKind=diri-rust-engine.
 # Prefer a local cargo build of dirijord-rs, then the packaged Rust Engine in
-# an installed bundle. Never point at Swift `dirijord` — the client rejects it
-# and the UI comes up unable to spawn or list sessions.
+# an installed bundle. Never point at the retired legacy daemon — the client
+# rejects it and the UI comes up unable to spawn or list sessions.
 if [[ -z "${DIRIJORD_PATH:-}" ]]; then
     for candidate in \
         "${target_dir}/${profile}/dirijord-rs" \

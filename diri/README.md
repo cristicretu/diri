@@ -4,7 +4,7 @@ For first-party VPS execution, per-node Claude/Codex accounts, fleet usage,
 and transactional local↔cloud handoff, see [NODE.md](NODE.md).
 
 `diri` is the Rust + GPUI desktop app, shipped self-contained: the app bundle
-carries the daemon (`dirijord`), the session holders that keep agents alive
+carries the Engine (`dirijord-rs`), the session holders that keep agents alive
 across daemon restarts and upgrades, the `dirijor` CLI, and the MCP proxy. The
 workspace holds the protocol/client core, the session engine, terminal
 renderer, shared design system, session store, usage accounting, and
@@ -18,18 +18,10 @@ Sessions are owned by *holder* processes, not the daemon: the daemon can
 crash, upgrade, or be swapped out and every live agent keeps running, to be
 adopted by whatever daemon starts next.
 
-Two daemons ship in the bundle. `dirijord` (Swift) is the default.
-`dirijord-rs` is the cross-platform Rust engine
-([`crates/diri-engine`](crates/diri-engine)) — same socket, same wire
-protocol, same on-disk state, same holders, so flipping between them never
-loses a session. Opt a machine in with:
-
-```sh
-DIRIJORD_PATH=/Applications/diri.app/Contents/Resources/bin/dirijord-rs open -a diri
-```
-
-[`PORT.md`](PORT.md) tracks the port layer by layer, including the remaining
-gaps that keep the Swift daemon the default for now.
+`dirijord-rs` is the authoritative cross-platform Engine
+([`crates/diri-engine`](crates/diri-engine)). It owns the control socket and
+on-disk state, while `diri-holder` owns local PTYs across Engine restarts.
+[`PORT.md`](PORT.md) records the completed migration layer by layer.
 
 ## Install
 

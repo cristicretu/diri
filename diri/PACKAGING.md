@@ -33,11 +33,8 @@ scripts/install-local.sh
 
 With no signing environment, `package.sh` applies an ad-hoc hardened-runtime signature and verifies it. Set `DIRI_CREATE_DMG=1` to also create `dist/diri-<version>-universal.dmg`. `DIRI_DIST_DIR` changes the output directory, and `DIRI_VERSION` changes the DMG filename.
 
-The committed `assets/icon.icns` is deterministic and can be regenerated on macOS with:
-
-```sh
-scripts/make-icon.sh
-```
+The committed `assets/icon.icns` and `assets/dev-icon.icns` are the release and
+development icon inputs.
 
 ## Developer ID signing and notarization
 
@@ -50,7 +47,7 @@ export APPLE_NOTARIZATION_KEYCHAIN_PROFILE=dirijor-notary
 scripts/package.sh
 ```
 
-The keychain-profile variable also accepts the Swift release flow's `NOTARY_PROFILE` name and cargo-packager's `APPLE_KEYCHAIN_PROFILE` name. Alternatively, set all three direct credential variables:
+The keychain-profile variable also accepts the legacy `NOTARY_PROFILE` name and cargo-packager's `APPLE_KEYCHAIN_PROFILE` name. Alternatively, set all three direct credential variables:
 
 - `APPLE_NOTARIZATION_APPLE_ID`
 - `APPLE_NOTARIZATION_PASSWORD` (an app-specific password)

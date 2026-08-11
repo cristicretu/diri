@@ -183,6 +183,8 @@ pub struct AgentDescriptor {
     pub display_name: String,
     #[serde(default)]
     pub short_label: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
     #[serde(default)]
     pub glyph: String,
     #[serde(default)]

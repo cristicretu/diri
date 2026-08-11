@@ -574,6 +574,7 @@ mod tests {
             id: "amp".to_owned(),
             display_name: "Amp".to_owned(),
             short_label: "amp".to_owned(),
+            aliases: vec!["ampcode".to_owned()],
             glyph: "\u{23fb}".to_owned(),
             first_class: true,
             approve: Some(AgentKeystroke {
