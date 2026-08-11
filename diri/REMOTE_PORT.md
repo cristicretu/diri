@@ -397,10 +397,12 @@ and sequence. Scrollback is bounded to 4 MiB and served on demand through
 `Scroll`. Raw output is bounded to 32 MiB.
 
 The PTY reader must never block on a client. The Holder uses bounded queues. It
-coalesces active output for no more than 16 ms. When no client is attached, it
-continues parsing terminal state but does not construct or serialize diffs. If
-an attached client falls behind, stale updates are discarded and the connection
-is reseeded from a complete snapshot after reconnect.
+coalesces background output for no more than 16 ms, while up to two grid
+publications after interactive input bypass that wait (one trailing publication
+may already be in flight before the actual response). When no client is
+attached, it continues parsing terminal state but does not construct or
+serialize diffs. If an attached client falls behind, stale updates are discarded
+and the connection is reseeded from a complete snapshot after reconnect.
 
 One owner/event loop handles PTY drain, terminal parsing, diff construction, and
 attach writes. The hot path does not put an `Arc<Mutex<Terminal>>` across tasks.
@@ -492,19 +494,19 @@ Release builds must satisfy the local Helper/UDS gates:
 ```text
 FullSnapshot p90          <= 100 ms
 input-to-PTY p95          <= 10 ms
-output-to-diff p90        <= 50 ms
+output-to-diff p90        <= 8 ms
 loopback interaction p50 <= 75 ms
 loopback interaction p90 <= 150 ms
 ```
 
-The 2026-08-09 local release sample measured:
+The 2026-08-11 local release sample measured:
 
 ```text
-FullSnapshot p90          1 us
-input-to-PTY p95          667 us
-output-to-diff p90        17.319 ms
-loopback interaction p50 179 us
-loopback interaction p90 401 us
+FullSnapshot p90          0 us
+input-to-PTY p95          138 us
+output-to-diff p90        13 us
+loopback interaction p50 76 us
+loopback interaction p90 99 us
 ```
 
 Measured values are printed in CI so regressions are visible rather than hidden
