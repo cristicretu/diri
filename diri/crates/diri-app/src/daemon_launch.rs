@@ -110,9 +110,38 @@ pub fn ensure_daemon_running(socket_path: &Path) {
                     | io::ErrorKind::ConnectionRefused
                     | io::ErrorKind::ConnectionReset
             ) => {}
+        // Something is listening but cannot identify itself. The usual cause is
+        // not corruption, it is age: every Engine older than `daemon.hello`
+        // answers `not_found`, which arrives here as a plain error rather than
+        // a refused connection. Returning would strand exactly the people who
+        // are upgrading — the shipped 0.4.7 Engine behaves this way, verified
+        // against a live one — so an Engine that cannot answer the probe is
+        // retired like one that answers with the wrong build.
+        //
+        // Probed twice before deciding: a healthy but momentarily busy Engine
+        // can miss the one-second read timeout, and restarting it over a
+        // hiccup is needless churn. `daemon.shutdown` persists state first and
+        // holder-owned sessions outlive it either way.
+        Err(error) if probe_daemon(socket_path).is_err() => {
+            eprintln!(
+                "diri: replacing the Engine at {} — it could not answer the identity probe ({error})",
+                socket_path.display()
+            );
+            if daemon.is_none() {
+                eprintln!("diri: no bundled Engine to replace it with; leaving it alone");
+                return;
+            }
+            if let Err(error) = stop_daemon_for_upgrade(socket_path) {
+                eprintln!(
+                    "diri: could not stop the unidentified Engine at {}: {error}",
+                    socket_path.display()
+                );
+                return;
+            }
+        }
         Err(error) => {
             eprintln!(
-                "diri: live daemon at {} failed the Rust identity probe: {error}",
+                "diri: the Engine at {} answered a retried identity probe; leaving it alone ({error})",
                 socket_path.display()
             );
             return;
