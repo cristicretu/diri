@@ -268,6 +268,42 @@ private func parse<T: ParsableCommand>(_ argv: [String], as type: T.Type) throws
     #expect(AgentKind.parse("htop") == .generic(command: "htop"))
 }
 
+@Test func doctorDerivesDistinctDeterministicBinaryChecksFromTheCatalog() {
+    let descriptors = [
+        AgentDescriptor(
+            id: "zeta", displayName: "Zeta Agent", statusAuthority: .screen,
+            binary: "shared-agent"),
+        AgentDescriptor(
+            id: "beta", displayName: "Beta", statusAuthority: .screen,
+            binary: "beta"),
+        AgentDescriptor(
+            id: "alpha", displayName: "Alpha Agent", statusAuthority: .screen,
+            binary: "shared-agent"),
+        // Pseudo-agents stay excluded even if malformed input gives them a binary.
+        AgentDescriptor(
+            id: BuiltinAgentID.shell, displayName: "Shell", binary: "/bin/zsh"),
+        AgentDescriptor(
+            id: BuiltinAgentID.generic, displayName: "Command", binary: "command"),
+        AgentDescriptor(id: "empty", displayName: "Empty", binary: ""),
+    ]
+
+    let checks = Doctor.agentBinaryDiagnostics(from: descriptors)
+    #expect(checks == [
+        AgentBinaryDiagnostic(binary: "beta", displayName: "Beta"),
+        AgentBinaryDiagnostic(binary: "shared-agent", displayName: "Alpha Agent"),
+    ])
+    #expect(checks.map(\.label) == ["Beta", "Alpha Agent (shared-agent)"])
+}
+
+@Test func doctorMapsTheRealLaunchableCatalogWithoutPathProbing() {
+    let checks = Doctor.agentBinaryDiagnostics(from: AgentCatalog.shared.launchable)
+    let binaries = checks.map(\.binary)
+    #expect(binaries == binaries.sorted())
+    #expect(Set(binaries).count == binaries.count)
+    #expect(!binaries.isEmpty)
+    #expect(!checks.contains { $0.binary == "shell" || $0.binary == "generic" })
+}
+
 private func record(id: String, title: String) -> SessionRecord {
     SessionRecord(
         id: SessionID(rawValue: id),

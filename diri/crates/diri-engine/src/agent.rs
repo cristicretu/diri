@@ -415,7 +415,7 @@ mod tests {
         );
     }
 
-    /// Sixteen of the twenty shipped manifests declare `returnToLoginShell`;
+    /// Eighteen of the twenty-two shipped manifests declare `returnToLoginShell`;
     /// only `cursor`, `gemini` and the two command-less manifests do not. The
     /// flag has been lost wholesale once already, so assert the whole set
     /// rather than a sample: a port that drops it fails here.
@@ -443,6 +443,7 @@ mod tests {
                 "amp",
                 "antigravity",
                 "claude-code",
+                "cline",
                 "codex",
                 "copilot",
                 "devin",
@@ -452,6 +453,7 @@ mod tests {
                 "kilo",
                 "kimi",
                 "kiro",
+                "maki",
                 "opencode",
                 "pi",
                 "qoder",

@@ -204,6 +204,17 @@ struct Status: ParsableCommand {
 
 // MARK: - doctor
 
+struct AgentBinaryDiagnostic: Equatable, Sendable {
+    let binary: String
+    let displayName: String
+
+    var label: String {
+        displayName.caseInsensitiveCompare(binary) == .orderedSame
+            ? displayName
+            : "\(displayName) (\(binary))"
+    }
+}
+
 struct Doctor: ParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Check the daemon socket, agent binaries, and state file."
@@ -230,12 +241,13 @@ struct Doctor: ParsableCommand {
             print("✗ daemon socket missing at \(socketPath)")
         }
 
-        // 2. Agent binaries on PATH.
-        for binary in ["claude", "codex"] {
-            if let path = CLISupport.which(binary) {
-                print("✓ \(binary) found at \(path)")
+        // 2. Agent binaries on PATH. The catalog is the supported-agent list;
+        // adding a manifest must automatically add its diagnostic.
+        for check in Self.agentBinaryDiagnostics(from: AgentCatalog.shared.launchable) {
+            if let path = CLISupport.which(check.binary) {
+                print("✓ \(check.label) found at \(path)")
             } else {
-                print("✗ \(binary) not found on PATH")
+                print("✗ \(check.label) not found on PATH")
             }
         }
 
@@ -250,5 +262,24 @@ struct Doctor: ParsableCommand {
         if !daemonOK {
             throw ExitCode.failure
         }
+    }
+
+    /// Pure catalog-to-check-list mapping. PATH probing stays in `run`, so
+    /// tests never depend on which optional agent CLIs a machine installed.
+    static func agentBinaryDiagnostics(
+        from descriptors: [AgentDescriptor]
+    ) -> [AgentBinaryDiagnostic] {
+        var byBinary: [String: AgentBinaryDiagnostic] = [:]
+        for descriptor in descriptors.sorted(by: { $0.id < $1.id }) {
+            guard descriptor.id != BuiltinAgentID.shell,
+                descriptor.id != BuiltinAgentID.generic,
+                let binary = descriptor.binary,
+                !binary.isEmpty,
+                byBinary[binary] == nil
+            else { continue }
+            byBinary[binary] = AgentBinaryDiagnostic(
+                binary: binary, displayName: descriptor.displayName)
+        }
+        return byBinary.values.sorted { $0.binary < $1.binary }
     }
 }

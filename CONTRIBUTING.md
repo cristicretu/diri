@@ -81,10 +81,12 @@ consequences worth knowing:
 ## Adding an agent
 
 This is the easiest place to start and needs no Swift or Rust. Agent support is
-data: each agent is one JSON file in `Sources/DirijorCore/Resources/manifests/`
-describing how to spawn it, how to resume a session, which keystrokes approve or
-deny, and the screen predicates that decide whether it is working, waiting on
-you, or done. Copy the closest existing manifest and adjust it.
+data: each agent is one logical JSON manifest describing how to spawn it, how
+to resume a session, which keystrokes approve or deny, and the screen predicates
+that decide whether it is working, waiting on you, or done. Built-in manifests
+are mirrored in the Swift compatibility and authoritative Rust engine catalogs.
+The [manifest-authoring guide](docs/AGENT-MANIFESTS.md) covers the schema,
+real-screen capture workflow, examples, overrides, and focused validation.
 
 Claude Code and Codex have first-class status detection and resume. Anything
 without a manifest still runs as a plain terminal.

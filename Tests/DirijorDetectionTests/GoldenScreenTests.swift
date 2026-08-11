@@ -185,6 +185,98 @@ import Testing
         #expect(obs?.state == .idle)
     }
 
+    // MARK: Cline
+    // Text and layout markers come from Cline's official OpenTUI components.
+
+    @Test func clineToolPermission() {
+        let s = snap([
+            "Approve tool call?",
+            "run_commands",
+            "  $ swift test",
+            "[y] approve  [n] deny",
+        ])
+        let obs = try! #require(engine.evaluate(s, manifestID: "cline"))
+        #expect(obs.state == .blockedPermission)
+        #expect(obs.matchedRuleID == "tool-permission")
+        #expect(obs.promptExcerpt?.contains("swift test") == true)
+    }
+
+    @Test func clineFollowUpQuestion() {
+        let s = snap([
+            "Which approach should I use?",
+            "❯ Keep the API",
+            "  Replace it",
+            "  Type a response...",
+            "↑/↓ navigate, Enter to select, 1-2 to pick",
+        ])
+        let obs = engine.evaluate(s, manifestID: "cline")
+        #expect(obs?.state == .blockedQuestion)
+        #expect(obs?.matchedRuleID == "follow-up-question")
+    }
+
+    @Test func clineStreamingOutranksPersistentComposer() {
+        let s = snap([
+            "⠋ Streaming a response",
+            "❯ Ask anything...",
+            "○ Plan  ● Act  (Tab)",
+        ])
+        let obs = engine.evaluate(s, manifestID: "cline")
+        #expect(obs?.state == .working)
+        #expect(obs?.matchedRuleID == "streaming-spinner")
+    }
+
+    @Test func clineIdleComposerSupportsBothModes() {
+        #expect(
+            engine.evaluate(snap(["❯ Ask anything..."]), manifestID: "cline")?.state == .idle)
+        #expect(
+            engine.evaluate(snap(["❯ Plan something..."]), manifestID: "cline")?.state == .idle)
+    }
+
+    // MARK: Maki
+    // These are the stable form and mode-bar shapes in Maki's TUI.
+
+    @Test func makiPermissionForm() {
+        let s = snap([
+            "Permission required",
+            "bash: rm build/output",
+            "y allow    n deny",
+        ])
+        let obs = engine.evaluate(s, manifestID: "maki")
+        #expect(obs?.state == .blockedPermission)
+        #expect(obs?.matchedRuleID == "permission-prompt")
+    }
+
+    @Test func makiPlanCompleteForm() {
+        let s = snap([
+            "Plan complete",
+            "space toggle parallel    edit plan",
+            "enter confirm",
+        ])
+        let obs = engine.evaluate(s, manifestID: "maki")
+        #expect(obs?.state == .blockedQuestion)
+        #expect(obs?.matchedRuleID == "plan-complete-form")
+    }
+
+    @Test func makiModeBarDistinguishesWorkingFromIdle() {
+        let working = engine.evaluate(snap([" ⠋ ⠙ [BUILD] sonnet"]), manifestID: "maki")
+        #expect(working?.state == .working)
+        #expect(working?.matchedRuleID == "status-bar-spinner-working")
+
+        let idle = engine.evaluate(snap([" [PLAN] sonnet"]), manifestID: "maki")
+        #expect(idle?.state == .idle)
+        #expect(idle?.matchedRuleID == "status-bar-idle")
+    }
+
+    @Test func makiNarrowPaneFallbackRejectsQueuedPrompt() {
+        let idle = engine.evaluate(snap(["────────", "❯ ", "model"]), manifestID: "maki")
+        #expect(idle?.state == .idle)
+        #expect(idle?.matchedRuleID == "prompt-box-idle")
+
+        let queued = engine.evaluate(
+            snap(["queue another prompt", "❯ ", "model"]), manifestID: "maki")
+        #expect(queued == nil)
+    }
+
     // MARK: Aider
     // Screens below are verbatim from live aider 0.86.2 PTY captures.
 

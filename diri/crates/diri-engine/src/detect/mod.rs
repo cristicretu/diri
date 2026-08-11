@@ -261,7 +261,7 @@ mod tests {
 
         // The whole catalog, by name. A shrunken catalog does not error: a
         // missing agent just spawns as a bare login shell, which is how this
-        // shipped broken once already. Spelling out all twenty ids means a
+        // shipped broken once already. Spelling out all twenty-two ids means a
         // dropped manifest fails here instead of in someone's terminal.
         let mut ids = engine.ids();
         ids.sort_unstable();
@@ -272,6 +272,7 @@ mod tests {
                 "amp",
                 "antigravity",
                 "claude-code",
+                "cline",
                 "codex",
                 "copilot",
                 "cursor",
@@ -284,6 +285,7 @@ mod tests {
                 "kilo",
                 "kimi",
                 "kiro",
+                "maki",
                 "opencode",
                 "pi",
                 "qoder",
@@ -300,7 +302,7 @@ mod tests {
             .into_iter()
             .map(|id| engine.manifest(id).expect("manifest").rules.len())
             .sum();
-        assert_eq!(rules, 85, "the shipped ruleset lost rules");
+        assert_eq!(rules, 95, "the shipped ruleset lost rules");
 
         for id in engine.ids() {
             let expected_empty = matches!(id, "shell" | "generic" | "pi");
@@ -316,7 +318,7 @@ mod tests {
     /// decodes it as `diri_proto::AgentDescriptor`. That type needs `id` and
     /// `displayName`, and a single manifest missing either fails the *whole*
     /// response — leaving the client with no catalog and every agent spawning
-    /// as a bare shell. Decode all twenty the way the client will.
+    /// as a bare shell. Decode all twenty-two the way the client will.
     #[test]
     fn every_shipped_descriptor_decodes_the_way_the_client_decodes_it() {
         let engine = engine();
@@ -349,6 +351,85 @@ mod tests {
                     pair[1].priority
                 );
             }
+        }
+    }
+
+    #[test]
+    fn cline_rules_cover_permission_question_working_and_idle() {
+        let engine = engine();
+        let cases = [
+            (
+                vec![
+                    "Approve tool call?",
+                    "run_commands",
+                    "[y] approve  [n] deny",
+                ],
+                ManifestState::BlockedPermission,
+                "tool-permission",
+            ),
+            (
+                vec![
+                    "Which approach should I use?",
+                    "❯ Keep the API",
+                    "  Type a response...",
+                    "↑/↓ navigate, Enter to select, 1-2 to pick",
+                ],
+                ManifestState::BlockedQuestion,
+                "follow-up-question",
+            ),
+            (
+                vec!["⠋ streaming a response", "❯ Ask anything..."],
+                ManifestState::Working,
+                "streaming-spinner",
+            ),
+            (
+                vec!["❯ Ask anything...", "● Act (Tab)"],
+                ManifestState::Idle,
+                "idle-input-placeholder",
+            ),
+        ];
+
+        for (lines, state, rule) in cases {
+            let observation = engine
+                .evaluate(&ScreenSnapshot::from_lines(lines), "cline")
+                .expect("Cline screen should match");
+            assert_eq!(observation.state, state);
+            assert_eq!(observation.matched_rule_id, rule);
+        }
+    }
+
+    #[test]
+    fn maki_rules_cover_permission_plan_working_and_idle() {
+        let engine = engine();
+        let cases = [
+            (
+                vec!["Permission required", "y allow    n deny"],
+                ManifestState::BlockedPermission,
+                "permission-prompt",
+            ),
+            (
+                vec!["Plan complete", "space toggle parallel", "enter confirm"],
+                ManifestState::BlockedQuestion,
+                "plan-complete-form",
+            ),
+            (
+                vec![" ⠋ ⠙ [BUILD] model"],
+                ManifestState::Working,
+                "status-bar-spinner-working",
+            ),
+            (
+                vec![" [PLAN] model"],
+                ManifestState::Idle,
+                "status-bar-idle",
+            ),
+        ];
+
+        for (lines, state, rule) in cases {
+            let observation = engine
+                .evaluate(&ScreenSnapshot::from_lines(lines), "maki")
+                .expect("Maki screen should match");
+            assert_eq!(observation.state, state);
+            assert_eq!(observation.matched_rule_id, rule);
         }
     }
 

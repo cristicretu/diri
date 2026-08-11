@@ -77,11 +77,12 @@ Two processes, one wire protocol:
 
 ## Adding an agent
 
-Agent support is data, not code. Each agent is one JSON file in
-`Sources/DirijorCore/Resources/manifests/` describing how to spawn it, how to resume, which keys
-approve or deny a prompt, and the screen rules that decide whether it is working, waiting, or
-done. Copy the closest existing manifest and adjust it — no Swift or Rust required. This is the
-easiest way to contribute.
+Agent support is data, not code. Each agent is one logical JSON manifest describing how to
+spawn it, how to resume, which keys approve or deny a prompt, and the screen rules that decide
+whether it is working, waiting, or done. Built-ins are mirrored in the Swift compatibility and
+authoritative Rust catalogs. The [manifest-authoring guide](docs/AGENT-MANIFESTS.md) explains
+the schema, safe capture workflow, examples, overrides, and validation — no Swift or Rust is
+required.
 
 ## Building from source
 

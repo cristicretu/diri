@@ -88,6 +88,35 @@ jobs:
       - name: Release build
         run: cargo build --workspace --release
 
+  engine-linux:
+    name: Rust engine (Linux x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: diri
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.0.0
+      - name: Report Linux environment
+        run: |
+          cat /etc/os-release
+          uname -a
+          rustc --version --verbose
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            diri/target
+          key: linux-engine-cargo-${{ hashFiles('diri/Cargo.lock') }}
+          restore-keys: linux-engine-cargo-
+      # This is deliberately native rather than a cross-build: the PTY suite
+      # exercises openpty/ioctl/SIGWINCH/process groups and Linux's EIO-at-EOF
+      # behavior against real child processes.
+      - name: Test Rust engine natively
+        run: cargo test --locked -p diri-engine -- --nocapture
+
   remote-helper-native:
     name: Remote Helper (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}

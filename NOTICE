@@ -25,6 +25,7 @@ herdr's TOML screen manifests (`src/detect/manifests/*.toml`):
 
     Sources/DirijorCore/Resources/manifests/amp.json
     Sources/DirijorCore/Resources/manifests/antigravity.json
+    Sources/DirijorCore/Resources/manifests/cline.json
     Sources/DirijorCore/Resources/manifests/copilot.json
     Sources/DirijorCore/Resources/manifests/devin.json
     Sources/DirijorCore/Resources/manifests/droid.json
@@ -33,6 +34,7 @@ herdr's TOML screen manifests (`src/detect/manifests/*.toml`):
     Sources/DirijorCore/Resources/manifests/kilo.json
     Sources/DirijorCore/Resources/manifests/kimi.json
     Sources/DirijorCore/Resources/manifests/kiro.json
+    Sources/DirijorCore/Resources/manifests/maki.json
     Sources/DirijorCore/Resources/manifests/opencode.json
     Sources/DirijorCore/Resources/manifests/pi.json
     Sources/DirijorCore/Resources/manifests/qoder.json

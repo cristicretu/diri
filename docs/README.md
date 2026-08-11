@@ -3,6 +3,8 @@
 - [Getting started](GETTING_STARTED.md) — installation, first session, worktrees,
   remote hosts, diagnostics, and local data.
 - [Security model](SECURITY-MODEL.md) — trust boundaries and safe-use guidance.
+- [Agent manifests](AGENT-MANIFESTS.md) — add an agent, author screen rules,
+  capture safe fixtures, and validate both engines.
 - [Remote nodes](../diri/NODE.md) — run sessions over SSH and tmux.
 - [Packaging](../diri/PACKAGING.md) — build, signing, and notarization.
 - [Updates and releases](../diri/UPDATING.md) — updater design and release flow.
