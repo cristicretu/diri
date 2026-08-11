@@ -18,13 +18,10 @@ you are typing in a terminal.
 | ⇧⌘N | Shift-Command-N | Start a Codex session |
 | ⌘R | Command-R | Rename the selected session in place |
 | ⇧⌘W | Shift-Command-W | Archive the selected session |
-| ⌘W | Command-W | Close the selected session; with no session selected, close the window |
+| ⌘W | Command-W | Close a focused auxiliary terminal; otherwise close the selected session, or the window when none is selected |
 | ⇧⌘T | Shift-Command-T | Reopen the most recently closed session |
 | ⌘Q | Command-Q | Quit Diri (the daemon keeps sessions alive) |
 | ⌘H | Command-H | Hide Diri |
-
-⌘T, ⌥⌘T and ⇧⌘N are no-ops when the app cannot spawn — the keystroke is left
-alone rather than swallowed, so nothing else changes.
 
 ## Moving between sessions
 
@@ -35,7 +32,7 @@ alone rather than swallowed, so nothing else changes.
 | ⌘[ / ⌘] | Command-bracket | Previous / next session in sidebar order, wrapping |
 | ⌥⌘↑ / ⌥⌘↓ | Option-Command-arrow | Previous / next session |
 | ⌥⌘← / ⌥⌘→ | Option-Command-arrow | Previous / next session |
-| ⌃⌘↑ / ⌃⌘↓ | Control-Command-arrow | Move the selected row up or down within its project group |
+| ⌃⌘↑ / ⌃⌘↓ | Control-Command-arrow | Move the selected row up or down among its siblings within the project group |
 | ⇧⌘J | Shift-Command-J | Jump to the next session that needs input |
 | ⌃⇥ | Control-Tab | Open the most-recently-used switcher; hold ⌃ and press ⇥ again to advance |
 
@@ -60,11 +57,12 @@ the overview is open, so those surfaces keep the arrow keys.
 | ⌘, | Command-comma | Settings |
 | ⌘B | Command-B | Show or hide the sidebar |
 | ⇧⌘D | Shift-Command-D | Show or hide the inspector |
-| ⌘J | Command-J | Open or focus a terminal below the selected agent's workbench |
+| ⌘J | Command-J | Show or hide an auxiliary terminal below the selected agent's workbench |
 
-The command palette lists ⌘T (or ⇧⌘N, depending on which agent is the default
-host), ⌥⌘T, ⌘P, ⇧⌘O, ⌥⌘W, ⌘B and ⌘, next to their commands, so the palette
-doubles as a reminder for the shortcuts you use least.
+The command palette always lists ⌘T for the default agent. When Codex is not
+the default, its command also shows ⇧⌘N. The palette lists ⌥⌘T, ⌘P, ⇧⌘O,
+⌥⌘W, ⌘B and ⌘, too, so it doubles as a reminder for the shortcuts you use
+least.
 
 ### Inside the command palette and Quick Open
 
@@ -99,7 +97,7 @@ highlight, ↵ commits it, and Esc closes the picker without closing the launche
 | ↵ | Return | Activate the focused session |
 | ⌘A | Command-A | Select every session |
 | Any character | — | Append to the filter query, space included |
-| ⌫ / ⌦ | Delete | Delete back through the filter query |
+| ⌫ / ⌦ | Delete | Delete back through the filter query; with an empty query and a selection, close the selected sessions |
 | Esc | Escape | Step back, then close |
 
 ### Inside history, settings and worktrees
@@ -138,9 +136,9 @@ With the find bar open, ↵ jumps to the next match, ⇧↵ to the previous one,
 Esc closes it. Typing edits the query through the [shared text keymap](#text-fields);
 ⌘V stays the paste action rather than a find-bar edit, so it never inserts twice.
 
-Keys without ⌘ go to the running program, modifiers and all. Keys with ⌘ do not
-reach the program — ⌫ is the one exception, so ⌥⌫ and ⌘⌫ still delete a word or a
-line inside the shell.
+Apart from ⌃⇥ and the active-surface shortcuts above, keys without ⌘ go to the
+running program, modifiers and all. Keys with ⌘ do not reach the program — ⌫ is the
+one exception, so ⌥⌫ and ⌘⌫ still delete a word or a line inside the shell.
 
 ## Text fields
 
@@ -167,9 +165,9 @@ launcher prompt and the inspector composers share one keymap.
 Diri resolves an ambiguous keystroke by asking which surface is in front, then
 falling back to the terminal:
 
-- **A global shortcut that is not handled is not swallowed.** ⌘R with nothing
-  selected, ⌘9 with one session, ⌘T when spawning is unavailable — each leaves
-  the keystroke alone rather than eating it.
+- **A global shortcut that is not handled is not swallowed.** ⌘R or ⌘J with
+  nothing selected, and ⌘9 with no sessions, leave the keystroke alone rather
+  than eating it.
 - **The launcher takes everything while it is open**, except ⌘N, which stays
   available.
 - **History, settings and worktrees take everything** except ⌘H, ⌘K, ⌘P and ⌘,.
@@ -178,10 +176,11 @@ falling back to the terminal:
 - **Esc is shared.** With the overview closed, Esc clears a multi-session sidebar
   selection but is deliberately not swallowed — the focused terminal still gets
   it, so pressing Esc in vim never depends on what the sidebar is doing.
-- **⌘W is two commands.** The sidebar closes the selected session; only with no
-  session selected does it reach the window and close it.
-- **⌘J and ⇧⌘J are unrelated.** ⌘J opens a workbench terminal; ⇧⌘J is the
-  attention jump that used to live on plain ⌘J.
+- **⌘W is three commands.** It closes a focused auxiliary terminal first;
+  otherwise the sidebar closes the selected session, and only with no session
+  selected does it reach the window and close it.
+- **⌘J and ⇧⌘J are unrelated.** ⌘J toggles an auxiliary workbench terminal;
+  ⇧⌘J is the attention jump that used to live on plain ⌘J.
 
 The following bindings are internal or contextual rather than user-facing, and
 are documented above only where they surface in the UI: the switcher's swallowing
