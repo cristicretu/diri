@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use diri_proto::{DateMillis, SessionRecord, SessionStatus, TitleSource};
+use diri_proto::{DateMillis, ExitInfo, ExitReason, SessionRecord, SessionStatus, TitleSource};
 use serde::{Deserialize, Serialize};
 
 use crate::detect::ManifestEngine;
@@ -252,11 +252,60 @@ impl Registry {
     /// this is what makes sessions survive a daemon restart — or the switch
     /// from the Swift daemon to this one.
     ///
-    /// Returns the ids adopted. Sessions whose holder is gone are left as
-    /// records only, exactly as [`load`] left them.
+    /// Returns the ids adopted. Local sessions whose holder did not survive
+    /// are reconciled to `Exited` by [`reap_orphans`], so a record can never
+    /// go on claiming a status only a live holder could report.
     ///
     /// [`load`]: Registry::load
+    /// [`reap_orphans`]: Registry::reap_orphans
     pub fn restore(&mut self, holder: &HolderConfig, logs_dir: &Path) -> Vec<String> {
+        let adopted = self.adopt_live_holders(holder, logs_dir);
+        self.reap_orphans();
+        adopted
+    }
+
+    /// Marks every local record that no live session backs as exited.
+    ///
+    /// A record's status is a live holder's claim about a process. When the
+    /// machine dies, the holders die with it and nothing is left to retract
+    /// the claim — so `load` hands back records still saying `Working`, and
+    /// every consumer reads them as running: the app dials a socket that will
+    /// never answer and retries "Reconnecting terminal…" forever, offering no
+    /// Resume because the conversation still looks live. Retract the claim
+    /// here, once, on the only pass that knows which holders answered.
+    ///
+    /// Remote (`host`-bound) sessions are none of this pass's business: they
+    /// live in tmux on another machine and outlive both this daemon and this
+    /// Mac, so their records stay untouched.
+    fn reap_orphans(&mut self) {
+        let orphaned: Vec<String> = self
+            .records
+            .values()
+            .filter(|record| record.host.is_none())
+            .filter(|record| !matches!(record.status, SessionStatus::Exited(_)))
+            .filter(|record| !self.sessions.contains_key(&record.id.0))
+            .map(|record| record.id.0.clone())
+            .collect();
+        if orphaned.is_empty() {
+            return;
+        }
+        for id in &orphaned {
+            if let Some(record) = self.records.get_mut(id) {
+                record.status = SessionStatus::Exited(ExitInfo {
+                    reason: ExitReason::DaemonRestart,
+                    code: None,
+                    signal: None,
+                });
+                record.needs_input = None;
+            }
+        }
+        let _ = self.persist();
+    }
+
+    /// Adopts the holders that are still answering. See [`restore`].
+    ///
+    /// [`restore`]: Registry::restore
+    fn adopt_live_holders(&mut self, holder: &HolderConfig, logs_dir: &Path) -> Vec<String> {
         let holders_dir = HolderPaths::new(&holder.holders_dir, "probe").directory;
         let Ok(entries) = std::fs::read_dir(&holders_dir) else {
             return Vec::new();
@@ -1112,6 +1161,67 @@ mod tests {
         assert_eq!(
             registry.record("s_dead").expect("record").resumability,
             Resumability::Resumable
+        );
+    }
+
+    /// The machine-death case. Holders die with the Mac, so the records they
+    /// were reporting for come back saying `Working` with nobody behind them.
+    /// Left alone they read as running to every consumer: the app dials a
+    /// socket that will never answer and spins "Reconnecting terminal…"
+    /// forever, and no Resume is offered because the session still looks live.
+    #[test]
+    fn a_local_session_whose_holder_died_with_the_machine_is_reaped_into_resumable() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+
+        let mut orphan = record("s_orphan");
+        orphan.kind = AgentKind::CLAUDE_CODE;
+        orphan.agent_session_id = Some("conv-1".into());
+        orphan.resumability = Resumability::Live;
+        orphan.status = SessionStatus::Working;
+        registry.records.insert("s_orphan".into(), orphan);
+
+        // No holder sockets: exactly what an empty holders dir looks like
+        // after the machine that owned them went down.
+        let holders_dir = temp.path().join("holders");
+        std::fs::create_dir_all(&holders_dir).expect("holders dir");
+        let holder = HolderConfig {
+            holders_dir,
+            executable: temp.path().join("diri-holder"),
+        };
+        assert!(registry.restore(&holder, temp.path()).is_empty());
+
+        let reaped = registry.record("s_orphan").expect("record");
+        assert!(matches!(reaped.status, SessionStatus::Exited(_)));
+        assert_eq!(reaped.resumability, Resumability::Resumable);
+    }
+
+    /// Remote sessions live in tmux on another machine: they outlive this
+    /// daemon and this Mac, so the reap pass must not touch them. Marking one
+    /// exited would strand still-running work behind a Resume button that
+    /// starts a second agent on top of the first.
+    #[test]
+    fn a_remote_session_survives_the_reap() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+
+        let mut remote = record("s_remote");
+        remote.kind = AgentKind::CLAUDE_CODE;
+        remote.host = Some("forge".into());
+        remote.status = SessionStatus::Working;
+        registry.records.insert("s_remote".into(), remote);
+
+        let holders_dir = temp.path().join("holders");
+        std::fs::create_dir_all(&holders_dir).expect("holders dir");
+        let holder = HolderConfig {
+            holders_dir,
+            executable: temp.path().join("diri-holder"),
+        };
+        registry.restore(&holder, temp.path());
+
+        assert_eq!(
+            registry.record("s_remote").expect("record").status,
+            SessionStatus::Working
         );
     }
 
