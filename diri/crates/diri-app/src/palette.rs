@@ -8,11 +8,15 @@ use std::path::PathBuf;
 
 use diri_proto::{AgentKind, HostEntry, Project, SessionRecord};
 
+use crate::commands::{self, CommandId};
 use crate::fuzzy::{FuzzyMatcher, FuzzyQuery, PreparedText, Score};
 use crate::store::DefaultAgent;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaletteCommand {
+    /// A static application command. The palette dispatches the same typed
+    /// action used by key bindings, menus, and toolbar controls.
+    Action(CommandId),
     SpawnAgent {
         agent: DefaultAgent,
         cwd: Option<PathBuf>,
@@ -20,23 +24,10 @@ pub enum PaletteCommand {
         /// host's defaultCwd unless overridden).
         host: Option<String>,
     },
-    SpawnShell {
-        host: Option<String>,
-    },
     /// `session.migrate` the SELECTED session; None = back to local.
-    MigrateSelected {
-        target_host: Option<String>,
-    },
+    MigrateSelected { target_host: Option<String> },
     /// `host.sync_prefs` to one configured host.
-    SyncPrefs {
-        host: String,
-    },
-    OpenQuickOpen,
-    OpenSessionOverview,
-    OpenWorktrees,
-    ToggleSidebar,
-    OpenSettings,
-    CheckForUpdates,
+    SyncPrefs { host: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,32 +73,9 @@ pub fn actions_for_default_host(
         |host| format!("New Terminal on {}", host.display_name()),
     );
     result.extend([
-        PaletteAction {
-            id: "new-terminal".into(),
-            title: terminal_title,
-            system_image: "terminal",
-            shortcut: Some("⌥⌘T"),
-            command: PaletteCommand::SpawnShell {
-                host: default_host.map(|host| host.id.clone()),
-            },
-            keywords: "shell console zsh bash tty".into(),
-        },
-        PaletteAction {
-            id: "quick-open".into(),
-            title: "Quick Open…".into(),
-            system_image: "magnifyingglass",
-            shortcut: Some("⌘P"),
-            command: PaletteCommand::OpenQuickOpen,
-            keywords: "folder project directory jump goto find".into(),
-        },
-        PaletteAction {
-            id: "session-overview".into(),
-            title: "Session Overview".into(),
-            system_image: "square.grid.2x2",
-            shortcut: Some("⌘⇧O"),
-            command: PaletteCommand::OpenSessionOverview,
-            keywords: "board grid switcher all sessions".into(),
-        },
+        registered_action_with_title(CommandId::NewTerminal, terminal_title),
+        registered_action(CommandId::ToggleQuickOpen),
+        registered_action(CommandId::ToggleOverview),
     ]);
 
     for project in projects {
@@ -192,40 +160,37 @@ pub fn actions_for_default_host(
     }
 
     result.extend([
-        PaletteAction {
-            id: "worktrees".into(),
-            title: "Worktrees Overview".into(),
-            system_image: "square.stack.3d.up",
-            shortcut: Some("⌥⌘W"),
-            command: PaletteCommand::OpenWorktrees,
-            keywords: "git branch checkout".into(),
-        },
-        PaletteAction {
-            id: "toggle-sidebar".into(),
-            title: "Toggle Sidebar".into(),
-            system_image: "sidebar.left",
-            shortcut: Some("⌘B"),
-            command: PaletteCommand::ToggleSidebar,
-            keywords: "hide show panel".into(),
-        },
-        PaletteAction {
-            id: "settings".into(),
-            title: "Settings…".into(),
-            system_image: "gearshape",
-            shortcut: Some("⌘,"),
-            command: PaletteCommand::OpenSettings,
-            keywords: "preferences config options".into(),
-        },
-        PaletteAction {
-            id: "check-for-updates".into(),
-            title: "Check for Updates…".into(),
-            system_image: "arrow.triangle.2.circlepath",
-            shortcut: None,
-            command: PaletteCommand::CheckForUpdates,
-            keywords: "upgrade version release".into(),
-        },
+        registered_action(CommandId::OpenWorktrees),
+        registered_action(CommandId::ToggleSidebar),
+        registered_action(CommandId::OpenSettings),
+        registered_action(CommandId::CheckForUpdates),
     ]);
     result
+}
+
+fn registered_action(id: CommandId) -> PaletteAction {
+    let command = commands::command(id);
+    let title = command
+        .palette
+        .expect("palette commands must carry palette metadata")
+        .title
+        .to_owned();
+    registered_action_with_title(id, title)
+}
+
+fn registered_action_with_title(id: CommandId, title: String) -> PaletteAction {
+    let command = commands::command(id);
+    let palette = command
+        .palette
+        .expect("palette commands must carry palette metadata");
+    PaletteAction {
+        id: command.stable_id.into(),
+        title,
+        system_image: palette.system_image,
+        shortcut: command.shortcut,
+        command: PaletteCommand::Action(id),
+        keywords: palette.keywords.into(),
+    }
 }
 
 fn new_agent_action(
@@ -233,6 +198,7 @@ fn new_agent_action(
     is_default: bool,
     host: Option<&HostEntry>,
 ) -> PaletteAction {
+    let registered = is_default.then_some(CommandId::NewDefaultSession);
     PaletteAction {
         id: if is_default {
             "new-default".into()
@@ -244,18 +210,17 @@ fn new_agent_action(
             |host| format!("New {} on {}", agent.display_name(), host.display_name()),
         ),
         system_image: agent.system_image(),
-        shortcut: if is_default {
-            Some("⌘T")
-        } else if agent == DefaultAgent::Codex {
-            Some("⌘⇧N")
-        } else {
-            None
-        },
-        command: PaletteCommand::SpawnAgent {
-            agent,
-            cwd: None,
-            host: host.map(|host| host.id.clone()),
-        },
+        shortcut: registered
+            .or((agent == DefaultAgent::Codex).then_some(CommandId::NewCodexSession))
+            .and_then(|id| commands::command(id).shortcut),
+        command: registered.map_or_else(
+            || PaletteCommand::SpawnAgent {
+                agent,
+                cwd: None,
+                host: host.map(|host| host.id.clone()),
+            },
+            PaletteCommand::Action,
+        ),
         keywords: format!("{} agent spawn start create tab", agent.raw_value()),
     }
 }
@@ -526,11 +491,7 @@ mod tests {
         assert_eq!(result[0].shortcut, Some("⌘T"));
         assert_eq!(
             result[0].command,
-            PaletteCommand::SpawnAgent {
-                agent: DefaultAgent::ClaudeCode,
-                cwd: None,
-                host: Some("forge".into()),
-            }
+            PaletteCommand::Action(CommandId::NewDefaultSession)
         );
         let terminal = result
             .iter()
@@ -540,9 +501,7 @@ mod tests {
         assert_eq!(terminal.shortcut, Some("⌥⌘T"));
         assert_eq!(
             terminal.command,
-            PaletteCommand::SpawnShell {
-                host: Some("forge".into())
-            }
+            PaletteCommand::Action(CommandId::NewTerminal)
         );
     }
 

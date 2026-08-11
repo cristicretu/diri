@@ -6,17 +6,25 @@ use diri_proto::SessionId;
 use diri_ui::{FloatingSurface, Ink, Radius, SemanticColors, Typo};
 use gpui::{
     AnyElement, App, Context, CursorStyle, DragMoveEvent, Entity, FocusHandle, Focusable,
-    FontWeight, KeyDownEvent, KeyUpEvent, Modifiers, ModifiersChangedEvent, MouseButton, Render,
-    StyleRefinement, Subscription, Task, Window, actions, deferred, div, prelude::*, px, rgba,
+    FontWeight, KeyContext, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton, Render,
+    StyleRefinement, Subscription, Task, Window, deferred, div, prelude::*, px, rgba,
 };
 
 use crate::AppServices;
+use crate::commands::{
+    APP_CONTEXT, ArchiveSelectedSession, CheckForUpdates, CloseSession, CommandId,
+    MoveSelectedSessionDown, MoveSelectedSessionUp, NewCodexSession, NewDefaultSession,
+    NewTerminal, OpenLauncher, OpenSettings, OpenWorktrees, RenameSelectedSession, ReopenSession,
+    SESSION_NAVIGATION_CONTEXT, SelectLastSession, SelectNextAttentionSession, SelectNextSession,
+    SelectPreviousSession, SelectSession1, SelectSession2, SelectSession3, SelectSession4,
+    SelectSession5, SelectSession6, SelectSession7, SelectSession8, ToggleAuxiliaryTerminal,
+    ToggleCommandPalette, ToggleHistory, ToggleInspector, ToggleOverview, ToggleQuickOpen,
+    ToggleSidebar,
+};
 use crate::inspector::{InspectorEvent, WorkbenchInspector};
 use crate::launcher::{LauncherEvent, LauncherOverlay};
 use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
-use crate::navigation::{
-    NavigationEvent, NavigationOverlay, ToggleCommandPalette, ToggleQuickOpen,
-};
+use crate::navigation::NavigationOverlay;
 use crate::notifications::{InAppBanner, NotificationSound};
 use crate::seam::{SeamSlide, toggle_has_settled};
 use crate::session_surfaces::SessionSurfaces;
@@ -36,48 +44,6 @@ pub(crate) fn cached_window_overlay<T: Render>(view: Entity<T>) -> impl IntoElem
 
 #[cfg(target_os = "macos")]
 use crate::macos::{menu_bar::NativeMenuBar, notifier::NativeNotifier};
-
-actions!(diri, [CloseSession, ReopenSession, OpenLauncher]);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NewSessionShortcut {
-    Default,
-    Shell,
-    Codex,
-}
-
-/// The session-creation shortcut policy, kept separate from dispatch so it can
-/// be regression-tested without constructing the full daemon-backed root view.
-fn new_session_shortcut(key: &str, modifiers: Modifiers) -> Option<NewSessionShortcut> {
-    if !modifiers.platform {
-        return None;
-    }
-    match key {
-        "t" if modifiers.alt => Some(NewSessionShortcut::Shell),
-        "t" if !modifiers.shift => Some(NewSessionShortcut::Default),
-        "n" if modifiers.shift => Some(NewSessionShortcut::Codex),
-        _ => None,
-    }
-}
-
-/// Session navigation owns only its explicit shortcut. Returning `None` leaves
-/// arrow keys available to the focused text field or terminal.
-fn session_navigation_delta(
-    key: &str,
-    modifiers: Modifiers,
-    arrow_surface_visible: bool,
-) -> Option<isize> {
-    if !modifiers.platform || arrow_surface_visible {
-        return None;
-    }
-    match key {
-        "up" | "left" if modifiers.alt => Some(-1),
-        "down" | "right" if modifiers.alt => Some(1),
-        "[" | "{" => Some(-1),
-        "]" | "}" => Some(1),
-        _ => None,
-    }
-}
 
 /// Drag payload for the sidebar resize seam. Renders nothing -- it exists so
 /// GPUI keeps routing mouse moves to the root while the seam is being dragged.
@@ -243,19 +209,14 @@ impl RootView {
             });
         }
         if let Some(terminal) = &terminal {
-            cx.subscribe(terminal, |this, _, event, cx| match event {
-                TerminalPaneEvent::ToggleSidebar => {
-                    this.sidebar.update(cx, |sidebar, cx| sidebar.toggle(cx));
-                }
-                TerminalPaneEvent::ToggleInspector => this.toggle_inspector(cx),
-                TerminalPaneEvent::OpenFileReference { reference, cwd, .. } => {
-                    let inspector = this.inspector.clone();
-                    this.reveal_inspector(cx);
-                    if let Some(inspector) = inspector {
-                        inspector.update(cx, |inspector, cx| {
-                            inspector.open_file_reference(cwd.clone(), reference.clone(), cx);
-                        });
-                    }
+            cx.subscribe(terminal, |this, _, event, cx| {
+                let TerminalPaneEvent::OpenFileReference { reference, cwd, .. } = event;
+                let inspector = this.inspector.clone();
+                this.reveal_inspector(cx);
+                if let Some(inspector) = inspector {
+                    inspector.update(cx, |inspector, cx| {
+                        inspector.open_file_reference(cwd.clone(), reference.clone(), cx);
+                    });
                 }
             })
             .detach();
@@ -269,11 +230,6 @@ impl RootView {
             }
             if let SidebarEvent::Update(command) = event {
                 this.services.updates.send(command.clone());
-            }
-            if matches!(event, SidebarEvent::OpenSettings)
-                && let Some(surfaces) = &this.utility_surfaces
-            {
-                surfaces.update(cx, |surfaces, cx| surfaces.open_settings(cx));
             }
             if matches!(event, SidebarEvent::AddRemoteHost)
                 && let Some(surfaces) = &this.utility_surfaces
@@ -303,32 +259,6 @@ impl RootView {
             },
         )
         .detach();
-        if let Some(navigation) = &navigation {
-            cx.subscribe(navigation, |this, _, event, cx| match event {
-                NavigationEvent::ToggleSidebar => {
-                    this.sidebar.update(cx, |sidebar, cx| sidebar.toggle(cx));
-                }
-                NavigationEvent::OpenOverview => {
-                    if let Some(surfaces) = &this.session_surfaces {
-                        surfaces.update(cx, |surfaces, cx| surfaces.open_overview(cx));
-                    }
-                }
-                NavigationEvent::OpenWorktrees => {
-                    if let Some(surfaces) = &this.utility_surfaces {
-                        surfaces.update(cx, |surfaces, cx| surfaces.open_worktrees(cx));
-                    }
-                }
-                NavigationEvent::OpenSettings => {
-                    if let Some(surfaces) = &this.utility_surfaces {
-                        surfaces.update(cx, |surfaces, cx| surfaces.open_settings(cx));
-                    }
-                }
-                NavigationEvent::CheckForUpdates => {
-                    this.services.updates.check(true);
-                }
-            })
-            .detach();
-        }
         if let Some(inspector) = &inspector {
             cx.subscribe(inspector, |this, _, event, cx| {
                 if matches!(event, InspectorEvent::Close) {
@@ -621,181 +551,131 @@ impl RootView {
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         if self.launcher.read(cx).is_open() {
-            let reopen = event.keystroke.modifiers.platform
-                && event.keystroke.key == "n"
-                && !event.keystroke.modifiers.shift;
             self.launcher.update(cx, |launcher, cx| {
                 launcher.handle_key_down(event, _window, cx);
             });
-            if !reopen {
-                cx.stop_propagation();
-            }
+            cx.stop_propagation();
             return;
         }
         if let Some(surfaces) = &self.utility_surfaces
             && surfaces.read(cx).is_open()
         {
-            let global_overlay_shortcut = event.keystroke.modifiers.platform
-                && matches!(event.keystroke.key.as_str(), "h" | "," | "k" | "p");
-            if !global_overlay_shortcut {
-                surfaces.update(cx, |surfaces, cx| {
-                    surfaces.key_down(event, _window, cx);
-                });
-                cx.stop_propagation();
-                return;
-            }
+            surfaces.update(cx, |surfaces, cx| {
+                surfaces.key_down(event, _window, cx);
+            });
+            cx.stop_propagation();
+            return;
         }
         if let Some(surfaces) = &self.session_surfaces {
             surfaces.update(cx, |surfaces, cx| {
                 surfaces.handle_key_down(event, _window, cx);
             });
         }
-        if !event.keystroke.modifiers.platform {
-            return;
-        }
-        match event.keystroke.key.as_str() {
-            "k" => {
+    }
+
+    /// Executes application commands after GPUI has resolved the active key
+    /// context. This is the only place that translates static commands into
+    /// mutations of RootView's child modules.
+    fn run_command(&mut self, command: CommandId, window: &mut Window, cx: &mut Context<Self>) {
+        match command {
+            CommandId::NewDefaultSession => {
+                self.spawn_default();
+            }
+            CommandId::NewTerminal => {
+                self.spawn(None);
+            }
+            CommandId::NewCodexSession => {
+                self.spawn(Some(DefaultAgent::Codex));
+            }
+            CommandId::ToggleCommandPalette => {
                 if let Some(navigation) = &self.navigation {
                     navigation.update(cx, |navigation, cx| {
-                        navigation.toggle_command_palette(&ToggleCommandPalette, _window, cx);
+                        navigation.toggle_command_palette(&ToggleCommandPalette, window, cx);
                     });
                 }
             }
-            "p" => {
+            CommandId::ToggleQuickOpen => {
                 if let Some(navigation) = &self.navigation {
                     navigation.update(cx, |navigation, cx| {
-                        navigation.toggle_quick_open(&ToggleQuickOpen, _window, cx);
+                        navigation.toggle_quick_open(&ToggleQuickOpen, window, cx);
                     });
                 }
             }
-            "h" if event.keystroke.modifiers.shift => {
+            CommandId::ToggleHistory => {
                 if let Some(surfaces) = &self.utility_surfaces {
                     surfaces.update(cx, |surfaces, cx| surfaces.toggle_history(cx));
                 }
             }
-            "," => {
+            CommandId::ToggleOverview => {
+                if let Some(surfaces) = &self.session_surfaces {
+                    surfaces.update(cx, |surfaces, cx| surfaces.toggle_overview(cx));
+                }
+            }
+            CommandId::OpenWorktrees => {
+                if let Some(surfaces) = &self.utility_surfaces {
+                    surfaces.update(cx, |surfaces, cx| surfaces.open_worktrees(cx));
+                }
+            }
+            CommandId::OpenSettings => {
                 if let Some(surfaces) = &self.utility_surfaces {
                     surfaces.update(cx, |surfaces, cx| surfaces.open_settings(cx));
                 }
             }
-            "b" => self.sidebar.update(cx, |sidebar, cx| sidebar.toggle(cx)),
-            "d" if event.keystroke.modifiers.shift => self.toggle_inspector(cx),
-            key @ ("t" | "n") => match new_session_shortcut(key, event.keystroke.modifiers) {
-                Some(NewSessionShortcut::Default) => {
-                    if !self.spawn_default() {
-                        return;
-                    }
-                }
-                Some(NewSessionShortcut::Shell) => {
-                    if !self.spawn(None) {
-                        return;
-                    }
-                }
-                Some(NewSessionShortcut::Codex) => {
-                    if !self.spawn(Some(DefaultAgent::Codex)) {
-                        return;
-                    }
-                }
-                None => return,
-            },
-            // ⌥⌘W: worktrees overview. ⌘⇧W archives the selected session;
-            // plain ⌘W is bound globally to CloseSession.
-            "w" if event.keystroke.modifiers.alt => {
-                if let Some(surfaces) = &self.utility_surfaces {
-                    surfaces.update(cx, |surfaces, cx| surfaces.open_worktrees(cx));
-                } else {
-                    return;
-                }
+            CommandId::ToggleSidebar => {
+                self.sidebar.update(cx, |sidebar, cx| sidebar.toggle(cx));
             }
-            "w" if event.keystroke.modifiers.shift => {
-                let archived = self
-                    .sidebar
+            CommandId::ToggleInspector => self.toggle_inspector(cx),
+            CommandId::ToggleAuxiliaryTerminal => {
+                self.open_auxiliary_terminal(window, cx);
+            }
+            CommandId::ArchiveSelectedSession => {
+                self.sidebar
                     .update(cx, |sidebar, cx| sidebar.archive_selected(cx));
-                if !archived {
-                    return;
-                }
             }
-            "r" if !event.keystroke.modifiers.shift => {
-                let renaming = self
-                    .sidebar
-                    .update(cx, |sidebar, cx| sidebar.rename_selected(_window, cx));
-                if !renaming {
-                    return;
-                }
+            CommandId::RenameSelectedSession => {
+                self.sidebar
+                    .update(cx, |sidebar, cx| sidebar.rename_selected(window, cx));
             }
-            // ⇧⌘J retains the attention-navigation command that previously
-            // occupied plain ⌘J.
-            "j" if event.keystroke.modifiers.shift => {
-                let selected = self
-                    .sidebar
+            CommandId::SelectNextAttentionSession => {
+                self.sidebar
                     .update(cx, |sidebar, cx| sidebar.select_next_needing_input(cx));
-                if !selected {
-                    return;
-                }
             }
-            // ⌘J opens (or focuses) a terminal owned by the selected agent's
-            // workbench, below the primary pane.
-            "j" => {
-                if !self.open_auxiliary_terminal(_window, cx) {
-                    return;
-                }
+            CommandId::CheckForUpdates => self.services.updates.check(true),
+            CommandId::SelectPreviousSession if !self.arrow_surface_visible() => {
+                self.sidebar
+                    .update(cx, |sidebar, cx| sidebar.select_relative(-1, cx));
             }
-            digit @ ("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8") => {
-                // ⌘1–⌘8 select the nth session, matching the sidebar's row
-                // hints; selection also focuses the terminal via
-                // SessionActivated.
-                let index = (digit.as_bytes()[0] - b'1') as usize;
-                let selected = self
-                    .sidebar
-                    .update(cx, |sidebar, cx| sidebar.select_shortcut(index, cx));
-                if !selected {
-                    return;
-                }
+            CommandId::SelectNextSession if !self.arrow_surface_visible() => {
+                self.sidebar
+                    .update(cx, |sidebar, cx| sidebar.select_relative(1, cx));
             }
-            // ⌘9 jumps to the last session, the browser convention.
-            "9" => {
-                let selected = self
-                    .sidebar
+            CommandId::MoveSelectedSessionUp if !self.arrow_surface_visible() => {
+                self.sidebar
+                    .update(cx, |sidebar, cx| sidebar.reorder_selected(-1, cx));
+            }
+            CommandId::MoveSelectedSessionDown if !self.arrow_surface_visible() => {
+                self.sidebar
+                    .update(cx, |sidebar, cx| sidebar.reorder_selected(1, cx));
+            }
+            CommandId::SelectSession1 => self.select_session_shortcut(0, cx),
+            CommandId::SelectSession2 => self.select_session_shortcut(1, cx),
+            CommandId::SelectSession3 => self.select_session_shortcut(2, cx),
+            CommandId::SelectSession4 => self.select_session_shortcut(3, cx),
+            CommandId::SelectSession5 => self.select_session_shortcut(4, cx),
+            CommandId::SelectSession6 => self.select_session_shortcut(5, cx),
+            CommandId::SelectSession7 => self.select_session_shortcut(6, cx),
+            CommandId::SelectSession8 => self.select_session_shortcut(7, cx),
+            CommandId::SelectLastSession => {
+                self.sidebar
                     .update(cx, |sidebar, cx| sidebar.select_last(cx));
-                if !selected {
-                    return;
-                }
             }
-            // ⌃⌘↑/⌃⌘↓ move the selected row within its project group.
-            "up" | "down" if event.keystroke.modifiers.control && !self.arrow_surface_visible() => {
-                let delta = if event.keystroke.key == "up" { -1 } else { 1 };
-                let moved = self
-                    .sidebar
-                    .update(cx, |sidebar, cx| sidebar.reorder_selected(delta, cx));
-                if !moved {
-                    return;
-                }
-            }
-            // The explicit session-navigation shortcut steps through sidebar
-            // order, wrapping. The switcher and overview own arrows while open.
-            key if session_navigation_delta(
-                key,
-                event.keystroke.modifiers,
-                self.arrow_surface_visible(),
-            )
-            .is_some() =>
-            {
-                let delta = session_navigation_delta(
-                    key,
-                    event.keystroke.modifiers,
-                    self.arrow_surface_visible(),
-                )
-                .expect("guard checked navigation shortcut");
-                let selected = self
-                    .sidebar
-                    .update(cx, |sidebar, cx| sidebar.select_relative(delta, cx));
-                if !selected {
-                    return;
-                }
-            }
-            _ => return,
+            _ => cx.propagate(),
         }
-        cx.stop_propagation();
+    }
+
+    fn select_session_shortcut(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.select_shortcut(index, cx));
     }
 
     /// Spawns a shell (`None`) or a specific agent straight from a shortcut,
@@ -1888,6 +1768,9 @@ impl Render for RootView {
         self.inspector_seam = advance_seam(&mut self.inspector_slide, inspector_width, now, window);
         let seam = self.sidebar_seam;
         let inspector_seam = self.inspector_seam;
+        let mut key_context = KeyContext::new_with_defaults();
+        key_context.add(APP_CONTEXT);
+        key_context.add(SESSION_NAVIGATION_CONTEXT);
         // Each panel keeps its full width and is pinned to the wrapper edge it
         // lives against -- the sidebar's right, the inspector's left -- so
         // narrowing a wrapper slides its panel out under the clip instead of
@@ -1918,6 +1801,7 @@ impl Render for RootView {
 
         let mut root = div()
             .id("root")
+            .key_context(key_context)
             .size_full()
             // Real SF Pro (registered from SFNS.ttf at startup) for every UI
             // surface; the terminal grid sets its own mono font.
@@ -1933,6 +1817,99 @@ impl Render for RootView {
             .on_action(cx.listener(Self::close_selected_session))
             .on_action(cx.listener(Self::reopen_last_session))
             .on_action(cx.listener(Self::open_launcher))
+            .on_action(cx.listener(|this, _: &NewDefaultSession, window, cx| {
+                this.run_command(CommandId::NewDefaultSession, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NewTerminal, window, cx| {
+                this.run_command(CommandId::NewTerminal, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NewCodexSession, window, cx| {
+                this.run_command(CommandId::NewCodexSession, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| {
+                this.run_command(CommandId::ToggleCommandPalette, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleQuickOpen, window, cx| {
+                this.run_command(CommandId::ToggleQuickOpen, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleHistory, window, cx| {
+                this.run_command(CommandId::ToggleHistory, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleOverview, window, cx| {
+                this.run_command(CommandId::ToggleOverview, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenWorktrees, window, cx| {
+                this.run_command(CommandId::OpenWorktrees, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                this.run_command(CommandId::OpenSettings, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| {
+                this.run_command(CommandId::ToggleSidebar, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleInspector, window, cx| {
+                this.run_command(CommandId::ToggleInspector, window, cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &ToggleAuxiliaryTerminal, window, cx| {
+                    this.run_command(CommandId::ToggleAuxiliaryTerminal, window, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &ArchiveSelectedSession, window, cx| {
+                this.run_command(CommandId::ArchiveSelectedSession, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &RenameSelectedSession, window, cx| {
+                this.run_command(CommandId::RenameSelectedSession, window, cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &SelectNextAttentionSession, window, cx| {
+                    this.run_command(CommandId::SelectNextAttentionSession, window, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &CheckForUpdates, window, cx| {
+                this.run_command(CommandId::CheckForUpdates, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectPreviousSession, window, cx| {
+                this.run_command(CommandId::SelectPreviousSession, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectNextSession, window, cx| {
+                this.run_command(CommandId::SelectNextSession, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MoveSelectedSessionUp, window, cx| {
+                this.run_command(CommandId::MoveSelectedSessionUp, window, cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &MoveSelectedSessionDown, window, cx| {
+                    this.run_command(CommandId::MoveSelectedSessionDown, window, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &SelectSession1, window, cx| {
+                this.run_command(CommandId::SelectSession1, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectSession2, window, cx| {
+                this.run_command(CommandId::SelectSession2, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectSession3, window, cx| {
+                this.run_command(CommandId::SelectSession3, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectSession4, window, cx| {
+                this.run_command(CommandId::SelectSession4, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectSession5, window, cx| {
+                this.run_command(CommandId::SelectSession5, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectSession6, window, cx| {
+                this.run_command(CommandId::SelectSession6, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectSession7, window, cx| {
+                this.run_command(CommandId::SelectSession7, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectSession8, window, cx| {
+                this.run_command(CommandId::SelectSession8, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectLastSession, window, cx| {
+                this.run_command(CommandId::SelectLastSession, window, cx);
+            }))
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             // Fires for every move once the seam drag starts, wherever the
             // pointer wanders -- unlike hover-gated move listeners.
@@ -2123,43 +2100,4 @@ fn preview_hint(system_image: &str, label: &str, colors: SemanticColors) -> AnyE
                 .child(label.to_owned()),
         )
         .into_any_element()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn command_modifiers() -> Modifiers {
-        Modifiers {
-            platform: true,
-            ..Modifiers::default()
-        }
-    }
-
-    #[test]
-    fn command_t_launches_the_configured_default_agent() {
-        assert_eq!(
-            new_session_shortcut("t", command_modifiers()),
-            Some(NewSessionShortcut::Default)
-        );
-    }
-
-    #[test]
-    fn session_navigation_requires_command_option_arrows() {
-        let command = command_modifiers();
-        assert_eq!(session_navigation_delta("left", command, false), None);
-
-        let command_option = Modifiers {
-            alt: true,
-            ..command
-        };
-        assert_eq!(
-            session_navigation_delta("left", command_option, false),
-            Some(-1)
-        );
-        assert_eq!(
-            session_navigation_delta("right", command_option, false),
-            Some(1)
-        );
-    }
 }

@@ -29,17 +29,21 @@ use diri_ui::{
     StatusGlyph, StatusState, Typo,
 };
 use gpui::{
-    AnyElement, App, ClickEvent, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter,
-    FocusHandle, KeyBinding, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton, Render,
-    ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Task, Window, actions,
-    div, font, prelude::*, px, rgba,
+    AnyElement, ClickEvent, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter,
+    FocusHandle, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton, Render, ScrollDelta,
+    ScrollWheelEvent, SharedString, StatefulInteractiveElement, Task, Window, div, font,
+    prelude::*, px, rgba,
 };
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
 use crate::clipboard_transfer::StagedClipboardImage;
+use crate::commands::{
+    CloseFind, CopySelection, FindNext, FindPrevious, OpenFind, Paste, ResetZoom, TERMINAL_CONTEXT,
+    ToggleInspector, ToggleSidebar, ZoomIn, ZoomOut,
+};
 use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
-use crate::navigation::{NavigationOverlay, ToggleCommandPalette, ToggleQuickOpen, query_label};
+use crate::navigation::{NavigationOverlay, query_label};
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
 use crate::session_surfaces::switcher_key;
 use crate::store::StoreRuntime;
@@ -92,44 +96,13 @@ const ANCHOR_SLACK: f32 = 1.0;
 /// caches are rebuilt on promotion — so the ceiling is a memory bound, not a
 /// residency one.
 const PARKED_GRID_CAP: usize = 12;
-actions!(
-    diri_terminal,
-    [
-        OpenFind,
-        FindNext,
-        FindPrevious,
-        CloseFind,
-        ZoomIn,
-        ZoomOut,
-        ResetZoom,
-        Paste,
-        CopySelection,
-    ]
-);
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalPaneEvent {
-    ToggleSidebar,
-    ToggleInspector,
     OpenFileReference {
         reference: String,
         cwd: String,
         session_id: SessionId,
     },
-}
-
-pub fn bind_terminal_keys(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("cmd-f", OpenFind, None),
-        KeyBinding::new("cmd-g", FindNext, None),
-        KeyBinding::new("cmd-shift-g", FindPrevious, None),
-        KeyBinding::new("cmd-=", ZoomIn, None),
-        KeyBinding::new("cmd-+", ZoomIn, None),
-        KeyBinding::new("cmd--", ZoomOut, None),
-        KeyBinding::new("cmd-0", ResetZoom, None),
-        KeyBinding::new("cmd-v", Paste, None),
-        KeyBinding::new("cmd-c", CopySelection, None),
-    ]);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1410,47 +1383,6 @@ impl TerminalPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if event.keystroke.modifiers.platform {
-            let handled = match event.keystroke.key.as_str() {
-                "k" => self.navigation.as_ref().is_some_and(|navigation| {
-                    navigation.update(cx, |navigation, cx| {
-                        navigation.toggle_command_palette(&ToggleCommandPalette, window, cx);
-                    });
-                    true
-                }),
-                "p" => self.navigation.as_ref().is_some_and(|navigation| {
-                    navigation.update(cx, |navigation, cx| {
-                        navigation.toggle_quick_open(&ToggleQuickOpen, window, cx);
-                    });
-                    true
-                }),
-                "h" if event.keystroke.modifiers.shift => {
-                    self.utility_surfaces.as_ref().is_some_and(|surfaces| {
-                        surfaces.update(cx, |surfaces, cx| surfaces.toggle_history(cx));
-                        true
-                    })
-                }
-                "," => self.utility_surfaces.as_ref().is_some_and(|surfaces| {
-                    surfaces.update(cx, |surfaces, cx| surfaces.open_settings(cx));
-                    true
-                }),
-                "o" if event.keystroke.modifiers.shift => {
-                    self.runtime
-                        .store
-                        .write()
-                        .expect("session store lock poisoned")
-                        .toggle_overview();
-                    true
-                }
-                _ => false,
-            };
-            if handled {
-                cx.stop_propagation();
-                cx.notify();
-                return;
-            }
-        }
-
         if let Some(navigation) = &self.navigation
             && navigation.read(cx).is_open()
         {
@@ -1801,8 +1733,8 @@ impl TerminalPane {
                     .cursor_pointer()
                     .hover(move |button| button.bg(Fill::subtle(colors)))
                     .child(sf_symbol("sidebar.left", 15.0, colors.secondary))
-                    .on_click(cx.listener(|_, _, _, cx| {
-                        cx.emit(TerminalPaneEvent::ToggleSidebar);
+                    .on_click(cx.listener(|_, _, window, cx| {
+                        window.dispatch_action(Box::new(ToggleSidebar), cx);
                         cx.stop_propagation();
                     })),
             )
@@ -1977,8 +1909,8 @@ impl TerminalPane {
                                         colors.secondary
                                     },
                                 ))
-                                .on_click(cx.listener(|_, _, _, cx| {
-                                    cx.emit(TerminalPaneEvent::ToggleInspector);
+                                .on_click(cx.listener(|_, _, window, cx| {
+                                    window.dispatch_action(Box::new(ToggleInspector), cx);
                                     cx.stop_propagation();
                                 })),
                         )
@@ -2827,6 +2759,7 @@ impl Render for TerminalPane {
         };
         div()
             .id(root_id)
+            .key_context(TERMINAL_CONTEXT)
             .track_focus(&self.focus)
             .flex()
             .size_full()

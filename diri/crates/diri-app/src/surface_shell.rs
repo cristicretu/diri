@@ -21,10 +21,14 @@ use diri_ui::{
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, FocusHandle, Focusable, FontWeight,
     IntoElement, KeyDownEvent, MouseButton, Pixels, Render, Rgba, SharedString, Task, TextRun,
-    Window, actions, canvas, deferred, div, font, prelude::*, px, rgba,
+    Window, canvas, deferred, div, font, prelude::*, px, rgba,
 };
 use tokio::runtime::Runtime;
 
+use crate::commands::{
+    Activate, CloseSurface, MoveDown, MoveUp, OpenSettings, OpenWorktrees, ToggleHistory,
+    UTILITY_CONTEXT,
+};
 const SETTINGS_WIDTH: f32 = 600.0;
 const SETTINGS_HEIGHT: f32 = 420.0;
 const SETTINGS_NAV_WIDTH: f32 = 150.0;
@@ -34,19 +38,6 @@ const RESULT_LIMIT: usize = 200;
 /// Reinstall success is confirmation, not persistent host state. Errors stay
 /// actionable and first-time setup keeps its "Use by default" action.
 const HOST_REINSTALL_SUCCESS_VISIBILITY: Duration = Duration::from_secs(3);
-
-actions!(
-    diri,
-    [
-        ToggleHistory,
-        OpenWorktrees,
-        OpenSettings,
-        CloseSurface,
-        MoveUp,
-        MoveDown,
-        Activate
-    ]
-);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Surface {
@@ -2869,7 +2860,7 @@ impl Render for UtilitySurfaces {
         let root = div()
             .id("utility-surfaces")
             .track_focus(&self.focus)
-            .key_context("Diri")
+            .key_context(UTILITY_CONTEXT)
             .on_key_down(cx.listener(Self::key_down))
             .on_action(cx.listener(|this, _: &ToggleHistory, _, cx| {
                 if this.surface == Surface::History {

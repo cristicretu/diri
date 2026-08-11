@@ -20,6 +20,7 @@ use gpui::{
 };
 use tokio::sync::mpsc;
 
+use crate::commands::OpenSettings;
 use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::query_label;
 use crate::query_editor::{self, ClipboardEdit, Edit};
@@ -41,9 +42,6 @@ const PREVIEW_USAGE: f64 = 4.82;
 pub enum SidebarEvent {
     VisibilityChanged,
     WidthChanged,
-    /// The title-bar gear is a settings affordance. RootView owns the settings
-    /// surface, so the sidebar requests it instead of opening its account menu.
-    OpenSettings,
     /// One-click path from the footer menu into the Remote host editor.
     AddRemoteHost,
     /// A plain click (or shortcut) selected a session: hand keyboard focus
@@ -595,9 +593,9 @@ impl Sidebar {
                 "gearshape",
                 settings_hover,
                 colors,
-                cx.listener(|this, _, _, cx| {
+                cx.listener(|this, _, window, cx| {
                     this.ui.popover = None;
-                    cx.emit(SidebarEvent::OpenSettings);
+                    window.dispatch_action(Box::new(OpenSettings), cx);
                 }),
                 cx.listener(|this, hovered: &bool, _, cx| {
                     this.ui.hovered_control = hovered.then_some("settings");

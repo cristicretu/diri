@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use crate::commands::{NAVIGATION_CONTEXT, ToggleCommandPalette, ToggleQuickOpen};
 use crate::fuzzy::{FuzzyMatcher, FuzzyQuery};
 use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::palette::{self, PaletteAction, PaletteCommand, Ranked};
@@ -16,12 +17,10 @@ use crate::store::{SessionStore, SpawnOptions, StoreRuntime};
 use diri_proto::{AgentKind, AttentionLevel, SessionId, SessionRecord};
 use diri_ui::{FloatingSurface, HairlineDivider, Palette, Radius, SemanticColors};
 use gpui::{
-    AnyElement, App, Context, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle,
-    KeyDownEvent, MouseButton, Pixels, Render, ScrollHandle, SharedString,
-    StatefulInteractiveElement, StyledText, Task, Window, actions, div, prelude::*, px, rgba,
+    AnyElement, App, Context, FocusHandle, Focusable, FontWeight, HighlightStyle, KeyDownEvent,
+    MouseButton, Pixels, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
+    StyledText, Task, Window, div, prelude::*, px, rgba,
 };
-
-actions!(diri, [ToggleCommandPalette, ToggleQuickOpen]);
 
 /// The search field above the results, and the gap the surface keeps from the
 /// window edges. Everything else is measured against the live viewport so the
@@ -80,15 +79,6 @@ enum CommandSelection {
     Session(SessionId),
 }
 
-#[derive(Clone, Copy, Debug)]
-pub enum NavigationEvent {
-    ToggleSidebar,
-    OpenOverview,
-    OpenWorktrees,
-    OpenSettings,
-    CheckForUpdates,
-}
-
 pub struct NavigationOverlay {
     focus_handle: FocusHandle,
     store: Arc<RwLock<SessionStore>>,
@@ -115,8 +105,6 @@ pub struct NavigationOverlay {
     /// palette's session rows go stale.
     _store_changes: Option<Task<()>>,
 }
-
-impl EventEmitter<NavigationEvent> for NavigationOverlay {}
 
 impl NavigationOverlay {
     pub fn new(runtime: Arc<StoreRuntime>, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -385,7 +373,7 @@ impl NavigationOverlay {
     pub(crate) fn on_key_down(
         &mut self,
         event: &KeyDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.overlay.is_none() {
@@ -398,7 +386,7 @@ impl NavigationOverlay {
             "down" => self.move_highlight(1, cx),
             "p" if modifiers.control => self.move_highlight(-1, cx),
             "n" if modifiers.control => self.move_highlight(1, cx),
-            "enter" => self.run_highlighted(modifiers.platform, cx),
+            "enter" => self.run_highlighted(modifiers.platform, window, cx),
             _ => self.edit_query(event, cx),
         }
         cx.stop_propagation();
@@ -482,7 +470,7 @@ impl NavigationOverlay {
         }
     }
 
-    fn run_highlighted(&mut self, secondary: bool, cx: &mut Context<Self>) {
+    fn run_highlighted(&mut self, secondary: bool, window: &mut Window, cx: &mut Context<Self>) {
         match self.overlay {
             Some(Overlay::CommandPalette) => {
                 let selection = if let Some(action) = self.ranked_actions.get(self.highlight) {
@@ -493,7 +481,7 @@ impl NavigationOverlay {
                         .map(|ranked| CommandSelection::Session(ranked.item.id.clone()))
                 };
                 if let Some(selection) = selection {
-                    self.run_command_selection(selection, cx);
+                    self.run_command_selection(selection, window, cx);
                 }
             }
             Some(Overlay::QuickOpen) => {
@@ -523,7 +511,12 @@ impl NavigationOverlay {
         }
     }
 
-    fn run_command_selection(&mut self, selection: CommandSelection, cx: &mut Context<Self>) {
+    fn run_command_selection(
+        &mut self,
+        selection: CommandSelection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match selection {
             CommandSelection::Session(id) => {
                 self.store
@@ -532,12 +525,21 @@ impl NavigationOverlay {
                     .select(id);
                 self.close_overlay(cx);
             }
-            CommandSelection::Action(command) => self.run_palette_command(command, cx),
+            CommandSelection::Action(command) => self.run_palette_command(command, window, cx),
         }
     }
 
-    fn run_palette_command(&mut self, command: PaletteCommand, cx: &mut Context<Self>) {
+    fn run_palette_command(
+        &mut self,
+        command: PaletteCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match command {
+            PaletteCommand::Action(id) => {
+                self.close_overlay(cx);
+                window.dispatch_action(id.action(), cx);
+            }
             PaletteCommand::SpawnAgent { agent, cwd, host } => {
                 {
                     let mut store = self.store.write().expect("session store lock poisoned");
@@ -578,47 +580,6 @@ impl NavigationOverlay {
                     .write()
                     .expect("session store lock poisoned")
                     .sync_prefs(host);
-                self.close_overlay(cx);
-            }
-            PaletteCommand::SpawnShell { host } => {
-                self.store
-                    .write()
-                    .expect("session store lock poisoned")
-                    .spawn_kind(
-                        diri_proto::AgentKind::SHELL,
-                        SpawnOptions {
-                            host,
-                            ..SpawnOptions::default()
-                        },
-                    );
-                self.close_overlay(cx);
-            }
-            PaletteCommand::OpenQuickOpen => {
-                self.overlay = Some(Overlay::QuickOpen);
-                self.query.clear();
-                self.reset_selection();
-                self.ranked_items.clear();
-                self.refresh_directory_index(cx);
-                cx.notify();
-            }
-            PaletteCommand::ToggleSidebar => {
-                cx.emit(NavigationEvent::ToggleSidebar);
-                self.close_overlay(cx);
-            }
-            PaletteCommand::OpenSessionOverview => {
-                cx.emit(NavigationEvent::OpenOverview);
-                self.close_overlay(cx);
-            }
-            PaletteCommand::OpenWorktrees => {
-                cx.emit(NavigationEvent::OpenWorktrees);
-                self.close_overlay(cx);
-            }
-            PaletteCommand::OpenSettings => {
-                cx.emit(NavigationEvent::OpenSettings);
-                self.close_overlay(cx);
-            }
-            PaletteCommand::CheckForUpdates => {
-                cx.emit(NavigationEvent::CheckForUpdates);
                 self.close_overlay(cx);
             }
         }
@@ -808,8 +769,8 @@ impl NavigationOverlay {
                 cx.notify();
             }
         }))
-        .on_click(cx.listener(move |this, _, _, cx| {
-            this.run_command_selection(CommandSelection::Action(command.clone()), cx);
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.run_command_selection(CommandSelection::Action(command.clone()), window, cx);
         }))
         .into_any_element()
     }
@@ -844,8 +805,8 @@ impl NavigationOverlay {
                 cx.notify();
             }
         }))
-        .on_click(cx.listener(move |this, _, _, cx| {
-            this.run_command_selection(CommandSelection::Session(id.clone()), cx);
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.run_command_selection(CommandSelection::Session(id.clone()), window, cx);
         }))
         .into_any_element()
     }
@@ -1054,7 +1015,7 @@ impl Render for NavigationOverlay {
         let overlay = self.overlay.map(|_| self.render_overlay(layout, cx));
         let root = div()
             .id("navigation-overlay")
-            .key_context("Diri")
+            .key_context(NAVIGATION_CONTEXT)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::toggle_command_palette))
             .on_action(cx.listener(Self::toggle_quick_open))
