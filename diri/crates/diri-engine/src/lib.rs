@@ -35,6 +35,7 @@ pub mod holder;
 pub mod hooks;
 pub mod hosts;
 pub mod inject;
+pub mod legacy_remote;
 pub mod log;
 pub mod mcp;
 pub mod migrate;

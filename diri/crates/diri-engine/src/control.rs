@@ -146,13 +146,23 @@ impl ControlServer {
     /// from a daemon with no UI behind it. Local sessions are served
     /// immediately now, and remote ones join as they are verified.
     pub fn spawn_remote_restore(self: &Arc<Self>) {
-        let Some(manager) = self.remote.clone() else {
+        if self.remote_bindings.is_none() {
             return;
-        };
+        }
+        let manager = self.remote.clone();
         let server = Arc::clone(self);
         if let Err(error) = std::thread::Builder::new()
             .name("diri-remote-restore".into())
             .spawn(move || {
+                // Before adoption, not after: adoption prunes bindings for
+                // sessions it finds dead, and a pruned binding is
+                // indistinguishable from a record that never had one. Running
+                // first is what keeps the legacy test — "has a host and no
+                // binding" — from swallowing this launch's own casualties.
+                server.retire_legacy_remote_sessions();
+                let Some(manager) = manager else {
+                    return;
+                };
                 let adopted = server.restore_remote_bindings(&manager);
                 if !adopted.is_empty() {
                     eprintln!(
@@ -164,6 +174,46 @@ impl ControlServer {
         {
             eprintln!("diri-engine: could not start remote session restore: {error}");
         }
+    }
+
+    /// One-shot upgrade path for sessions the deleted `ssh -t` + tmux transport
+    /// created. See [`crate::legacy_remote`] for what it does, what it refuses
+    /// to do, and why this is not a tmux fallback.
+    ///
+    /// Deliberately independent of `with_remote`: a build with no Helper
+    /// artifact still has the user's old records and still owes them a working
+    /// Resume button and a cleaned-up host.
+    fn retire_legacy_remote_sessions(&self) {
+        let plan = crate::legacy_remote::Plan {
+            registry: &self.registry,
+            bindings: self.remote_bindings.as_ref(),
+            hosts: &diri_proto::HostsConfig::load(self.hosts_file()),
+            marker_path: self.legacy_remote_marker(),
+        };
+        let outcome =
+            crate::legacy_remote::retire_legacy_remote_sessions(&plan, &crate::hosts::run_shell);
+        if let Some(summary) = outcome.summary() {
+            eprintln!("{summary}");
+        }
+        // These records have no live session, so the registry watcher — which
+        // only diffs live ones — will never announce the rewrite. Without this
+        // the sidebar keeps showing them as running until the next relaunch.
+        if !outcome.migrated.is_empty()
+            && let Ok(registry) = self.registry.lock()
+        {
+            for id in &outcome.migrated {
+                self.publish_updated(&registry, id);
+            }
+        }
+    }
+
+    /// Beside the socket, next to `remote-bindings` — one file, deletable the
+    /// day this migration is retired.
+    fn legacy_remote_marker(&self) -> PathBuf {
+        self.socket_path
+            .parent()
+            .map(|parent| parent.join("legacy-remote-migration.json"))
+            .unwrap_or_else(|| PathBuf::from("legacy-remote-migration.json"))
     }
 
     fn restore_remote_bindings(
