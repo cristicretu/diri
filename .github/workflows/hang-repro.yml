@@ -1,0 +1,41 @@
+name: Hang repro
+
+# This workflow is deliberately separate from CI. A manual diagnostic run may
+# hang by design and should not also launch the normal build and test matrix.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  hang-repro:
+    name: Sample the tests that hang on CI
+    runs-on: macos-15
+    # Longer than the watchdog's last pass (5min + 2 x 2min, plus sampling) so
+    # the stacks are printed before the job is cut off, and long enough for the
+    # ~13-minute stall that has been seen to play out.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.0.0
+      - name: Build tests
+        run: swift build --build-tests
+      - name: Run the skipped tests under the stack watchdog
+        env:
+          DIRIJOR_RUN_HANGING_TESTS: "1"
+          DIRIJOR_TEST_TIMEOUT_SCALE: "6"
+        run: |
+          ./scripts/sample-hung-tests.sh 300 3 120 &
+          watchdog=$!
+          # No pipe and no `tee`: this job wants the run's own stdout on the
+          # runner's terminal, and a failing test here is a result, not a
+          # broken job.
+          # One regex, not two --filter flags: --filter takes a pattern, and
+          # an alternation is unambiguous about being a union. Drop the filter
+          # entirely if the two alone turn out not to reproduce it — the hang
+          # has only ever been seen with the rest of the suite behind it.
+          script -q /dev/null swift test --no-parallel \
+            --filter 'isLinkedWorktreeDistinguishesMainFromLinked|codexWrapperReentersShellAndResolvesFreshInteractivePath' \
+            || true
+          kill "${watchdog}" 2>/dev/null || true
+          wait "${watchdog}" 2>/dev/null || true

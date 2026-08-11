@@ -71,12 +71,12 @@ consequences worth knowing:
 - Browser tests are opt-in behind `DIRIJOR_RUN_BROWSER_TESTS=1` and need
   `npx playwright install` first.
 - Two tests are skipped on CI because they hang there (#1). They still run
-  locally. To take a stack from a runner instead of guessing, dispatch the
-  `hang-repro` job by hand: it sets `DIRIJOR_RUN_HANGING_TESTS=1` and runs
+  locally. To take a stack from a runner instead of guessing, run the manual
+  `Hang repro` workflow: it sets `DIRIJOR_RUN_HANGING_TESTS=1` and runs
   `scripts/sample-hung-tests.sh` alongside the suite, which samples the test
   binary and everything it spawned. That script works on any stuck run —
-  `./scripts/sample-hung-tests.sh 60 1 0` while a local `swift test` is
-  wedged prints the same thing.
+  `./scripts/sample-hung-tests.sh 60 1 0` while a local `swift test` is wedged
+  prints the same thing.
 
 ## Adding an agent
 
