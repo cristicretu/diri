@@ -114,6 +114,8 @@ jobs:
       # This is deliberately native rather than a cross-build: the PTY suite
       # exercises openpty/ioctl/SIGWINCH/process groups and Linux's EIO-at-EOF
       # behavior against real child processes.
+      - name: Test shared PTY crate natively
+        run: cargo test --locked -p diri-pty -- --nocapture
       - name: Test Rust engine natively
         run: cargo test --locked -p diri-engine -- --nocapture
 

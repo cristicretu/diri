@@ -214,4 +214,23 @@ import Testing
             #expect(engine.storage.manifests[descriptor.id] != nil, "no rules for \(descriptor.id)")
         }
     }
+
+    @Test func clineAndMakiCarryOfficialSetupGuidance() throws {
+        let urls = Dictionary(uniqueKeysWithValues: AgentCatalog.manifestURLs(
+            overridesDirectory: nil
+        ).map { ($0.deletingPathExtension().lastPathComponent, $0) })
+        for (id, expectedURL) in [
+            ("cline", "https://docs.cline.bot/getting-started/installing-cline"),
+            ("maki", "https://github.com/tontinton/maki#installation"),
+        ] {
+            let url = try #require(urls[id], "missing \(id) manifest")
+            let root = try #require(
+                JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+            let agent = try #require(root["agent"] as? [String: Any])
+            let setup = try #require(agent["setup"] as? [String: Any])
+            #expect(setup["url"] as? String == expectedURL)
+            #expect(!(setup["installHint"] as? String ?? "").isEmpty)
+            #expect(!(setup["signInHint"] as? String ?? "").isEmpty)
+        }
+    }
 }

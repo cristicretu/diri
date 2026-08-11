@@ -13,6 +13,11 @@
       "maki"
     ],
     "firstClass": true,
+    "setup": {
+      "url": "https://github.com/tontinton/maki#installation",
+      "installHint": "Follow Maki's official installation guide and add maki to PATH.",
+      "signInHint": "Configure a supported provider API key; OpenAI users can run maki auth login openai."
+    },
     "statusAuthority": "screen",
     "binary": "maki",
     "returnToLoginShell": true,

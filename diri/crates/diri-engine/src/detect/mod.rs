@@ -337,6 +337,37 @@ mod tests {
     }
 
     #[test]
+    fn cline_and_maki_carry_official_setup_guidance() {
+        let engine = engine();
+        for (id, expected_url) in [
+            (
+                "cline",
+                "https://docs.cline.bot/getting-started/installing-cline",
+            ),
+            ("maki", "https://github.com/tontinton/maki#installation"),
+        ] {
+            let setup = engine
+                .raw_agent(id)
+                .and_then(|agent| agent.get("setup"))
+                .and_then(serde_json::Value::as_object)
+                .unwrap_or_else(|| panic!("{id} has no setup metadata"));
+            assert_eq!(
+                setup.get("url").and_then(serde_json::Value::as_str),
+                Some(expected_url)
+            );
+            for field in ["installHint", "signInHint"] {
+                assert!(
+                    setup
+                        .get(field)
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|hint| !hint.trim().is_empty()),
+                    "{id} has no {field}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn rules_are_sorted_by_descending_priority() {
         let engine = engine();
         for id in engine.ids() {

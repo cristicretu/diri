@@ -104,6 +104,7 @@ Do not use an ignored key for behavior.
 | `glyph` | No | One-character mark for places without an icon; defaults to `▸`. |
 | `aliases` | No | Additional case-insensitive names accepted by spawn surfaces. Do not reuse another agent's alias. |
 | `firstClass` | No | `true` when the manifest provides real detailed status. Keep this aligned with `statusModel: full`. |
+| `setup` | First-class agents | Display-only setup guidance: an official HTTP(S) `url`, concise `installHint`, and optional `signInHint`. Clients show these strings but never execute them. |
 | `statusAuthority` | Yes for built-ins | `screen` for ordinary TUI agents, `hooks` when a supported hook integration is primary, or `process` for liveness only. |
 | `binary` | Yes for a launchable agent | `argv[0]`, such as `maki`; omit only for pseudo-agents such as `shell` and `generic`. |
 | `spawnArgs` | No | Fixed argv words inserted on every launch. Each item is one word; never concatenate a shell command. |
@@ -121,6 +122,12 @@ components used when Diri adopts an agent typed into a plain shell session. It
 does not change the launch command. Script-based Node or Python CLIs may need an
 identifying installed-path component because their real foreground executable
 can be `node` or `python`.
+
+For `setup`, link to the agent publisher's installation page, not a package
+search or third-party tutorial. Keep commands in `installHint` short enough for
+an unavailable-agent row, and use `signInHint` only for the documented next
+step after installation. Setup metadata is guidance: Diri does not run either
+hint or open its URL without an explicit user action.
 
 ### Resume behavior
 

@@ -14,6 +14,11 @@
       "cline-cli"
     ],
     "firstClass": true,
+    "setup": {
+      "url": "https://docs.cline.bot/getting-started/installing-cline",
+      "installHint": "Install Cline CLI with npm install -g cline.",
+      "signInHint": "Run cline auth and choose a provider or API key."
+    },
     "statusAuthority": "screen",
     "binary": "cline",
     "returnToLoginShell": true,
