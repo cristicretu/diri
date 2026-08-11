@@ -62,6 +62,19 @@ pub struct ApproveSpec {
     pub submit: bool,
 }
 
+/// Display-only setup metadata. It is parsed here so user overrides can carry
+/// it, but the Engine never executes the hint or opens the URL.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupSpec {
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub install_hint: Option<String>,
+    #[serde(default)]
+    pub sign_in_hint: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentDescriptor {
@@ -105,6 +118,8 @@ pub struct AgentDescriptor {
     pub env_scrub_prefixes: Vec<String>,
     #[serde(default)]
     pub approve: Option<ApproveSpec>,
+    #[serde(default)]
+    pub setup: Option<SetupSpec>,
 }
 
 impl AgentDescriptor {

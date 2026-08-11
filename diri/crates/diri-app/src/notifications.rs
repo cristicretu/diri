@@ -584,6 +584,7 @@ mod tests {
                 text: "n".to_owned(),
                 submit: true,
             }),
+            setup: None,
         };
         let current = session(
             amp.clone(),

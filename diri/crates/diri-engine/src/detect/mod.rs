@@ -335,6 +335,37 @@ mod tests {
     }
 
     #[test]
+    fn first_class_agents_ship_verified_official_setup_links() {
+        let engine = engine();
+        for (id, expected_url) in [
+            (
+                "claude-code",
+                "https://docs.anthropic.com/en/docs/claude-code/getting-started",
+            ),
+            ("codex", "https://developers.openai.com/codex/cli/"),
+            ("cursor", "https://docs.cursor.com/en/cli/installation"),
+            ("gemini", "https://github.com/google-gemini/gemini-cli"),
+        ] {
+            let descriptor: diri_proto::AgentDescriptor = serde_json::from_value(
+                engine
+                    .raw_agent(id)
+                    .expect("first-class descriptor")
+                    .clone(),
+            )
+            .expect("client descriptor");
+            let setup = descriptor.setup.expect("first-class setup metadata");
+            assert_eq!(setup.url.as_deref(), Some(expected_url));
+            assert!(
+                setup
+                    .install_hint
+                    .as_deref()
+                    .is_some_and(|hint| !hint.trim().is_empty()),
+                "{id} needs an install hint"
+            );
+        }
+    }
+
+    #[test]
     fn rules_are_sorted_by_descending_priority() {
         let engine = engine();
         for id in engine.ids() {

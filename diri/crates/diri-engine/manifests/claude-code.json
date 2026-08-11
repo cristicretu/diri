@@ -14,6 +14,11 @@
       "cc"
     ],
     "firstClass": true,
+    "setup": {
+      "url": "https://docs.anthropic.com/en/docs/claude-code/getting-started",
+      "installHint": "Follow Anthropic's Claude Code installation guide.",
+      "signInHint": "Run claude and choose an Anthropic Console or Claude account."
+    },
     "statusAuthority": "hooks",
     "binary": "claude",
     "returnToLoginShell": true,

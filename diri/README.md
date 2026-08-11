@@ -130,6 +130,16 @@ Removing the file leaves the app in local-only mode. Tailscale IPv4 addresses
 and MagicDNS names work like any other SSH destination when OpenSSH can resolve
 them; Diri neither requires nor configures Tailscale for Remote Holder sessions.
 
+## Agent preferences
+
+The default agent is stored in
+`~/Library/Application Support/diri/prefs.json` as the agent manifest's stable
+`id`. Preferences written before the manifest catalog (`claudeCode`, `codex`,
+`cursor`, or `gemini`) remain readable and are rewritten with the canonical id
+on the next save. If a saved agent is removed or is no longer available, Diri
+chooses the first installed first-class agent; when none are installed it falls
+back to the terminal shell.
+
 ## Coexistence
 
 `diri` launches the daemon bundled beside it when none is running, and

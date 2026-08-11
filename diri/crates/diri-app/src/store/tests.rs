@@ -2,8 +2,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use diri_proto::{
-    AgentKind, AttentionLevel, DateMillis, ExitInfo, ExitReason, Project, ProjectId, Resumability,
-    SessionId, SessionListResult, SessionRecord, SessionStatus, TitleSource,
+    AgentDescriptor, AgentKind, AgentReadinessItem, AgentReadinessResult, AttentionLevel,
+    DateMillis, ExitInfo, ExitReason, Project, ProjectId, Resumability, SessionId,
+    SessionListResult, SessionRecord, SessionStatus, TitleSource,
 };
 use tempfile::tempdir;
 use tokio::sync::mpsc;
@@ -11,9 +12,9 @@ use tokio::sync::mpsc;
 use crate::notifications::NotificationSound;
 
 use super::{
-    ClickModifiers, DefaultAgent, EventEnvelope, InspectorTab, Prefs, SessionStore,
-    SidebarProjection, StoreEffect, StoreEventChange, TerminalResidency, WindowMode,
-    WindowPlacement, event_publication_policy,
+    ClickModifiers, EventEnvelope, InspectorTab, Prefs, SessionStore, SidebarProjection,
+    StoreEffect, StoreEventChange, TerminalResidency, WindowMode, WindowPlacement,
+    event_publication_policy,
 };
 use crate::switcher::{OverviewFilter, OverviewLane, SwitcherKey};
 
@@ -1099,7 +1100,7 @@ fn prefs_round_trip_and_zoom_clamp() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("nested/prefs.json");
     let prefs = Prefs {
-        default_agent: DefaultAgent::Gemini,
+        default_agent: AgentKind::GEMINI,
         default_spawn_host: Some("forge".to_owned()),
         terminal_font_size: 19.5,
         window_placement: Some(WindowPlacement {
@@ -1130,6 +1131,72 @@ fn prefs_round_trip_and_zoom_clamp() {
     assert_eq!(store.prefs.terminal_font_size, 10.0);
     store.reset_terminal_zoom().unwrap();
     assert_eq!(Prefs::load(&path).unwrap().terminal_font_size, 13.0);
+}
+
+#[test]
+fn default_agent_preferences_migrate_legacy_values_and_persist_manifest_ids() {
+    for (saved, expected) in [
+        ("claudeCode", AgentKind::CLAUDE_CODE),
+        ("codex", AgentKind::CODEX),
+        ("cursor", AgentKind::CURSOR),
+        ("gemini", AgentKind::GEMINI),
+    ] {
+        let prefs: Prefs = serde_json::from_value(serde_json::json!({
+            "defaultAgent": saved
+        }))
+        .expect("legacy prefs decode");
+        assert_eq!(prefs.default_agent, expected);
+    }
+
+    let prefs = Prefs {
+        default_agent: AgentKind::new("amp"),
+        ..Prefs::default()
+    };
+    let encoded = serde_json::to_value(&prefs).expect("prefs encode");
+    assert_eq!(encoded["defaultAgent"], "amp");
+    let decoded: Prefs = serde_json::from_value(encoded).expect("manifest id decodes");
+    assert_eq!(decoded.default_agent, AgentKind::new("amp"));
+}
+
+#[test]
+fn unknown_saved_default_repairs_to_available_first_class_then_shell() {
+    let prefs = Prefs {
+        default_agent: AgentKind::new("removed-agent"),
+        ..Prefs::default()
+    };
+    let (mut store, _) = SessionStore::headless(prefs);
+    store.set_agent_catalog(AgentReadinessResult {
+        agents: vec![AgentReadinessItem {
+            kind: AgentKind::CODEX,
+            binary: "codex".into(),
+            path: Some("/bin/codex".into()),
+            descriptor: Some(AgentDescriptor {
+                id: AgentKind::CODEX_ID.into(),
+                display_name: "Codex".into(),
+                first_class: true,
+                ..AgentDescriptor::default()
+            }),
+        }],
+    });
+    assert_eq!(store.preferences().default_agent, AgentKind::CODEX);
+
+    store
+        .update_preferences(|prefs| prefs.default_agent = AgentKind::new("removed-again"))
+        .expect("headless prefs update");
+    store.set_agent_catalog(AgentReadinessResult {
+        agents: vec![AgentReadinessItem {
+            kind: AgentKind::new("amp"),
+            binary: "amp".into(),
+            path: Some("/bin/amp".into()),
+            descriptor: Some(AgentDescriptor {
+                id: "amp".into(),
+                display_name: "Amp".into(),
+                first_class: false,
+                ..AgentDescriptor::default()
+            }),
+        }],
+    });
+    assert_eq!(store.preferences().default_agent, AgentKind::SHELL);
 }
 
 #[test]

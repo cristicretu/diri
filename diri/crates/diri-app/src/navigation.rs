@@ -560,9 +560,14 @@ impl NavigationOverlay {
                             options.cwd = Some(store.local_fallback_directory());
                         }
                     }
-                    store.spawn_kind(agent.kind(), options);
+                    store.spawn_kind(agent, options);
                 }
                 self.close_overlay(cx);
+            }
+            PaletteCommand::UnavailableAgent { setup_url } => {
+                if let Some(url) = setup_url {
+                    cx.open_url(&url);
+                }
             }
             PaletteCommand::MigrateSelected { target_host } => {
                 {
@@ -640,7 +645,8 @@ impl NavigationOverlay {
             let selected = store.selected_session().cloned();
             let default_host = store.default_spawn_host();
             let actions = palette::actions_for_default_host(
-                store.preferences().default_agent,
+                store.preferences().default_agent.clone(),
+                store.agent_catalog(),
                 &projects,
                 &hosts,
                 selected.as_ref(),
@@ -794,10 +800,15 @@ impl NavigationOverlay {
     ) -> AnyElement {
         let action = ranked.item;
         let command = action.command.clone();
+        let trailing = action
+            .detail
+            .clone()
+            .map(SharedString::from)
+            .or_else(|| action.shortcut.map(SharedString::from));
         palette_row(
             highlighted_label(action.title, &ranked.title_matches),
             sf_symbol(action.system_image, 12.5, colors.secondary),
-            action.shortcut.map(SharedString::from),
+            trailing,
             index == self.highlight,
             index,
             colors,
@@ -945,14 +956,13 @@ impl NavigationOverlay {
         } else {
             colors.secondary
         };
-        let default_name = self
-            .store
-            .read()
-            .expect("session store lock poisoned")
-            .preferences()
-            .default_agent
-            .display_name()
-            .to_owned();
+        let default_name = {
+            let store = self.store.read().expect("session store lock poisoned");
+            crate::agent_catalog::display_name(
+                &store.preferences().default_agent,
+                store.agent_catalog(),
+            )
+        };
         let row = div()
             .id(format!("quick-row-{index}"))
             .flex()

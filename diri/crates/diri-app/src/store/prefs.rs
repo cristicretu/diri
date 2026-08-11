@@ -3,7 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use diri_proto::{AgentKind, ProjectId, SessionId};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 const DEFAULT_THEME: &str = "dirijor-dark";
 
@@ -40,31 +40,40 @@ pub enum InspectorTab {
     Artifacts,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum DefaultAgent {
-    #[default]
-    ClaudeCode,
-    Codex,
-    Cursor,
-    Gemini,
+/// Preferences intentionally persist the manifest id as a plain string. The
+/// four pre-catalog enum spellings are accepted forever because prefs survive
+/// upgrades; new saves use the canonical manifest ids (for example
+/// `"claude-code"` and `"opencode"`).
+fn serialize_default_agent<S>(agent: &AgentKind, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(agent.id())
 }
 
-impl DefaultAgent {
-    pub fn kind(self) -> AgentKind {
-        match self {
-            Self::ClaudeCode => AgentKind::CLAUDE_CODE,
-            Self::Codex => AgentKind::CODEX,
-            Self::Cursor => AgentKind::CURSOR,
-            Self::Gemini => AgentKind::GEMINI,
-        }
-    }
+fn deserialize_default_agent<'de, D>(deserializer: D) -> Result<AgentKind, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let saved = String::deserialize(deserializer)?;
+    Ok(match saved.as_str() {
+        "claudeCode" | AgentKind::CLAUDE_CODE_ID => AgentKind::CLAUDE_CODE,
+        "codex" => AgentKind::CODEX,
+        "cursor" => AgentKind::CURSOR,
+        "gemini" => AgentKind::GEMINI,
+        "shell" => AgentKind::SHELL,
+        _ => AgentKind::new(saved),
+    })
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Prefs {
-    pub default_agent: DefaultAgent,
+    #[serde(
+        serialize_with = "serialize_default_agent",
+        deserialize_with = "deserialize_default_agent"
+    )]
+    pub default_agent: AgentKind,
     /// Persistent destination for global new-session shortcuts. `None` means
     /// this Mac; a host id means that configured remote host. The alias
     /// migrates preferences written by the earlier last-used implementation.
@@ -114,7 +123,7 @@ pub struct Prefs {
 impl Default for Prefs {
     fn default() -> Self {
         Self {
-            default_agent: DefaultAgent::ClaudeCode,
+            default_agent: AgentKind::CLAUDE_CODE,
             default_spawn_host: None,
             start_at_login: false,
             confirm_before_closing_session: true,

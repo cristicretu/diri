@@ -13,6 +13,11 @@
       "cursor-agent"
     ],
     "firstClass": true,
+    "setup": {
+      "url": "https://docs.cursor.com/en/cli/installation",
+      "installHint": "Follow Cursor's CLI installation guide.",
+      "signInHint": "Run cursor-agent and complete authentication when prompted."
+    },
     "statusAuthority": "screen",
     "binary": "cursor-agent",
     "foregroundExecNames": [

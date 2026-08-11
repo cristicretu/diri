@@ -158,6 +158,20 @@ pub struct AgentKeystroke {
     pub submit: bool,
 }
 
+/// Optional, display-only guidance for installing and authenticating an
+/// Agent. Clients must never execute either hint; the URL is opened only after
+/// an explicit user action and is validated by the client as HTTP(S).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSetup {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_in_hint: Option<String>,
+}
+
 /// The daemon-side manifest descriptor for one agent, as much of it as the
 /// client needs. Deliberately partial and tolerant: the daemon owns the full
 /// schema (spawn args, env hygiene, injection), and unknown fields are ignored
@@ -181,6 +195,11 @@ pub struct AgentDescriptor {
     pub approve: Option<AgentKeystroke>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny: Option<AgentKeystroke>,
+    /// Additive setup guidance. Older clients ignore this field and older
+    /// daemons omit it, so user manifest overrides remain forwards/backwards
+    /// compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<AgentSetup>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

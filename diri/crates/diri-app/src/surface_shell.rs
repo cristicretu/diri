@@ -9,7 +9,7 @@ use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::query_label;
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
 use crate::settings::{HostDraft, SettingsTab, default_agent_label, theme};
-use crate::store::{DefaultAgent, Prefs, SessionStore, StoreRuntime};
+use crate::store::{Prefs, SessionStore, StoreRuntime};
 use crate::updates::{UpdateCommand, UpdateHandle, UpdatePhase};
 use crate::worktrees::WorktreesSheet;
 use diri_proto::{AgentKind as ProtoAgentKind, HistoryEntry, HostEntry, HostsConfig};
@@ -1632,10 +1632,16 @@ impl UtilitySurfaces {
 
     fn default_agent_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = self.settings_colors();
-        let selected = self.prefs.default_agent;
+        let (selected, catalog) = {
+            let store = self.store.read().expect("session store lock poisoned");
+            (
+                store.preferences().default_agent.clone(),
+                store.agent_catalog().clone(),
+            )
+        };
         let open = self.settings_menu == Some(SettingsMenu::DefaultAgent);
         let trigger = settings_select_button(
-            default_agent_label(selected),
+            default_agent_label(&selected, &catalog),
             "default-agent-dropdown",
             open,
             SettingsMenu::DefaultAgent,
@@ -1646,34 +1652,79 @@ impl UtilitySurfaces {
         let mut control = div().relative().min_w(px(154.0)).child(trigger);
         if open {
             let mut options = div().p(px(4.0)).flex().flex_col();
-            for (index, agent) in DefaultAgent::ALL.into_iter().enumerate() {
-                let is_selected = agent == selected;
+            for (index, option) in crate::agent_catalog::default_agent_options(&catalog)
+                .into_iter()
+                .enumerate()
+            {
+                let is_selected = option.kind == selected;
+                let enabled = option.available;
+                let agent = option.kind.clone();
+                let setup_url = option.setup_url.clone();
+                let unavailable = option.unavailable_label();
+                let install_hint = option.install_hint.clone();
                 options = options.child(
                     div()
                         .id(SharedString::from(format!("default-agent-option-{index}")))
-                        .h(px(Metrics::ROW_HEIGHT))
+                        .min_h(px(Metrics::ROW_HEIGHT))
                         .px(px(8.0))
+                        .py(px(5.0))
                         .flex()
                         .items_center()
                         .gap(px(8.0))
                         .rounded(px(Radius::ROW))
                         .bg(Fill::selected(colors, is_selected))
-                        .cursor_pointer()
-                        .hover(move |style| style.bg(colors.primary.alpha(0.08)))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.prefs.default_agent = agent;
-                            this.settings_menu = None;
-                            this.persist_prefs();
-                            cx.notify();
-                        }))
-                        .child(AgentLogo::new(ui_default_agent(agent), 16.0, colors).badged(false))
+                        .when(enabled, |row| {
+                            row.cursor_pointer()
+                                .hover(move |style| style.bg(colors.primary.alpha(0.08)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.prefs.default_agent = agent.clone();
+                                    this.settings_menu = None;
+                                    this.persist_prefs();
+                                    cx.notify();
+                                }))
+                        })
+                        .child(AgentLogo::new(ui_agent(&option.kind), 16.0, colors).badged(false))
                         .child(
                             div()
+                                .min_w_0()
                                 .flex_1()
+                                .flex()
+                                .flex_col()
                                 .text_size(px(Typo::ROW.size))
-                                .text_color(colors.primary)
-                                .child(default_agent_label(agent)),
+                                .text_color(if enabled {
+                                    colors.primary
+                                } else {
+                                    colors.secondary
+                                })
+                                .child(option.display_name)
+                                .when_some(unavailable, |label, unavailable| {
+                                    label.child(
+                                        div()
+                                            .whitespace_nowrap()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .text_size(px(Typo::META.size))
+                                            .text_color(colors.tertiary)
+                                            .child(format!("{unavailable} · {install_hint}")),
+                                    )
+                                }),
                         )
+                        .when_some(setup_url, |row, url| {
+                            row.child(
+                                div()
+                                    .id(format!("default-agent-setup-{index}"))
+                                    .px(px(6.0))
+                                    .py(px(3.0))
+                                    .rounded(px(Radius::CHIP))
+                                    .cursor_pointer()
+                                    .text_size(px(Typo::META.size))
+                                    .text_color(colors.secondary)
+                                    .bg(Fill::subtle(colors))
+                                    .hover(move |button| button.bg(colors.primary.alpha(0.10)))
+                                    .on_click(move |_, _, cx| cx.open_url(&url))
+                                    .child("Setup…"),
+                            )
+                        })
                         .when(is_selected, |row| {
                             row.child(sf_symbol_weighted(
                                 "checkmark",
@@ -3477,15 +3528,6 @@ fn ui_agent(kind: &ProtoAgentKind) -> diri_ui::AgentKind {
         ProtoAgentKind::GEMINI_ID => diri_ui::AgentKind::Gemini,
         ProtoAgentKind::SHELL_ID => diri_ui::AgentKind::Shell,
         _ => diri_ui::AgentKind::Generic,
-    }
-}
-
-fn ui_default_agent(agent: DefaultAgent) -> diri_ui::AgentKind {
-    match agent {
-        DefaultAgent::ClaudeCode => diri_ui::AgentKind::ClaudeCode,
-        DefaultAgent::Codex => diri_ui::AgentKind::Codex,
-        DefaultAgent::Cursor => diri_ui::AgentKind::Cursor,
-        DefaultAgent::Gemini => diri_ui::AgentKind::Gemini,
     }
 }
 

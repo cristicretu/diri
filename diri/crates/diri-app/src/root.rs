@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use diri_proto::SessionId;
+use diri_proto::{AgentKind, SessionId};
 use diri_ui::{FloatingSurface, Ink, Radius, SemanticColors, Typo};
 use gpui::{
     AnyElement, App, Context, CursorStyle, DragMoveEvent, Entity, FocusHandle, Focusable,
@@ -22,7 +22,7 @@ use crate::seam::{SeamSlide, toggle_has_settled};
 use crate::session_surfaces::SessionSurfaces;
 use crate::sidebar::{PreviewScenario, Sidebar, SidebarEvent};
 use crate::sounds::{self, AfplayPlayer, SoundGate, StatusSound};
-use crate::store::{DefaultAgent, SpawnOptions};
+use crate::store::SpawnOptions;
 use crate::surface_shell::UtilitySurfaces;
 use crate::terminal_pane::{TerminalPane, TerminalPaneEvent, TerminalViewport};
 use crate::updates::UpdatePhase;
@@ -692,7 +692,7 @@ impl RootView {
                     }
                 }
                 Some(NewSessionShortcut::Codex) => {
-                    if !self.spawn(Some(DefaultAgent::Codex)) {
+                    if !self.spawn(Some(AgentKind::CODEX)) {
                         return;
                     }
                 }
@@ -801,7 +801,7 @@ impl RootView {
     /// Spawns a shell (`None`) or a specific agent straight from a shortcut,
     /// bypassing the sidebar's picker. No-ops in preview, which has no daemon
     /// to spawn into. Reports whether the spawn was dispatched.
-    fn spawn(&self, agent: Option<DefaultAgent>) -> bool {
+    fn spawn(&self, agent: Option<AgentKind>) -> bool {
         if self.preview {
             return false;
         }
@@ -815,7 +815,7 @@ impl RootView {
             Some(agent) => {
                 let host = store.default_spawn_host();
                 store.spawn_kind(
-                    agent.kind(),
+                    agent,
                     SpawnOptions {
                         host,
                         ..SpawnOptions::default()

@@ -6,15 +6,17 @@
 use std::ops::Range;
 use std::path::PathBuf;
 
-use diri_proto::{AgentKind, HostEntry, Project, SessionRecord};
+use diri_proto::{AgentKind, AgentReadinessResult, HostEntry, Project, SessionRecord};
 
+use crate::agent_catalog::{
+    AgentOption, agent_options, display_name, resolved_default_agent, system_image,
+};
 use crate::fuzzy::{FuzzyMatcher, FuzzyQuery, PreparedText, Score};
-use crate::store::DefaultAgent;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaletteCommand {
     SpawnAgent {
-        agent: DefaultAgent,
+        agent: AgentKind,
         cwd: Option<PathBuf>,
         /// `HostEntry.id` — spawn on that remote host (cwd then comes from the
         /// host's defaultCwd unless overridden).
@@ -22,6 +24,11 @@ pub enum PaletteCommand {
     },
     SpawnShell {
         host: Option<String>,
+    },
+    /// An unavailable local Agent row. A verified HTTP(S) setup URL is opened
+    /// on activation; without one the row remains informational.
+    UnavailableAgent {
+        setup_url: Option<String>,
     },
     /// `session.migrate` the SELECTED session; None = back to local.
     MigrateSelected {
@@ -45,6 +52,8 @@ pub struct PaletteAction {
     pub title: String,
     pub system_image: &'static str,
     pub shortcut: Option<&'static str>,
+    /// Availability copy displayed in the trailing chip.
+    pub detail: Option<String>,
     pub command: PaletteCommand,
     /// Scored alongside the title but never rendered: the folder path behind
     /// "New Claude Code in anara", a host's ssh target, and the synonyms people
@@ -53,29 +62,47 @@ pub struct PaletteAction {
 }
 
 pub fn actions(
-    default_agent: DefaultAgent,
+    default_agent: AgentKind,
+    catalog: &AgentReadinessResult,
     projects: &[Project],
     hosts: &[HostEntry],
     selected: Option<&SessionRecord>,
 ) -> Vec<PaletteAction> {
-    actions_for_default_host(default_agent, projects, hosts, selected, None)
+    actions_for_default_host(default_agent, catalog, projects, hosts, selected, None)
 }
 
 pub fn actions_for_default_host(
-    default_agent: DefaultAgent,
+    default_agent: AgentKind,
+    catalog: &AgentReadinessResult,
     projects: &[Project],
     hosts: &[HostEntry],
     selected: Option<&SessionRecord>,
     default_host_id: Option<&str>,
 ) -> Vec<PaletteAction> {
     let default_host = default_host_id.and_then(|id| hosts.iter().find(|host| host.id == id));
-    let mut result = vec![new_agent_action(default_agent, true, default_host)];
+    let default_agent = resolved_default_agent(&default_agent, catalog);
+    let options = agent_options(catalog);
+    let mut result = Vec::new();
+    if default_agent == AgentKind::SHELL {
+        result.push(PaletteAction {
+            id: "new-default".into(),
+            title: "New Terminal".into(),
+            system_image: "terminal",
+            shortcut: Some("⌘T"),
+            detail: None,
+            command: PaletteCommand::SpawnShell {
+                host: default_host.map(|host| host.id.clone()),
+            },
+            keywords: "shell console zsh bash tty default".into(),
+        });
+    } else if let Some(option) = options.iter().find(|option| option.kind == default_agent) {
+        result.push(new_agent_action(option, true, default_host));
+    }
     result.extend(
-        DefaultAgent::ALL
+        options
             .iter()
-            .copied()
-            .filter(|agent| *agent != default_agent)
-            .map(|agent| new_agent_action(agent, false, default_host)),
+            .filter(|option| option.kind != default_agent)
+            .map(|option| new_agent_action(option, false, default_host)),
     );
     let terminal_title = default_host.map_or_else(
         || "New Terminal".to_owned(),
@@ -87,6 +114,7 @@ pub fn actions_for_default_host(
             title: terminal_title,
             system_image: "terminal",
             shortcut: Some("⌥⌘T"),
+            detail: None,
             command: PaletteCommand::SpawnShell {
                 host: default_host.map(|host| host.id.clone()),
             },
@@ -97,6 +125,7 @@ pub fn actions_for_default_host(
             title: "Quick Open…".into(),
             system_image: "magnifyingglass",
             shortcut: Some("⌘P"),
+            detail: None,
             command: PaletteCommand::OpenQuickOpen,
             keywords: "folder project directory jump goto find".into(),
         },
@@ -105,19 +134,22 @@ pub fn actions_for_default_host(
             title: "Session Overview".into(),
             system_image: "square.grid.2x2",
             shortcut: Some("⌘⇧O"),
+            detail: None,
             command: PaletteCommand::OpenSessionOverview,
             keywords: "board grid switcher all sessions".into(),
         },
     ]);
 
+    let default_name = display_name(&default_agent, catalog);
     for project in projects {
         result.push(PaletteAction {
             id: format!("new-default-in-{}", project.root),
-            title: format!("New {} in {}", default_agent.display_name(), project.name),
+            title: format!("New {default_name} in {}", project.name),
             system_image: "folder",
             shortcut: None,
+            detail: None,
             command: PaletteCommand::SpawnAgent {
-                agent: default_agent,
+                agent: default_agent.clone(),
                 cwd: Some(PathBuf::from(&project.root)),
                 host: None,
             },
@@ -128,14 +160,15 @@ pub fn actions_for_default_host(
     // Remote spawns: one entry per agent per configured host, in the host's
     // default cwd (hosts.json).
     for host in hosts {
-        for agent in DefaultAgent::ALL {
+        for option in &options {
             result.push(PaletteAction {
-                id: format!("new-{}-on-{}", agent.raw_value(), host.id),
-                title: format!("New {} on {}", agent.display_name(), host.display_name()),
+                id: format!("new-{}-on-{}", option.kind.id(), host.id),
+                title: format!("New {} on {}", option.display_name, host.display_name()),
                 system_image: "network",
                 shortcut: None,
+                detail: None,
                 command: PaletteCommand::SpawnAgent {
-                    agent,
+                    agent: option.kind.clone(),
                     cwd: None,
                     host: Some(host.id.clone()),
                 },
@@ -157,6 +190,7 @@ pub fn actions_for_default_host(
                     title: "Move Session to Local".into(),
                     system_image: "arrow.left.arrow.right",
                     shortcut: None,
+                    detail: None,
                     command: PaletteCommand::MigrateSelected { target_host: None },
                     keywords: "migrate handoff move back local".into(),
                 });
@@ -168,6 +202,7 @@ pub fn actions_for_default_host(
                     title: format!("Move Session to {}", host.display_name()),
                     system_image: "arrow.left.arrow.right",
                     shortcut: None,
+                    detail: None,
                     command: PaletteCommand::MigrateSelected {
                         target_host: Some(host.id.clone()),
                     },
@@ -184,6 +219,7 @@ pub fn actions_for_default_host(
             title: format!("Sync Prefs to {}", host.display_name()),
             system_image: "arrow.triangle.2.circlepath",
             shortcut: None,
+            detail: None,
             command: PaletteCommand::SyncPrefs {
                 host: host.id.clone(),
             },
@@ -197,6 +233,7 @@ pub fn actions_for_default_host(
             title: "Worktrees Overview".into(),
             system_image: "square.stack.3d.up",
             shortcut: Some("⌥⌘W"),
+            detail: None,
             command: PaletteCommand::OpenWorktrees,
             keywords: "git branch checkout".into(),
         },
@@ -205,6 +242,7 @@ pub fn actions_for_default_host(
             title: "Toggle Sidebar".into(),
             system_image: "sidebar.left",
             shortcut: Some("⌘B"),
+            detail: None,
             command: PaletteCommand::ToggleSidebar,
             keywords: "hide show panel".into(),
         },
@@ -213,6 +251,7 @@ pub fn actions_for_default_host(
             title: "Settings…".into(),
             system_image: "gearshape",
             shortcut: Some("⌘,"),
+            detail: None,
             command: PaletteCommand::OpenSettings,
             keywords: "preferences config options".into(),
         },
@@ -221,6 +260,7 @@ pub fn actions_for_default_host(
             title: "Check for Updates…".into(),
             system_image: "arrow.triangle.2.circlepath",
             shortcut: None,
+            detail: None,
             command: PaletteCommand::CheckForUpdates,
             keywords: "upgrade version release".into(),
         },
@@ -229,34 +269,56 @@ pub fn actions_for_default_host(
 }
 
 fn new_agent_action(
-    agent: DefaultAgent,
+    option: &AgentOption,
     is_default: bool,
     host: Option<&HostEntry>,
 ) -> PaletteAction {
+    let available = host.is_some() || option.available;
     PaletteAction {
         id: if is_default {
             "new-default".into()
         } else {
-            format!("new-{}", agent.raw_value())
+            format!("new-{}", option.kind.id())
         },
         title: host.map_or_else(
-            || format!("New {} Session", agent.display_name()),
-            |host| format!("New {} on {}", agent.display_name(), host.display_name()),
+            || format!("New {} Session", option.display_name),
+            |host| format!("New {} on {}", option.display_name, host.display_name()),
         ),
-        system_image: agent.system_image(),
-        shortcut: if is_default {
+        system_image: system_image(&option.kind),
+        shortcut: if !available {
+            None
+        } else if is_default {
             Some("⌘T")
-        } else if agent == DefaultAgent::Codex {
+        } else if option.kind == AgentKind::CODEX {
             Some("⌘⇧N")
         } else {
             None
         },
-        command: PaletteCommand::SpawnAgent {
-            agent,
-            cwd: None,
-            host: host.map(|host| host.id.clone()),
+        detail: (!available).then(|| {
+            format!(
+                "{} · {}",
+                option
+                    .unavailable_label()
+                    .expect("unavailable option has a missing-binary label"),
+                option.install_hint
+            )
+        }),
+        command: if available {
+            PaletteCommand::SpawnAgent {
+                agent: option.kind.clone(),
+                cwd: None,
+                host: host.map(|host| host.id.clone()),
+            }
+        } else {
+            PaletteCommand::UnavailableAgent {
+                setup_url: option.setup_url.clone(),
+            }
         },
-        keywords: format!("{} agent spawn start create tab", agent.raw_value()),
+        keywords: format!(
+            "{} {} agent spawn start create tab setup install",
+            option.kind.id(),
+            option.binary
+        ),
     }
 }
 
@@ -382,42 +444,105 @@ fn agent_keyword(kind: &AgentKind) -> &str {
     }
 }
 
-impl DefaultAgent {
-    pub const ALL: [Self; 4] = [Self::ClaudeCode, Self::Codex, Self::Cursor, Self::Gemini];
-
-    pub const fn raw_value(self) -> &'static str {
-        match self {
-            Self::ClaudeCode => "claudeCode",
-            Self::Codex => "codex",
-            Self::Cursor => "cursor",
-            Self::Gemini => "gemini",
-        }
-    }
-
-    pub const fn display_name(self) -> &'static str {
-        match self {
-            Self::ClaudeCode => "Claude Code",
-            Self::Codex => "Codex",
-            Self::Cursor => "Cursor",
-            Self::Gemini => "Gemini",
-        }
-    }
-
-    const fn system_image(self) -> &'static str {
-        match self {
-            Self::ClaudeCode => "sparkle",
-            Self::Codex => "chevron.left.forwardslash.chevron.right",
-            Self::Cursor => "cube",
-            Self::Gemini => "sparkles",
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use diri_proto::ProjectId;
+    use diri_proto::{AgentDescriptor, AgentReadinessItem, AgentSetup, ProjectId};
 
     use super::*;
+
+    fn catalog() -> AgentReadinessResult {
+        AgentReadinessResult::default()
+    }
+
+    fn catalog_item(
+        id: &str,
+        display_name: &str,
+        available: bool,
+        setup_url: Option<&str>,
+    ) -> AgentReadinessItem {
+        AgentReadinessItem {
+            kind: AgentKind::new(id),
+            binary: format!("{id}-bin"),
+            path: available.then(|| format!("/bin/{id}")),
+            descriptor: Some(AgentDescriptor {
+                id: id.into(),
+                display_name: display_name.into(),
+                setup: setup_url.map(|url| AgentSetup {
+                    url: Some(url.into()),
+                    install_hint: Some(format!("Install {display_name}.")),
+                    sign_in_hint: None,
+                }),
+                ..AgentDescriptor::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn manifest_only_agents_get_local_and_remote_actions_with_open_dispatch() {
+        let catalog = AgentReadinessResult {
+            agents: vec![catalog_item("amp", "Amp", true, None)],
+        };
+        let host = HostEntry {
+            id: "forge".into(),
+            name: Some("Forge".into()),
+            ssh: "forge.local".into(),
+            default_cwd: None,
+            node: None,
+        };
+        let actions = actions(
+            AgentKind::new("amp"),
+            &catalog,
+            &[],
+            std::slice::from_ref(&host),
+            None,
+        );
+        assert_eq!(actions[0].title, "New Amp Session");
+        assert_eq!(actions[0].shortcut, Some("⌘T"));
+        assert_eq!(
+            actions[0].command,
+            PaletteCommand::SpawnAgent {
+                agent: AgentKind::new("amp"),
+                cwd: None,
+                host: None,
+            }
+        );
+        assert!(actions.iter().any(|action| {
+            action.id == "new-amp-on-forge"
+                && action.command
+                    == PaletteCommand::SpawnAgent {
+                        agent: AgentKind::new("amp"),
+                        cwd: None,
+                        host: Some("forge".into()),
+                    }
+        }));
+    }
+
+    #[test]
+    fn unavailable_catalog_action_uses_shared_missing_binary_and_safe_setup() {
+        let catalog = AgentReadinessResult {
+            agents: vec![catalog_item(
+                "amp",
+                "Amp",
+                false,
+                Some("https://ampcode.com/manual"),
+            )],
+        };
+        let actions = actions(AgentKind::new("amp"), &catalog, &[], &[], None);
+        let amp = actions
+            .iter()
+            .find(|action| action.id == "new-amp")
+            .expect("unavailable Amp row");
+        assert_eq!(
+            amp.detail.as_deref(),
+            Some("Missing amp-bin · Install Amp.")
+        );
+        assert_eq!(
+            amp.command,
+            PaletteCommand::UnavailableAgent {
+                setup_url: Some("https://ampcode.com/manual".into())
+            }
+        );
+    }
 
     #[test]
     fn action_list_matches_swift_order_and_dynamic_default() {
@@ -427,13 +552,13 @@ mod tests {
             name: "diri".into(),
             pinned_order: None,
         };
-        let result = actions(DefaultAgent::Codex, &[project], &[], None);
+        let result = actions(AgentKind::CODEX, &catalog(), &[project], &[], None);
         let ids: Vec<_> = result.iter().map(|action| action.id.as_str()).collect();
         assert_eq!(
             ids,
             [
                 "new-default",
-                "new-claudeCode",
+                "new-claude-code",
                 "new-cursor",
                 "new-gemini",
                 "new-terminal",
@@ -470,7 +595,7 @@ mod tests {
                 node: None,
             },
         ];
-        let result = actions(DefaultAgent::ClaudeCode, &[], &hosts, None);
+        let result = actions(AgentKind::CLAUDE_CODE, &catalog(), &[], &hosts, None);
         let forge_actions: Vec<_> = result
             .iter()
             .filter(|action| action.id.ends_with("-on-forge"))
@@ -479,8 +604,8 @@ mod tests {
             .iter()
             .filter(|action| action.id.ends_with("-on-studio"))
             .collect();
-        assert_eq!(forge_actions.len(), DefaultAgent::ALL.len());
-        assert_eq!(studio_actions.len(), DefaultAgent::ALL.len());
+        assert_eq!(forge_actions.len(), 4);
+        assert_eq!(studio_actions.len(), 4);
         assert_eq!(forge_actions[0].title, "New Claude Code on Forge");
         assert_eq!(forge_actions[0].system_image, "network");
         assert_eq!(studio_actions[0].title, "New Claude Code on Studio Mac");
@@ -488,7 +613,7 @@ mod tests {
         assert_eq!(
             forge_actions[0].command,
             PaletteCommand::SpawnAgent {
-                agent: DefaultAgent::ClaudeCode,
+                agent: AgentKind::CLAUDE_CODE,
                 cwd: None,
                 host: Some("forge".into()),
             }
@@ -496,7 +621,7 @@ mod tests {
         // Remote entries slot between the per-project block and the tail.
         let first_remote = result
             .iter()
-            .position(|action| action.id == "new-claudeCode-on-forge")
+            .position(|action| action.id == "new-claude-code-on-forge")
             .unwrap();
         let worktrees = result
             .iter()
@@ -515,7 +640,8 @@ mod tests {
             node: None,
         };
         let result = actions_for_default_host(
-            DefaultAgent::ClaudeCode,
+            AgentKind::CLAUDE_CODE,
+            &catalog(),
             &[],
             std::slice::from_ref(&host),
             None,
@@ -527,7 +653,7 @@ mod tests {
         assert_eq!(
             result[0].command,
             PaletteCommand::SpawnAgent {
-                agent: DefaultAgent::ClaudeCode,
+                agent: AgentKind::CLAUDE_CODE,
                 cwd: None,
                 host: Some("forge".into()),
             }
@@ -593,7 +719,7 @@ mod tests {
 
         // Local Claude session → one "Move Session to <host>" per host.
         let local = claude_session(None);
-        let result = actions(DefaultAgent::ClaudeCode, &[], hosts, Some(&local));
+        let result = actions(AgentKind::CLAUDE_CODE, &catalog(), &[], hosts, Some(&local));
         let migrate = result
             .iter()
             .find(|action| action.id == "migrate-to-forge")
@@ -608,7 +734,13 @@ mod tests {
 
         // Remote Claude session → a single "Move Session to Local".
         let remote = claude_session(Some("forge"));
-        let result = actions(DefaultAgent::ClaudeCode, &[], hosts, Some(&remote));
+        let result = actions(
+            AgentKind::CLAUDE_CODE,
+            &catalog(),
+            &[],
+            hosts,
+            Some(&remote),
+        );
         let back = result
             .iter()
             .find(|action| action.id == "migrate-to-local")
@@ -622,7 +754,7 @@ mod tests {
         // Non-Claude selections get no move entries; sync entries always show.
         let mut shell = claude_session(None);
         shell.kind = AgentKind::SHELL;
-        let result = actions(DefaultAgent::ClaudeCode, &[], hosts, Some(&shell));
+        let result = actions(AgentKind::CLAUDE_CODE, &catalog(), &[], hosts, Some(&shell));
         assert!(
             !result
                 .iter()
@@ -641,7 +773,7 @@ mod tests {
         );
 
         // No hosts configured → neither family appears.
-        let result = actions(DefaultAgent::ClaudeCode, &[], &[], Some(&local));
+        let result = actions(AgentKind::CLAUDE_CODE, &catalog(), &[], &[], Some(&local));
         assert!(!result.iter().any(|action| {
             action.id.starts_with("migrate-") || action.id.starts_with("sync-prefs-")
         }));
@@ -659,7 +791,8 @@ mod tests {
     #[test]
     fn empty_query_keeps_every_action_in_curated_order() {
         let all = actions(
-            DefaultAgent::ClaudeCode,
+            AgentKind::CLAUDE_CODE,
+            &catalog(),
             &[project("/work/diri", "diri")],
             &[],
             None,
@@ -674,7 +807,8 @@ mod tests {
     #[test]
     fn actions_are_found_by_title_acronym_synonym_and_project_path() {
         let all = actions(
-            DefaultAgent::ClaudeCode,
+            AgentKind::CLAUDE_CODE,
+            &catalog(),
             &[project("/work/anara", "anara")],
             &[],
             None,
@@ -700,7 +834,7 @@ mod tests {
 
     #[test]
     fn title_matches_outrank_keyword_matches_and_carry_highlights() {
-        let all = actions(DefaultAgent::ClaudeCode, &[], &[], None);
+        let all = actions(AgentKind::CLAUDE_CODE, &catalog(), &[], &[], None);
         let ranked = rank_actions(all, &FuzzyQuery::new("terminal"), &mut FuzzyMatcher::text());
         assert_eq!(ranked[0].item.id, "new-terminal");
         // "Terminal" starts at byte 4 of "New Terminal".
