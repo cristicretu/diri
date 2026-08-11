@@ -926,6 +926,14 @@ fn repair_persisted_agent_title(record: &mut SessionRecord) -> bool {
 
 fn fold_session_status(record: &mut SessionRecord, view: &SessionView) {
     record.status.clone_from(&view.status);
+    // Keep evidence only when it explains this exact canonical state. This is
+    // both a mixed-version guard and protection against observing the reducer
+    // and shared record on opposite sides of an in-flight transition.
+    record.status_evidence = view
+        .status_evidence
+        .as_ref()
+        .filter(|evidence| evidence.status == view.status)
+        .cloned();
     record.needs_input.clone_from(&view.needs_input);
 }
 
@@ -1001,6 +1009,7 @@ mod tests {
             agent_session_id: None,
             transcript_path: None,
             status: SessionStatus::Starting,
+            status_evidence: None,
             needs_input: None,
             resumability: Resumability::NotResumable,
             parent: None,
@@ -1409,6 +1418,7 @@ mod tests {
         let view = SessionView {
             id: "claude".to_owned(),
             status: SessionStatus::Working,
+            status_evidence: None,
             needs_input: None,
             title: Some("Repair remote attach".to_owned()),
             title_source: Some(TitleSource::AgentProvided),

@@ -90,6 +90,7 @@ pub(crate) struct ClientCore {
     events_subscribed: AtomicBool,
     last_seq: AtomicU64,
     shutdown_tx: watch::Sender<bool>,
+    retry_tx: watch::Sender<u64>,
 }
 
 impl ClientCore {
@@ -291,6 +292,7 @@ impl DaemonClient {
         ));
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (shutdown_tx, _) = watch::channel(false);
+        let (retry_tx, _) = watch::channel(0);
         Self {
             core: Arc::new(ClientCore {
                 socket_path: socket_path.into(),
@@ -305,6 +307,7 @@ impl DaemonClient {
                 events_subscribed: AtomicBool::new(false),
                 last_seq: AtomicU64::new(0),
                 shutdown_tx,
+                retry_tx,
             }),
             lifecycle: StdMutex::new(None),
         }
@@ -345,6 +348,13 @@ impl DaemonClient {
 
     pub fn connection_state(&self) -> watch::Receiver<ConnectionState> {
         self.core.state_tx.subscribe()
+    }
+
+    /// Wakes the reconnect loop out of its bounded backoff. The operation is
+    /// idempotent and never launches, kills, or replaces a daemon by itself.
+    pub fn retry_now(&self) {
+        let next = self.core.retry_tx.borrow().wrapping_add(1);
+        self.core.retry_tx.send_replace(next);
     }
 
     pub fn events(&self) -> broadcast::Receiver<EventEnvelope> {
@@ -801,6 +811,7 @@ struct AttemptOutcome {
 async fn run_lifecycle(core: Arc<ClientCore>) {
     let mut backoff = INITIAL_BACKOFF;
     let mut shutdown = core.shutdown_tx.subscribe();
+    let mut retries = core.retry_tx.subscribe();
     while !*shutdown.borrow() {
         core.set_state(ConnectionState::Connecting);
         let outcome = run_once(Arc::clone(&core), &mut shutdown).await;
@@ -816,6 +827,11 @@ async fn run_lifecycle(core: Arc<ClientCore>) {
         }
         tokio::select! {
             () = tokio::time::sleep(backoff) => {}
+            result = retries.changed() => {
+                if result.is_err() {
+                    break;
+                }
+            }
             result = shutdown.changed() => {
                 if result.is_err() || *shutdown.borrow() {
                     break;
@@ -912,6 +928,24 @@ mod tests {
     use std::error::Error;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn retry_now_wakes_the_lifecycle_signal_without_spawning_a_daemon() {
+        let client = DaemonClient::with_socket_path("/nonexistent/diri-test.sock");
+        let mut retries = client.core.retry_tx.subscribe();
+
+        client.retry_now();
+
+        retries.changed().await.expect("retry sender remains alive");
+        assert_eq!(*retries.borrow(), 1);
+        assert!(
+            client
+                .lifecycle
+                .lock()
+                .expect("lifecycle mutex poisoned")
+                .is_none()
+        );
+    }
 
     #[tokio::test]
     async fn live_daemon_control_round_trip() -> Result<(), Box<dyn Error>> {

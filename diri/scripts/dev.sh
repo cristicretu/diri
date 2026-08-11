@@ -17,7 +17,7 @@ Build and launch an unmistakable development copy of diri.
 
 Options:
   --release       Build with Cargo's release profile.
-  --settings TAB  Open Settings on general, terminal, resources, or remote.
+  --settings TAB  Open Settings on general, terminal, resources, remote, or diagnostics.
   -h, --help      Show this help.
 
 Arguments after -- are passed to cargo build. Options that change Cargo's
@@ -64,7 +64,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "${settings_preview}" in
-    ""|general|terminal|resources|remote) ;;
+    ""|general|terminal|resources|remote|diagnostics) ;;
     *)
         echo "error: unknown Settings tab: ${settings_preview}" >&2
         exit 2

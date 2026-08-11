@@ -1520,6 +1520,7 @@ mod tests {
             agent_session_id: None,
             transcript_path: None,
             status: SessionStatus::Working,
+            status_evidence: None,
             needs_input: None,
             resumability: Resumability::Live,
             parent: None,

@@ -560,6 +560,7 @@ mod tests {
             agent_session_id: Some("uuid".into()),
             transcript_path: None,
             status: diri_proto::SessionStatus::Idle,
+            status_evidence: None,
             needs_input: None,
             resumability: Resumability::Live,
             parent: None,

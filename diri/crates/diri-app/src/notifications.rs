@@ -500,6 +500,7 @@ mod tests {
             agent_session_id: None,
             transcript_path: None,
             status,
+            status_evidence: None,
             needs_input: Some(NeedsInputDetail {
                 kind: NeedsInputKind::Permission,
                 source: NeedsInputSource::ScreenScrape,

@@ -18,6 +18,7 @@ use crate::navigation::{
     NavigationEvent, NavigationOverlay, ToggleCommandPalette, ToggleQuickOpen,
 };
 use crate::notifications::{InAppBanner, NotificationSound};
+use crate::recovery::{RecoveryAction, RecoveryKind, RecoveryNotice};
 use crate::seam::{SeamSlide, toggle_has_settled};
 use crate::session_surfaces::SessionSurfaces;
 use crate::sidebar::{PreviewScenario, Sidebar, SidebarEvent};
@@ -1862,11 +1863,128 @@ impl RootView {
             .into_any_element(),
         )
     }
+
+    fn recovery_notice(&self, notice: RecoveryNotice, colors: SemanticColors) -> AnyElement {
+        let accent = match notice.kind {
+            RecoveryKind::Connecting
+            | RecoveryKind::Reconnecting
+            | RecoveryKind::RetryingAction => colors.secondary,
+            RecoveryKind::ManualAttention | RecoveryKind::ActionFailed => Ink::ATTENTION,
+        };
+        let mut bar = div()
+            .id("recovery-notice")
+            .debug_selector(|| "RECOVERY_NOTICE".to_owned())
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(px(42.0))
+            .px(px(14.0))
+            .flex()
+            .items_center()
+            .gap(px(9.0))
+            .bg(colors.sidebar_surface())
+            .border_b_1()
+            .border_color(colors.primary.alpha(0.08))
+            .text_color(colors.primary)
+            .child(div().size(px(7.0)).flex_none().rounded_full().bg(accent))
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .flex_1()
+                    .flex()
+                    .items_baseline()
+                    .gap(px(7.0))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(Typo::ROW_EMPHASIZED.size))
+                            .font_weight(Typo::ROW_EMPHASIZED.weight)
+                            .child(notice.title),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .text_ellipsis()
+                            .text_size(px(Typo::META.size))
+                            .text_color(colors.secondary)
+                            .child(bounded_notice_body(&notice.body)),
+                    ),
+            );
+        if let Some((action, label)) = notice.primary_action {
+            let store = Arc::clone(&self.services.store.store);
+            bar = bar.child(
+                div()
+                    .id("recovery-primary-action")
+                    .h(px(27.0))
+                    .px(px(9.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .rounded(px(Radius::ROW))
+                    .cursor_pointer()
+                    .bg(colors.primary.alpha(0.075))
+                    .hover(move |button| button.bg(colors.primary.alpha(0.12)))
+                    .text_size(px(Typo::META.size))
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(label)
+                    .on_click(move |_, _, cx| {
+                        let mut store = store.write().expect("session store lock poisoned");
+                        match action {
+                            RecoveryAction::RetryConnection => store.retry_connection(),
+                            RecoveryAction::RetryAction => store.retry_last_action(),
+                        }
+                        cx.stop_propagation();
+                    }),
+            );
+        }
+        if notice.dismissible {
+            let store = Arc::clone(&self.services.store.store);
+            bar = bar.child(
+                div()
+                    .id("dismiss-recovery-notice")
+                    .size(px(24.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(Radius::CHIP))
+                    .cursor_pointer()
+                    .hover(move |button| button.bg(colors.primary.alpha(0.06)))
+                    .child(sf_symbol_weighted(
+                        "xmark",
+                        8.5,
+                        SymbolWeight::Bold,
+                        colors.tertiary,
+                    ))
+                    .on_click(move |_, _, cx| {
+                        store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .dismiss_action_failure();
+                        cx.stop_propagation();
+                    }),
+            );
+        }
+        bar.into_any_element()
+    }
 }
 
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.colors();
+        let recovery_notice = if self.preview {
+            None
+        } else {
+            let store = self
+                .services
+                .store
+                .store
+                .read()
+                .expect("session store lock poisoned");
+            RecoveryNotice::resolve(store.daemon_state(), store.action_failure())
+        };
+        let recovery_height = if recovery_notice.is_some() { 42.0 } else { 0.0 };
         let launcher_open = self.launcher.read(cx).is_open();
         let sidebar_visible = self.sidebar.read(cx).is_visible();
         let sidebar_width = self.sidebar.read(cx).width();
@@ -1918,7 +2036,9 @@ impl Render for RootView {
 
         let mut root = div()
             .id("root")
+            .relative()
             .size_full()
+            .pt(px(recovery_height))
             // Real SF Pro (registered from SFNS.ttf at startup) for every UI
             // surface; the terminal grid sets its own mono font.
             .font_family(crate::fonts::ui_family())
@@ -2032,17 +2152,32 @@ impl Render for RootView {
         if let Some(status) = self.status_banner(colors, cx) {
             root = root.child(status);
         }
+        if let Some(notice) = recovery_notice {
+            root = root.child(self.recovery_notice(notice, colors));
+        }
         if let Some(build) = &self.services.dev_build {
-            root = root.child(dev_build_marker(build.marker_label(), colors));
+            root = root.child(dev_build_marker(
+                build.marker_label(),
+                colors,
+                recovery_height + 10.0,
+            ));
         }
         root
     }
 }
 
-fn dev_build_marker(label: &str, colors: SemanticColors) -> AnyElement {
+fn bounded_notice_body(body: &str) -> String {
+    body.trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(240)
+        .collect()
+}
+
+fn dev_build_marker(label: &str, colors: SemanticColors, top: f32) -> AnyElement {
     div()
         .absolute()
-        .top(px(10.0))
+        .top(px(top))
         .left_0()
         .right_0()
         .flex()
