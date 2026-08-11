@@ -225,17 +225,65 @@ fn login_shell() -> String {
 /// space-separated list, so `echo $PATH` produces garbage there — and `-i -l`
 /// sources both interactive and login files, which is where agent PATHs are
 /// actually configured.
+///
+/// Hard ceiling: wait for the shell to exit, then read stdout. On timeout,
+/// SIGKILL the process group (not SIGTERM — rc files can trap that) and fall
+/// back. Never block on an unbounded pipe read while the writer may still live.
 #[cfg(unix)]
 fn login_path(shell: &str) -> Option<String> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
     let fallback = || {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
         format!("{home}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
     };
-    let output = std::process::Command::new(shell)
-        .args(["-i", "-l", "-c", "printenv PATH"])
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let mut child = unsafe {
+        Command::new(shell)
+            .args(["-i", "-l", "-c", "printenv PATH"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .pre_exec(|| {
+                // Own process group so trapped shells / hung children die with us.
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            })
+            .spawn()
+    }
+    .ok()?;
+
+    const CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
+    let started = Instant::now();
+    let timed_out = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break false,
+            Ok(None) if started.elapsed() < CAPTURE_TIMEOUT => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) | Err(_) => break true,
+        }
+    };
+
+    if timed_out {
+        let pid = child.id() as i32;
+        // SAFETY: pid is this child's id; negative targets its process group.
+        unsafe {
+            let _ = libc::kill(-pid, libc::SIGKILL);
+            let _ = libc::kill(pid, libc::SIGKILL);
+        }
+        let _ = child.wait();
+        return Some(fallback());
+    }
+
+    let mut stdout = child.stdout.take()?;
+    let mut bytes = Vec::new();
+    let _ = stdout.read_to_end(&mut bytes);
+    let stdout = String::from_utf8_lossy(&bytes);
     // Interactive shells may print a greeting; take the last line that looks
     // like a PATH.
     let path = stdout

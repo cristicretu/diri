@@ -187,6 +187,9 @@ pub fn injection_args_with_cursor(
 
 /// Writes `<inject>/cursor-plugin/<session>/` with plugin manifest, optional
 /// `mcp.json`, and optional `hooks/hooks.json`. Returns the plugin directory.
+///
+/// Always stages into a fresh temp dir and replaces the live plugin tree so a
+/// resume that disables MCP or hooks cannot leave the previous files active.
 pub fn write_cursor_plugin(
     inject_dir: &Path,
     cli_path: &Path,
@@ -195,10 +198,14 @@ pub fn write_cursor_plugin(
     mcp: bool,
     hooks: bool,
 ) -> io::Result<PathBuf> {
-    let plugin_dir = inject_dir.join("cursor-plugin").join(session_id);
-    std::fs::create_dir_all(plugin_dir.join(".cursor-plugin"))?;
+    let plugin_root = inject_dir.join("cursor-plugin");
+    std::fs::create_dir_all(&plugin_root)?;
+    let plugin_dir = plugin_root.join(session_id);
+    let staging = plugin_root.join(format!(".{session_id}.{}.tmp", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(staging.join(".cursor-plugin"))?;
     write_atomic(
-        &plugin_dir.join(".cursor-plugin/plugin.json"),
+        &staging.join(".cursor-plugin/plugin.json"),
         &serde_json::to_vec_pretty(&json!({
             "name": "dirijor",
             "version": "0.1.0",
@@ -214,7 +221,7 @@ pub fn write_cursor_plugin(
             .chain(target_args)
             .collect::<Vec<_>>();
         write_atomic(
-            &plugin_dir.join("mcp.json"),
+            &staging.join("mcp.json"),
             &serde_json::to_vec_pretty(&json!({
                 "mcpServers": {
                     "dirijor": {
@@ -233,11 +240,11 @@ pub fn write_cursor_plugin(
     }
 
     if hooks {
-        std::fs::create_dir_all(plugin_dir.join("hooks"))?;
+        std::fs::create_dir_all(staging.join("hooks"))?;
         // Absolute CLI path: Cursor does not expand $DIRIJOR_CLI in hook cmds.
         let quoted = shell_single_quote(&cli_path.to_string_lossy());
         write_atomic(
-            &plugin_dir.join("hooks/hooks.json"),
+            &staging.join("hooks/hooks.json"),
             &serde_json::to_vec_pretty(&json!({
                 "version": 1,
                 "hooks": {
@@ -250,7 +257,24 @@ pub fn write_cursor_plugin(
         )?;
     }
 
-    Ok(plugin_dir)
+    let backup = plugin_root.join(format!(".{session_id}.{}.old", std::process::id()));
+    let _ = std::fs::remove_dir_all(&backup);
+    if plugin_dir.exists() {
+        std::fs::rename(&plugin_dir, &backup)?;
+    }
+    match std::fs::rename(&staging, &plugin_dir) {
+        Ok(()) => {
+            let _ = std::fs::remove_dir_all(&backup);
+            Ok(plugin_dir)
+        }
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            if backup.exists() {
+                let _ = std::fs::rename(&backup, &plugin_dir);
+            }
+            Err(error)
+        }
+    }
 }
 
 fn shell_single_quote(s: &str) -> String {
@@ -463,6 +487,57 @@ mod tests {
         let stop = hooks["hooks"]["stop"][0]["command"].as_str().expect("cmd");
         assert!(stop.contains("hook Stop"), "{stop}");
         assert!(stop.contains("dirijor"), "{stop}");
+    }
+
+    #[test]
+    fn cursor_plugin_rewrite_drops_disabled_components() {
+        let temp = tempfile::tempdir().expect("temp");
+        let cli = temp.path().join("bin/dirijor");
+        std::fs::create_dir_all(cli.parent().unwrap()).expect("mkdir");
+        std::fs::write(&cli, b"#!/bin/sh\n").expect("cli");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let socket = temp.path().join("d.sock");
+        let both = InjectionSpec {
+            cursor_mcp: true,
+            cursor_hooks: true,
+            ..Default::default()
+        };
+        let args = injection_args_with_cursor(
+            &both,
+            temp.path(),
+            &cli,
+            Some(CursorInject {
+                session_id: "s_reuse",
+                socket_path: &socket,
+            }),
+        );
+        let plugin = Path::new(&args[1]);
+        assert!(plugin.join("mcp.json").is_file());
+        assert!(plugin.join("hooks/hooks.json").is_file());
+
+        let hooks_only = InjectionSpec {
+            cursor_mcp: false,
+            cursor_hooks: true,
+            ..Default::default()
+        };
+        let _ = injection_args_with_cursor(
+            &hooks_only,
+            temp.path(),
+            &cli,
+            Some(CursorInject {
+                session_id: "s_reuse",
+                socket_path: &socket,
+            }),
+        );
+        assert!(
+            !plugin.join("mcp.json").exists(),
+            "disabled mcp.json must not survive a rewrite"
+        );
+        assert!(plugin.join("hooks/hooks.json").is_file());
     }
 
     #[test]

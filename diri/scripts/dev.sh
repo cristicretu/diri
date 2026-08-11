@@ -98,15 +98,24 @@ mkdir -p "${target_dir}"
 
 cd "${workspace_dir}"
 echo "==> Building ${display_name} (${profile})"
+# diri-app does not pull dirijord-rs into target/<profile>/; build both so a
+# clean checkout launches against this tree's Engine instead of a missing or
+# stale binary (installed app / leftover debug build).
 if (( ${#cargo_args[@]} > 0 )); then
-    cargo build --package diri-app --bin diri "${cargo_args[@]}"
+    cargo build --package diri-app --bin diri --package diri-engine --bin dirijord-rs "${cargo_args[@]}"
 else
-    cargo build --package diri-app --bin diri
+    cargo build --package diri-app --bin diri --package diri-engine --bin dirijord-rs
 fi
 
 binary="${target_dir}/${profile}/diri"
 if [[ ! -x "${binary}" ]]; then
     echo "error: cargo did not produce ${binary}" >&2
+    exit 1
+fi
+
+engine_bin="${target_dir}/${profile}/dirijord-rs"
+if [[ ! -x "${engine_bin}" ]]; then
+    echo "error: cargo did not produce ${engine_bin}" >&2
     exit 1
 fi
 

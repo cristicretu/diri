@@ -1,6 +1,7 @@
 import DirijorCore
 import DirijorProtocol
 import Foundation
+import Darwin
 
 /// Builds spawn command lines + env with hook/notify injection for each agent
 /// kind. Pure — fully unit-testable.
@@ -417,6 +418,9 @@ public enum InjectionBuilder {
 
     /// Session-local Cursor plugin: `.cursor-plugin/plugin.json` + optional
     /// `mcp.json` / `hooks/hooks.json`.
+    ///
+    /// Stages into a fresh temp directory and replaces the live plugin tree so
+    /// a resume that disables MCP or hooks cannot leave the previous files.
     public static func writeCursorPlugin(
         into pluginDir: URL,
         mcp: Bool,
@@ -426,8 +430,14 @@ public enum InjectionBuilder {
         cliPath: String
     ) throws {
         let fm = FileManager.default
-        try fm.createDirectory(at: pluginDir, withIntermediateDirectories: true)
-        let manifestDir = pluginDir.appendingPathComponent(".cursor-plugin", isDirectory: true)
+        let parent = pluginDir.deletingLastPathComponent()
+        try fm.createDirectory(at: parent, withIntermediateDirectories: true)
+        let staging = parent.appendingPathComponent(
+            ".\(pluginDir.lastPathComponent).\(getpid()).tmp", isDirectory: true)
+        try? fm.removeItem(at: staging)
+        try fm.createDirectory(at: staging, withIntermediateDirectories: true)
+
+        let manifestDir = staging.appendingPathComponent(".cursor-plugin", isDirectory: true)
         try fm.createDirectory(at: manifestDir, withIntermediateDirectories: true)
         let manifest: [String: Any] = [
             "name": "dirijor",
@@ -456,11 +466,11 @@ public enum InjectionBuilder {
             try JSONSerialization.data(
                 withJSONObject: mcpConfig, options: [.prettyPrinted, .sortedKeys]
             )
-            .write(to: pluginDir.appendingPathComponent("mcp.json"), options: .atomic)
+            .write(to: staging.appendingPathComponent("mcp.json"), options: .atomic)
         }
 
         if hooks {
-            let hooksDir = pluginDir.appendingPathComponent("hooks", isDirectory: true)
+            let hooksDir = staging.appendingPathComponent("hooks", isDirectory: true)
             try fm.createDirectory(at: hooksDir, withIntermediateDirectories: true)
             // Absolute CLI path: Cursor does not expand $DIRIJOR_CLI in hook
             // commands the way Claude's settings do. Reuse the Claude hook
@@ -478,6 +488,23 @@ public enum InjectionBuilder {
                 withJSONObject: hooksConfig, options: [.prettyPrinted, .sortedKeys]
             )
             .write(to: hooksDir.appendingPathComponent("hooks.json"), options: .atomic)
+        }
+
+        let backup = parent.appendingPathComponent(
+            ".\(pluginDir.lastPathComponent).\(getpid()).old", isDirectory: true)
+        try? fm.removeItem(at: backup)
+        if fm.fileExists(atPath: pluginDir.path) {
+            try fm.moveItem(at: pluginDir, to: backup)
+        }
+        do {
+            try fm.moveItem(at: staging, to: pluginDir)
+            try? fm.removeItem(at: backup)
+        } catch {
+            try? fm.removeItem(at: staging)
+            if fm.fileExists(atPath: backup.path) {
+                try? fm.moveItem(at: backup, to: pluginDir)
+            }
+            throw error
         }
     }
 

@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// Resolves the user's real interactive-login environment so agents spawned by
@@ -44,18 +45,31 @@ public enum LoginEnvironment {
         process.standardError = FileHandle.nullDevice
         // No TTY: some interactive rc files wait on input forever. A hung
         // capture used to brick daemon init (Daemon → BrowserPool → PATH) so
-        // the socket never came up — kill and fall back instead.
+        // the socket never came up — kill the process group and fall back.
+        // Wait for exit first (bounded), then read the pipe: an unbounded
+        // readDataToEndOfFile while the writer still lives is what wedged
+        // past SIGTERM when a child held stdout open.
         let captureTimeoutSeconds: TimeInterval = 5
         do {
             try process.run()
-            let watchdog = DispatchWorkItem {
-                if process.isRunning { process.terminate() }
+            let pid = process.processIdentifier
+            // Own process group so a trapped shell's children die with it.
+            _ = setpgid(pid, pid)
+
+            let exited = DispatchGroup()
+            exited.enter()
+            DispatchQueue.global().async {
+                process.waitUntilExit()
+                exited.leave()
             }
-            DispatchQueue.global().asyncAfter(
-                deadline: .now() + captureTimeoutSeconds, execute: watchdog)
+            if exited.wait(timeout: .now() + captureTimeoutSeconds) == .timedOut {
+                kill(-pid, SIGKILL)
+                kill(pid, SIGKILL)
+                process.waitUntilExit()
+                return fallback
+            }
+
             let data = out.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-            watchdog.cancel()
             // Interactive shells may print a greeting; take the last line that
             // looks like a PATH (contains a "/" and a ":").
             let lines = String(decoding: data, as: UTF8.self)

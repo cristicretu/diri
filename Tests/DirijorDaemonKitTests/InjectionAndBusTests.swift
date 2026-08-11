@@ -352,6 +352,50 @@ func codexWrapperReentersShellAndResolvesFreshInteractivePath() throws {
     #expect(stop.contains(cli.path))
 }
 
+@Test func cursorPluginRewriteDropsDisabledComponents() throws {
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("dirijor-cursor-plugin-reuse-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let cli = dir.appendingPathComponent("bin/dirijor")
+    try FileManager.default.createDirectory(
+        at: cli.deletingLastPathComponent(), withIntermediateDirectories: true)
+    FileManager.default.createFile(atPath: cli.path, contents: Data("#!/bin/sh\n".utf8))
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cli.path)
+
+    let sessionID = SessionID(rawValue: "s_reuse")
+    let plugin = dir
+        .appendingPathComponent("cursor-plugin", isDirectory: true)
+        .appendingPathComponent("s_reuse", isDirectory: true)
+
+    try InjectionBuilder.writeCursorPlugin(
+        into: plugin,
+        mcp: true,
+        hooks: true,
+        sessionID: sessionID,
+        socketPath: "/tmp/d.sock",
+        cliPath: cli.path
+    )
+    #expect(FileManager.default.fileExists(atPath: plugin.appendingPathComponent("mcp.json").path))
+    #expect(
+        FileManager.default.fileExists(
+            atPath: plugin.appendingPathComponent("hooks/hooks.json").path))
+
+    try InjectionBuilder.writeCursorPlugin(
+        into: plugin,
+        mcp: false,
+        hooks: true,
+        sessionID: sessionID,
+        socketPath: "/tmp/d.sock",
+        cliPath: cli.path
+    )
+    #expect(
+        !FileManager.default.fileExists(atPath: plugin.appendingPathComponent("mcp.json").path))
+    #expect(
+        FileManager.default.fileExists(
+            atPath: plugin.appendingPathComponent("hooks/hooks.json").path))
+}
+
 @Test func eventBusSeqAndReplay() async {
     let bus = EventBus(ringCapacity: 8)
     await bus.publish(name: "a", params: .null)
