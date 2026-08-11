@@ -1004,12 +1004,10 @@ impl TerminalPane {
         if !applied {
             return;
         }
-        let repaint = terminal_damage_should_repaint(
-            window.is_window_active(),
-            selected.as_ref(),
-            &id,
-            changed,
-        );
+        // Visibility/occlusion is GPUI's job (display-link stops when the
+        // window is truly hidden). `is_window_active` is only OS focus, so
+        // gating on it freezes a still-visible window on another monitor.
+        let repaint = terminal_damage_should_repaint(selected.as_ref(), &id, changed);
         if schedule_find {
             self.schedule_find(id, Duration::from_millis(100), window, cx);
         }
@@ -3251,12 +3249,11 @@ fn sorted_checks(pr: &PullRequestStatus) -> Vec<PrCheck> {
 }
 
 fn terminal_damage_should_repaint(
-    window_active: bool,
     selected: Option<&SessionId>,
     updated: &SessionId,
     changed: bool,
 ) -> bool {
-    window_active && changed && selected == Some(updated)
+    changed && selected == Some(updated)
 }
 
 /// What to do with a geometry change that just landed.
@@ -3880,33 +3877,27 @@ mod tests {
     }
 
     #[test]
-    fn offscreen_terminal_damage_updates_its_buffer_without_repainting_the_window() {
+    fn unselected_terminal_damage_updates_its_buffer_without_repainting_the_window() {
         let selected = SessionId::new("selected");
         let background = SessionId::new("background");
 
+        // Selected session damage always paints, including when the window is
+        // unfocused-but-visible on another monitor. GPUI occlusion handles
+        // truly hidden windows.
         assert!(terminal_damage_should_repaint(
-            true,
             Some(&selected),
             &selected,
             true
         ));
         assert!(!terminal_damage_should_repaint(
-            true,
             Some(&selected),
             &background,
             true
         ));
         assert!(!terminal_damage_should_repaint(
-            true,
             Some(&selected),
             &selected,
             false
-        ));
-        assert!(!terminal_damage_should_repaint(
-            false,
-            Some(&selected),
-            &selected,
-            true
         ));
     }
 
