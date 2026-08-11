@@ -27,7 +27,9 @@ silicon and Intel), signed and notarized. diri updates itself from there.
 
 The tap has to be named in full — a bare `diri` resolves only against Homebrew's default
 taps. The cask lives in [cristicretu/homebrew-diri](https://github.com/cristicretu/homebrew-diri)
-rather than `homebrew-cask`, which requires a notability threshold diri does not meet yet.
+rather than `homebrew-cask` until the repository-age gate for an official submission opens
+on September 3, 2026, at 10:08:23 UTC. The current status and tested migration procedure are
+recorded in the [official-cask submission runbook](docs/HOMEBREW_CASK_SUBMISSION.md).
 
 macOS 15 or newer.
 

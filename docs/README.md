@@ -9,6 +9,8 @@
   capture safe fixtures, and validate both engines.
 - [Remote nodes](../diri/NODE.md) — run sessions over SSH and tmux.
 - [Packaging](../diri/PACKAGING.md) — build, signing, and notarization.
+- [Official Homebrew cask submission](HOMEBREW_CASK_SUBMISSION.md) — eligibility,
+  release verification, validation, and migration from the maintained tap.
 - [Updates and releases](../diri/UPDATING.md) — updater design and release flow.
 - [Engine port history](../diri/PORT.md) — record of the completed Rust migration.
 - [Performance](../diri/PERF.md) — budgets and measurement workflow.
