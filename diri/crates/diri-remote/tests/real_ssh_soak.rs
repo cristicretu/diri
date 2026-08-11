@@ -129,9 +129,13 @@ fn real_ssh_detach_soak_reconnects_the_same_process() {
             .process_state,
     );
 
-    // Closing Session drops the SSH Bridge. The remote Holder and process
-    // must survive independently for the requested soak interval.
+    // Closing Session drops the SSH Bridge. Closing the ControlMaster then
+    // tears down Diri's final underlying SSH connection; the remote Holder
+    // and process must survive independently for the requested soak interval.
     drop(session);
+    manager
+        .close_control_masters()
+        .expect("close every Diri SSH connection before soak");
     std::thread::sleep(Duration::from_secs(soak));
 
     let binding = load_binding(&bindings, &session_id);
@@ -178,6 +182,42 @@ fn real_ssh_detach_soak_reconnects_the_same_process() {
         .terminate(Duration::from_millis(500))
         .expect("clean Holder state");
     cleanup.armed = false;
+}
+
+#[test]
+#[ignore = "requires a disposable PAM/logind SSH account that kills logout processes"]
+fn real_ssh_pam_logout_is_classified_non_persistent() {
+    let target = required_env("DIRI_REMOTE_SSH_TARGET");
+    let helper_path = env::var_os("DIRI_REMOTE_HELPER_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_diri-remote")));
+    let ssh = env::var_os("DIRI_REMOTE_SSH_EXECUTABLE").unwrap_or_else(|| "ssh".into());
+    let temporary = tempfile::tempdir().expect("local acceptance state");
+    let manager = RemoteManager::new(
+        ProcessExecutor::new(ssh),
+        ArtifactCatalog::from_native_helper(&helper_path).expect("native Helper catalog"),
+        temporary.path().join("ssh-control"),
+    )
+    .expect("remote manager");
+    let host = HostEntry {
+        id: "real-ssh-pam-logout".into(),
+        name: None,
+        ssh: target,
+        default_cwd: Some("~".into()),
+        node: None,
+    };
+    let helper = manager.ensure_helper(&host).expect("install exact Helper");
+
+    assert_eq!(
+        manager
+            .probe_persistence(&host, &helper)
+            .expect("probe remote persistence"),
+        PersistenceCapability::NonPersistent,
+        "a PAM/logind account that kills logout processes must never claim detach support"
+    );
+    manager
+        .close_control_masters()
+        .expect("close PAM probe ControlMaster");
 }
 
 fn session_spec(id: &str, local_root: &Path, remote: Option<RemoteSessionSpec>) -> SessionSpec {

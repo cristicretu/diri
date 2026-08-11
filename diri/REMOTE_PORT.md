@@ -358,10 +358,11 @@ restart/adoption preserves still-running sessions.
 every Linux host. PAM or `systemd-logind` policy may kill all processes from a
 login session.
 
-Each host is therefore probed rather than assumed. Diri launches a temporary
-Holder, closes the first SSH channel, reconnects through an independent channel,
-checks the process identity, and cleans up the test session. The result is one
-of:
+Each host is therefore probed rather than assumed. Diri closes any finite-lived
+bootstrap ControlMaster, launches a temporary Holder over a non-multiplexed SSH
+connection, waits for that underlying connection to close, reconnects over a
+second non-multiplexed connection, checks the process identity, and cleans up
+the test session. The result is one of:
 
 ```text
 native-detach
@@ -573,10 +574,14 @@ OpenSSH detach/reconnect soak. These are mandatory release gates and do not use
 Rosetta or a developer's real SSH host.
 
 The acceptance suite validates release-mode UDS performance, a 23 MiB slow-
-attach recovery case, and transient user-supervisor behavior. The real SSH soak
-verifies bootstrap, login-shell handling, persistence probing, Bridge
-disconnection, same-PID/same-incarnation reconnection, snapshot restoration,
-continued input, and cleanup.
+attach recovery case, transient user-supervisor behavior, and an actual Holder
+PTY's `isatty`, canonical editing, resize, and `SIGWINCH` behavior. The real SSH
+soak verifies bootstrap, login-shell handling, persistence probing, Bridge
+disconnection, explicit ControlMaster teardown, same-PID/same-incarnation
+reconnection, snapshot restoration, continued input, and cleanup. A separate
+PAM/logind endpoint with logout process cleanup enabled verifies that such a
+host is classified as non-persistent rather than receiving a false detach
+guarantee.
 
 An optional manual soak uses:
 

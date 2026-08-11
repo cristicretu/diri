@@ -188,6 +188,51 @@ jobs:
           DIRI_REMOTE_SSH_TARGET: diri-ci-soak
           DIRI_REMOTE_SOAK_SECONDS: "5"
         run: scripts/remote-ssh-soak.sh
+      - name: Start PAM/logind logout-policy endpoint
+        run: |
+          sudo useradd --create-home --shell /bin/bash diri-pam
+          sudo usermod -p '*' diri-pam
+          sudo install -d -m 700 -o diri-pam -g diri-pam /home/diri-pam/.ssh
+          sudo install -m 600 -o diri-pam -g diri-pam \
+            "${RUNNER_TEMP}/diri_ci_key.pub" /home/diri-pam/.ssh/authorized_keys
+          sudo mkdir -p /etc/systemd/logind.conf.d
+          printf '%s\n' \
+            '[Login]' \
+            'KillUserProcesses=yes' \
+            'UserStopDelaySec=0' \
+            | sudo tee /etc/systemd/logind.conf.d/99-diri-ci.conf >/dev/null
+          sudo systemctl restart systemd-logind
+          printf '%s\n' \
+            'Host diri-ci-pam' \
+            '  HostName 127.0.0.1' \
+            '  Port 2223' \
+            '  User diri-pam' \
+            "  IdentityFile ${RUNNER_TEMP}/diri_ci_key" \
+            '  IdentitiesOnly yes' \
+            '  StrictHostKeyChecking accept-new' \
+            "  UserKnownHostsFile ${RUNNER_TEMP}/known_hosts" \
+            >> "${HOME}/.ssh/config"
+          sudo /usr/sbin/sshd -D -e -p 2223 \
+            -o PasswordAuthentication=no \
+            -o KbdInteractiveAuthentication=no \
+            -o UsePAM=yes \
+            -o AllowUsers=diri-pam \
+            -o PidFile="${RUNNER_TEMP}/sshd/pam-sshd.pid" \
+            >"${RUNNER_TEMP}/sshd/pam-sshd.log" 2>&1 &
+          for attempt in $(seq 1 50); do
+            if ssh -o BatchMode=yes diri-ci-pam true; then
+              exit 0
+            fi
+            sleep 0.1
+          done
+          cat "${RUNNER_TEMP}/sshd/pam-sshd.log"
+          exit 1
+      - name: Verify PAM/logind logout is not misclassified
+        env:
+          DIRI_REMOTE_SSH_TARGET: diri-ci-pam
+        run: >-
+          cargo test --locked --release --package diri-remote --test real_ssh_soak
+          real_ssh_pam_logout_is_classified_non_persistent -- --ignored --exact --nocapture
 
   bundle:
     name: Package diri.app (unsigned)

@@ -2098,7 +2098,7 @@ impl ControlServer {
                         .is_ok_and(|registry| registry.live_count() == 0);
                     if still_idle {
                         if let Some(remote) = remote {
-                            remote.close_control_masters();
+                            let _ = remote.close_control_masters();
                         }
                         if let Some(holder) = holder {
                             let paths = crate::holder::HolderManagerPaths::new(&holder.holders_dir);

@@ -40,6 +40,11 @@ impl SshTransport {
         self
     }
 
+    #[must_use]
+    pub(crate) fn control_path(&self) -> &Path {
+        &self.control_path
+    }
+
     /// Long-lived connection used only to amortize authentication and SSH
     /// handshake cost. It is never a Session persistence mechanism.
     #[must_use]
@@ -101,12 +106,17 @@ impl SshTransport {
         command: HelperCommand,
     ) -> Result<CommandSpec, BootstrapError> {
         validate_component("build id", build_id)?;
-        Ok(self.channel(&format!(
+        let remote_command = format!(
             "set -eu; [ -d \"$HOME/.cache\" ] && [ ! -L \"$HOME/.cache\" ] || exit 73; exec \"$HOME/.cache/diri/bin/protocol-{}/{}/diri-remote\" {}",
             diri_proto::remote_pty::PROTOCOL_MAJOR,
             build_id,
             command.as_str()
-        )))
+        );
+        Ok(if command == HelperCommand::Persistence {
+            self.independent_channel(&remote_command)
+        } else {
+            self.channel(&remote_command)
+        })
     }
 
     /// Receives one artifact on stdin into a nonce-scoped owner-only path.
@@ -174,6 +184,29 @@ impl SshTransport {
         // End local option parsing before the user-configured destination.
         // A separator after the destination would instead become part of the
         // remote command sent to the login shell.
+        arguments.push(OsString::from("--"));
+        arguments.push(OsString::from(&self.destination));
+        arguments.push(OsString::from(posix_shell_command(remote_command)));
+        CommandSpec {
+            program: self.executable.clone(),
+            arguments,
+        }
+    }
+
+    /// Opens a fresh connection that cannot reuse or leave behind an OpenSSH
+    /// multiplexing master. Persistence probes use this path so returning from
+    /// the command proves that its underlying SSH connection has closed.
+    fn independent_channel(&self, remote_command: &str) -> CommandSpec {
+        let mut arguments = vec![
+            OsString::from("-T"),
+            OsString::from("-o"),
+            OsString::from("ControlMaster=no"),
+            OsString::from("-o"),
+            OsString::from("ControlPersist=no"),
+            OsString::from("-o"),
+            OsString::from("ControlPath=none"),
+        ];
+        push_keepalives(&mut arguments);
         arguments.push(OsString::from("--"));
         arguments.push(OsString::from(&self.destination));
         arguments.push(OsString::from(posix_shell_command(remote_command)));
@@ -285,6 +318,22 @@ mod tests {
             words.last().expect("command"),
             &posix_shell_command(PLATFORM_PROBE_COMMAND)
         );
+    }
+
+    #[test]
+    fn persistence_channels_never_share_an_ssh_connection() {
+        let transport = SshTransport::new(&host(), "/tmp/diri master/socket");
+        let words = words(
+            &transport
+                .helper_command("build-123", HelperCommand::Persistence)
+                .expect("persistence command"),
+        );
+
+        assert!(words.contains(&"ControlMaster=no".to_string()));
+        assert!(words.contains(&"ControlPersist=no".to_string()));
+        assert!(words.contains(&"ControlPath=none".to_string()));
+        assert!(!words.contains(&"ControlMaster=auto".to_string()));
+        assert!(!words.contains(&"ControlPath=/tmp/diri master/socket".to_string()));
     }
 
     #[test]

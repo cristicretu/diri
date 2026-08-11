@@ -379,6 +379,67 @@ fn detach_reconnect_preserves_pid_snapshot_and_input() {
 }
 
 #[test]
+fn holder_agent_has_a_real_editable_resizable_terminal() {
+    let temporary = tempfile::tempdir().expect("temp");
+    let state_dir = temporary.path().join("state");
+    let request = LaunchRequest {
+        session_id: "holder-terminal-capabilities".into(),
+        session_token: token(),
+        argv: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "stty erase '^?'; trap 'set -- $(stty size); printf \"winch=%sx%s\\n\" \"$1\" \"$2\"' WINCH; if [ -t 0 ] && [ -t 1 ] && [ -t 2 ]; then printf 'isatty=yes\\n'; else printf 'isatty=no\\n'; fi; printf 'ready>'; IFS= read -r line; printf 'line=<%s>\\n' \"$line\"; while :; do sleep 1; done"
+                .into(),
+        ],
+        cwd: "/".into(),
+        environment: vec![
+            diri_proto::remote_pty::EnvironmentVariable {
+                name: "PATH".into(),
+                value: "/usr/bin:/bin".into(),
+            },
+            diri_proto::remote_pty::EnvironmentVariable {
+                name: "TERM".into(),
+                value: "xterm-256color".into(),
+            },
+        ],
+        cols: 80,
+        rows: 24,
+        persistence: PersistenceCapability::NonPersistent,
+    };
+    let launch: LaunchResult = run_json("launch", &state_dir, Some(&request));
+    let mut attach = Attach::open(&state_dir, hello(&launch, Some(0), "terminal-capabilities"));
+
+    attach.receive_until(Duration::from_secs(3), |message| {
+        message_contains(message, "isatty=yes") && message_contains(message, "ready>")
+    });
+    attach.send(RemoteMessage::Terminal(Frame::input(
+        b"abc\x7fd\n".to_vec(),
+    )));
+    attach.receive_until(Duration::from_secs(3), |message| {
+        message_contains(message, "line=<abd>")
+    });
+
+    attach.send(RemoteMessage::Terminal(Frame::resize(100, 30)));
+    attach.receive_until(Duration::from_secs(4), |message| {
+        message_contains(message, "winch=30x100")
+    });
+
+    let killed: SessionInspection = run_json(
+        "kill",
+        &state_dir,
+        Some(&SessionSelector {
+            session_id: launch.session_id,
+            session_token: token(),
+            expected_incarnation: Some(launch.session_incarnation),
+        }),
+    );
+    assert!(matches!(
+        killed.process_state,
+        RemoteProcessState::Exited { .. }
+    ));
+}
+
+#[test]
 fn list_kill_and_gc_complete_the_session_lifecycle() {
     let temporary = tempfile::tempdir().expect("temp");
     let state_dir = temporary.path().join("state");
@@ -675,6 +736,17 @@ fn grid_text(grid: &diri_proto::grid::GridUpdate) -> String {
         lines.push(line.trim_end().to_string());
     }
     lines.join("\n")
+}
+
+fn message_contains(message: &RemoteMessage, needle: &str) -> bool {
+    match message {
+        RemoteMessage::Terminal(frame) => frame
+            .output_payload()
+            .is_some_and(|(_, bytes)| String::from_utf8_lossy(bytes).contains(needle)),
+        RemoteMessage::FullSnapshot(snapshot) => grid_text(&snapshot.grid).contains(needle),
+        RemoteMessage::GridDelta(delta) => grid_text(&delta.grid).contains(needle),
+        _ => false,
+    }
 }
 
 #[test]

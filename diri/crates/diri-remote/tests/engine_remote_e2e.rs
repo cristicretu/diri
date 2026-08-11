@@ -68,6 +68,56 @@ fn engine_lists_remote_directories_through_the_verified_helper() {
 }
 
 #[test]
+fn persistence_probe_closes_the_shared_master_before_independent_checks() {
+    let temporary = tempfile::tempdir().expect("temp");
+    let remote_home = temporary.path().join("remote-home");
+    let remote_state = temporary.path().join("remote-state");
+    let argv_log = temporary.path().join("ssh-argv.log");
+    fs::create_dir(&remote_home).expect("remote home");
+    let fake_ssh =
+        write_fake_ssh_with_argv_log(temporary.path(), &remote_home, &remote_state, &argv_log);
+    let manager = RemoteManager::new(
+        ProcessExecutor::new(fake_ssh),
+        ArtifactCatalog::from_native_helper(Path::new(helper())).expect("catalog"),
+        temporary.path().join("ssh-control"),
+    )
+    .expect("manager");
+    let host = HostEntry {
+        id: "persistence-fixture".into(),
+        name: None,
+        ssh: "fixture-host".into(),
+        default_cwd: Some("/".into()),
+        node: None,
+    };
+    let installed = manager.ensure_helper(&host).expect("bootstrap");
+    fs::write(&argv_log, b"").expect("clear bootstrap calls");
+
+    assert_eq!(
+        manager
+            .probe_persistence(&host, &installed)
+            .expect("persistence"),
+        PersistenceCapability::NativeDetach
+    );
+
+    let calls = fs::read_to_string(&argv_log).expect("SSH argv log");
+    let mut lines = calls.lines();
+    let teardown = lines.next().expect("control-master teardown");
+    assert!(
+        teardown.contains("<-O><exit>"),
+        "first persistence action did not close the shared master: {calls}"
+    );
+    let probes = lines
+        .filter(|line| line.contains(" persistence"))
+        .collect::<Vec<_>>();
+    assert_eq!(probes.len(), 3, "begin, check and cleanup: {calls}");
+    assert!(probes.iter().all(|line| {
+        line.contains("<ControlMaster=no>")
+            && line.contains("<ControlPersist=no>")
+            && line.contains("<ControlPath=none>")
+    }));
+}
+
+#[test]
 fn engine_bootstraps_detaches_and_adopts_the_same_remote_process() {
     let temporary = tempfile::tempdir().expect("temp");
     let remote_home = temporary.path().join("remote-home");
@@ -517,6 +567,26 @@ fn write_fake_ssh(root: &Path, home: &Path, state: &Path) -> std::path::PathBuf 
     )
     .expect("fake ssh script");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("mode");
+    path
+}
+
+fn write_fake_ssh_with_argv_log(
+    root: &Path,
+    home: &Path,
+    state: &Path,
+    argv_log: &Path,
+) -> std::path::PathBuf {
+    let path = root.join("ssh-argv-log");
+    write_executable_script(
+        &path,
+        &format!(
+            "#!/bin/sh\nprintf '<%s>' \"$@\" >> '{}'\nprintf '\\n' >> '{}'\ncase \" $* \" in\n  *' -O exit '*) exit 0;;\nesac\nexport HOME='{}'\nexport DIRI_REMOTE_STATE_DIR='{}'\nfor last; do :; done\nexec /bin/sh -c \"$last\"",
+            argv_log.display(),
+            argv_log.display(),
+            home.display(),
+            state.display(),
+        ),
+    );
     path
 }
 
