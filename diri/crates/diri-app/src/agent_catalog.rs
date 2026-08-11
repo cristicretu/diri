@@ -22,6 +22,15 @@ impl AgentOption {
     pub(crate) fn unavailable_label(&self) -> Option<String> {
         (!self.available).then(|| missing_binary_label(&self.binary))
     }
+
+    pub(crate) fn unavailable_detail(&self) -> Option<String> {
+        let mut detail = format!("{} · {}", self.unavailable_label()?, self.install_hint);
+        if let Some(sign_in_hint) = &self.sign_in_hint {
+            detail.push_str(" · ");
+            detail.push_str(sign_in_hint);
+        }
+        Some(detail)
+    }
 }
 
 /// Catalog rows in deterministic product order. An empty response means an
@@ -51,11 +60,16 @@ pub(crate) fn agent_options(catalog: &AgentReadinessResult) -> Vec<AgentOption> 
     options
 }
 
-/// Settings needs to expose the shell fallback when no manifest Agent can be
-/// launched, so a repaired preference remains visible and user-selectable.
+/// Settings and the launcher must expose the shell whenever default resolution
+/// can choose it. Available catalog extensions are valid explicit defaults,
+/// but they do not replace the first-class-or-shell repair policy for a removed
+/// preference.
 pub(crate) fn default_agent_options(catalog: &AgentReadinessResult) -> Vec<AgentOption> {
     let mut options = agent_options(catalog);
-    if !options.iter().any(|option| option.available) {
+    if !options
+        .iter()
+        .any(|option| option.available && option.first_class)
+    {
         options.push(AgentOption {
             kind: AgentKind::SHELL,
             display_name: "Terminal".to_owned(),
@@ -270,7 +284,7 @@ mod tests {
         unavailable.descriptor.as_mut().unwrap().setup = Some(AgentSetup {
             url: Some("https://ampcode.com/manual".into()),
             install_hint: Some("Install Amp's CLI.".into()),
-            sign_in_hint: None,
+            sign_in_hint: Some("Run amp login.".into()),
         });
         let options = agent_options(&AgentReadinessResult {
             agents: vec![unavailable],
@@ -280,6 +294,10 @@ mod tests {
             Some("Missing amp-bin")
         );
         assert_eq!(options[0].install_hint, "Install Amp's CLI.");
+        assert_eq!(
+            options[0].unavailable_detail().as_deref(),
+            Some("Missing amp-bin · Install Amp's CLI. · Run amp login.")
+        );
         assert_eq!(
             options[0].setup_url.as_deref(),
             Some("https://ampcode.com/manual")
@@ -309,6 +327,14 @@ mod tests {
             resolved_default_agent(&AgentKind::new("removed"), &catalog),
             AgentKind::SHELL
         );
+        let options = default_agent_options(&catalog);
+        let resolved = resolved_default_agent(&AgentKind::new("removed"), &catalog);
+        let selected = options
+            .iter()
+            .find(|option| option.kind == resolved)
+            .expect("launcher/settings options represent the repaired default");
+        assert_eq!(selected.display_name, "Terminal");
+        assert!(selected.available);
     }
 
     #[test]

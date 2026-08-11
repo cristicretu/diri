@@ -26,7 +26,7 @@ pub enum PaletteCommand {
         host: Option<String>,
     },
     /// An unavailable local Agent row. A verified HTTP(S) setup URL is opened
-    /// on activation; without one the row remains informational.
+    /// on activation; without one the containing action is disabled.
     UnavailableAgent {
         setup_url: Option<String>,
     },
@@ -54,6 +54,9 @@ pub struct PaletteAction {
     pub shortcut: Option<&'static str>,
     /// Availability copy displayed in the trailing chip.
     pub detail: Option<String>,
+    /// Disabled rows remain searchable as setup guidance, but cannot be
+    /// activated when the manifest provides no safe setup destination.
+    pub enabled: bool,
     pub command: PaletteCommand,
     /// Scored alongside the title but never rendered: the folder path behind
     /// "New Claude Code in anara", a host's ssh target, and the synonyms people
@@ -90,6 +93,7 @@ pub fn actions_for_default_host(
             system_image: "terminal",
             shortcut: Some("⌘T"),
             detail: None,
+            enabled: true,
             command: PaletteCommand::SpawnShell {
                 host: default_host.map(|host| host.id.clone()),
             },
@@ -115,6 +119,7 @@ pub fn actions_for_default_host(
             system_image: "terminal",
             shortcut: Some("⌥⌘T"),
             detail: None,
+            enabled: true,
             command: PaletteCommand::SpawnShell {
                 host: default_host.map(|host| host.id.clone()),
             },
@@ -126,6 +131,7 @@ pub fn actions_for_default_host(
             system_image: "magnifyingglass",
             shortcut: Some("⌘P"),
             detail: None,
+            enabled: true,
             command: PaletteCommand::OpenQuickOpen,
             keywords: "folder project directory jump goto find".into(),
         },
@@ -135,6 +141,7 @@ pub fn actions_for_default_host(
             system_image: "square.grid.2x2",
             shortcut: Some("⌘⇧O"),
             detail: None,
+            enabled: true,
             command: PaletteCommand::OpenSessionOverview,
             keywords: "board grid switcher all sessions".into(),
         },
@@ -148,6 +155,7 @@ pub fn actions_for_default_host(
             system_image: "folder",
             shortcut: None,
             detail: None,
+            enabled: true,
             command: PaletteCommand::SpawnAgent {
                 agent: default_agent.clone(),
                 cwd: Some(PathBuf::from(&project.root)),
@@ -167,6 +175,7 @@ pub fn actions_for_default_host(
                 system_image: "network",
                 shortcut: None,
                 detail: None,
+                enabled: true,
                 command: PaletteCommand::SpawnAgent {
                     agent: option.kind.clone(),
                     cwd: None,
@@ -191,6 +200,7 @@ pub fn actions_for_default_host(
                     system_image: "arrow.left.arrow.right",
                     shortcut: None,
                     detail: None,
+                    enabled: true,
                     command: PaletteCommand::MigrateSelected { target_host: None },
                     keywords: "migrate handoff move back local".into(),
                 });
@@ -203,6 +213,7 @@ pub fn actions_for_default_host(
                     system_image: "arrow.left.arrow.right",
                     shortcut: None,
                     detail: None,
+                    enabled: true,
                     command: PaletteCommand::MigrateSelected {
                         target_host: Some(host.id.clone()),
                     },
@@ -220,6 +231,7 @@ pub fn actions_for_default_host(
             system_image: "arrow.triangle.2.circlepath",
             shortcut: None,
             detail: None,
+            enabled: true,
             command: PaletteCommand::SyncPrefs {
                 host: host.id.clone(),
             },
@@ -234,6 +246,7 @@ pub fn actions_for_default_host(
             system_image: "square.stack.3d.up",
             shortcut: Some("⌥⌘W"),
             detail: None,
+            enabled: true,
             command: PaletteCommand::OpenWorktrees,
             keywords: "git branch checkout".into(),
         },
@@ -243,6 +256,7 @@ pub fn actions_for_default_host(
             system_image: "sidebar.left",
             shortcut: Some("⌘B"),
             detail: None,
+            enabled: true,
             command: PaletteCommand::ToggleSidebar,
             keywords: "hide show panel".into(),
         },
@@ -252,6 +266,7 @@ pub fn actions_for_default_host(
             system_image: "gearshape",
             shortcut: Some("⌘,"),
             detail: None,
+            enabled: true,
             command: PaletteCommand::OpenSettings,
             keywords: "preferences config options".into(),
         },
@@ -261,6 +276,7 @@ pub fn actions_for_default_host(
             system_image: "arrow.triangle.2.circlepath",
             shortcut: None,
             detail: None,
+            enabled: true,
             command: PaletteCommand::CheckForUpdates,
             keywords: "upgrade version release".into(),
         },
@@ -294,15 +310,8 @@ fn new_agent_action(
         } else {
             None
         },
-        detail: (!available).then(|| {
-            format!(
-                "{} · {}",
-                option
-                    .unavailable_label()
-                    .expect("unavailable option has a missing-binary label"),
-                option.install_hint
-            )
-        }),
+        detail: (!available).then(|| option.unavailable_detail()).flatten(),
+        enabled: available || option.setup_url.is_some(),
         command: if available {
             PaletteCommand::SpawnAgent {
                 agent: option.kind.clone(),
@@ -459,6 +468,7 @@ mod tests {
         display_name: &str,
         available: bool,
         setup_url: Option<&str>,
+        sign_in_hint: Option<&str>,
     ) -> AgentReadinessItem {
         AgentReadinessItem {
             kind: AgentKind::new(id),
@@ -470,7 +480,7 @@ mod tests {
                 setup: setup_url.map(|url| AgentSetup {
                     url: Some(url.into()),
                     install_hint: Some(format!("Install {display_name}.")),
-                    sign_in_hint: None,
+                    sign_in_hint: sign_in_hint.map(str::to_owned),
                 }),
                 ..AgentDescriptor::default()
             }),
@@ -480,7 +490,7 @@ mod tests {
     #[test]
     fn manifest_only_agents_get_local_and_remote_actions_with_open_dispatch() {
         let catalog = AgentReadinessResult {
-            agents: vec![catalog_item("amp", "Amp", true, None)],
+            agents: vec![catalog_item("amp", "Amp", true, None, None)],
         };
         let host = HostEntry {
             id: "forge".into(),
@@ -525,6 +535,7 @@ mod tests {
                 "Amp",
                 false,
                 Some("https://ampcode.com/manual"),
+                Some("Run amp login."),
             )],
         };
         let actions = actions(AgentKind::new("amp"), &catalog, &[], &[], None);
@@ -534,13 +545,35 @@ mod tests {
             .expect("unavailable Amp row");
         assert_eq!(
             amp.detail.as_deref(),
-            Some("Missing amp-bin · Install Amp.")
+            Some("Missing amp-bin · Install Amp. · Run amp login.")
         );
+        assert!(amp.enabled);
         assert_eq!(
             amp.command,
             PaletteCommand::UnavailableAgent {
                 setup_url: Some("https://ampcode.com/manual".into())
             }
+        );
+    }
+
+    #[test]
+    fn unavailable_action_without_setup_metadata_is_disabled_not_a_noop() {
+        let catalog = AgentReadinessResult {
+            agents: vec![catalog_item("private", "Private", false, None, None)],
+        };
+        let actions = actions(AgentKind::new("private"), &catalog, &[], &[], None);
+        let private = actions
+            .iter()
+            .find(|action| action.id == "new-private")
+            .expect("unavailable informational row");
+        assert!(!private.enabled);
+        assert_eq!(
+            private.detail.as_deref(),
+            Some("Missing private-bin · Install private-bin and add it to PATH.")
+        );
+        assert_eq!(
+            private.command,
+            PaletteCommand::UnavailableAgent { setup_url: None }
         );
     }
 

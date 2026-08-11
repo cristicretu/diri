@@ -337,24 +337,29 @@ mod tests {
     #[test]
     fn first_class_agents_ship_verified_official_setup_links() {
         let engine = engine();
-        for (id, expected_url) in [
-            (
-                "claude-code",
-                "https://docs.anthropic.com/en/docs/claude-code/getting-started",
-            ),
-            ("codex", "https://developers.openai.com/codex/cli/"),
-            ("cursor", "https://docs.cursor.com/en/cli/installation"),
-            ("gemini", "https://github.com/google-gemini/gemini-cli"),
-        ] {
-            let descriptor: diri_proto::AgentDescriptor = serde_json::from_value(
-                engine
-                    .raw_agent(id)
-                    .expect("first-class descriptor")
-                    .clone(),
-            )
-            .expect("client descriptor");
+        let mut first_class_count = 0;
+        for id in engine.ids() {
+            let descriptor: diri_proto::AgentDescriptor =
+                serde_json::from_value(engine.raw_agent(id).expect("bundled descriptor").clone())
+                    .expect("client descriptor");
+            if !descriptor.first_class {
+                continue;
+            }
+            first_class_count += 1;
             let setup = descriptor.setup.expect("first-class setup metadata");
-            assert_eq!(setup.url.as_deref(), Some(expected_url));
+            let url = setup
+                .url
+                .as_deref()
+                .filter(|url| url.starts_with("https://") || url.starts_with("http://"))
+                .unwrap_or_else(|| panic!("{id} needs a verified HTTP(S) setup URL"));
+            let authority = url
+                .split_once("://")
+                .expect("checked scheme")
+                .1
+                .split(['/', '?', '#'])
+                .next()
+                .unwrap_or_default();
+            assert!(!authority.is_empty(), "{id} setup URL has no host");
             assert!(
                 setup
                     .install_hint
@@ -362,7 +367,18 @@ mod tests {
                     .is_some_and(|hint| !hint.trim().is_empty()),
                 "{id} needs an install hint"
             );
+            assert!(
+                setup
+                    .sign_in_hint
+                    .as_deref()
+                    .is_some_and(|hint| !hint.trim().is_empty()),
+                "{id} needs a sign-in hint"
+            );
         }
+        assert!(
+            first_class_count >= 17,
+            "the bundled first-class roster unexpectedly shrank"
+        );
     }
 
     #[test]

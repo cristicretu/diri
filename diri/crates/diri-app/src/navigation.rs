@@ -486,7 +486,10 @@ impl NavigationOverlay {
         match self.overlay {
             Some(Overlay::CommandPalette) => {
                 let selection = if let Some(action) = self.ranked_actions.get(self.highlight) {
-                    Some(CommandSelection::Action(action.item.command.clone()))
+                    action
+                        .item
+                        .enabled
+                        .then(|| CommandSelection::Action(action.item.command.clone()))
                 } else {
                     self.ranked_sessions
                         .get(self.highlight.saturating_sub(self.ranked_actions.len()))
@@ -800,6 +803,7 @@ impl NavigationOverlay {
     ) -> AnyElement {
         let action = ranked.item;
         let command = action.command.clone();
+        let enabled = action.enabled;
         let trailing = action
             .detail
             .clone()
@@ -811,6 +815,7 @@ impl NavigationOverlay {
             trailing,
             index == self.highlight,
             index,
+            enabled,
             colors,
         )
         .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
@@ -819,9 +824,11 @@ impl NavigationOverlay {
                 cx.notify();
             }
         }))
-        .on_click(cx.listener(move |this, _, _, cx| {
-            this.run_command_selection(CommandSelection::Action(command.clone()), cx);
-        }))
+        .when(enabled, |row| {
+            row.on_click(cx.listener(move |this, _, _, cx| {
+                this.run_command_selection(CommandSelection::Action(command.clone()), cx);
+            }))
+        })
         .into_any_element()
     }
 
@@ -847,6 +854,7 @@ impl NavigationOverlay {
             Some(SharedString::from(chip)),
             index == self.highlight,
             index,
+            true,
             colors,
         )
         .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
@@ -1175,6 +1183,7 @@ fn palette_row(
     trailing: Option<SharedString>,
     highlighted: bool,
     index: usize,
+    enabled: bool,
     colors: SemanticColors,
 ) -> gpui::Stateful<gpui::Div> {
     div()
@@ -1194,7 +1203,8 @@ fn palette_row(
         } else {
             colors.primary.alpha(0.0)
         })
-        .cursor_pointer()
+        .opacity(if enabled { 1.0 } else { 0.48 })
+        .when(enabled, |row| row.cursor_pointer())
         .text_size(px(13.0))
         .child(
             div()

@@ -433,7 +433,10 @@ impl LauncherOverlay {
     }
 
     fn choose_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.picker = None;
+        close_picker_for_folder_choice(&mut self.picker);
+        // The native sheet temporarily owns focus. Keep the composer focused
+        // on both sides so a cancel or completion returns keyboard input to
+        // the untouched draft.
         window.focus(&self.focus, cx);
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -469,8 +472,7 @@ impl LauncherOverlay {
             let kind = choice.kind.clone();
             let logo = ui_agent_kind(&choice.kind);
             let setup_url = choice.setup_url.clone();
-            let unavailable = choice.unavailable_label();
-            let install_hint = choice.install_hint.clone();
+            let unavailable = choice.unavailable_detail();
             list = list.child(
                 div()
                     .id(format!("launcher-harness-{index}"))
@@ -515,7 +517,7 @@ impl LauncherOverlay {
                                         .text_ellipsis()
                                         .text_size(px(9.5))
                                         .text_color(colors.tertiary)
-                                        .child(format!("{unavailable} · {install_hint}")),
+                                        .child(unavailable),
                                 )
                             }),
                     )
@@ -1070,6 +1072,10 @@ fn project_commit(project_count: usize, highlight: usize) -> ProjectCommit {
     }
 }
 
+fn close_picker_for_folder_choice(picker: &mut Option<Picker>) {
+    *picker = None;
+}
+
 fn apply_folder_choice(selected_root: &mut String, chosen: Option<&Path>) -> bool {
     let Some(chosen) = chosen else {
         return false;
@@ -1097,15 +1103,23 @@ mod tests {
     }
 
     #[test]
-    fn folder_chooser_cancel_preserves_selection_and_completion_replaces_it() {
+    fn folder_chooser_closes_picker_and_preserves_draft_across_cancel_and_completion() {
+        let mut prompt = PromptComposer::default();
+        prompt.insert_multiline("keep this\nunfinished prompt");
+        let mut picker = Some(Picker::Project);
         let mut selected = "/work/current".to_owned();
+
+        close_picker_for_folder_choice(&mut picker);
+        assert!(picker.is_none(), "native chooser must dismiss the popover");
         assert!(!apply_folder_choice(&mut selected, None));
         assert_eq!(selected, "/work/current");
+        assert_eq!(prompt.text(), "keep this\nunfinished prompt");
 
         assert!(apply_folder_choice(
             &mut selected,
             Some(Path::new("/work/chosen"))
         ));
         assert_eq!(selected, "/work/chosen");
+        assert_eq!(prompt.text(), "keep this\nunfinished prompt");
     }
 }

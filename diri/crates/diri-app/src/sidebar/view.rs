@@ -2170,10 +2170,8 @@ impl Sidebar {
             let agent_kind = ui_agent_kind(&option.kind);
             let spawn_kind = option.kind.clone();
             let available = selected_host.is_some() || option.available;
-            let unavailable =
-                (!available).then(|| crate::agent_catalog::missing_binary_label(&option.binary));
+            let unavailable = (!available).then_some(option.unavailable_detail).flatten();
             let setup_url = (!available).then_some(option.setup_url).flatten();
-            let install_hint = option.install_hint;
             content = content.child(
                 div()
                     .id(row_id)
@@ -2237,7 +2235,7 @@ impl Sidebar {
                                         .text_ellipsis()
                                         .text_size(px(Typo::META.size))
                                         .text_color(colors.tertiary)
-                                        .child(format!("{unavailable} · {install_hint}")),
+                                        .child(unavailable),
                                 )
                             }),
                     )
@@ -3854,24 +3852,27 @@ struct AgentPickerOption {
     binary: String,
     available: bool,
     setup_url: Option<String>,
-    install_hint: String,
+    unavailable_detail: Option<String>,
 }
 
 fn agent_picker_options(catalog: &diri_proto::AgentReadinessResult) -> Vec<AgentPickerOption> {
     let mut options: Vec<_> = crate::agent_catalog::agent_options(catalog)
         .into_iter()
-        .map(|option| AgentPickerOption {
-            title: option.display_name,
-            shortcut: if option.kind == ProtoAgentKind::CODEX {
-                "⌘⇧N"
-            } else {
-                ""
-            },
-            kind: option.kind,
-            binary: option.binary,
-            available: option.available,
-            setup_url: option.setup_url,
-            install_hint: option.install_hint,
+        .map(|option| {
+            let unavailable_detail = option.unavailable_detail();
+            AgentPickerOption {
+                title: option.display_name,
+                shortcut: if option.kind == ProtoAgentKind::CODEX {
+                    "⌘⇧N"
+                } else {
+                    ""
+                },
+                kind: option.kind,
+                binary: option.binary,
+                available: option.available,
+                setup_url: option.setup_url,
+                unavailable_detail,
+            }
         })
         .collect();
     // Terminal is last on purpose: it is the escape hatch, not an agent.
@@ -3882,7 +3883,7 @@ fn agent_picker_options(catalog: &diri_proto::AgentReadinessResult) -> Vec<Agent
         binary: "login shell".to_owned(),
         available: true,
         setup_url: None,
-        install_hint: "Uses your login shell.".to_owned(),
+        unavailable_detail: None,
     });
     options
 }
@@ -4126,7 +4127,7 @@ mod tests {
                         setup: Some(diri_proto::AgentSetup {
                             url: Some("https://opencode.ai/docs".into()),
                             install_hint: Some("Install OpenCode.".into()),
-                            sign_in_hint: None,
+                            sign_in_hint: Some("Run /connect.".into()),
                         }),
                         ..diri_proto::AgentDescriptor::default()
                     }),
@@ -4145,6 +4146,10 @@ mod tests {
             .expect("unavailable option remains visible");
         assert!(!opencode.available);
         assert_eq!(opencode.binary, "opencode");
+        assert_eq!(
+            opencode.unavailable_detail.as_deref(),
+            Some("Missing opencode · Install OpenCode. · Run /connect.")
+        );
         assert_eq!(
             opencode.setup_url.as_deref(),
             Some("https://opencode.ai/docs")

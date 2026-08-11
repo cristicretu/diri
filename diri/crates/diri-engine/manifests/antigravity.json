@@ -15,6 +15,11 @@
       "agy"
     ],
     "firstClass": true,
+    "setup": {
+      "url": "https://antigravity.google/docs/cli-install",
+      "installHint": "Install agy with Google's platform installer.",
+      "signInHint": "Run agy and complete the Google OAuth flow."
+    },
     "statusAuthority": "screen",
     "binary": "agy",
     "resume": {

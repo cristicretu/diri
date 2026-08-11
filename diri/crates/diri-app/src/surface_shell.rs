@@ -1660,8 +1660,7 @@ impl UtilitySurfaces {
                 let enabled = option.available;
                 let agent = option.kind.clone();
                 let setup_url = option.setup_url.clone();
-                let unavailable = option.unavailable_label();
-                let install_hint = option.install_hint.clone();
+                let unavailable = option.unavailable_detail();
                 options = options.child(
                     div()
                         .id(SharedString::from(format!("default-agent-option-{index}")))
@@ -1705,7 +1704,7 @@ impl UtilitySurfaces {
                                             .text_ellipsis()
                                             .text_size(px(Typo::META.size))
                                             .text_color(colors.tertiary)
-                                            .child(format!("{unavailable} · {install_hint}")),
+                                            .child(unavailable),
                                     )
                                 }),
                         )
