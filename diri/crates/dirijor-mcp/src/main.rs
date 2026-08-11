@@ -28,8 +28,8 @@ impl ProcessBackend {
             })
             .or_else(|| {
                 env::var_os("HOME").and_then(|home| {
-                    let path = PathBuf::from(home)
-                        .join("Library/Application Support/Dirijor/bin/dirijor");
+                    let path =
+                        PathBuf::from(home).join("Library/Application Support/Dirijor/bin/dirijor");
                     is_executable(&path).then_some(path)
                 })
             })
