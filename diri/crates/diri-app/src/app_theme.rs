@@ -1,5 +1,5 @@
-use diri_term::theme::TermTheme;
-use diri_ui::SemanticColors;
+use diri_term::theme::{TermTheme, ThemeAppearance};
+use diri_ui::{Appearance, SemanticColors};
 use gpui::Rgba;
 
 /// Resolves persisted theme ids in one place for both terminal and app chrome.
@@ -24,6 +24,10 @@ fn semantic_colors(theme: TermTheme, sidebar_tones: bool) -> SemanticColors {
     let sidebar_surface = mix(theme.background, theme.foreground, 0.08, 0.92);
     let floating_surface = mix(theme.background, theme.foreground, 0.13, 1.0);
     SemanticColors::themed(
+        match theme.appearance {
+            ThemeAppearance::Dark => Appearance::Dark,
+            ThemeAppearance::Light => Appearance::Light,
+        },
         theme.background,
         theme.foreground,
         sidebar_surface,
@@ -71,5 +75,17 @@ mod tests {
         let sidebar = sidebar_colors("tokyo-night");
         assert!(sidebar.secondary.a > base.secondary.a);
         assert!(sidebar.tertiary.a > base.tertiary.a);
+    }
+
+    #[test]
+    fn light_terminal_themes_produce_light_application_semantics() {
+        let theme = terminal_theme("dirijor-light");
+        let app = colors(theme.id);
+
+        assert_eq!(app.appearance, Appearance::Light);
+        assert_eq!(app.background, theme.background);
+        assert_eq!(app.primary, theme.foreground);
+        assert_eq!(app.floating_stroke().r, 0.0);
+        assert_eq!(app.floating_stroke().a, 0.10);
     }
 }

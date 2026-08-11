@@ -94,11 +94,15 @@ for target in "${targets[@]}"; do
     # the musl binaries are plain ELF and are measured as built.
     case "${target}" in
         *-apple-darwin)
+            # A secure timestamp is required for notarization: without it Apple
+            # rejects the whole archive with "The signature does not include a
+            # secure timestamp." Ad-hoc signatures cannot carry one, so they
+            # opt out explicitly — those builds are not notarized anyway.
             if [[ -n "${DIRI_SIGN_IDENTITY:-}" && "${DIRI_SIGN_IDENTITY}" != "-" ]]; then
-                codesign --force --options runtime --timestamp=none \
+                codesign --force --options runtime --timestamp \
                     --sign "${DIRI_SIGN_IDENTITY}" "${artifact}"
             else
-                codesign --force --sign - "${artifact}"
+                codesign --force --timestamp=none --sign - "${artifact}"
             fi
             ;;
     esac

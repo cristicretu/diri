@@ -202,6 +202,47 @@ impl QueryEditor {
         }
     }
 
+    /// Puts the caret at an arbitrary offset. Multi-line callers compute
+    /// offsets from a wrapped layout this type knows nothing about — vertical
+    /// motion, or a `Line` motion that should stop at a visual line rather
+    /// than at the ends of the buffer.
+    pub fn move_to(&mut self, offset: usize, extend: bool) {
+        self.cursor = self.floor_boundary(offset);
+        if !extend {
+            self.anchor = self.cursor;
+        }
+    }
+
+    /// Deletes between the caret and `offset` (or the selection, if there is
+    /// one), leaving the caret at the near edge.
+    pub fn delete_to(&mut self, offset: usize) -> bool {
+        if let Some(range) = self.selection() {
+            self.text.replace_range(range.clone(), "");
+            self.cursor = range.start;
+            self.anchor = self.cursor;
+            return true;
+        }
+        let offset = self.floor_boundary(offset);
+        if offset == self.cursor {
+            return false;
+        }
+        let range = offset.min(self.cursor)..offset.max(self.cursor);
+        self.text.replace_range(range.clone(), "");
+        self.cursor = range.start;
+        self.anchor = range.start;
+        true
+    }
+
+    /// Nearest character boundary at or before `offset`, so a caller working
+    /// in graphemes can never split a multibyte character.
+    fn floor_boundary(&self, offset: usize) -> usize {
+        let mut offset = offset.min(self.text.len());
+        while !self.text.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        offset
+    }
+
     fn offset_before(&self, from: usize, motion: Motion) -> usize {
         match motion {
             Motion::Line => 0,

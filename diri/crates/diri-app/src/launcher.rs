@@ -8,25 +8,54 @@ use diri_ui::{
     AgentKind as UiAgentKind, AgentLogo, Fill, FloatingSurface, Palette, Radius, SemanticColors,
 };
 use gpui::{
-    AnyElement, App, Context, EventEmitter, FocusHandle, Focusable, FontWeight, KeyDownEvent,
-    MouseButton, PathPromptOptions, Render, Task, Window, div, prelude::*, px, rgba,
+    AnyElement, App, Context, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle,
+    KeyDownEvent, MouseButton, PathPromptOptions, Render, Task, Window, div, prelude::*, px, rgba,
 };
 
 use crate::AppServices;
+use crate::composer::PromptComposer;
 use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
-use crate::navigation::query_label;
-use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
+use crate::navigation::CARET;
+use crate::query_editor::{self, ClipboardEdit, Edit};
 use crate::store::SpawnOptions;
 
 const PANEL_WIDTH: f32 = 540.0;
 const TITLE_HEIGHT: f32 = 36.0;
 const TITLE_GAP: f32 = 22.0;
-const COMPOSER_HEIGHT: f32 = 108.0;
-const COMPOSER_TEXT_HEIGHT: f32 = 64.0;
 const CONTROL_SIZE: f32 = 32.0;
 const CONTROL_RADIUS: f32 = 9.0;
 const SHELF_HEIGHT: f32 = 40.0;
 const PICKER_HEIGHT: f32 = 200.0;
+
+/// Composer metrics. The text area is sized from the wrapped line count
+/// rather than pinned at one height: a one-line prompt should not sit in a
+/// half-empty box, and a twenty-line one should not vanish out of the bottom
+/// of a fixed one — it grows to [`COMPOSER_MAX_LINES`] and then scrolls,
+/// following the caret.
+const COMPOSER_FONT_SIZE: f32 = 13.0;
+const COMPOSER_LINE_HEIGHT: f32 = 19.0;
+const COMPOSER_MIN_LINES: usize = 3;
+const COMPOSER_MAX_LINES: usize = 9;
+const COMPOSER_INSET: f32 = 8.0;
+const COMPOSER_PADDING: f32 = 16.0;
+const COMPOSER_PAD_TOP: f32 = 12.0;
+const COMPOSER_PAD_BOTTOM: f32 = 6.0;
+const COMPOSER_CONTROLS_HEIGHT: f32 = 44.0;
+
+/// The width text actually wraps at, derived from the panel so the two cannot
+/// drift apart: the panel, less the composer's margin, padding and border.
+const COMPOSER_TEXT_WIDTH: f32 = PANEL_WIDTH - 2.0 * COMPOSER_INSET - 2.0 * COMPOSER_PADDING - 2.0;
+
+const fn composer_text_height(lines: usize) -> f32 {
+    let visible = if lines < COMPOSER_MIN_LINES {
+        COMPOSER_MIN_LINES
+    } else if lines > COMPOSER_MAX_LINES {
+        COMPOSER_MAX_LINES
+    } else {
+        lines
+    };
+    visible as f32 * COMPOSER_LINE_HEIGHT + COMPOSER_PAD_TOP + COMPOSER_PAD_BOTTOM
+}
 
 #[derive(Clone)]
 struct HarnessChoice {
@@ -42,14 +71,22 @@ pub(crate) enum LauncherEvent {
 pub(crate) struct LauncherOverlay {
     services: Arc<AppServices>,
     focus: FocusHandle,
-    prompt: QueryEditor,
+    prompt: PromptComposer,
     selected_harness: AgentKind,
     selected_root: String,
-    harness_picker_open: bool,
-    project_picker_open: bool,
+    /// Which picker, if any, is open — and where its keyboard highlight sits,
+    /// so both are reachable without the mouse.
+    picker: Option<Picker>,
+    highlight: usize,
     open: bool,
     preview: bool,
     _store_changes: Task<()>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Picker {
+    Harness,
+    Project,
 }
 
 impl EventEmitter<LauncherEvent> for LauncherOverlay {}
@@ -75,11 +112,11 @@ impl LauncherOverlay {
         Self {
             services,
             focus,
-            prompt: QueryEditor::default(),
+            prompt: PromptComposer::default(),
             selected_harness,
             selected_root,
-            harness_picker_open: false,
-            project_picker_open: false,
+            picker: None,
+            highlight: 0,
             open: false,
             preview,
             _store_changes: store_changes,
@@ -91,12 +128,16 @@ impl LauncherOverlay {
     }
 
     pub(crate) fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (harness, root) = initial_target(&self.services);
-        self.selected_harness = harness;
-        self.selected_root = root;
-        self.prompt.clear();
-        self.harness_picker_open = false;
-        self.project_picker_open = false;
+        // A half-written prompt survives Escape. This used to clear on every
+        // open, so closing the launcher by reflex — or bouncing off it to
+        // check something — threw the prompt away with no way back. It is
+        // cleared on submit, and only there.
+        if self.prompt.is_empty() {
+            let (harness, root) = initial_target(&self.services);
+            self.selected_harness = harness;
+            self.selected_root = root;
+        }
+        self.picker = None;
         self.open = true;
         window.focus(&self.focus, cx);
         cx.notify();
@@ -111,8 +152,7 @@ impl LauncherOverlay {
             return;
         }
         self.open = false;
-        self.harness_picker_open = false;
-        self.project_picker_open = false;
+        self.picker = None;
         cx.emit(LauncherEvent::Closed);
         cx.notify();
     }
@@ -197,14 +237,29 @@ impl LauncherOverlay {
             .unwrap_or_else(|| "Choose project".to_owned())
     }
 
+    /// Why the prompt cannot be sent yet, as something to show the user.
+    /// `None` means it can. The submit button used to just sit there dimmed
+    /// with no explanation, which reads as "broken" rather than "not yet".
+    fn blocker(&self) -> Option<String> {
+        if self.selected_root.is_empty() {
+            return Some("Choose a project to start in".to_owned());
+        }
+        match self
+            .harness_choices()
+            .into_iter()
+            .find(|choice| choice.kind == self.selected_harness)
+        {
+            Some(choice) if choice.available => None,
+            Some(choice) => Some(format!("{} is not installed", choice.label)),
+            None => Some(format!(
+                "{} is not available on this machine",
+                self.selected_harness_label()
+            )),
+        }
+    }
+
     fn can_submit(&self) -> bool {
-        !self.preview
-            && !self.prompt.text().trim().is_empty()
-            && !self.selected_root.is_empty()
-            && self
-                .harness_choices()
-                .iter()
-                .any(|choice| choice.kind == self.selected_harness && choice.available)
+        !self.preview && !self.prompt.text().trim().is_empty() && self.blocker().is_none()
     }
 
     fn submit(&mut self, cx: &mut Context<Self>) -> bool {
@@ -225,6 +280,7 @@ impl LauncherOverlay {
                     ..SpawnOptions::default()
                 },
             );
+        self.prompt.clear();
         self.close(cx);
         true
     }
@@ -235,25 +291,131 @@ impl LauncherOverlay {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.picker.is_some() && self.handle_picker_key(event, cx) {
+            return true;
+        }
+        let shift = event.keystroke.modifiers.shift;
         match event.keystroke.key.as_str() {
-            "escape" if self.harness_picker_open || self.project_picker_open => {
-                self.harness_picker_open = false;
-                self.project_picker_open = false;
-                cx.notify();
-                true
-            }
             "escape" => {
                 self.close(cx);
                 true
             }
-            "enter" if event.keystroke.modifiers.shift => {
+            "enter" if shift => {
                 self.prompt.insert_multiline("\n");
                 cx.notify();
                 true
             }
             "enter" => self.submit(cx),
+            // Cycling the agent from the keyboard: the picker was mouse-only,
+            // which is a strange thing to require of a surface you reached
+            // with ⌘N and are about to leave with ↵.
+            "tab" => {
+                self.cycle_harness(if shift { -1 } else { 1 });
+                cx.notify();
+                true
+            }
+            "up" => {
+                self.prompt.move_up(shift);
+                cx.notify();
+                true
+            }
+            "down" => {
+                self.prompt.move_down(shift);
+                cx.notify();
+                true
+            }
             _ => self.edit_prompt(event, cx),
         }
+    }
+
+    /// Arrow keys drive the open picker instead of the prompt behind it.
+    fn handle_picker_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        let count = match self.picker {
+            Some(Picker::Harness) => self.harness_choices().len(),
+            Some(Picker::Project) => self.projects().len(),
+            None => return false,
+        };
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                self.picker = None;
+                cx.notify();
+                true
+            }
+            "up" | "down" if count > 0 => {
+                self.highlight = if event.keystroke.key == "up" {
+                    self.highlight.saturating_sub(1)
+                } else {
+                    (self.highlight + 1).min(count - 1)
+                };
+                cx.notify();
+                true
+            }
+            "enter" => {
+                self.commit_highlight();
+                cx.notify();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn commit_highlight(&mut self) {
+        match self.picker {
+            Some(Picker::Harness) => {
+                if let Some(choice) = self
+                    .harness_choices()
+                    .get(self.highlight)
+                    .filter(|choice| choice.available)
+                {
+                    self.selected_harness = choice.kind.clone();
+                }
+            }
+            Some(Picker::Project) => {
+                if let Some(project) = self.projects().get(self.highlight) {
+                    self.selected_root.clone_from(&project.root);
+                }
+            }
+            None => return,
+        }
+        self.picker = None;
+    }
+
+    fn toggle_picker(&mut self, picker: Picker) {
+        if self.picker == Some(picker) {
+            self.picker = None;
+            return;
+        }
+        self.highlight = match picker {
+            Picker::Harness => self
+                .harness_choices()
+                .iter()
+                .position(|choice| choice.kind == self.selected_harness),
+            Picker::Project => self
+                .projects()
+                .iter()
+                .position(|project| project.root == self.selected_root),
+        }
+        .unwrap_or(0);
+        self.picker = Some(picker);
+    }
+
+    /// Steps to the next installed agent, skipping any that cannot run.
+    fn cycle_harness(&mut self, delta: isize) {
+        let choices: Vec<_> = self
+            .harness_choices()
+            .into_iter()
+            .filter(|choice| choice.available)
+            .collect();
+        if choices.is_empty() {
+            return;
+        }
+        let current = choices
+            .iter()
+            .position(|choice| choice.kind == self.selected_harness)
+            .unwrap_or(0);
+        let count = choices.len() as isize;
+        let next = (current as isize + delta).rem_euclid(count) as usize;
+        self.selected_harness = choices[next].kind.clone();
     }
 
     fn edit_prompt(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
@@ -265,10 +427,10 @@ impl LauncherOverlay {
                 self.prompt.apply(local);
             }
             Edit::Clipboard(ClipboardEdit::Copy) => {
-                query_editor::copy_selection(&self.prompt, cx);
+                query_editor::copy_selection(self.prompt.editor(), cx);
             }
             Edit::Clipboard(ClipboardEdit::Cut) => {
-                query_editor::cut_selection(&mut self.prompt, cx);
+                query_editor::cut_selection(self.prompt.editor_mut(), cx);
             }
             Edit::Clipboard(ClipboardEdit::Paste) => {
                 if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
@@ -281,7 +443,7 @@ impl LauncherOverlay {
     }
 
     fn choose_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.project_picker_open = false;
+        self.picker = None;
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -313,6 +475,7 @@ impl LauncherOverlay {
         for (index, choice) in self.harness_choices().into_iter().enumerate() {
             let selected = choice.kind == self.selected_harness;
             let enabled = choice.available;
+            let highlighted = self.highlight == index;
             let kind = choice.kind.clone();
             let logo = ui_agent_kind(&choice.kind);
             list = list.child(
@@ -331,12 +494,15 @@ impl LauncherOverlay {
                     } else {
                         colors.tertiary
                     })
+                    .when(highlighted && enabled, |row| {
+                        row.bg(colors.primary.alpha(0.08))
+                    })
                     .when(enabled, |row| {
                         row.cursor_pointer()
                             .hover(move |row| row.bg(colors.primary.alpha(0.06)))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.selected_harness = kind.clone();
-                                this.harness_picker_open = false;
+                                this.picker = None;
                                 cx.notify();
                             }))
                     })
@@ -385,6 +551,7 @@ impl LauncherOverlay {
         }
         for (index, project) in projects.into_iter().enumerate() {
             let selected = project.root == self.selected_root;
+            let highlighted = self.highlight == index;
             let root = project.root.clone();
             list = list.child(
                 div()
@@ -398,10 +565,11 @@ impl LauncherOverlay {
                     .gap(px(9.0))
                     .rounded(px(8.0))
                     .cursor_pointer()
+                    .when(highlighted, |row| row.bg(colors.primary.alpha(0.08)))
                     .hover(move |row| row.bg(colors.primary.alpha(0.06)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.selected_root.clone_from(&root);
-                        this.project_picker_open = false;
+                        this.picker = None;
                         cx.notify();
                     }))
                     .child(sf_symbol("folder", 12.0, colors.secondary))
@@ -447,8 +615,14 @@ impl LauncherOverlay {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let can_submit = self.can_submit();
-        let harness_open = self.harness_picker_open;
-        let project_open = self.project_picker_open;
+        let harness_open = self.picker == Some(Picker::Harness);
+        let project_open = self.picker == Some(Picker::Project);
+        let text_height = composer_text_height(self.prompt.line_count());
+        let composer_height = text_height + COMPOSER_CONTROLS_HEIGHT;
+        // The pickers hang off the bottom of the panel, which now moves with
+        // the composer.
+        let picker_top = TITLE_HEIGHT + TITLE_GAP + composer_height + SHELF_HEIGHT + 8.0;
+        let blocker = self.blocker();
         let harness_label = self.selected_harness_label();
         let project_label = self.selected_project_label();
         let logo = ui_agent_kind(&self.selected_harness);
@@ -463,16 +637,17 @@ impl LauncherOverlay {
             rgba(0xe8e7e4ff)
         };
 
+        // Wrapped lines are children of a scroll container so the composer's
+        // handle can scroll BY LINE to keep the caret on screen — the whole
+        // point of the rewrite. An empty prompt shows the placeholder in the
+        // same row the caret is on, so the two do not fight over the baseline.
         let prompt = if self.prompt.is_empty() {
             div()
+                .h(px(COMPOSER_LINE_HEIGHT))
                 .flex()
                 .items_center()
                 .when(focused, |line| {
-                    line.child(
-                        div()
-                            .text_color(colors.primary.alpha(0.92))
-                            .child(query_label(&self.prompt)),
-                    )
+                    line.child(div().text_color(colors.primary.alpha(0.92)).child(CARET))
                 })
                 .child(
                     div()
@@ -481,7 +656,22 @@ impl LauncherOverlay {
                 )
                 .into_any_element()
         } else {
-            query_label(&self.prompt)
+            div()
+                .id("launcher-prompt-lines")
+                .size_full()
+                .flex()
+                .flex_col()
+                .overflow_y_scroll()
+                .track_scroll(self.prompt.scroll_handle())
+                .children(self.prompt.render_lines(
+                    px(COMPOSER_LINE_HEIGHT),
+                    focused.then_some(CARET),
+                    HighlightStyle {
+                        background_color: Some(Palette::CLAY.alpha(0.35).into()),
+                        ..HighlightStyle::default()
+                    },
+                ))
+                .into_any_element()
         };
 
         let panel = div()
@@ -505,8 +695,8 @@ impl LauncherOverlay {
                 div()
                     .relative()
                     .mt(px(TITLE_GAP))
-                    .mx(px(8.0))
-                    .h(px(COMPOSER_HEIGHT))
+                    .mx(px(COMPOSER_INSET))
+                    .h(px(composer_height))
                     .rounded(px(Radius::PANEL))
                     .bg(composer_fill)
                     .border_1()
@@ -522,18 +712,18 @@ impl LauncherOverlay {
                     })
                     .child(
                         div()
-                            .h(px(COMPOSER_TEXT_HEIGHT))
-                            .px(px(16.0))
-                            .pt(px(12.0))
-                            .overflow_hidden()
-                            .text_size(px(13.0))
-                            .line_height(px(19.0))
+                            .h(px(text_height))
+                            .px(px(COMPOSER_PADDING))
+                            .pt(px(COMPOSER_PAD_TOP))
+                            .pb(px(COMPOSER_PAD_BOTTOM))
+                            .text_size(px(COMPOSER_FONT_SIZE))
+                            .line_height(px(COMPOSER_LINE_HEIGHT))
                             .text_color(colors.primary)
                             .child(prompt),
                     )
                     .child(
                         div()
-                            .h(px(COMPOSER_HEIGHT - COMPOSER_TEXT_HEIGHT))
+                            .h(px(COMPOSER_CONTROLS_HEIGHT))
                             .px(px(10.0))
                             .pb(px(8.0))
                             .flex()
@@ -566,7 +756,9 @@ impl LauncherOverlay {
                                         div()
                                             .text_size(px(10.0))
                                             .text_color(colors.tertiary)
-                                            .child("⇧↵  New line"),
+                                            .child(blocker.clone().unwrap_or_else(|| {
+                                                "⇧↵  New line   ⇥  Agent".to_owned()
+                                            })),
                                     ),
                             )
                             .child(
@@ -602,9 +794,7 @@ impl LauncherOverlay {
                                             .child(harness_label)
                                             .child(sf_symbol("chevron.down", 7.5, colors.tertiary))
                                             .on_click(cx.listener(|this, _, _, cx| {
-                                                this.harness_picker_open =
-                                                    !this.harness_picker_open;
-                                                this.project_picker_open = false;
+                                                this.toggle_picker(Picker::Harness);
                                                 cx.notify();
                                             })),
                                     )
@@ -685,8 +875,7 @@ impl LauncherOverlay {
                             )
                             .child(sf_symbol("chevron.down", 8.0, colors.tertiary))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.project_picker_open = !this.project_picker_open;
-                                this.harness_picker_open = false;
+                                this.toggle_picker(Picker::Project);
                                 cx.notify();
                             })),
                     )
@@ -713,32 +902,32 @@ impl LauncherOverlay {
             )
             .when(harness_open, |panel| {
                 panel.child(
-                    div()
-                        .absolute()
-                        .right(px(8.0))
-                        .top(px(TITLE_HEIGHT
-                            + TITLE_GAP
-                            + COMPOSER_HEIGHT
-                            + SHELF_HEIGHT
-                            + 8.0))
+                    self.floating(picker_top, cx)
+                        .right(px(COMPOSER_INSET))
                         .child(self.render_harness_picker(colors, cx)),
                 )
             })
             .when(project_open, |panel| {
                 panel.child(
-                    div()
-                        .absolute()
-                        .left(px(8.0))
-                        .top(px(TITLE_HEIGHT
-                            + TITLE_GAP
-                            + COMPOSER_HEIGHT
-                            + SHELF_HEIGHT
-                            + 8.0))
+                    self.floating(picker_top, cx)
+                        .left(px(COMPOSER_INSET))
                         .child(self.render_project_picker(colors, cx)),
                 )
             });
 
         panel.into_any_element()
+    }
+
+    /// Wrapper for a picker popover. It swallows its own mouse-down so the
+    /// canvas behind it — which closes any open picker — does not tear the
+    /// list away between press and release, which would eat the click.
+    fn floating(&self, top: f32, cx: &mut Context<Self>) -> gpui::Div {
+        div().absolute().top(px(top)).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|_, _, _, cx| {
+                cx.stop_propagation();
+            }),
+        )
     }
 }
 
@@ -749,7 +938,7 @@ impl Focusable for LauncherOverlay {
 }
 
 impl Render for LauncherOverlay {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let root = div()
             .id("new-session-launcher")
             .key_context("DiriLauncher")
@@ -761,23 +950,39 @@ impl Render for LauncherOverlay {
             return root.size(px(0.0));
         }
 
+        // Soft-wrapping needs the text system, which only exists here. Doing
+        // it before the panel is built is what lets the composer size itself
+        // to the prompt and scroll the caret into view.
+        self.prompt.layout(
+            px(COMPOSER_TEXT_WIDTH),
+            gpui::font(crate::fonts::ui_family()),
+            px(COMPOSER_FONT_SIZE),
+            window,
+        );
+
         // The session workbench is intentionally always dark, independent of
         // macOS appearance. This is a destination in that workbench—not a
         // translucent window overlay—so paint the same fully opaque surface.
         let colors = SemanticColors::dark();
-        let focused = self.focus.is_focused(_window);
-        let focus = self.focus.clone();
+        let focused = self.focus.is_focused(window);
         root.size_full()
             .relative()
             .flex()
             .items_center()
             .justify_center()
             .bg(colors.background)
-            // The entire empty workbench behaves like the editor's canvas.
-            // This also recovers focus after a project/harness popover click.
-            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                window.focus(&focus, cx);
-            })
+            // The entire empty workbench behaves like the editor's canvas: a
+            // click anywhere returns to the prompt and dismisses whichever
+            // picker was open, which previously stayed up until you found the
+            // button again or pressed Escape.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.picker = None;
+                    window.focus(&this.focus, cx);
+                    cx.notify();
+                }),
+            )
             // Command-N is a high-frequency keyboard action; the destination
             // appears immediately rather than making the user wait on motion.
             .child(self.render_panel(colors, focused, cx))

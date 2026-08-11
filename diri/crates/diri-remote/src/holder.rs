@@ -29,6 +29,7 @@ use crate::state::{
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const DIFF_COALESCE: Duration = Duration::from_millis(16);
+const INTERACTIVE_GRID_BUDGET: u8 = 2;
 const MAX_OUTBOUND_BYTES: usize = 20 << 20;
 const MAX_PENDING_INPUT_BYTES: usize = 1 << 20;
 const REPLAY_BUDGET_BYTES: usize = 4 << 20;
@@ -405,6 +406,7 @@ struct Holder {
     pending_connection: Option<Connection>,
     pending_input: PendingBytes,
     dirty_since: Option<Instant>,
+    interactive_grid_budget: u8,
     last_persisted_offset: u64,
 }
 
@@ -477,6 +479,7 @@ impl Holder {
             pending_connection: None,
             pending_input: PendingBytes::default(),
             dirty_since: None,
+            interactive_grid_budget: 0,
             last_persisted_offset: 0,
         })
     }
@@ -605,10 +608,9 @@ impl Holder {
             {
                 self.read_pending_connection()?;
             }
-            if self
-                .dirty_since
-                .is_some_and(|since| since.elapsed() >= DIFF_COALESCE)
-            {
+            if self.dirty_since.is_some_and(|since| {
+                self.interactive_grid_budget > 0 || since.elapsed() >= DIFF_COALESCE
+            }) {
                 self.emit_grid_delta()?;
             }
         }
@@ -956,6 +958,10 @@ impl Holder {
             ));
         }
         self.pending_input.push(bytes);
+        // One publication can be trailing output already in flight and the
+        // next the actual echo/TUI response. Keep the fast path bounded to
+        // those two frames so a keystroke cannot unthrottle a bulk stream.
+        self.interactive_grid_budget = INTERACTIVE_GRID_BUDGET;
         self.flush_input()
     }
 
@@ -997,6 +1003,7 @@ impl Holder {
     }
 
     fn emit_grid_delta(&mut self) -> io::Result<()> {
+        self.interactive_grid_budget = self.interactive_grid_budget.saturating_sub(1);
         self.dirty_since = None;
         if self
             .connection

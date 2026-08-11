@@ -57,9 +57,9 @@ const TOOLBAR_LINK_MAX_WIDTH: f32 = 176.0;
 const TOOLBAR_OVERFLOW_WIDTH: f32 = 50.0;
 const REATTACH_DELAY: Duration = Duration::from_millis(500);
 /// Burst ceiling for repaints (~60fps). The pacer paints the first frame of a
-/// burst immediately; this only caps sustained output, and background panes
-/// never invalidate the window, so idle budgets are unaffected. Matched to the
-/// daemon's `gridFlushInterval`.
+/// burst and the next response after interactive input immediately; this only
+/// caps sustained output, and background panes never invalidate the window, so
+/// idle budgets are unaffected. Matched to the daemon's `gridFlushInterval`.
 const ACTIVE_REPAINT_INTERVAL: Duration = Duration::from_millis(16);
 /// How often a live drag is allowed to push a new PTY geometry. Matched to the
 /// daemon's coalesced grid flush (also 16ms): resizing faster produces frames
@@ -392,10 +392,18 @@ enum AttachmentCommand {
 #[derive(Clone)]
 struct AttachmentControl {
     tx: mpsc::UnboundedSender<AttachmentCommand>,
+    pane_tx: mpsc::UnboundedSender<PaneEvent>,
 }
 
 impl AttachmentControl {
     fn input(&self, bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        // Queue the priority marker before the bytes leave for the daemon, so
+        // an echo that returns immediately cannot land behind the UI's
+        // background-output repaint timer.
+        let _ = self.pane_tx.send(PaneEvent::InteractiveInput);
         let _ = self.tx.send(AttachmentCommand::Input(bytes));
     }
 
@@ -418,6 +426,7 @@ impl AttachmentControl {
 }
 
 enum PaneEvent {
+    InteractiveInput,
     AttachmentState(SessionId, AttachmentState),
     Chunk(SessionId, TerminalChunk),
     FindSnapshot(SessionId, SearchRequest, FindSnapshot),
@@ -891,6 +900,7 @@ impl TerminalPane {
 
     fn handle_pane_event(&mut self, event: PaneEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
+            PaneEvent::InteractiveInput => self.repaint_pacer.prioritize_interactive_damage(),
             PaneEvent::AttachmentState(id, state) => {
                 if let Some(resident) = self.residents.get_mut(&id) {
                     resident.attachment_state = state;
@@ -3001,7 +3011,10 @@ fn spawn_attachment(
     pane_tx: mpsc::UnboundedSender<PaneEvent>,
 ) -> AttachmentControl {
     let (command_tx, mut commands) = mpsc::unbounded_channel();
-    let control = AttachmentControl { tx: command_tx };
+    let control = AttachmentControl {
+        tx: command_tx,
+        pane_tx: pane_tx.clone(),
+    };
     runtime.spawn(async move {
         // The first resize must be the measured pane geometry: deferred agent
         // launch waits for it. Do not seed an arbitrary 80×24 size.

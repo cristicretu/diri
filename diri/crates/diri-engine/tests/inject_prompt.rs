@@ -201,3 +201,48 @@ fn a_silently_swallowed_prompt_is_retried_until_it_lands() {
 
     control.request("session.kill", json!({ "sessionID": id }));
 }
+
+/// The Claude Code shape, and the one that used to lose prompts outright:
+/// bracketed paste comes on EARLY, while the banner is still repainting, and
+/// input typed into that window is discarded. A busy screen must not be
+/// mistaken for "the prompt arrived" — the prompt itself has to show up.
+#[test]
+fn a_prompt_swallowed_behind_a_repainting_banner_still_lands() {
+    let temp = tempfile::tempdir().expect("temp");
+    let server = start_server(temp.path());
+    let mut control = Control::connect(&server);
+
+    // Paste mode on immediately (the readiness tell), then ~7s of repainting
+    // while every line typed is discarded, then a real reader. The screen
+    // changes constantly throughout, so any "did the screen move?" check
+    // reports success on the very first attempt and the prompt is lost.
+    let id = spawn(
+        &mut control,
+        r#"printf '\033[?2004h'; stty -echo; end=$((SECONDS+7)); while [ $SECONDS -lt $end ]; do printf '.'; read -t 1 junk; done; exec cat"#,
+        "/bin/bash",
+        "prompt behind the banner",
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut text = String::new();
+    while Instant::now() < deadline {
+        text = screen(&mut control, &id);
+        if text.contains("prompt behind the banner") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        text.contains("prompt behind the banner"),
+        "a repainting banner was mistaken for a delivered prompt: {text:?}"
+    );
+    std::thread::sleep(Duration::from_millis(2500));
+    let text = screen(&mut control, &id);
+    assert_eq!(
+        occurrences(&text, "prompt behind the banner"),
+        1,
+        "retries must stop the moment one attempt lands: {text:?}"
+    );
+
+    control.request("session.kill", json!({ "sessionID": id }));
+}

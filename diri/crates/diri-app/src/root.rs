@@ -21,7 +21,7 @@ use crate::notifications::{InAppBanner, NotificationSound};
 use crate::seam::{SeamSlide, toggle_has_settled};
 use crate::session_surfaces::SessionSurfaces;
 use crate::sidebar::{PreviewScenario, Sidebar, SidebarEvent};
-use crate::sounds::{self, AfplayPlayer, StatusSound};
+use crate::sounds::{self, AfplayPlayer, SoundGate, StatusSound};
 use crate::store::{DefaultAgent, SpawnOptions};
 use crate::surface_shell::UtilitySurfaces;
 use crate::terminal_pane::{TerminalPane, TerminalPaneEvent, TerminalViewport};
@@ -173,6 +173,7 @@ pub struct RootView {
     window_bounds_save: Option<Task<()>>,
     status_banner: Option<InAppBanner>,
     status_banner_generation: u64,
+    sound_gate: SoundGate,
     preview: bool,
     preview_scenario: PreviewScenario,
     #[cfg(target_os = "macos")]
@@ -393,7 +394,9 @@ impl RootView {
                                     NotificationSound::Done => StatusSound::Done,
                                     NotificationSound::Frozen => StatusSound::Frozen,
                                 };
-                                let _ = sounds::play(&AfplayPlayer, sound);
+                                if this.sound_gate.should_play(sound, Instant::now()) {
+                                    let _ = sounds::play(&AfplayPlayer, sound);
+                                }
                             }
                             #[cfg(target_os = "macos")]
                             if let Some(notification) = &status.notification
@@ -552,6 +555,7 @@ impl RootView {
             window_bounds_save: None,
             status_banner: None,
             status_banner_generation: 0,
+            sound_gate: SoundGate::default(),
             preview,
             preview_scenario,
             #[cfg(target_os = "macos")]

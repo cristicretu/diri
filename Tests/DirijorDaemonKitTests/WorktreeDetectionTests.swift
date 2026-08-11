@@ -23,8 +23,10 @@ import Testing
 ///
 /// It passes locally, every time, including under a scrubbed environment and a
 /// single-threaded cooperative pool. Rather than keep a known-hanging test in
-/// the CI path, it runs where it is meaningful. Set `CI=` to force it on.
-@Test(.enabled(if: ProcessInfo.processInfo.environment["CI"] == nil))
+/// the CI path, it runs where it is meaningful. Set `CI=` to force it on
+/// locally, or `DIRIJOR_RUN_HANGING_TESTS=1` to force it on a runner — see
+/// `HangingTestGate` and the `hang-repro` workflow.
+@Test(.enabled(if: HangingTestGate.isEnabled))
 func isLinkedWorktreeDistinguishesMainFromLinked() throws {
     let git = "/usr/bin/git"
     guard FileManager.default.fileExists(atPath: git) else { return }
