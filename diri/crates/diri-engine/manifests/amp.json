@@ -18,7 +18,7 @@
     "setup": {
       "url": "https://ampcode.com/manual",
       "installHint": "Install Amp with its official installer or Homebrew.",
-      "signInHint": "Run amp login or sign in at ampcode.com."
+      "signInHint": "Sign in at ampcode.com, then run amp."
     },
     "statusAuthority": "screen",
     "binary": "amp",

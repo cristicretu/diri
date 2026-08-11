@@ -448,6 +448,13 @@ mod tests {
                     .is_some_and(|hint| !hint.trim().is_empty()),
                 "{id} needs a sign-in hint"
             );
+            if id == "amp" {
+                assert_eq!(
+                    setup.sign_in_hint.as_deref(),
+                    Some("Sign in at ampcode.com, then run amp."),
+                    "Amp guidance must stay within its official manual"
+                );
+            }
         }
         assert!(
             first_class_count >= 17,

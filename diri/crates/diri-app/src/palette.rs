@@ -535,7 +535,7 @@ mod tests {
                 "Amp",
                 false,
                 Some("https://ampcode.com/manual"),
-                Some("Run amp login."),
+                Some("Sign in at ampcode.com, then run amp."),
             )],
         };
         let actions = actions(AgentKind::new("amp"), &catalog, &[], &[], None);
@@ -545,7 +545,7 @@ mod tests {
             .expect("unavailable Amp row");
         assert_eq!(
             amp.detail.as_deref(),
-            Some("Missing amp-bin · Install Amp. · Run amp login.")
+            Some("Missing amp-bin · Install Amp. · Sign in at ampcode.com, then run amp.")
         );
         assert!(amp.enabled);
         assert_eq!(

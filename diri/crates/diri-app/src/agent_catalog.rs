@@ -284,7 +284,7 @@ mod tests {
         unavailable.descriptor.as_mut().unwrap().setup = Some(AgentSetup {
             url: Some("https://ampcode.com/manual".into()),
             install_hint: Some("Install Amp's CLI.".into()),
-            sign_in_hint: Some("Run amp login.".into()),
+            sign_in_hint: Some("Sign in at ampcode.com, then run amp.".into()),
         });
         let options = agent_options(&AgentReadinessResult {
             agents: vec![unavailable],
@@ -296,7 +296,7 @@ mod tests {
         assert_eq!(options[0].install_hint, "Install Amp's CLI.");
         assert_eq!(
             options[0].unavailable_detail().as_deref(),
-            Some("Missing amp-bin · Install Amp's CLI. · Run amp login.")
+            Some("Missing amp-bin · Install Amp's CLI. · Sign in at ampcode.com, then run amp.")
         );
         assert_eq!(
             options[0].setup_url.as_deref(),
