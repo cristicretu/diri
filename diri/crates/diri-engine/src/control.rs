@@ -1287,6 +1287,7 @@ impl ControlServer {
             let target_id = target_host.as_ref().map(|host| host.id.clone());
             let branch = prepared.branch.clone();
             let cwd = prepared.target_repo_root.clone();
+            let worktree = prepared.target_is_worktree.then(|| cwd.clone());
             let transcript = shuttle.local_target_path.clone();
             let local = target_host.is_none();
             registry.ensure_session_project(&cwd, target_id.as_deref());
@@ -1295,7 +1296,7 @@ impl ControlServer {
                 record.cwd = cwd;
                 record.project_id =
                     crate::registry::session_project_id(&record.cwd, record.host.as_deref());
-                record.worktree_path = None;
+                record.worktree_path = worktree;
                 record.git_branch = Some(branch);
                 record.transcript_path = if local { transcript } else { None };
                 record.status = diri_proto::SessionStatus::Exited(diri_proto::ExitInfo {

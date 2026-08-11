@@ -467,7 +467,9 @@ pub type SessionReopenLastResult = SessionRecord;
 
 /// `session.migrate`: one-click handoff of a live Claude session between local
 /// and a remote host, preserving conversation context (`claude --resume`) and
-/// code state (WIP commit + push + hard-sync of the target checkout).
+/// code state — committed work by push + hard-sync of the target checkout,
+/// uncommitted work re-applied to the target tree as uncommitted state, so a
+/// session round-trips losslessly and origin only ever sees real commits.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionMigrateParams {

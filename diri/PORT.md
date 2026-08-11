@@ -54,8 +54,9 @@ This is the record of replacing it with `crates/diri-engine`.
 Since ported into `dirijord-rs` (2026-08-07 second pass): artifacts scanning
 + PR enrichment + listening ports, the full resource governor with all three
 auto-hibernation policies, spawn-on-host + remote revive over ssh+tmux,
-`host.sync_prefs`, `host.locate_repo`, `session.migrate` (WIP-commit handoff
-with transcript shuttle, prepare flow tested against two local checkouts),
+`host.sync_prefs`, `host.locate_repo`, `session.migrate` (lossless round-trip
+handoff — dirty state travels as a patch and arrives uncommitted, worktree
+identity survives, transcript shuttle; tested against two local checkouts),
 `worktree.overview`, and the Playwright browser pool (`test.run` /
 `browser.act` via the node sidecar).
 
