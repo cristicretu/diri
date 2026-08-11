@@ -144,7 +144,7 @@ cp "${universal_askpass_binary}" "${app_bin_dir}/diri-ssh-askpass"
 echo "==> Building three-platform Rust remote Helper catalog"
 remote_helpers_dir="${app_bin_dir}/remote-helpers"
 rm -rf "${remote_helpers_dir}"
-"${script_dir}/build-remote-helpers.sh" "${remote_helpers_dir}"
+DIRI_SIGN_IDENTITY="${DIRI_SIGN_IDENTITY:-}" "${script_dir}/build-remote-helpers.sh" "${remote_helpers_dir}"
 
 # Rust-owned Agent catalog used by local and remote session orchestration.
 rm -rf "${app_bin_dir}/manifests"
@@ -185,8 +185,11 @@ codesign --force --options runtime "${ts_flag[@]}" --sign "${sign_id}" "${app_bi
 codesign --force --options runtime "${ts_flag[@]}" --sign "${sign_id}" "${app_bin_dir}/dirijord-rs"
 codesign --force --options runtime "${ts_flag[@]}" --sign "${sign_id}" "${app_bin_dir}/diri-holder"
 codesign --force --options runtime "${ts_flag[@]}" --sign "${sign_id}" "${app_bin_dir}/diri-ssh-askpass"
-codesign --force --options runtime "${ts_flag[@]}" --sign "${sign_id}" \
-    "${app_bin_dir}/remote-helpers/artifacts/aarch64-apple-darwin/diri-remote"
+# The Apple remote Helper is deliberately NOT signed here. Signing rewrites the
+# Mach-O, and its length and digest are already recorded in the catalog manifest
+# that the Engine verifies before upload; signing after the fact invalidates the
+# manifest and the Engine rejects the entire catalog, disabling every remote
+# host. build-remote-helpers.sh signs it before measuring instead.
 echo "==> Signing ${app_path}"
 codesign --force --options runtime "${ts_flag[@]}" \
     --entitlements "${entitlements}" \

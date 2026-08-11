@@ -86,6 +86,22 @@ for target in "${targets[@]}"; do
     artifact="${artifact_dir}/diri-remote"
     cp "${source_binary}" "${artifact}"
     chmod 700 "${artifact}"
+    # Sign BEFORE measuring. A signature is written into the Mach-O, so signing
+    # an artifact after its length and digest are recorded invalidates the very
+    # manifest that vouches for it, and the Engine then rejects the whole
+    # catalog — every remote host, not just this one — with
+    # "artifact length is N; expected M". Only Apple targets are signable;
+    # the musl binaries are plain ELF and are measured as built.
+    case "${target}" in
+        *-apple-darwin)
+            if [[ -n "${DIRI_SIGN_IDENTITY:-}" && "${DIRI_SIGN_IDENTITY}" != "-" ]]; then
+                codesign --force --options runtime --timestamp=none \
+                    --sign "${DIRI_SIGN_IDENTITY}" "${artifact}"
+            else
+                codesign --force --sign - "${artifact}"
+            fi
+            ;;
+    esac
     length="$(file_length "${artifact}")"
     sha256="$(sha256_file "${artifact}")"
     if [[ "${first}" == 0 ]]; then
