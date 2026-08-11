@@ -24,8 +24,9 @@ use diri_proto::frames::{Frame, FrameCodec, FrameType};
 use crate::registry::Registry;
 use crate::session::{AttachmentSeed, GridSignature};
 
-/// Burst ceiling for grid emission, matching the client pacer and the Swift
-/// daemon's flush interval. The first frame after quiet goes immediately.
+/// Background-output ceiling for grid emission, matching the client pacer and
+/// the Swift daemon's flush interval. The first frame after quiet and the
+/// bounded response frames after interactive input go immediately.
 const GRID_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
 
 /// One attached client's write half.
@@ -202,9 +203,10 @@ impl AttachHub {
         }
     }
 
-    /// The per-session broadcast loop. Grid writers wake it on change; bursts
-    /// coalesce to 16 ms, while a quiet attached terminal performs no Registry
-    /// or Screen polling. Ends within one bounded wait after the last sink.
+    /// The per-session broadcast loop. Grid writers wake it on change;
+    /// background bursts coalesce to 16 ms while interactive responses bypass
+    /// that wait. A quiet attached terminal performs no Registry or Screen
+    /// polling. Ends within one bounded wait after the last sink.
     fn pump(&self, registry: &Arc<Mutex<Registry>>, session_id: &str, seed: AttachmentSeed) {
         let mut signature = seed.signature;
         let mut last_modes = Some(seed.modes);
@@ -215,9 +217,11 @@ impl AttachHub {
             .unwrap_or_else(Instant::now);
         let stop = AtomicBool::new(false);
         loop {
-            let next_generation = wake.wait_for_change(wake_generation, Duration::from_secs(1));
-            let mut changed = next_generation != wake_generation;
-            wake_generation = next_generation;
+            let observed_generation = wake_generation;
+            let event = wake.wait_for_change(wake_generation, Duration::from_secs(1));
+            let mut changed = event.generation != wake_generation;
+            let mut interactive = event.interactive;
+            wake_generation = event.generation;
 
             // A restart can replace the Session (and therefore its wake
             // source) while sinks remain connected. The bounded wait above is
@@ -234,12 +238,17 @@ impl AttachHub {
                 signature = GridSignature::default();
                 last_modes = None;
                 changed = true;
+                interactive = true;
             }
 
-            if changed {
+            if changed && !interactive {
                 let elapsed = last_emission.elapsed();
                 if elapsed < GRID_FLUSH_INTERVAL {
-                    std::thread::sleep(GRID_FLUSH_INTERVAL - elapsed);
+                    let event = wake.wait_for_priority_or_timeout(
+                        observed_generation,
+                        GRID_FLUSH_INTERVAL - elapsed,
+                    );
+                    wake_generation = event.generation;
                 }
             }
             // The session may be briefly absent mid-restart adoption: keep
@@ -274,6 +283,11 @@ impl AttachHub {
             }
 
             if !frames.is_empty() {
+                // Two publications per input may bypass coalescing: one can
+                // be a trailing change already in flight, and the next is the
+                // actual terminal response. The bounded budget prevents a
+                // keystroke from unthrottling sustained output indefinitely.
+                wake.consume_interactive_priority();
                 last_emission = Instant::now();
                 let sinks: Vec<(u64, Arc<Mutex<UnixStream>>)> = {
                     let sessions = self.sessions.lock().expect("attach hub");

@@ -1028,7 +1028,7 @@ fn performance_gate_meets_remote_holder_latency_budget() {
 
     assert_percentile("snapshot p90", &mut snapshot_latencies, 90, 100);
     assert_percentile("input-to-PTY p95", &mut input_to_pty, 95, 10);
-    assert_percentile("output-to-diff p90", &mut output_to_diff, 90, 50);
+    assert_percentile("output-to-diff p90", &mut output_to_diff, 90, 8);
     assert_percentile("loopback median", &mut loopback.clone(), 50, 75);
     assert_percentile("loopback p90", &mut loopback, 90, 150);
 

@@ -104,6 +104,8 @@ pub struct Prefs {
     pub sidebar_pinned_projects: Vec<ProjectId>,
     pub sidebar_pinned_sessions: Vec<SessionId>,
     pub sidebar_collapsed_projects: Vec<ProjectId>,
+    /// Sessions whose spawned children are folded away.
+    pub sidebar_collapsed_sessions: Vec<SessionId>,
     pub sidebar_expanded_archives: Vec<ProjectId>,
     /// Session that should regain focus after the daemon's initial hydrate.
     pub last_selected_session: Option<SessionId>,
@@ -136,6 +138,7 @@ impl Default for Prefs {
             sidebar_pinned_projects: Vec::new(),
             sidebar_pinned_sessions: Vec::new(),
             sidebar_collapsed_projects: Vec::new(),
+            sidebar_collapsed_sessions: Vec::new(),
             sidebar_expanded_archives: Vec::new(),
             last_selected_session: None,
         }

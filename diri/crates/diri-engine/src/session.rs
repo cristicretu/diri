@@ -264,45 +264,95 @@ pub(crate) struct GridWake {
 }
 
 struct GridWakeInner {
-    generation: Mutex<u64>,
+    state: Mutex<GridWakeState>,
     changed: Condvar,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GridWakeEvent {
+    pub generation: u64,
+    pub interactive: bool,
+}
+
+struct GridWakeState {
+    generation: u64,
+    interactive_budget: u8,
+}
+
+const INTERACTIVE_GRID_BUDGET: u8 = 2;
 
 impl GridWake {
     fn new() -> Self {
         Self {
             inner: Arc::new(GridWakeInner {
-                generation: Mutex::new(0),
+                state: Mutex::new(GridWakeState {
+                    generation: 0,
+                    interactive_budget: 0,
+                }),
                 changed: Condvar::new(),
             }),
         }
     }
 
     fn notify(&self) {
-        let mut generation = self.inner.generation.lock().expect("grid wake");
-        *generation = generation.wrapping_add(1);
+        let mut state = self.inner.state.lock().expect("grid wake");
+        state.generation = state.generation.saturating_add(1);
         self.inner.changed.notify_all();
     }
 
-    pub(crate) fn generation(&self) -> u64 {
-        *self.inner.generation.lock().expect("grid wake")
+    fn prioritize_interactive_changes(&self) {
+        let mut state = self.inner.state.lock().expect("grid wake");
+        state.interactive_budget = INTERACTIVE_GRID_BUDGET;
+        self.inner.changed.notify_all();
     }
 
-    pub(crate) fn wait_for_change(&self, observed: u64, timeout: Duration) -> u64 {
-        let generation = self.inner.generation.lock().expect("grid wake");
-        if *generation != observed {
-            return *generation;
+    pub(crate) fn consume_interactive_priority(&self) {
+        let mut state = self.inner.state.lock().expect("grid wake");
+        state.interactive_budget = state.interactive_budget.saturating_sub(1);
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.inner.state.lock().expect("grid wake").generation
+    }
+
+    pub(crate) fn wait_for_change(&self, observed: u64, timeout: Duration) -> GridWakeEvent {
+        let state = self.inner.state.lock().expect("grid wake");
+        if state.generation != observed {
+            return grid_wake_event(&state, observed);
         }
-        let (generation, _) = self
+        let (state, _) = self
             .inner
             .changed
-            .wait_timeout_while(generation, timeout, |generation| *generation == observed)
+            .wait_timeout_while(state, timeout, |state| state.generation == observed)
             .expect("grid wake");
-        *generation
+        grid_wake_event(&state, observed)
+    }
+
+    pub(crate) fn wait_for_priority_or_timeout(
+        &self,
+        observed: u64,
+        timeout: Duration,
+    ) -> GridWakeEvent {
+        let state = self.inner.state.lock().expect("grid wake");
+        let (state, _) = self
+            .inner
+            .changed
+            .wait_timeout_while(state, timeout, |state| {
+                state.interactive_budget == 0 || state.generation == observed
+            })
+            .expect("grid wake");
+        grid_wake_event(&state, observed)
     }
 
     pub(crate) fn same_source(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+fn grid_wake_event(state: &GridWakeState, observed: u64) -> GridWakeEvent {
+    GridWakeEvent {
+        generation: state.generation,
+        interactive: state.interactive_budget > 0 && state.generation != observed,
     }
 }
 
@@ -1281,6 +1331,13 @@ impl Session {
         // Input means someone is interacting: keep the pump on its fast tick
         // so the echo renders promptly.
         self.shared.note_hot();
+        if !bytes.is_empty() {
+            // The next grid changes are likely a trailing echo already in
+            // flight and the TUI's response. Let the attachment pump interrupt
+            // its background coalescing wait instead of making typed input
+            // cross a 16 ms frame boundary before the host can render it.
+            self.shared.grid_wake.prioritize_interactive_changes();
+        }
         self.observe_prompt_input(bytes);
         // Typed before the deferred exec: queue for the launch flush, and
         // still count as a keystroke for the reducer.
@@ -2770,10 +2827,37 @@ mod grid_wake_tests {
 
         let changed = wake.wait_for_change(observed, Duration::from_secs(1));
         thread.join().expect("notifier");
-        assert!(changed > observed);
+        assert!(changed.generation > observed);
+        assert!(!changed.interactive);
         assert_eq!(
-            wake.wait_for_change(changed, Duration::from_millis(5)),
+            wake.wait_for_change(changed.generation, Duration::from_millis(5)),
             changed
         );
+    }
+
+    #[test]
+    fn interactive_priority_covers_two_grid_changes_then_expires() {
+        let wake = GridWake::new();
+        let observed = wake.generation();
+        wake.prioritize_interactive_changes();
+
+        let unchanged = wake.wait_for_priority_or_timeout(observed, Duration::from_millis(1));
+        assert_eq!(unchanged.generation, observed);
+        assert!(!unchanged.interactive);
+
+        wake.notify();
+        let changed = wake.wait_for_priority_or_timeout(observed, Duration::from_secs(1));
+        assert!(changed.generation > observed);
+        assert!(changed.interactive);
+
+        wake.consume_interactive_priority();
+        wake.notify();
+        let trailing = wake.wait_for_change(changed.generation, Duration::from_secs(1));
+        assert!(trailing.interactive);
+
+        wake.consume_interactive_priority();
+        wake.notify();
+        let background = wake.wait_for_change(trailing.generation, Duration::from_secs(1));
+        assert!(!background.interactive);
     }
 }
