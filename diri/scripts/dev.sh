@@ -156,14 +156,20 @@ if [[ -n "${settings_preview}" ]]; then
     launch_environment+=("DIRI_SETTINGS_PREVIEW=${settings_preview}")
 fi
 
-# A dev wrapper intentionally does not carry a second daemon. If no daemon is
-# live, point its launch-only fallback at the installed release bundle; both
-# clients still use the same socket and Application Support directory.
+# The Rust app fail-closes unless Hello reports engineKind=diri-rust-engine.
+# Prefer a local cargo build of dirijord-rs, then the packaged Rust Engine in
+# an installed bundle. Never point at Swift `dirijord` — the client rejects it
+# and the UI comes up unable to spawn or list sessions.
 if [[ -z "${DIRIJORD_PATH:-}" ]]; then
-    for installed_app in "${HOME}/Applications/diri.app" "/Applications/diri.app"; do
-        installed_daemon="${installed_app}/Contents/Resources/bin/dirijord"
-        if [[ -x "${installed_daemon}" ]]; then
-            launch_environment+=("DIRIJORD_PATH=${installed_daemon}")
+    for candidate in \
+        "${target_dir}/${profile}/dirijord-rs" \
+        "${target_dir}/debug/dirijord-rs" \
+        "${target_dir}/release/dirijord-rs" \
+        "${HOME}/Applications/diri.app/Contents/Resources/bin/dirijord-rs" \
+        "/Applications/diri.app/Contents/Resources/bin/dirijord-rs"
+    do
+        if [[ -x "${candidate}" ]]; then
+            launch_environment+=("DIRIJORD_PATH=${candidate}")
             break
         fi
     done
@@ -171,6 +177,14 @@ fi
 
 echo "==> Launching ${display_name} (${build_label})"
 echo "    ${app_path}"
+if [[ -n "${DIRIJORD_PATH:-}" ]]; then
+    echo "    engine: ${DIRIJORD_PATH}"
+fi
+for item in "${launch_environment[@]}"; do
+    if [[ "${item}" == DIRIJORD_PATH=* ]]; then
+        echo "    engine: ${item#DIRIJORD_PATH=}"
+    fi
+done
 exec env \
     -u DIRIJOR_SOCKET \
     -u DIRIJOR_SESSION_ID \

@@ -304,6 +304,53 @@ func codexWrapperReentersShellAndResolvesFreshInteractivePath() throws {
     #expect((config["args"] as? [String]) == [])
 }
 
+@Test func cursorPluginIsLaunchScopedWithBakedEnvAndStopHook() throws {
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("dirijor-cursor-plugin-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let cli = dir.appendingPathComponent("Application Support/dirijor")
+    try FileManager.default.createDirectory(
+        at: cli.deletingLastPathComponent(), withIntermediateDirectories: true)
+    FileManager.default.createFile(atPath: cli.path, contents: Data("#!/bin/sh\n".utf8))
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cli.path)
+    let proxy = cli.deletingLastPathComponent().appendingPathComponent("dirijor-mcp")
+    FileManager.default.createFile(atPath: proxy.path, contents: Data("#!/bin/sh\n".utf8))
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: proxy.path)
+
+    let sessionID = SessionID(rawValue: "s_cursor")
+    let args = InjectionBuilder.cursorPluginArgs(
+        .init(cursorMCP: true, cursorHooks: true),
+        sessionID: sessionID,
+        socketPath: "/tmp/d.sock",
+        cliPath: cli.path,
+        injectDir: dir
+    )
+    #expect(args.count == 2)
+    #expect(args[0] == "--plugin-dir")
+    #expect(args[1].hasSuffix("cursor-plugin/s_cursor"))
+
+    let plugin = URL(fileURLWithPath: args[1])
+    let mcp = try JSONSerialization.jsonObject(
+        with: Data(contentsOf: plugin.appendingPathComponent("mcp.json"))
+    ) as! [String: Any]
+    let server = ((mcp["mcpServers"] as! [String: Any])["dirijor"] as! [String: Any])
+    #expect(server["command"] as? String == "/usr/bin/env")
+    #expect((server["args"] as? [String]) == [proxy.path])
+    let env = server["env"] as! [String: String]
+    #expect(env[DirijorEnv.sessionID] == "s_cursor")
+    #expect(env[DirijorEnv.socket] == "/tmp/d.sock")
+    #expect(env[DirijorEnv.cli] == cli.path)
+
+    let hooks = try JSONSerialization.jsonObject(
+        with: Data(contentsOf: plugin.appendingPathComponent("hooks/hooks.json"))
+    ) as! [String: Any]
+    let stop = (((hooks["hooks"] as! [String: Any])["stop"] as! [[String: Any]])[0]["command"]
+        as! String)
+    #expect(stop.contains("hook Stop"))
+    #expect(stop.contains(cli.path))
+}
+
 @Test func eventBusSeqAndReplay() async {
     let bus = EventBus(ringCapacity: 8)
     await bus.publish(name: "a", params: .null)

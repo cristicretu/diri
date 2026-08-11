@@ -400,7 +400,10 @@ public actor SessionRegistry {
         } else {
             guard
                 let resumeArgv = InjectionBuilder.resumeArgv(
-                    record: record, injectDir: config.injectDir)
+                    record: record,
+                    injectDir: config.injectDir,
+                    socketPath: config.socketPath,
+                    cliPath: config.cliPath)
             else {
                 throw ControlError.badRequest("session is not resumable")
             }
@@ -780,7 +783,11 @@ public actor SessionRegistry {
             return try await reopenLastClosed()
         }
         if record.host != nil
-            || InjectionBuilder.resumeArgv(record: record, injectDir: config.injectDir) != nil
+            || InjectionBuilder.resumeArgv(
+                record: record,
+                injectDir: config.injectDir,
+                socketPath: config.socketPath,
+                cliPath: config.cliPath) != nil
         {
             // Reinsert the record (as exited) and drive the existing resume path
             // so the conversation comes back under its original identity —

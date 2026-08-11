@@ -716,10 +716,14 @@ impl ControlServer {
                 uuid
             });
             if let Some(injection) = &self.injection {
-                launch_args.extend(crate::inject::injection_args(
+                launch_args.extend(crate::inject::injection_args_with_cursor(
                     &descriptor.injection,
                     &injection.inject_dir,
                     &injection.cli_path,
+                    Some(crate::inject::CursorInject {
+                        session_id: &id,
+                        socket_path: &self.socket_path,
+                    }),
                 ));
             }
         }
@@ -1906,15 +1910,21 @@ impl ControlServer {
             // Only the appendable flag mechanisms replay on resume, exactly
             // as in Swift: Codex's global `-c` overrides must precede the
             // resume SUBCOMMAND and are deliberately not replayed.
-            let claude_only = crate::agent::InjectionSpec {
+            let replay = crate::agent::InjectionSpec {
                 claude_hooks: descriptor.injection.claude_hooks,
                 claude_mcp: descriptor.injection.claude_mcp,
+                cursor_mcp: descriptor.injection.cursor_mcp,
+                cursor_hooks: descriptor.injection.cursor_hooks,
                 ..Default::default()
             };
-            launch_args.extend(crate::inject::injection_args(
-                &claude_only,
+            launch_args.extend(crate::inject::injection_args_with_cursor(
+                &replay,
                 &injection.inject_dir,
                 &injection.cli_path,
+                Some(crate::inject::CursorInject {
+                    session_id: id,
+                    socket_path: &self.socket_path,
+                }),
             ));
         }
 
@@ -2800,6 +2810,11 @@ mod tests {
             codex_descriptor.injection.codex_notify || codex_descriptor.injection.codex_mcp,
             "codex opts into at least one shim"
         );
+
+        let cursor = engine.manifest("cursor").expect("cursor manifest");
+        let cursor_descriptor = cursor.agent.clone().expect("agent");
+        assert!(cursor_descriptor.injection.cursor_mcp);
+        assert!(cursor_descriptor.injection.cursor_hooks);
     }
 
     #[test]

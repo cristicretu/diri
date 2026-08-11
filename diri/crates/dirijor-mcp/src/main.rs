@@ -17,15 +17,23 @@ struct ProcessBackend {
 
 impl ProcessBackend {
     fn discover() -> Self {
-        let cli = env::var_os("DIRIJOR_CLI").map_or_else(
-            || {
+        let cli = env::var_os("DIRIJOR_CLI")
+            .map(PathBuf::from)
+            .filter(|path| is_executable(path))
+            .or_else(|| {
                 env::current_exe()
                     .ok()
                     .and_then(|path| path.parent().map(|parent| parent.join("dirijor")))
-                    .unwrap_or_else(|| PathBuf::from("dirijor"))
-            },
-            PathBuf::from,
-        );
+                    .filter(|path| is_executable(path))
+            })
+            .or_else(|| {
+                env::var_os("HOME").and_then(|home| {
+                    let path = PathBuf::from(home)
+                        .join("Library/Application Support/Dirijor/bin/dirijor");
+                    is_executable(&path).then_some(path)
+                })
+            })
+            .unwrap_or_else(|| PathBuf::from("dirijor"));
         Self {
             cli,
             cached_tools: None,
@@ -176,6 +184,20 @@ fn handle_message(message: Value, backend: &mut impl ToolBackend) -> Option<Valu
             -32601,
             format!("Method not found: {method}"),
         )),
+    }
+}
+
+fn is_executable(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        path.exists()
     }
 }
 

@@ -32,6 +32,10 @@
       "DIRI_",
       "DIRIJOR_"
     ],
+    "injection": {
+      "cursorMCP": true,
+      "cursorHooks": true
+    },
     "deny": {
       "text": "n",
       "submit": false

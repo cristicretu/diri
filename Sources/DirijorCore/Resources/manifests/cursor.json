@@ -25,7 +25,11 @@
       "style": "latest",
       "token": "resume"
     },
-    "_resumeNotice": "Verified against cursor-agent CLI help: 'resume  Resume the latest chat session'. Chat ids are minted server-side, so --resume <chatId> is not buildable, but the bare subcommand needs no id."
+    "_resumeNotice": "Verified against cursor-agent CLI help: 'resume  Resume the latest chat session'. Chat ids are minted server-side, so --resume <chatId> is not buildable, but the bare subcommand needs no id.",
+    "injection": {
+      "cursorMCP": true,
+      "cursorHooks": true
+    }
   },
   "rules": [
     {

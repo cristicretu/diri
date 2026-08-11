@@ -108,11 +108,28 @@ fn mcp_launch(cli_path: &Path) -> (String, Vec<String>) {
     }
 }
 
+/// Session identity needed to bake Cursor's per-launch plugin (MCP env + hooks).
+pub struct CursorInject<'a> {
+    pub session_id: &'a str,
+    pub socket_path: &'a Path,
+}
+
 /// Per-launch injection arguments for the mechanisms a manifest opted into.
 pub fn injection_args(
     injection: &InjectionSpec,
     inject_dir: &Path,
     cli_path: &Path,
+) -> Vec<String> {
+    injection_args_with_cursor(injection, inject_dir, cli_path, None)
+}
+
+/// Like [`injection_args`], and when `cursor` is set also writes/appends the
+/// session-local Cursor `--plugin-dir` (MCP + stop hook).
+pub fn injection_args_with_cursor(
+    injection: &InjectionSpec,
+    inject_dir: &Path,
+    cli_path: &Path,
+    cursor: Option<CursorInject<'_>>,
 ) -> Vec<String> {
     let mut argv = Vec::new();
     if injection.claude_hooks {
@@ -151,7 +168,93 @@ pub fn injection_args(
         argv.push("-c".into());
         argv.push(format!("mcp_servers.dirijor.args=[{encoded_args}]"));
     }
+    if (injection.cursor_mcp || injection.cursor_hooks)
+        && let Some(cursor) = cursor
+        && let Ok(plugin_dir) = write_cursor_plugin(
+            inject_dir,
+            cli_path,
+            cursor.session_id,
+            cursor.socket_path,
+            injection.cursor_mcp,
+            injection.cursor_hooks,
+        )
+    {
+        argv.push("--plugin-dir".into());
+        argv.push(plugin_dir.to_string_lossy().into_owned());
+    }
     argv
+}
+
+/// Writes `<inject>/cursor-plugin/<session>/` with plugin manifest, optional
+/// `mcp.json`, and optional `hooks/hooks.json`. Returns the plugin directory.
+pub fn write_cursor_plugin(
+    inject_dir: &Path,
+    cli_path: &Path,
+    session_id: &str,
+    socket_path: &Path,
+    mcp: bool,
+    hooks: bool,
+) -> io::Result<PathBuf> {
+    let plugin_dir = inject_dir.join("cursor-plugin").join(session_id);
+    std::fs::create_dir_all(plugin_dir.join(".cursor-plugin"))?;
+    write_atomic(
+        &plugin_dir.join(".cursor-plugin/plugin.json"),
+        &serde_json::to_vec_pretty(&json!({
+            "name": "dirijor",
+            "version": "0.1.0",
+            "description": "Diri agent orchestration for Cursor sessions",
+        }))?,
+    )?;
+
+    if mcp {
+        let (target, target_args) = mcp_launch(cli_path);
+        // Cursor splits `command` on spaces before spawning it. Keep the
+        // App Support path in argv, where JSON preserves it as one argument.
+        let args = std::iter::once(target)
+            .chain(target_args)
+            .collect::<Vec<_>>();
+        write_atomic(
+            &plugin_dir.join("mcp.json"),
+            &serde_json::to_vec_pretty(&json!({
+                "mcpServers": {
+                    "dirijor": {
+                        "type": "stdio",
+                        "command": "/usr/bin/env",
+                        "args": args,
+                        "env": {
+                            "DIRIJOR_SESSION_ID": session_id,
+                            "DIRIJOR_SOCKET": socket_path.to_string_lossy(),
+                            "DIRIJOR_CLI": cli_path.to_string_lossy(),
+                        }
+                    }
+                }
+            }))?,
+        )?;
+    }
+
+    if hooks {
+        std::fs::create_dir_all(plugin_dir.join("hooks"))?;
+        // Absolute CLI path: Cursor does not expand $DIRIJOR_CLI in hook cmds.
+        let quoted = shell_single_quote(&cli_path.to_string_lossy());
+        write_atomic(
+            &plugin_dir.join("hooks/hooks.json"),
+            &serde_json::to_vec_pretty(&json!({
+                "version": 1,
+                "hooks": {
+                    "stop": [{ "command": format!("{quoted} hook Stop") }],
+                    "beforeSubmitPrompt": [{
+                        "command": format!("{quoted} hook UserPromptSubmit")
+                    }],
+                }
+            }))?,
+        )?;
+    }
+
+    Ok(plugin_dir)
+}
+
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Claude Code's project-directory slug for a working directory: `/` and `.`
@@ -300,6 +403,66 @@ mod tests {
                 .any(|arg| arg.starts_with("mcp_servers.dirijor.command=")),
             "{args:?}"
         );
+    }
+
+    #[test]
+    fn cursor_plugin_is_launch_scoped_with_baked_env_and_stop_hook() {
+        let temp = tempfile::tempdir().expect("temp");
+        let cli = temp.path().join("Application Support/dirijor");
+        std::fs::create_dir_all(cli.parent().unwrap()).expect("mkdir");
+        std::fs::write(&cli, b"#!/bin/sh\n").expect("cli");
+        let proxy = cli.with_file_name("dirijor-mcp");
+        std::fs::write(&proxy, b"#!/bin/sh\n").expect("proxy");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&cli).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&cli, perms).unwrap();
+            std::fs::set_permissions(&proxy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let socket = temp.path().join("d.sock");
+        let cursor = InjectionSpec {
+            cursor_mcp: true,
+            cursor_hooks: true,
+            ..Default::default()
+        };
+        let args = injection_args_with_cursor(
+            &cursor,
+            temp.path(),
+            &cli,
+            Some(CursorInject {
+                session_id: "s_test",
+                socket_path: &socket,
+            }),
+        );
+        assert_eq!(args[0], "--plugin-dir");
+        assert!(args[1].ends_with("cursor-plugin/s_test"), "{args:?}");
+
+        let plugin = Path::new(&args[1]);
+        let mcp: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(plugin.join("mcp.json")).expect("mcp.json"))
+                .expect("json");
+        assert_eq!(mcp["mcpServers"]["dirijor"]["command"], "/usr/bin/env");
+        assert_eq!(
+            mcp["mcpServers"]["dirijor"]["args"][0],
+            proxy.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            mcp["mcpServers"]["dirijor"]["env"]["DIRIJOR_SESSION_ID"],
+            "s_test"
+        );
+        assert_eq!(
+            mcp["mcpServers"]["dirijor"]["env"]["DIRIJOR_SOCKET"],
+            socket.to_string_lossy().as_ref()
+        );
+
+        let hooks: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(plugin.join("hooks/hooks.json")).expect("hooks"))
+                .expect("json");
+        let stop = hooks["hooks"]["stop"][0]["command"].as_str().expect("cmd");
+        assert!(stop.contains("hook Stop"), "{stop}");
+        assert!(stop.contains("dirijor"), "{stop}");
     }
 
     #[test]

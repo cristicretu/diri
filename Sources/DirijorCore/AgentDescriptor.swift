@@ -88,21 +88,33 @@ public struct AgentDescriptor: Codable, Hashable, Sendable {
         public var codexNotify: Bool = false
         /// `-c mcp_servers.dirijor.…`: Codex's TOML-override MCP wiring.
         public var codexMCP: Bool = false
+        /// Cursor has no `--mcp-config`. Launch a session-local `--plugin-dir`
+        /// whose `mcp.json` advertises the `dirijor` stdio server.
+        public var cursorMCP: Bool = false
+        /// Same plugin ships `hooks.json`: Cursor `stop` → `dirijor hook Stop`
+        /// (strong idle / done chime), `beforeSubmitPrompt` → working.
+        public var cursorHooks: Bool = false
 
         public init(
             claudeHooks: Bool = false, claudeMCP: Bool = false,
-            codexNotify: Bool = false, codexMCP: Bool = false
+            codexNotify: Bool = false, codexMCP: Bool = false,
+            cursorMCP: Bool = false, cursorHooks: Bool = false
         ) {
             self.claudeHooks = claudeHooks
             self.claudeMCP = claudeMCP
             self.codexNotify = codexNotify
             self.codexMCP = codexMCP
+            self.cursorMCP = cursorMCP
+            self.cursorHooks = cursorHooks
         }
 
-        public var isEmpty: Bool { !claudeHooks && !claudeMCP && !codexNotify && !codexMCP }
+        public var isEmpty: Bool {
+            !claudeHooks && !claudeMCP && !codexNotify && !codexMCP
+                && !cursorMCP && !cursorHooks
+        }
 
         private enum CodingKeys: String, CodingKey {
-            case claudeHooks, claudeMCP, codexNotify, codexMCP
+            case claudeHooks, claudeMCP, codexNotify, codexMCP, cursorMCP, cursorHooks
         }
 
         public init(from decoder: any Decoder) throws {
@@ -111,6 +123,8 @@ public struct AgentDescriptor: Codable, Hashable, Sendable {
             claudeMCP = try c.decodeIfPresent(Bool.self, forKey: .claudeMCP) ?? false
             codexNotify = try c.decodeIfPresent(Bool.self, forKey: .codexNotify) ?? false
             codexMCP = try c.decodeIfPresent(Bool.self, forKey: .codexMCP) ?? false
+            cursorMCP = try c.decodeIfPresent(Bool.self, forKey: .cursorMCP) ?? false
+            cursorHooks = try c.decodeIfPresent(Bool.self, forKey: .cursorHooks) ?? false
         }
     }
 

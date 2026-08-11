@@ -117,7 +117,11 @@ fn main() {
     );
     let registry = Arc::new(Mutex::new(registry));
 
-    let cli_path = exe_dir.join("dirijor");
+    // Stable CLI path under App Support (same contract as Swift dirijord):
+    // hooks, Codex notify, and dirijor-mcp all reference this absolute path.
+    // A cargo-built dirijord-rs does not sit next to a `dirijor` binary, so
+    // inventing `target/debug/dirijor` makes every MCP tools/list fail.
+    let cli_path = install_cli_helpers(&exe_dir, &app_support);
     let mut server = ControlServer::new(Arc::clone(&registry), app_support.join("daemon.sock"))
         .with_logs_dir(&logs_dir)
         .with_holder(holder)
@@ -261,6 +265,159 @@ fn app_support_dir() -> PathBuf {
     Path::new(&home).join("Library/Application Support/Dirijor")
 }
 
+/// Copy `dirijor`, `dirijor-mcp`, and the CLI's manifest resource bundle into
+/// App Support `bin/`, then return the stable `dirijor` path used for injection.
+#[cfg(unix)]
+fn install_cli_helpers(exe_dir: &Path, app_support: &Path) -> PathBuf {
+    let bin_dir = app_support.join("bin");
+    let _ = std::fs::create_dir_all(&bin_dir);
+    for name in ["dirijor", "dirijor-mcp"] {
+        let dest = bin_dir.join(name);
+        let Some(source) = cli_helper_sources(exe_dir, name)
+            .into_iter()
+            .find(|path| is_executable(path))
+        else {
+            continue;
+        };
+        if source.canonicalize().ok() == dest.canonicalize().ok() {
+            continue;
+        }
+        match install_cli_helper(&source, &dest) {
+            Ok(()) => eprintln!(
+                "dirijord-rs: installed helper: {} -> {}",
+                source.display(),
+                dest.display()
+            ),
+            Err(error) => eprintln!(
+                "dirijord-rs: helper install failed for {name}: {error} (source {})",
+                source.display()
+            ),
+        }
+    }
+    install_cli_resource_bundle(exe_dir, &bin_dir);
+    let stable = bin_dir.join("dirijor");
+    if is_executable(&stable) {
+        stable
+    } else if is_executable(&exe_dir.join("dirijor")) {
+        exe_dir.join("dirijor")
+    } else {
+        // Last resort: PATH lookup at spawn time. Still better than a path
+        // that is known not to exist beside this Engine binary.
+        PathBuf::from("dirijor")
+    }
+}
+
+#[cfg(unix)]
+fn install_cli_helper(source: &Path, dest: &Path) -> std::io::Result<()> {
+    let file_name = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid helper name")
+        })?;
+    let staging = dest.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&staging);
+    std::fs::copy(source, &staging)?;
+    set_executable(&staging);
+    if let Err(error) = std::fs::rename(&staging, dest) {
+        let _ = std::fs::remove_file(&staging);
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn install_cli_resource_bundle(exe_dir: &Path, bin_dir: &Path) {
+    const NAME: &str = "dirijor_DirijorCore.bundle";
+    let Some(source) = cli_helper_sources(exe_dir, NAME)
+        .into_iter()
+        .find(|path| path.is_dir())
+    else {
+        return;
+    };
+    let dest = bin_dir.join(NAME);
+    if source.canonicalize().ok() == dest.canonicalize().ok() {
+        return;
+    }
+    let staging = bin_dir.join(format!(".{NAME}.{}.tmp", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging);
+    if let Err(error) = copy_dir(&source, &staging) {
+        let _ = std::fs::remove_dir_all(&staging);
+        eprintln!(
+            "dirijord-rs: helper resource install failed: {error} (source {})",
+            source.display()
+        );
+        return;
+    }
+    let _ = std::fs::remove_dir_all(&dest);
+    if let Err(error) = std::fs::rename(&staging, &dest) {
+        let _ = std::fs::remove_dir_all(&staging);
+        eprintln!("dirijord-rs: helper resource activation failed: {error}");
+    }
+}
+
+#[cfg(unix)]
+fn copy_dir(source: &Path, dest: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let target = dest.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else if file_type.is_file() {
+            std::fs::copy(entry.path(), target)?;
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "resource bundle contains a symlink or special file",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn cli_helper_sources(exe_dir: &Path, name: &str) -> Vec<PathBuf> {
+    let mut sources = vec![exe_dir.join(name)];
+    // cargo: <repo>/diri/target/{debug,release} → <repo>/.build/debug/<name>
+    if let Some(repo) = exe_dir
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+    {
+        sources.push(repo.join(".build/debug").join(name));
+        sources.push(repo.join(".build/arm64-apple-macosx/debug").join(name));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        sources.push(
+            Path::new(&home)
+                .join("Applications/diri.app/Contents/Resources/bin")
+                .join(name),
+        );
+    }
+    sources.push(PathBuf::from("/Applications/diri.app/Contents/Resources/bin").join(name));
+    sources
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn set_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mut perms = meta.permissions();
+        perms.set_mode(perms.mode() | 0o755);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+}
+
 #[cfg(unix)]
 /// Rust-owned base catalog next to the executable, then user overrides, then
 /// the source-tree fallback used by loose development binaries.
@@ -368,6 +525,48 @@ fn resolve_remote_catalog_source(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_helper_replacement_keeps_the_running_inode_intact() {
+        use std::io::Read;
+
+        let temporary = tempfile::tempdir().expect("temp");
+        let source = temporary.path().join("source");
+        let dest = temporary.path().join("dirijor-mcp");
+        std::fs::write(&source, b"new").expect("source");
+        std::fs::write(&dest, b"old").expect("dest");
+        let mut running = std::fs::File::open(&dest).expect("running helper");
+
+        install_cli_helper(&source, &dest).expect("install");
+
+        let mut old = String::new();
+        running.read_to_string(&mut old).expect("old inode");
+        assert_eq!(old, "old");
+        assert_eq!(std::fs::read_to_string(&dest).expect("new path"), "new");
+    }
+
+    #[test]
+    fn cli_resource_bundle_is_installed_without_stale_files() {
+        let temporary = tempfile::tempdir().expect("temp");
+        let source = temporary.path().join("source");
+        let bin = temporary.path().join("bin");
+        let manifests = source.join("dirijor_DirijorCore.bundle/manifests");
+        std::fs::create_dir_all(&manifests).expect("source bundle");
+        std::fs::write(manifests.join("cursor.json"), b"cursor").expect("cursor manifest");
+
+        install_cli_resource_bundle(&source, &bin);
+        let installed = bin.join("dirijor_DirijorCore.bundle/manifests");
+        assert_eq!(
+            std::fs::read(installed.join("cursor.json")).expect("installed cursor manifest"),
+            b"cursor"
+        );
+
+        std::fs::remove_file(manifests.join("cursor.json")).expect("remove old manifest");
+        std::fs::write(manifests.join("codex.json"), b"codex").expect("codex manifest");
+        install_cli_resource_bundle(&source, &bin);
+        assert!(!installed.join("cursor.json").exists());
+        assert!(installed.join("codex.json").exists());
+    }
 
     #[test]
     fn loose_build_prefers_current_sibling_over_a_stale_catalog() {

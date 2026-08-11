@@ -109,6 +109,13 @@ echo "==> Bundling CLI and lightweight MCP proxy into Resources/bin"
 mkdir -p "${app_bin_dir}"
 cp "${daemon_bin}/dirijor" "${app_bin_dir}/dirijor"
 cp "${universal_mcp_binary}" "${app_bin_dir}/dirijor-mcp"
+core_bundle="${daemon_bin}/dirijor_DirijorCore.bundle"
+if [[ ! -d "${core_bundle}" ]]; then
+    echo "error: Swift CLI resource bundle is missing: ${core_bundle}" >&2
+    exit 1
+fi
+rm -rf "${app_bin_dir}/dirijor_DirijorCore.bundle"
+cp -R "${core_bundle}" "${app_bin_dir}/dirijor_DirijorCore.bundle"
 
 # The Rust Engine is the authoritative daemon launched by diri. The remote
 # Helper catalog below is consumed by this executable directly.

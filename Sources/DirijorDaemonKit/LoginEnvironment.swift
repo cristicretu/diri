@@ -42,10 +42,20 @@ public enum LoginEnvironment {
         let out = Pipe()
         process.standardOutput = out
         process.standardError = FileHandle.nullDevice
+        // No TTY: some interactive rc files wait on input forever. A hung
+        // capture used to brick daemon init (Daemon → BrowserPool → PATH) so
+        // the socket never came up — kill and fall back instead.
+        let captureTimeoutSeconds: TimeInterval = 5
         do {
             try process.run()
+            let watchdog = DispatchWorkItem {
+                if process.isRunning { process.terminate() }
+            }
+            DispatchQueue.global().asyncAfter(
+                deadline: .now() + captureTimeoutSeconds, execute: watchdog)
             let data = out.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
+            watchdog.cancel()
             // Interactive shells may print a greeting; take the last line that
             // looks like a PATH (contains a "/" and a ":").
             let lines = String(decoding: data, as: UTF8.self)

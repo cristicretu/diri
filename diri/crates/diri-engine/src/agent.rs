@@ -51,6 +51,13 @@ pub struct InjectionSpec {
     pub codex_notify: bool,
     #[serde(default, rename = "codexMCP")]
     pub codex_mcp: bool,
+    /// Cursor has no `--mcp-config`. Launch a session-local `--plugin-dir`
+    /// whose `mcp.json` advertises the `dirijor` stdio server.
+    #[serde(default, rename = "cursorMCP")]
+    pub cursor_mcp: bool,
+    /// Same plugin ships hooks: Cursor `stop` → `dirijor hook Stop`.
+    #[serde(default, rename = "cursorHooks")]
+    pub cursor_hooks: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
