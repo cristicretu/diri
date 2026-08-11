@@ -1565,8 +1565,8 @@ impl UtilitySurfaces {
                         ))
                         .child(setting_divider(colors))
                         .child(toggle_row(
-                            "Chime on agent status changes",
-                            "Play a sound when an agent needs input or finishes.",
+                            "Gentle status chimes",
+                            "Quiet cues for input, completion, and memory pauses.",
                             self.prefs.status_sounds,
                             "toggle-status-sounds",
                             colors,
