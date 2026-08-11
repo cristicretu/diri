@@ -13,7 +13,7 @@ use crate::store::{DefaultAgent, Prefs, SessionStore, StoreRuntime};
 use crate::updates::{UpdateCommand, UpdateHandle, UpdatePhase};
 use crate::worktrees::WorktreesSheet;
 use diri_proto::{AgentKind as ProtoAgentKind, HistoryEntry, HostEntry, HostsConfig};
-use diri_term::theme::TermTheme;
+use diri_term::theme::{TermTheme, ThemeAppearance};
 use diri_ui::{
     AgentLogo, Fill, FloatingSurface, HairlineDivider, Ink, LoadingIndicator, Metrics, Palette,
     Radius, SemanticColors, Space, Typo,
@@ -25,8 +25,6 @@ use gpui::{
 };
 use tokio::runtime::Runtime;
 
-const COLORS: SemanticColors = SemanticColors::dark();
-const SETTINGS_COLORS: SemanticColors = SemanticColors::sidebar(diri_ui::Appearance::Dark);
 const SETTINGS_WIDTH: f32 = 600.0;
 const SETTINGS_HEIGHT: f32 = 420.0;
 const SETTINGS_NAV_WIDTH: f32 = 150.0;
@@ -987,6 +985,7 @@ impl UtilitySurfaces {
     }
 
     fn render_history(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.colors();
         let entries = self.visible_history();
         let empty = entries.is_empty() && !self.history_loading;
         let rows = entries.into_iter().enumerate().map(|(index, entry)| {
@@ -1009,15 +1008,15 @@ impl UtilitySurfaces {
                 .items_center()
                 .gap(px(9.0))
                 .opacity(if resumable { 1.0 } else { 0.45 })
-                .bg(Fill::selected(COLORS, selected))
+                .bg(Fill::selected(colors, selected))
                 .cursor_pointer()
-                .hover(|style| style.bg(Fill::hover(COLORS, true)))
+                .hover(move |style| style.bg(Fill::hover(colors, true)))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if resumable {
                         this.resume_history(entry.clone(), cx);
                     }
                 }))
-                .child(AgentLogo::new(agent, 18.0, COLORS))
+                .child(AgentLogo::new(agent, 18.0, colors))
                 .child(
                     div()
                         .flex()
@@ -1028,7 +1027,7 @@ impl UtilitySurfaces {
                         .child(
                             div()
                                 .text_size(px(13.0))
-                                .text_color(COLORS.primary)
+                                .text_color(colors.primary)
                                 .overflow_hidden()
                                 .child(title),
                         )
@@ -1037,17 +1036,20 @@ impl UtilitySurfaces {
                                 .flex()
                                 .gap(px(5.0))
                                 .text_size(px(11.0))
-                                .child(div().text_color(COLORS.secondary).child(folder))
-                                .child(div().text_color(COLORS.tertiary).child(parent)),
+                                .child(div().text_color(colors.secondary).child(folder))
+                                .child(div().text_color(colors.tertiary).child(parent)),
                         ),
                 )
-                .child(chip(if !resumable {
-                    "folder gone".to_owned()
-                } else if selected {
-                    "↵ resume".to_owned()
-                } else {
-                    age
-                }))
+                .child(chip(
+                    if !resumable {
+                        "folder gone".to_owned()
+                    } else if selected {
+                        "↵ resume".to_owned()
+                    } else {
+                        age
+                    },
+                    colors,
+                ))
         });
 
         FloatingSurface::new(
@@ -1065,14 +1067,14 @@ impl UtilitySurfaces {
                         .items_center()
                         .gap(px(10.0))
                         .text_size(px(15.0))
-                        .child(sf_symbol("magnifyingglass", 13.0, COLORS.tertiary))
+                        .child(sf_symbol("magnifyingglass", 13.0, colors.tertiary))
                         .child(
                             div()
                                 .flex_1()
                                 .text_color(if self.history_query.is_empty() {
-                                    COLORS.tertiary
+                                    colors.tertiary
                                 } else {
-                                    COLORS.primary
+                                    colors.primary
                                 })
                                 .child(if self.history_query.is_empty() {
                                     div().child("Search past conversations…").into_any_element()
@@ -1080,9 +1082,9 @@ impl UtilitySurfaces {
                                     query_label(&self.history_query)
                                 }),
                         )
-                        .child(chip("esc".to_owned())),
+                        .child(chip("esc".to_owned(), colors)),
                 )
-                .child(HairlineDivider::horizontal(COLORS))
+                .child(HairlineDivider::horizontal(colors))
                 .child(
                     div()
                         .id("history-results")
@@ -1093,17 +1095,23 @@ impl UtilitySurfaces {
                         .flex_col()
                         .gap(px(1.0))
                         .when(self.history_loading, |view| {
-                            view.child(empty_label("Scanning Claude and Codex transcripts…"))
+                            view.child(empty_label(
+                                "Scanning Claude and Codex transcripts…",
+                                colors,
+                            ))
                         })
                         .when_some(self.history_error.clone(), |view, error| {
-                            view.child(empty_label(&error))
+                            view.child(empty_label(&error, colors))
                         })
                         .when(empty, |view| {
-                            view.child(empty_label(if self.history_query.is_empty() {
-                                "No past conversations"
-                            } else {
-                                "No matches"
-                            }))
+                            view.child(empty_label(
+                                if self.history_query.is_empty() {
+                                    "No past conversations"
+                                } else {
+                                    "No matches"
+                                },
+                                colors,
+                            ))
                         })
                         .children(rows),
                 ),
@@ -1111,6 +1119,7 @@ impl UtilitySurfaces {
     }
 
     fn render_worktrees(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.colors();
         let cards = self
             .worktrees
             .entries
@@ -1132,9 +1141,9 @@ impl UtilitySurfaces {
                     .border_color(if stale {
                         Ink::ATTENTION.alpha(0.6)
                     } else {
-                        COLORS.primary.alpha(0.06)
+                        colors.primary.alpha(0.06)
                     })
-                    .bg(Fill::subtle(COLORS))
+                    .bg(Fill::subtle(colors))
                     .flex()
                     .flex_col()
                     .gap(px(8.0))
@@ -1145,13 +1154,13 @@ impl UtilitySurfaces {
                             .gap(px(6.0))
                             .text_size(px(13.0))
                             .font_weight(FontWeight::MEDIUM)
-                            .child(sf_symbol("arrow.branch", 13.0, COLORS.secondary))
+                            .child(sf_symbol("arrow.branch", 13.0, colors.secondary))
                             .child(branch),
                     )
                     .child(
                         div()
                             .text_size(px(11.0))
-                            .text_color(COLORS.tertiary)
+                            .text_color(colors.tertiary)
                             .child(project),
                     )
                     .child(
@@ -1164,7 +1173,7 @@ impl UtilitySurfaces {
                             .when(entry.merged, |row| {
                                 row.child(colored_badge("merged", Ink::FRESH))
                             })
-                            .child(chip(format!("{}d", entry.age_days))),
+                            .child(chip(format!("{}d", entry.age_days), colors)),
                     )
                     .when(stale, |card| {
                         card.child(
@@ -1220,17 +1229,24 @@ impl UtilitySurfaces {
                                 .child(surface_button(
                                     "Refresh",
                                     "refresh-worktrees",
+                                    colors,
                                     cx,
                                     |this, cx| {
                                         this.refresh_worktrees(cx);
                                     },
                                 ))
-                                .child(surface_button("Done", "done-worktrees", cx, |this, cx| {
-                                    this.close_surface(cx);
-                                })),
+                                .child(surface_button(
+                                    "Done",
+                                    "done-worktrees",
+                                    colors,
+                                    cx,
+                                    |this, cx| {
+                                        this.close_surface(cx);
+                                    },
+                                )),
                         ),
                 )
-                .child(HairlineDivider::horizontal(COLORS))
+                .child(HairlineDivider::horizontal(colors))
                 .child(
                     div()
                         .id("worktree-cards")
@@ -1242,14 +1258,14 @@ impl UtilitySurfaces {
                         .content_start()
                         .gap(px(12.0))
                         .when(self.worktrees.loading, |view| {
-                            view.child(empty_label("Refreshing worktrees…"))
+                            view.child(empty_label("Refreshing worktrees…", colors))
                         })
                         .when_some(self.worktrees.error.clone(), |view, error| {
-                            view.child(empty_label(&error))
+                            view.child(empty_label(&error, colors))
                         })
                         .when(
                             self.worktrees.entries.is_empty() && !self.worktrees.loading,
-                            |view| view.child(empty_label("No worktrees")),
+                            |view| view.child(empty_label("No worktrees", colors)),
                         )
                         .children(cards),
                 )
@@ -1297,7 +1313,7 @@ impl UtilitySurfaces {
                                             .child(
                                                 div()
                                                     .text_size(px(11.0))
-                                                    .text_color(COLORS.secondary)
+                                                    .text_color(colors.secondary)
                                                     .child(format!(
                                                         "{} is merged and clean.",
                                                         entry.path
@@ -1307,6 +1323,7 @@ impl UtilitySurfaces {
                                     .child(surface_button(
                                         "Cancel",
                                         "cancel-cleanup",
+                                        colors,
                                         cx,
                                         |this, cx| {
                                             this.worktrees.cancel_cleanup();
@@ -1323,6 +1340,7 @@ impl UtilitySurfaces {
     }
 
     fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
         let tabs = SettingsTab::ALL
             .into_iter()
             .map(|tab| {
@@ -1335,14 +1353,14 @@ impl UtilitySurfaces {
                     .flex()
                     .items_center()
                     .gap(px(8.0))
-                    .bg(Fill::selected(SETTINGS_COLORS, selected))
+                    .bg(Fill::selected(colors, selected))
                     .text_color(if selected {
-                        SETTINGS_COLORS.primary
+                        colors.primary
                     } else {
-                        SETTINGS_COLORS.secondary
+                        colors.secondary
                     })
                     .cursor_pointer()
-                    .hover(|style| style.bg(Fill::hover(SETTINGS_COLORS, true)))
+                    .hover(move |style| style.bg(Fill::hover(colors, true)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.settings_tab = tab;
                         this.settings_menu = None;
@@ -1356,9 +1374,9 @@ impl UtilitySurfaces {
                         tab.icon(),
                         13.0,
                         if selected {
-                            SETTINGS_COLORS.primary
+                            colors.primary
                         } else {
-                            SETTINGS_COLORS.tertiary
+                            colors.tertiary
                         },
                     ))
                     .child(
@@ -1381,7 +1399,7 @@ impl UtilitySurfaces {
             SettingsTab::Remote => self.remote_settings(cx).into_any_element(),
         };
         FloatingSurface::new(
-            self.settings_colors(),
+            colors,
             div()
                 .id("settings-dialog")
                 .debug_selector(|| "settings-dialog".into())
@@ -1406,7 +1424,7 @@ impl UtilitySurfaces {
                     div()
                         .w(px(SETTINGS_NAV_WIDTH))
                         .h_full()
-                        .bg(SETTINGS_COLORS.primary.alpha(0.018))
+                        .bg(colors.primary.alpha(0.018))
                         .flex()
                         .flex_col()
                         .child(
@@ -1416,7 +1434,7 @@ impl UtilitySurfaces {
                                 .flex()
                                 .items_center()
                                 .gap(px(Metrics::TOOLBAR_ITEM_GAP))
-                                .child(sf_symbol("gearshape", 15.0, SETTINGS_COLORS.secondary))
+                                .child(sf_symbol("gearshape", 15.0, colors.secondary))
                                 .child(
                                     div()
                                         .text_size(px(Typo::TITLE.size))
@@ -1440,11 +1458,11 @@ impl UtilitySurfaces {
                                 .px(px(Metrics::TOOLBAR_EDGE_INSET))
                                 .pb(px(10.0))
                                 .text_size(px(Typo::META.size))
-                                .text_color(SETTINGS_COLORS.tertiary)
+                                .text_color(colors.tertiary)
                                 .child(format!("diri {}", crate::updates::CURRENT_VERSION)),
                         ),
                 )
-                .child(HairlineDivider::vertical(SETTINGS_COLORS))
+                .child(HairlineDivider::vertical(colors))
                 .child(
                     div()
                         .relative()
@@ -1473,7 +1491,7 @@ impl UtilitySurfaces {
                                 .items_center()
                                 .justify_center()
                                 .cursor_pointer()
-                                .hover(|style| style.bg(Fill::subtle(SETTINGS_COLORS)))
+                                .hover(move |style| style.bg(Fill::subtle(colors)))
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.close_surface(cx);
@@ -1482,7 +1500,7 @@ impl UtilitySurfaces {
                                     "xmark",
                                     13.5,
                                     SymbolWeight::Bold,
-                                    SETTINGS_COLORS.secondary,
+                                    colors.secondary,
                                 )),
                         ),
                 ),
@@ -1490,6 +1508,7 @@ impl UtilitySurfaces {
     }
 
     fn general_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
         let quick_open_roots = if self.prefs.quick_open_roots.is_empty() {
             "~/fun".to_owned()
         } else {
@@ -1507,7 +1526,9 @@ impl UtilitySurfaces {
                         "Default agent",
                         "Used by ⌘T and Quick Open.",
                         self.default_agent_dropdown(cx),
+                        colors,
                     ),
+                    colors,
                 ))
                 .child(setting_section(
                     "Behavior",
@@ -1519,6 +1540,7 @@ impl UtilitySurfaces {
                             "Open diri automatically after you sign in.",
                             self.prefs.start_at_login,
                             "toggle-login",
+                            colors,
                             cx,
                             |this, cx| {
                                 this.prefs.start_at_login = !this.prefs.start_at_login;
@@ -1526,12 +1548,13 @@ impl UtilitySurfaces {
                                 cx.notify();
                             },
                         ))
-                        .child(setting_divider())
+                        .child(setting_divider(colors))
                         .child(toggle_row(
                             "Confirm before closing a session",
                             "Ask before closing a session with a running process.",
                             self.prefs.confirm_before_closing_session,
                             "toggle-close-confirm",
+                            colors,
                             cx,
                             |this, cx| {
                                 this.prefs.confirm_before_closing_session =
@@ -1540,12 +1563,13 @@ impl UtilitySurfaces {
                                 cx.notify();
                             },
                         ))
-                        .child(setting_divider())
+                        .child(setting_divider(colors))
                         .child(toggle_row(
                             "Chime on agent status changes",
                             "Play a sound when an agent needs input or finishes.",
                             self.prefs.status_sounds,
                             "toggle-status-sounds",
+                            colors,
                             cx,
                             |this, cx| {
                                 this.prefs.status_sounds = !this.prefs.status_sounds;
@@ -1553,6 +1577,7 @@ impl UtilitySurfaces {
                                 cx.notify();
                             },
                         )),
+                    colors,
                 ))
                 .child(self.update_settings(cx))
                 .child(setting_section(
@@ -1575,11 +1600,11 @@ impl UtilitySurfaces {
                                 .whitespace_normal()
                                 .p(px(10.0))
                                 .rounded(px(Radius::BADGE))
-                                .bg(SETTINGS_COLORS.primary.alpha(0.055))
+                                .bg(colors.primary.alpha(0.055))
                                 .font_family(crate::fonts::mono_family())
                                 .text_size(px(11.0))
                                 .line_height(px(17.0))
-                                .text_color(SETTINGS_COLORS.secondary)
+                                .text_color(colors.secondary)
                                 .child(wrappable_setting_copy(quick_open_roots.into())),
                         )
                         .child(
@@ -1589,7 +1614,7 @@ impl UtilitySurfaces {
                                 .whitespace_normal()
                                 .text_size(px(11.0))
                                 .line_height(px(16.0))
-                                .text_color(SETTINGS_COLORS.tertiary)
+                                .text_color(colors.tertiary)
                                 .child(wrappable_setting_copy(
                                     if self.prefs.quick_open_roots.is_empty() {
                                         "Using the default folder plus project parent folders."
@@ -1599,11 +1624,14 @@ impl UtilitySurfaces {
                                     .into(),
                                 )),
                         ),
+                    colors,
                 )),
+            colors,
         )
     }
 
     fn default_agent_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
         let selected = self.prefs.default_agent;
         let open = self.settings_menu == Some(SettingsMenu::DefaultAgent);
         let trigger = settings_select_button(
@@ -1611,6 +1639,7 @@ impl UtilitySurfaces {
             "default-agent-dropdown",
             open,
             SettingsMenu::DefaultAgent,
+            colors,
             cx,
         );
 
@@ -1628,24 +1657,21 @@ impl UtilitySurfaces {
                         .items_center()
                         .gap(px(8.0))
                         .rounded(px(Radius::ROW))
-                        .bg(Fill::selected(SETTINGS_COLORS, is_selected))
+                        .bg(Fill::selected(colors, is_selected))
                         .cursor_pointer()
-                        .hover(|style| style.bg(SETTINGS_COLORS.primary.alpha(0.08)))
+                        .hover(move |style| style.bg(colors.primary.alpha(0.08)))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.prefs.default_agent = agent;
                             this.settings_menu = None;
                             this.persist_prefs();
                             cx.notify();
                         }))
-                        .child(
-                            AgentLogo::new(ui_default_agent(agent), 16.0, SETTINGS_COLORS)
-                                .badged(false),
-                        )
+                        .child(AgentLogo::new(ui_default_agent(agent), 16.0, colors).badged(false))
                         .child(
                             div()
                                 .flex_1()
                                 .text_size(px(Typo::ROW.size))
-                                .text_color(SETTINGS_COLORS.primary)
+                                .text_color(colors.primary)
                                 .child(default_agent_label(agent)),
                         )
                         .when(is_selected, |row| {
@@ -1653,12 +1679,12 @@ impl UtilitySurfaces {
                                 "checkmark",
                                 10.0,
                                 SymbolWeight::Semibold,
-                                SETTINGS_COLORS.secondary,
+                                colors.secondary,
                             ))
                         }),
                 );
             }
-            control = control.child(settings_dropdown(options, 204.0, self.settings_colors()));
+            control = control.child(settings_dropdown(options, 204.0, colors));
         }
         control.into_any_element()
     }
@@ -1669,6 +1695,7 @@ impl UtilitySurfaces {
     /// the button here (and the sidebar pill), because diri holds live agent
     /// sessions and relaunching underneath them uninvited would be hostile.
     fn update_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
         let state = self.updates.state();
         let unsupported = matches!(state.phase, UpdatePhase::Unsupported(_));
         let action = match &state.phase {
@@ -1695,6 +1722,7 @@ impl UtilitySurfaces {
             control.child(surface_button(
                 label,
                 "update-action",
+                colors,
                 cx,
                 move |this, _| {
                     this.updates.send(command.clone());
@@ -1705,29 +1733,32 @@ impl UtilitySurfaces {
             summary,
             update_detail(&state, unsupported),
             action_control,
+            colors,
         ));
 
         // "Skip" only makes sense for a release that is offered but not yet
         // downloaded; once it is staged the bytes are already on disk.
         if let UpdatePhase::Available(release) = &state.phase {
             let version = release.version.clone();
-            rows = rows.child(setting_divider()).child(setting_row(
+            rows = rows.child(setting_divider(colors)).child(setting_row(
                 "Skip this version",
                 "Hide this release until a newer version is available.",
-                surface_button("Skip", "skip-update", cx, move |this, cx| {
+                surface_button("Skip", "skip-update", colors, cx, move |this, cx| {
                     this.prefs.skipped_update_version = version.clone();
                     this.persist_prefs();
                     this.updates.send(UpdateCommand::Skip);
                     cx.notify();
                 }),
+                colors,
             ));
         }
         if !unsupported {
-            rows = rows.child(setting_divider()).child(toggle_row(
+            rows = rows.child(setting_divider(colors)).child(toggle_row(
                 "Check automatically",
                 "Look for new releases in the background.",
                 self.prefs.automatic_updates,
                 "toggle-automatic-updates",
+                colors,
                 cx,
                 |this, cx| {
                     this.prefs.automatic_updates = !this.prefs.automatic_updates;
@@ -1738,17 +1769,18 @@ impl UtilitySurfaces {
                 },
             ));
         }
-        setting_section("Software updates", rows)
+        setting_section("Software updates", rows, colors)
     }
 
     fn terminal_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
         let selected = theme(&self.prefs.terminal_theme);
         let font_control = div()
             .h(px(28.0))
             .rounded(px(Radius::BADGE))
             .border_1()
-            .border_color(SETTINGS_COLORS.primary.alpha(0.11))
-            .bg(SETTINGS_COLORS.primary.alpha(0.045))
+            .border_color(colors.primary.alpha(0.11))
+            .bg(colors.primary.alpha(0.045))
             .flex()
             .items_center()
             .child(
@@ -1761,7 +1793,7 @@ impl UtilitySurfaces {
                     .justify_center()
                     .text_size(px(15.0))
                     .cursor_pointer()
-                    .hover(|style| style.bg(SETTINGS_COLORS.primary.alpha(0.08)))
+                    .hover(move |style| style.bg(colors.primary.alpha(0.08)))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.prefs.zoom_terminal(-1.0);
                         this.persist_prefs();
@@ -1769,7 +1801,7 @@ impl UtilitySurfaces {
                     }))
                     .child("−"),
             )
-            .child(HairlineDivider::vertical(SETTINGS_COLORS))
+            .child(HairlineDivider::vertical(colors))
             .child(
                 div()
                     .w(px(52.0))
@@ -1778,10 +1810,10 @@ impl UtilitySurfaces {
                     .justify_center()
                     .font_family(crate::fonts::mono_family())
                     .text_size(px(11.0))
-                    .text_color(SETTINGS_COLORS.secondary)
+                    .text_color(colors.secondary)
                     .child(format!("{:.0} pt", self.prefs.terminal_font_size)),
             )
-            .child(HairlineDivider::vertical(SETTINGS_COLORS))
+            .child(HairlineDivider::vertical(colors))
             .child(
                 div()
                     .id("font-larger")
@@ -1792,7 +1824,7 @@ impl UtilitySurfaces {
                     .justify_center()
                     .text_size(px(15.0))
                     .cursor_pointer()
-                    .hover(|style| style.bg(SETTINGS_COLORS.primary.alpha(0.08)))
+                    .hover(move |style| style.bg(colors.primary.alpha(0.08)))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.prefs.zoom_terminal(1.0);
                         this.persist_prefs();
@@ -1816,9 +1848,11 @@ impl UtilitySurfaces {
                             "Color theme",
                             "Applies immediately across the app and every open terminal.",
                             self.terminal_theme_dropdown(cx),
+                            colors,
                         ))
-                        .child(setting_divider())
-                        .child(div().p(px(12.0)).child(theme_preview(selected))),
+                        .child(setting_divider(colors))
+                        .child(div().p(px(12.0)).child(theme_preview(selected, colors))),
+                    colors,
                 ))
                 .child(setting_section(
                     "Text",
@@ -1826,12 +1860,16 @@ impl UtilitySurfaces {
                         "Font size",
                         "Adjust terminal text without changing the rest of the app.",
                         font_control,
+                        colors,
                     ),
+                    colors,
                 )),
+            colors,
         )
     }
 
     fn resource_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
         settings_page(
             "Resources",
             div()
@@ -1847,28 +1885,34 @@ impl UtilitySurfaces {
                             "Hibernate idle sessions",
                             "Freeze inactive sessions after this amount of time.",
                             self.hibernate_dropdown(cx),
+                            colors,
                         ))
-                        .child(setting_divider())
+                        .child(setting_divider(colors))
                         .child(setting_row(
                             "Memory limit",
                             "Freeze an individual session when it reaches this size.",
                             self.memory_dropdown(cx),
+                            colors,
                         )),
+                    colors,
                 ))
                 .child(
                     settings_note(
                         "moon.fill",
                         None,
                         "Frozen sessions are never killed. Opening one wakes it immediately, exactly where you left it.",
-                        SETTINGS_COLORS.tertiary,
-                        SETTINGS_COLORS.primary.alpha(0.07),
-                        SETTINGS_COLORS.primary.alpha(0.035),
+                        colors.tertiary,
+                        colors.primary.alpha(0.07),
+                        colors.primary.alpha(0.035),
+                        colors,
                     ),
                 ),
+            colors,
         )
     }
 
     fn remote_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
         settings_page(
             "Remote",
             div()
@@ -1881,15 +1925,18 @@ impl UtilitySurfaces {
                         "lock.shield",
                         Some("OpenSSH transport"),
                         "Diri uses your SSH configuration without changing the host. Private-network and Tailscale names work transparently when OpenSSH can resolve them.",
-                        SETTINGS_COLORS.secondary,
-                        SETTINGS_COLORS.primary.alpha(0.08),
-                        SETTINGS_COLORS.primary.alpha(0.035),
+                        colors.secondary,
+                        colors.primary.alpha(0.08),
+                        colors.primary.alpha(0.035),
+                        colors,
                     ),
                 ),
+            colors,
         )
     }
 
     fn remote_hosts_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
         let default_host = self
             .store
             .read()
@@ -1898,8 +1945,8 @@ impl UtilitySurfaces {
         let mut catalog = div()
             .rounded(px(Radius::ROW))
             .border_1()
-            .border_color(SETTINGS_COLORS.primary.alpha(0.065))
-            .bg(SETTINGS_COLORS.primary.alpha(0.02))
+            .border_color(colors.primary.alpha(0.065))
+            .bg(colors.primary.alpha(0.02))
             .overflow_hidden();
 
         if let Some(editor) = &self.host_editor {
@@ -1916,11 +1963,11 @@ impl UtilitySurfaces {
                         div()
                             .size(px(34.0))
                             .rounded(px(10.0))
-                            .bg(SETTINGS_COLORS.primary.alpha(0.065))
+                            .bg(colors.primary.alpha(0.065))
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(sf_symbol("network", 17.0, SETTINGS_COLORS.tertiary)),
+                            .child(sf_symbol("network", 17.0, colors.tertiary)),
                     )
                     .child(
                         div()
@@ -1936,7 +1983,7 @@ impl UtilitySurfaces {
                             .child(
                                 div()
                                     .text_size(px(11.0))
-                                    .text_color(SETTINGS_COLORS.tertiary)
+                                    .text_color(colors.tertiary)
                                     .child("Add any machine you can reach over SSH."),
                             ),
                     ),
@@ -1944,7 +1991,7 @@ impl UtilitySurfaces {
         } else {
             for (index, host) in self.hosts.iter().enumerate() {
                 if index > 0 {
-                    catalog = catalog.child(setting_divider());
+                    catalog = catalog.child(setting_divider(colors));
                 }
                 let id = host.id.clone();
                 let name = host.display_name().to_owned();
@@ -1961,7 +2008,7 @@ impl UtilitySurfaces {
                         .items_center()
                         .gap(px(11.0))
                         .cursor_pointer()
-                        .hover(|style| style.bg(SETTINGS_COLORS.primary.alpha(0.055)))
+                        .hover(move |style| style.bg(colors.primary.alpha(0.055)))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.begin_editing_host(&id, window, cx);
                         }))
@@ -1969,11 +2016,11 @@ impl UtilitySurfaces {
                             div()
                                 .size(px(30.0))
                                 .rounded(px(9.0))
-                                .bg(SETTINGS_COLORS.primary.alpha(0.06))
+                                .bg(colors.primary.alpha(0.06))
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .child(sf_symbol("network", 15.0, SETTINGS_COLORS.secondary)),
+                                .child(sf_symbol("network", 15.0, colors.secondary)),
                         )
                         .child(
                             div()
@@ -2037,19 +2084,19 @@ impl UtilitySurfaces {
                                         .text_ellipsis()
                                         .font_family(crate::fonts::mono_family())
                                         .text_size(px(10.5))
-                                        .text_color(SETTINGS_COLORS.tertiary)
+                                        .text_color(colors.tertiary)
                                         .child(destination)
                                         .when_some(folder, |line, folder| {
                                             line.child(
                                                 div()
-                                                    .text_color(SETTINGS_COLORS.primary.alpha(0.22))
+                                                    .text_color(colors.primary.alpha(0.22))
                                                     .child("·"),
                                             )
                                             .child(folder)
                                         }),
                                 ),
                         )
-                        .child(sf_symbol("chevron.right", 10.0, SETTINGS_COLORS.tertiary)),
+                        .child(sf_symbol("chevron.right", 10.0, colors.tertiary)),
                 );
             }
         }
@@ -2069,7 +2116,7 @@ impl UtilitySurfaces {
                         div()
                             .text_size(px(Typo::SECTION_HEADER.size))
                             .font_weight(Typo::SECTION_HEADER.weight)
-                            .text_color(SETTINGS_COLORS.tertiary)
+                            .text_color(colors.tertiary)
                             .child("Execution hosts"),
                     )
                     .when(self.host_editor.is_none(), |header| {
@@ -2093,6 +2140,7 @@ impl UtilitySurfaces {
         state: HostInitialization,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let colors = self.settings_colors();
         let HostInitializationCardModel {
             id,
             name,
@@ -2224,7 +2272,7 @@ impl UtilitySurfaces {
                         div()
                             .text_size(px(11.5))
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(SETTINGS_COLORS.primary)
+                            .text_color(colors.primary)
                             .child(title),
                     )
                     .child(
@@ -2234,7 +2282,7 @@ impl UtilitySurfaces {
                             .whitespace_normal()
                             .text_size(px(10.5))
                             .line_height(px(15.0))
-                            .text_color(SETTINGS_COLORS.tertiary)
+                            .text_color(colors.tertiary)
                             .child(wrappable_setting_copy(detail.into())),
                     ),
             )
@@ -2245,6 +2293,7 @@ impl UtilitySurfaces {
                         .child(surface_button(
                             label,
                             "host-initialization-action",
+                            colors,
                             cx,
                             move |this, cx| {
                                 if let Some(kind) = retry_kind {
@@ -2266,6 +2315,7 @@ impl UtilitySurfaces {
     }
 
     fn host_editor_panel(&self, editor: &HostEditor, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
         let editing = editor.original_id.is_some();
         let title = if editing { "Edit host" } else { "Add a host" };
         let mut form = div()
@@ -2295,7 +2345,7 @@ impl UtilitySurfaces {
                             .child(
                                 div()
                                     .text_size(px(11.0))
-                                    .text_color(SETTINGS_COLORS.tertiary)
+                                    .text_color(colors.tertiary)
                                     .child("SSH aliases from ~/.ssh/config work too."),
                             ),
                     )
@@ -2308,12 +2358,12 @@ impl UtilitySurfaces {
                             .items_center()
                             .justify_center()
                             .cursor_pointer()
-                            .hover(|style| style.bg(SETTINGS_COLORS.primary.alpha(0.08)))
+                            .hover(move |style| style.bg(colors.primary.alpha(0.08)))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.host_editor = None;
                                 cx.notify();
                             }))
-                            .child(sf_symbol("xmark", 11.0, SETTINGS_COLORS.secondary)),
+                            .child(sf_symbol("xmark", 11.0, colors.secondary)),
                     ),
             )
             .child(
@@ -2356,7 +2406,7 @@ impl UtilitySurfaces {
                             .pt(px(2.0))
                             .text_size(px(10.0))
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(SETTINGS_COLORS.secondary)
+                            .text_color(colors.secondary)
                             .child("First-party node (optional)"),
                     )
                     .child(
@@ -2396,7 +2446,7 @@ impl UtilitySurfaces {
                             .whitespace_normal()
                             .text_size(px(10.0))
                             .line_height(px(15.0))
-                            .text_color(SETTINGS_COLORS.tertiary)
+                            .text_color(colors.tertiary)
                             .child(wrappable_setting_copy(
                                 "The token stays in that owner-only file. SSH remains available for install and recovery."
                                     .into(),
@@ -2447,7 +2497,7 @@ impl UtilitySurfaces {
                             .min_w(px(0.0))
                             .whitespace_normal()
                             .text_size(px(11.0))
-                            .text_color(SETTINGS_COLORS.secondary)
+                            .text_color(colors.secondary)
                             .child(wrappable_setting_copy(
                                 format!("Remove {name}? Existing sessions must be moved first.")
                                     .into(),
@@ -2458,12 +2508,18 @@ impl UtilitySurfaces {
                             .flex()
                             .items_center()
                             .gap(px(7.0))
-                            .child(surface_button("Keep Host", "keep-host", cx, |this, cx| {
-                                if let Some(editor) = &mut this.host_editor {
-                                    editor.confirm_remove = false;
-                                }
-                                cx.notify();
-                            }))
+                            .child(surface_button(
+                                "Keep Host",
+                                "keep-host",
+                                colors,
+                                cx,
+                                |this, cx| {
+                                    if let Some(editor) = &mut this.host_editor {
+                                        editor.confirm_remove = false;
+                                    }
+                                    cx.notify();
+                                },
+                            ))
                             .child(settings_danger_button(
                                 "Remove Host",
                                 "confirm-remove-host",
@@ -2499,6 +2555,7 @@ impl UtilitySurfaces {
                                     .child(surface_button(
                                         "Reinstall Environment",
                                         "reinstall-remote-environment",
+                                        colors,
                                         cx,
                                         move |this, cx| this.reinstall_host(&host_id, cx),
                                     )),
@@ -2509,10 +2566,16 @@ impl UtilitySurfaces {
                             .flex()
                             .items_center()
                             .gap(px(7.0))
-                            .child(surface_button("Cancel", "cancel-host", cx, |this, cx| {
-                                this.host_editor = None;
-                                cx.notify();
-                            }))
+                            .child(surface_button(
+                                "Cancel",
+                                "cancel-host",
+                                colors,
+                                cx,
+                                |this, cx| {
+                                    this.host_editor = None;
+                                    cx.notify();
+                                },
+                            ))
                             .child(settings_primary_button(
                                 if editing { "Save Host" } else { "Add Host" },
                                 "save-host",
@@ -2534,11 +2597,12 @@ impl UtilitySurfaces {
         field: HostFormField,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let colors = self.settings_colors();
         let active = self
             .host_editor
             .as_ref()
             .is_some_and(|host_editor| host_editor.active_field == field);
-        let value = host_field_value(editor, placeholder, active, field);
+        let value = host_field_value(editor, placeholder, active, field, colors);
         let bounds_slot = Rc::clone(&self.host_field_bounds[field.index()]);
         div()
             .min_w(px(0.0))
@@ -2549,7 +2613,7 @@ impl UtilitySurfaces {
                 div()
                     .text_size(px(10.0))
                     .font_weight(FontWeight::MEDIUM)
-                    .text_color(SETTINGS_COLORS.secondary)
+                    .text_color(colors.secondary)
                     .child(label),
             )
             .child({
@@ -2563,20 +2627,14 @@ impl UtilitySurfaces {
                     .px(px(10.0))
                     .rounded(px(Radius::BADGE))
                     .border_1()
-                    .border_color(
-                        SETTINGS_COLORS
-                            .primary
-                            .alpha(if active { 0.26 } else { 0.11 }),
-                    )
-                    .bg(SETTINGS_COLORS
-                        .primary
-                        .alpha(if active { 0.075 } else { 0.04 }))
+                    .border_color(colors.primary.alpha(if active { 0.26 } else { 0.11 }))
+                    .bg(colors.primary.alpha(if active { 0.075 } else { 0.04 }))
                     .flex()
                     .items_center()
                     .overflow_hidden()
                     .font_family(crate::fonts::mono_family())
                     .text_size(px(11.0))
-                    .text_color(SETTINGS_COLORS.primary)
+                    .text_color(colors.primary)
                     .cursor(CursorStyle::IBeam)
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         this.select_host_field(field, window, cx);
@@ -2585,7 +2643,7 @@ impl UtilitySurfaces {
                         };
                         let x = (event.position().x - bounds.left() - px(10.0)).max(px(0.0));
                         let offset = this.host_editor.as_ref().map_or(0, |editor| {
-                            text_offset_for_x(editor.field(field).text(), x, window)
+                            text_offset_for_x(editor.field(field).text(), x, window, colors)
                         });
                         if let Some(editor) = &mut this.host_editor {
                             editor
@@ -2608,6 +2666,7 @@ impl UtilitySurfaces {
 
     fn terminal_theme_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
         let selected = theme(&self.prefs.terminal_theme);
+        let colors = self.settings_colors();
         let open = self.settings_menu == Some(SettingsMenu::TerminalTheme);
         let mut control = div()
             .relative()
@@ -2617,50 +2676,89 @@ impl UtilitySurfaces {
                 "terminal-theme-dropdown",
                 open,
                 SettingsMenu::TerminalTheme,
+                colors,
                 cx,
             ));
         if open {
-            let mut options = div().p(px(4.0)).flex().flex_col();
-            for (index, candidate) in TermTheme::CATALOG.into_iter().enumerate() {
-                let is_selected = candidate.id == selected.id;
+            let mut options = div()
+                .id("terminal-theme-options")
+                .max_h(px(300.0))
+                .overflow_y_scroll()
+                .p(px(4.0))
+                .flex()
+                .flex_col();
+            for appearance in ThemeAppearance::ALL {
                 options = options.child(
                     div()
-                        .id(SharedString::from(format!("terminal-theme-option-{index}")))
-                        .h(px(Metrics::ROW_HEIGHT))
+                        .h(px(24.0))
                         .px(px(8.0))
-                        .rounded(px(Radius::ROW))
                         .flex()
                         .items_center()
-                        .gap(px(8.0))
-                        .bg(Fill::selected(SETTINGS_COLORS, is_selected))
-                        .cursor_pointer()
-                        .hover(|style| style.bg(SETTINGS_COLORS.primary.alpha(0.08)))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.prefs.terminal_theme = candidate.id.to_owned();
-                            this.settings_menu = None;
-                            this.persist_prefs();
-                            cx.notify();
-                        }))
-                        .child(
-                            div()
-                                .size(px(12.0))
-                                .rounded(px(4.0))
-                                .bg(candidate.background)
-                                .border_1()
-                                .border_color(SETTINGS_COLORS.primary.alpha(0.14)),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_size(px(Typo::ROW.size))
-                                .child(candidate.name),
-                        )
-                        .when(is_selected, |row| {
-                            row.child(sf_symbol("checkmark", 10.0, SETTINGS_COLORS.secondary))
-                        }),
+                        .text_size(px(Typo::META.size - 1.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(colors.tertiary)
+                        .child(appearance.label()),
                 );
+                for (index, candidate) in TermTheme::CATALOG
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, theme)| theme.appearance == appearance)
+                {
+                    let is_selected = candidate.id == selected.id;
+                    options =
+                        options.child(
+                            div()
+                                .id(SharedString::from(format!("terminal-theme-option-{index}")))
+                                .h(px(Metrics::ROW_HEIGHT))
+                                .px(px(8.0))
+                                .rounded(px(Radius::ROW))
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .bg(Fill::selected(colors, is_selected))
+                                .cursor_pointer()
+                                .hover(move |style| style.bg(colors.primary.alpha(0.08)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.prefs.terminal_theme = candidate.id.to_owned();
+                                    this.settings_menu = None;
+                                    this.persist_prefs();
+                                    cx.notify();
+                                }))
+                                .child(
+                                    div()
+                                        .size(px(16.0))
+                                        .rounded(px(5.0))
+                                        .bg(candidate.background)
+                                        .border_1()
+                                        .border_color(colors.primary.alpha(0.16))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(
+                                            div()
+                                                .size(px(5.0))
+                                                .rounded(px(2.5))
+                                                .bg(candidate.foreground),
+                                        ),
+                                )
+                                .child(div().flex().gap(px(2.0)).children(
+                                    [candidate.ansi[2], candidate.ansi[4], candidate.ansi[5]].map(
+                                        |color| div().size(px(5.0)).rounded(px(2.5)).bg(color),
+                                    ),
+                                ))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_size(px(Typo::ROW.size))
+                                        .child(candidate.name),
+                                )
+                                .when(is_selected, |row| {
+                                    row.child(sf_symbol("checkmark", 10.0, colors.secondary))
+                                }),
+                        );
+                }
             }
-            control = control.child(settings_dropdown(options, 218.0, self.settings_colors()));
+            control = control.child(settings_dropdown(options, 252.0, colors));
         }
         control.into_any_element()
     }
@@ -2673,6 +2771,7 @@ impl UtilitySurfaces {
             (30, "30 minutes"),
             (60, "1 hour"),
         ];
+        let colors = self.settings_colors();
         let selected_label = OPTIONS
             .into_iter()
             .find_map(|(value, label)| {
@@ -2688,6 +2787,7 @@ impl UtilitySurfaces {
                 "hibernate-dropdown",
                 open,
                 SettingsMenu::HibernateAfter,
+                colors,
                 cx,
             ));
         if open {
@@ -2698,6 +2798,7 @@ impl UtilitySurfaces {
                     format!("hibernate-option-{index}"),
                     label,
                     is_selected,
+                    colors,
                     cx,
                     move |this, cx| {
                         this.prefs.hibernate_after_minutes = value;
@@ -2707,13 +2808,14 @@ impl UtilitySurfaces {
                     },
                 ));
             }
-            control = control.child(settings_dropdown(options, 172.0, self.settings_colors()));
+            control = control.child(settings_dropdown(options, 172.0, colors));
         }
         control.into_any_element()
     }
 
     fn memory_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
         const OPTIONS: [u64; 4] = [2, 4, 6, 8];
+        let colors = self.settings_colors();
         let open = self.settings_menu == Some(SettingsMenu::MemoryLimit);
         let mut control = div()
             .relative()
@@ -2723,6 +2825,7 @@ impl UtilitySurfaces {
                 "memory-dropdown",
                 open,
                 SettingsMenu::MemoryLimit,
+                colors,
                 cx,
             ));
         if open {
@@ -2733,6 +2836,7 @@ impl UtilitySurfaces {
                     format!("memory-option-{index}"),
                     format!("{value} GB"),
                     is_selected,
+                    colors,
                     cx,
                     move |this, cx| {
                         this.prefs.memory_hard_limit_gb = value;
@@ -2742,7 +2846,7 @@ impl UtilitySurfaces {
                     },
                 ));
             }
-            control = control.child(settings_dropdown(options, 132.0, self.settings_colors()));
+            control = control.child(settings_dropdown(options, 132.0, colors));
         }
         control.into_any_element()
     }
@@ -2829,6 +2933,7 @@ impl Render for UtilitySurfaces {
 fn surface_button(
     label: impl Into<SharedString>,
     id: impl Into<SharedString>,
+    colors: SemanticColors,
     cx: &mut Context<UtilitySurfaces>,
     handler: impl Fn(&mut UtilitySurfaces, &mut Context<UtilitySurfaces>) + 'static,
 ) -> impl IntoElement {
@@ -2838,13 +2943,13 @@ fn surface_button(
         .px(px(9.0))
         .rounded(px(Radius::BADGE))
         .border_1()
-        .border_color(COLORS.primary.alpha(0.10))
-        .bg(COLORS.primary.alpha(0.04))
+        .border_color(colors.primary.alpha(0.10))
+        .bg(colors.primary.alpha(0.04))
         .flex()
         .items_center()
         .text_size(px(11.0))
         .cursor_pointer()
-        .hover(|style| style.bg(COLORS.primary.alpha(0.09)))
+        .hover(move |style| style.bg(colors.primary.alpha(0.09)))
         .on_click(cx.listener(move |this, _, _, cx| handler(this, cx)))
         .child(label.into())
 }
@@ -2910,6 +3015,7 @@ fn host_field_value(
     placeholder: &'static str,
     active: bool,
     field: HostFormField,
+    colors: SemanticColors,
 ) -> AnyElement {
     let debug_name = field.debug_name();
     let content = if active {
@@ -2920,7 +3026,7 @@ fn host_field_value(
     } else if editor.is_empty() {
         div()
             .debug_selector(move || format!("HOST_FIELD_PLACEHOLDER_{debug_name}"))
-            .text_color(SETTINGS_COLORS.tertiary)
+            .text_color(colors.tertiary)
             .child(placeholder)
             .into_any_element()
     } else {
@@ -2936,14 +3042,14 @@ fn host_field_value(
         .into_any_element()
 }
 
-fn text_offset_for_x(text: &str, x: Pixels, window: &Window) -> usize {
+fn text_offset_for_x(text: &str, x: Pixels, window: &Window, colors: SemanticColors) -> usize {
     if text.is_empty() {
         return 0;
     }
     let run = TextRun {
         len: text.len(),
         font: font(crate::fonts::mono_family()),
-        color: SETTINGS_COLORS.primary.into(),
+        color: colors.primary.into(),
         ..TextRun::default()
     };
     window
@@ -2977,6 +3083,7 @@ fn toggle_row(
     detail: &'static str,
     enabled: bool,
     id: &'static str,
+    colors: SemanticColors,
     cx: &mut Context<UtilitySurfaces>,
     handler: impl Fn(&mut UtilitySurfaces, &mut Context<UtilitySurfaces>) + 'static,
 ) -> impl IntoElement {
@@ -2989,9 +3096,9 @@ fn toggle_row(
         .justify_between()
         .gap(px(12.0))
         .cursor_pointer()
-        .hover(|style| style.bg(SETTINGS_COLORS.primary.alpha(0.025)))
+        .hover(move |style| style.bg(colors.primary.alpha(0.025)))
         .on_click(cx.listener(move |this, _, _, cx| handler(this, cx)))
-        .child(setting_text_stack(label.into(), detail.into()))
+        .child(setting_text_stack(label.into(), detail.into(), colors))
         .child(
             div()
                 .flex_none()
@@ -3002,21 +3109,20 @@ fn toggle_row(
                 .bg(if enabled {
                     Ink::FRESH.alpha(0.72)
                 } else {
-                    SETTINGS_COLORS.primary.alpha(0.14)
+                    colors.primary.alpha(0.14)
                 })
                 .flex()
                 .justify_end()
                 .when(!enabled, |toggle| toggle.justify_start())
-                .child(
-                    div()
-                        .size(px(14.0))
-                        .rounded(px(7.0))
-                        .bg(SETTINGS_COLORS.primary),
-                ),
+                .child(div().size(px(14.0)).rounded(px(7.0)).bg(colors.primary)),
         )
 }
 
-fn setting_section(title: &'static str, content: impl IntoElement) -> impl IntoElement {
+fn setting_section(
+    title: &'static str,
+    content: impl IntoElement,
+    colors: SemanticColors,
+) -> impl IntoElement {
     div()
         .flex()
         .flex_col()
@@ -3026,15 +3132,15 @@ fn setting_section(title: &'static str, content: impl IntoElement) -> impl IntoE
                 .px(px(1.0))
                 .text_size(px(Typo::SECTION_HEADER.size))
                 .font_weight(Typo::SECTION_HEADER.weight)
-                .text_color(SETTINGS_COLORS.tertiary)
+                .text_color(colors.tertiary)
                 .child(title),
         )
         .child(
             div()
                 .rounded(px(Radius::ROW))
                 .border_1()
-                .border_color(SETTINGS_COLORS.primary.alpha(0.065))
-                .bg(SETTINGS_COLORS.primary.alpha(0.02))
+                .border_color(colors.primary.alpha(0.065))
+                .bg(colors.primary.alpha(0.02))
                 .overflow_hidden()
                 .child(content),
         )
@@ -3044,6 +3150,7 @@ fn setting_row(
     label: impl Into<SharedString>,
     detail: impl Into<SharedString>,
     control: impl IntoElement,
+    colors: SemanticColors,
 ) -> impl IntoElement {
     let label = label.into();
     let detail = detail.into();
@@ -3055,11 +3162,15 @@ fn setting_row(
         .items_center()
         .justify_between()
         .gap(px(12.0))
-        .child(setting_text_stack(label, detail))
+        .child(setting_text_stack(label, detail, colors))
         .child(control)
 }
 
-fn setting_text_stack(label: SharedString, detail: SharedString) -> AnyElement {
+fn setting_text_stack(
+    label: SharedString,
+    detail: SharedString,
+    colors: SemanticColors,
+) -> AnyElement {
     div()
         .flex_1()
         .min_w(px(0.0))
@@ -3073,7 +3184,7 @@ fn setting_text_stack(label: SharedString, detail: SharedString) -> AnyElement {
                 .whitespace_normal()
                 .text_size(px(Typo::ROW_EMPHASIZED.size))
                 .font_weight(Typo::ROW_EMPHASIZED.weight)
-                .text_color(SETTINGS_COLORS.primary)
+                .text_color(colors.primary)
                 .child(wrappable_setting_copy(label)),
         )
         .child(
@@ -3084,7 +3195,7 @@ fn setting_text_stack(label: SharedString, detail: SharedString) -> AnyElement {
                 .whitespace_normal()
                 .text_size(px(Typo::META.size))
                 .line_height(px(14.0))
-                .text_color(SETTINGS_COLORS.tertiary)
+                .text_color(colors.tertiary)
                 .child(wrappable_setting_copy(detail)),
         )
         .into_any_element()
@@ -3119,6 +3230,7 @@ fn settings_note(
     icon_color: Rgba,
     border_color: Rgba,
     background: Rgba,
+    colors: SemanticColors,
 ) -> AnyElement {
     div()
         .p(px(12.0))
@@ -3156,14 +3268,18 @@ fn settings_note(
                         .whitespace_normal()
                         .text_size(px(11.0))
                         .line_height(px(17.0))
-                        .text_color(SETTINGS_COLORS.secondary)
+                        .text_color(colors.secondary)
                         .child(wrappable_setting_copy(body.into())),
                 ),
         )
         .into_any_element()
 }
 
-fn settings_page(title: &'static str, content: impl IntoElement) -> impl IntoElement {
+fn settings_page(
+    title: &'static str,
+    content: impl IntoElement,
+    colors: SemanticColors,
+) -> impl IntoElement {
     div()
         .w_full()
         .px(px(20.0))
@@ -3180,17 +3296,17 @@ fn settings_page(title: &'static str, content: impl IntoElement) -> impl IntoEle
                 .items_center()
                 .text_size(px(Typo::DISPLAY_TITLE.size))
                 .font_weight(Typo::DISPLAY_TITLE.weight)
-                .text_color(SETTINGS_COLORS.primary)
+                .text_color(colors.primary)
                 .child(title),
         )
         .child(content)
 }
 
-fn setting_divider() -> impl IntoElement {
+fn setting_divider(colors: SemanticColors) -> impl IntoElement {
     div()
         .h(px(1.0))
         .mx(px(12.0))
-        .bg(SETTINGS_COLORS.primary.alpha(0.055))
+        .bg(colors.primary.alpha(0.055))
 }
 
 fn settings_select_button(
@@ -3198,6 +3314,7 @@ fn settings_select_button(
     id: impl Into<SharedString>,
     open: bool,
     menu: SettingsMenu,
+    colors: SemanticColors,
     cx: &mut Context<UtilitySurfaces>,
 ) -> impl IntoElement {
     div()
@@ -3206,19 +3323,13 @@ fn settings_select_button(
         .px(px(9.0))
         .rounded(px(Radius::BADGE))
         .border_1()
-        .border_color(
-            SETTINGS_COLORS
-                .primary
-                .alpha(if open { 0.20 } else { 0.10 }),
-        )
-        .bg(SETTINGS_COLORS
-            .primary
-            .alpha(if open { 0.08 } else { 0.04 }))
+        .border_color(colors.primary.alpha(if open { 0.20 } else { 0.10 }))
+        .bg(colors.primary.alpha(if open { 0.08 } else { 0.04 }))
         .flex()
         .items_center()
         .gap(px(8.0))
         .cursor_pointer()
-        .hover(|style| style.bg(SETTINGS_COLORS.primary.alpha(0.075)))
+        .hover(move |style| style.bg(colors.primary.alpha(0.075)))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(cx.listener(move |this, _, _, cx| {
             this.settings_menu = if this.settings_menu == Some(menu) {
@@ -3233,14 +3344,14 @@ fn settings_select_button(
                 .flex_1()
                 .text_size(px(Typo::META.size))
                 .font_weight(Typo::META.weight)
-                .text_color(SETTINGS_COLORS.primary)
+                .text_color(colors.primary)
                 .child(label.into()),
         )
         .child(sf_symbol_weighted(
             if open { "chevron.up" } else { "chevron.down" },
             8.0,
             SymbolWeight::Semibold,
-            SETTINGS_COLORS.tertiary,
+            colors.tertiary,
         ))
 }
 
@@ -3266,6 +3377,7 @@ fn settings_choice_row(
     id: impl Into<SharedString>,
     label: impl Into<SharedString>,
     selected: bool,
+    colors: SemanticColors,
     cx: &mut Context<UtilitySurfaces>,
     handler: impl Fn(&mut UtilitySurfaces, &mut Context<UtilitySurfaces>) + 'static,
 ) -> impl IntoElement {
@@ -3277,9 +3389,9 @@ fn settings_choice_row(
         .flex()
         .items_center()
         .gap(px(8.0))
-        .bg(Fill::selected(SETTINGS_COLORS, selected))
+        .bg(Fill::selected(colors, selected))
         .cursor_pointer()
-        .hover(|style| style.bg(SETTINGS_COLORS.primary.alpha(0.08)))
+        .hover(move |style| style.bg(colors.primary.alpha(0.08)))
         .on_click(cx.listener(move |this, _, _, cx| handler(this, cx)))
         .child(
             div()
@@ -3288,16 +3400,16 @@ fn settings_choice_row(
                 .child(label.into()),
         )
         .when(selected, |row| {
-            row.child(sf_symbol("checkmark", 10.0, SETTINGS_COLORS.secondary))
+            row.child(sf_symbol("checkmark", 10.0, colors.secondary))
         })
 }
 
-fn theme_preview(theme: TermTheme) -> impl IntoElement {
+fn theme_preview(theme: TermTheme, colors: SemanticColors) -> impl IntoElement {
     div()
         .p(px(10.0))
         .rounded(px(Radius::BADGE))
         .border_1()
-        .border_color(SETTINGS_COLORS.primary.alpha(0.10))
+        .border_color(colors.primary.alpha(0.10))
         .bg(theme.background)
         .flex()
         .flex_col()
@@ -3322,14 +3434,14 @@ fn theme_preview(theme: TermTheme) -> impl IntoElement {
         )
 }
 
-fn chip(label: String) -> impl IntoElement {
+fn chip(label: String, colors: SemanticColors) -> impl IntoElement {
     div()
         .px(px(5.0))
         .py(px(2.0))
         .rounded(px(Radius::CHIP))
-        .bg(COLORS.primary.alpha(0.09))
+        .bg(colors.primary.alpha(0.09))
         .text_size(px(11.0))
-        .text_color(COLORS.secondary)
+        .text_color(colors.secondary)
         .child(label)
 }
 
@@ -3344,14 +3456,14 @@ fn colored_badge(label: &'static str, color: Rgba) -> impl IntoElement {
         .child(label)
 }
 
-fn empty_label(label: &str) -> impl IntoElement {
+fn empty_label(label: &str, colors: SemanticColors) -> impl IntoElement {
     div()
         .h(px(42.0))
         .px(px(10.0))
         .flex()
         .items_center()
         .text_size(px(13.0))
-        .text_color(COLORS.tertiary)
+        .text_color(colors.tertiary)
         .child(label.to_owned())
 }
 
@@ -3562,6 +3674,7 @@ mod tests {
                     "Long setting",
                     "averylongremotehostdestinationwithoutnaturalwhitespaceorlinebreaks.example.internal",
                     div().w(px(92.0)).child("Control"),
+                    SemanticColors::dark(),
                 ))
         }
     }
