@@ -169,6 +169,40 @@ impl TermTheme {
         ],
     );
 
+    /// Vesper's official terminal palette. The ANSI colors come from the
+    /// upstream Warp theme; cursor and selection colors come from its iTerm
+    /// profile so the theme keeps Vesper's warm accent throughout the UI.
+    pub const VESPER: Self = Self {
+        id: "vesper",
+        name: "Vesper",
+        appearance: ThemeAppearance::Dark,
+        background: hex(0x101010),
+        foreground: hex(0xffffff),
+        cursor: hex(0xffc799),
+        cursor_text: hex(0x101010),
+        selection: with_alpha(hex(0xf8feff), 0.247_058_82),
+        find_match: with_alpha(hex(0xffc799), 0.35),
+        find_match_current: with_alpha(hex(0xffc799), 0.65),
+        ansi: [
+            hex(0x101010),
+            hex(0xff8080),
+            hex(0x99ffe4),
+            hex(0xffc799),
+            hex(0xa0a0a0),
+            hex(0xff7300),
+            hex(0x99ffe4),
+            hex(0xffffff),
+            hex(0x505050),
+            hex(0xff8080),
+            hex(0x99ffe4),
+            hex(0xffcfa8),
+            hex(0xa0a0a0),
+            hex(0xff8080),
+            hex(0x99ffe4),
+            hex(0xffffff),
+        ],
+    };
+
     pub const NORD: Self = dark_theme(
         "nord",
         "Nord",
@@ -277,7 +311,7 @@ impl TermTheme {
         ],
     );
 
-    pub const CATALOG: [Self; 16] = [
+    pub const CATALOG: [Self; 17] = [
         Self::DIRIJOR_DARK,
         Self::SOLARIZED_DARK,
         Self::DRACULA,
@@ -285,6 +319,7 @@ impl TermTheme {
         Self::GRUVBOX_DARK,
         Self::TOKYO_NIGHT,
         Self::CATPPUCCIN_MOCHA,
+        Self::VESPER,
         Self::NORD,
         Self::ROSE_PINE,
         Self::KANAGAWA_WAVE,
@@ -502,7 +537,7 @@ mod tests {
 
     #[test]
     fn catalog_keeps_original_themes_and_adds_light_and_dark_choices() {
-        assert_eq!(TermTheme::CATALOG.len(), 16);
+        assert_eq!(TermTheme::CATALOG.len(), 17);
         assert_eq!(TermTheme::CATALOG[0].id, "dirijor-dark");
         assert!(
             TermTheme::CATALOG
@@ -528,6 +563,10 @@ mod tests {
             TermTheme::DIRIJOR_DARK.background,
             rgba_f32(0.071, 0.075, 0.094, 1.0),
         );
+        assert_eq!(TermTheme::VESPER.appearance, ThemeAppearance::Dark);
+        assert_rgba(TermTheme::VESPER.background, hex(0x101010));
+        assert_rgba(TermTheme::VESPER.cursor, hex(0xffc799));
+        assert_rgba(TermTheme::VESPER.ansi[5], hex(0xff7300));
         assert_rgba(TermTheme::GITHUB_LIGHT.background, hex(0xffffff));
     }
 
