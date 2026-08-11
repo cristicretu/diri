@@ -46,6 +46,20 @@ impl QueryEditor {
         self.cursor
     }
 
+    /// Places the caret at a byte offset supplied by a rendered text hit-test.
+    /// Invalid offsets are rounded back to the nearest UTF-8 boundary so UI
+    /// components cannot violate the editor's indexing invariant.
+    pub fn set_cursor(&mut self, offset: usize, extend_selection: bool) {
+        let mut offset = offset.min(self.text.len());
+        while !self.text.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        self.cursor = offset;
+        if !extend_selection {
+            self.anchor = offset;
+        }
+    }
+
     /// The selected byte range, or `None` when the selection is empty.
     pub fn selection(&self) -> Option<Range<usize>> {
         (self.cursor != self.anchor).then(|| {
@@ -461,6 +475,17 @@ mod tests {
         assert_eq!(editor.text(), "café");
         editor.delete_backward(Motion::Character);
         assert_eq!(editor.text(), "caf");
+    }
+
+    #[test]
+    fn pointer_offsets_cannot_split_utf8_and_optionally_extend_selection() {
+        let mut editor = seeded("a猫b");
+        editor.set_cursor(2, false);
+        assert_eq!(editor.cursor(), 1);
+        assert_eq!(editor.selection(), None);
+
+        editor.set_cursor(editor.text().len(), true);
+        assert_eq!(editor.selected_text(), Some("猫b"));
     }
 
     fn keystroke(key: &str, modifiers: &str) -> Keystroke {

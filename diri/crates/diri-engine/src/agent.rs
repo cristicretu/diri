@@ -201,6 +201,40 @@ impl AgentDescriptor {
         Some(spec)
     }
 
+    /// Builds the same exact argv/environment tuple for a remote Helper.
+    /// Executable lookup is deliberately left to the remote Holder against
+    /// the captured remote PATH; no local filesystem probe can answer it.
+    /// `return_to_login_shell` is not synthesized as a shell command: remote
+    /// Agent launches remain structured and the session exits with Agent.
+    pub fn remote_spawn_spec(
+        &self,
+        cwd: &std::path::Path,
+        inherited: impl IntoIterator<Item = (String, String)>,
+        extra_args: &[String],
+    ) -> Option<PtySpec> {
+        let binary = self.binary.clone()?;
+        let mut spec = PtySpec::new(
+            std::iter::once(binary)
+                .chain(extra_args.iter().cloned())
+                .collect(),
+            cwd,
+        );
+        for (key, value) in inherited {
+            if !self.should_scrub(&key) {
+                spec.env.push((key, value));
+            }
+        }
+        spec.env
+            .retain(|(key, _)| !matches!(key.as_str(), "NO_COLOR" | "TERM" | "COLORTERM"));
+        spec.env.push(("TERM".into(), "xterm-256color".into()));
+        spec.env.push(("COLORTERM".into(), "truecolor".into()));
+        for (key, value) in &self.env {
+            spec.env.retain(|(existing, _)| existing != key);
+            spec.env.push((key.clone(), value.clone()));
+        }
+        Some(spec)
+    }
+
     fn should_scrub(&self, key: &str) -> bool {
         self.env_scrub_prefixes
             .iter()
@@ -267,8 +301,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     fn manifest_dir() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../Sources/DirijorCore/Resources/manifests")
+        crate::detect::bundled_manifest_dir()
             .canonicalize()
             .expect("manifests")
     }
@@ -357,8 +390,13 @@ mod tests {
     }
 
     #[test]
-    fn return_to_login_shell_keeps_the_session_alive_after_the_agent_exits() {
+    fn shipped_agents_land_in_a_login_shell_when_the_agent_exits() {
+        // Codex replaces its own binary when it self-updates and then exits.
+        // Without the wrapper the PTY dies with it and the session is gone; the
+        // wrapper leaves a usable prompt in the same tab. Dropping
+        // `returnToLoginShell` from the manifests silently reverts that.
         let codex = descriptor("codex");
+        assert!(codex.return_to_login_shell);
         let spec = codex
             .spawn_spec(
                 Path::new("/tmp"),
@@ -370,19 +408,54 @@ mod tests {
             )
             .expect("codex has a binary");
 
+        assert_eq!(spec.argv[..4], ["/bin/sh", "-i", "-l", "-c"]);
         assert_eq!(
-            &spec.argv[..4],
-            &["/bin/sh", "-i", "-l", "-c"],
-            "the login shell must remain the PTY's top-level process"
+            spec.argv[4], "'codex' '--version'; exec '/bin/sh' -i -l",
+            "the agent runs first, then the shell takes the PTY over"
         );
-        let command = &spec.argv[4];
-        assert!(
-            command.starts_with("'codex' '--version'"),
-            "the agent should run inside the shell: {command}"
-        );
-        assert!(
-            command.ends_with("; exec '/bin/sh' -i -l"),
-            "exiting the agent should land at an interactive prompt: {command}"
+    }
+
+    /// Sixteen of the twenty shipped manifests declare `returnToLoginShell`;
+    /// only `cursor`, `gemini` and the two command-less manifests do not. The
+    /// flag has been lost wholesale once already, so assert the whole set
+    /// rather than a sample: a port that drops it fails here.
+    #[test]
+    fn the_login_shell_wrapper_is_declared_by_every_agent_that_needs_it() {
+        let (engine, failed) = ManifestEngine::load_dir(&manifest_dir()).expect("load");
+        assert!(failed.is_empty(), "manifests failed to decode: {failed:?}");
+
+        let mut wrapped: Vec<&str> = engine
+            .ids()
+            .into_iter()
+            .filter(|id| {
+                engine
+                    .manifest(id)
+                    .and_then(|manifest| manifest.agent.as_ref())
+                    .is_some_and(|agent| agent.return_to_login_shell)
+            })
+            .collect();
+        wrapped.sort_unstable();
+
+        assert_eq!(
+            wrapped,
+            [
+                "aider",
+                "amp",
+                "antigravity",
+                "claude-code",
+                "codex",
+                "copilot",
+                "devin",
+                "droid",
+                "grok",
+                "hermes",
+                "kilo",
+                "kimi",
+                "kiro",
+                "opencode",
+                "pi",
+                "qoder",
+            ]
         );
     }
 
@@ -492,6 +565,32 @@ mod tests {
             Some(vec!["--resume".to_string()]),
             "claude can resume the latest session without an id"
         );
+
+        // Gemini mints no id of its own: without `sessionIDFlag` there is no
+        // caller-minted UUID to resume against, so losing that one field
+        // silently costs gemini its resume entirely.
+        let gemini = descriptor("gemini");
+        assert_eq!(gemini.session_id_flag.as_deref(), Some("--session-id"));
+        assert_eq!(
+            gemini.resume_args(Some("uuid-1")),
+            Some(vec!["--resume".to_string(), "uuid-1".to_string()])
+        );
+
+        // The latest-session agents: no id anywhere, so the bare token is the
+        // whole resume. A manifest with no `resume` block cannot resume at all.
+        for (id, token) in [
+            ("opencode", "--continue"),
+            ("aider", "--restore-chat-history"),
+            ("codex", "resume"),
+            ("cursor", "resume"),
+            ("pi", "-c"),
+        ] {
+            assert_eq!(
+                descriptor(id).resume_args(None),
+                Some(vec![token.to_string()]),
+                "{id} must resume"
+            );
+        }
     }
 
     #[test]

@@ -11,15 +11,17 @@
 //! `not_found` control error, which is what an older daemon does for a method
 //! it does not know, rather than dropping the connection.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use diri_proto::control::MAX_CONTROL_LINE_BYTES;
 use diri_proto::{ControlError, ControlMessage, JsonValue, Method, WIRE_VERSION};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::registry::Registry;
 
@@ -32,12 +34,15 @@ pub struct ControlServer {
     socket_path: PathBuf,
     logs_dir: PathBuf,
     holder: Option<crate::session::HolderConfig>,
+    remote: Option<Arc<crate::remote::manager::RemoteManager>>,
+    remote_bindings: Option<crate::remote::binding::RemoteBindingStore>,
     events: crate::events::EventBus,
     attach: crate::attach::AttachHub,
     pr_monitor_wake: crate::pr_monitor::PrMonitorWake,
     injection: Option<InjectionConfig>,
     governor: std::sync::Arc<Mutex<crate::governor::GovernorConfig>>,
     browser: std::sync::OnceLock<crate::browser::BrowserPool>,
+    active_connections: Arc<AtomicUsize>,
 }
 
 /// Where injection files live and which CLI they point at. Present, spawns
@@ -50,22 +55,31 @@ pub struct InjectionConfig {
 
 impl ControlServer {
     pub fn new(registry: Arc<Mutex<Registry>>, socket_path: impl Into<PathBuf>) -> Self {
+        // Capture the bytes this process actually started from before an app
+        // updater can replace the bundle path underneath the live daemon.
+        let _ = process_executable_hash();
         let socket_path = socket_path.into();
         let logs_dir = socket_path
             .parent()
             .map(|parent| parent.join("logs"))
             .unwrap_or_else(|| PathBuf::from("logs"));
+        let remote_bindings = socket_path.parent().and_then(|parent| {
+            crate::remote::binding::RemoteBindingStore::new(parent.join("remote-bindings")).ok()
+        });
         Self {
             registry,
             socket_path,
             logs_dir,
             holder: None,
+            remote: None,
+            remote_bindings,
             events: crate::events::EventBus::new(),
             attach: crate::attach::AttachHub::new(),
             pr_monitor_wake: crate::pr_monitor::PrMonitorWake::default(),
             injection: None,
             governor: std::sync::Arc::new(Mutex::new(crate::governor::GovernorConfig::default())),
             browser: std::sync::OnceLock::new(),
+            active_connections: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -115,6 +129,180 @@ impl ControlServer {
         self
     }
 
+    /// Enables the SSH-bootstrapped remote Holder transport. The local app
+    /// still talks only to this Engine; it never executes SSH itself.
+    pub fn with_remote(mut self, manager: Arc<crate::remote::manager::RemoteManager>) -> Self {
+        self.remote = Some(manager);
+        self
+    }
+
+    /// Re-adopts remote Holder sessions in the background.
+    ///
+    /// Every binding costs at least one SSH round trip, and each carries a
+    /// two-minute timeout. Doing that before `bind()` meant the control socket
+    /// did not exist until the last host answered: one reachable-but-hung host
+    /// kept the whole app disconnected, and because the executor forces
+    /// `SSH_ASKPASS_REQUIRE`, a host needing a passphrase could raise a modal
+    /// from a daemon with no UI behind it. Local sessions are served
+    /// immediately now, and remote ones join as they are verified.
+    pub fn spawn_remote_restore(self: &Arc<Self>) {
+        if self.remote_bindings.is_none() {
+            return;
+        }
+        let manager = self.remote.clone();
+        let server = Arc::clone(self);
+        if let Err(error) = std::thread::Builder::new()
+            .name("diri-remote-restore".into())
+            .spawn(move || {
+                // Before adoption, not after: adoption prunes bindings for
+                // sessions it finds dead, and a pruned binding is
+                // indistinguishable from a record that never had one. Running
+                // first is what keeps the legacy test — "has a host and no
+                // binding" — from swallowing this launch's own casualties.
+                server.retire_legacy_remote_sessions();
+                let Some(manager) = manager else {
+                    return;
+                };
+                let adopted = server.restore_remote_bindings(&manager);
+                if !adopted.is_empty() {
+                    eprintln!(
+                        "diri-engine: adopted {} remote Holder session(s): {adopted:?}",
+                        adopted.len()
+                    );
+                }
+            })
+        {
+            eprintln!("diri-engine: could not start remote session restore: {error}");
+        }
+    }
+
+    /// One-shot upgrade path for sessions the deleted `ssh -t` + tmux transport
+    /// created. See [`crate::legacy_remote`] for what it does, what it refuses
+    /// to do, and why this is not a tmux fallback.
+    ///
+    /// Deliberately independent of `with_remote`: a build with no Helper
+    /// artifact still has the user's old records and still owes them a working
+    /// Resume button and a cleaned-up host.
+    fn retire_legacy_remote_sessions(&self) {
+        let plan = crate::legacy_remote::Plan {
+            registry: &self.registry,
+            bindings: self.remote_bindings.as_ref(),
+            hosts: &diri_proto::HostsConfig::load(self.hosts_file()),
+            marker_path: self.legacy_remote_marker(),
+        };
+        let outcome =
+            crate::legacy_remote::retire_legacy_remote_sessions(&plan, &crate::hosts::run_shell);
+        if let Some(summary) = outcome.summary() {
+            eprintln!("{summary}");
+        }
+        // These records have no live session, so the registry watcher — which
+        // only diffs live ones — will never announce the rewrite. Without this
+        // the sidebar keeps showing them as running until the next relaunch.
+        if !outcome.migrated.is_empty()
+            && let Ok(registry) = self.registry.lock()
+        {
+            for id in &outcome.migrated {
+                self.publish_updated(&registry, id);
+            }
+        }
+    }
+
+    /// Beside the socket, next to `remote-bindings` — one file, deletable the
+    /// day this migration is retired.
+    fn legacy_remote_marker(&self) -> PathBuf {
+        self.socket_path
+            .parent()
+            .map(|parent| parent.join("legacy-remote-migration.json"))
+            .unwrap_or_else(|| PathBuf::from("legacy-remote-migration.json"))
+    }
+
+    fn restore_remote_bindings(
+        &self,
+        manager: &Arc<crate::remote::manager::RemoteManager>,
+    ) -> Vec<String> {
+        let Some(store) = &self.remote_bindings else {
+            return Vec::new();
+        };
+        let Ok(bindings) = store.load_all() else {
+            return Vec::new();
+        };
+        let hosts = diri_proto::HostsConfig::load(self.hosts_file());
+        let mut registry = match self.registry.lock() {
+            Ok(registry) => registry,
+            Err(_) => return Vec::new(),
+        };
+        let records = registry
+            .records()
+            .into_iter()
+            .map(|record| (record.id.0.clone(), record))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut adopted = Vec::new();
+        for binding in bindings {
+            let Some(record) = records.get(&binding.session_id) else {
+                continue;
+            };
+            if record.host.as_deref() != Some(&binding.host_id) {
+                continue;
+            }
+            let Some(host) = hosts.host(&binding.host_id) else {
+                continue;
+            };
+            let Ok(helper) =
+                manager.existing_helper(host, &binding.helper_build_id, binding.protocol)
+            else {
+                continue;
+            };
+            let selector = diri_proto::remote_pty::SessionSelector {
+                session_id: binding.session_id.clone(),
+                session_token: binding.session_token.clone(),
+                expected_incarnation: Some(binding.session_incarnation.clone()),
+            };
+            let Ok(inspection) = manager.inspect(&helper, &selector) else {
+                continue;
+            };
+            if matches!(record.status, diri_proto::SessionStatus::Exited(_))
+                || matches!(
+                    inspection.process_state,
+                    diri_proto::remote_pty::RemoteProcessState::Exited { .. }
+                )
+            {
+                let _ = manager.kill(&helper, &selector);
+                let _ = store.remove(&binding.session_id);
+                continue;
+            }
+            if !matches!(
+                inspection.process_state,
+                diri_proto::remote_pty::RemoteProcessState::Running { .. }
+            ) {
+                continue;
+            }
+            let manifest_id = record.kind.id().to_string();
+            let spec = crate::session::SessionSpec {
+                id: binding.session_id.clone(),
+                pty: crate::pty::PtySpec::new(Vec::new(), &record.cwd)
+                    .size(inspection.cols, inspection.rows),
+                manifest_id: manifest_id.clone(),
+                authority: crate::session::authority_for(&manifest_id, &registry.engine()),
+                logs_dir: self.logs_dir.clone(),
+                holder: None,
+                remote: None,
+                defer_launch: false,
+            };
+            let remote = crate::session::RemoteAdoptSpec {
+                manager: Arc::clone(manager),
+                helper,
+                token: binding.session_token,
+                incarnation: binding.session_incarnation,
+                binding_store: store.clone(),
+                output_offset: binding.last_output_offset,
+            };
+            if registry.adopt_remote(spec, remote).is_ok() {
+                adopted.push(binding.session_id);
+            }
+        }
+        adopted
+    }
+
     /// Binds the socket, owner-only.
     ///
     /// The socket carries a user's terminal contents and can spawn processes as
@@ -158,6 +346,7 @@ impl ControlServer {
     /// answering requests — one connection carries both, as the Swift daemon's
     /// does.
     pub fn serve(&self, stream: UnixStream) -> std::io::Result<()> {
+        let _connection = ActiveConnectionGuard::new(Arc::clone(&self.active_connections));
         let mut reader = BufReader::new(stream.try_clone()?);
         let writer = Arc::new(Mutex::new(stream));
         let mut subscription: Option<SubscriptionHandle> = None;
@@ -396,6 +585,8 @@ impl ControlServer {
             "browser.act" => self.browser_call("browser", params),
             Method::EVENTS_WAIT => self.events_wait(params),
             Method::HOST_SYNC_PREFS => self.host_sync_prefs(params),
+            Method::HOST_INITIALIZE => self.host_initialize(params),
+            Method::HOST_LIST_DIRECTORIES => self.host_list_directories(params),
             Method::SESSION_MIGRATE => self.session_migrate(params),
             Method::HOST_LOCATE_REPO => self.host_locate_repo(params),
             Method::HOOK_REPORT => self.hook_report(params),
@@ -408,12 +599,10 @@ impl ControlServer {
             Method::SESSION_HIBERNATE => self.session_hibernate(params),
             Method::SESSION_WAKE => self.session_wake(params),
             Method::DAEMON_PREPARE_SHUTDOWN => self.daemon_prepare_shutdown(),
+            Method::DAEMON_SHUTDOWN_IF_IDLE => self.daemon_shutdown_if_idle(),
             Method::DAEMON_SHUTDOWN => self.daemon_shutdown(),
             Method::GOVERNOR_CONFIGURE => self.governor_configure(params),
             Method::CLIENT_SET_ACTIVE => self.client_set_active(params),
-            // Ownership arbitration is a desktop/mobile feature this engine
-            // does not model yet; accepting it keeps clients on their happy path.
-            Method::SESSION_SET_OWNER => Ok(json!({})),
             other => Err(ControlError::not_found(format!(
                 "method {other:?} is not implemented by this engine yet"
             ))),
@@ -434,7 +623,9 @@ impl ControlServer {
         Ok(json!({
             "proto": WIRE_VERSION,
             "build": BUILD,
+            "engineKind": diri_proto::RUST_ENGINE_KIND,
             "pid": std::process::id() as i32,
+            "executableHash": process_executable_hash(),
         }))
     }
 
@@ -462,8 +653,8 @@ impl ControlServer {
             })
             .unwrap_or_default();
         let p: diri_proto::SessionSpawnParams = decode(Some(raw))?;
-        if let Some(host_id) = &p.host {
-            return self.session_spawn_remote(&p, host_id);
+        if p.host.is_some() {
+            return self.session_spawn_remote(p, argv);
         }
         let kind = p.kind.id().to_string();
         // A generic kind carries the user's command line inside itself.
@@ -551,6 +742,10 @@ impl ControlServer {
         };
 
         let mut record = new_record(&id, &kind, &cwd);
+        // A linked worktree is an execution cwd inside the project selected
+        // by the user; it does not become a new first-level sidebar project.
+        record.project_id = crate::registry::session_project_id(&p.cwd, None);
+        registry.ensure_session_project(&p.cwd, None);
         if let Some(title) = &p.title {
             record.title = title.clone();
             record.title_source = diri_proto::TitleSource::DirijorAssigned;
@@ -595,10 +790,11 @@ impl ControlServer {
         let spec = crate::session::SessionSpec {
             id: id.clone(),
             pty,
-            manifest_id: kind,
+            manifest_id: kind.clone(),
             authority,
             logs_dir: self.logs_dir.clone(),
             holder: self.holder.clone(),
+            remote: None,
             defer_launch: true,
         };
         registry
@@ -612,11 +808,17 @@ impl ControlServer {
         // `injectInitialPrompt`, which replaced a blind fixed delay that
         // raced Claude Code's boot and lost keystrokes into a composer that
         // did not exist yet.
-        if let Some(prompt) = p.initial_prompt.clone().filter(|prompt| !prompt.is_empty()) {
+        let prompt = p.initial_prompt.clone().filter(|prompt| !prompt.is_empty());
+        if kind == diri_proto::AgentKind::CLAUDE_CODE_ID || prompt.is_some() {
             let registry = Arc::clone(&self.registry);
             let session_id = id.clone();
             std::thread::spawn(move || {
-                inject_initial_prompt(&registry, &session_id, &prompt);
+                prepare_agent_input(
+                    &registry,
+                    &session_id,
+                    kind == diri_proto::AgentKind::CLAUDE_CODE_ID,
+                    prompt.as_deref(),
+                );
             });
         }
 
@@ -630,156 +832,196 @@ impl ControlServer {
         serde_json::to_value(&record).map_err(|error| ControlError::internal(error.to_string()))
     }
 
-    /// Spawn on a remote host: the local PTY runs ssh, which runs tmux on the
-    /// host — tmux is what keeps the agent alive across SSH drops, and the
-    /// `-A` reattach semantics make respawn, reconnect, and resume one path.
     fn session_spawn_remote(
         &self,
-        p: &diri_proto::SessionSpawnParams,
-        host_id: &str,
+        p: diri_proto::SessionSpawnParams,
+        caller_argv: Vec<String>,
     ) -> Result<JsonValue, ControlError> {
-        let entry = self.resolve_host(host_id)?;
-        let kind = p.kind.id().to_string();
-        let registry_engine = {
-            let registry = self.registry.lock().map_err(poisoned)?;
-            registry.engine()
-        };
-        let manifest = registry_engine
-            .manifest(&kind)
-            .ok_or_else(|| ControlError::not_found(format!("no manifest for agent {kind}")))?;
-        let descriptor = manifest.agent.clone().unwrap_or_default();
-        let authority = descriptor.authority();
+        let manager = self
+            .remote
+            .as_ref()
+            .cloned()
+            .ok_or_else(crate::remote::transport_unavailable)?;
+        let binding_store = self.remote_bindings.clone().ok_or_else(|| {
+            ControlError::internal("owner-only remote binding store is unavailable")
+        })?;
+        let host_id = p
+            .host
+            .as_deref()
+            .ok_or_else(|| ControlError::bad_request("remote host is required"))?;
+        let host = self.resolve_host(host_id)?;
+        if p.new_worktree.unwrap_or(false) {
+            return Err(ControlError::bad_request(
+                "remote worktree creation requires the structured workspace RPC",
+            ));
+        }
+        if p.same_repo_as.is_some() {
+            return Err(ControlError::bad_request(
+                "sameRepoAs requires the structured remote workspace RPC",
+            ));
+        }
 
-        let remote_cwd = if p.cwd.is_empty() {
-            entry.default_cwd.clone().unwrap_or_else(|| "~".into())
+        let helper = manager.ensure_helper(&host).map_err(io_control_error)?;
+        let persistence = manager
+            .probe_persistence(&host, &helper)
+            .map_err(io_control_error)?;
+        let requested_cwd = if p.cwd.trim().is_empty() {
+            host.default_cwd.clone().unwrap_or_else(|| "~".into())
         } else {
             p.cwd.clone()
         };
-        let id = next_session_id();
-        // Only agents that accept a caller-minted id get one; for the rest
-        // the remote conversation id never reaches us.
-        let agent_session_id = descriptor
-            .session_id_flag
-            .is_some()
-            .then(crate::inject::uuid_v4);
-        let argv = crate::remote::remote_argv(
-            &kind,
-            &descriptor,
-            &id,
-            &entry,
-            &remote_cwd,
-            agent_session_id.as_deref(),
-            false,
-        );
+        let captured = manager
+            .capture_environment(
+                &helper,
+                &diri_proto::remote_pty::EnvironmentCaptureRequest {
+                    cwd: Some(requested_cwd),
+                    timeout_millis: 10_000,
+                },
+            )
+            .map_err(io_control_error)?;
+        let cwd = PathBuf::from(&captured.cwd);
+        if !cwd.is_absolute() {
+            return Err(ControlError::internal(
+                "remote Helper returned a non-absolute cwd",
+            ));
+        }
 
-        // The local PTY runs ssh from home; hooks and MCP flags reference
-        // local paths that don't exist on the other machine, so none are
-        // injected — but the DIRIJOR env triplet stays local-side.
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
-        let mut pty = crate::pty::PtySpec::new(argv, &home);
-        pty.env = std::env::vars().collect();
-        pty.env.retain(|(key, _)| key != "NO_COLOR");
-        absolutize_remote_argv0(&mut pty);
+        let kind = p.kind.id().to_string();
+        let (descriptor, engine) = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            let engine = registry.engine();
+            let manifest = engine.manifest(&kind).ok_or_else(|| {
+                ControlError::not_found(format!("no manifest for agent {kind:?}"))
+            })?;
+            (manifest.agent.clone().unwrap_or_default(), engine)
+        };
+        drop(engine);
+        let authority = descriptor.authority();
+        let inherited = captured
+            .environment
+            .into_iter()
+            .map(|variable| (variable.name, variable.value))
+            .collect::<Vec<_>>();
+
+        let id = next_session_id();
+        let mut agent_session_id = None;
+        let mut launch_args = caller_argv.clone();
+        if descriptor.binary.is_some() {
+            launch_args.extend(descriptor.spawn_args.iter().cloned());
+            agent_session_id = descriptor.session_id_flag.as_ref().map(|flag| {
+                let uuid = crate::inject::uuid_v4();
+                launch_args.push(flag.clone());
+                launch_args.push(uuid.clone());
+                uuid
+            });
+        }
+
+        let argv = if descriptor.binary.is_some() {
+            descriptor
+                .remote_spawn_spec(&cwd, inherited.clone(), &launch_args)
+                .ok_or_else(|| ControlError::internal("remote descriptor has no binary"))?
+                .argv
+        } else if !caller_argv.is_empty() {
+            caller_argv
+        } else if let Some(command) = p.kind.command().filter(|command| !command.is_empty()) {
+            vec![captured.shell.clone(), "-lc".into(), command.to_string()]
+        } else if kind == diri_proto::AgentKind::SHELL_ID {
+            vec![captured.shell.clone(), "-l".into()]
+        } else {
+            return Err(ControlError::bad_request(format!(
+                "agent {kind:?} declares no binary, so argv is required"
+            )));
+        };
+        let mut pty = if descriptor.binary.is_some() {
+            descriptor
+                .remote_spawn_spec(&cwd, inherited, &launch_args)
+                .ok_or_else(|| ControlError::internal("remote descriptor has no binary"))?
+        } else {
+            let mut spec = crate::pty::PtySpec::new(argv, &cwd);
+            spec.env = inherited;
+            spec.env.retain(|(key, _)| key != "NO_COLOR");
+            spec.env.retain(|(key, _)| key != "TERM");
+            spec.env.push(("TERM".into(), "xterm-256color".into()));
+            spec
+        };
         if let (Some(cols), Some(rows)) = (p.initial_cols, p.initial_rows) {
             pty.cols = cols.clamp(2, u16::MAX as i64) as u16;
             pty.rows = rows.clamp(2, u16::MAX as i64) as u16;
         }
-        if let Some(injection) = &self.injection {
-            pty.env
-                .push((crate::inject::SESSION_ID_ENV.into(), id.clone()));
-            pty.env.push((
-                crate::inject::SOCKET_ENV.into(),
-                self.socket_path.to_string_lossy().into_owned(),
-            ));
-            pty.env.push((
-                crate::inject::CLI_ENV.into(),
-                injection.cli_path.to_string_lossy().into_owned(),
-            ));
-        }
 
-        let mut record = new_record(&id, &kind, &remote_cwd);
-        record.host = Some(entry.id.clone());
+        let token = random_session_token()?;
+        let launch = diri_proto::remote_pty::LaunchRequest {
+            session_id: id.clone(),
+            session_token: token,
+            argv: pty.argv.clone(),
+            cwd: captured.cwd.clone(),
+            environment: pty
+                .env
+                .iter()
+                .map(
+                    |(name, value)| diri_proto::remote_pty::EnvironmentVariable {
+                        name: name.clone(),
+                        value: value.clone(),
+                    },
+                )
+                .collect(),
+            cols: pty.cols,
+            rows: pty.rows,
+            persistence,
+        };
+
+        let mut record = new_record(&id, &kind, &captured.cwd);
+        record.host = Some(host.id.clone());
+        record.project_id = crate::registry::session_project_id(&captured.cwd, Some(&host.id));
+        record.remote_persistence = Some(persistence);
+        record.parent = p.parent.clone();
         record.agent_session_id = agent_session_id;
         if let Some(title) = &p.title {
             record.title = title.clone();
             record.title_source = diri_proto::TitleSource::DirijorAssigned;
         }
-        record.parent = p.parent.clone();
-
         let spec = crate::session::SessionSpec {
             id: id.clone(),
             pty,
-            manifest_id: kind,
+            manifest_id: kind.clone(),
             authority,
             logs_dir: self.logs_dir.clone(),
-            holder: self.holder.clone(),
-            defer_launch: true,
+            holder: None,
+            remote: Some(crate::session::RemoteSessionSpec {
+                manager,
+                helper,
+                launch,
+                host_id: host.id.clone(),
+                binding_store,
+            }),
+            defer_launch: false,
         };
         let mut registry = self.registry.lock().map_err(poisoned)?;
+        registry.ensure_session_project(&captured.cwd, Some(&host.id));
         registry
             .spawn(spec, record)
             .map_err(|error| ControlError::internal(error.to_string()))?;
         let _ = registry.persist();
         self.publish_updated(&registry, &id);
+
+        let prompt = p.initial_prompt.filter(|prompt| !prompt.is_empty());
+        if kind == diri_proto::AgentKind::CLAUDE_CODE_ID || prompt.is_some() {
+            let registry = Arc::clone(&self.registry);
+            let session_id = id.clone();
+            std::thread::spawn(move || {
+                prepare_agent_input(
+                    &registry,
+                    &session_id,
+                    kind == diri_proto::AgentKind::CLAUDE_CODE_ID,
+                    prompt.as_deref(),
+                );
+            });
+        }
         let record = registry
             .records()
             .into_iter()
             .find(|record| record.id.0 == id)
-            .ok_or_else(|| ControlError::internal("the new session vanished"))?;
-        serde_json::to_value(&record).map_err(|error| ControlError::internal(error.to_string()))
-    }
-
-    /// Revives a remote session under its existing record: ssh + `tmux
-    /// new-session -A` reattaches or restarts, resuming the conversation.
-    fn session_resume_remote(
-        &self,
-        record: &diri_proto::SessionRecord,
-        host_id: &str,
-    ) -> Result<JsonValue, ControlError> {
-        let entry = self.resolve_host(host_id)?;
-        let kind = record.kind.id().to_string();
-        let registry_engine = {
-            let registry = self.registry.lock().map_err(poisoned)?;
-            registry.engine()
-        };
-        let manifest = registry_engine
-            .manifest(&kind)
-            .ok_or_else(|| ControlError::not_found(format!("no manifest for agent {kind}")))?;
-        let descriptor = manifest.agent.clone().unwrap_or_default();
-        let argv = crate::remote::remote_argv(
-            &kind,
-            &descriptor,
-            &record.id.0,
-            &entry,
-            &record.cwd,
-            record.agent_session_id.as_deref(),
-            true,
-        );
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
-        let mut pty = crate::pty::PtySpec::new(argv, &home);
-        pty.env = std::env::vars().collect();
-        pty.env.retain(|(key, _)| key != "NO_COLOR");
-        absolutize_remote_argv0(&mut pty);
-        let spec = crate::session::SessionSpec {
-            id: record.id.0.clone(),
-            pty,
-            manifest_id: kind,
-            authority: descriptor.authority(),
-            logs_dir: self.logs_dir.clone(),
-            holder: self.holder.clone(),
-            defer_launch: true,
-        };
-        let mut registry = self.registry.lock().map_err(poisoned)?;
-        registry
-            .respawn(spec)
-            .map_err(|error| ControlError::internal(error.to_string()))?;
-        let _ = registry.persist();
-        self.publish_updated(&registry, &record.id.0);
-        let record = registry
-            .records()
-            .into_iter()
-            .find(|current| current.id.0 == record.id.0)
-            .ok_or_else(|| ControlError::internal("the resumed session vanished"))?;
+            .ok_or_else(|| ControlError::internal("the new remote session vanished"))?;
         serde_json::to_value(&record).map_err(|error| ControlError::internal(error.to_string()))
     }
 
@@ -848,6 +1090,10 @@ impl ControlServer {
             let output = std::process::Command::new("git")
                 .args(args)
                 .current_dir(dir)
+                .env("LC_ALL", "C")
+                .env("LANG", "C")
+                .env("LANGUAGE", "C")
+                .env("GIT_TERMINAL_PROMPT", "0")
                 .output()
                 .ok()?;
             output
@@ -938,6 +1184,15 @@ impl ControlServer {
                 .find(|record| record.id.0 == id)
                 .ok_or_else(|| ControlError::not_found(id.clone()))?
         };
+        // Handoff needs no terminal multiplexer of its own. Its phases are
+        // git preparation over `hosts::run_shell`, stopping the source through
+        // the session's own transport (which signals the remote Agent via its
+        // Holder), the transcript shuttle, and a normal resume on the target.
+        // Refuse only when a leg is remote and no Helper transport exists to
+        // carry it, rather than refusing every call.
+        if (record.host.is_some() || p.target_host.is_some()) && self.remote.is_none() {
+            return Err(crate::remote::transport_unavailable());
+        }
         if record.kind.id() != diri_proto::AgentKind::CLAUDE_CODE_ID {
             return Err(ControlError::bad_request(
                 "only Claude Code sessions can move between hosts",
@@ -1011,12 +1266,6 @@ impl ControlServer {
             let mut registry = self.registry.lock().map_err(poisoned)?;
             let _ = registry.terminate(&id, std::time::Duration::from_secs(3));
         }
-        if let Some(source) = &source_host
-            && let Some(warning) = crate::migrate::kill_remote_tmux(source, &id)
-        {
-            warnings.push(warning);
-        }
-
         // Phase 2: transcript shuttle (source stopped ⇒ the jsonl is final).
         let shuttle = crate::migrate::shuttle_transcript(
             &record.cwd,
@@ -1040,9 +1289,12 @@ impl ControlServer {
             let cwd = prepared.target_repo_root.clone();
             let transcript = shuttle.local_target_path.clone();
             let local = target_host.is_none();
+            registry.ensure_session_project(&cwd, target_id.as_deref());
             registry.update_record(&id, |record| {
                 record.host = target_id;
                 record.cwd = cwd;
+                record.project_id =
+                    crate::registry::session_project_id(&record.cwd, record.host.as_deref());
                 record.worktree_path = None;
                 record.git_branch = Some(branch);
                 record.transcript_path = if local { transcript } else { None };
@@ -1084,6 +1336,64 @@ impl ControlServer {
             .map(PathBuf::from)
             .map_err(|_| ControlError::internal("HOME is not set"))?;
         encode(&crate::hosts::sync_prefs(&entry, &home))
+    }
+
+    /// `host.initialize`: run the complete idempotent SSH bootstrap before a
+    /// user creates the first session. No environment values cross back into
+    /// the app; only facts suitable for a visible readiness summary do.
+    fn host_initialize(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::HostInitializeParams = decode(params)?;
+        let manager = self
+            .remote
+            .as_ref()
+            .ok_or_else(crate::remote::transport_unavailable)?;
+        let host = self.resolve_host(&p.host)?;
+        let helper = if p.force_reinstall {
+            manager.reinstall_helper(&host)
+        } else {
+            manager.ensure_helper(&host)
+        }
+        .map_err(io_control_error)?;
+        let persistence = manager
+            .probe_persistence(&host, &helper)
+            .map_err(io_control_error)?;
+        let captured = manager
+            .capture_environment(
+                &helper,
+                &diri_proto::remote_pty::EnvironmentCaptureRequest {
+                    cwd: Some(host.default_cwd.clone().unwrap_or_else(|| "~".into())),
+                    timeout_millis: 10_000,
+                },
+            )
+            .map_err(io_control_error)?;
+        encode(&diri_proto::HostInitializeResult {
+            helper_build_id: helper.build_id,
+            protocol: helper.protocol,
+            persistence,
+            cwd: captured.cwd,
+            shell: captured.shell,
+        })
+    }
+
+    /// `host.list_directories`: one shallow, bounded filesystem read on the
+    /// requested execution machine. Remote work stays behind the Engine and
+    /// uses the verified Helper over `ssh -T`; the app never executes SSH.
+    fn host_list_directories(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::HostListDirectoriesParams = decode(params)?;
+        let request = diri_proto::remote_pty::DirectoryListRequest { path: p.path };
+        let result = if let Some(host_id) = p.host {
+            let manager = self
+                .remote
+                .as_ref()
+                .ok_or_else(crate::remote::transport_unavailable)?;
+            let host = self.resolve_host(&host_id)?;
+            manager
+                .list_directories(&host, &request)
+                .map_err(io_control_error)?
+        } else {
+            crate::directories::list(&request).map_err(io_control_error)?
+        };
+        encode(&result)
     }
 
     /// `host.locate_repo`: find a checkout by origin URL (given directly, or
@@ -1150,6 +1460,9 @@ impl ControlServer {
             })
     }
 
+    /// Applies the current application build's remote environment gate before
+    /// a stateless SSH action. Live Holder operations deliberately use their
+    /// session binding's creation-time Helper instead.
     fn hosts_file(&self) -> PathBuf {
         self.socket_path
             .parent()
@@ -1246,6 +1559,9 @@ impl ControlServer {
             return Err(ControlError::not_found(p.session_id.0.clone()));
         }
         let _ = registry.persist();
+        if let Some(store) = &self.remote_bindings {
+            let _ = store.remove(&p.session_id.0);
+        }
         self.publish_updated(&registry, &p.session_id.0);
         Ok(json!({}))
     }
@@ -1257,6 +1573,9 @@ impl ControlServer {
             .remove(&p.session_id.0, &self.logs_dir)
             .map_err(io_control_error)?;
         let _ = registry.persist();
+        if let Some(store) = &self.remote_bindings {
+            let _ = store.remove(&p.session_id.0);
+        }
         self.events.publish(
             diri_proto::EventName::SESSION_REMOVED,
             json!({ "id": p.session_id.0, "reason": "released" }),
@@ -1350,6 +1669,40 @@ impl ControlServer {
     /// Revives an exited session's conversation under the SAME record id.
     fn session_resume(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::SessionIdParams = decode(params)?;
+        let record = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            let record = registry
+                .records()
+                .into_iter()
+                .find(|record| record.id.0 == p.session_id.0)
+                .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+            // Presence in the registry is not liveness: only an explicit kill
+            // removes a session, so an agent that died on its own is still in
+            // the map. Returning here on presence alone would hand back the
+            // corpse this call was asked to revive; the exited case falls
+            // through to the eviction path below.
+            if registry.get(&p.session_id.0).is_some()
+                && !matches!(record.status, diri_proto::SessionStatus::Exited(_))
+            {
+                // Genuinely live: resuming is a no-op, not an error.
+                return serde_json::to_value(&record)
+                    .map_err(|error| ControlError::internal(error.to_string()));
+            }
+            record
+        };
+        let spec = if record.host.is_some() {
+            self.remote_resume_spec(&record)?
+        } else {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            self.resume_spec(
+                &registry,
+                &record.id.0,
+                record.kind.id(),
+                &record.cwd,
+                record.agent_session_id.as_deref(),
+            )?
+        };
+        let remote_persistence = spec.remote.as_ref().map(|remote| remote.launch.persistence);
         let mut registry = self.registry.lock().map_err(poisoned)?;
         let record = registry
             .records()
@@ -1370,23 +1723,14 @@ impl ControlServer {
             // silently handing back the dead record it was asked to revive.
             let _ = registry.terminate(&p.session_id.0, std::time::Duration::from_millis(500));
         }
-        if let Some(host_id) = record.host.clone() {
-            // Remote revive: the same tmux name reattaches the live remote
-            // session when it survived, else a fresh agent resumes the
-            // conversation from the remote-side transcript.
-            drop(registry);
-            return self.session_resume_remote(&record, &host_id);
-        }
-        let spec = self.resume_spec(
-            &registry,
-            &record.id.0,
-            record.kind.id(),
-            &record.cwd,
-            record.agent_session_id.as_deref(),
-        )?;
         registry
             .respawn(spec)
             .map_err(|error| ControlError::internal(error.to_string()))?;
+        if let Some(persistence) = remote_persistence {
+            registry.update_record(&p.session_id.0, |record| {
+                record.remote_persistence = Some(persistence);
+            });
+        }
         let _ = registry.persist();
         self.publish_updated(&registry, &p.session_id.0);
         let record = registry
@@ -1395,6 +1739,109 @@ impl ControlServer {
             .find(|record| record.id.0 == p.session_id.0)
             .ok_or_else(|| ControlError::internal("the resumed session vanished"))?;
         serde_json::to_value(&record).map_err(|error| ControlError::internal(error.to_string()))
+    }
+
+    fn remote_resume_spec(
+        &self,
+        record: &diri_proto::SessionRecord,
+    ) -> Result<crate::session::SessionSpec, ControlError> {
+        let manager = self
+            .remote
+            .as_ref()
+            .cloned()
+            .ok_or_else(crate::remote::transport_unavailable)?;
+        let binding_store = self.remote_bindings.clone().ok_or_else(|| {
+            ControlError::internal("owner-only remote binding store is unavailable")
+        })?;
+        let host_id = record
+            .host
+            .as_deref()
+            .ok_or_else(|| ControlError::bad_request("remote record has no host"))?;
+        let host = self.resolve_host(host_id)?;
+        let helper = manager.ensure_helper(&host).map_err(io_control_error)?;
+        let persistence = manager
+            .probe_persistence(&host, &helper)
+            .map_err(io_control_error)?;
+        let captured = manager
+            .capture_environment(
+                &helper,
+                &diri_proto::remote_pty::EnvironmentCaptureRequest {
+                    cwd: Some(record.cwd.clone()),
+                    timeout_millis: 10_000,
+                },
+            )
+            .map_err(io_control_error)?;
+        let cwd = PathBuf::from(&captured.cwd);
+        if !cwd.is_absolute() {
+            return Err(ControlError::internal(
+                "remote Helper returned a non-absolute cwd",
+            ));
+        }
+        let (descriptor, authority) = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            let engine = registry.engine();
+            let manifest = engine.manifest(record.kind.id()).ok_or_else(|| {
+                ControlError::not_found(format!("no manifest for agent {}", record.kind.id()))
+            })?;
+            let descriptor = manifest.agent.clone().unwrap_or_default();
+            let authority = descriptor.authority();
+            (descriptor, authority)
+        };
+        let mut launch_args = descriptor.spawn_args.clone();
+        launch_args.extend(
+            descriptor
+                .resume_args(record.agent_session_id.as_deref())
+                .ok_or_else(|| {
+                    ControlError::bad_request(format!(
+                        "agent {} does not support resume",
+                        record.kind.id()
+                    ))
+                })?,
+        );
+        let inherited = captured
+            .environment
+            .into_iter()
+            .map(|variable| (variable.name, variable.value));
+        let pty = descriptor
+            .remote_spawn_spec(&cwd, inherited, &launch_args)
+            .ok_or_else(|| {
+                ControlError::bad_request(format!("agent {} declares no binary", record.kind.id()))
+            })?;
+        let launch = diri_proto::remote_pty::LaunchRequest {
+            session_id: record.id.0.clone(),
+            session_token: random_session_token()?,
+            argv: pty.argv.clone(),
+            cwd: captured.cwd,
+            environment: pty
+                .env
+                .iter()
+                .map(
+                    |(name, value)| diri_proto::remote_pty::EnvironmentVariable {
+                        name: name.clone(),
+                        value: value.clone(),
+                    },
+                )
+                .collect(),
+            cols: pty.cols,
+            rows: pty.rows,
+            persistence,
+        };
+        Ok(crate::session::SessionSpec {
+            id: record.id.0.clone(),
+            pty,
+            manifest_id: record.kind.id().to_string(),
+            authority,
+            logs_dir: self.logs_dir.clone(),
+            holder: None,
+            remote: Some(crate::session::RemoteSessionSpec {
+                manager,
+                helper,
+                launch,
+                host_id: host.id,
+                binding_store,
+            }),
+            defer_launch: false,
+        })
     }
 
     /// Revives a conversation found in an agent's own history: a NEW record
@@ -1415,6 +1862,7 @@ impl ControlServer {
             record.title_source = diri_proto::TitleSource::FirstPrompt;
         }
         let spec = self.resume_spec(&registry, &id, &kind, &p.entry.cwd, Some(&p.entry.id))?;
+        registry.ensure_session_project(&p.entry.cwd, None);
         registry
             .spawn(spec, record)
             .map_err(|error| ControlError::internal(error.to_string()))?;
@@ -1493,6 +1941,7 @@ impl ControlServer {
             authority: descriptor.authority(),
             logs_dir: self.logs_dir.clone(),
             holder: self.holder.clone(),
+            remote: None,
             defer_launch: true,
         })
     }
@@ -1546,17 +1995,26 @@ impl ControlServer {
     /// The working tree's diff against a base ref, for the app's diff pane.
     fn session_read_diff(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::SessionReadDiffParams = decode(params)?;
-        let cwd = {
+        let (cwd, host_id) = {
             let registry = self.registry.lock().map_err(poisoned)?;
             registry
                 .records()
                 .into_iter()
                 .find(|record| record.id.0 == p.session_id.0)
-                .map(|record| record.cwd)
+                .map(|record| (record.cwd, record.host))
                 .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?
         };
-        let result =
-            crate::git::working_diff(Path::new(&cwd), p.base.as_ref()).map_err(io_control_error)?;
+        let result = if let Some(host_id) = host_id {
+            let manager = self
+                .remote
+                .as_ref()
+                .ok_or_else(crate::remote::transport_unavailable)?;
+            let host = self.resolve_host(&host_id)?;
+            crate::git::working_diff_remote(manager, &host, &cwd, p.base.as_ref())
+                .map_err(io_control_error)?
+        } else {
+            crate::git::working_diff(Path::new(&cwd), p.base.as_ref()).map_err(io_control_error)?
+        };
         encode(&result)
     }
 
@@ -1600,6 +2058,69 @@ impl ControlServer {
         Ok(json!({}))
     }
 
+    /// Releases the detached Engine after the desktop App goes away, but only
+    /// when doing so cannot strand a live Agent or interrupt another client.
+    /// The delayed recheck happens after the acknowledgement has flushed and
+    /// the requesting connection has had time to close.
+    fn daemon_shutdown_if_idle(&self) -> Result<JsonValue, ControlError> {
+        let live_sessions = {
+            let mut registry = self.registry.lock().map_err(poisoned)?;
+            let live_sessions = registry.live_count();
+            if live_sessions == 0 {
+                let _ = registry.persist();
+            }
+            live_sessions
+        };
+        let connections = self.active_connections.load(Ordering::Acquire);
+        let refusal = idle_shutdown_refusal(live_sessions, connections);
+        if let Some(reason) = refusal {
+            return encode(&diri_proto::DaemonShutdownIfIdleResult {
+                will_exit: false,
+                reason: Some(reason.to_owned()),
+            });
+        }
+
+        let registry = Arc::clone(&self.registry);
+        let active_connections = Arc::clone(&self.active_connections);
+        let remote = self.remote.clone();
+        let holder = self.holder.clone();
+        let browser = self.browser.get().cloned();
+        let socket_path = self.socket_path.clone();
+        std::thread::spawn(move || {
+            // The control response must reach the App before its client shuts
+            // down. Wait up to one second for precisely that connection to
+            // disappear; any new/other client cancels the exit.
+            for _ in 0..20 {
+                std::thread::sleep(Duration::from_millis(50));
+                if active_connections.load(Ordering::Acquire) == 0 {
+                    let still_idle = registry
+                        .lock()
+                        .is_ok_and(|registry| registry.live_count() == 0);
+                    if still_idle {
+                        if let Some(remote) = remote {
+                            remote.close_control_masters();
+                        }
+                        if let Some(holder) = holder {
+                            let paths = crate::holder::HolderManagerPaths::new(&holder.holders_dir);
+                            let _ = crate::holder::HolderManagerClient::new(paths.socket())
+                                .shutdown_if_idle();
+                        }
+                        if let Some(browser) = browser {
+                            browser.shutdown();
+                        }
+                        let _ = std::fs::remove_file(socket_path);
+                        std::process::exit(0);
+                    }
+                    return;
+                }
+            }
+        });
+        encode(&diri_proto::DaemonShutdownIfIdleResult {
+            will_exit: true,
+            reason: None,
+        })
+    }
+
     /// Ack first, then exit: the response has to flush before the process
     /// dies, so the client sees a clean reply followed by a socket drop and
     /// relaunches the fresh binary.
@@ -1608,8 +2129,14 @@ impl ControlServer {
             let mut registry = self.registry.lock().map_err(poisoned)?;
             let _ = registry.persist();
         }
-        std::thread::spawn(|| {
+        let browser = self.browser.get().cloned();
+        let socket_path = self.socket_path.clone();
+        std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(200));
+            if let Some(browser) = browser {
+                browser.shutdown();
+            }
+            let _ = std::fs::remove_file(socket_path);
             std::process::exit(0);
         });
         Ok(json!({}))
@@ -1691,6 +2218,33 @@ impl Drop for ControlServer {
     }
 }
 
+/// Content identity of the running Engine. It is computed once, then reused by
+/// every heartbeat so version coordination has no steady-state hashing cost.
+fn process_executable_hash() -> Option<&'static str> {
+    static HASH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    HASH.get_or_init(|| {
+        let executable = std::env::current_exe().ok()?;
+        let mut file = std::fs::File::open(executable).ok()?;
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer).ok()?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+        Some(
+            digest
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+        )
+    })
+    .as_deref()
+}
+
 /// A session id in the daemon's format: `s_` plus twelve hex digits.
 pub(crate) fn next_session_id() -> String {
     let mut bytes = [0u8; 6];
@@ -1699,14 +2253,26 @@ pub(crate) fn next_session_id() -> String {
     format!("s_{hex}")
 }
 
+fn random_session_token() -> Result<diri_proto::remote_pty::SessionToken, ControlError> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| ControlError::internal(format!("secure random source failed: {error}")))?;
+    let encoded = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    diri_proto::remote_pty::SessionToken::new(encoded)
+        .map_err(|error| ControlError::internal(error.to_string()))
+}
+
 pub(crate) fn new_record(id: &str, kind: &str, cwd: &str) -> diri_proto::SessionRecord {
-    use diri_proto::{AgentKind, DateMillis, ProjectId, Resumability, SessionId, TitleSource};
+    use diri_proto::{AgentKind, DateMillis, Resumability, SessionId, TitleSource};
     let now: DateMillis = std::time::SystemTime::now().into();
     diri_proto::SessionRecord {
         id: SessionId(id.to_string()),
         kind: AgentKind::new(kind),
         cwd: cwd.to_string(),
-        project_id: ProjectId(cwd.to_string()),
+        project_id: crate::registry::session_project_id(cwd, None),
         worktree_path: None,
         git_branch: None,
         title: kind.to_string(),
@@ -1723,8 +2289,8 @@ pub(crate) fn new_record(id: &str, kind: &str, cwd: &str) -> diri_proto::Session
         last_seen_at: None,
         pinned: false,
         archived_at: None,
-        remote_active: false,
         host: None,
+        remote_persistence: None,
         hibernation: None,
         memory_bytes: None,
         artifacts: None,
@@ -1739,6 +2305,44 @@ pub(crate) fn new_record(id: &str, kind: &str, cwd: &str) -> diri_proto::Session
 struct SubscriptionHandle {
     stop: Arc<std::sync::atomic::AtomicBool>,
     _thread: std::thread::JoinHandle<()>,
+}
+
+impl Drop for SubscriptionHandle {
+    fn drop(&mut self) {
+        // Dropping a JoinHandle detaches rather than cancels its thread. Make
+        // the subscription's 250 ms receive timeout a real upper bound on
+        // cleanup instead of leaking one polling thread per reconnect.
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+struct ActiveConnectionGuard {
+    connections: Arc<AtomicUsize>,
+}
+
+impl ActiveConnectionGuard {
+    fn new(connections: Arc<AtomicUsize>) -> Self {
+        connections.fetch_add(1, Ordering::AcqRel);
+        Self { connections }
+    }
+}
+
+impl Drop for ActiveConnectionGuard {
+    fn drop(&mut self) {
+        self.connections.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn idle_shutdown_refusal(live_sessions: usize, connections: usize) -> Option<&'static str> {
+    if live_sessions != 0 {
+        Some("live sessions still require the Engine")
+    } else if connections == 0 {
+        Some("request is not associated with a live control connection")
+    } else if connections > 1 {
+        Some("another control client still requires the Engine")
+    } else {
+        None
+    }
 }
 
 /// Serializes one message onto the shared write half. Responses and event
@@ -1796,44 +2400,6 @@ fn resolve_on_path(binary: &str) -> Option<String> {
     }
     None
 }
-
-/// Resolves a spec's bare argv[0] to an absolute path against its own env
-/// PATH (daemon PATH as fallback). The process that execs it may be a
-/// long-lived holder manager whose environment predates this daemon —
-/// program lookup happens THERE, so a bare "ssh" can exit 127 no matter
-/// what env the spec carries.
-pub(crate) fn absolutize_remote_argv0(pty: &mut crate::pty::PtySpec) {
-    // The daemon itself has no terminal (launchd env): without an asserted
-    // TERM, `ssh -t` hands the remote an empty one and tmux refuses to start
-    // ("terminal does not support clear") — the same assertion spawn_spec
-    // makes for local agents.
-    pty.env
-        .retain(|(key, _)| key != "TERM" && key != "COLORTERM");
-    pty.env.push(("TERM".into(), "xterm-256color".into()));
-    pty.env.push(("COLORTERM".into(), "truecolor".into()));
-    absolutize_argv0(pty);
-}
-
-fn absolutize_argv0(pty: &mut crate::pty::PtySpec) {
-    if let Some(first) = pty.argv.first_mut()
-        && !first.contains('/')
-    {
-        let path = pty
-            .env
-            .iter()
-            .rev()
-            .find(|(key, _)| key == "PATH")
-            .map(|(_, value)| value.clone())
-            .or_else(|| std::env::var("PATH").ok());
-        if let Some(resolved) = path
-            .as_deref()
-            .and_then(|path| crate::agent::resolve_on_path(first, path))
-        {
-            *first = resolved;
-        }
-    }
-}
-
 fn migrate_control_error(error: crate::migrate::MigrateError) -> ControlError {
     match error {
         crate::migrate::MigrateError::BadRequest(message) => ControlError::bad_request(message),
@@ -1886,6 +2452,70 @@ fn with_session<T>(
         .lock()
         .ok()
         .and_then(|guard| guard.get(session_id).map(read))
+}
+
+/// Handles the only startup prompt Diri can safely pre-authorize: the exact
+/// workspace the user just selected for Claude. Current Claude has no launch
+/// flag that skips only workspace trust; its documented bypass flag also
+/// disables every tool permission and is deliberately not used.
+fn prepare_agent_input(
+    registry: &Arc<Mutex<Registry>>,
+    session_id: &str,
+    accept_claude_workspace: bool,
+    prompt: Option<&str>,
+) {
+    if accept_claude_workspace {
+        accept_claude_workspace_trust(registry, session_id);
+    }
+    if let Some(prompt) = prompt {
+        inject_initial_prompt(registry, session_id, prompt);
+    }
+}
+
+/// Answers Claude Code's "do you trust this folder?" picker on the user's
+/// behalf so a spawn does not stall behind it and swallow the initial prompt.
+///
+/// This is a deliberate trade: it auto-grants workspace trust for whatever
+/// directory the session was pointed at. That is defensible when the user
+/// picked the directory in the UI, and weaker when they did not — an
+/// orchestrator spawning into a freshly cloned repository gets trust without
+/// anyone affirming it. The window is bounded (20s, and it stops at the first
+/// non-matching screen), but a session whose own output contains the matched
+/// phrases inside that window would also receive the keystroke.
+fn accept_claude_workspace_trust(registry: &Arc<Mutex<Registry>>, session_id: &str) {
+    for _ in 0..200 {
+        let Some((exited, screen)) = with_session(registry, session_id, |session| {
+            (session.view().exited, session.screen_lines().join("\n"))
+        }) else {
+            return;
+        };
+        if exited {
+            return;
+        }
+        if is_claude_workspace_trust_screen(&screen) {
+            let _ = with_session(registry, session_id, |session| session.send_text("1", true));
+            // Let Claude persist trust and replace the picker before a caller's
+            // initial prompt starts its own readiness/verification loop.
+            for _ in 0..20 {
+                std::thread::sleep(Duration::from_millis(100));
+                let changed = with_session(registry, session_id, |session| {
+                    !is_claude_workspace_trust_screen(&session.screen_lines().join("\n"))
+                })
+                .unwrap_or(true);
+                if changed {
+                    return;
+                }
+            }
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn is_claude_workspace_trust_screen(screen: &str) -> bool {
+    let normalized = screen.to_ascii_lowercase();
+    normalized.contains("yes, i trust this folder")
+        && (normalized.contains("1.") || normalized.contains("1 "))
 }
 
 /// Types an initial prompt into a freshly spawned agent, gated on the TUI
@@ -2021,8 +2651,7 @@ mod tests {
     use crate::detect::ManifestEngine;
 
     fn engine() -> Arc<ManifestEngine> {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../Sources/DirijorCore/Resources/manifests")
+        let dir = crate::detect::bundled_manifest_dir()
             .canonicalize()
             .expect("manifests");
         let (engine, _) = ManifestEngine::load_dir(&dir).expect("load");
@@ -2057,8 +2686,8 @@ mod tests {
             last_seen_at: None,
             pinned: false,
             archived_at: None,
-            remote_active: false,
             host: None,
+            remote_persistence: None,
             hibernation: None,
             memory_bytes: None,
             artifacts: None,
@@ -2120,6 +2749,12 @@ mod tests {
             "the handshake should say which engine answered: {result}"
         );
         assert!(result["pid"].as_i64().is_some_and(|pid| pid > 0));
+        assert_eq!(result["engineKind"], diri_proto::RUST_ENGINE_KIND);
+        assert_eq!(
+            result["executableHash"].as_str().map(str::len),
+            Some(64),
+            "the app needs a stable content identity for upgrade coordination"
+        );
     }
 
     #[test]
@@ -2168,7 +2803,7 @@ mod tests {
     }
 
     #[test]
-    fn resuming_an_agent_keeps_the_login_shell_as_session_leader() {
+    fn resuming_an_agent_directly_executes_the_agent() {
         let temp = tempfile::tempdir().expect("temp");
         let registry = Registry::new(engine(), temp.path().join("state.json"));
         let server = ControlServer::new(
@@ -2182,15 +2817,13 @@ mod tests {
         let spec = server
             .resume_spec(&registry, "s_resume", "claude-code", "/tmp", Some("uuid-1"))
             .expect("resume spec");
-        assert_eq!(&spec.pty.argv[1..4], &["-i", "-l", "-c"]);
-        let command = &spec.pty.argv[4];
+        // Claude declares `returnToLoginShell`, so the agent runs inside the
+        // PTY's login shell rather than as its argv[0]; the resume flags still
+        // have to reach the agent itself.
+        let command = spec.pty.argv.last().expect("argv");
         assert!(
-            command.contains("'claude' '--resume' 'uuid-1'"),
-            "the complete resume command must run inside the shell: {command}"
-        );
-        assert!(
-            command.contains("; exec "),
-            "the shell must survive: {command}"
+            command.contains("'claude'") && command.contains("'--resume' 'uuid-1'"),
+            "resume flags must reach the agent: {command:?}"
         );
     }
 
@@ -2246,6 +2879,7 @@ mod tests {
                         authority: crate::session::authority_for("probe", &probe),
                         logs_dir: temp.path().join("logs"),
                         holder: None,
+                        remote: None,
                         defer_launch: false,
                     },
                     record,
@@ -2631,6 +3265,56 @@ mod tests {
     }
 
     #[test]
+    fn remote_spawn_fails_with_the_structured_transport_error() {
+        let temp = tempfile::tempdir().expect("temp");
+        let server = server(temp.path());
+        let error = err_of(call(
+            &server,
+            "session.spawn",
+            Some(json!({
+                "kind": { "shell": {} },
+                "cwd": "/tmp",
+                "host": "forge",
+            })),
+        ));
+        assert_eq!(error.code, crate::remote::TRANSPORT_UNAVAILABLE_CODE);
+        assert!(
+            server
+                .registry
+                .lock()
+                .expect("registry")
+                .records()
+                .is_empty(),
+            "an unavailable remote transport must not create a session record"
+        );
+    }
+
+    #[test]
+    fn host_initialization_fails_closed_without_the_remote_transport() {
+        let temp = tempfile::tempdir().expect("temp");
+        diri_proto::HostsConfig {
+            hosts: vec![diri_proto::HostEntry {
+                id: "forge".into(),
+                name: Some("Forge".into()),
+                ssh: "you@forge".into(),
+                default_cwd: None,
+                node: None,
+            }],
+        }
+        .save(temp.path().join("hosts.json"))
+        .expect("host catalog");
+        let server = server(temp.path());
+
+        let error = err_of(call(
+            &server,
+            Method::HOST_INITIALIZE,
+            Some(json!({ "host": "forge" })),
+        ));
+
+        assert_eq!(error.code, crate::remote::TRANSPORT_UNAVAILABLE_CODE);
+    }
+
+    #[test]
     fn malformed_json_gets_an_error_rather_than_silence() {
         // A client waiting on a reply should learn that none is coming.
         let temp = tempfile::tempdir().expect("temp");
@@ -2708,5 +3392,62 @@ mod tests {
             &path,
         );
         let _listener = server.bind().expect("a stale socket should be replaced");
+    }
+
+    #[test]
+    fn workspace_trust_auto_accept_is_narrowly_scoped_to_claudes_exact_picker() {
+        assert!(is_claude_workspace_trust_screen(
+            "1. Yes, I trust this folder\n2. No, exit"
+        ));
+        assert!(!is_claude_workspace_trust_screen(
+            "1. Yes, allow this shell command\n2. No"
+        ));
+        assert!(!is_claude_workspace_trust_screen(
+            "Yes, I trust this folder"
+        ));
+    }
+
+    #[test]
+    fn idle_shutdown_requires_exactly_the_requesting_client_and_no_session() {
+        assert_eq!(
+            idle_shutdown_refusal(1, 1),
+            Some("live sessions still require the Engine")
+        );
+        assert_eq!(
+            idle_shutdown_refusal(0, 0),
+            Some("request is not associated with a live control connection")
+        );
+        assert_eq!(
+            idle_shutdown_refusal(0, 2),
+            Some("another control client still requires the Engine")
+        );
+        assert_eq!(idle_shutdown_refusal(0, 1), None);
+    }
+
+    #[test]
+    fn dropping_an_event_subscription_stops_its_detached_thread() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker_finished = Arc::clone(&finished);
+        let thread = std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            worker_finished.store(true, Ordering::Release);
+        });
+        drop(SubscriptionHandle {
+            stop,
+            _thread: thread,
+        });
+        for _ in 0..100 {
+            if finished.load(Ordering::Acquire) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("subscription worker did not observe Drop cancellation");
     }
 }

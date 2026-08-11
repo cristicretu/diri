@@ -1,0 +1,130 @@
+{
+  "schemaVersion": 2,
+  "id": "cursor",
+  "version": "2026.07.10",
+  "statusModel": "full",
+  "agent": {
+    "id": "cursor",
+    "displayName": "Cursor",
+    "shortLabel": "cursor",
+    "glyph": "\u25ae",
+    "aliases": [
+      "cursor",
+      "cursor-agent"
+    ],
+    "firstClass": true,
+    "statusAuthority": "screen",
+    "binary": "cursor-agent",
+    "foregroundExecNames": [
+      "cursor-agent"
+    ],
+    "approve": {
+      "text": "y",
+      "submit": false
+    },
+    "resume": {
+      "style": "flag",
+      "token": "resume"
+    },
+    "_resumeNotice": "Verified against cursor-agent CLI help: 'resume  Resume the latest chat session'. Chat ids are minted server-side, so --resume <chatId> is not buildable, but the bare subcommand needs no id.",
+    "_resumeStyleNotice": "Rust's AgentDescriptor::resume_args implements only \"flag\" and \"sessionIDFlag\"; Swift's \"latest\" has no implementation there and would silently resume nothing. Declared as \"flag\": this agent has no sessionIDFlag, so it never carries a caller-minted id and resume_args emits the bare token \u2014 exactly the semantics the token was chosen for.",
+    "envScrubPrefixes": [
+      "DIRI_",
+      "DIRIJOR_"
+    ],
+    "deny": {
+      "text": "n",
+      "submit": false
+    }
+  },
+  "rules": [
+    {
+      "id": "confirm-dialog",
+      "state": "blockedPermission",
+      "priority": 1000,
+      "region": "whole_recent",
+      "when": {
+        "any": [
+          {
+            "contains": "run this command?"
+          },
+          {
+            "contains": "run this mcp tool?"
+          },
+          {
+            "contains": "delete this file?"
+          },
+          {
+            "contains": "write to this file?"
+          },
+          {
+            "contains": "proceed with this http request?"
+          },
+          {
+            "contains": "proceed with this edit?"
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "plan-approval",
+      "state": "blockedQuestion",
+      "priority": 950,
+      "region": "whole_recent",
+      "when": {
+        "contains": "suggested plan"
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "working-status-line",
+      "state": "working",
+      "priority": 900,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 4,
+      "when": {
+        "lineRegex": "^\\s*(Generating|Thinking)"
+      }
+    },
+    {
+      "id": "idle-prompt-arrow",
+      "state": "idle",
+      "priority": 500,
+      "region": "prompt_box_body",
+      "when": {
+        "lineRegex": "^\\s*\u2192"
+      }
+    },
+    {
+      "id": "idle-follow-up-placeholder",
+      "state": "idle",
+      "priority": 450,
+      "region": "whole_recent",
+      "when": {
+        "any": [
+          {
+            "contains": "add a follow-up"
+          },
+          {
+            "contains": "plan, search, build anything"
+          }
+        ]
+      }
+    }
+  ]
+}

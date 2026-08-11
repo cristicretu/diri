@@ -104,6 +104,12 @@ impl HolderManagerClient {
         self.request(&HolderManagerRequest::launch(spec.clone()))
     }
 
+    /// Stops the manager only after it has confirmed that no Holder thread is
+    /// active. A refusal is safe and leaves its normal 30-second grace intact.
+    pub fn shutdown_if_idle(&self) -> HolderResult<i32> {
+        self.request(&HolderManagerRequest::shutdown_if_idle())
+    }
+
     pub fn is_alive(&self) -> bool {
         self.ping().is_ok()
     }

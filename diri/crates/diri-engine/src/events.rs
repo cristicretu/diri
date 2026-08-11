@@ -391,7 +391,9 @@ pub fn spawn_registry_watcher(
             let mut published: HashMap<String, u64> = HashMap::new();
             while !stop.load(Ordering::SeqCst) {
                 let changed = {
-                    let Ok(registry) = registry.lock() else { break };
+                    let Ok(mut registry) = registry.lock() else {
+                        break;
+                    };
                     registry.changed_since(&mut published)
                 };
                 for (id, record) in changed {

@@ -1,0 +1,110 @@
+{
+  "_notice": "Screen-detection predicates adapted from the herdr project (https://github.com/herdrdev/herdr, src/detect/manifests/*.toml), licensed Apache-2.0. Translated from herdr's TOML rule schema into Dirijor's JSON predicate schema and re-prioritised for this engine; the agent capability block is Dirijor's own.",
+  "schemaVersion": 2,
+  "id": "droid",
+  "version": "2026.07.31.1",
+  "statusModel": "full",
+  "agent": {
+    "id": "droid",
+    "displayName": "Droid",
+    "shortLabel": "droid",
+    "glyph": "\u25c8",
+    "aliases": [
+      "droid",
+      "factory",
+      "factory-droid"
+    ],
+    "firstClass": true,
+    "statusAuthority": "screen",
+    "binary": "droid",
+    "resume": {
+      "style": "flag",
+      "token": "--resume"
+    },
+    "returnToLoginShell": true,
+    "foregroundExecNames": [
+      "droid"
+    ],
+    "_resumeNotice": "Verified against Factory's CLI reference: 'droid --resume [sessionId] | Resume a session (defaults to last modified).' https://docs.factory.ai/droid-cli/cli-reference",
+    "_resumeStyleNotice": "Rust's AgentDescriptor::resume_args implements only \"flag\" and \"sessionIDFlag\"; Swift's \"latest\" has no implementation there and would silently resume nothing. Declared as \"flag\": this agent has no sessionIDFlag, so it never carries a caller-minted id and resume_args emits the bare token \u2014 exactly the semantics the token was chosen for.",
+    "envScrubPrefixes": [
+      "DIRI_",
+      "DIRIJOR_"
+    ]
+  },
+  "rules": [
+    {
+      "id": "blocked-select-dialog",
+      "state": "blockedPermission",
+      "priority": 300,
+      "region": "whole_recent",
+      "when": {
+        "all": [
+          {
+            "any": [
+              {
+                "contains": "enter to select"
+              },
+              {
+                "contains": "enter select"
+              }
+            ]
+          },
+          {
+            "any": [
+              {
+                "contains": "esc to cancel"
+              },
+              {
+                "contains": "esc cancel"
+              }
+            ]
+          },
+          {
+            "any": [
+              {
+                "lineRegex": "(?i)^\\s*[\u276f>]?\\s*yes, allow"
+              },
+              {
+                "lineRegex": "(?i)^\\s*[\u276f>]?\\s*no, cancel"
+              }
+            ]
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "working-spinner-stop",
+      "state": "working",
+      "priority": 110,
+      "region": "whole_recent",
+      "when": {
+        "all": [
+          {
+            "contains": "esc to stop"
+          },
+          {
+            "lineRegex": "^\\s*[\\u2800-\\u28FF]"
+          }
+        ]
+      }
+    },
+    {
+      "id": "working-esc-stop",
+      "state": "working",
+      "priority": 100,
+      "region": "whole_recent",
+      "when": {
+        "contains": "esc to stop"
+      }
+    }
+  ]
+}

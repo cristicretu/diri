@@ -17,13 +17,20 @@
 //! servers off the cooperative pool earlier tonight.
 
 use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
+use diri_proto::frames::FrameType;
+use diri_proto::remote_pty::{
+    FullSnapshot, GridDelta, LaunchRequest, ProcessExit, RemoteCodec, RemoteMessage,
+    RemoteProcessState,
+};
 use diri_proto::{NeedsInputDetail, SessionStatus};
+use diri_terminal_state::GridMirror;
 
 use crate::detect::ManifestEngine;
 use crate::holder::{
@@ -32,6 +39,9 @@ use crate::holder::{
 };
 use crate::log::OutputLog;
 use crate::pty::{Exit, Pty, PtySpec};
+use crate::remote::binding::{RemoteBinding, RemoteBindingStore};
+use crate::remote::client::RemoteSessionClient;
+use crate::remote::manager::{InstalledHelper, RemoteManager};
 use crate::screen::HeadlessScreen;
 use crate::status::{Authority, ClaudeHook, ReducerOutcome, StatusReducer, StatusSignal};
 
@@ -94,8 +104,62 @@ pub struct SessionView {
     pub status: SessionStatus,
     pub needs_input: Option<NeedsInputDetail>,
     pub title: Option<String>,
+    pub title_source: Option<diri_proto::TitleSource>,
     pub tail_offset: u64,
     pub exited: bool,
+}
+
+/// Small input-side composer mirror used only until the first real prompt is
+/// submitted. It avoids parsing an Agent's rendered screen or reading remote
+/// transcript files, and disappears from the hot path after the title exists.
+#[derive(Default)]
+struct PromptInputState {
+    draft: String,
+}
+
+impl PromptInputState {
+    fn observe(&mut self, bytes: &[u8]) -> Option<String> {
+        if matches!(bytes, b"\r" | b"\n") {
+            let prompt = std::mem::take(&mut self.draft);
+            return (!prompt.trim().is_empty()).then_some(prompt);
+        }
+        if bytes == [0x7f] || bytes == [0x08] {
+            self.draft.pop();
+            return None;
+        }
+        if bytes == [0x15] {
+            self.draft.clear();
+            return None;
+        }
+        if bytes == [0x17] {
+            while self.draft.ends_with(char::is_whitespace) {
+                self.draft.pop();
+            }
+            while self
+                .draft
+                .chars()
+                .last()
+                .is_some_and(|c| !c.is_whitespace())
+            {
+                self.draft.pop();
+            }
+            return None;
+        }
+
+        let bytes = bytes
+            .strip_prefix(b"\x1b[200~")
+            .and_then(|bytes| bytes.strip_suffix(b"\x1b[201~"))
+            .unwrap_or(bytes);
+        if bytes.iter().any(|byte| *byte == 0x1b || *byte < 0x09)
+            || bytes.iter().any(|byte| (0x0e..0x20).contains(byte))
+        {
+            return None;
+        }
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            self.draft.push_str(text);
+        }
+        None
+    }
 }
 
 /// The state the pump thread and the outside world share.
@@ -104,6 +168,8 @@ struct Shared {
     status: Mutex<SessionStatus>,
     needs_input: Mutex<Option<NeedsInputDetail>>,
     title: Mutex<Option<String>>,
+    prompt_title: Mutex<Option<String>>,
+    prompt_input: Mutex<PromptInputState>,
     log: Mutex<OutputLog>,
     screen: Mutex<HeadlessScreen>,
     reducer: Mutex<StatusReducer>,
@@ -128,6 +194,17 @@ struct Shared {
     queued_input: Mutex<Vec<u8>>,
     /// The child's pid, for tree enumeration by the resource governor.
     child_pid: std::sync::atomic::AtomicI32,
+    /// The remote Holder's grid is display-authoritative. Raw output still
+    /// feeds `screen` for local status reduction and artifact detection.
+    remote_grid: Mutex<Option<RemoteGridState>>,
+    remote_output_offset: AtomicU64,
+    grid_wake: GridWake,
+}
+
+struct RemoteGridState {
+    mirror: GridMirror,
+    revision: u64,
+    pending: Option<diri_proto::grid::GridUpdate>,
 }
 
 impl Shared {
@@ -178,6 +255,65 @@ pub struct GridSignature {
     pub mouse_reporting: bool,
 }
 
+/// Event source for the attachment writer. PTY readers advance it only after
+/// the authoritative grid changes, so a quiet attached terminal has no
+/// frame-rate polling cost.
+#[derive(Clone)]
+pub(crate) struct GridWake {
+    inner: Arc<GridWakeInner>,
+}
+
+struct GridWakeInner {
+    generation: Mutex<u64>,
+    changed: Condvar,
+}
+
+impl GridWake {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(GridWakeInner {
+                generation: Mutex::new(0),
+                changed: Condvar::new(),
+            }),
+        }
+    }
+
+    fn notify(&self) {
+        let mut generation = self.inner.generation.lock().expect("grid wake");
+        *generation = generation.wrapping_add(1);
+        self.inner.changed.notify_all();
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        *self.inner.generation.lock().expect("grid wake")
+    }
+
+    pub(crate) fn wait_for_change(&self, observed: u64, timeout: Duration) -> u64 {
+        let generation = self.inner.generation.lock().expect("grid wake");
+        if *generation != observed {
+            return *generation;
+        }
+        let (generation, _) = self
+            .inner
+            .changed
+            .wait_timeout_while(generation, timeout, |generation| *generation == observed)
+            .expect("grid wake");
+        *generation
+    }
+
+    pub(crate) fn same_source(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+pub(crate) struct AttachmentSeed {
+    pub grid: diri_proto::grid::GridUpdate,
+    pub modes: (bool, bool),
+    pub signature: GridSignature,
+    pub wake: GridWake,
+    pub wake_generation: u64,
+}
+
 /// Who owns the PTY.
 enum Transport {
     /// This process does; dropping the session kills the child.
@@ -185,6 +321,9 @@ enum Transport {
     /// A holder process does; this session is a socket client and a log
     /// tail, and the child outlives it.
     Held(HolderClient),
+    /// A remote Holder owns the PTY. Dropping this transport closes only the
+    /// SSH Bridge; explicit termination is the only path that kills Agent.
+    Remote(Arc<RemoteSessionClient>),
 }
 
 pub struct Session {
@@ -313,6 +452,52 @@ pub struct HolderConfig {
     pub executable: PathBuf,
 }
 
+/// Everything needed to launch one structured command through an installed
+/// remote Helper. Secrets stay in Engine memory and are never written into a
+/// public [`diri_proto::SessionRecord`].
+#[derive(Clone)]
+pub struct RemoteSessionSpec {
+    pub manager: Arc<RemoteManager>,
+    pub helper: InstalledHelper,
+    pub launch: LaunchRequest,
+    pub host_id: String,
+    pub binding_store: RemoteBindingStore,
+}
+
+#[derive(Clone)]
+pub struct RemoteAdoptSpec {
+    pub manager: Arc<RemoteManager>,
+    pub helper: InstalledHelper,
+    pub token: diri_proto::remote_pty::SessionToken,
+    pub incarnation: String,
+    pub binding_store: RemoteBindingStore,
+    pub output_offset: u64,
+}
+
+struct RemoteLaunchCleanup {
+    manager: Arc<RemoteManager>,
+    helper: InstalledHelper,
+    binding_store: RemoteBindingStore,
+    selector: diri_proto::remote_pty::SessionSelector,
+    armed: bool,
+}
+
+impl RemoteLaunchCleanup {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RemoteLaunchCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = self.manager.kill(&self.helper, &self.selector);
+        let _ = self.binding_store.remove(&self.selector.session_id);
+    }
+}
+
 /// How to start a session.
 pub struct SessionSpec {
     pub id: String,
@@ -323,6 +508,9 @@ pub struct SessionSpec {
     pub logs_dir: PathBuf,
     /// `Some` spawns through a holder so the child survives this process.
     pub holder: Option<HolderConfig>,
+    /// Present for a remote Holder-backed session. It is mutually exclusive
+    /// with the local `holder` transport.
+    pub remote: Option<RemoteSessionSpec>,
     /// Defer the exec until the first client size settles (holder spawns
     /// only), so the agent's banner renders at the real viewport width.
     pub defer_launch: bool,
@@ -332,11 +520,162 @@ impl Session {
     /// Spawns the child and starts watching it — through a holder when the
     /// spec carries a [`HolderConfig`], directly otherwise.
     pub fn spawn(spec: SessionSpec, engine: Arc<ManifestEngine>) -> std::io::Result<Self> {
+        if spec.remote.is_some() {
+            return Self::spawn_remote(spec, engine);
+        }
         match spec.holder.clone() {
             Some(holder) if spec.defer_launch => Self::spawn_held_deferred(spec, &holder, engine),
             Some(holder) => Self::spawn_held(spec, &holder, engine),
             None => Self::spawn_direct(spec, engine),
         }
+    }
+
+    fn spawn_remote(mut spec: SessionSpec, engine: Arc<ManifestEngine>) -> std::io::Result<Self> {
+        if spec.holder.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a session cannot use local and remote Holders together",
+            ));
+        }
+        let remote = spec.remote.take().expect("checked");
+        remote.launch.validate().map_err(std::io::Error::other)?;
+        if remote.launch.session_id != spec.id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "remote launch session id does not match SessionSpec",
+            ));
+        }
+        let token = remote.launch.session_token.clone();
+        let launched = remote.manager.launch(&remote.helper, &remote.launch)?;
+        let mut cleanup = RemoteLaunchCleanup {
+            manager: Arc::clone(&remote.manager),
+            helper: remote.helper.clone(),
+            binding_store: remote.binding_store.clone(),
+            selector: diri_proto::remote_pty::SessionSelector {
+                session_id: spec.id.clone(),
+                session_token: token.clone(),
+                expected_incarnation: Some(launched.session_incarnation.clone()),
+            },
+            armed: true,
+        };
+        if launched.session_id != spec.id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "remote Helper launched the wrong session",
+            ));
+        }
+        let binding = RemoteBinding {
+            session_id: spec.id.clone(),
+            host_id: remote.host_id,
+            helper_build_id: remote.helper.build_id.clone(),
+            protocol: remote.helper.protocol,
+            session_token: token.clone(),
+            session_incarnation: launched.session_incarnation.clone(),
+            last_output_offset: 0,
+        };
+        remote.binding_store.save(&binding)?;
+        let client = Arc::new(RemoteSessionClient::new(
+            Arc::clone(&remote.manager),
+            remote.helper,
+            spec.id.clone(),
+            token,
+            launched.session_incarnation,
+            remote.binding_store,
+            0,
+        ));
+        let log = OutputLog::writer(&spec.logs_dir, &spec.id)?;
+        let shared = new_shared(&spec, log);
+        *shared.remote_grid.lock().expect("remote grid") = Some(RemoteGridState {
+            mirror: GridMirror::new(),
+            revision: 0,
+            pending: None,
+        });
+
+        let pump = {
+            let shared = Arc::clone(&shared);
+            let engine = Arc::clone(&engine);
+            let client = Arc::clone(&client);
+            let manifest_id = spec.manifest_id.clone();
+            std::thread::Builder::new()
+                .name(format!("diri-remote-session-{}", spec.id))
+                .spawn(move || pump_remote(shared, engine, client, manifest_id))?
+        };
+
+        let session = Self {
+            shared,
+            transport: Transport::Remote(client),
+            pump: Some(pump),
+            manifest_id: spec.manifest_id,
+            deferred: None,
+        };
+        cleanup.disarm();
+        Ok(session)
+    }
+
+    /// Reattaches an Engine restarted after the Holder was launched. The
+    /// owner-only binding provides the bearer and exact Helper build.
+    pub fn adopt_remote(
+        spec: SessionSpec,
+        remote: RemoteAdoptSpec,
+        engine: Arc<ManifestEngine>,
+    ) -> std::io::Result<Self> {
+        Self::adopt_remote_with_status(spec, remote, engine, None)
+    }
+
+    /// Reattaches a remote Holder while retaining the last canonical status.
+    /// The incoming Full Snapshot still updates the reducer; seeding prevents
+    /// an Engine/App restart from presenting an already-idle Agent as a fresh
+    /// launch during startup grace.
+    pub fn adopt_remote_with_status(
+        spec: SessionSpec,
+        remote: RemoteAdoptSpec,
+        engine: Arc<ManifestEngine>,
+        initial_status: Option<(SessionStatus, Option<NeedsInputDetail>)>,
+    ) -> std::io::Result<Self> {
+        let client = Arc::new(RemoteSessionClient::new(
+            remote.manager,
+            remote.helper,
+            spec.id.clone(),
+            remote.token,
+            remote.incarnation,
+            remote.binding_store,
+            remote.output_offset,
+        ));
+        let log = OutputLog::writer(&spec.logs_dir, &spec.id)?;
+        let shared = new_shared(&spec, log);
+        shared
+            .remote_output_offset
+            .store(remote.output_offset, Ordering::SeqCst);
+        *shared.remote_grid.lock().expect("remote grid") = Some(RemoteGridState {
+            mirror: GridMirror::new(),
+            revision: 0,
+            pending: None,
+        });
+        if let Some((status, needs_input)) = initial_status {
+            *shared.status.lock().expect("status") = status;
+            *shared.needs_input.lock().expect("needs input") = needs_input;
+        }
+        shared
+            .reducer
+            .lock()
+            .expect("reducer")
+            .finish_startup_grace(SystemTime::now());
+        let pump = {
+            let shared = Arc::clone(&shared);
+            let engine = Arc::clone(&engine);
+            let client = Arc::clone(&client);
+            let manifest_id = spec.manifest_id.clone();
+            std::thread::Builder::new()
+                .name(format!("diri-remote-session-{}", spec.id))
+                .spawn(move || pump_remote(shared, engine, client, manifest_id))?
+        };
+        Ok(Self {
+            shared,
+            transport: Transport::Remote(client),
+            pump: Some(pump),
+            manifest_id: spec.manifest_id,
+            deferred: None,
+        })
     }
 
     fn spawn_direct(spec: SessionSpec, engine: Arc<ManifestEngine>) -> std::io::Result<Self> {
@@ -592,11 +931,26 @@ impl Session {
     }
 
     pub fn view(&self) -> SessionView {
+        let prompt_title = self
+            .shared
+            .prompt_title
+            .lock()
+            .expect("prompt title")
+            .clone();
+        let (title, title_source) = if let Some(title) = prompt_title {
+            (Some(title), Some(diri_proto::TitleSource::FirstPrompt))
+        } else {
+            (
+                self.shared.title.lock().expect("title").clone(),
+                Some(diri_proto::TitleSource::AgentProvided),
+            )
+        };
         SessionView {
             id: self.shared.id.clone(),
             status: self.shared.status.lock().expect("status").clone(),
             needs_input: self.shared.needs_input.lock().expect("needs input").clone(),
-            title: self.shared.title.lock().expect("title").clone(),
+            title,
+            title_source,
             tail_offset: self.shared.log.lock().expect("log").tail_offset(),
             exited: self.shared.exited.load(Ordering::SeqCst),
         }
@@ -638,30 +992,107 @@ impl Session {
     }
 
     pub fn screen_size(&self) -> (usize, usize) {
+        if let Some(remote) = self
+            .shared
+            .remote_grid
+            .lock()
+            .expect("remote grid")
+            .as_ref()
+            && remote.mirror.sequence().is_some()
+        {
+            let (cols, rows) = remote.mirror.size();
+            return (usize::from(cols), usize::from(rows));
+        }
         self.shared.screen.lock().expect("screen").size()
     }
 
-    /// A full grid snapshot for a freshly attached sink, plus current modes.
-    /// Does not disturb the shared diff baseline.
-    pub fn full_grid(&self) -> (diri_proto::grid::GridUpdate, (bool, bool)) {
+    /// A coherent full snapshot and change-generation baseline for a freshly
+    /// attached sink. Sampling the generation on both sides closes the race
+    /// where output lands between the seed and pump registration.
+    pub(crate) fn attachment_seed(&self) -> AttachmentSeed {
         self.shared.note_hot();
-        let screen = self.shared.screen.lock().expect("screen");
-        let modes = (screen.is_alt_screen(), screen.mouse_reporting());
-        (screen.full_snapshot(), modes)
+        let wake = self.shared.grid_wake.clone();
+        loop {
+            let wake_generation = wake.generation();
+            let sampled = {
+                let remote = self.shared.remote_grid.lock().expect("remote grid");
+                remote.as_ref().and_then(|remote| {
+                    let grid = remote.mirror.full_update()?;
+                    let (cols, rows) = remote.mirror.size();
+                    let (cursor_col, cursor_row, cursor_visible) = remote.mirror.cursor();
+                    let (alt_screen, _, mouse_reporting) = remote.mirror.modes();
+                    Some((
+                        grid,
+                        (alt_screen, mouse_reporting),
+                        GridSignature {
+                            content_seq: remote.revision,
+                            size: (usize::from(cols), usize::from(rows)),
+                            cursor: (cursor_col, cursor_row, cursor_visible),
+                            alt_screen,
+                            mouse_reporting,
+                        },
+                    ))
+                })
+            }
+            .unwrap_or_else(|| {
+                let screen = self.shared.screen.lock().expect("screen");
+                (
+                    screen.full_snapshot(),
+                    (screen.is_alt_screen(), screen.mouse_reporting()),
+                    GridSignature {
+                        content_seq: screen.content_seq(),
+                        size: screen.size(),
+                        cursor: screen.cursor(),
+                        alt_screen: screen.is_alt_screen(),
+                        mouse_reporting: screen.mouse_reporting(),
+                    },
+                )
+            });
+            if wake.generation() == wake_generation {
+                return AttachmentSeed {
+                    grid: sampled.0,
+                    modes: sampled.1,
+                    signature: sampled.2,
+                    wake,
+                    wake_generation,
+                };
+            }
+        }
     }
 
-    /// The next grid diff, if anything observable changed since `signature`.
-    /// The signature compare makes an idle 16ms pump tick cost one mutex lock
-    /// and a tuple compare — the grid walk only happens on change.
-    ///
-    /// Doubles as the attachment heartbeat: the attach hub polls this while
-    /// any sink is connected, which keeps the session pump on its fast tick
-    /// without the hub having to know about pump cadence.
+    /// The next grid diff after a [`GridWake`] notification, if anything
+    /// observable changed since `signature`.
     pub fn grid_update_if_changed(
         &self,
         signature: &mut GridSignature,
     ) -> Option<diri_proto::grid::GridUpdate> {
-        self.shared.note_hot();
+        if let Some(remote) = self
+            .shared
+            .remote_grid
+            .lock()
+            .expect("remote grid")
+            .as_mut()
+            && remote.mirror.sequence().is_some()
+        {
+            let (cols, rows) = remote.mirror.size();
+            let (cursor_col, cursor_row, cursor_visible) = remote.mirror.cursor();
+            let (alt_screen, _, mouse_reporting) = remote.mirror.modes();
+            let current = GridSignature {
+                content_seq: remote.revision,
+                size: (usize::from(cols), usize::from(rows)),
+                cursor: (cursor_col, cursor_row, cursor_visible),
+                alt_screen,
+                mouse_reporting,
+            };
+            if current == *signature {
+                return None;
+            }
+            *signature = current;
+            return remote
+                .pending
+                .take()
+                .or_else(|| remote.mirror.full_update());
+        }
         let mut screen = self.shared.screen.lock().expect("screen");
         let current = GridSignature {
             content_seq: screen.content_seq(),
@@ -677,14 +1108,39 @@ impl Session {
         Some(screen.grid_update(false))
     }
 
+    pub(crate) fn grid_wake(&self) -> GridWake {
+        self.shared.grid_wake.clone()
+    }
+
     /// Whether the child has bracketed-paste mode on — the "composer is
     /// alive" tell that gates initial-prompt injection.
     pub fn bracketed_paste(&self) -> bool {
+        if let Some(remote) = self
+            .shared
+            .remote_grid
+            .lock()
+            .expect("remote grid")
+            .as_ref()
+            && remote.mirror.sequence().is_some()
+        {
+            return remote.mirror.modes().1;
+        }
         self.shared.screen.lock().expect("screen").bracketed_paste()
     }
 
     /// Current (alt_screen, mouse_reporting).
     pub fn modes(&self) -> (bool, bool) {
+        if let Some(remote) = self
+            .shared
+            .remote_grid
+            .lock()
+            .expect("remote grid")
+            .as_ref()
+            && remote.mirror.sequence().is_some()
+        {
+            let (alt_screen, _, mouse_reporting) = remote.mirror.modes();
+            return (alt_screen, mouse_reporting);
+        }
         let screen = self.shared.screen.lock().expect("screen");
         (screen.is_alt_screen(), screen.mouse_reporting())
     }
@@ -716,6 +1172,11 @@ impl Session {
         first_row: i64,
         max_rows: i64,
     ) -> diri_proto::ReadScrollbackCellsResult {
+        if let Transport::Remote(client) = &self.transport
+            && let Ok(result) = client.read_scrollback_cells(first_row, max_rows)
+        {
+            return result;
+        }
         self.shared
             .screen
             .lock()
@@ -757,6 +1218,10 @@ impl Session {
                 .into_iter()
                 .map(|sample| (sample.pid, sample.start_sec))
                 .collect()),
+            Transport::Remote(client) => {
+                client.signal(signal)?;
+                Ok(Vec::new())
+            }
         }
     }
 
@@ -784,6 +1249,7 @@ impl Session {
                 writer.flush()
             }
             Transport::Held(client) => client.write(bytes).map_err(holder_io_error),
+            Transport::Remote(client) => client.write(bytes),
         }
     }
 
@@ -799,7 +1265,8 @@ impl Session {
         if !submit {
             return self.write_input(text.as_bytes());
         }
-        let framed = if self.shared.screen.lock().expect("screen").bracketed_paste() {
+        self.capture_prompt_title(text);
+        let framed = if self.bracketed_paste() {
             format!("\x1b[200~{text}\x1b[201~")
         } else {
             text.to_string()
@@ -814,6 +1281,7 @@ impl Session {
         // Input means someone is interacting: keep the pump on its fast tick
         // so the echo renders promptly.
         self.shared.note_hot();
+        self.observe_prompt_input(bytes);
         // Typed before the deferred exec: queue for the launch flush, and
         // still count as a keystroke for the reducer.
         if let Some(deferred) = &self.deferred
@@ -841,9 +1309,62 @@ impl Session {
                 writer.flush()?;
             }
             Transport::Held(client) => client.write(bytes).map_err(holder_io_error)?,
+            Transport::Remote(client) => client.write(bytes)?,
         }
         self.feed_signal(StatusSignal::UserKeystroke);
         Ok(())
+    }
+
+    fn observe_prompt_input(&self, bytes: &[u8]) {
+        if self.manifest_id == "shell"
+            || self
+                .shared
+                .prompt_title
+                .lock()
+                .expect("prompt title")
+                .is_some()
+        {
+            return;
+        }
+        if !matches!(
+            *self.shared.status.lock().expect("status"),
+            SessionStatus::Idle
+        ) {
+            if matches!(bytes, b"\r" | b"\n") {
+                self.shared
+                    .prompt_input
+                    .lock()
+                    .expect("prompt input")
+                    .draft
+                    .clear();
+            }
+            return;
+        }
+        let prompt = self
+            .shared
+            .prompt_input
+            .lock()
+            .expect("prompt input")
+            .observe(bytes);
+        if let Some(prompt) = prompt {
+            self.capture_prompt_title(&prompt);
+        }
+    }
+
+    fn capture_prompt_title(&self, prompt: &str) {
+        if self.manifest_id == "shell" {
+            return;
+        }
+        let title = crate::hooks::title_from_prompt(prompt);
+        if title.is_empty() {
+            return;
+        }
+        let mut current = self.shared.prompt_title.lock().expect("prompt title");
+        if current.is_none() {
+            *current = Some(title);
+            drop(current);
+            self.shared.bump_state_version();
+        }
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
@@ -858,12 +1379,14 @@ impl Session {
         match &self.transport {
             Transport::Direct(pty) => pty.lock().expect("pty").resize(cols, rows)?,
             Transport::Held(client) => client.resize(cols, rows).map_err(holder_io_error)?,
+            Transport::Remote(client) => client.resize(cols, rows)?,
         }
         self.shared
             .screen
             .lock()
             .expect("screen")
             .resize(cols as usize, rows as usize);
+        self.shared.grid_wake.notify();
         Ok(())
     }
 
@@ -919,8 +1442,35 @@ impl Session {
                     .expect("exit")
                     .unwrap_or(Exit::Signal(libc::SIGKILL))
             }
+            Transport::Remote(client) => {
+                if !self.shared.exited.load(Ordering::SeqCst) {
+                    let _ = client.signal(libc::SIGTERM);
+                    let deadline = std::time::Instant::now() + grace;
+                    while std::time::Instant::now() < deadline
+                        && !self.shared.exited.load(Ordering::SeqCst)
+                    {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
+                // `kill` also stops the per-session Holder. Do this even when
+                // the Agent already exited naturally; an explicit lifecycle
+                // termination must not leave an idle remote owner behind.
+                if let Err(error) = client.kill()
+                    && !self.shared.exited.load(Ordering::SeqCst)
+                {
+                    return Err(error);
+                }
+                self.shared
+                    .exit
+                    .lock()
+                    .expect("exit")
+                    .unwrap_or(Exit::Signal(libc::SIGKILL))
+            }
         };
         self.shared.stop.store(true, Ordering::SeqCst);
+        if let Transport::Remote(client) = &self.transport {
+            client.close();
+        }
         if let Some(pump) = self.pump.take() {
             let _ = pump.join();
         }
@@ -952,6 +1502,9 @@ impl Drop for Session {
         {
             let _ = pty.kill_group(libc::SIGKILL);
         }
+        if let Transport::Remote(client) = &self.transport {
+            client.close();
+        }
         if let Some(pump) = self.pump.take() {
             let _ = pump.join();
         }
@@ -964,6 +1517,8 @@ fn new_shared(spec: &SessionSpec, log: OutputLog) -> Arc<Shared> {
         status: Mutex::new(SessionStatus::Starting),
         needs_input: Mutex::new(None),
         title: Mutex::new(None),
+        prompt_title: Mutex::new(None),
+        prompt_input: Mutex::new(PromptInputState::default()),
         log: Mutex::new(log),
         screen: Mutex::new(HeadlessScreen::new(
             spec.pty.cols as usize,
@@ -979,6 +1534,9 @@ fn new_shared(spec: &SessionSpec, log: OutputLog) -> Arc<Shared> {
         hibernated: AtomicBool::new(false),
         queued_input: Mutex::new(Vec::new()),
         child_pid: std::sync::atomic::AtomicI32::new(0),
+        remote_grid: Mutex::new(None),
+        remote_output_offset: AtomicU64::new(0),
+        grid_wake: GridWake::new(),
     })
 }
 
@@ -1087,6 +1645,442 @@ fn scan_artifacts_if_due(
     *artifacts = crate::artifacts::scan(&text, &artifacts, now);
 }
 
+/// Follows one remote Holder through any number of short-lived SSH Bridges.
+/// The Holder remains the PTY owner; a broken Bridge only advances this
+/// reconnect loop. Offsets and grid sequences make every retry idempotent.
+fn pump_remote(
+    shared: Arc<Shared>,
+    engine: Arc<ManifestEngine>,
+    client: Arc<RemoteSessionClient>,
+    manifest_id: String,
+) {
+    let mut reconnect_delay = Duration::from_millis(50);
+    let mut reconnects = 0_u32;
+    while !shared.stop.load(Ordering::SeqCst) && !shared.exited.load(Ordering::SeqCst) {
+        let output_offset = shared.remote_output_offset.load(Ordering::SeqCst);
+        let grid_sequence = shared
+            .remote_grid
+            .lock()
+            .expect("remote grid")
+            .as_ref()
+            .and_then(|state| state.mirror.sequence());
+        let Ok((generation, mut output)) = client.connect(output_offset, grid_sequence) else {
+            reconnects = reconnects.saturating_add(1);
+            if reconnects.is_multiple_of(3) && remote_inspection_exited(&shared, &client) {
+                break;
+            }
+            wait_for_remote_retry(&shared, reconnect_delay);
+            reconnect_delay = (reconnect_delay * 2).min(Duration::from_secs(2));
+            continue;
+        };
+        reconnect_delay = Duration::from_millis(50);
+        let disposition = pump_remote_connection(
+            &shared,
+            &engine,
+            &client,
+            generation,
+            &mut output,
+            &manifest_id,
+        );
+        client.disconnect(generation);
+        match disposition {
+            RemoteConnectionDisposition::Continue => continue,
+            RemoteConnectionDisposition::Reconnect => {
+                reconnects = reconnects.saturating_add(1);
+                if reconnects.is_multiple_of(3) && remote_inspection_exited(&shared, &client) {
+                    break;
+                }
+                wait_for_remote_retry(&shared, reconnect_delay);
+                reconnect_delay = (reconnect_delay * 2).min(Duration::from_secs(2));
+            }
+            RemoteConnectionDisposition::Exited | RemoteConnectionDisposition::Stopped => break,
+            RemoteConnectionDisposition::Fatal => {
+                mark_remote_transport_failed(&shared);
+                break;
+            }
+        }
+    }
+    let _ = shared.log.lock().expect("log").flush();
+}
+
+fn remote_inspection_exited(shared: &Shared, client: &RemoteSessionClient) -> bool {
+    let Ok(inspection) = client.inspect() else {
+        return false;
+    };
+    let RemoteProcessState::Exited { code, signal } = inspection.process_state else {
+        return false;
+    };
+    record_remote_exit(shared, ProcessExit { code, signal });
+    true
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemoteConnectionDisposition {
+    Continue,
+    Reconnect,
+    Exited,
+    Stopped,
+    Fatal,
+}
+
+fn pump_remote_connection(
+    shared: &Shared,
+    engine: &ManifestEngine,
+    client: &RemoteSessionClient,
+    generation: u64,
+    output: &mut std::process::ChildStdout,
+    manifest_id: &str,
+) -> RemoteConnectionDisposition {
+    let mut codec = RemoteCodec::new();
+    let mut buffer = [0_u8; 64 << 10];
+    let mut replaying = false;
+    let mut hello_accepted = false;
+    let mut last_tick = SystemTime::now();
+    let mut last_eval_seq = 0_u64;
+    let mut last_scan_at = None;
+    let mut last_scan_seq = 0_u64;
+    let fd = output.as_raw_fd();
+
+    loop {
+        if shared.stop.load(Ordering::SeqCst) {
+            return RemoteConnectionDisposition::Stopped;
+        }
+        if shared.exited.load(Ordering::SeqCst) {
+            return RemoteConnectionDisposition::Exited;
+        }
+        scan_artifacts_if_due(shared, &mut last_scan_at, &mut last_scan_seq);
+
+        let mut poll_fd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `poll_fd` points to one initialized pollfd and remains valid
+        // for the duration of this call.
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, TICK_INTERVAL.as_millis() as i32) };
+        if ready < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return RemoteConnectionDisposition::Reconnect;
+        }
+
+        if ready == 0 {
+            let now = SystemTime::now();
+            let outcome = shared
+                .reducer
+                .lock()
+                .expect("reducer")
+                .reduce(StatusSignal::Tick, now);
+            apply(shared, &outcome);
+            last_tick = now;
+            continue;
+        }
+
+        match output.read(&mut buffer) {
+            Ok(0) => return RemoteConnectionDisposition::Reconnect,
+            Ok(count) => {
+                let messages = match codec.feed(&buffer[..count]) {
+                    Ok(messages) => messages,
+                    Err(_) => return RemoteConnectionDisposition::Fatal,
+                };
+                for message in messages {
+                    let disposition = handle_remote_message(
+                        shared,
+                        engine,
+                        client,
+                        generation,
+                        manifest_id,
+                        &mut last_eval_seq,
+                        &mut replaying,
+                        &mut hello_accepted,
+                        message,
+                    );
+                    if disposition != RemoteConnectionDisposition::Continue {
+                        return disposition;
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return RemoteConnectionDisposition::Reconnect,
+        }
+
+        if last_tick.elapsed().unwrap_or_default() >= TICK_INTERVAL {
+            last_tick = SystemTime::now();
+            let outcome = shared
+                .reducer
+                .lock()
+                .expect("reducer")
+                .reduce(StatusSignal::Tick, last_tick);
+            apply(shared, &outcome);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_remote_message(
+    shared: &Shared,
+    engine: &ManifestEngine,
+    client: &RemoteSessionClient,
+    generation: u64,
+    manifest_id: &str,
+    last_eval_seq: &mut u64,
+    replaying: &mut bool,
+    hello_accepted: &mut bool,
+    message: RemoteMessage,
+) -> RemoteConnectionDisposition {
+    if !*hello_accepted && !matches!(message, RemoteMessage::HelloAck(_)) {
+        return RemoteConnectionDisposition::Fatal;
+    }
+    match message {
+        RemoteMessage::HelloAck(acknowledgement) => {
+            if *hello_accepted
+                || client.validate_hello(&acknowledgement).is_err()
+                || client
+                    .accept_hello(generation, acknowledgement.controller_epoch)
+                    .is_err()
+            {
+                return RemoteConnectionDisposition::Fatal;
+            }
+            if let RemoteProcessState::Exited { code, signal } = acknowledgement.process_state {
+                record_remote_exit(shared, ProcessExit { code, signal });
+                return RemoteConnectionDisposition::Exited;
+            }
+            *hello_accepted = true;
+            RemoteConnectionDisposition::Continue
+        }
+        RemoteMessage::Terminal(frame) => match frame.frame_type {
+            FrameType::ReplayBegin => {
+                *replaying = true;
+                RemoteConnectionDisposition::Continue
+            }
+            FrameType::ReplayEnd => {
+                *replaying = false;
+                RemoteConnectionDisposition::Continue
+            }
+            FrameType::Output => {
+                let Some((offset, bytes)) = frame.output_payload() else {
+                    return RemoteConnectionDisposition::Fatal;
+                };
+                client.observe_output_offset(offset.saturating_add(bytes.len() as u64));
+                apply_remote_output(
+                    shared,
+                    engine,
+                    manifest_id,
+                    last_eval_seq,
+                    offset,
+                    bytes,
+                    *replaying,
+                );
+                RemoteConnectionDisposition::Continue
+            }
+            _ => RemoteConnectionDisposition::Fatal,
+        },
+        RemoteMessage::FullSnapshot(snapshot) => {
+            if apply_remote_snapshot(shared, engine, manifest_id, last_eval_seq, snapshot).is_err()
+            {
+                RemoteConnectionDisposition::Fatal
+            } else {
+                RemoteConnectionDisposition::Continue
+            }
+        }
+        RemoteMessage::GridDelta(delta) => {
+            if apply_remote_delta(shared, delta).is_err() {
+                // A gap is recoverable: the next Hello always reseeds with a
+                // full authoritative snapshot.
+                RemoteConnectionDisposition::Reconnect
+            } else {
+                RemoteConnectionDisposition::Continue
+            }
+        }
+        RemoteMessage::ControlGranted(granted) => {
+            if client
+                .grant_control(generation, granted.controller_epoch)
+                .is_err()
+            {
+                RemoteConnectionDisposition::Reconnect
+            } else {
+                RemoteConnectionDisposition::Continue
+            }
+        }
+        RemoteMessage::ControlRevoked(_) => RemoteConnectionDisposition::Reconnect,
+        RemoteMessage::ProcessExit(exit) => {
+            record_remote_exit(shared, exit);
+            RemoteConnectionDisposition::Exited
+        }
+        RemoteMessage::ScrollbackResponse(response) => {
+            client.complete_scrollback(response);
+            RemoteConnectionDisposition::Continue
+        }
+        RemoteMessage::Error(error) if error.fatal => RemoteConnectionDisposition::Fatal,
+        RemoteMessage::Error(_) => RemoteConnectionDisposition::Continue,
+        _ => RemoteConnectionDisposition::Fatal,
+    }
+}
+
+fn apply_remote_output(
+    shared: &Shared,
+    engine: &ManifestEngine,
+    manifest_id: &str,
+    last_eval_seq: &mut u64,
+    offset: u64,
+    bytes: &[u8],
+    replaying: bool,
+) {
+    let expected = shared.remote_output_offset.load(Ordering::SeqCst);
+    let end = offset.saturating_add(bytes.len() as u64);
+    if end <= expected {
+        return;
+    }
+    let skip = expected.saturating_sub(offset).min(bytes.len() as u64) as usize;
+    let bytes = &bytes[skip..];
+    if bytes.is_empty() {
+        return;
+    }
+    shared.remote_output_offset.store(end, Ordering::SeqCst);
+    let _ = shared.log.lock().expect("log").append(bytes);
+    let observation = {
+        let mut screen = shared.screen.lock().expect("screen");
+        screen.feed(bytes);
+        evaluate_if_screen_changed(shared, &mut screen, engine, manifest_id, last_eval_seq)
+    };
+    let now = SystemTime::now();
+    let mut reducer = shared.reducer.lock().expect("reducer");
+    if !replaying {
+        let outcome = reducer.reduce(StatusSignal::PtyOutputActivity, now);
+        apply(shared, &outcome);
+    }
+    if let Some(observation) = observation {
+        let outcome = reducer.reduce(StatusSignal::Screen(observation), now);
+        drop(reducer);
+        apply(shared, &outcome);
+    }
+}
+
+fn apply_remote_snapshot(
+    shared: &Shared,
+    engine: &ManifestEngine,
+    manifest_id: &str,
+    last_eval_seq: &mut u64,
+    snapshot: FullSnapshot,
+) -> std::io::Result<()> {
+    {
+        let mut remote = shared.remote_grid.lock().expect("remote grid");
+        let remote = remote
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("remote grid state is unavailable"))?;
+        remote
+            .mirror
+            .apply_snapshot(
+                snapshot.sequence,
+                &snapshot.grid,
+                snapshot.alt_screen,
+                snapshot.bracketed_paste,
+                snapshot.mouse_reporting,
+            )
+            .map_err(std::io::Error::other)?;
+        remote.revision = remote.revision.saturating_add(1);
+        remote.pending = Some(snapshot.grid.clone());
+    }
+    shared.grid_wake.notify();
+    let observation = {
+        let mut screen = shared.screen.lock().expect("screen");
+        screen.resize(
+            usize::from(snapshot.grid.cols),
+            usize::from(snapshot.grid.rows),
+        );
+        if !screen.restore(
+            // A remote Full Snapshot carries only the visible grid; scrollback
+            // is fetched on demand through `Scroll`, never replayed here.
+            &[],
+            &snapshot.grid,
+            snapshot.alt_screen,
+            snapshot.bracketed_paste,
+            snapshot.mouse_reporting,
+        ) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "remote terminal snapshot could not be restored",
+            ));
+        }
+        evaluate_if_screen_changed(shared, &mut screen, engine, manifest_id, last_eval_seq)
+    };
+    if let Some(observation) = observation {
+        let outcome = shared
+            .reducer
+            .lock()
+            .expect("reducer")
+            .reduce(StatusSignal::Screen(observation), SystemTime::now());
+        apply(shared, &outcome);
+    }
+    Ok(())
+}
+
+fn apply_remote_delta(shared: &Shared, delta: GridDelta) -> std::io::Result<()> {
+    {
+        let mut remote = shared.remote_grid.lock().expect("remote grid");
+        let remote = remote
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("remote grid state is unavailable"))?;
+        remote
+            .mirror
+            .apply_delta(
+                delta.sequence,
+                &delta.grid,
+                delta.alt_screen,
+                delta.bracketed_paste,
+                delta.mouse_reporting,
+            )
+            .map_err(std::io::Error::other)?;
+        remote.revision = remote.revision.saturating_add(1);
+        remote.pending = if remote.pending.is_some() {
+            remote.mirror.full_update()
+        } else {
+            Some(delta.grid)
+        };
+    }
+    shared.grid_wake.notify();
+    Ok(())
+}
+
+fn record_remote_exit(shared: &Shared, exit: ProcessExit) {
+    let local = match (exit.code, exit.signal) {
+        (_, Some(signal)) => Exit::Signal(signal),
+        (Some(code), None) => Exit::Code(code),
+        (None, None) => Exit::Code(-1),
+    };
+    *shared.exit.lock().expect("exit") = Some(local);
+    let outcome = shared.reducer.lock().expect("reducer").reduce(
+        StatusSignal::ProcessExit {
+            code: exit.code,
+            signal: exit.signal,
+        },
+        SystemTime::now(),
+    );
+    apply(shared, &outcome);
+    shared.exited.store(true, Ordering::SeqCst);
+}
+
+fn mark_remote_transport_failed(shared: &Shared) {
+    *shared.exit.lock().expect("exit") = Some(Exit::Code(126));
+    let outcome = shared.reducer.lock().expect("reducer").reduce(
+        StatusSignal::ProcessExit {
+            code: Some(126),
+            signal: None,
+        },
+        SystemTime::now(),
+    );
+    apply(shared, &outcome);
+    shared.exited.store(true, Ordering::SeqCst);
+}
+
+fn wait_for_remote_retry(shared: &Shared, duration: Duration) {
+    let deadline = Instant::now() + duration;
+    while !shared.stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// The read/evaluate/reduce loop.
 ///
 /// Waits on the terminal with a timeout rather than blocking in `read`. Two
@@ -1164,6 +2158,7 @@ fn pump(
                         &mut last_eval_seq,
                     )
                 };
+                shared.grid_wake.notify();
 
                 let now = SystemTime::now();
                 let mut reducer = shared.reducer.lock().expect("reducer");
@@ -1294,6 +2289,10 @@ fn pump_held(
             ),
         }
     };
+    // Adoption can restore a checkpoint concurrently with a freshly attached
+    // App. One event is cheap and guarantees a seed that raced the restore is
+    // corrected without bringing back periodic grid polling.
+    shared.grid_wake.notify();
     let mut last_checkpoint_key: Option<CheckpointKey> = None;
     let mut checkpoint_dirty_at: Option<Instant> = None;
     let mut last_liveness = Instant::now();
@@ -1423,6 +2422,7 @@ fn pump_held(
                     &mut last_eval_seq,
                 )
             };
+            shared.grid_wake.notify();
             let now = SystemTime::now();
             let mut reducer = shared.reducer.lock().expect("reducer");
             if !replaying {
@@ -1722,4 +2722,58 @@ pub fn authority_for(manifest_id: &str, engine: &ManifestEngine) -> Authority {
         .manifest(manifest_id)
         .and_then(|manifest| manifest.agent.as_ref())
         .map_or(Authority::ProcessOnly, |agent| agent.authority())
+}
+
+#[cfg(test)]
+mod prompt_title_tests {
+    use super::PromptInputState;
+
+    #[test]
+    fn committed_utf8_prompt_becomes_a_title_candidate() {
+        let mut input = PromptInputState::default();
+        assert!(input.observe("修".as_bytes()).is_none());
+        assert!(input.observe("复 remote attach".as_bytes()).is_none());
+        assert_eq!(input.observe(b"\r").as_deref(), Some("修复 remote attach"));
+    }
+
+    #[test]
+    fn bracketed_paste_and_edits_are_normalized_before_submit() {
+        let mut input = PromptInputState::default();
+        input.observe(b"wrong");
+        input.observe(&[0x15]);
+        input.observe(b"\x1b[200~repair remote titles\x1b[201~");
+        input.observe(&[0x7f]);
+        input.observe(b"e");
+        assert_eq!(
+            input.observe(b"\r").as_deref(),
+            Some("repair remote titlee")
+        );
+    }
+}
+
+#[cfg(test)]
+mod grid_wake_tests {
+    use std::time::Duration;
+
+    use super::GridWake;
+
+    #[test]
+    fn grid_waiter_sleeps_until_a_real_change_and_coalesces_generations() {
+        let wake = GridWake::new();
+        let observed = wake.generation();
+        let notifier = wake.clone();
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            notifier.notify();
+            notifier.notify();
+        });
+
+        let changed = wake.wait_for_change(observed, Duration::from_secs(1));
+        thread.join().expect("notifier");
+        assert!(changed > observed);
+        assert_eq!(
+            wake.wait_for_change(changed, Duration::from_millis(5)),
+            changed
+        );
+    }
 }

@@ -5,7 +5,6 @@
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -18,8 +17,7 @@ use diri_proto::grid::GridUpdate;
 use serde_json::json;
 
 fn engine() -> Arc<ManifestEngine> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../Sources/DirijorCore/Resources/manifests")
+    let dir = diri_engine::detect::bundled_manifest_dir()
         .canonicalize()
         .expect("manifests");
     let (engine, _) = ManifestEngine::load_dir(&dir).expect("load");
@@ -155,8 +153,23 @@ fn an_attach_is_seeded_then_streams_diffs_and_answers_input() {
         frame.frame_type == FrameType::Modes
     });
 
-    // Typing through the data channel: cat echoes, and the echo comes back
-    // as a grid DIFF (not a full snapshot).
+    // Let the per-session pump establish its shared diff baseline. Its first
+    // sample is allowed to be a FullSnapshot: if input beats that first tick,
+    // the snapshot legitimately includes the new text. A second turn is the
+    // deterministic seam for asserting steady-state diff behavior.
+    data.write_all(&FrameCodec::encode(&Frame::input(b"warm-up-pump\n".to_vec())).expect("encode"))
+        .expect("send warm-up input");
+    frames.until("the warm-up echo", |frame| {
+        frame.frame_type == FrameType::Grid
+            && frame
+                .grid_payload()
+                .ok()
+                .flatten()
+                .is_some_and(|update| grid_text(&update).contains("warm-up-pump"))
+    });
+
+    // Typing through the established data channel: cat echoes, and the echo
+    // comes back as a grid DIFF (not a full snapshot).
     data.write_all(
         &FrameCodec::encode(&Frame::input(b"typed-over-attach\n".to_vec())).expect("encode"),
     )

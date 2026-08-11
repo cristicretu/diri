@@ -66,6 +66,11 @@ impl SessionSurfaces {
         }
     }
 
+    fn colors(&self) -> SemanticColors {
+        let store = self.store.read().expect("session store lock poisoned");
+        crate::app_theme::colors(&store.preferences().terminal_theme)
+    }
+
     /// T11 supplies the same resident buffer used by the mounted terminal. A
     /// separate painter/cache renders it into switcher and overview thumbnails
     /// without reading back the onscreen Metal layer.
@@ -270,7 +275,7 @@ impl SessionSurfaces {
             (state, sessions)
         };
         let highlighted = sessions.get(state.index()).cloned();
-        let colors = SemanticColors::dark();
+        let colors = self.colors();
 
         let preview_content = highlighted.as_ref().map_or_else(
             || div().size_full().into_any_element(),
@@ -318,7 +323,7 @@ impl SessionSurfaces {
                 .gap(px(10.0))
                 .h(px(54.0))
                 .px(px(14.0))
-                .bg(rgba(0x1b1d24f5))
+                .bg(colors.floating_surface())
                 .child(AgentLogo::new(kind, 26.0, colors))
                 .child(details)
                 .child(div().flex_1())
@@ -335,7 +340,6 @@ impl SessionSurfaces {
             .overflow_x_scroll();
         for (index, session) in sessions.iter().enumerate() {
             let active = index == state.index();
-            let colors = SemanticColors::dark();
             filmstrip = filmstrip.child(
                 div()
                     .id(("switcher-chip", index))
@@ -462,7 +466,7 @@ impl SessionSurfaces {
             let mut store = self.store.write().expect("session store lock poisoned");
             (store.ordered_sessions(), store.overview_state().clone())
         };
-        let colors = SemanticColors::dark();
+        let colors = self.colors();
         let project_count = sessions
             .iter()
             .map(|session| &session.project_id)
@@ -485,8 +489,8 @@ impl SessionSurfaces {
             .bg(colors.primary.alpha(0.045))
             .border_1()
             .border_color(colors.primary.alpha(0.07))
-            .child(self.mode_button(OverviewMode::Board, state.mode(), "Board", cx))
-            .child(self.mode_button(OverviewMode::List, state.mode(), "List", cx));
+            .child(self.mode_button(OverviewMode::Board, state.mode(), "Board", colors, cx))
+            .child(self.mode_button(OverviewMode::List, state.mode(), "List", colors, cx));
 
         let header = div()
             .flex()
@@ -561,6 +565,7 @@ impl SessionSurfaces {
             "All",
             sessions.len(),
             state.filter(),
+            colors,
             cx,
         ));
         for lane in OverviewLane::ALL {
@@ -574,6 +579,7 @@ impl SessionSurfaces {
                     lane.label(),
                     count,
                     state.filter(),
+                    colors,
                     cx,
                 ));
             }
@@ -659,10 +665,10 @@ impl SessionSurfaces {
         mode: OverviewMode,
         current: OverviewMode,
         label: &'static str,
+        colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let active = mode == current;
-        let colors = SemanticColors::dark();
         div()
             .id(SharedString::from(format!("overview-mode-{label}")))
             .flex_none()
@@ -697,10 +703,10 @@ impl SessionSurfaces {
         label: &'static str,
         count: usize,
         current: OverviewFilter,
+        colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let active = filter == current;
-        let colors = SemanticColors::dark();
         div()
             .id(SharedString::from(format!("overview-filter-{label}")))
             .flex()
@@ -1224,7 +1230,7 @@ impl SessionSurfaces {
         visible_count: usize,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let colors = SemanticColors::dark();
+        let colors = self.colors();
         div()
             .absolute()
             .bottom(px(20.0))
@@ -1355,7 +1361,10 @@ impl SessionSurfaces {
             .entry(key)
             .or_insert_with(|| StatusGlyph::entity(kind, state, size, colors, cx))
             .clone();
-        glyph.update(cx, |glyph, cx| glyph.set_state(state, window, cx));
+        glyph.update(cx, |glyph, cx| {
+            glyph.set_state(state, window, cx);
+            glyph.set_colors(colors, cx);
+        });
         glyph
     }
 }
@@ -1520,8 +1529,8 @@ mod tests {
             last_seen_at: None,
             pinned: false,
             archived_at: None,
-            remote_active: false,
             host: None,
+            remote_persistence: None,
             hibernation: None,
             memory_bytes: None,
             artifacts: None,

@@ -13,9 +13,8 @@ use std::time::Duration;
 
 use diri_proto::HostEntry;
 
-use crate::hosts::{SSH_OPTIONS, run_shell};
+use crate::hosts::{SSH_OPTIONS, run_shell, shell_quote, shell_quote_path};
 use crate::inject::{claude_project_slug, claude_transcript_path};
-use crate::remote::{remote_tmux_session_name, shell_quote, shell_quote_path};
 
 /// A migrate failure the user can act on (preconditions, dirty trees) versus
 /// one they can't (plumbing).
@@ -356,27 +355,6 @@ pub fn shuttle_transcript(
             Err(detail) => failed(detail),
         }
     }
-}
-
-/// Best-effort: end the source-side tmux session after a remote→local
-/// migration so the host doesn't keep a zombie agent. Never fatal.
-pub fn kill_remote_tmux(host: &HostEntry, session_id: &str) -> Option<String> {
-    let name = remote_tmux_session_name(session_id);
-    let result = run_shell(
-        Some(host),
-        &format!(
-            "tmux kill-session -t {} 2>/dev/null || true",
-            shell_quote(&name)
-        ),
-        Duration::from_secs(15),
-    );
-    if result.map(|result| result.ok) != Some(true) {
-        return Some(format!(
-            "could not stop the tmux session on {} ({name}) — it may still be running there",
-            host.display_name()
-        ));
-    }
-    None
 }
 
 fn local_transcript(

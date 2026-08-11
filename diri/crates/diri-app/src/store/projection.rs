@@ -10,6 +10,9 @@ use super::{Prefs, is_auxiliary_terminal};
 #[derive(Clone, Debug, PartialEq)]
 pub struct SidebarProject {
     pub project: Project,
+    /// Execution location shared by every Session in this project node.
+    /// `None` means local; a host id means the remote filesystem owns root.
+    pub host: Option<String>,
     pub sessions: Vec<Arc<SessionRecord>>,
     pub archived: Vec<Arc<SessionRecord>>,
 }
@@ -64,6 +67,7 @@ pub(super) fn build_projection(
             .get(&project_id)
             .cloned()
             .unwrap_or_else(|| synthetic_project(&project_id, &group));
+        let host = group.first().and_then(|session| session.host.clone());
         let (mut archived, mut active): (Vec<_>, Vec<_>) =
             group.into_iter().partition(|session| session.is_archived());
         active.sort_by(|left, right| {
@@ -84,6 +88,7 @@ pub(super) fn build_projection(
         });
         result.push(SidebarProject {
             project,
+            host,
             sessions: active,
             archived,
         });

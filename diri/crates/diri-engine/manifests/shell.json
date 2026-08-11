@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 2,
+  "id": "shell",
+  "version": "1",
+  "statusModel": "processOnly",
+  "agent": {
+    "id": "shell",
+    "displayName": "Shell",
+    "shortLabel": "shell",
+    "glyph": "$",
+    "aliases": [
+      "terminal",
+      "sh"
+    ],
+    "firstClass": false,
+    "statusAuthority": "process"
+  },
+  "rules": []
+}

@@ -1,0 +1,205 @@
+{
+  "_notice": "Screen-detection predicates adapted from the herdr project (https://github.com/herdrdev/herdr, src/detect/manifests/*.toml), licensed Apache-2.0. Translated from herdr's TOML rule schema into Dirijor's JSON predicate schema and re-prioritised for this engine; the agent capability block is Dirijor's own.",
+  "schemaVersion": 2,
+  "id": "grok",
+  "version": "2026.07.31.1",
+  "statusModel": "full",
+  "agent": {
+    "id": "grok",
+    "displayName": "Grok",
+    "shortLabel": "grok",
+    "glyph": "\u2715",
+    "aliases": [
+      "grok",
+      "grok-cli",
+      "grok-build"
+    ],
+    "firstClass": true,
+    "statusAuthority": "screen",
+    "binary": "grok",
+    "resume": {
+      "style": "flag",
+      "token": "--continue"
+    },
+    "returnToLoginShell": true,
+    "foregroundExecNames": [
+      "grok"
+    ],
+    "_resumeNotice": "Verified against xAI's CLI reference: '-c, --continue | Continue the most recent session for the current directory'. https://docs.x.ai/build/cli/reference",
+    "_resumeStyleNotice": "Rust's AgentDescriptor::resume_args implements only \"flag\" and \"sessionIDFlag\"; Swift's \"latest\" has no implementation there and would silently resume nothing. Declared as \"flag\": this agent has no sessionIDFlag, so it never carries a caller-minted id and resume_args emits the bare token \u2014 exactly the semantics the token was chosen for.",
+    "envScrubPrefixes": [
+      "DIRI_",
+      "DIRIJOR_"
+    ]
+  },
+  "rules": [
+    {
+      "id": "blocked-osc-title",
+      "state": "blockedPermission",
+      "priority": 1300,
+      "region": "osc_title",
+      "when": {
+        "contains": "action required"
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "blocked-option-dialog",
+      "state": "blockedQuestion",
+      "priority": 1200,
+      "region": "whole_recent",
+      "when": {
+        "lineRegex": "^\\s*\u2503\\s+[0-9a-z]+\\s+\\([\u25cf\u25cb]\\)\\s"
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "blocked-footer-select",
+      "state": "blockedPermission",
+      "priority": 1190,
+      "region": "whole_recent",
+      "when": {
+        "all": [
+          {
+            "contains": ":select"
+          },
+          {
+            "contains": "ctrl+o:yolo"
+          },
+          {
+            "contains": "ctrl+c:cancel"
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "blocked-question-dialog",
+      "state": "blockedQuestion",
+      "priority": 1185,
+      "region": "whole_recent",
+      "when": {
+        "all": [
+          {
+            "contains": "tab:scrollback"
+          },
+          {
+            "contains": "shift+x:dismiss"
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "working-osc-progress",
+      "state": "working",
+      "priority": 1150,
+      "region": "osc_progress",
+      "when": {
+        "progress": {
+          "state": 1
+        }
+      }
+    },
+    {
+      "id": "idle-osc-title-bare",
+      "state": "idle",
+      "priority": 1100,
+      "region": "osc_title",
+      "when": {
+        "all": [
+          {
+            "regex": "(?:^| - )grok$"
+          },
+          {
+            "not": {
+              "regex": "[\\u2800-\\u28FF]"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "working-osc-title",
+      "state": "working",
+      "priority": 1000,
+      "region": "osc_title",
+      "when": {
+        "regex": "\\S"
+      }
+    },
+    {
+      "id": "idle-osc-progress",
+      "state": "idle",
+      "priority": 950,
+      "region": "osc_progress",
+      "when": {
+        "progress": {
+          "state": 0
+        }
+      }
+    },
+    {
+      "id": "working-stop-rail",
+      "state": "working",
+      "priority": 200,
+      "region": "whole_recent",
+      "when": {
+        "lineRegex": "^\\s*[\\u2800-\\u28FF]\\s.*\\[stop\\]\\s*$"
+      }
+    },
+    {
+      "id": "working-cancel-hint",
+      "state": "working",
+      "priority": 190,
+      "region": "whole_recent",
+      "when": {
+        "all": [
+          {
+            "contains": "esc:cancel"
+          },
+          {
+            "contains": "ctrl+.:shortcuts"
+          }
+        ]
+      }
+    },
+    {
+      "id": "idle-shortcut-hint",
+      "state": "idle",
+      "priority": 100,
+      "region": "whole_recent",
+      "when": {
+        "contains": "ctrl+.:shortcuts"
+      }
+    }
+  ]
+}

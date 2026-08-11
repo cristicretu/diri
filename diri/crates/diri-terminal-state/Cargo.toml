@@ -1,0 +1,10 @@
+[package]
+name = "diri-terminal-state"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+alacritty_terminal.workspace = true
+diri-proto.workspace = true

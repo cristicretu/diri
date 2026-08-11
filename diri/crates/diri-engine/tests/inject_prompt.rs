@@ -17,8 +17,7 @@ use diri_proto::ControlMessage;
 use serde_json::json;
 
 fn engine() -> Arc<ManifestEngine> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../Sources/DirijorCore/Resources/manifests")
+    let dir = diri_engine::detect::bundled_manifest_dir()
         .canonicalize()
         .expect("manifests");
     let (engine, _) = ManifestEngine::load_dir(&dir).expect("load");

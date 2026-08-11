@@ -65,9 +65,11 @@ impl DefaultAgent {
 #[serde(default, rename_all = "camelCase")]
 pub struct Prefs {
     pub default_agent: DefaultAgent,
-    /// Where the most recently dispatched agent was opened. `None` means
-    /// local; a host id means that configured remote host.
-    pub last_spawn_host: Option<String>,
+    /// Persistent destination for global new-session shortcuts. `None` means
+    /// this Mac; a host id means that configured remote host. The alias
+    /// migrates preferences written by the earlier last-used implementation.
+    #[serde(alias = "lastSpawnHost")]
+    pub default_spawn_host: Option<String>,
     pub start_at_login: bool,
     pub confirm_before_closing_session: bool,
     pub status_sounds: bool,
@@ -111,7 +113,7 @@ impl Default for Prefs {
     fn default() -> Self {
         Self {
             default_agent: DefaultAgent::ClaudeCode,
-            last_spawn_host: None,
+            default_spawn_host: None,
             start_at_login: false,
             confirm_before_closing_session: true,
             status_sounds: true,

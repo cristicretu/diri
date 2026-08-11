@@ -2,10 +2,9 @@
 //!
 //! An agent's status — working, idle, waiting on you — is inferred from what it
 //! painted on its terminal, using per-agent rules that live in JSON manifests.
-//! This is a port of the Swift `DirijorDetection`, and it deliberately reads
-//! **the same manifest files**: the rules are data, shared by both engines, so
-//! adding an agent stays a one-file change and the two implementations cannot
-//! drift apart.
+//! The rules and Agent launch descriptors are Rust-workspace resources under
+//! `crates/diri-engine/manifests`. Adding an agent remains a data-only change,
+//! without coupling the authoritative Engine to another implementation.
 //!
 //! The one behavioral difference worth knowing: Swift compiled these patterns
 //! with `NSRegularExpression` (ICU), while this uses the `regex` crate, which
@@ -23,31 +22,16 @@ pub use redact::redact;
 use std::collections::HashMap;
 use std::path::Path;
 
+pub use diri_terminal_state::ScreenSnapshot;
+
 use manifest::Rule;
 
-/// What the emulator saw: the plain-text grid plus the OSC state parsed out of
-/// the stream.
-#[derive(Clone, Debug, Default)]
-pub struct ScreenSnapshot {
-    pub lines: Vec<String>,
-    pub osc_title: Option<String>,
-    pub osc_progress_state: Option<i64>,
-    /// Bumps whenever the visible content changes; carried through so a
-    /// consumer can tell a fresh verdict from a repeated one.
-    pub content_seq: u64,
-}
-
-impl ScreenSnapshot {
-    pub fn from_lines<I, S>(lines: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        Self {
-            lines: lines.into_iter().map(Into::into).collect(),
-            ..Default::default()
-        }
-    }
+/// Source-tree location of the Rust-owned built-in Agent catalog. Release
+/// packaging copies this directory next to `dirijord-rs`; this fallback keeps
+/// tests and loose development binaries independent of application packaging.
+#[must_use]
+pub fn bundled_manifest_dir() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("manifests")
 }
 
 /// The engine's verdict for one snapshot.
@@ -241,10 +225,9 @@ impl ManifestEngine {
 mod tests {
     use super::*;
 
-    /// The real manifests, shared with the Swift engine.
+    /// The exact Rust-owned catalog shipped next to the Engine.
     pub(crate) fn manifest_dir() -> std::path::PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../Sources/DirijorCore/Resources/manifests")
+        bundled_manifest_dir()
             .canonicalize()
             .expect("manifests directory")
     }
@@ -276,26 +259,79 @@ mod tests {
             engine.ids()
         );
 
-        for expected in [
-            "claude-code",
-            "codex",
-            "cursor",
-            "gemini",
-            "shell",
-            "generic",
-        ] {
-            assert!(
-                engine.manifest(expected).is_some(),
-                "{expected} is missing; loaded {:?}",
-                engine.ids()
-            );
-        }
+        // The whole catalog, by name. A shrunken catalog does not error: a
+        // missing agent just spawns as a bare login shell, which is how this
+        // shipped broken once already. Spelling out all twenty ids means a
+        // dropped manifest fails here instead of in someone's terminal.
+        let mut ids = engine.ids();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            [
+                "aider",
+                "amp",
+                "antigravity",
+                "claude-code",
+                "codex",
+                "copilot",
+                "cursor",
+                "devin",
+                "droid",
+                "gemini",
+                "generic",
+                "grok",
+                "hermes",
+                "kilo",
+                "kimi",
+                "kiro",
+                "opencode",
+                "pi",
+                "qoder",
+                "shell",
+            ]
+        );
+
+        // Every id but the two command-less ones detects state from the
+        // screen, and the rules are the substance of that. Counting them is
+        // what catches a manifest that survives as a stub: `pi` alone ships
+        // zero rules, deliberately, because it is process-only.
         let rules: usize = engine
             .ids()
-            .iter()
+            .into_iter()
             .map(|id| engine.manifest(id).expect("manifest").rules.len())
             .sum();
-        assert!(rules >= 80, "expected the full ruleset, got {rules} rules");
+        assert_eq!(rules, 85, "the shipped ruleset lost rules");
+
+        for id in engine.ids() {
+            let expected_empty = matches!(id, "shell" | "generic" | "pi");
+            assert_eq!(
+                engine.manifest(id).expect("manifest").rules.is_empty(),
+                expected_empty,
+                "{id}: unexpected rule coverage"
+            );
+        }
+    }
+
+    /// `agent.readiness` hands the raw `agent` object to the client, which
+    /// decodes it as `diri_proto::AgentDescriptor`. That type needs `id` and
+    /// `displayName`, and a single manifest missing either fails the *whole*
+    /// response — leaving the client with no catalog and every agent spawning
+    /// as a bare shell. Decode all twenty the way the client will.
+    #[test]
+    fn every_shipped_descriptor_decodes_the_way_the_client_decodes_it() {
+        let engine = engine();
+        for id in engine.ids() {
+            let raw = engine
+                .raw_agent(id)
+                .unwrap_or_else(|| panic!("{id} carries no agent object"));
+            let descriptor: diri_proto::AgentDescriptor = serde_json::from_value(raw.clone())
+                .unwrap_or_else(|error| panic!("{id} is not a client descriptor: {error}"));
+            assert_eq!(descriptor.id, id, "{id} declares a mismatched agent id");
+            assert!(
+                !descriptor.display_name.is_empty(),
+                "{id} has no display name"
+            );
+        }
     }
 
     #[test]

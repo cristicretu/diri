@@ -5,9 +5,20 @@
 ## One-time setup
 
 ```sh
-rustup target add aarch64-apple-darwin x86_64-apple-darwin
+rustup target add aarch64-apple-darwin x86_64-apple-darwin \
+    aarch64-unknown-linux-musl x86_64-unknown-linux-musl
 cargo install cargo-packager --locked
+brew install zig
+cargo install cargo-zigbuild --locked
 ```
+
+The two musl targets, `zig`, and `cargo-zigbuild` are **required to cut a
+release**, not optional. The app bundles one remote Helper binary per supported
+remote platform, and `package.sh` fails rather than shipping a partial catalog:
+a Helper the remote host cannot run means that host simply does not work. Only
+the two Linux targets are cross-built; the Apple Helper needs a macOS builder,
+which is why releases are cut on macOS. CI asserts all three artifacts are
+present in the bundle.
 
 `package.sh` uses the toolchain in `~/.cargo` and builds into `<workspace>/target`. Override either with `CARGO_HOME` or `CARGO_TARGET_DIR` — but never point `CARGO_TARGET_DIR` at a cache shared with another checkout: cross-workspace fingerprint collisions link stale crates into the shipped app.
 

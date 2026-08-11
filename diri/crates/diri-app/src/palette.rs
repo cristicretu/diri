@@ -20,7 +20,9 @@ pub enum PaletteCommand {
         /// host's defaultCwd unless overridden).
         host: Option<String>,
     },
-    SpawnShell,
+    SpawnShell {
+        host: Option<String>,
+    },
     /// `session.migrate` the SELECTED session; None = back to local.
     MigrateSelected {
         target_host: Option<String>,
@@ -56,21 +58,38 @@ pub fn actions(
     hosts: &[HostEntry],
     selected: Option<&SessionRecord>,
 ) -> Vec<PaletteAction> {
-    let mut result = vec![new_agent_action(default_agent, true)];
+    actions_for_default_host(default_agent, projects, hosts, selected, None)
+}
+
+pub fn actions_for_default_host(
+    default_agent: DefaultAgent,
+    projects: &[Project],
+    hosts: &[HostEntry],
+    selected: Option<&SessionRecord>,
+    default_host_id: Option<&str>,
+) -> Vec<PaletteAction> {
+    let default_host = default_host_id.and_then(|id| hosts.iter().find(|host| host.id == id));
+    let mut result = vec![new_agent_action(default_agent, true, default_host)];
     result.extend(
         DefaultAgent::ALL
             .iter()
             .copied()
             .filter(|agent| *agent != default_agent)
-            .map(|agent| new_agent_action(agent, false)),
+            .map(|agent| new_agent_action(agent, false, default_host)),
+    );
+    let terminal_title = default_host.map_or_else(
+        || "New Terminal".to_owned(),
+        |host| format!("New Terminal on {}", host.display_name()),
     );
     result.extend([
         PaletteAction {
             id: "new-terminal".into(),
-            title: "New Terminal".into(),
+            title: terminal_title,
             system_image: "terminal",
             shortcut: Some("⌥⌘T"),
-            command: PaletteCommand::SpawnShell,
+            command: PaletteCommand::SpawnShell {
+                host: default_host.map(|host| host.id.clone()),
+            },
             keywords: "shell console zsh bash tty".into(),
         },
         PaletteAction {
@@ -209,14 +228,21 @@ pub fn actions(
     result
 }
 
-fn new_agent_action(agent: DefaultAgent, is_default: bool) -> PaletteAction {
+fn new_agent_action(
+    agent: DefaultAgent,
+    is_default: bool,
+    host: Option<&HostEntry>,
+) -> PaletteAction {
     PaletteAction {
         id: if is_default {
             "new-default".into()
         } else {
             format!("new-{}", agent.raw_value())
         },
-        title: format!("New {} Session", agent.display_name()),
+        title: host.map_or_else(
+            || format!("New {} Session", agent.display_name()),
+            |host| format!("New {} on {}", agent.display_name(), host.display_name()),
+        ),
         system_image: agent.system_image(),
         shortcut: if is_default {
             Some("⌘T")
@@ -228,7 +254,7 @@ fn new_agent_action(agent: DefaultAgent, is_default: bool) -> PaletteAction {
         command: PaletteCommand::SpawnAgent {
             agent,
             cwd: None,
-            host: None,
+            host: host.map(|host| host.id.clone()),
         },
         keywords: format!("{} agent spawn start create tab", agent.raw_value()),
     }
@@ -479,6 +505,47 @@ mod tests {
         assert!(first_remote < worktrees);
     }
 
+    #[test]
+    fn global_palette_shortcuts_follow_the_selected_default_host() {
+        let host = HostEntry {
+            id: "forge".into(),
+            name: Some("Forge".into()),
+            ssh: "cristi@forge".into(),
+            default_cwd: None,
+            node: None,
+        };
+        let result = actions_for_default_host(
+            DefaultAgent::ClaudeCode,
+            &[],
+            std::slice::from_ref(&host),
+            None,
+            Some("forge"),
+        );
+
+        assert_eq!(result[0].title, "New Claude Code on Forge");
+        assert_eq!(result[0].shortcut, Some("⌘T"));
+        assert_eq!(
+            result[0].command,
+            PaletteCommand::SpawnAgent {
+                agent: DefaultAgent::ClaudeCode,
+                cwd: None,
+                host: Some("forge".into()),
+            }
+        );
+        let terminal = result
+            .iter()
+            .find(|action| action.id == "new-terminal")
+            .expect("terminal action");
+        assert_eq!(terminal.title, "New Terminal on Forge");
+        assert_eq!(terminal.shortcut, Some("⌥⌘T"));
+        assert_eq!(
+            terminal.command,
+            PaletteCommand::SpawnShell {
+                host: Some("forge".into())
+            }
+        );
+    }
+
     fn claude_session(host: Option<&str>) -> SessionRecord {
         use diri_proto::{DateMillis, ProjectId, Resumability, SessionId, TitleSource};
         SessionRecord {
@@ -502,8 +569,8 @@ mod tests {
             last_seen_at: None,
             pinned: false,
             archived_at: None,
-            remote_active: false,
             host: host.map(str::to_owned),
+            remote_persistence: None,
             hibernation: None,
             memory_bytes: None,
             artifacts: None,

@@ -6,6 +6,9 @@ members = [
     "crates/diri-node",
     "crates/dirijor-mcp",
     "crates/diri-proto",
+    "crates/diri-pty",
+    "crates/diri-remote",
+    "crates/diri-terminal-state",
     "crates/diri-term",
     "crates/diri-ui",
     "crates/diri-usage",
@@ -25,6 +28,8 @@ diri-client = { path = "crates/diri-client" }
 diri-engine = { path = "crates/diri-engine" }
 diri-node = { path = "crates/diri-node" }
 diri-proto = { path = "crates/diri-proto" }
+diri-pty = { path = "crates/diri-pty" }
+diri-terminal-state = { path = "crates/diri-terminal-state" }
 diri-term = { path = "crates/diri-term" }
 diri-ui = { path = "crates/diri-ui" }
 diri-usage = { path = "crates/diri-usage" }
@@ -46,6 +51,7 @@ sha2 = "0.11"
 tempfile = "3"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 unicode-segmentation = "1"
+zeroize = { version = "1", features = ["derive"] }
 
 # No [profile.release] overrides, deliberately: both `lto = "thin"` and
 # `codegen-units = 1` make the linker reject gpui_macos's Objective-C statics

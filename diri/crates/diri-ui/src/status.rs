@@ -82,6 +82,16 @@ pub fn wall_clock_seconds() -> f64 {
 /// Status marks are deliberately static. State changes invalidate the entity,
 /// but leaving a working or needs-input glyph on screen never schedules
 /// another frame.
+///
+/// This is a performance contract, not a style preference. A glyph that moves
+/// has to be invalidated by somebody, and the only cadence that reads as
+/// motion also keeps the window rendering for as long as any Agent is
+/// working — which is most of the time this app is open. Measured on the
+/// packaged app in preview mode, a 10 Hz status ticker cost ~3% idle CPU and
+/// held ~240 MB of GPU memory that an idle window otherwise returns within
+/// seconds of the last frame. `status_glyphs_never_create_autonomous_frame_tasks`
+/// and `status_marks_never_sample_a_clock_while_rendering` below are what keep
+/// it that way.
 pub struct StatusGlyph {
     kind: AgentKind,
     state: StatusState,
@@ -102,6 +112,20 @@ impl StatusGlyph {
     pub fn set_state(&mut self, state: StatusState, _window: &mut Window, cx: &mut Context<Self>) {
         if self.state != state {
             self.state = state;
+            cx.notify();
+        }
+    }
+
+    pub fn set_kind(&mut self, kind: AgentKind, cx: &mut Context<Self>) {
+        if self.kind != kind {
+            self.kind = kind;
+            cx.notify();
+        }
+    }
+
+    pub fn set_colors(&mut self, colors: SemanticColors, cx: &mut Context<Self>) {
+        if self.colors != colors {
+            self.colors = colors;
             cx.notify();
         }
     }
@@ -294,6 +318,39 @@ mod tests {
         assert!(
             !source.contains(&periodic_timer),
             "status glyphs must not own periodic frame timers"
+        );
+    }
+
+    /// The companion to `status_glyphs_never_create_autonomous_frame_tasks`:
+    /// that one stops a glyph from scheduling its own frames, this one stops a
+    /// glyph from *needing* somebody else to schedule them. A mark whose
+    /// appearance depends on the current time is only correct if something
+    /// repaints it, so sampling a clock here silently re-creates the 10 Hz
+    /// wake even when the timer lives in another crate.
+    #[test]
+    fn status_marks_never_sample_a_clock_while_rendering() {
+        // Only the shipped half of the file: the tests below deliberately
+        // evaluate `AnimationPhase` at fixed instants to check its math, which
+        // costs nothing at runtime.
+        let source = include_str!("status.rs");
+        let test_module = ["#[cfg", "(test)]"].concat();
+        let shipped = source
+            .split_once(&test_module)
+            .map_or(source, |(shipped, _)| shipped);
+        let phase_sample = ["AnimationPhase", "::at("].concat();
+        let clock_sample = ["wall_clock_seconds", "()"].concat();
+
+        assert!(
+            !shipped.contains(&phase_sample),
+            "a status mark that reads an animation phase has to be repainted to stay correct"
+        );
+        // `wall_clock_seconds` is declared here for other animated surfaces;
+        // only its own declaration may name it.
+        assert_eq!(
+            shipped.matches(&clock_sample).count(),
+            1,
+            "status marks must not sample the wall clock; only the shared helper's own \
+             declaration may name it"
         );
     }
 }

@@ -210,7 +210,7 @@ fn read_claude_head(path: &Path) -> Vec<String> {
 
 /// The newest `ai-title` in the tail — the title Claude generated for the
 /// conversation.
-fn latest_claude_ai_title(path: &Path) -> Option<String> {
+pub(crate) fn latest_claude_ai_title(path: &Path) -> Option<String> {
     let mut handle = std::fs::File::open(path).ok()?;
     let end = handle.seek(SeekFrom::End(0)).ok()?;
     let start = end.saturating_sub(CLAUDE_TAIL_BYTES as u64);

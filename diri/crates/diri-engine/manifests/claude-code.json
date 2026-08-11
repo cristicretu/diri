@@ -1,0 +1,203 @@
+{
+  "schemaVersion": 2,
+  "id": "claude-code",
+  "version": "2026.07.07.1",
+  "statusModel": "full",
+  "agent": {
+    "id": "claude-code",
+    "displayName": "Claude Code",
+    "shortLabel": "claude",
+    "glyph": "\u2733",
+    "aliases": [
+      "claude",
+      "claude-code",
+      "cc"
+    ],
+    "firstClass": true,
+    "statusAuthority": "hooks",
+    "binary": "claude",
+    "returnToLoginShell": true,
+    "sessionIDFlag": "--session-id",
+    "resume": {
+      "style": "flag",
+      "token": "--resume"
+    },
+    "env": {
+      "CLAUDE_CODE_NO_FLICKER": "1"
+    },
+    "envScrubPrefixes": [
+      "CLAUDE",
+      "DIRI_",
+      "DIRIJOR_"
+    ],
+    "injection": {
+      "claudeHooks": true,
+      "claudeMCP": true
+    },
+    "foregroundExecNames": [
+      "claude"
+    ],
+    "approve": {
+      "text": "1",
+      "submit": true
+    },
+    "deny": {
+      "text": "\u001b",
+      "submit": false
+    }
+  },
+  "rules": [
+    {
+      "id": "transcript-viewer",
+      "state": "skip",
+      "priority": 1200,
+      "region": "whole_recent",
+      "when": {
+        "contains": "showing detailed transcript"
+      },
+      "flags": [
+        "skip_state_update"
+      ]
+    },
+    {
+      "id": "permission-proceed",
+      "state": "blockedPermission",
+      "priority": 1000,
+      "region": "whole_recent",
+      "when": {
+        "all": [
+          {
+            "contains": "do you want to proceed?"
+          },
+          {
+            "contains": "esc to cancel"
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "prompt_box_body",
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "permission-bash",
+      "state": "blockedPermission",
+      "priority": 990,
+      "region": "whole_recent",
+      "when": {
+        "all": [
+          {
+            "contains": "bash command"
+          },
+          {
+            "lineRegex": "^\\s*[\u276f>]?\\s*1\\.\\s*yes"
+          },
+          {
+            "contains": "esc to cancel"
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "prompt_box_body",
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "question-confirm-dialog",
+      "state": "blockedQuestion",
+      "priority": 970,
+      "region": "whole_recent",
+      "when": {
+        "all": [
+          {
+            "lineRegex": "^\\s*\u276f\\s*\\d+\\."
+          },
+          {
+            "any": [
+              {
+                "contains": "enter to confirm"
+              },
+              {
+                "contains": "enter to select"
+              }
+            ]
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "question-select",
+      "state": "blockedQuestion",
+      "priority": 980,
+      "region": "whole_recent",
+      "when": {
+        "all": [
+          {
+            "lineRegex": "^\\s*[\u276f>]?\\s*\\d+\\."
+          },
+          {
+            "contains": "enter to select"
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "prompt_box_body",
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "working-spinner",
+      "state": "working",
+      "priority": 900,
+      "region": "osc_title",
+      "when": {
+        "regex": "^[\u2800-\u28ff]"
+      }
+    },
+    {
+      "id": "idle-prompt-box",
+      "state": "idle",
+      "priority": 500,
+      "region": "prompt_box_body",
+      "when": {
+        "lineRegex": "^\\s*\u276f"
+      }
+    },
+    {
+      "id": "idle-title-star",
+      "state": "idle",
+      "priority": 450,
+      "region": "osc_title",
+      "when": {
+        "regex": "^\u2733"
+      }
+    },
+    {
+      "id": "idle-progress-zero",
+      "state": "idle",
+      "priority": 400,
+      "region": "osc_progress",
+      "when": {
+        "progress": {
+          "state": 0
+        }
+      }
+    }
+  ]
+}

@@ -1,12 +1,13 @@
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::query_label;
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
-use crate::remote_access::{self, CompanionAccess};
 use crate::settings::{HostDraft, SettingsTab, default_agent_label, theme};
 use crate::store::{DefaultAgent, Prefs, SessionStore, StoreRuntime};
 use crate::updates::{UpdateCommand, UpdateHandle, UpdatePhase};
@@ -14,24 +15,27 @@ use crate::worktrees::WorktreesSheet;
 use diri_proto::{AgentKind as ProtoAgentKind, HistoryEntry, HostEntry, HostsConfig};
 use diri_term::theme::TermTheme;
 use diri_ui::{
-    AgentLogo, Appearance, Fill, FloatingSurface, HairlineDivider, Ink, Metrics, Palette, Radius,
-    SemanticColors, Space, Typo,
+    AgentLogo, Fill, FloatingSurface, HairlineDivider, Ink, LoadingIndicator, Metrics, Palette,
+    Radius, SemanticColors, Space, Typo,
 };
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, CursorStyle, FocusHandle, Focusable, FontWeight,
-    IntoElement, KeyDownEvent, MouseButton, Render, Rgba, SharedString, Task, Window, actions,
-    deferred, div, prelude::*, px, rgba,
+    AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, FocusHandle, Focusable, FontWeight,
+    IntoElement, KeyDownEvent, MouseButton, Pixels, Render, Rgba, SharedString, Task, TextRun,
+    Window, actions, canvas, deferred, div, font, prelude::*, px, rgba,
 };
 use tokio::runtime::Runtime;
 
 const COLORS: SemanticColors = SemanticColors::dark();
-const SETTINGS_COLORS: SemanticColors = SemanticColors::sidebar(Appearance::Dark);
+const SETTINGS_COLORS: SemanticColors = SemanticColors::sidebar(diri_ui::Appearance::Dark);
 const SETTINGS_WIDTH: f32 = 600.0;
 const SETTINGS_HEIGHT: f32 = 420.0;
 const SETTINGS_NAV_WIDTH: f32 = 150.0;
 const SETTINGS_SECTION_GAP: f32 = 16.0;
 const SETTINGS_ROW_HEIGHT: f32 = 50.0;
 const RESULT_LIMIT: usize = 200;
+/// Reinstall success is confirmation, not persistent host state. Errors stay
+/// actionable and first-time setup keeps its "Use by default" action.
+const HOST_REINSTALL_SUCCESS_VISIBILITY: Duration = Duration::from_secs(3);
 
 actions!(
     diri,
@@ -93,6 +97,28 @@ impl HostFormField {
         let delta = if backwards { Self::ALL.len() - 1 } else { 1 };
         Self::ALL[(index + delta) % Self::ALL.len()]
     }
+
+    const fn debug_name(self) -> &'static str {
+        match self {
+            Self::Name => "NAME",
+            Self::Ssh => "SSH",
+            Self::DefaultCwd => "DEFAULT_CWD",
+            Self::NodeEndpoint => "NODE_ENDPOINT",
+            Self::NodeTokenFile => "NODE_TOKEN_FILE",
+            Self::NodeId => "NODE_ID",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Name => 0,
+            Self::Ssh => 1,
+            Self::DefaultCwd => 2,
+            Self::NodeEndpoint => 3,
+            Self::NodeTokenFile => 4,
+            Self::NodeId => 5,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -107,6 +133,63 @@ struct HostEditor {
     active_field: HostFormField,
     error: Option<String>,
     confirm_remove: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostPreparationKind {
+    Initialize,
+    Reinstall,
+}
+
+#[derive(Clone, Debug)]
+enum HostInitialization {
+    Running {
+        id: String,
+        name: String,
+        kind: HostPreparationKind,
+        operation: u64,
+    },
+    Ready {
+        id: String,
+        name: String,
+        kind: HostPreparationKind,
+        operation: u64,
+        result: diri_proto::HostInitializeResult,
+    },
+    Failed {
+        id: String,
+        name: String,
+        kind: HostPreparationKind,
+        operation: u64,
+        message: String,
+    },
+}
+
+struct HostInitializationCardModel {
+    id: String,
+    name: String,
+    symbol: Option<&'static str>,
+    title: String,
+    detail: String,
+    tone: Rgba,
+    action: Option<&'static str>,
+    retry_kind: Option<HostPreparationKind>,
+}
+
+impl HostInitialization {
+    fn id(&self) -> &str {
+        match self {
+            Self::Running { id, .. } | Self::Ready { id, .. } | Self::Failed { id, .. } => id,
+        }
+    }
+
+    fn operation(&self) -> u64 {
+        match self {
+            Self::Running { operation, .. }
+            | Self::Ready { operation, .. }
+            | Self::Failed { operation, .. } => *operation,
+        }
+    }
 }
 
 impl HostEditor {
@@ -155,6 +238,17 @@ impl HostEditor {
             HostFormField::NodeId => &mut self.node_id,
         }
     }
+
+    fn field(&self, field: HostFormField) -> &QueryEditor {
+        match field {
+            HostFormField::Name => &self.name,
+            HostFormField::Ssh => &self.ssh,
+            HostFormField::DefaultCwd => &self.default_cwd,
+            HostFormField::NodeEndpoint => &self.node_endpoint,
+            HostFormField::NodeTokenFile => &self.node_token_file,
+            HostFormField::NodeId => &self.node_id,
+        }
+    }
 }
 
 pub struct UtilitySurfaces {
@@ -168,15 +262,14 @@ pub struct UtilitySurfaces {
     worktrees: WorktreesSheet,
     settings_tab: SettingsTab,
     settings_menu: Option<SettingsMenu>,
-    home: PathBuf,
     hosts_path: PathBuf,
     hosts: Vec<HostEntry>,
     host_editor: Option<HostEditor>,
+    host_initialization: Option<HostInitialization>,
+    host_initialization_generation: u64,
+    host_field_bounds: [Rc<Cell<Option<Bounds<Pixels>>>>; 6],
     prefs: Prefs,
     store: Arc<RwLock<SessionStore>>,
-    companion_access: CompanionAccess,
-    companion_busy: bool,
-    companion_error: Option<String>,
     store_runtime: Arc<StoreRuntime>,
     runtime: Arc<Runtime>,
     updates: UpdateHandle,
@@ -205,7 +298,6 @@ impl UtilitySurfaces {
                 .expect("session store lock poisoned");
             (store.preferences().clone(), store.hosts().to_vec())
         };
-        let companion_access = CompanionAccess::load(&home);
         let settings_preview = std::env::var("DIRI_SETTINGS_PREVIEW")
             .ok()
             .map(|value| value.to_ascii_lowercase());
@@ -259,15 +351,14 @@ impl UtilitySurfaces {
             worktrees: WorktreesSheet::default(),
             settings_tab,
             settings_menu: None,
-            home,
             hosts_path,
             hosts,
             host_editor: None,
+            host_initialization: None,
+            host_initialization_generation: 0,
+            host_field_bounds: std::array::from_fn(|_| Rc::new(Cell::new(None))),
             prefs,
             store: Arc::clone(&store_runtime.store),
-            companion_access,
-            companion_busy: false,
-            companion_error: None,
             store_runtime,
             runtime,
             updates,
@@ -275,6 +366,14 @@ impl UtilitySurfaces {
             _update_changes: update_changes,
             _store_changes: store_changes,
         }
+    }
+
+    fn colors(&self) -> SemanticColors {
+        crate::app_theme::colors(&self.prefs.terminal_theme)
+    }
+
+    fn settings_colors(&self) -> SemanticColors {
+        crate::app_theme::sidebar_colors(&self.prefs.terminal_theme)
     }
 
     pub(crate) fn open_history(&mut self, cx: &mut Context<Self>) {
@@ -443,104 +542,6 @@ impl UtilitySurfaces {
             .set_hosts(self.hosts.clone());
     }
 
-    fn reload_companion_access(&mut self) {
-        self.companion_access = CompanionAccess::load(&self.home);
-        self.companion_error = None;
-    }
-
-    fn set_companion_access(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        if self.companion_busy {
-            return;
-        }
-        self.companion_busy = true;
-        self.companion_error = None;
-        self.activity = if enabled {
-            "Enabling iPhone access…".to_owned()
-        } else {
-            "Disabling iPhone access…".to_owned()
-        };
-        cx.notify();
-
-        let home = self.home.clone();
-        let client = Arc::clone(self.store_runtime.client());
-        let socket_path = client.socket_path().to_path_buf();
-        let runtime = Arc::clone(&self.runtime);
-        cx.spawn(async move |this, cx| {
-            let task = runtime.spawn(async move {
-                let config_home = home.clone();
-                let access = tokio::task::spawn_blocking(move || {
-                    if enabled {
-                        remote_access::enable(&config_home)
-                    } else {
-                        remote_access::disable(&config_home)
-                    }
-                })
-                .await
-                .map_err(|error| error.to_string())??;
-
-                client
-                    .wait_until_connected(Duration::from_secs(5))
-                    .await
-                    .map_err(|error| {
-                        format!("Saved the setting, but the daemon is offline: {error}")
-                    })?;
-                client
-                    .restart_daemon_for_remote_config()
-                    .await
-                    .map_err(|error| {
-                        format!("Saved the setting, but could not reload the daemon: {error}")
-                    })?;
-
-                tokio::task::spawn_blocking(move || {
-                    crate::daemon_launch::relaunch_after_remote_config_change(&socket_path);
-                })
-                .await
-                .map_err(|error| error.to_string())?;
-                Ok::<_, String>(access)
-            });
-
-            let result = task
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| result);
-            let _ = this.update(cx, |this, cx| {
-                this.companion_busy = false;
-                match result {
-                    Ok(access) => {
-                        this.companion_access = access;
-                        this.activity = if enabled {
-                            "iPhone access is ready".to_owned()
-                        } else {
-                            "iPhone access disabled".to_owned()
-                        };
-                    }
-                    Err(error) => {
-                        // Reload in case writing the config succeeded but the
-                        // explicit daemon restart failed.
-                        this.companion_access = CompanionAccess::load(&this.home);
-                        this.companion_error = Some(error.clone());
-                        this.activity = error;
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn copy_pairing_link(&mut self, cx: &mut Context<Self>) {
-        let Some(url) = self.companion_access.pairing_url() else {
-            self.companion_error =
-                Some("No reachable Tailscale endpoint is available for pairing yet.".to_owned());
-            cx.notify();
-            return;
-        };
-        cx.write_to_clipboard(ClipboardItem::new_string(url));
-        self.activity = "Pairing link copied — open it on your iPhone".to_owned();
-        self.companion_error = None;
-        cx.notify();
-    }
-
     fn begin_adding_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_menu = None;
         self.host_editor = Some(HostEditor::adding());
@@ -588,6 +589,7 @@ impl UtilitySurfaces {
                 return;
             }
         };
+        let is_new = editor.original_id.is_none();
         let mut hosts = self.hosts.clone();
         if let Some(index) = hosts.iter().position(|host| host.id == entry.id) {
             hosts[index] = entry.clone();
@@ -595,6 +597,134 @@ impl UtilitySurfaces {
             hosts.push(entry.clone());
         }
         self.persist_hosts(hosts, format!("{} is ready", entry.display_name()), cx);
+        if is_new && self.host_editor.is_none() {
+            self.initialize_host(entry, cx);
+        }
+    }
+
+    fn initialize_host(&mut self, host: HostEntry, cx: &mut Context<Self>) {
+        self.prepare_host(host, HostPreparationKind::Initialize, cx);
+    }
+
+    fn reinstall_host(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(host) = self.hosts.iter().find(|host| host.id == id).cloned() else {
+            return;
+        };
+        // Reinstallation always targets the saved HostEntry. Discarding the
+        // editor avoids implying that unsaved SSH credentials are in use and
+        // exposes the progress card immediately.
+        self.host_editor = None;
+        self.prepare_host(host, HostPreparationKind::Reinstall, cx);
+    }
+
+    fn prepare_host(&mut self, host: HostEntry, kind: HostPreparationKind, cx: &mut Context<Self>) {
+        let id = host.id.clone();
+        let name = host.display_name().to_owned();
+        self.host_initialization_generation = self.host_initialization_generation.wrapping_add(1);
+        let operation = self.host_initialization_generation;
+        self.host_initialization = Some(HostInitialization::Running {
+            id: id.clone(),
+            name: name.clone(),
+            kind,
+            operation,
+        });
+        self.activity = match kind {
+            HostPreparationKind::Initialize => format!("Setting up {name} over SSH…"),
+            HostPreparationKind::Reinstall => {
+                format!("Reinstalling the remote environment on {name}…")
+            }
+        };
+        cx.notify();
+
+        let client = Arc::clone(self.store_runtime.client());
+        let runtime = Arc::clone(&self.runtime);
+        cx.spawn(async move |this, cx| {
+            let task = runtime.spawn(async move {
+                match kind {
+                    HostPreparationKind::Initialize => client.initialize_host(&id).await,
+                    HostPreparationKind::Reinstall => client.reinstall_host(&id).await,
+                }
+            });
+            let outcome = match task.await {
+                Ok(result) => result.map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            let expire_success = outcome.is_ok() && kind == HostPreparationKind::Reinstall;
+            let expiration_id = host.id.clone();
+            let _ = this.update(cx, |this, cx| {
+                if this
+                    .host_initialization
+                    .as_ref()
+                    .is_none_or(|state| state.id() != host.id || state.operation() != operation)
+                {
+                    return;
+                }
+                match outcome {
+                    Ok(result) => {
+                        this.activity = match kind {
+                            HostPreparationKind::Initialize => {
+                                format!("{} is ready", host.display_name())
+                            }
+                            HostPreparationKind::Reinstall => {
+                                format!("Remote environment reinstalled on {}", host.display_name())
+                            }
+                        };
+                        this.host_initialization = Some(HostInitialization::Ready {
+                            id: host.id.clone(),
+                            name: host.display_name().to_owned(),
+                            kind,
+                            operation,
+                            result,
+                        });
+                    }
+                    Err(message) => {
+                        this.activity = match kind {
+                            HostPreparationKind::Initialize => {
+                                format!("Could not initialize {}", host.display_name())
+                            }
+                            HostPreparationKind::Reinstall => format!(
+                                "Could not reinstall the remote environment on {}",
+                                host.display_name()
+                            ),
+                        };
+                        this.host_initialization = Some(HostInitialization::Failed {
+                            id: host.id.clone(),
+                            name: host.display_name().to_owned(),
+                            kind,
+                            operation,
+                            message,
+                        });
+                    }
+                }
+                cx.notify();
+            });
+            if expire_success {
+                cx.background_executor()
+                    .timer(HOST_REINSTALL_SUCCESS_VISIBILITY)
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    if expire_completed_reinstall(
+                        &mut this.host_initialization,
+                        &expiration_id,
+                        operation,
+                    ) {
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn retry_host_initialization(
+        &mut self,
+        id: &str,
+        kind: HostPreparationKind,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(host) = self.hosts.iter().find(|host| host.id == id).cloned() {
+            self.prepare_host(host, kind, cx);
+        }
     }
 
     fn request_remove_host(&mut self, cx: &mut Context<Self>) {
@@ -646,6 +776,13 @@ impl UtilitySurfaces {
         {
             Ok(()) => {
                 self.hosts = hosts;
+                if self
+                    .host_initialization
+                    .as_ref()
+                    .is_some_and(|state| !self.hosts.iter().any(|host| host.id == state.id()))
+                {
+                    self.host_initialization = None;
+                }
                 self.store
                     .write()
                     .expect("session store lock poisoned")
@@ -781,8 +918,14 @@ impl UtilitySurfaces {
         self.surface = Surface::Settings;
         self.settings_menu = None;
         self.host_editor = None;
-        self.reload_companion_access();
         cx.notify();
+    }
+
+    pub(crate) fn open_add_remote_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings(cx);
+        self.settings_tab = SettingsTab::Remote;
+        self.reload_hosts();
+        self.begin_adding_host(window, cx);
     }
 
     pub(crate) fn toggle_history(&mut self, cx: &mut Context<Self>) {
@@ -908,7 +1051,7 @@ impl UtilitySurfaces {
         });
 
         FloatingSurface::new(
-            COLORS,
+            self.colors(),
             div()
                 .w(px(560.0))
                 .max_h(px(440.0))
@@ -1051,7 +1194,7 @@ impl UtilitySurfaces {
             .collect::<Vec<_>>();
         let pending = self.worktrees.pending_cleanup.clone();
         FloatingSurface::new(
-            COLORS,
+            self.colors(),
             div()
                 .w(px(620.0))
                 .h(px(460.0))
@@ -1130,7 +1273,7 @@ impl UtilitySurfaces {
                                 }),
                             )
                             .child(FloatingSurface::new(
-                                COLORS,
+                                self.colors(),
                                 div()
                                     .w(px(560.0))
                                     .p(px(16.0))
@@ -1206,7 +1349,6 @@ impl UtilitySurfaces {
                         this.host_editor = None;
                         if tab == SettingsTab::Remote {
                             this.reload_hosts();
-                            this.reload_companion_access();
                         }
                         cx.notify();
                     }))
@@ -1239,7 +1381,7 @@ impl UtilitySurfaces {
             SettingsTab::Remote => self.remote_settings(cx).into_any_element(),
         };
         FloatingSurface::new(
-            SETTINGS_COLORS,
+            self.settings_colors(),
             div()
                 .id("settings-dialog")
                 .debug_selector(|| "settings-dialog".into())
@@ -1312,6 +1454,7 @@ impl UtilitySurfaces {
                         .child(
                             div()
                                 .id("settings-pane")
+                                .debug_selector(|| "settings-pane".into())
                                 .absolute()
                                 .inset_0()
                                 .overflow_y_scroll()
@@ -1427,6 +1570,9 @@ impl UtilitySurfaces {
                         )
                         .child(
                             div()
+                                .min_w(px(0.0))
+                                .w_full()
+                                .whitespace_normal()
                                 .p(px(10.0))
                                 .rounded(px(Radius::BADGE))
                                 .bg(SETTINGS_COLORS.primary.alpha(0.055))
@@ -1434,18 +1580,24 @@ impl UtilitySurfaces {
                                 .text_size(px(11.0))
                                 .line_height(px(17.0))
                                 .text_color(SETTINGS_COLORS.secondary)
-                                .child(quick_open_roots),
+                                .child(wrappable_setting_copy(quick_open_roots.into())),
                         )
                         .child(
                             div()
+                                .min_w(px(0.0))
+                                .w_full()
+                                .whitespace_normal()
                                 .text_size(px(11.0))
                                 .line_height(px(16.0))
                                 .text_color(SETTINGS_COLORS.tertiary)
-                                .child(if self.prefs.quick_open_roots.is_empty() {
-                                    "Using the default folder plus project parent folders."
-                                } else {
-                                    "One folder per line, scanned four levels deep."
-                                }),
+                                .child(wrappable_setting_copy(
+                                    if self.prefs.quick_open_roots.is_empty() {
+                                        "Using the default folder plus project parent folders."
+                                    } else {
+                                        "One folder per line, scanned four levels deep."
+                                    }
+                                    .into(),
+                                )),
                         ),
                 )),
         )
@@ -1506,7 +1658,7 @@ impl UtilitySurfaces {
                         }),
                 );
             }
-            control = control.child(settings_dropdown(options, 204.0));
+            control = control.child(settings_dropdown(options, 204.0, self.settings_colors()));
         }
         control.into_any_element()
     }
@@ -1662,7 +1814,7 @@ impl UtilitySurfaces {
                         .flex_col()
                         .child(setting_row(
                             "Color theme",
-                            "Applies immediately to every open terminal.",
+                            "Applies immediately across the app and every open terminal.",
                             self.terminal_theme_dropdown(cx),
                         ))
                         .child(setting_divider())
@@ -1704,99 +1856,19 @@ impl UtilitySurfaces {
                         )),
                 ))
                 .child(
-                    div()
-                        .p(px(12.0))
-                        .rounded(px(Radius::ROW))
-                        .border_1()
-                        .border_color(SETTINGS_COLORS.primary.alpha(0.07))
-                        .bg(SETTINGS_COLORS.primary.alpha(0.035))
-                        .flex()
-                        .items_start()
-                        .gap(px(10.0))
-                        .child(sf_symbol(
-                            "moon.fill",
-                            15.0,
-                            SETTINGS_COLORS.tertiary,
-                        ))
-                        .child(
-                            div()
-                                .text_size(px(11.0))
-                                .line_height(px(17.0))
-                                .text_color(SETTINGS_COLORS.secondary)
-                                .child("Frozen sessions are never killed. Opening one wakes it immediately, exactly where you left it."),
-                        ),
+                    settings_note(
+                        "moon.fill",
+                        None,
+                        "Frozen sessions are never killed. Opening one wakes it immediately, exactly where you left it.",
+                        SETTINGS_COLORS.tertiary,
+                        SETTINGS_COLORS.primary.alpha(0.07),
+                        SETTINGS_COLORS.primary.alpha(0.035),
+                    ),
                 ),
         )
     }
 
     fn remote_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let configured = self.companion_access.is_configured();
-        let endpoint = self.companion_access.endpoint_label();
-        let action = if self.companion_busy {
-            div()
-                .h(px(26.0))
-                .px(px(9.0))
-                .flex()
-                .items_center()
-                .text_size(px(11.0))
-                .text_color(SETTINGS_COLORS.tertiary)
-                .child("Applying…")
-                .into_any_element()
-        } else if configured {
-            surface_button("Disable", "disable-companion", cx, |this, cx| {
-                this.set_companion_access(false, cx);
-            })
-            .into_any_element()
-        } else {
-            surface_button("Enable", "enable-companion", cx, |this, cx| {
-                this.set_companion_access(true, cx);
-            })
-            .into_any_element()
-        };
-
-        let mut companion_rows = div().flex().flex_col().child(setting_row(
-            "Connect this iPhone",
-            endpoint,
-            div()
-                .flex()
-                .items_center()
-                .gap(px(8.0))
-                .child(colored_badge(
-                    if configured { "Ready" } else { "Off" },
-                    if configured {
-                        Ink::FRESH
-                    } else {
-                        SETTINGS_COLORS.secondary
-                    },
-                ))
-                .child(action),
-        ));
-
-        if configured {
-            companion_rows = companion_rows.child(setting_divider()).child(setting_row(
-                "Pair this iPhone",
-                "Copy the secure link, then open it on your phone. The token stays out of the UI.",
-                surface_button("Copy Link", "copy-pairing-link", cx, |this, cx| {
-                    this.copy_pairing_link(cx);
-                }),
-            ));
-        }
-        if let Some(error) = &self.companion_error {
-            companion_rows = companion_rows.child(setting_divider()).child(
-                div()
-                    .px(px(12.0))
-                    .py(px(10.0))
-                    .flex()
-                    .items_start()
-                    .gap(px(8.0))
-                    .text_size(px(11.0))
-                    .line_height(px(16.0))
-                    .text_color(Ink::ATTENTION)
-                    .child(sf_symbol("exclamationmark.triangle", 13.0, Ink::ATTENTION))
-                    .child(error.clone()),
-            );
-        }
-
         settings_page(
             "Remote",
             div()
@@ -1804,42 +1876,25 @@ impl UtilitySurfaces {
                 .flex_col()
                 .gap(px(SETTINGS_SECTION_GAP))
                 .child(self.remote_hosts_section(cx))
-                .child(setting_section("Companion access", companion_rows))
                 .child(
-                    div()
-                        .p(px(12.0))
-                        .rounded(px(Radius::ROW))
-                        .border_1()
-                        .border_color(Ink::ATTENTION.alpha(0.25))
-                        .bg(Ink::ATTENTION.alpha(0.045))
-                        .flex()
-                        .items_start()
-                        .gap(px(10.0))
-                        .child(sf_symbol("exclamationmark.triangle", 15.0, Ink::ATTENTION))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap(px(4.0))
-                                .child(
-                                    div()
-                                        .text_size(px(Typo::TITLE.size))
-                                        .font_weight(Typo::TITLE.weight)
-                                        .child("Private by default"),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(11.0))
-                                        .line_height(px(17.0))
-                                        .text_color(SETTINGS_COLORS.secondary)
-                                        .child("The listener binds only to this Mac's Tailscale IPv4 address. Changing access briefly reloads the daemon while holder-owned sessions stay alive."),
-                                ),
-                        ),
+                    settings_note(
+                        "lock.shield",
+                        Some("OpenSSH transport"),
+                        "Diri uses your SSH configuration without changing the host. Private-network and Tailscale names work transparently when OpenSSH can resolve them.",
+                        SETTINGS_COLORS.secondary,
+                        SETTINGS_COLORS.primary.alpha(0.08),
+                        SETTINGS_COLORS.primary.alpha(0.035),
+                    ),
                 ),
         )
     }
 
     fn remote_hosts_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let default_host = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .default_spawn_host();
         let mut catalog = div()
             .rounded(px(Radius::ROW))
             .border_1()
@@ -1896,6 +1951,7 @@ impl UtilitySurfaces {
                 let destination = host.ssh.clone();
                 let folder = host.default_cwd.clone();
                 let first_party = host.node.is_some();
+                let is_default = default_host.as_deref() == Some(host.id.as_str());
                 catalog = catalog.child(
                     div()
                         .id(SharedString::from(format!("remote-host-{id}")))
@@ -1929,11 +1985,20 @@ impl UtilitySurfaces {
                                 .child(
                                     div()
                                         .flex()
+                                        .min_w(px(0.0))
                                         .items_center()
                                         .gap(px(7.0))
                                         .text_size(px(13.0))
                                         .font_weight(FontWeight::MEDIUM)
-                                        .child(name)
+                                        .child(
+                                            div()
+                                                .min_w(px(0.0))
+                                                .flex_1()
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .text_ellipsis()
+                                                .child(name),
+                                        )
                                         .when(first_party, |row| {
                                             row.child(
                                                 div()
@@ -1946,13 +2011,30 @@ impl UtilitySurfaces {
                                                     .text_color(Ink::FRESH)
                                                     .child("NODE"),
                                             )
+                                        })
+                                        .when(is_default, |row| {
+                                            row.child(
+                                                div()
+                                                    .px(px(6.0))
+                                                    .py(px(2.0))
+                                                    .rounded(px(Radius::BADGE))
+                                                    .bg(Palette::CLAY.alpha(0.12))
+                                                    .text_size(px(9.0))
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(Palette::CLAY)
+                                                    .child("DEFAULT"),
+                                            )
                                         }),
                                 )
                                 .child(
                                     div()
                                         .flex()
+                                        .min_w(px(0.0))
                                         .items_center()
                                         .gap(px(7.0))
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
                                         .font_family(crate::fonts::mono_family())
                                         .text_size(px(10.5))
                                         .text_color(SETTINGS_COLORS.tertiary)
@@ -2000,7 +2082,187 @@ impl UtilitySurfaces {
                         ))
                     }),
             )
+            .when_some(self.host_initialization.clone(), |section, state| {
+                section.child(self.host_initialization_card(state, cx))
+            })
             .child(catalog)
+    }
+
+    fn host_initialization_card(
+        &self,
+        state: HostInitialization,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let HostInitializationCardModel {
+            id,
+            name,
+            symbol,
+            title,
+            detail,
+            tone,
+            action,
+            retry_kind,
+        } = match state {
+            HostInitialization::Running { id, name, kind, .. } => {
+                let (title, detail) = match kind {
+                    HostPreparationKind::Initialize => (
+                        format!("Setting up {name}"),
+                        "Connecting with SSH, verifying diri-remote, loading the login environment, and testing session persistence."
+                            .to_owned(),
+                    ),
+                    HostPreparationKind::Reinstall => (
+                        format!("Reinstalling {name}"),
+                        "Uploading and verifying the packaged diri-remote build, then refreshing the remote environment checks. Running sessions are not interrupted."
+                            .to_owned(),
+                    ),
+                };
+                HostInitializationCardModel {
+                    id,
+                    name,
+                    symbol: None,
+                    title,
+                    detail,
+                    tone: Palette::CLAY,
+                    action: None,
+                    retry_kind: None,
+                }
+            }
+            HostInitialization::Ready {
+                id,
+                name,
+                kind,
+                result,
+                ..
+            } => {
+                let persistence = match result.persistence {
+                    diri_proto::remote_pty::PersistenceCapability::NativeDetach => "native detach",
+                    diri_proto::remote_pty::PersistenceCapability::UserSupervisor => {
+                        "user supervisor"
+                    }
+                    diri_proto::remote_pty::PersistenceCapability::NonPersistent => {
+                        "non-persistent"
+                    }
+                };
+                let title = match kind {
+                    HostPreparationKind::Initialize => format!("{name} is ready"),
+                    HostPreparationKind::Reinstall => {
+                        format!("Remote environment reinstalled on {name}")
+                    }
+                };
+                let action = (kind == HostPreparationKind::Initialize).then_some("Use by default");
+                HostInitializationCardModel {
+                    id,
+                    name: name.clone(),
+                    symbol: Some("checkmark.circle.fill"),
+                    title,
+                    detail: format!(
+                        "{} · {} · build {} · protocol {}.{} · {persistence}",
+                        result.cwd,
+                        result.shell,
+                        result.helper_build_id,
+                        result.protocol.major,
+                        result.protocol.minor
+                    ),
+                    tone: Ink::FRESH,
+                    action,
+                    retry_kind: None,
+                }
+            }
+            HostInitialization::Failed {
+                id,
+                name,
+                kind,
+                message,
+                ..
+            } => {
+                let title = match kind {
+                    HostPreparationKind::Initialize => {
+                        format!("Could not initialize {name}")
+                    }
+                    HostPreparationKind::Reinstall => {
+                        format!("Could not reinstall the remote environment on {name}")
+                    }
+                };
+                HostInitializationCardModel {
+                    id,
+                    name,
+                    symbol: Some("exclamationmark.triangle.fill"),
+                    title,
+                    detail: message,
+                    tone: Ink::DANGER,
+                    action: Some("Retry"),
+                    retry_kind: Some(kind),
+                }
+            }
+        };
+        let action_id = id.clone();
+        let status_mark = symbol.map_or_else(
+            || LoadingIndicator::new("host-initialization-loading", 16.0, tone).into_any_element(),
+            |symbol| sf_symbol(symbol, 13.0, tone),
+        );
+        div()
+            .id("host-initialization")
+            .debug_selector(|| "HOST_INITIALIZATION".into())
+            .rounded(px(Radius::ROW))
+            .border_1()
+            .border_color(tone.alpha(0.22))
+            .bg(tone.alpha(0.055))
+            .px(px(12.0))
+            .py(px(10.0))
+            .flex()
+            .items_start()
+            .gap(px(9.0))
+            .child(div().pt(px(1.0)).text_color(tone).child(status_mark))
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.0))
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(SETTINGS_COLORS.primary)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .w_full()
+                            .whitespace_normal()
+                            .text_size(px(10.5))
+                            .line_height(px(15.0))
+                            .text_color(SETTINGS_COLORS.tertiary)
+                            .child(wrappable_setting_copy(detail.into())),
+                    ),
+            )
+            .when_some(action, |card, label| {
+                card.child(
+                    div()
+                        .debug_selector(|| "HOST_INITIALIZATION_ACTION".into())
+                        .child(surface_button(
+                            label,
+                            "host-initialization-action",
+                            cx,
+                            move |this, cx| {
+                                if let Some(kind) = retry_kind {
+                                    this.retry_host_initialization(&action_id, kind, cx);
+                                } else {
+                                    this.store
+                                        .write()
+                                        .expect("session store lock poisoned")
+                                        .set_default_spawn_host(Some(action_id.clone()));
+                                    this.activity =
+                                        format!("{name} is now the default execution host");
+                                    cx.notify();
+                                }
+                            },
+                        )),
+                )
+            })
+            .into_any_element()
     }
 
     fn host_editor_panel(&self, editor: &HostEditor, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2019,6 +2281,8 @@ impl UtilitySurfaces {
                     .gap(px(12.0))
                     .child(
                         div()
+                            .flex_1()
+                            .min_w(px(0.0))
                             .flex()
                             .flex_col()
                             .gap(px(3.0))
@@ -2061,20 +2325,24 @@ impl UtilitySurfaces {
                         div()
                             .flex()
                             .gap(px(10.0))
-                            .child(div().flex_1().child(self.host_text_field(
-                                "Name",
-                                "Forge",
-                                &editor.name,
-                                HostFormField::Name,
-                                cx,
-                            )))
-                            .child(div().flex_1().child(self.host_text_field(
-                                "SSH destination",
-                                "you@forge",
-                                &editor.ssh,
-                                HostFormField::Ssh,
-                                cx,
-                            ))),
+                            .child(
+                                div().min_w(px(0.0)).flex_1().child(self.host_text_field(
+                                    "Name",
+                                    "Forge",
+                                    &editor.name,
+                                    HostFormField::Name,
+                                    cx,
+                                )),
+                            )
+                            .child(
+                                div().min_w(px(0.0)).flex_1().child(self.host_text_field(
+                                    "SSH destination",
+                                    "you@forge",
+                                    &editor.ssh,
+                                    HostFormField::Ssh,
+                                    cx,
+                                )),
+                            ),
                     )
                     .child(self.host_text_field(
                         "Default folder",
@@ -2095,20 +2363,24 @@ impl UtilitySurfaces {
                         div()
                             .flex()
                             .gap(px(10.0))
-                            .child(div().flex_1().child(self.host_text_field(
-                                "Node endpoint",
-                                "tcp://100.64.0.2:7337",
-                                &editor.node_endpoint,
-                                HostFormField::NodeEndpoint,
-                                cx,
-                            )))
-                            .child(div().flex_1().child(self.host_text_field(
-                                "Local token file",
-                                "~/.config/dirijor/forge.token",
-                                &editor.node_token_file,
-                                HostFormField::NodeTokenFile,
-                                cx,
-                            ))),
+                            .child(
+                                div().min_w(px(0.0)).flex_1().child(self.host_text_field(
+                                    "Node endpoint",
+                                    "tcp://100.64.0.2:7337",
+                                    &editor.node_endpoint,
+                                    HostFormField::NodeEndpoint,
+                                    cx,
+                                )),
+                            )
+                            .child(
+                                div().min_w(px(0.0)).flex_1().child(self.host_text_field(
+                                    "Local token file",
+                                    "~/.config/dirijor/forge.token",
+                                    &editor.node_token_file,
+                                    HostFormField::NodeTokenFile,
+                                    cx,
+                                )),
+                            ),
                     )
                     .child(self.host_text_field(
                         "Pinned node ID",
@@ -2119,10 +2391,16 @@ impl UtilitySurfaces {
                     ))
                     .child(
                         div()
+                            .min_w(px(0.0))
+                            .w_full()
+                            .whitespace_normal()
                             .text_size(px(10.0))
                             .line_height(px(15.0))
                             .text_color(SETTINGS_COLORS.tertiary)
-                            .child("The token stays in that owner-only file. SSH remains available for install and recovery."),
+                            .child(wrappable_setting_copy(
+                                "The token stays in that owner-only file. SSH remains available for install and recovery."
+                                    .into(),
+                            )),
                     ),
             );
 
@@ -2139,7 +2417,13 @@ impl UtilitySurfaces {
                     .text_size(px(11.0))
                     .text_color(Ink::DANGER)
                     .child(sf_symbol("exclamationmark.triangle", 12.0, Ink::DANGER))
-                    .child(error.clone()),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .whitespace_normal()
+                            .child(wrappable_setting_copy(error.clone().into())),
+                    ),
             );
         }
 
@@ -2153,15 +2437,20 @@ impl UtilitySurfaces {
                 div()
                     .pt(px(2.0))
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .justify_between()
                     .gap(px(12.0))
                     .child(
                         div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .whitespace_normal()
                             .text_size(px(11.0))
                             .text_color(SETTINGS_COLORS.secondary)
-                            .child(format!(
-                                "Remove {name}? Existing sessions must be moved first."
+                            .child(wrappable_setting_copy(
+                                format!("Remove {name}? Existing sessions must be moved first.")
+                                    .into(),
                             )),
                     )
                     .child(
@@ -2184,19 +2473,36 @@ impl UtilitySurfaces {
                     ),
             );
         } else {
+            let reinstall_host_id = editor.original_id.clone();
             form = form.child(
                 div()
                     .pt(px(2.0))
                     .flex()
                     .items_center()
                     .justify_between()
+                    .gap(px(8.0))
                     .child(div().when(editing, |left| {
-                        left.child(settings_danger_button(
-                            "Remove",
-                            "remove-host",
-                            cx,
-                            |this, cx| this.request_remove_host(cx),
-                        ))
+                        let host_id = reinstall_host_id.expect("editing host id");
+                        left.flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(px(7.0))
+                            .child(settings_danger_button(
+                                "Remove",
+                                "remove-host",
+                                cx,
+                                |this, cx| this.request_remove_host(cx),
+                            ))
+                            .child(
+                                div()
+                                    .debug_selector(|| "REINSTALL_REMOTE_ENVIRONMENT".into())
+                                    .child(surface_button(
+                                        "Reinstall Environment",
+                                        "reinstall-remote-environment",
+                                        cx,
+                                        move |this, cx| this.reinstall_host(&host_id, cx),
+                                    )),
+                            )
                     }))
                     .child(
                         div()
@@ -2232,20 +2538,10 @@ impl UtilitySurfaces {
             .host_editor
             .as_ref()
             .is_some_and(|host_editor| host_editor.active_field == field);
-        let value = if editor.is_empty() {
-            div()
-                .flex()
-                .items_center()
-                .text_color(SETTINGS_COLORS.tertiary)
-                .when(active, |value| value.child(query_label(editor)))
-                .child(placeholder)
-                .into_any_element()
-        } else if active {
-            query_label(editor)
-        } else {
-            div().child(editor.text().to_owned()).into_any_element()
-        };
+        let value = host_field_value(editor, placeholder, active, field);
+        let bounds_slot = Rc::clone(&self.host_field_bounds[field.index()]);
         div()
+            .min_w(px(0.0))
             .flex()
             .flex_col()
             .gap(px(5.0))
@@ -2256,9 +2552,13 @@ impl UtilitySurfaces {
                     .text_color(SETTINGS_COLORS.secondary)
                     .child(label),
             )
-            .child(
+            .child({
+                let debug_name = field.debug_name();
                 div()
                     .id(SharedString::from(format!("host-field-{field:?}")))
+                    .debug_selector(move || format!("HOST_FIELD_{debug_name}"))
+                    .relative()
+                    .min_w(px(0.0))
                     .h(px(34.0))
                     .px(px(10.0))
                     .rounded(px(Radius::BADGE))
@@ -2273,15 +2573,37 @@ impl UtilitySurfaces {
                         .alpha(if active { 0.075 } else { 0.04 }))
                     .flex()
                     .items_center()
+                    .overflow_hidden()
                     .font_family(crate::fonts::mono_family())
                     .text_size(px(11.0))
                     .text_color(SETTINGS_COLORS.primary)
                     .cursor(CursorStyle::IBeam)
-                    .on_click(cx.listener(move |this, _, window, cx| {
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         this.select_host_field(field, window, cx);
+                        let Some(bounds) = this.host_field_bounds[field.index()].get() else {
+                            return;
+                        };
+                        let x = (event.position().x - bounds.left() - px(10.0)).max(px(0.0));
+                        let offset = this.host_editor.as_ref().map_or(0, |editor| {
+                            text_offset_for_x(editor.field(field).text(), x, window)
+                        });
+                        if let Some(editor) = &mut this.host_editor {
+                            editor
+                                .field_mut()
+                                .set_cursor(offset, event.modifiers().shift);
+                        }
+                        cx.notify();
                     }))
-                    .child(value),
-            )
+                    .child(value)
+                    .child(
+                        canvas(
+                            move |bounds, _, _| bounds_slot.set(Some(bounds)),
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .inset_0(),
+                    )
+            })
     }
 
     fn terminal_theme_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -2338,7 +2660,7 @@ impl UtilitySurfaces {
                         }),
                 );
             }
-            control = control.child(settings_dropdown(options, 218.0));
+            control = control.child(settings_dropdown(options, 218.0, self.settings_colors()));
         }
         control.into_any_element()
     }
@@ -2385,7 +2707,7 @@ impl UtilitySurfaces {
                     },
                 ));
             }
-            control = control.child(settings_dropdown(options, 172.0));
+            control = control.child(settings_dropdown(options, 172.0, self.settings_colors()));
         }
         control.into_any_element()
     }
@@ -2420,7 +2742,7 @@ impl UtilitySurfaces {
                     },
                 ));
             }
-            control = control.child(settings_dropdown(options, 132.0));
+            control = control.child(settings_dropdown(options, 132.0, self.settings_colors()));
         }
         control.into_any_element()
     }
@@ -2469,7 +2791,7 @@ impl Render for UtilitySurfaces {
             // then paints no dim at all and the dialog centers on the window's
             // top edge, putting its tab list and close control off-window.
             .size_full()
-            .text_color(COLORS.primary);
+            .text_color(self.colors().primary);
         if let Some(overlay) = overlay {
             root.inset_0().child(
                 div()
@@ -2583,6 +2905,53 @@ fn text_editor(value: &str) -> QueryEditor {
     editor
 }
 
+fn host_field_value(
+    editor: &QueryEditor,
+    placeholder: &'static str,
+    active: bool,
+    field: HostFormField,
+) -> AnyElement {
+    let debug_name = field.debug_name();
+    let content = if active {
+        div()
+            .debug_selector(|| "host-field-caret".into())
+            .child(query_label(editor))
+            .into_any_element()
+    } else if editor.is_empty() {
+        div()
+            .debug_selector(move || format!("HOST_FIELD_PLACEHOLDER_{debug_name}"))
+            .text_color(SETTINGS_COLORS.tertiary)
+            .child(placeholder)
+            .into_any_element()
+    } else {
+        div().child(editor.text().to_owned()).into_any_element()
+    };
+    div()
+        .min_w(px(0.0))
+        .w_full()
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_ellipsis()
+        .child(content)
+        .into_any_element()
+}
+
+fn text_offset_for_x(text: &str, x: Pixels, window: &Window) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    let run = TextRun {
+        len: text.len(),
+        font: font(crate::fonts::mono_family()),
+        color: SETTINGS_COLORS.primary.into(),
+        ..TextRun::default()
+    };
+    window
+        .text_system()
+        .shape_line(text.to_owned().into(), px(11.0), &[run], None)
+        .closest_index_for_x(x)
+}
+
 fn danger_button(
     label: &'static str,
     cx: &mut Context<UtilitySurfaces>,
@@ -2622,28 +2991,7 @@ fn toggle_row(
         .cursor_pointer()
         .hover(|style| style.bg(SETTINGS_COLORS.primary.alpha(0.025)))
         .on_click(cx.listener(move |this, _, _, cx| handler(this, cx)))
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.0))
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .child(
-                    div()
-                        .text_size(px(Typo::ROW_EMPHASIZED.size))
-                        .font_weight(Typo::ROW_EMPHASIZED.weight)
-                        .text_color(SETTINGS_COLORS.primary)
-                        .child(label),
-                )
-                .child(
-                    div()
-                        .text_size(px(Typo::META.size))
-                        .line_height(px(14.0))
-                        .text_color(SETTINGS_COLORS.tertiary)
-                        .child(detail),
-                ),
-        )
+        .child(setting_text_stack(label.into(), detail.into()))
         .child(
             div()
                 .flex_none()
@@ -2697,36 +3045,122 @@ fn setting_row(
     detail: impl Into<SharedString>,
     control: impl IntoElement,
 ) -> impl IntoElement {
+    let label = label.into();
+    let detail = detail.into();
     div()
+        .debug_selector(|| "settings-row".into())
         .min_h(px(SETTINGS_ROW_HEIGHT))
         .px(px(12.0))
         .flex()
         .items_center()
         .justify_between()
         .gap(px(12.0))
+        .child(setting_text_stack(label, detail))
+        .child(control)
+}
+
+fn setting_text_stack(label: SharedString, detail: SharedString) -> AnyElement {
+    div()
+        .flex_1()
+        .min_w(px(0.0))
+        .flex()
+        .flex_col()
+        .gap(px(2.0))
+        .child(
+            div()
+                .min_w(px(0.0))
+                .w_full()
+                .whitespace_normal()
+                .text_size(px(Typo::ROW_EMPHASIZED.size))
+                .font_weight(Typo::ROW_EMPHASIZED.weight)
+                .text_color(SETTINGS_COLORS.primary)
+                .child(wrappable_setting_copy(label)),
+        )
+        .child(
+            div()
+                .debug_selector(|| "settings-row-detail".into())
+                .min_w(px(0.0))
+                .w_full()
+                .whitespace_normal()
+                .text_size(px(Typo::META.size))
+                .line_height(px(14.0))
+                .text_color(SETTINGS_COLORS.tertiary)
+                .child(wrappable_setting_copy(detail)),
+        )
+        .into_any_element()
+}
+
+fn wrappable_setting_copy(text: SharedString) -> SharedString {
+    let mut output = String::with_capacity(text.len());
+    let mut uninterrupted = 0usize;
+    for character in text.chars() {
+        output.push(character);
+        if character.is_whitespace() {
+            uninterrupted = 0;
+            continue;
+        }
+        uninterrupted += 1;
+        if matches!(
+            character,
+            '/' | '\\' | '.' | ':' | '-' | '_' | '@' | '?' | '&' | '='
+        ) || uninterrupted >= 24
+        {
+            output.push('\u{200b}');
+            uninterrupted = 0;
+        }
+    }
+    output.into()
+}
+
+fn settings_note(
+    icon: &'static str,
+    title: Option<&'static str>,
+    body: &'static str,
+    icon_color: Rgba,
+    border_color: Rgba,
+    background: Rgba,
+) -> AnyElement {
+    div()
+        .p(px(12.0))
+        .rounded(px(Radius::ROW))
+        .border_1()
+        .border_color(border_color)
+        .bg(background)
+        .flex()
+        .items_start()
+        .gap(px(10.0))
+        .child(sf_symbol(icon, 15.0, icon_color))
         .child(
             div()
                 .flex_1()
                 .min_w(px(0.0))
                 .flex()
                 .flex_col()
-                .gap(px(2.0))
+                .gap(px(4.0))
+                .when_some(title, |copy, title| {
+                    copy.child(
+                        div()
+                            .min_w(px(0.0))
+                            .w_full()
+                            .whitespace_normal()
+                            .text_size(px(Typo::TITLE.size))
+                            .font_weight(Typo::TITLE.weight)
+                            .child(wrappable_setting_copy(title.into())),
+                    )
+                })
                 .child(
                     div()
-                        .text_size(px(Typo::ROW_EMPHASIZED.size))
-                        .font_weight(Typo::ROW_EMPHASIZED.weight)
-                        .text_color(SETTINGS_COLORS.primary)
-                        .child(label.into()),
-                )
-                .child(
-                    div()
-                        .text_size(px(Typo::META.size))
-                        .line_height(px(14.0))
-                        .text_color(SETTINGS_COLORS.tertiary)
-                        .child(detail.into()),
+                        .debug_selector(|| "SETTINGS_NOTE_COPY".into())
+                        .min_w(px(0.0))
+                        .w_full()
+                        .whitespace_normal()
+                        .text_size(px(11.0))
+                        .line_height(px(17.0))
+                        .text_color(SETTINGS_COLORS.secondary)
+                        .child(wrappable_setting_copy(body.into())),
                 ),
         )
-        .child(control)
+        .into_any_element()
 }
 
 fn settings_page(title: &'static str, content: impl IntoElement) -> impl IntoElement {
@@ -2810,7 +3244,11 @@ fn settings_select_button(
         ))
 }
 
-fn settings_dropdown(content: impl IntoElement, width: f32) -> impl IntoElement {
+fn settings_dropdown(
+    content: impl IntoElement,
+    width: f32,
+    colors: SemanticColors,
+) -> impl IntoElement {
     deferred(
         div()
             .absolute()
@@ -2819,7 +3257,7 @@ fn settings_dropdown(content: impl IntoElement, width: f32) -> impl IntoElement 
             .w(px(width))
             .occlude()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(FloatingSurface::new(SETTINGS_COLORS, content)),
+            .child(FloatingSurface::new(colors, content)),
     )
     .with_priority(5)
 }
@@ -2991,6 +3429,26 @@ fn update_detail(state: &crate::updates::UpdateState, unsupported: bool) -> Stri
     format!("Last checked {ago}")
 }
 
+fn expire_completed_reinstall(
+    state: &mut Option<HostInitialization>,
+    id: &str,
+    operation: u64,
+) -> bool {
+    let should_expire = matches!(
+        state.as_ref(),
+        Some(HostInitialization::Ready {
+            id: state_id,
+            kind: HostPreparationKind::Reinstall,
+            operation: state_operation,
+            ..
+        }) if state_id == id && *state_operation == operation
+    );
+    if should_expire {
+        *state = None;
+    }
+    should_expire
+}
+
 fn relative_time(milliseconds: f64) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3056,6 +3514,368 @@ mod tests {
                 )
                 .child(self.surfaces.clone())
         }
+    }
+
+    #[test]
+    fn completed_reinstall_expires_without_clearing_a_newer_operation() {
+        let result = diri_proto::HostInitializeResult {
+            helper_build_id: "test-build".into(),
+            protocol: diri_proto::remote_pty::ProtocolVersion::CURRENT,
+            persistence: diri_proto::remote_pty::PersistenceCapability::NativeDetach,
+            cwd: "/Users/remote".into(),
+            shell: "/bin/zsh".into(),
+        };
+        let mut state = Some(HostInitialization::Ready {
+            id: "forge".into(),
+            name: "Forge".into(),
+            kind: HostPreparationKind::Reinstall,
+            operation: 7,
+            result: result.clone(),
+        });
+
+        expire_completed_reinstall(&mut state, "forge", 7);
+        assert!(state.is_none());
+
+        state = Some(HostInitialization::Ready {
+            id: "forge".into(),
+            name: "Forge".into(),
+            kind: HostPreparationKind::Reinstall,
+            operation: 8,
+            result,
+        });
+        expire_completed_reinstall(&mut state, "forge", 7);
+        assert!(state.is_some(), "a stale timer must preserve newer work");
+    }
+
+    struct CachedSettingsModalHarness {
+        surfaces: Entity<UtilitySurfaces>,
+    }
+
+    struct SettingRowHarness;
+
+    impl Render for SettingRowHarness {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .debug_selector(|| "settings-row-root".into())
+                .w(px(260.0))
+                .child(setting_row(
+                    "Long setting",
+                    "averylongremotehostdestinationwithoutnaturalwhitespaceorlinebreaks.example.internal",
+                    div().w(px(92.0)).child("Control"),
+                ))
+        }
+    }
+
+    #[gpui::test]
+    fn setting_copy_wraps_long_tokens_inside_the_component(cx: &mut TestAppContext) {
+        let (_view, cx) = cx.add_window_view(|_, _| SettingRowHarness);
+        let root = cx.debug_bounds("settings-row-root").expect("row root");
+        let row = cx.debug_bounds("settings-row").expect("setting row");
+        let detail = cx
+            .debug_bounds("settings-row-detail")
+            .expect("setting detail");
+
+        assert!(detail.right() <= root.right());
+        assert!(
+            row.size.height > px(SETTINGS_ROW_HEIGHT),
+            "a long token should wrap and grow the shared row"
+        );
+    }
+
+    #[gpui::test]
+    fn focused_empty_host_field_does_not_render_the_placeholder_as_input(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let updates = crate::updates::inert();
+        let (_view, cx) = cx.add_window_view(move |window, cx| {
+            let surfaces = cx.new(|cx| {
+                let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
+                surfaces.open_settings(cx);
+                surfaces.settings_tab = SettingsTab::Remote;
+                surfaces.begin_adding_host(window, cx);
+                surfaces
+            });
+            SettingsModalHarness {
+                surfaces,
+                background_events: Arc::new(AtomicUsize::new(0)),
+            }
+        });
+
+        assert!(cx.debug_bounds("host-field-caret").is_some());
+        assert!(
+            cx.debug_bounds("HOST_FIELD_PLACEHOLDER_NAME").is_none(),
+            "placeholder must not become editable-looking text beside the caret"
+        );
+    }
+
+    #[gpui::test]
+    fn remote_setting_copy_stays_inside_the_scrollable_pane(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let updates = crate::updates::inert();
+        let (_view, cx) = cx.add_window_view(move |window, cx| {
+            let surfaces = cx.new(|cx| {
+                let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
+                surfaces.open_settings(cx);
+                surfaces.settings_tab = SettingsTab::Remote;
+                surfaces
+            });
+            SettingsModalHarness {
+                surfaces,
+                background_events: Arc::new(AtomicUsize::new(0)),
+            }
+        });
+
+        let pane = cx.debug_bounds("settings-pane").expect("settings pane");
+        let copy = cx
+            .debug_bounds("SETTINGS_NOTE_COPY")
+            .expect("remote privacy copy");
+        assert!(
+            copy.right() <= pane.right(),
+            "remote copy escaped its pane: {copy:?} vs {pane:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn remote_initialization_is_visible_and_can_become_the_default_host(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let store = Arc::clone(&runtime.store);
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let updates = crate::updates::inert();
+        let (_view, cx) = cx.add_window_view(move |window, cx| {
+            let surfaces = cx.new(|cx| {
+                let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
+                let host = HostEntry {
+                    id: "forge".into(),
+                    name: Some("Forge".into()),
+                    ssh: "you@forge".into(),
+                    default_cwd: Some("~".into()),
+                    node: None,
+                };
+                surfaces.hosts = vec![host.clone()];
+                surfaces
+                    .store
+                    .write()
+                    .expect("session store lock poisoned")
+                    .set_hosts(vec![host]);
+                surfaces.host_initialization = Some(HostInitialization::Ready {
+                    id: "forge".into(),
+                    name: "Forge".into(),
+                    kind: HostPreparationKind::Initialize,
+                    operation: 1,
+                    result: diri_proto::HostInitializeResult {
+                        helper_build_id: "test-build".into(),
+                        protocol: diri_proto::remote_pty::ProtocolVersion::CURRENT,
+                        persistence: diri_proto::remote_pty::PersistenceCapability::NativeDetach,
+                        cwd: "/Users/remote".into(),
+                        shell: "/bin/zsh".into(),
+                    },
+                });
+                surfaces.open_settings(cx);
+                surfaces.settings_tab = SettingsTab::Remote;
+                surfaces
+            });
+            SettingsModalHarness {
+                surfaces,
+                background_events: Arc::new(AtomicUsize::new(0)),
+            }
+        });
+
+        assert!(cx.debug_bounds("HOST_INITIALIZATION").is_some());
+        let action = cx
+            .debug_bounds("HOST_INITIALIZATION_ACTION")
+            .expect("default host action")
+            .center();
+        cx.simulate_click(action, Modifiers::default());
+        assert_eq!(
+            store
+                .read()
+                .expect("session store lock poisoned")
+                .default_spawn_host()
+                .as_deref(),
+            Some("forge")
+        );
+    }
+
+    #[gpui::test]
+    fn editing_a_saved_host_offers_remote_environment_reinstallation(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let updates = crate::updates::inert();
+        let (_view, cx) = cx.add_window_view(move |window, cx| {
+            let surfaces = cx.new(|cx| {
+                let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
+                surfaces.hosts = vec![HostEntry {
+                    id: "forge".into(),
+                    name: Some("Forge".into()),
+                    ssh: "you@forge".into(),
+                    default_cwd: Some("~".into()),
+                    node: None,
+                }];
+                surfaces.open_settings(cx);
+                surfaces.settings_tab = SettingsTab::Remote;
+                surfaces.begin_editing_host("forge", window, cx);
+                surfaces
+            });
+            SettingsModalHarness {
+                surfaces,
+                background_events: Arc::new(AtomicUsize::new(0)),
+            }
+        });
+
+        assert!(
+            cx.debug_bounds("REINSTALL_REMOTE_ENVIRONMENT").is_some(),
+            "the saved SSH host editor must expose the reinstall action"
+        );
+    }
+
+    #[gpui::test]
+    fn clicking_a_host_field_places_the_caret_at_the_pointer(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let updates = crate::updates::inert();
+        let (view, cx) = cx.add_window_view(move |window, cx| {
+            let surfaces = cx.new(|cx| {
+                let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
+                surfaces.open_add_remote_host(window, cx);
+                surfaces
+                    .host_editor
+                    .as_mut()
+                    .expect("host editor")
+                    .name
+                    .insert("abcdef");
+                surfaces
+            });
+            SettingsModalHarness {
+                surfaces,
+                background_events: Arc::new(AtomicUsize::new(0)),
+            }
+        });
+        let surfaces = view.read_with(cx, |harness, _| harness.surfaces.clone());
+        let field = cx.debug_bounds("HOST_FIELD_NAME").expect("name field");
+
+        cx.simulate_click(
+            point(field.left() + px(11.0), field.center().y),
+            Modifiers::default(),
+        );
+        assert_eq!(
+            surfaces.read_with(cx, |surfaces, _| surfaces
+                .host_editor
+                .as_ref()
+                .expect("host editor")
+                .name
+                .cursor()),
+            0
+        );
+
+        cx.simulate_click(
+            point(field.right() - px(11.0), field.center().y),
+            Modifiers::default(),
+        );
+        assert_eq!(
+            surfaces.read_with(cx, |surfaces, _| surfaces
+                .host_editor
+                .as_ref()
+                .expect("host editor")
+                .name
+                .cursor()),
+            "abcdef".len()
+        );
+    }
+
+    #[gpui::test]
+    fn remote_host_shortcut_opens_the_add_form_directly(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let updates = crate::updates::inert();
+        let (view, cx) = cx.add_window_view(move |window, cx| {
+            let surfaces = cx.new(|cx| UtilitySurfaces::new(runtime, tokio, updates, window, cx));
+            SettingsModalHarness {
+                surfaces,
+                background_events: Arc::new(AtomicUsize::new(0)),
+            }
+        });
+        let surfaces = view.read_with(cx, |harness, _| harness.surfaces.clone());
+
+        surfaces.update_in(cx, |surfaces, window, cx| {
+            surfaces.open_add_remote_host(window, cx);
+        });
+
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(surfaces.surface, Surface::Settings);
+            assert_eq!(surfaces.settings_tab, SettingsTab::Remote);
+            assert!(surfaces.host_editor.is_some());
+        });
+    }
+
+    impl Render for CachedSettingsModalHarness {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .debug_selector(|| "cached-settings-root".into())
+                .size_full()
+                .child(crate::root::cached_window_overlay(self.surfaces.clone()))
+        }
+    }
+
+    #[gpui::test]
+    fn cached_settings_modal_stays_inside_window(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let updates = crate::updates::inert();
+        let (_view, cx) = cx.add_window_view(move |window, cx| {
+            let surfaces = cx.new(|cx| {
+                let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
+                surfaces.open_settings(cx);
+                surfaces
+            });
+            CachedSettingsModalHarness { surfaces }
+        });
+
+        let root = cx
+            .debug_bounds("cached-settings-root")
+            .expect("settings root should render");
+        let dialog = cx
+            .debug_bounds("settings-dialog")
+            .expect("settings dialog should render");
+
+        assert_eq!(dialog.center(), root.center());
+        assert!(dialog.top() >= root.top());
+        assert!(dialog.bottom() <= root.bottom());
     }
 
     #[gpui::test]

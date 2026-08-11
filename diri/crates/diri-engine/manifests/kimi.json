@@ -1,0 +1,192 @@
+{
+  "_notice": "Screen-detection predicates adapted from the herdr project (https://github.com/herdrdev/herdr, src/detect/manifests/*.toml), licensed Apache-2.0. Translated from herdr's TOML rule schema into Dirijor's JSON predicate schema and re-prioritised for this engine; the agent capability block is Dirijor's own.",
+  "schemaVersion": 2,
+  "id": "kimi",
+  "version": "2026.07.31.1",
+  "statusModel": "full",
+  "agent": {
+    "id": "kimi",
+    "displayName": "Kimi",
+    "shortLabel": "kimi",
+    "glyph": "\ud83c\udf19",
+    "aliases": [
+      "kimi",
+      "kimi-code",
+      "kimi-cli"
+    ],
+    "firstClass": true,
+    "statusAuthority": "screen",
+    "binary": "kimi",
+    "resume": {
+      "style": "flag",
+      "token": "--continue"
+    },
+    "returnToLoginShell": true,
+    "foregroundExecNames": [
+      "kimi"
+    ],
+    "_resumeNotice": "Verified against Kimi Code CLI docs: '--continue | -c | Continue the most recent session in the current working directory, without specifying an ID manually'. https://moonshotai.github.io/kimi-code/en/reference/kimi-command.html. --session is the picker/id form.",
+    "_resumeStyleNotice": "Rust's AgentDescriptor::resume_args implements only \"flag\" and \"sessionIDFlag\"; Swift's \"latest\" has no implementation there and would silently resume nothing. Declared as \"flag\": this agent has no sessionIDFlag, so it never carries a caller-minted id and resume_args emits the bare token \u2014 exactly the semantics the token was chosen for.",
+    "envScrubPrefixes": [
+      "DIRI_",
+      "DIRIJOR_"
+    ]
+  },
+  "rules": [
+    {
+      "id": "blocked-approval-panel",
+      "state": "blockedPermission",
+      "priority": 400,
+      "region": "whole_recent",
+      "when": {
+        "all": [
+          {
+            "contains": "\u21b5 confirm"
+          },
+          {
+            "any": [
+              {
+                "contains": "run this command?"
+              },
+              {
+                "contains": "write this file?"
+              },
+              {
+                "contains": "apply these edits?"
+              },
+              {
+                "contains": "stop this task?"
+              },
+              {
+                "contains": "ready to build with this plan?"
+              },
+              {
+                "lineRegex": "(?i)^\\s*\u25b6?\\s*approve .*\\?$"
+              }
+            ]
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "blocked-question-panel",
+      "state": "blockedQuestion",
+      "priority": 390,
+      "region": "whole_recent",
+      "when": {
+        "all": [
+          {
+            "contains": "\u2191\u2193 select"
+          },
+          {
+            "contains": "esc cancel"
+          },
+          {
+            "any": [
+              {
+                "lineRegex": "(?i)^\\s*question\\s*$"
+              },
+              {
+                "lineRegex": "^\\s*\\? "
+              }
+            ]
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "blocked-legacy-approval",
+      "state": "blockedPermission",
+      "priority": 300,
+      "region": "whole_recent",
+      "when": {
+        "all": [
+          {
+            "contains": "requesting approval"
+          },
+          {
+            "contains": "reject"
+          },
+          {
+            "any": [
+              {
+                "contains": "approve once"
+              },
+              {
+                "contains": "approve for this session"
+              }
+            ]
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "working-thinking",
+      "state": "working",
+      "priority": 120,
+      "region": "whole_recent",
+      "when": {
+        "regex": "(?i)\\bkimi[-\\w.]*\\s+thinking\\b"
+      }
+    },
+    {
+      "id": "working-moon-spinner",
+      "state": "working",
+      "priority": 100,
+      "region": "whole_recent",
+      "when": {
+        "lineRegex": "^\\s*(\ud83c\udf15|\ud83c\udf16|\ud83c\udf17|\ud83c\udf18|\ud83c\udf11|\ud83c\udf12|\ud83c\udf13|\ud83c\udf14)\\s*$"
+      }
+    },
+    {
+      "id": "working-spinner-verb",
+      "state": "working",
+      "priority": 90,
+      "region": "whole_recent",
+      "when": {
+        "all": [
+          {
+            "lineRegex": "^\\s*[\\u2800-\\u28FF]"
+          },
+          {
+            "any": [
+              {
+                "contains": "thinking..."
+              },
+              {
+                "contains": "working..."
+              },
+              {
+                "contains": "using "
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

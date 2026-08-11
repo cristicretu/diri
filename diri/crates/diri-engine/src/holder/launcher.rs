@@ -98,10 +98,7 @@ impl HolderLauncher {
             .ok()
             .and_then(|exe| exe.canonicalize().ok())
             .and_then(|exe| exe.parent().map(Path::to_path_buf));
-        let candidates: Vec<PathBuf> = beside
-            .iter()
-            .flat_map(|dir| ["diri-holder", "dirijord-holder"].map(|name| dir.join(name)))
-            .collect();
+        let candidates: Vec<PathBuf> = beside.iter().map(|dir| dir.join("diri-holder")).collect();
         candidates
             .iter()
             .find(|candidate| is_executable(candidate))

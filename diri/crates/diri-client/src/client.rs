@@ -483,6 +483,52 @@ impl DaemonClient {
             .await
     }
 
+    /// Bootstraps and validates one configured SSH host. This remains an
+    /// Engine RPC so the desktop app never executes SSH or handles protocol
+    /// credentials itself.
+    pub async fn initialize_host(&self, host: &str) -> Result<HostInitializeResult, ClientError> {
+        self.prepare_host(host, false).await
+    }
+
+    /// Re-runs the complete verified upload/bootstrap path for a configured
+    /// host. Existing Holder sessions keep their creation-time Helper.
+    pub async fn reinstall_host(&self, host: &str) -> Result<HostInitializeResult, ClientError> {
+        self.prepare_host(host, true).await
+    }
+
+    async fn prepare_host(
+        &self,
+        host: &str,
+        force_reinstall: bool,
+    ) -> Result<HostInitializeResult, ClientError> {
+        self.core
+            .request_typed(
+                Method::HOST_INITIALIZE,
+                Some(&HostInitializeParams {
+                    host: host.to_owned(),
+                    force_reinstall,
+                }),
+                Some(Duration::from_secs(600)),
+            )
+            .await
+    }
+
+    /// Lists exactly one directory level on the Engine-selected machine.
+    /// Remote requests stay behind the Engine's authenticated SSH transport.
+    pub async fn list_directories(
+        &self,
+        host: Option<String>,
+        path: String,
+    ) -> Result<HostListDirectoriesResult, ClientError> {
+        self.core
+            .request_typed(
+                Method::HOST_LIST_DIRECTORIES,
+                Some(&HostListDirectoriesParams { host, path }),
+                Some(Duration::from_secs(30)),
+            )
+            .await
+    }
+
     /// `host.locate_repo`: cached daemon-side; the first remote lookup still
     /// crosses ssh, hence the explicit timeout.
     pub async fn locate_repo(
@@ -527,21 +573,6 @@ impl DaemonClient {
                 session_id: session_id.clone(),
                 cols,
                 rows,
-            },
-        )
-        .await
-    }
-
-    pub async fn set_owner(
-        &self,
-        session_id: &SessionId,
-        role: ClientRole,
-    ) -> Result<(), ClientError> {
-        self.empty(
-            Method::SESSION_SET_OWNER,
-            &SessionSetOwnerParams {
-                session_id: session_id.clone(),
-                role,
             },
         )
         .await
@@ -709,13 +740,10 @@ impl DaemonClient {
         self.no_params(Method::STATE_SNAPSHOT).await
     }
 
-    /// Applies an explicit, user-initiated companion-access change. This is the
-    /// single global daemon operation exposed by diri: Settings writes
-    /// `remote.json`, then asks the daemon to persist and exit so its listener is
-    /// rebuilt from that file. It is never used for automatic upgrades or startup.
-    pub async fn restart_daemon_for_remote_config(&self) -> Result<(), ClientError> {
-        let _: EmptyResult = self.no_params(Method::DAEMON_SHUTDOWN).await?;
-        Ok(())
+    /// Releases an App-owned Engine only when the Engine itself confirms that
+    /// no live session and no other control client still needs it.
+    pub async fn shutdown_daemon_if_idle(&self) -> Result<DaemonShutdownIfIdleResult, ClientError> {
+        self.no_params(Method::DAEMON_SHUTDOWN_IF_IDLE).await
     }
 
     async fn typed<P, R>(&self, method: &str, params: &P) -> Result<R, ClientError>
@@ -824,6 +852,14 @@ async fn run_once(core: Arc<ClientCore>, shutdown: &mut watch::Receiver<bool>) -
             };
         }
     };
+    if hello.engine_kind.as_deref() != Some(diri_proto::RUST_ENGINE_KIND) {
+        return AttemptOutcome {
+            error: ClientError::protocol(
+                "the daemon socket is not owned by the authoritative Rust Engine",
+            ),
+            established: false,
+        };
+    }
 
     if core.want_events.load(Ordering::Acquire) {
         let subscribed = tokio::select! {

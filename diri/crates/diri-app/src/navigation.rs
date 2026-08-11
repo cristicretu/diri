@@ -580,11 +580,17 @@ impl NavigationOverlay {
                     .sync_prefs(host);
                 self.close_overlay(cx);
             }
-            PaletteCommand::SpawnShell => {
+            PaletteCommand::SpawnShell { host } => {
                 self.store
                     .write()
                     .expect("session store lock poisoned")
-                    .spawn_shell(SpawnOptions::default());
+                    .spawn_kind(
+                        diri_proto::AgentKind::SHELL,
+                        SpawnOptions {
+                            host,
+                            ..SpawnOptions::default()
+                        },
+                    );
                 self.close_overlay(cx);
             }
             PaletteCommand::OpenQuickOpen => {
@@ -632,11 +638,13 @@ impl NavigationOverlay {
                 .collect();
             let hosts = store.hosts().to_vec();
             let selected = store.selected_session().cloned();
-            let actions = palette::actions(
+            let default_host = store.default_spawn_host();
+            let actions = palette::actions_for_default_host(
                 store.preferences().default_agent,
                 &projects,
                 &hosts,
                 selected.as_ref(),
+                default_host.as_deref(),
             );
             (actions, store.ordered_sessions())
         };
@@ -661,7 +669,10 @@ impl NavigationOverlay {
     }
 
     fn render_overlay(&mut self, layout: OverlayLayout, cx: &mut Context<Self>) -> AnyElement {
-        let colors = SemanticColors::dark();
+        let colors = {
+            let store = self.store.read().expect("session store lock poisoned");
+            crate::app_theme::colors(&store.preferences().terminal_theme)
+        };
         let content = match self.overlay {
             Some(Overlay::CommandPalette) => self.render_command_palette(layout, colors, cx),
             Some(Overlay::QuickOpen) => self.render_quick_open(layout, colors, cx),
@@ -1337,7 +1348,7 @@ mod tests {
                 .child(div().absolute().inset_0().on_scroll_wheel(move |_, _, _| {
                     background_scrolls.fetch_add(1, AtomicOrdering::Relaxed);
                 }))
-                .child(self.overlay.clone())
+                .child(crate::root::cached_window_overlay(self.overlay.clone()))
         }
     }
 

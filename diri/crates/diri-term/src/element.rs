@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 use diri_proto::grid::{GridCell, GridUpdate};
 use gpui::{
     App, Bounds, ContentMask, Element, ElementId, FocusHandle, Font, FontFallbacks, FontId,
-    GlobalElementId, InspectorElementId, IntoElement, LayoutId, PaintQuad, Pixels, Point,
-    ShapedLine, SharedString, Style, TextAlign, TextRun, Window, fill, font, point, px, relative,
-    size,
+    GlobalElementId, InputHandler, InspectorElementId, IntoElement, LayoutId, PaintQuad, Pixels,
+    Point, ShapedLine, SharedString, Style, TextAlign, TextRun, UTF16Selection, Window, fill, font,
+    point, px, relative, size,
 };
 
 use crate::buffer::{ApplySummary, GridBuffer};
@@ -24,6 +24,7 @@ use crate::theme::{ResolvedCellStyle, TermTheme, is_default_background};
 static NEXT_ELEMENT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub type SharedGridBuffer = Arc<RwLock<GridBuffer>>;
+type TextInputCallback = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// A command-clickable reference rendered in a terminal row.
 ///
@@ -63,8 +64,127 @@ pub struct TerminalElement {
     font: Font,
     font_size: Pixels,
     focus_handle: Option<FocusHandle>,
+    text_input: Option<TextInputCallback>,
+    ime_state: Arc<Mutex<TerminalImeState>>,
     focus_override: Option<bool>,
     suspended: bool,
+}
+
+#[derive(Default)]
+struct TerminalImeState {
+    marked_text: String,
+}
+
+impl TerminalImeState {
+    fn marked_range(&self) -> Option<std::ops::Range<usize>> {
+        (!self.marked_text.is_empty()).then(|| 0..self.marked_text.encode_utf16().count())
+    }
+}
+
+struct TerminalInputHandler {
+    text_input: TextInputCallback,
+    ime_state: Arc<Mutex<TerminalImeState>>,
+    cursor_bounds: Bounds<Pixels>,
+    cell_width: Pixels,
+}
+
+impl TerminalInputHandler {
+    fn commit_text(&self, text: &str) {
+        mutex_lock(&self.ime_state).marked_text.clear();
+        (self.text_input)(text);
+    }
+
+    fn mark_text(&self, text: &str) {
+        text.clone_into(&mut mutex_lock(&self.ime_state).marked_text);
+    }
+}
+
+impl InputHandler for TerminalInputHandler {
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection {
+            range: 0..0,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<std::ops::Range<usize>> {
+        mutex_lock(&self.ime_state).marked_range()
+    }
+
+    fn text_for_range(
+        &mut self,
+        _range_utf16: std::ops::Range<usize>,
+        _adjusted_range: &mut Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<String> {
+        None
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _replacement_range: Option<std::ops::Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        _cx: &mut App,
+    ) {
+        self.commit_text(text);
+        window.invalidate_character_coordinates();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range_utf16: Option<std::ops::Range<usize>>,
+        new_text: &str,
+        _new_selected_range: Option<std::ops::Range<usize>>,
+        window: &mut Window,
+        _cx: &mut App,
+    ) {
+        self.mark_text(new_text);
+        window.invalidate_character_coordinates();
+    }
+
+    fn unmark_text(&mut self, window: &mut Window, _cx: &mut App) {
+        mutex_lock(&self.ime_state).marked_text.clear();
+        window.invalidate_character_coordinates();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: std::ops::Range<usize>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<Bounds<Pixels>> {
+        let mut bounds = self.cursor_bounds;
+        bounds.origin.x += self.cell_width * range_utf16.start as f32;
+        Some(bounds)
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<usize> {
+        None
+    }
+
+    fn apple_press_and_hold_enabled(&mut self) -> bool {
+        false
+    }
+
+    fn prefers_ime_for_printable_keys(&mut self, _window: &mut Window, _cx: &mut App) -> bool {
+        true
+    }
 }
 
 struct ElementSharedState {
@@ -222,6 +342,8 @@ impl TerminalElement {
             font: terminal_font,
             font_size: px(13.0),
             focus_handle: None,
+            text_input: None,
+            ime_state: Arc::new(Mutex::new(TerminalImeState::default())),
             focus_override: None,
             suspended: false,
         }
@@ -273,6 +395,13 @@ impl TerminalElement {
     pub fn focus_handle(mut self, focus_handle: FocusHandle) -> Self {
         self.focus_handle = Some(focus_handle);
         self.focus_override = None;
+        self
+    }
+
+    /// Receives committed platform text, including multi-stage IME input.
+    #[must_use]
+    pub fn on_text_input(mut self, handler: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        self.text_input = Some(Arc::new(handler));
         self
     }
 
@@ -905,6 +1034,38 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        if let (Some(focus_handle), Some(text_input)) = (&self.focus_handle, &self.text_input) {
+            let (cursor_bounds, cell_width) = match (prepaint.metrics, prepaint.cursor.as_ref()) {
+                (Some(metrics), Some(cursor)) => (
+                    Bounds::new(
+                        point(
+                            bounds.left() + metrics.x_for_col(cursor.col),
+                            bounds.top() + metrics.y_for_row(cursor.row),
+                        ),
+                        size(metrics.cell_width, metrics.line_height),
+                    ),
+                    metrics.cell_width,
+                ),
+                (Some(metrics), None) => (
+                    Bounds::new(bounds.origin, size(metrics.cell_width, metrics.line_height)),
+                    metrics.cell_width,
+                ),
+                (None, _) => (
+                    Bounds::new(bounds.origin, size(px(1.0), self.font_size * 1.4)),
+                    px(1.0),
+                ),
+            };
+            window.handle_input(
+                focus_handle,
+                TerminalInputHandler {
+                    text_input: Arc::clone(text_input),
+                    ime_state: Arc::clone(&self.ime_state),
+                    cursor_bounds,
+                    cell_width,
+                },
+                cx,
+            );
+        }
         let Some(metrics) = prepaint.metrics else {
             return;
         };
@@ -1348,7 +1509,14 @@ fn write_lock<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
 
 #[cfg(test)]
 mod link_tests {
-    use super::{TerminalReference, file_reference_from_run, reference_from_run, url_from_run};
+    use std::sync::{Arc, Mutex};
+
+    use gpui::{Bounds, point, px, size};
+
+    use super::{
+        TerminalImeState, TerminalInputHandler, TerminalReference, file_reference_from_run,
+        mutex_lock, reference_from_run, url_from_run,
+    };
 
     #[test]
     fn terminal_renderer_never_creates_autonomous_frame_tasks() {
@@ -1364,6 +1532,43 @@ mod link_tests {
             !source.contains(&periodic_timer),
             "the terminal cursor must not own a periodic frame timer"
         );
+    }
+
+    #[test]
+    fn focused_terminal_registers_a_platform_input_handler_for_ime() {
+        let source = include_str!("element.rs");
+        let registration = ["window.", "handle_input("].concat();
+        let ime_priority = ["fn prefers_ime", "_for_printable_keys"].concat();
+        assert!(
+            source.contains(&registration),
+            "a key-down listener cannot receive marked or committed IME text"
+        );
+        assert!(
+            source.contains(&ime_priority),
+            "composition input sources must reach the IME before terminal key bindings"
+        );
+    }
+
+    #[test]
+    fn ime_tracks_marked_utf16_and_commits_utf8_exactly_once() {
+        let committed = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&committed);
+        let state = Arc::new(Mutex::new(TerminalImeState::default()));
+        let handler = TerminalInputHandler {
+            text_input: Arc::new(move |text| {
+                mutex_lock(&sink).push(text.to_owned());
+            }),
+            ime_state: Arc::clone(&state),
+            cursor_bounds: Bounds::new(point(px(0.0), px(0.0)), size(px(8.0), px(16.0))),
+            cell_width: px(8.0),
+        };
+
+        handler.mark_text("ni");
+        assert_eq!(mutex_lock(&state).marked_range(), Some(0..2));
+        handler.commit_text("你");
+
+        assert!(mutex_lock(&state).marked_range().is_none());
+        assert_eq!(&*mutex_lock(&committed), &["你"]);
     }
 
     #[test]

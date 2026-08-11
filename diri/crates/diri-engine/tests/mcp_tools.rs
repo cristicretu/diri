@@ -23,8 +23,7 @@ use diri_proto::{
 use serde_json::{Value, json};
 
 fn manifest_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../Sources/DirijorCore/Resources/manifests")
+    diri_engine::detect::bundled_manifest_dir()
         .canonicalize()
         .expect("manifests")
 }
@@ -56,8 +55,8 @@ fn record(id: &str, parent: Option<&str>) -> SessionRecord {
         last_seen_at: None,
         pinned: false,
         archived_at: None,
-        remote_active: false,
         host: None,
+        remote_persistence: None,
         hibernation: None,
         memory_bytes: None,
         artifacts: None,
@@ -78,6 +77,7 @@ fn spec(id: &str, script: &str, logs: &Path) -> SessionSpec {
         authority: Authority::ProcessOnly,
         logs_dir: logs.to_path_buf(),
         holder: None,
+        remote: None,
         defer_launch: false,
     }
 }
@@ -407,6 +407,19 @@ fn spawn_agent_starts_a_session_owned_by_its_caller() {
     )
     .expect_err("bad cwd");
     assert!(bad_cwd.contains("not a directory"), "got {bad_cwd}");
+
+    // Old clients may still send `host`; fail before cwd inspection, host
+    // lookup, code sync, or session creation while the new transport is dark.
+    let unavailable = call(
+        &server,
+        "spawn_agent",
+        json!({ "kind": "claude-code", "cwd": "/no/such/dir", "host": "forge" }),
+    )
+    .expect_err("remote transport unavailable");
+    assert!(
+        unavailable.contains("remote_transport_unavailable"),
+        "got {unavailable}"
+    );
 
     assert_eq!(
         registry.lock().expect("registry").live_count(),

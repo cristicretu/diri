@@ -12,10 +12,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use diri_client::{ClientError, ConnectionState, DaemonClient, EventEnvelope};
 use diri_proto::paths::DirijorPaths;
+use diri_proto::remote_pty::DirectoryListResult;
 use diri_proto::{
-    AgentDescriptor, AgentKind, AgentReadinessResult, AttentionLevel, ClientRole, DateMillis,
-    EventName, ExitReason, GovernorConfigureParams, HostEntry, HostsConfig, Project, ProjectId,
-    Resumability, SessionId, SessionListResult, SessionRecord, SessionSpawnParams, SessionStatus,
+    AgentDescriptor, AgentKind, AgentReadinessResult, AttentionLevel, DateMillis, EventName,
+    ExitReason, GovernorConfigureParams, HostEntry, HostsConfig, Project, ProjectId, Resumability,
+    SessionId, SessionListResult, SessionRecord, SessionSpawnParams, SessionStatus,
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -121,13 +122,16 @@ pub enum StoreEffect {
         host: Option<String>,
         session_id: SessionId,
     },
+    /// One bounded level for the New Agent folder picker. Results are keyed by
+    /// generation so a slow host cannot overwrite a newer navigation click.
+    ListDirectories {
+        request_id: u64,
+        host: Option<String>,
+        path: String,
+    },
     ReopenLast,
     SetActive(bool),
     ConfigureGovernor(GovernorConfigureParams),
-    SetOwner {
-        id: SessionId,
-        role: ClientRole,
-    },
     /// T11 consumes this by closing and dropping the corresponding attachment.
     DetachAttachment(SessionId),
     /// T15 consumes this without involving daemon lifecycle operations.
@@ -195,6 +199,21 @@ pub enum RepoTarget {
     NoOrigin,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DirectoryListingState {
+    Loading,
+    Ready(DirectoryListResult),
+    Error(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryListing {
+    pub request_id: u64,
+    pub host: Option<String>,
+    pub requested_path: String,
+    pub state: DirectoryListingState,
+}
+
 fn repo_target_key(host: Option<&str>) -> String {
     host.unwrap_or("local").to_owned()
 }
@@ -222,6 +241,8 @@ pub struct SessionStore {
     repo_targets: HashMap<String, RepoTarget>,
     /// The session whose repo the popover preserves (selected at open time).
     repo_target_session: Option<SessionId>,
+    directory_request_seq: u64,
+    directory_listing: Option<DirectoryListing>,
     prefs: Prefs,
     terminal_residency: TerminalResidency,
     app_is_active: bool,
@@ -280,6 +301,8 @@ impl SessionStore {
                 syncing_prefs: HashSet::new(),
                 repo_targets: HashMap::new(),
                 repo_target_session: None,
+                directory_request_seq: 0,
+                directory_listing: None,
                 prefs,
                 terminal_residency: TerminalResidency::default(),
                 app_is_active: true,
@@ -306,6 +329,7 @@ impl SessionStore {
         self.hosts = std::env::var_os("HOME")
             .map(|home| HostsConfig::load(DirijorPaths::hosts_config_file(home)).hosts)
             .unwrap_or_default();
+        self.repair_default_spawn_host();
     }
 
     /// Installs the agent catalog fetched on connect.
@@ -325,6 +349,7 @@ impl SessionStore {
     /// Test/preview seam: inject a host catalog without touching the disk.
     pub fn set_hosts(&mut self, hosts: Vec<HostEntry>) {
         self.hosts = hosts;
+        self.repair_default_spawn_host();
     }
 
     pub fn hosts(&self) -> &[HostEntry] {
@@ -340,6 +365,44 @@ impl SessionStore {
     pub fn host_display_name(&self, id: &str) -> String {
         self.host(id)
             .map_or_else(|| id.to_owned(), |host| host.display_name().to_owned())
+    }
+
+    /// Host used by the global new-session shortcuts. `None` means this Mac.
+    /// A removed host can never remain the effective default.
+    pub fn default_spawn_host(&self) -> Option<String> {
+        self.prefs
+            .default_spawn_host
+            .as_deref()
+            .filter(|id| self.host(id).is_some())
+            .map(str::to_owned)
+    }
+
+    /// Selects where global new-session shortcuts run and persists the choice.
+    /// The new-agent picker calls this when its target changes, making the
+    /// checkmarked machine and the shortcut destination one coherent state.
+    pub fn set_default_spawn_host(&mut self, host: Option<String>) {
+        let host = host.filter(|id| self.host(id).is_some());
+        if self.prefs.default_spawn_host == host {
+            return;
+        }
+        self.prefs.default_spawn_host = host;
+        if let Err(error) = self.persist_preferences() {
+            eprintln!("diri: could not save the default spawn host: {error}");
+        }
+    }
+
+    fn repair_default_spawn_host(&mut self) {
+        if self
+            .prefs
+            .default_spawn_host
+            .as_deref()
+            .is_some_and(|id| self.host(id).is_none())
+        {
+            self.prefs.default_spawn_host = None;
+            if let Err(error) = self.persist_preferences() {
+                eprintln!("diri: could not clear a removed default host: {error}");
+            }
+        }
     }
 
     pub fn load_default() -> io::Result<(Self, mpsc::UnboundedReceiver<StoreEffect>)> {
@@ -448,12 +511,12 @@ impl SessionStore {
 
     /// Called when the new-agent popover opens: repo resolution restarts
     /// against the currently selected session, while the target defaults to
-    /// where the most recent agent was opened.
+    /// the configured shortcut destination.
     pub fn begin_repo_targeting(&mut self) -> Option<String> {
         self.repo_targets.clear();
         self.repo_target_session = self.selected_session_id.clone();
         self.prefs
-            .last_spawn_host
+            .default_spawn_host
             .clone()
             .filter(|host| self.host(host).is_some())
     }
@@ -479,6 +542,53 @@ impl SessionStore {
 
     pub fn repo_target(&self, host: Option<&str>) -> Option<&RepoTarget> {
         self.repo_targets.get(&repo_target_key(host))
+    }
+
+    pub fn request_directory_listing(&mut self, host: Option<String>, path: String) {
+        self.directory_request_seq = self.directory_request_seq.wrapping_add(1);
+        let request_id = self.directory_request_seq;
+        self.directory_listing = Some(DirectoryListing {
+            request_id,
+            host: host.clone(),
+            requested_path: path.clone(),
+            state: DirectoryListingState::Loading,
+        });
+        self.emit(StoreEffect::ListDirectories {
+            request_id,
+            host,
+            path,
+        });
+    }
+
+    pub fn directory_listing(
+        &self,
+        host: Option<&str>,
+        requested_path: &str,
+    ) -> Option<&DirectoryListingState> {
+        self.directory_listing
+            .as_ref()
+            .filter(|listing| {
+                listing.host.as_deref() == host && listing.requested_path == requested_path
+            })
+            .map(|listing| &listing.state)
+    }
+
+    fn finish_directory_listing(
+        &mut self,
+        request_id: u64,
+        result: Result<DirectoryListResult, String>,
+    ) {
+        let Some(listing) = self
+            .directory_listing
+            .as_mut()
+            .filter(|listing| listing.request_id == request_id)
+        else {
+            return;
+        };
+        listing.state = match result {
+            Ok(result) => DirectoryListingState::Ready(result),
+            Err(error) => DirectoryListingState::Error(error),
+        };
     }
 
     pub fn set_repo_target(&mut self, key: String, target: RepoTarget) {
@@ -775,6 +885,25 @@ impl SessionStore {
             self.agents.descriptor(session.effective_kind()),
         );
         let arriving_archived = session.is_archived();
+        // Closing the tab also drops the Engine record and deletes the
+        // session's output log, so it may only happen where nothing is lost.
+        // A clean `exit 0` from something with no conversation to return to —
+        // a shell — is that case. A crash, a signal (macOS memory pressure
+        // kills agents with SIGTERM), or anything resumable stays listed with
+        // its exit pill and Resume button: that is the whole point of deriving
+        // resumability for exited sessions, and the scrollback is the only
+        // record of what went wrong.
+        let should_auto_close = !self.closing.contains(&id)
+            && matches!(
+                &session.status,
+                SessionStatus::Exited(info)
+                    if info.reason == ExitReason::Exited
+                        && info.code == Some(0)
+                        && session.resumability != Resumability::Resumable
+            )
+            && previous
+                .as_deref()
+                .is_none_or(|record| !matches!(record.status, SessionStatus::Exited(_)));
         self.sessions.insert(id.clone(), Arc::new(session));
         // Spawn selects the id before the authoritative record arrives, and
         // only focus_session grants terminal residency -- without this, a
@@ -792,6 +921,13 @@ impl SessionStore {
         self.invalidate_projection();
         for transition in transitions {
             self.emit(StoreEffect::StatusTransition(transition));
+        }
+        if should_auto_close {
+            // Process exit is terminal UI state, not a historical tab. Hide
+            // the row and detach its terminal immediately; `session.remove`
+            // then clears the authoritative Engine record.
+            self.remove_sessions(vec![id]);
+            return;
         }
         self.auto_resume_if_needed(&id);
         if is_new {
@@ -1281,10 +1417,6 @@ impl SessionStore {
         });
     }
 
-    pub fn set_owner(&self, id: SessionId, role: ClientRole) {
-        self.emit(StoreEffect::SetOwner { id, role });
-    }
-
     pub fn rename(&mut self, id: SessionId, title: impl Into<String>) {
         let title = title.into();
         if let Some(session) = self.sessions.get_mut(&id) {
@@ -1300,11 +1432,17 @@ impl SessionStore {
         self.emit(StoreEffect::ReopenLast);
     }
 
-    pub fn spawn_default(&mut self, options: SpawnOptions) {
+    pub fn spawn_default(&mut self, mut options: SpawnOptions) {
+        if options.host.is_none() && options.cwd.is_none() && options.same_repo_as.is_none() {
+            options.host = self.default_spawn_host();
+        }
         self.spawn_kind(self.prefs.default_agent.kind(), options);
     }
 
-    pub fn spawn_shell(&mut self, options: SpawnOptions) {
+    pub fn spawn_shell(&mut self, mut options: SpawnOptions) {
+        if options.host.is_none() && options.cwd.is_none() && options.same_repo_as.is_none() {
+            options.host = self.default_spawn_host();
+        }
         self.spawn_kind(AgentKind::SHELL, options);
     }
 
@@ -1338,12 +1476,6 @@ impl SessionStore {
 
     pub fn spawn_kind(&mut self, kind: AgentKind, options: SpawnOptions) {
         let host = options.host;
-        if self.prefs.last_spawn_host != host {
-            self.prefs.last_spawn_host.clone_from(&host);
-            if let Err(error) = self.persist_preferences() {
-                eprintln!("diri: could not remember the last spawn target: {error}");
-            }
-        }
         let cwd = if let Some(host_id) = &host {
             // Remote spawn: local directories are meaningless — use the
             // explicit remote override or the host's default cwd.
@@ -1975,6 +2107,27 @@ async fn run_effects(
                     .set_repo_target(key, target);
                 Ok(())
             }
+            StoreEffect::ListDirectories {
+                request_id,
+                host,
+                path,
+            } => {
+                let client = Arc::clone(&client);
+                let store = Arc::clone(&store);
+                let change_tx = change_tx.clone();
+                tokio::spawn(async move {
+                    let result = client
+                        .list_directories(host, path)
+                        .await
+                        .map_err(|error| error.to_string());
+                    store
+                        .write()
+                        .expect("session store lock poisoned")
+                        .finish_directory_listing(request_id, result);
+                    let _ = change_tx.send(());
+                });
+                Ok(())
+            }
             StoreEffect::ReopenLast => match client.reopen_last().await {
                 Ok(record) => {
                     let id = record.id.clone();
@@ -1987,7 +2140,6 @@ async fn run_effects(
             },
             StoreEffect::SetActive(active) => client.set_active(active).await,
             StoreEffect::ConfigureGovernor(settings) => client.configure_governor(settings).await,
-            StoreEffect::SetOwner { id, role } => client.set_owner(&id, role).await,
             StoreEffect::DetachAttachment(id) => {
                 let _ = detach_tx.send(id);
                 Ok(())

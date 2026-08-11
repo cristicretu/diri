@@ -1,14 +1,9 @@
-//! dirijord-rs — the Rust Dirijor daemon.
+//! dirijord-rs — the authoritative local Diri Engine.
 //!
-//! Drop-in for the Swift `dirijord`: same socket, same on-disk state, same
-//! wire protocol, same holder adoption. Point the app at it with
-//! `DIRIJORD_PATH` (the launch override `daemon_launch.rs` already honors) to
-//! opt a machine in; live sessions carry over because both daemons speak the
-//! same holder protocol.
-//!
-//! Known gaps vs the Swift daemon, all answering clean `not_found`s:
-//! session.migrate, host.*, test.run (browser pool), remote-host spawning,
-//! mobile ownership arbitration, resource sampling.
+//! It owns local and remote session orchestration. Remote phase-one spawning,
+//! reconnect and adoption are implemented here; later remote hooks, MCP,
+//! migration and resource features remain explicit non-goals rather than
+//! reasons to delegate remote behavior to another daemon.
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -123,15 +118,17 @@ fn main() {
     let registry = Arc::new(Mutex::new(registry));
 
     let cli_path = exe_dir.join("dirijor");
-    let server = Arc::new(
-        ControlServer::new(Arc::clone(&registry), app_support.join("daemon.sock"))
-            .with_logs_dir(&logs_dir)
-            .with_holder(holder)
-            .with_injection(InjectionConfig {
-                inject_dir: app_support.join("inject"),
-                cli_path,
-            }),
-    );
+    let mut server = ControlServer::new(Arc::clone(&registry), app_support.join("daemon.sock"))
+        .with_logs_dir(&logs_dir)
+        .with_holder(holder)
+        .with_injection(InjectionConfig {
+            inject_dir: app_support.join("inject"),
+            cli_path,
+        });
+    if let Some(remote) = remote_manager(&exe_dir, &app_support) {
+        server = server.with_remote(remote);
+    }
+    let server = Arc::new(server);
     let listener = match server.bind() {
         Ok(listener) => listener,
         Err(error) => {
@@ -145,6 +142,10 @@ fn main() {
             });
         }
     };
+
+    // Only once the socket is accepting: remote adoption is SSH-bound and must
+    // never be what a client waits behind.
+    server.spawn_remote_restore();
 
     let _watcher = diri_engine::events::spawn_registry_watcher(
         Arc::clone(&registry),
@@ -261,17 +262,15 @@ fn app_support_dir() -> PathBuf {
 }
 
 #[cfg(unix)]
-/// Base catalog next to the executable (the SPM resource bundle layout the
-/// app ships), then user overrides, then dev-checkout fallbacks.
+/// Rust-owned base catalog next to the executable, then user overrides, then
+/// the source-tree fallback used by loose development binaries.
 fn load_manifests(exe_dir: &Path, app_support: &Path) -> (ManifestEngine, Vec<String>) {
     let mut bases: Vec<PathBuf> = Vec::new();
     if let Ok(configured) = std::env::var("DIRI_MANIFESTS_DIR") {
         bases.push(PathBuf::from(configured));
     }
-    bases.push(exe_dir.join("dirijor_DirijorCore.bundle/manifests"));
     bases.push(exe_dir.join("manifests"));
-    // Dev checkout: crates/diri-engine target dirs sit under diri/.
-    bases.push(exe_dir.join("../../../../Sources/DirijorCore/Resources/manifests"));
+    bases.push(diri_engine::detect::bundled_manifest_dir());
     let base = bases.into_iter().find(|dir| dir.is_dir());
     let overrides = app_support.join("manifests/overrides");
 
@@ -288,11 +287,113 @@ fn load_manifests(exe_dir: &Path, app_support: &Path) -> (ManifestEngine, Vec<St
 
 #[cfg(unix)]
 fn holder_executable(exe_dir: &Path) -> PathBuf {
-    for name in ["diri-holder", "dirijord-holder"] {
-        let candidate = exe_dir.join(name);
-        if candidate.is_file() {
-            return candidate;
+    exe_dir.join("diri-holder")
+}
+
+#[cfg(unix)]
+fn remote_manager(
+    exe_dir: &Path,
+    app_support: &Path,
+) -> Option<Arc<diri_engine::remote::manager::RemoteManager>> {
+    use diri_engine::remote::executor::ProcessExecutor;
+    use diri_engine::remote::manager::{ArtifactCatalog, RemoteManager};
+
+    let configured = std::env::var_os("DIRI_REMOTE_HELPER_PATH").map(PathBuf::from);
+    let Some(source) = resolve_remote_catalog_source(exe_dir, configured.as_deref()) else {
+        eprintln!("dirijord-rs: remote transport disabled: no current Helper artifact");
+        return None;
+    };
+    let catalog = match source {
+        RemoteCatalogSource::Native(path) => ArtifactCatalog::from_native_helper(&path),
+        RemoteCatalogSource::Manifest(path) => ArtifactCatalog::from_manifest(&path),
+    };
+    let catalog = match catalog {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            eprintln!("dirijord-rs: remote Helper catalog rejected: {error}");
+            return None;
+        }
+    };
+    let askpass = exe_dir.join("diri-ssh-askpass");
+    let executor = if askpass.is_file() {
+        ProcessExecutor::default().with_askpass(askpass.into_os_string())
+    } else {
+        eprintln!(
+            "dirijord-rs: SSH UI broker is unavailable at {}; interactive authentication is disabled",
+            askpass.display()
+        );
+        ProcessExecutor::default()
+    };
+    match RemoteManager::new(executor, catalog, app_support.join("ssh-control")) {
+        Ok(manager) => Some(Arc::new(manager)),
+        Err(error) => {
+            eprintln!("dirijord-rs: remote manager initialization failed: {error}");
+            None
         }
     }
-    exe_dir.join("diri-holder")
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RemoteCatalogSource {
+    Native(PathBuf),
+    Manifest(PathBuf),
+}
+
+/// Loose Cargo builds place the just-built native Helper beside the Engine,
+/// while packaged apps contain only the cross-platform manifest. Prefer the
+/// sibling in the former layout so an old `target/remote-helpers` directory
+/// can never silently define the current development build.
+#[cfg(unix)]
+fn resolve_remote_catalog_source(
+    exe_dir: &Path,
+    configured: Option<&Path>,
+) -> Option<RemoteCatalogSource> {
+    if let Some(path) = configured {
+        return Some(RemoteCatalogSource::Native(path.to_path_buf()));
+    }
+    let sibling = exe_dir.join("diri-remote");
+    if sibling.is_file() {
+        return Some(RemoteCatalogSource::Native(sibling));
+    }
+    [
+        exe_dir.join("remote-helpers/manifest.json"),
+        exe_dir.join("diri-remote-helpers/manifest.json"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    .map(RemoteCatalogSource::Manifest)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loose_build_prefers_current_sibling_over_a_stale_catalog() {
+        let temporary = tempfile::tempdir().expect("temp");
+        let sibling = temporary.path().join("diri-remote");
+        let stale = temporary.path().join("remote-helpers/manifest.json");
+        std::fs::create_dir_all(stale.parent().expect("manifest parent")).expect("catalog dir");
+        std::fs::write(&sibling, b"current").expect("sibling");
+        std::fs::write(&stale, b"stale").expect("manifest");
+
+        assert_eq!(
+            resolve_remote_catalog_source(temporary.path(), None),
+            Some(RemoteCatalogSource::Native(sibling))
+        );
+    }
+
+    #[test]
+    fn packaged_layout_uses_the_cross_platform_manifest() {
+        let temporary = tempfile::tempdir().expect("temp");
+        let manifest = temporary.path().join("remote-helpers/manifest.json");
+        std::fs::create_dir_all(manifest.parent().expect("manifest parent")).expect("catalog dir");
+        std::fs::write(&manifest, b"catalog").expect("manifest");
+
+        assert_eq!(
+            resolve_remote_catalog_source(temporary.path(), None),
+            Some(RemoteCatalogSource::Manifest(manifest))
+        );
+    }
 }

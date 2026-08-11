@@ -1,0 +1,149 @@
+{
+  "_notice": "Screen-detection predicates adapted from the herdr project (https://github.com/herdrdev/herdr, src/detect/manifests/*.toml), licensed Apache-2.0. Translated from herdr's TOML rule schema into Dirijor's JSON predicate schema and re-prioritised for this engine; the agent capability block is Dirijor's own.",
+  "schemaVersion": 2,
+  "id": "qoder",
+  "version": "2026.07.31.1",
+  "statusModel": "full",
+  "agent": {
+    "id": "qoder",
+    "displayName": "Qoder CLI",
+    "shortLabel": "qoder",
+    "glyph": "\u25d1",
+    "aliases": [
+      "qoder",
+      "qodercli",
+      "qoder-cli"
+    ],
+    "firstClass": true,
+    "statusAuthority": "screen",
+    "binary": "qodercli",
+    "resume": {
+      "style": "flag",
+      "token": "-c"
+    },
+    "returnToLoginShell": true,
+    "foregroundExecNames": [
+      "qodercli"
+    ],
+    "_resumeNotice": "Verified against Qoder's official CLI docs: '-c | \u7ee7\u7eed\u4e0a\u6b21\u4f1a\u8bdd | qodercli -c' ('continue the last session'). https://docs.qoder.com/zh/cli/using-cli. --resume/-r is documented for a specific session.",
+    "_resumeStyleNotice": "Rust's AgentDescriptor::resume_args implements only \"flag\" and \"sessionIDFlag\"; Swift's \"latest\" has no implementation there and would silently resume nothing. Declared as \"flag\": this agent has no sessionIDFlag, so it never carries a caller-minted id and resume_args emits the bare token \u2014 exactly the semantics the token was chosen for.",
+    "envScrubPrefixes": [
+      "DIRI_",
+      "DIRIJOR_"
+    ]
+  },
+  "rules": [
+    {
+      "id": "blocked-confirmation",
+      "state": "blockedPermission",
+      "priority": 300,
+      "region": "whole_recent",
+      "when": {
+        "any": [
+          {
+            "all": [
+              {
+                "contains": "waiting for user confirmation"
+              },
+              {
+                "any": [
+                  {
+                    "contains": "yes"
+                  },
+                  {
+                    "contains": "no"
+                  },
+                  {
+                    "contains": "allow"
+                  },
+                  {
+                    "contains": "reject"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "all": [
+              {
+                "contains": "awaiting approval"
+              },
+              {
+                "any": [
+                  {
+                    "contains": "allow"
+                  },
+                  {
+                    "contains": "reject"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "contains": "permission required"
+          },
+          {
+            "contains": "allow once or always?"
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "blocked-question",
+      "state": "blockedQuestion",
+      "priority": 290,
+      "region": "whole_recent",
+      "when": {
+        "any": [
+          {
+            "contains": "asking user"
+          },
+          {
+            "contains": "enter your response"
+          },
+          {
+            "contains": "review your answers:"
+          },
+          {
+            "contains": "shell awaiting input"
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "working-cancel-hint",
+      "state": "working",
+      "priority": 100,
+      "region": "whole_recent",
+      "when": {
+        "contains": "(esc to cancel,"
+      }
+    },
+    {
+      "id": "working-osc-spinner",
+      "state": "working",
+      "priority": 90,
+      "region": "osc_title",
+      "when": {
+        "regex": "^[\\u2800-\\u28FF]"
+      }
+    }
+  ]
+}

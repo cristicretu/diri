@@ -8,18 +8,16 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use diri_engine::control::ControlServer;
 use diri_engine::detect::ManifestEngine;
 use diri_engine::registry::Registry;
-use diri_proto::{ControlMessage, WIRE_VERSION};
+use diri_proto::{ControlMessage, RUST_ENGINE_KIND, WIRE_VERSION};
 use serde_json::json;
 
 fn engine() -> Arc<ManifestEngine> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../Sources/DirijorCore/Resources/manifests")
+    let dir = diri_engine::detect::bundled_manifest_dir()
         .canonicalize()
         .expect("manifests");
     let (engine, _) = ManifestEngine::load_dir(&dir).expect("load");
@@ -72,6 +70,7 @@ fn a_client_can_handshake_and_list_over_the_socket() {
         } => {
             assert_eq!(id, 1, "the reply carries the request's id");
             assert_eq!(result["proto"], WIRE_VERSION);
+            assert_eq!(result["engineKind"], RUST_ENGINE_KIND);
         }
         other => panic!("handshake failed: {other:?}"),
     }

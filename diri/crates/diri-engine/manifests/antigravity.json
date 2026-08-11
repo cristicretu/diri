@@ -1,0 +1,93 @@
+{
+  "_notice": "Screen-detection predicates adapted from the herdr project (https://github.com/herdrdev/herdr, src/detect/manifests/*.toml), licensed Apache-2.0. Translated from herdr's TOML rule schema into Dirijor's JSON predicate schema and re-prioritised for this engine; the agent capability block is Dirijor's own.",
+  "schemaVersion": 2,
+  "id": "antigravity",
+  "version": "2026.07.31.1",
+  "statusModel": "full",
+  "agent": {
+    "id": "antigravity",
+    "displayName": "Antigravity",
+    "shortLabel": "antigravity",
+    "glyph": "\u25b3",
+    "aliases": [
+      "antigravity",
+      "antigravity-cli",
+      "agy"
+    ],
+    "firstClass": true,
+    "statusAuthority": "screen",
+    "binary": "agy",
+    "resume": {
+      "style": "flag",
+      "token": "--continue"
+    },
+    "returnToLoginShell": true,
+    "foregroundExecNames": [
+      "agy"
+    ],
+    "_resumeNotice": "Verified against Google's Antigravity CLI codelab: '--continue  Continue the most recent conversation'. https://codelabs.developers.google.com/sdd-agy-cli",
+    "_resumeStyleNotice": "Rust's AgentDescriptor::resume_args implements only \"flag\" and \"sessionIDFlag\"; Swift's \"latest\" has no implementation there and would silently resume nothing. Declared as \"flag\": this agent has no sessionIDFlag, so it never carries a caller-minted id and resume_args emits the bare token \u2014 exactly the semantics the token was chosen for.",
+    "envScrubPrefixes": [
+      "DIRI_",
+      "DIRIJOR_"
+    ]
+  },
+  "rules": [
+    {
+      "id": "blocked-permission-request",
+      "state": "blockedPermission",
+      "priority": 300,
+      "region": "whole_recent",
+      "when": {
+        "all": [
+          {
+            "contains": "requesting permission for:"
+          },
+          {
+            "any": [
+              {
+                "contains": "do you want to proceed?"
+              },
+              {
+                "all": [
+                  {
+                    "contains": "tab amend"
+                  },
+                  {
+                    "contains": "edit command"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "working-spinner-verb",
+      "state": "working",
+      "priority": 100,
+      "region": "whole_recent",
+      "when": {
+        "lineRegex": "^\\s*[\\u2800-\\u28FF]+\\s+[A-Za-z]+\\w*ing\\b"
+      }
+    },
+    {
+      "id": "working-task-chip",
+      "state": "working",
+      "priority": 90,
+      "region": "whole_recent",
+      "when": {
+        "regex": "(?i)\u00b7\\s*[1-9][0-9]*\\s+task"
+      }
+    }
+  ]
+}

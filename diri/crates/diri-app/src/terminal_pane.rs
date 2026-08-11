@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use diri_client::attachment::{SessionAttachment, TerminalChunk};
 use diri_proto::grid::GridUpdate;
 use diri_proto::{
-    AgentKind as ProtoAgentKind, ArtifactKind, ClientRole, ExitReason, PrCheck, PullRequestStatus,
+    AgentKind as ProtoAgentKind, ArtifactKind, ExitReason, PrCheck, PullRequestStatus,
     Resumability, RiskHint, SessionArtifact, SessionId, SessionRecord, SessionStatus,
 };
 use diri_term::buffer::GridBuffer;
@@ -25,8 +25,8 @@ use diri_term::repaint::{RepaintAction, RepaintPacer};
 use diri_term::scrollback::{WheelDelta, WheelEvent, WheelRoute};
 use diri_term::theme::TermTheme;
 use diri_ui::{
-    AgentKind as UiAgentKind, Appearance, Fill, FloatingSurface, Ink, Metrics, Radius,
-    SemanticColors, StatusGlyph, StatusState, Typo,
+    AgentKind as UiAgentKind, Fill, FloatingSurface, Ink, Metrics, Radius, SemanticColors,
+    StatusGlyph, StatusState, Typo,
 };
 use gpui::{
     AnyElement, App, ClickEvent, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter,
@@ -665,7 +665,7 @@ impl TerminalPane {
             _store_changes: store_changes,
         };
         pane.reconcile_residency();
-        pane.sync_status_glyphs(window, cx);
+        pane.sync_status_glyphs(pane.current_colors(), window, cx);
         pane
     }
 
@@ -730,6 +730,13 @@ impl TerminalPane {
                 .iter()
                 .position(|(parked, _)| parked == &id)
                 .map(|index| self.parked_grids.remove(index).1);
+            let attachment = spawn_attachment(
+                &self.tokio,
+                socket.clone(),
+                id.clone(),
+                self.pane_tx.clone(),
+            );
+            let ime_attachment = attachment.clone();
             let element = match parked {
                 // The parked cells paint on the first frame; the attach's
                 // full snapshot overwrites the same shared buffer moments
@@ -738,13 +745,8 @@ impl TerminalPane {
                 None => TerminalElement::with_buffer(GridBuffer::default()),
             }
             .font(mono)
-            .focus_handle(self.focus.clone());
-            let attachment = spawn_attachment(
-                &self.tokio,
-                socket.clone(),
-                id.clone(),
-                self.pane_tx.clone(),
-            );
+            .focus_handle(self.focus.clone())
+            .on_text_input(move |text| ime_attachment.input(text.as_bytes().to_vec()));
             self.residents.insert(
                 id,
                 ResidentTerminal {
@@ -774,7 +776,7 @@ impl TerminalPane {
         self.observed_selected_id = selected_id.clone();
 
         self.reconcile_residency();
-        self.sync_status_glyphs(window, cx);
+        self.sync_status_glyphs(self.current_colors(), window, cx);
 
         // Explicit sidebar clicks already focus through SessionActivated, but
         // successful spawns select their daemon-assigned id on the async store
@@ -833,7 +835,12 @@ impl TerminalPane {
         self.focus.is_focused(window)
     }
 
-    fn sync_status_glyphs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn sync_status_glyphs(
+        &mut self,
+        colors: SemanticColors,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let fixed_id = match &self.session_source {
             SessionSource::Fixed(id) => Some(id),
             SessionSource::FollowSelection => None,
@@ -862,13 +869,24 @@ impl TerminalPane {
         for (id, kind, state) in snapshots {
             if let Some(glyph) = self.glyphs.get(&id) {
                 glyph.update(cx, |glyph, cx| {
+                    glyph.set_kind(kind, cx);
                     glyph.set_state(state, window, cx);
+                    glyph.set_colors(colors, cx);
                 });
             } else {
-                let glyph = StatusGlyph::entity(kind, state, 16.0, SemanticColors::dark(), cx);
+                let glyph = StatusGlyph::entity(kind, state, 16.0, colors, cx);
                 self.glyphs.insert(id, glyph);
             }
         }
+    }
+
+    fn current_colors(&self) -> SemanticColors {
+        let store = self
+            .runtime
+            .store
+            .read()
+            .expect("session store lock poisoned");
+        crate::app_theme::colors(&store.preferences().terminal_theme)
     }
 
     fn handle_pane_event(&mut self, event: PaneEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1747,11 +1765,46 @@ impl TerminalPane {
         }
     }
 
+    fn render_sidebar_reveal_control(
+        &self,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(Metrics::TOOLBAR_ITEM_GAP))
+            // The visible lights need more breathing room than their native
+            // frames imply, so this is an intentional optical safe area.
+            .child(div().w(px(Metrics::TOOLBAR_TRAFFIC_LIGHT_LANE)).flex_none())
+            .child(
+                div()
+                    .id("show-sidebar")
+                    .debug_selector(|| "show-sidebar".into())
+                    .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(Radius::BADGE))
+                    .cursor_pointer()
+                    .hover(move |button| button.bg(Fill::subtle(colors)))
+                    .child(sf_symbol("sidebar.left", 15.0, colors.secondary))
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        cx.emit(TerminalPaneEvent::ToggleSidebar);
+                        cx.stop_propagation();
+                    })),
+            )
+            .into_any_element()
+    }
+
     fn render_header(
         &self,
         session: &SessionRecord,
         chips: &[PaneChip],
         visible_chip_count: usize,
+        colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let glyph = self.glyphs.get(&session.id).cloned();
@@ -1764,9 +1817,9 @@ impl TerminalPane {
                 .host_display_name(host)
         });
         let kind = ui_agent_kind(session.effective_kind());
-        let colors = SemanticColors::sidebar(Appearance::Dark);
         let shell_controls = matches!(self.session_source, SessionSource::FollowSelection);
         let show_sidebar = shell_controls && !self.sidebar_visible;
+        let sidebar_reveal = show_sidebar.then(|| self.render_sidebar_reveal_control(colors, cx));
         let inspector_open = self.inspector_open;
         let visible_chip_count = visible_chip_count.min(chips.len());
         let overflow_count = chips.len().saturating_sub(visible_chip_count);
@@ -1776,7 +1829,7 @@ impl TerminalPane {
             .items_center()
             .gap(px(Metrics::TOOLBAR_COMPACT_GAP));
         for chip in chips.iter().take(visible_chip_count).cloned() {
-            toolbar_links = toolbar_links.child(self.render_chip(chip, cx));
+            toolbar_links = toolbar_links.child(self.render_chip(chip, colors, cx));
         }
         if overflow_count > 0 {
             toolbar_links = toolbar_links.child(
@@ -1820,29 +1873,7 @@ impl TerminalPane {
                     .items_center()
                     .gap(px(Metrics::TOOLBAR_ITEM_GAP))
                     .overflow_hidden()
-                    .when(show_sidebar, |title| {
-                        title
-                            // The visible lights need more breathing room than their native
-                            // frames imply, so this is an intentional optical safe area.
-                            .child(div().w(px(Metrics::TOOLBAR_TRAFFIC_LIGHT_LANE)).flex_none())
-                            .child(
-                                div()
-                                    .id("show-sidebar")
-                                    .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
-                                    .flex_none()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(Radius::BADGE))
-                                    .cursor_pointer()
-                                    .hover(move |button| button.bg(Fill::subtle(colors)))
-                                    .child(sf_symbol("sidebar.left", 15.0, colors.secondary))
-                                    .on_click(cx.listener(|_, _, _, cx| {
-                                        cx.emit(TerminalPaneEvent::ToggleSidebar);
-                                        cx.stop_propagation();
-                                    })),
-                            )
-                    })
+                    .when_some(sidebar_reveal, |title, control| title.child(control))
                     .child(sf_symbol("terminal", 15.0, colors.secondary))
                     .child(
                         div()
@@ -1946,8 +1977,12 @@ impl TerminalPane {
             .into_any_element()
     }
 
-    fn render_chip(&self, chip: PaneChip, cx: &mut Context<Self>) -> AnyElement {
-        let colors = SemanticColors::sidebar(Appearance::Dark);
+    fn render_chip(
+        &self,
+        chip: PaneChip,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let tint = chip.tint.map(chip_tint_color);
         let background = tint.map_or_else(|| Fill::subtle(colors), |color| color.alpha(0.13));
         let hover_background =
@@ -2030,7 +2065,6 @@ impl TerminalPane {
             .focus_handle(self.focus.clone());
         let view_offset = resident.element.view_offset();
         let attachment_state = resident.attachment_state;
-        let remote_active = session.remote_active;
         let overflow = self.grid_row_overflow(resident.element.grid_rows(), font_size, window);
 
         let id_for_focus = session.id.clone();
@@ -2171,9 +2205,7 @@ impl TerminalPane {
                     })),
             );
         }
-        if remote_active {
-            body = body.child(self.render_remote_overlay(session, theme, cx));
-        } else if attachment_state != AttachmentState::Live {
+        if attachment_state != AttachmentState::Live {
             let message = match attachment_state {
                 AttachmentState::Attaching => "Attaching…",
                 AttachmentState::Reconnecting => "Reconnecting terminal…",
@@ -2263,6 +2295,7 @@ impl TerminalPane {
     fn render_find_bar(
         &self,
         session: &SessionRecord,
+        colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let resident = self.residents.get(&session.id)?;
@@ -2290,7 +2323,7 @@ impl TerminalPane {
                 .right(px(16.0))
                 .w(px(360.0))
                 .child(FloatingSurface::new(
-                    SemanticColors::dark(),
+                    colors,
                     div()
                         .flex()
                         .flex_col()
@@ -2463,62 +2496,10 @@ impl TerminalPane {
             .into_any_element()
     }
 
-    fn render_remote_overlay(
-        &self,
-        session: &SessionRecord,
-        theme: TermTheme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let id = session.id.clone();
-        div()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(theme.background)
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(14.0))
-                    .p(px(28.0))
-                    .child(div().text_size(px(44.0)).child("📱"))
-                    .child(
-                        div()
-                            .text_size(px(16.0))
-                            .font_weight(Typo::TITLE.weight)
-                            .text_color(rgba(0xffffffff))
-                            .child("Active on iPhone"),
-                    )
-                    .child(
-                        div()
-                            .max_w(px(300.0))
-                            .text_size(px(12.5))
-                            .text_color(rgba(0xffffff99))
-                            .child("Your terminal is being controlled from the Dirijor iOS app."),
-                    )
-                    .child(primary_button(
-                        "take-control",
-                        "Take back control",
-                        cx,
-                        move |this, cx| {
-                            this.runtime
-                                .store
-                                .read()
-                                .expect("session store lock poisoned")
-                                .set_owner(id.clone(), ClientRole::Desktop);
-                            cx.notify();
-                        },
-                    )),
-            )
-            .into_any_element()
-    }
-
     fn render_checks_popover(
         &self,
         session: &SessionRecord,
+        colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let chip_id = self.open_checks_for.as_ref()?;
@@ -2610,7 +2591,7 @@ impl TerminalPane {
                             cx.notify();
                         }))
                         .child(FloatingSurface::new(
-                            SemanticColors::dark(),
+                            colors,
                             div()
                                 .flex()
                                 .flex_col()
@@ -2644,6 +2625,7 @@ impl TerminalPane {
         &self,
         session: &SessionRecord,
         visible_chip_count: usize,
+        colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let chips = PaneChip::for_session(session);
@@ -2711,7 +2693,7 @@ impl TerminalPane {
                             cx.notify();
                         }))
                         .child(FloatingSurface::new(
-                            SemanticColors::dark(),
+                            colors,
                             list.id("toolbar-overflow-list")
                                 .max_h(px(320.0))
                                 .overflow_y_scroll(),
@@ -2725,21 +2707,24 @@ impl TerminalPane {
 impl Render for TerminalPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.reconcile_residency();
-        self.sync_status_glyphs(window, cx);
-        self.update_selected_geometry(window, cx);
-
-        let selected = self.selected_session();
-        let (theme, font_size) = {
+        let (theme, colors, sidebar_colors, font_size) = {
             let store = self
                 .runtime
                 .store
                 .read()
                 .expect("session store lock poisoned");
+            let theme_id = &store.preferences().terminal_theme;
             (
-                theme_by_id(&store.preferences().terminal_theme),
+                crate::app_theme::terminal_theme(theme_id),
+                crate::app_theme::colors(theme_id),
+                crate::app_theme::sidebar_colors(theme_id),
                 store.preferences().terminal_font_size,
             )
         };
+        self.sync_status_glyphs(colors, window, cx);
+        self.update_selected_geometry(window, cx);
+
+        let selected = self.selected_session();
 
         let content = if let Some(session) = selected {
             let chips = PaneChip::for_session(&session);
@@ -2759,9 +2744,15 @@ impl Render for TerminalPane {
                 .h_full()
                 .overflow_hidden()
                 .border_l_1()
-                .border_color(rgba(0xffffff14))
-                .bg(SemanticColors::sidebar(Appearance::Dark).sidebar_surface())
-                .child(self.render_header(&session, &chips, visible_chip_count, cx));
+                .border_color(sidebar_colors.primary.alpha(0.08))
+                .bg(sidebar_colors.sidebar_surface())
+                .child(self.render_header(
+                    &session,
+                    &chips,
+                    visible_chip_count,
+                    sidebar_colors,
+                    cx,
+                ));
             let terminal_surface = div()
                 .relative()
                 .min_h(px(0.0))
@@ -2774,27 +2765,49 @@ impl Render for TerminalPane {
                 .bg(theme.background)
                 .child(self.render_grid_and_overlays(&session, theme, font_size, window, cx));
             pane = pane.child(terminal_surface);
-            if let Some(find) = self.render_find_bar(&session, cx) {
+            if let Some(find) = self.render_find_bar(&session, colors, cx) {
                 pane = pane.child(find);
             }
-            if let Some(popover) = self.render_checks_popover(&session, cx) {
+            if let Some(popover) = self.render_checks_popover(&session, colors, cx) {
                 pane = pane.child(popover);
             }
-            if let Some(overflow) = self.render_overflow(&session, visible_chip_count, cx) {
+            if let Some(overflow) = self.render_overflow(&session, visible_chip_count, colors, cx) {
                 pane = pane.child(overflow);
             }
             pane.into_any_element()
         } else {
+            let show_sidebar = matches!(self.session_source, SessionSource::FollowSelection)
+                && !self.sidebar_visible;
+            let sidebar_reveal =
+                show_sidebar.then(|| self.render_sidebar_reveal_control(sidebar_colors, cx));
             div()
                 .flex_1()
                 .h_full()
                 .flex()
-                .items_center()
-                .justify_center()
+                .flex_col()
                 .bg(theme.background)
-                .text_size(px(13.0))
-                .text_color(rgba(0xffffff66))
-                .child("Start a terminal from the sidebar")
+                .when_some(sidebar_reveal, |pane, control| {
+                    pane.child(
+                        div()
+                            .h(px(Metrics::TITLE_BAR))
+                            .flex_none()
+                            .px(px(Metrics::TOOLBAR_EDGE_INSET))
+                            .flex()
+                            .items_center()
+                            .bg(sidebar_colors.sidebar_surface())
+                            .child(control),
+                    )
+                })
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(13.0))
+                        .text_color(sidebar_colors.tertiary)
+                        .child("Start a terminal from the sidebar"),
+                )
                 .into_any_element()
         };
 
@@ -2807,7 +2820,7 @@ impl Render for TerminalPane {
             .track_focus(&self.focus)
             .flex()
             .size_full()
-            .text_color(rgba(0xffffffff))
+            .text_color(colors.primary)
             .on_action(cx.listener(Self::open_find))
             .on_action(cx.listener(Self::find_next))
             .on_action(cx.listener(Self::find_previous))
@@ -3224,14 +3237,6 @@ fn sorted_checks(pr: &PullRequestStatus) -> Vec<PrCheck> {
     checks
 }
 
-fn theme_by_id(id: &str) -> TermTheme {
-    TermTheme::CATALOG
-        .iter()
-        .copied()
-        .find(|theme| theme.id == id)
-        .unwrap_or_default()
-}
-
 fn terminal_damage_should_repaint(
     window_active: bool,
     selected: Option<&SessionId>,
@@ -3645,6 +3650,32 @@ mod tests {
                 .map(|check| check.result.as_str())
                 .collect::<Vec<_>>(),
             ["fail", "pending", "pass"]
+        );
+    }
+
+    #[gpui::test]
+    fn an_empty_terminal_pane_keeps_the_sidebar_reveal_control(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+
+        let (pane, cx) = cx.add_window_view(move |window, cx| {
+            let mut pane = TerminalPane::new(runtime, tokio, window, cx);
+            pane.set_shell_chrome(false, false, cx);
+            pane
+        });
+
+        assert!(
+            pane.read_with(cx, |pane, _| pane.selected_session().is_none()),
+            "fixture must exercise the empty terminal state"
+        );
+        assert!(
+            cx.debug_bounds("show-sidebar").is_some(),
+            "collapsing the sidebar must leave a way to reveal it"
         );
     }
 

@@ -1,0 +1,180 @@
+{
+  "_notice": "Screen-detection predicates adapted from the herdr project (https://github.com/herdrdev/herdr, src/detect/manifests/*.toml), licensed Apache-2.0. Translated from herdr's TOML rule schema into Dirijor's JSON predicate schema and re-prioritised for this engine; the agent capability block is Dirijor's own.",
+  "schemaVersion": 2,
+  "id": "hermes",
+  "version": "2026.07.31.1",
+  "statusModel": "full",
+  "agent": {
+    "id": "hermes",
+    "displayName": "Hermes",
+    "shortLabel": "hermes",
+    "glyph": "\u2301",
+    "aliases": [
+      "hermes",
+      "hermes-agent"
+    ],
+    "firstClass": true,
+    "statusAuthority": "screen",
+    "binary": "hermes",
+    "resume": {
+      "style": "flag",
+      "token": "--continue"
+    },
+    "returnToLoginShell": true,
+    "foregroundExecNames": [
+      "hermes"
+    ],
+    "_resumeNotice": "Verified against Hermes' official session guide: 'hermes --continue' under 'Resume the most recent CLI session'; it says this 'looks up the most recent cli session'. https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/sessions.md. --resume is the id/title form.",
+    "_resumeStyleNotice": "Rust's AgentDescriptor::resume_args implements only \"flag\" and \"sessionIDFlag\"; Swift's \"latest\" has no implementation there and would silently resume nothing. Declared as \"flag\": this agent has no sessionIDFlag, so it never carries a caller-minted id and resume_args emits the bare token \u2014 exactly the semantics the token was chosen for.",
+    "envScrubPrefixes": [
+      "DIRI_",
+      "DIRIJOR_"
+    ]
+  },
+  "rules": [
+    {
+      "id": "blocked-osc-warning",
+      "state": "blockedPermission",
+      "priority": 1100,
+      "region": "osc_title",
+      "when": {
+        "regex": "^\u26a0"
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "working-osc-hourglass",
+      "state": "working",
+      "priority": 1050,
+      "region": "osc_title",
+      "when": {
+        "regex": "^\u23f3"
+      }
+    },
+    {
+      "id": "working-interrupt-hint",
+      "state": "working",
+      "priority": 950,
+      "region": "whole_recent",
+      "when": {
+        "any": [
+          {
+            "contains": "msg=interrupt"
+          },
+          {
+            "contains": "ctrl+c to interrupt"
+          }
+        ]
+      }
+    },
+    {
+      "id": "blocked-dangerous-command",
+      "state": "blockedPermission",
+      "priority": 900,
+      "region": "whole_recent",
+      "when": {
+        "all": [
+          {
+            "any": [
+              {
+                "contains": "dangerous"
+              },
+              {
+                "contains": "approval"
+              }
+            ]
+          },
+          {
+            "any": [
+              {
+                "contains": "allow once"
+              },
+              {
+                "lineRegex": "(?i)^\\s*[\u25b8>]?\\s*1\\.\\s*allow"
+              }
+            ]
+          },
+          {
+            "any": [
+              {
+                "contains": "enter confirm"
+              },
+              {
+                "contains": "\u2191/\u2193 to select"
+              },
+              {
+                "contains": "show full command"
+              }
+            ]
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 14,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "blocked-clarification",
+      "state": "blockedQuestion",
+      "priority": 890,
+      "region": "whole_recent",
+      "when": {
+        "any": [
+          {
+            "contains": "hermes needs your"
+          },
+          {
+            "lineRegex": "(?i)^\\s*ask\\s+\\S"
+          },
+          {
+            "contains": "type your answer"
+          },
+          {
+            "contains": "sudo password"
+          },
+          {
+            "contains": "skill setup"
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "working-cancel-hint",
+      "state": "working",
+      "priority": 500,
+      "region": "whole_recent",
+      "when": {
+        "contains": "ctrl+c cancel"
+      }
+    },
+    {
+      "id": "idle-osc-check",
+      "state": "idle",
+      "priority": 100,
+      "region": "osc_title",
+      "when": {
+        "regex": "^\u2713"
+      }
+    }
+  ]
+}

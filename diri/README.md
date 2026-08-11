@@ -126,15 +126,15 @@ use its own SSH user and can add any number of other SSH-reachable machines:
 
 `id` is the stable value persisted with sessions, `name` is presentation only,
 and `ssh` accepts either an SSH destination or an alias from `~/.ssh/config`.
-Removing the file leaves the app in local-only mode.
+Removing the file leaves the app in local-only mode. Tailscale IPv4 addresses
+and MagicDNS names work like any other SSH destination when OpenSSH can resolve
+them; Diri neither requires nor configures Tailscale for Remote Holder sessions.
 
 ## Coexistence
 
 `diri` launches the daemon bundled beside it when none is running, and
-otherwise talks to whichever daemon owns the socket — it never kills or
-automatically restarts a live `dirijord`; the sole explicit exception is
-Settings → Remote, where changing iPhone companion access asks the daemon to
-reload `remote.json`. Until the protocol gains multi-desktop geometry
-arbitration, do not focus the same session in two desktop clients at different
-terminal sizes; both would resize the same PTY, and input sent from both is
-interleaved.
+otherwise talks to whichever Rust Engine owns the socket. A packaged Engine
+upgrade may replace an outdated daemon after holders have preserved their
+sessions. Until the protocol gains multi-desktop geometry arbitration, do not
+focus the same session in two desktop clients at different terminal sizes;
+both would resize the same PTY, and input sent from both is interleaved.

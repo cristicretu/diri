@@ -1,0 +1,121 @@
+{
+  "schemaVersion": 2,
+  "id": "codex",
+  "version": "2026.07.07",
+  "statusModel": "full",
+  "agent": {
+    "id": "codex",
+    "displayName": "Codex",
+    "shortLabel": "codex",
+    "glyph": "\u25c7",
+    "aliases": [
+      "codex",
+      "openai-codex"
+    ],
+    "firstClass": true,
+    "statusAuthority": "screen",
+    "binary": "codex",
+    "returnToLoginShell": true,
+    "resume": {
+      "style": "flag",
+      "token": "resume"
+    },
+    "envScrubPrefixes": [
+      "CODEX",
+      "DIRI_",
+      "DIRIJOR_"
+    ],
+    "injection": {
+      "codexNotify": true,
+      "codexMCP": true
+    },
+    "foregroundExecNames": [
+      "codex"
+    ],
+    "approve": {
+      "text": "",
+      "submit": true
+    },
+    "_resumeStyleNotice": "Swift's \"subcommand\" style has no implementation in Rust's AgentDescriptor::resume_args. Declared as \"flag\": with no id it emits `codex resume`, and once a notify payload supplies a thread-id it emits `codex resume <thread-id>` \u2014 both are valid codex invocations.",
+    "deny": {
+      "text": "\u001b",
+      "submit": false
+    }
+  },
+  "rules": [
+    {
+      "id": "action-required-title",
+      "state": "blockedPermission",
+      "priority": 1100,
+      "region": "osc_title",
+      "when": {
+        "contains": "action required"
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "confirm-prompt",
+      "state": "blockedPermission",
+      "priority": 1000,
+      "region": "whole_recent",
+      "when": {
+        "any": [
+          {
+            "contains": "press enter to confirm or esc to cancel"
+          },
+          {
+            "contains": "allow command?"
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "prompt_box_body",
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "submit-answer",
+      "state": "blockedQuestion",
+      "priority": 950,
+      "region": "whole_recent",
+      "when": {
+        "contains": "enter to submit answer"
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "prompt_box_body",
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "working-spinner",
+      "state": "working",
+      "priority": 900,
+      "region": "osc_title",
+      "when": {
+        "regex": "^[\u2800-\u28ff]"
+      }
+    },
+    {
+      "id": "idle-prompt-box",
+      "state": "idle",
+      "priority": 500,
+      "region": "prompt_box_body",
+      "when": {
+        "lineRegex": "^\\s*[\u276f\u203a]"
+      }
+    }
+  ]
+}

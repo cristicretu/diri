@@ -22,6 +22,9 @@ target_dir="${CARGO_TARGET_DIR:-${workspace_dir}/target}"
 universal_dir="${target_dir}/universal-apple-darwin/release"
 universal_binary="${universal_dir}/diri"
 universal_mcp_binary="${universal_dir}/dirijor-mcp"
+universal_engine_binary="${universal_dir}/dirijord-rs"
+universal_holder_binary="${universal_dir}/diri-holder"
+universal_askpass_binary="${universal_dir}/diri-ssh-askpass"
 
 # Toolchain location. The migration-era toolchain lived in /tmp, which macOS
 # sweeps -- a reboot deleted it mid-project and releases could not be built at
@@ -94,91 +97,70 @@ cp "${workspace_dir}/../license-policy.json" "${license_dir}/license-policy.json
 cp "${workspace_dir}/../LICENSES/"*.txt "${license_dir}/"
 cp "${third_party_inventory}" "${license_dir}/THIRD-PARTY-LICENSES.json"
 
-# --------------------------------------------------------------------------
-# Bundle the Swift daemon inside diri.app so diri is self-contained and can
-# replace the retired Dirijor.app. diri launches dirijord from here; dirijord
-# finds dirijord-holder next to itself, so both must sit side by side. This
-# happens BEFORE signing/notarizing/zipping so the shipped app AND the
-# updater's zip both carry the daemon.
-#
-# Native (arm64) build — the same path the Swift pipeline used; the daemon was
-# arm64-only in Dirijor.app too. Universal needs the Metal Toolchain component
-# (SwiftTerm's shaders); to go universal: `xcodebuild -downloadComponent
-# MetalToolchain` then add `--arch arm64 --arch x86_64` below.
-# --------------------------------------------------------------------------
+# The Rust Engine is authoritative. The existing CLI remains packaged for
+# local automation/hooks, but no daemon, Holder, Agent manifest, or remote
+# transport artifact is sourced from a Swift product.
 repo_root="$(cd "${workspace_dir}/.." && pwd)"
-echo "==> Building the Swift daemon (native)"
-swift build --package-path "${repo_root}" -c release --product dirijord
-swift build --package-path "${repo_root}" -c release --product dirijord-holder
-# The CLI ships with the app because it is the automation surface: agent hooks,
-# `dirijor mcp-stdio`, and any script driving sessions or the event stream all
-# invoke it. A copy that only exists in a dev checkout is not a shipped feature.
+echo "==> Building the local automation CLI"
 swift build --package-path "${repo_root}" -c release --product dirijor
 daemon_bin="$(swift build --package-path "${repo_root}" -c release --show-bin-path)"
 app_bin_dir="${app_path}/Contents/Resources/bin"
-echo "==> Bundling daemon, CLI, holder, and lightweight MCP proxy into Resources/bin"
+echo "==> Bundling CLI and lightweight MCP proxy into Resources/bin"
 mkdir -p "${app_bin_dir}"
-cp "${daemon_bin}/dirijord" "${app_bin_dir}/dirijord"
-cp "${daemon_bin}/dirijord-holder" "${app_bin_dir}/dirijord-holder"
 cp "${daemon_bin}/dirijor" "${app_bin_dir}/dirijor"
 cp "${universal_mcp_binary}" "${app_bin_dir}/dirijor-mcp"
-lipo -info "${app_bin_dir}/dirijord"
 
-# The Rust daemon rides along for the engine switch: opt a machine in with
-#   DIRIJORD_PATH=.../Resources/bin/dirijord-rs open -a diri
-# Native arch like the Swift daemon; it adopts the same holders, so flipping
-# back and forth never loses a session.
-echo "==> Building the Rust daemon (native)"
+# The Rust Engine is the authoritative daemon launched by diri. The remote
+# Helper catalog below is consumed by this executable directly.
+echo "==> Building the authoritative Rust Engine (universal)"
 cargo build --release --package diri-engine --bin dirijord-rs --bin diri-holder \
+    --bin diri-ssh-askpass \
     --target aarch64-apple-darwin
-cp "${target_dir}/aarch64-apple-darwin/release/dirijord-rs" "${app_bin_dir}/dirijord-rs"
-cp "${target_dir}/aarch64-apple-darwin/release/diri-holder" "${app_bin_dir}/diri-holder"
+cargo build --release --package diri-engine --bin dirijord-rs --bin diri-holder \
+    --bin diri-ssh-askpass \
+    --target x86_64-apple-darwin
+lipo -create \
+    "${target_dir}/aarch64-apple-darwin/release/dirijord-rs" \
+    "${target_dir}/x86_64-apple-darwin/release/dirijord-rs" \
+    -output "${universal_engine_binary}"
+lipo -create \
+    "${target_dir}/aarch64-apple-darwin/release/diri-holder" \
+    "${target_dir}/x86_64-apple-darwin/release/diri-holder" \
+    -output "${universal_holder_binary}"
+lipo -create \
+    "${target_dir}/aarch64-apple-darwin/release/diri-ssh-askpass" \
+    "${target_dir}/x86_64-apple-darwin/release/diri-ssh-askpass" \
+    -output "${universal_askpass_binary}"
+lipo "${universal_engine_binary}" -verify_arch arm64 x86_64
+lipo "${universal_holder_binary}" -verify_arch arm64 x86_64
+lipo "${universal_askpass_binary}" -verify_arch arm64 x86_64
+cp "${universal_engine_binary}" "${app_bin_dir}/dirijord-rs"
+cp "${universal_holder_binary}" "${app_bin_dir}/diri-holder"
+cp "${universal_askpass_binary}" "${app_bin_dir}/diri-ssh-askpass"
 
-# SwiftPM resource bundles (agent manifests). Copy them NEXT TO the binaries,
-# because for a bare executable `Bundle.main` is the directory containing that
-# executable — Resources/bin here, not Contents/Resources — and that is the
-# spot `ResourceBundle.find` checks. Missing them is silent and total: the
-# daemon's AgentCatalog comes up empty, every `descriptor(for:)` returns the
-# no-binary `.fallback`, and InjectionBuilder.plan takes the generic branch, so
-# EVERY agent spawns as a bare login shell instead of claude/codex/… A shell is
-# a plausible-looking session, so nothing errors — this shipped once already.
-shopt -s nullglob
-resource_bundles=("${daemon_bin}"/*.bundle)
-shopt -u nullglob
-if [[ ${#resource_bundles[@]} -eq 0 ]]; then
-    echo "error: no SPM resource bundles in ${daemon_bin}; agents would all spawn as shells" >&2
+# The default SSH transport bootstraps one exact Rust Helper artifact selected
+# by remote OS/architecture. This build is independent of all daemon products
+# above and emits a versioned manifest verified again before upload.
+echo "==> Building three-platform Rust remote Helper catalog"
+remote_helpers_dir="${app_bin_dir}/remote-helpers"
+rm -rf "${remote_helpers_dir}"
+DIRI_SIGN_IDENTITY="${DIRI_SIGN_IDENTITY:-}" "${script_dir}/build-remote-helpers.sh" "${remote_helpers_dir}"
+
+# Rust-owned Agent catalog used by local and remote session orchestration.
+rm -rf "${app_bin_dir}/manifests"
+cp -R "${workspace_dir}/crates/diri-engine/manifests" "${app_bin_dir}/manifests"
+# Count, not just presence. A catalog that is merely SMALLER never errors at
+# runtime: each missing manifest silently downgrades that agent to a bare login
+# shell, which looks like a working session. That shipped once. The source
+# directory is the reference, so any shrink between it and the bundle is a
+# packaging bug worth failing the release over.
+source_manifests="$(find "${workspace_dir}/crates/diri-engine/manifests" -name '*.json' -type f | wc -l | tr -d ' ')"
+bundled_manifests="$(find "${app_bin_dir}/manifests" -name '*.json' -type f | wc -l | tr -d ' ')"
+if [[ ! -f "${app_bin_dir}/manifests/codex.json" || "${bundled_manifests}" != "${source_manifests}" || "${bundled_manifests}" -lt 20 ]]; then
+    echo "error: bundled Agent catalog is incomplete: ${bundled_manifests} manifest(s) bundled, ${source_manifests} in source (expected at least 20)" >&2
     exit 1
 fi
-echo "==> Bundling ${#resource_bundles[@]} SPM resource bundle(s) into Resources/bin"
-for bundle in "${resource_bundles[@]}"; do
-    name="$(basename "${bundle}")"       # e.g. dirijor_DirijorCore.bundle
-    stem="${name%.bundle}"
-    dest="${app_bin_dir}/${name}"
-    rm -rf "${dest}"
-    cp -R "${bundle}" "${dest}"
-    # A minimal Info.plist makes each a valid, signable bundle rather than a
-    # loose directory the app's signature would choke on.
-    if [[ ! -f "${dest}/Info.plist" ]]; then
-        cat > "${dest}/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleIdentifier</key><string>dev.dirijor.resource.${stem//_/-}</string>
-    <key>CFBundleName</key><string>${stem}</string>
-    <key>CFBundlePackageType</key><string>BNDL</string>
-    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-</dict>
-</plist>
-PLIST
-    fi
-done
-# Prove the manifests actually made the trip: the check that would have caught
-# the empty-catalog ship.
-if [[ ! -f "${app_bin_dir}/dirijor_DirijorCore.bundle/manifests/codex.json" ]]; then
-    echo "error: agent manifests missing from the app bundle" >&2
-    exit 1
-fi
+echo "==> Bundled ${bundled_manifests} Agent manifests"
 
 # Inside-out signing: sign the nested daemon binaries FIRST (their own hardened
 # runtime + timestamp), then the app LAST WITHOUT --deep. A --deep sign would
@@ -197,13 +179,17 @@ sign_id="${DIRI_SIGN_IDENTITY:--}"
 ts_flag=(--timestamp)
 [[ "${sign_id}" == "-" ]] && ts_flag=(--timestamp=none) && echo "==> No signing identity found; ad-hoc signature"
 [[ "${sign_id}" != "-" ]] && echo "==> Signing with: ${sign_id}"
-echo "==> Signing nested daemon binaries"
-codesign --force --options runtime "${ts_flag[@]}" --sign "${sign_id}" "${app_bin_dir}/dirijord-holder"
-codesign --force --options runtime "${ts_flag[@]}" --sign "${sign_id}" "${app_bin_dir}/dirijord"
+echo "==> Signing nested executables"
 codesign --force --options runtime "${ts_flag[@]}" --sign "${sign_id}" "${app_bin_dir}/dirijor"
 codesign --force --options runtime "${ts_flag[@]}" --sign "${sign_id}" "${app_bin_dir}/dirijor-mcp"
 codesign --force --options runtime "${ts_flag[@]}" --sign "${sign_id}" "${app_bin_dir}/dirijord-rs"
 codesign --force --options runtime "${ts_flag[@]}" --sign "${sign_id}" "${app_bin_dir}/diri-holder"
+codesign --force --options runtime "${ts_flag[@]}" --sign "${sign_id}" "${app_bin_dir}/diri-ssh-askpass"
+# The Apple remote Helper is deliberately NOT signed here. Signing rewrites the
+# Mach-O, and its length and digest are already recorded in the catalog manifest
+# that the Engine verifies before upload; signing after the fact invalidates the
+# manifest and the Engine rejects the entire catalog, disabling every remote
+# host. build-remote-helpers.sh signs it before measuring instead.
 echo "==> Signing ${app_path}"
 codesign --force --options runtime "${ts_flag[@]}" \
     --entitlements "${entitlements}" \

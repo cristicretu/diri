@@ -17,7 +17,7 @@ pub use brand::{
     AgentKind, AgentLogo, BrandMark, BrandMarkKind, CLAUDE_PATH, CURSOR_PATH, GEMINI_PATH,
     MarkRasterizer, OPENAI_PATH, set_mark_rasterizer,
 };
-pub use components::{FloatingSurface, HairlineDivider, RowFill};
+pub use components::{FloatingSurface, HairlineDivider, HoverMarquee, LoadingIndicator, RowFill};
 pub use icon::{Icon, IconAssets, IconName, IconSize, icon_from_system_name};
 pub use status::{
     AnimationPhase, AttentionDot, AttentionLevel, StatusGlyph, StatusState, wall_clock_seconds,

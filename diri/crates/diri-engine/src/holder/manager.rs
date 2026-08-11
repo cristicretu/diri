@@ -170,6 +170,15 @@ impl HolderManagerServer {
                     .map_err(|error| HolderError::io("spawn session holder", error))?;
                 Ok(HolderManagerResponse::success(std::process::id() as i32))
             }
+            HolderManagerOperation::ShutdownIfIdle => {
+                if !state.active.lock().expect("active").is_empty() {
+                    return Err(HolderError::Rejected(
+                        "holder manager still owns live sessions".into(),
+                    ));
+                }
+                stop_listener(state);
+                Ok(HolderManagerResponse::success(std::process::id() as i32))
+            }
         }
     }
 
@@ -226,20 +235,24 @@ fn watch_idle(state: &State, idle_timeout: Duration) {
         if !expired {
             continue;
         }
-        if state.shutting_down.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let fd = state.listen_fd.swap(-1, Ordering::SeqCst);
-        if fd >= 0 {
-            // Shutdown then close — only the close wakes a blocked accept(2)
-            // on macOS. `shutting_down` is already set, so the loop exits.
-            // SAFETY: raw-owned fd; nothing else closes it after the swap.
-            unsafe {
-                libc::shutdown(fd, libc::SHUT_RDWR);
-                libc::close(fd);
-            }
-        }
+        stop_listener(state);
         return;
+    }
+}
+
+fn stop_listener(state: &State) {
+    if state.shutting_down.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let fd = state.listen_fd.swap(-1, Ordering::SeqCst);
+    if fd >= 0 {
+        // Shutdown then close — only the close wakes a blocked accept(2) on
+        // macOS. `shutting_down` is already set, so the loop exits.
+        // SAFETY: raw-owned fd, claimed exactly once by the atomic swap.
+        unsafe {
+            libc::shutdown(fd, libc::SHUT_RDWR);
+            libc::close(fd);
+        }
     }
 }
 
@@ -252,4 +265,30 @@ fn write_pid_file(path: &Path) -> HolderResult<()> {
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::HolderManagerServer;
+    use crate::holder::{HolderManagerClient, HolderManagerPaths};
+
+    #[test]
+    fn an_idle_manager_accepts_immediate_graceful_shutdown() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let directory = temporary.path().join("holders");
+        let server = HolderManagerServer::new(&directory, Duration::from_secs(30));
+        let worker = std::thread::spawn(move || server.run());
+        let client = HolderManagerClient::new(HolderManagerPaths::new(&directory).socket());
+        for _ in 0..100 {
+            if client.is_alive() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        client.shutdown_if_idle().expect("idle shutdown");
+        worker.join().expect("manager thread").expect("manager run");
+        assert!(!client.is_alive());
+    }
 }

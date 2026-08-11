@@ -18,8 +18,7 @@ use diri_engine::{Authority, ManifestEngine, OutputLog, PtySpec, Registry};
 use diri_proto::SessionStatus;
 
 fn engine() -> Arc<ManifestEngine> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../Sources/DirijorCore/Resources/manifests")
+    let dir = diri_engine::detect::bundled_manifest_dir()
         .canonicalize()
         .expect("manifests");
     let (engine, _) = ManifestEngine::load_dir(&dir).expect("load");
@@ -51,6 +50,7 @@ fn shell_spec(id: &str, script: &str, logs: &Path, holder: Option<HolderConfig>)
         authority: Authority::ProcessOnly,
         logs_dir: logs.to_path_buf(),
         holder,
+        remote: None,
         defer_launch: false,
     }
 }
@@ -219,8 +219,8 @@ fn record(id: &str) -> diri_proto::SessionRecord {
         last_seen_at: None,
         pinned: false,
         archived_at: None,
-        remote_active: false,
         host: None,
+        remote_persistence: None,
         hibernation: None,
         memory_bytes: None,
         artifacts: None,

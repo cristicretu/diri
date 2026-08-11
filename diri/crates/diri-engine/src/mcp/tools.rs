@@ -45,22 +45,15 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
             "spawn_agent",
             "Open a NEW session (tab) in diri running an agent or a shell. USE THIS whenever the \
              user asks to open, start, spawn or launch another agent, session, or terminal. \
-             Optionally create a fresh git worktree for it and give it an initial prompt. \
-             With `host`, the agent runs on that remote machine instead: your local repo's \
-             branch (including uncommitted work) is pushed and hard-synced into the host's \
-             matching checkout first, so the cloud agent starts from your exact code state — \
-             then wait_for_agent / read_output / send_prompt work on it like any local child.",
+             Optionally create a fresh git worktree for it and give it an initial prompt.",
             json!({
                 "type": "object",
                 "properties": {
                     "kind": { "type": "string", "enum": kind_enum, "description": "Which agent to run." },
-                    "cwd": { "type": "string", "description": "Working directory (a repo path when worktree is true; with host, the LOCAL context source whose code state is handed off)." },
+                    "cwd": { "type": "string", "description": "Working directory (a repo path when worktree is true)." },
                     "worktree": { "type": "boolean", "description": "Create a fresh git worktree off cwd and run there (local spawns only)." },
                     "prompt": { "type": "string", "description": "Initial prompt to send once the agent is ready." },
-                    "name": { "type": "string", "description": "Session title." },
-                    "host": { "type": "string", "description": "Remote host id from Settings → Remote (e.g. \"forge\"): spawn there over ssh, in the checkout matching cwd's origin." },
-                    "remote_cwd": { "type": "string", "description": "Explicit directory on the host; default: locate the checkout by cwd's origin URL." },
-                    "sync_code": { "type": "boolean", "description": "Hand off code state first: WIP-commit + push the local branch, hard-sync the host checkout (default true; dirty host checkouts are a hard stop)." }
+                    "name": { "type": "string", "description": "Session title." }
                 },
                 "required": ["kind", "cwd"]
             }),

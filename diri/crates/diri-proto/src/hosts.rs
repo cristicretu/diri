@@ -1,10 +1,8 @@
-//! Remote host catalog (`hosts.json`) — hand-port of
-//! `Sources/DirijorProtocol/HostsConfig.swift`.
+//! Remote execution-host catalog (`hosts.json`).
 //!
-//! The file lives next to `remote.json` in the daemon's Application Support
-//! directory and is read by both the daemon (at spawn time) and the diri UI
-//! (for the host picker — same machine as the daemon). A missing or invalid
-//! file means "no remote hosts": the picker shows Local only.
+//! The file lives in the Engine's Application Support directory and is read by
+//! both the Engine at spawn time and the local UI for host selection. A missing
+//! or invalid file means "no remote hosts": the picker shows Local only.
 
 use std::fs;
 use std::io;
@@ -30,8 +28,8 @@ pub struct HostNodeConfig {
     pub node_id: Option<String>,
 }
 
-/// One configured remote host reachable through its first-party node, with
-/// SSH retained for installation, terminal fallback, and recovery.
+/// One configured SSH execution host with an optional first-party node used by
+/// enhanced fleet operations. Remote Holder sessions always use `ssh`.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostEntry {

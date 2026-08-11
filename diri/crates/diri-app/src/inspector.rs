@@ -15,7 +15,8 @@ use diri_proto::{
     SessionArtifact, SessionDiffBase, SessionId, SessionRecord, SessionStatus,
 };
 use diri_ui::{
-    AgentKind, AgentLogo, Fill, FloatingSurface, Ink, Metrics, Radius, SemanticColors, Typo,
+    AgentKind, AgentLogo, Fill, FloatingSurface, Ink, LoadingIndicator, Metrics, Radius,
+    SemanticColors, Typo,
 };
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Context, DragMoveEvent, Entity, EventEmitter,
@@ -183,7 +184,7 @@ pub struct WorkbenchInspector {
     scrollbar_interaction: ScrollbarInteraction,
     scrollbar_layout_primed: bool,
     refresh_task: Option<Task<()>>,
-    _poll_task: Task<()>,
+    poll_task: Option<Task<()>>,
     _store_changes: Task<()>,
 }
 
@@ -204,21 +205,6 @@ impl WorkbenchInspector {
         let tokio = tokio_owner.handle().clone();
         let code_viewer = cx.new(|cx| CodeViewer::new(tokio.clone(), cx));
         let focus = cx.focus_handle();
-        let poll_task = cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(REFRESH_INTERVAL).await;
-                if this
-                    .update(cx, |this, cx| {
-                        if this.visible {
-                            this.refresh(false, cx);
-                        }
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-            }
-        });
         let mut changes = runtime.changes();
         let store_changes = cx.spawn(async move |this, cx| {
             loop {
@@ -279,7 +265,7 @@ impl WorkbenchInspector {
             scrollbar_interaction: ScrollbarInteraction::default(),
             scrollbar_layout_primed: false,
             refresh_task: None,
-            _poll_task: poll_task,
+            poll_task: None,
             _store_changes: store_changes,
         }
     }
@@ -290,6 +276,10 @@ impl WorkbenchInspector {
         }
         self.visible = visible;
         if visible {
+            // One-shot, every tab. Info renders the Git summary and the header
+            // renders the Changes badge, so becoming visible always needs one
+            // settled read of the working tree — what stays tab-gated is the
+            // *periodic* poll below, not this edge-triggered refresh.
             self.refresh(true, cx);
         } else {
             self.comparison_menu_open = false;
@@ -298,7 +288,36 @@ impl WorkbenchInspector {
             self.ask_feedback = None;
             self.ask_query.clear();
         }
+        self.reconcile_diff_polling(cx);
         cx.notify();
+    }
+
+    fn reconcile_diff_polling(&mut self, cx: &mut Context<Self>) {
+        let should_poll = self.visible && self.selected_tab == InspectorTab::Changes;
+        if !should_poll {
+            // Dropping a GPUI Task cancels its timer/future. Info and Artifacts
+            // therefore perform no periodic Git work and have no idle wakeup.
+            self.poll_task = None;
+            return;
+        }
+        if self.poll_task.is_some() {
+            return;
+        }
+        self.poll_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(REFRESH_INTERVAL).await;
+                if this
+                    .update(cx, |this, cx| {
+                        if this.visible && this.selected_tab == InspectorTab::Changes {
+                            this.refresh(false, cx);
+                        }
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }));
     }
 
     /// Opens a terminal or diff-shaped file reference in the native code tab.
@@ -336,6 +355,10 @@ impl WorkbenchInspector {
         if !self.visible {
             return;
         }
+        // Edge-triggered on a real context change, on every tab: a store change
+        // that moves the selection must not leave Info showing the previous
+        // session's counts. This is not periodic work — an idle Info tab makes
+        // no Git calls because `reconcile_diff_polling` installs no timer.
         if self.selected_context() != self.context {
             self.refresh(true, cx);
         } else {
@@ -369,6 +392,7 @@ impl WorkbenchInspector {
         if tab == InspectorTab::Changes {
             self.refresh(true, cx);
         }
+        self.reconcile_diff_polling(cx);
         cx.notify();
     }
 
@@ -443,7 +467,7 @@ impl WorkbenchInspector {
         self.loading = true;
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
-        if context_changed || !matches!(self.state, LoadState::Ready(_)) {
+        if should_show_blocking_git_loading(context_changed, &self.state) {
             self.state = LoadState::Loading;
             cx.notify();
         }
@@ -1077,7 +1101,7 @@ impl WorkbenchInspector {
     fn render_git_summary(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
         let (symbol, title, detail, accent, can_open) = match &self.state {
             LoadState::Ready(snapshot) if snapshot.files > 0 => (
-                "arrow.left.arrow.right",
+                Some("arrow.left.arrow.right"),
                 format!(
                     "{} {} changed",
                     snapshot.files,
@@ -1088,7 +1112,7 @@ impl WorkbenchInspector {
                 true,
             ),
             LoadState::Ready(snapshot) => (
-                "checkmark.circle.fill",
+                Some("checkmark.circle.fill"),
                 "No changes".to_owned(),
                 format!(
                     "Matches {}",
@@ -1104,27 +1128,45 @@ impl WorkbenchInspector {
                 true,
             ),
             LoadState::Loading => (
-                "ellipsis.circle",
+                None,
                 "Reading working tree".to_owned(),
                 "Git status is updating…".to_owned(),
                 colors.secondary,
                 false,
             ),
+            LoadState::Error(error) if git_is_not_a_repository(error) => (
+                Some("folder"),
+                "Not a Git repository".to_owned(),
+                "This folder has no Git working tree.".to_owned(),
+                colors.tertiary,
+                false,
+            ),
+            LoadState::Error(error) if git_is_not_installed(error) => (
+                Some("terminal"),
+                "Git unavailable".to_owned(),
+                "Git is not installed on this host.".to_owned(),
+                colors.tertiary,
+                false,
+            ),
             LoadState::Error(error) => (
-                "exclamationmark.triangle.fill",
+                Some("exclamationmark.triangle.fill"),
                 "Git status unavailable".to_owned(),
                 error.clone(),
                 Ink::ATTENTION,
                 false,
             ),
             LoadState::NoSession => (
-                "minus.circle",
+                Some("minus.circle"),
                 "No session selected".to_owned(),
                 "Select an agent to inspect its working tree.".to_owned(),
                 colors.tertiary,
                 false,
             ),
         };
+        let status_mark = symbol.map_or_else(
+            || LoadingIndicator::new("inspector-git-loading", 16.0, accent).into_any_element(),
+            |symbol| sf_symbol(symbol, 15.0, accent),
+        );
         div()
             .id("inspector-git-summary")
             .min_h(px(52.0))
@@ -1145,7 +1187,7 @@ impl WorkbenchInspector {
                         cx.stop_propagation();
                     }))
             })
-            .child(sf_symbol(symbol, 15.0, accent))
+            .child(status_mark)
             .child(
                 div()
                     .min_w(px(0.0))
@@ -2672,9 +2714,33 @@ impl WorkbenchInspector {
     }
 }
 
+fn git_is_not_a_repository(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("not a git repository")
+        || error.contains("session cwd is not inside a git repository")
+}
+
+fn git_is_not_installed(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("git is not installed")
+        || error.contains("git: command not found")
+        || error.contains("git: not found")
+}
+
+fn should_show_blocking_git_loading(context_changed: bool, state: &LoadState) -> bool {
+    context_changed || matches!(state, LoadState::NoSession)
+}
+
 impl Render for WorkbenchInspector {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = SemanticColors::sidebar(diri_ui::Appearance::from_window(window.appearance()));
+        let colors = {
+            let store = self
+                .runtime
+                .store
+                .read()
+                .expect("session store lock poisoned");
+            crate::app_theme::sidebar_colors(&store.preferences().terminal_theme)
+        };
         let session = self.selected_session();
         let body = match self.selected_tab {
             InspectorTab::Info => self.render_info(session.as_ref(), colors, cx),
@@ -4266,6 +4332,102 @@ mod tests {
     }
 
     #[test]
+    fn background_git_refresh_keeps_the_last_settled_surface() {
+        assert!(!should_show_blocking_git_loading(
+            false,
+            &LoadState::Error("not a git repository".to_owned())
+        ));
+        assert!(!should_show_blocking_git_loading(
+            false,
+            &LoadState::Ready(Arc::new(DiffSnapshot::default()))
+        ));
+        assert!(should_show_blocking_git_loading(
+            true,
+            &LoadState::Error("old project".to_owned())
+        ));
+    }
+
+    /// The Info tab renders the Git summary, so it must be refreshed when it
+    /// becomes visible and whenever the selected session changes — but it must
+    /// never install the periodic diff poll, which stays exclusive to Changes.
+    #[gpui::test]
+    fn info_refreshes_on_context_change_without_a_periodic_poll(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let ids: Vec<SessionId> = fixture
+            .list
+            .sessions
+            .iter()
+            .map(|session| session.id.clone())
+            .collect();
+        assert!(ids.len() >= 2, "fixture must offer two sessions to switch");
+        {
+            let mut store = runtime.store.write().expect("session store lock poisoned");
+            store.hydrate(fixture.list);
+            store.select(ids[0].clone());
+        }
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let inspector_runtime = Arc::clone(&runtime);
+        let (harness, cx) = cx.add_window_view(move |_window, cx| {
+            let inspector = cx.new(|cx| WorkbenchInspector::new(inspector_runtime, tokio, cx));
+            InspectorHarness { inspector }
+        });
+        let inspector = harness.read_with(cx, |harness, _| harness.inspector.clone());
+
+        // Shipping defaults: the inspector opens visible on Info.
+        assert_eq!(
+            inspector.read_with(cx, |inspector, _| inspector.selected_tab),
+            InspectorTab::Info
+        );
+        inspector.update(cx, |inspector, cx| inspector.set_visible(true, cx));
+
+        let (generation, context, polling) = inspector.read_with(cx, |inspector, _| {
+            (
+                inspector.generation,
+                inspector.context.clone(),
+                inspector.poll_task.is_some(),
+            )
+        });
+        assert!(
+            generation > 0,
+            "becoming visible on Info must read Git once"
+        );
+        assert_eq!(context.map(|context| context.id), Some(ids[0].clone()));
+        assert!(!polling, "Info must not install a periodic diff poll");
+
+        {
+            let mut store = runtime.store.write().expect("session store lock poisoned");
+            store.select(ids[1].clone());
+        }
+        inspector.update(cx, |inspector, cx| inspector.refresh_if_context_changed(cx));
+
+        let (next_generation, next_context, still_polling) = inspector.read_with(cx, |i, _| {
+            (i.generation, i.context.clone(), i.poll_task.is_some())
+        });
+        assert!(
+            next_generation > generation,
+            "a session change on Info must refresh instead of stranding stale counts"
+        );
+        assert_eq!(next_context.map(|context| context.id), Some(ids[1].clone()));
+        assert!(!still_polling, "Info must still hold no periodic poll");
+
+        // Contrast: Changes owns the timer, and leaving it disposes of it.
+        inspector.update(cx, |inspector, cx| {
+            inspector.select_tab(InspectorTab::Changes, cx);
+        });
+        assert!(inspector.read_with(cx, |inspector, _| inspector.poll_task.is_some()));
+        inspector.update(cx, |inspector, cx| {
+            inspector.select_tab(InspectorTab::Info, cx);
+        });
+        assert!(inspector.read_with(cx, |inspector, _| inspector.poll_task.is_none()));
+    }
+
+    #[test]
     fn artifact_titles_extract_the_useful_destination() {
         let pull_request = SessionArtifact {
             kind: ArtifactKind::PullRequest,
@@ -4419,5 +4581,16 @@ mod tests {
         cx.run_until_parked();
         assert!(cx.debug_bounds("INSPECTOR_ASK_COMPOSER").is_some());
         assert!(cx.debug_bounds("INSPECTOR_ASK_SEND").is_some());
+    }
+
+    #[test]
+    fn ordinary_remote_git_absence_is_rendered_as_compatibility_state() {
+        assert!(git_is_not_a_repository(
+            "internal: fatal: not a git repository (or any parent)"
+        ));
+        assert!(git_is_not_installed(
+            "internal: git is not installed on this host"
+        ));
+        assert!(!git_is_not_a_repository("ssh connection timed out"));
     }
 }

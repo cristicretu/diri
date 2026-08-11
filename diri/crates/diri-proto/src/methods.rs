@@ -1,4 +1,4 @@
-//! Typed control methods from `DirijorProtocol/Methods.swift`.
+//! Typed control methods shared by the Rust Engine and its clients.
 
 use crate::control::{JsonValue, WIRE_VERSION};
 use crate::model::{
@@ -6,6 +6,11 @@ use crate::model::{
     SessionStatus, WorktreeInfo,
 };
 use serde::{Deserialize, Serialize};
+
+/// Stable control-plane identity of the authoritative Rust Engine. Clients
+/// use this additive Hello field to reject a protocol-compatible legacy daemon
+/// instead of silently routing remote work around the Rust implementation.
+pub const RUST_ENGINE_KIND: &str = "diri-rust-engine";
 
 /// Control-channel method names.
 pub struct Method;
@@ -20,7 +25,6 @@ impl Method {
     pub const SESSION_RESUME: &'static str = "session.resume";
     pub const SESSION_SEND_TEXT: &'static str = "session.send_text";
     pub const SESSION_RESIZE: &'static str = "session.resize";
-    pub const SESSION_SET_OWNER: &'static str = "session.set_owner";
     pub const SESSION_READ_SCREEN: &'static str = "session.read_screen";
     pub const SESSION_READ_SCROLLBACK: &'static str = "session.read_scrollback";
     pub const SESSION_READ_SCROLLBACK_CELLS: &'static str = "session.read_scrollback_cells";
@@ -34,6 +38,8 @@ impl Method {
     pub const SESSION_MIGRATE: &'static str = "session.migrate";
     pub const HOST_SYNC_PREFS: &'static str = "host.sync_prefs";
     pub const HOST_LOCATE_REPO: &'static str = "host.locate_repo";
+    pub const HOST_INITIALIZE: &'static str = "host.initialize";
+    pub const HOST_LIST_DIRECTORIES: &'static str = "host.list_directories";
     pub const SESSION_HISTORY: &'static str = "session.history";
     pub const SESSION_RESUME_FROM_HISTORY: &'static str = "session.resume_from_history";
     pub const WORKTREE_CREATE: &'static str = "worktree.create";
@@ -50,6 +56,7 @@ impl Method {
     pub const TEST_RUN: &'static str = "test.run";
     pub const STATE_SNAPSHOT: &'static str = "state.snapshot";
     pub const DAEMON_PREPARE_SHUTDOWN: &'static str = "daemon.prepare_shutdown";
+    pub const DAEMON_SHUTDOWN_IF_IDLE: &'static str = "daemon.shutdown_if_idle";
     pub const DAEMON_SHUTDOWN: &'static str = "daemon.shutdown";
 }
 
@@ -80,6 +87,17 @@ pub struct EmptyParams {}
 
 pub type EmptyResult = EmptyParams;
 
+/// Result of a best-effort desktop ownership release. The Engine remains
+/// alive whenever it still owns a live session or another control client is
+/// connected; callers must never turn a refusal into an unconditional kill.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonShutdownIfIdleResult {
+    pub will_exit: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct HelloParams {
     pub proto: u32,
@@ -104,6 +122,8 @@ pub struct HelloResult {
     pub proto: u32,
     pub build: String,
     pub pid: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub executable_hash: Option<String>,
 }
@@ -218,8 +238,8 @@ pub struct SessionSpawnParams {
     pub initial_cols: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub initial_rows: Option<i64>,
-    /// `HostEntry.id` from `hosts.json` — spawn on that remote host over
-    /// ssh+tmux instead of locally. Absent ⇒ local (wire-compatible).
+    /// `HostEntry.id` from `hosts.json` — spawn through the remote PTY Holder
+    /// transport instead of locally. Absent means local.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
     /// Repo-preserving spawn: open in the checkout of the SAME repository as
@@ -389,16 +409,6 @@ impl<'de> Deserialize<'de> for ClientRole {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionSetOwnerParams {
-    #[serde(rename = "sessionID")]
-    pub session_id: SessionId,
-    pub role: ClientRole,
-}
-
-pub type SessionSetOwnerResult = EmptyResult;
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ReadScreenResult {
     pub text: String,
     pub cols: i64,
@@ -476,7 +486,7 @@ pub struct SessionMigrateResult {
     /// False when no transcript existed to shuttle: the session respawned
     /// with a fresh conversation — code state moved, context was lost.
     pub transcript_migrated: bool,
-    /// Non-fatal issues (e.g. lingering remote tmux, missing transcript).
+    /// Non-fatal issues (for example Holder cleanup or a missing transcript).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
 }
@@ -507,6 +517,50 @@ pub struct PrefsSyncToolReport {
 pub struct HostSyncPrefsResult {
     pub tools: Vec<PrefsSyncToolReport>,
 }
+
+/// `host.initialize`: bootstrap and verify the exact packaged Remote Helper,
+/// probe logout survival, and capture the remote account/cwd environment.
+/// The result deliberately excludes environment values and authentication
+/// diagnostics because both can contain secrets.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostInitializeParams {
+    /// `HostEntry.id` from `hosts.json`.
+    pub host: String,
+    /// Force the packaged artifact through upload and activation even when
+    /// the exact Build ID already probes successfully. Activation remains
+    /// content-addressed and never overwrites a different live build.
+    #[serde(default)]
+    pub force_reinstall: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostInitializeResult {
+    pub helper_build_id: String,
+    pub protocol: crate::remote_pty::ProtocolVersion,
+    pub persistence: crate::remote_pty::PersistenceCapability,
+    /// Canonical absolute directory returned by the Helper for the configured
+    /// default cwd (or the remote home when the host omitted one).
+    pub cwd: String,
+    /// Login shell selected from the remote account database.
+    pub shell: String,
+}
+
+/// `host.list_directories`: list one directory level on the selected
+/// execution host. `host = None` addresses the Engine's local machine.
+///
+/// The operation is deliberately shallow and bounded. It is the backend for
+/// the New Agent folder picker, not a general remote filesystem protocol.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostListDirectoriesParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub path: String,
+}
+
+pub type HostListDirectoriesResult = crate::remote_pty::DirectoryListResult;
 
 /// `host.locate_repo`: find a checkout of a repo on a host by origin URL.
 /// Provide either `origin_url` directly, or `session_id` to derive the origin

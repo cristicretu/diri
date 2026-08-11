@@ -1,3 +1,4 @@
+mod app_theme;
 mod clipboard_transfer;
 mod code_intelligence;
 mod code_viewer;
@@ -18,7 +19,6 @@ pub mod notifications;
 pub mod palette;
 pub mod query_editor;
 pub mod quick_open;
-mod remote_access;
 pub mod review_prompt;
 pub mod root;
 pub mod seam;
@@ -159,8 +159,9 @@ fn main() {
 
     // diri is self-contained: if no daemon socket is live, launch the daemon
     // bundled in Contents/Resources/bin, then let DaemonClient's reconnect loop
-    // pick it up. Never shuts a daemon down or restarts on hash mismatch
-    // (PLAN.md §3.1 — avoids ping-pong with any still-installed Dirijor.app).
+    // pick it up. A Rust Engine whose executable hash differs from the
+    // bundled one is gracefully replaced so app and remote Helper catalogs
+    // advance together; Holder-owned sessions survive and are adopted.
     #[cfg(unix)]
     if !preview {
         let home = std::env::var_os("HOME")
@@ -318,6 +319,8 @@ fn main() {
         bind_terminal_keys(cx);
         install_app_menus(cx);
         let quit_store = Arc::clone(&services.store);
+        let release_owned_daemon =
+            !preview && std::env::var_os(diri_proto::paths::ENV_SOCKET).is_none();
         cx.on_app_quit(move |_| {
             let quit_store = Arc::clone(&quit_store);
             async move {
@@ -329,6 +332,12 @@ fn main() {
                 {
                     eprintln!("diri: could not flush preferences while quitting: {error}");
                 }
+                if release_owned_daemon
+                    && let Err(error) = quit_store.client().shutdown_daemon_if_idle().await
+                {
+                    eprintln!("diri: could not release the idle Engine while quitting: {error}");
+                }
+                quit_store.shutdown().await;
             }
         })
         .detach();

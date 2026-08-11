@@ -8,13 +8,9 @@
 //! drives each one over a per-session unix socket and tails its output log
 //! from disk.
 //!
-//! Ported from `DirijorHolderKit`. Every format here is load-bearing in both
-//! directions: a Rust daemon must adopt live Swift-spawned holders during the
-//! engine switch, and a Swift daemon must be able to fall back onto
-//! Rust-spawned ones. That means the same socket paths, the same one-line
-//! NDJSON request/response shapes (down to Swift's synthesized-Codable key
-//! spelling, `sessionID` not `sessionId`), the same pid-file contents, and the
-//! same in-band OSC 777 exit marker in the output log.
+//! All holder processes and protocols in the active architecture are
+//! Rust-owned. The socket paths, NDJSON request/response shapes, pid-file
+//! contents and in-band OSC 777 exit marker are versioned internal contracts.
 //!
 //! Wire protocol, per connection: one JSON request line in, one JSON response
 //! line out, connection closed. No framing beyond the newline; no pipelining.
@@ -42,7 +38,7 @@ pub use manager::HolderManagerServer;
 #[cfg(unix)]
 pub use server::HolderServer;
 
-/// Failures across the holder seam, mirroring the Swift `HolderError` cases.
+/// Failures across the local holder seam.
 #[derive(Debug)]
 pub enum HolderError {
     /// The request was malformed or violated a protocol rule.

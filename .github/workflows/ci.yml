@@ -20,6 +20,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.0.0
       - name: Validate shell scripts
         run: bash -n scripts/*.sh diri/scripts/*.sh
+      - name: Verify reviewed regressions stay fixed
+        run: diri/scripts/verify-remote-refactor.sh
       - name: Test release publishing guards
         run: |
           bash diri/scripts/test-publish-github-release.sh
@@ -84,8 +86,111 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - name: Remote Holder acceptance and latency gates
+        run: scripts/remote-acceptance.sh
       - name: Release build
         run: cargo build --workspace --release
+
+  remote-helper-native:
+    name: Remote Helper (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    defaults:
+      run:
+        working-directory: diri
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install target
+        run: rustup target add "${{ matrix.target }}"
+      - name: Install native musl linker
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+      - name: Build exact release Helper
+        env:
+          DIRI_REMOTE_BUILD_ID: ci-${{ matrix.target }}
+        run: cargo build --locked --release --package diri-remote --target "${{ matrix.target }}"
+      - name: Execute native probe and verify identity
+        env:
+          EXPECTED_TARGET: ${{ matrix.target }}
+          EXPECTED_BUILD: ci-${{ matrix.target }}
+        run: |
+          helper="target/${EXPECTED_TARGET}/release/diri-remote"
+          test -x "${helper}"
+          probe="$("${helper}" probe --format=json)"
+          jq -e \
+            --arg target "${EXPECTED_TARGET}" \
+            --arg build "${EXPECTED_BUILD}" \
+            '.target == $target and .buildId == $build and .protocol.major == 1 and .supported and .holderAvailable' \
+            <<<"${probe}"
+
+  remote-ssh-soak:
+    name: Remote OpenSSH detach/reconnect
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: diri
+    steps:
+      - uses: actions/checkout@v5
+      - name: Start disposable ordinary-user SSH endpoint
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes openssh-server
+          # sshd refuses to start without its privilege separation directory,
+          # which the package does not create on a fresh runner image.
+          sudo mkdir -p /run/sshd
+          # The runner account ships with no password, which leaves it locked
+          # ("!" in shadow) and makes sshd reject it before it ever considers
+          # the key. Unlock it without setting one; password and
+          # keyboard-interactive auth stay disabled below, so keys remain the
+          # only way in on this throwaway host.
+          sudo usermod -p '*' "${USER}"
+          mkdir -p "${HOME}/.ssh" "${RUNNER_TEMP}/sshd"
+          chmod 700 "${HOME}/.ssh"
+          ssh-keygen -q -t ed25519 -N '' -f "${RUNNER_TEMP}/diri_ci_key"
+          cat "${RUNNER_TEMP}/diri_ci_key.pub" >> "${HOME}/.ssh/authorized_keys"
+          chmod 600 "${HOME}/.ssh/authorized_keys"
+          printf '%s\n' \
+            'Host diri-ci-soak' \
+            '  HostName 127.0.0.1' \
+            '  Port 2222' \
+            "  User ${USER}" \
+            "  IdentityFile ${RUNNER_TEMP}/diri_ci_key" \
+            '  IdentitiesOnly yes' \
+            '  StrictHostKeyChecking accept-new' \
+            "  UserKnownHostsFile ${RUNNER_TEMP}/known_hosts" \
+            > "${HOME}/.ssh/config"
+          chmod 600 "${HOME}/.ssh/config"
+          sudo /usr/sbin/sshd -D -e -p 2222 \
+            -o PasswordAuthentication=no \
+            -o KbdInteractiveAuthentication=no \
+            -o UsePAM=no \
+            -o AllowUsers="${USER}" \
+            -o PidFile="${RUNNER_TEMP}/sshd/sshd.pid" \
+            >"${RUNNER_TEMP}/sshd.log" 2>&1 &
+          for attempt in $(seq 1 50); do
+            if ssh -o BatchMode=yes diri-ci-soak true; then
+              exit 0
+            fi
+            sleep 0.1
+          done
+          cat "${RUNNER_TEMP}/sshd.log"
+          exit 1
+      - name: Run real SSH persistence soak
+        env:
+          DIRI_REMOTE_SSH_TARGET: diri-ci-soak
+          DIRI_REMOTE_SOAK_SECONDS: "5"
+        run: scripts/remote-ssh-soak.sh
 
   bundle:
     name: Package diri.app (unsigned)
@@ -109,9 +214,12 @@ jobs:
       # with "can't find crate for std".
       - name: Install universal targets
         working-directory: diri
-        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
-      - name: Install cargo-packager
-        run: cargo install cargo-packager --locked
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-musl x86_64-unknown-linux-musl
+      - name: Install Rust packaging tools
+        run: |
+          brew install zig
+          cargo install cargo-packager --locked
+          cargo install cargo-zigbuild --locked
       - name: Package
         env:
           DIRI_DIST_DIR: ${{ runner.temp }}/diri-dist
@@ -120,9 +228,16 @@ jobs:
         run: |
           app="${RUNNER_TEMP}/diri-dist/diri.app"
           plutil -lint "${app}/Contents/Info.plist"
-          test -x "${app}/Contents/Resources/bin/dirijord"
-          test -x "${app}/Contents/Resources/bin/dirijord-holder"
           test -x "${app}/Contents/Resources/bin/dirijor"
+          test -x "${app}/Contents/Resources/bin/dirijord-rs"
+          test -x "${app}/Contents/Resources/bin/diri-holder"
+          test -x "${app}/Contents/Resources/bin/diri-ssh-askpass"
+          test -f "${app}/Contents/Resources/bin/manifests/codex.json"
+          lipo "${app}/Contents/Resources/bin/dirijord-rs" -verify_arch arm64 x86_64
+          lipo "${app}/Contents/Resources/bin/diri-holder" -verify_arch arm64 x86_64
+          lipo "${app}/Contents/Resources/bin/diri-ssh-askpass" -verify_arch arm64 x86_64
+          test -f "${app}/Contents/Resources/bin/remote-helpers/manifest.json"
+          test "$(find "${app}/Contents/Resources/bin/remote-helpers/artifacts" -name diri-remote -type f | wc -l | tr -d ' ')" = 3
           codesign --verify --deep --strict "${app}"
 
   # Issue #1: `isLinkedWorktreeDistinguishesMainFromLinked` hangs on a runner

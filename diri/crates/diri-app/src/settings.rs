@@ -1,8 +1,7 @@
 //! State shared by the four settings tabs.
 //!
 //! General, Terminal, and Resources mutate diri's preferences. Remote manages
-//! both the shared execution-host catalog and the explicit iOS companion-access
-//! setting.
+//! the shared execution-host catalog used by the SSH Remote Holder transport.
 
 use diri_proto::{HostEntry, HostNodeConfig};
 use diri_term::theme::TermTheme;
@@ -35,7 +34,7 @@ impl SettingsTab {
             Self::General => "Startup, sessions, and updates",
             Self::Terminal => "Appearance and text size",
             Self::Resources => "Idle sessions and memory",
-            Self::Remote => "Execution hosts and companion access",
+            Self::Remote => "SSH execution hosts",
         }
     }
 
@@ -66,7 +65,7 @@ pub struct HostDraft {
 impl HostDraft {
     pub fn new() -> Self {
         Self {
-            default_cwd: "~/code".to_owned(),
+            default_cwd: "~".to_owned(),
             ..Self::default()
         }
     }
@@ -180,10 +179,7 @@ pub fn default_agent_label(agent: DefaultAgent) -> &'static str {
 }
 
 pub fn theme(id: &str) -> TermTheme {
-    TermTheme::CATALOG
-        .into_iter()
-        .find(|theme| theme.id == id)
-        .unwrap_or_default()
+    crate::app_theme::terminal_theme(id)
 }
 
 pub fn next_theme(id: &str) -> TermTheme {
@@ -268,6 +264,11 @@ mod tests {
         let edited = editing.entry(&[]).expect("valid edit");
         assert_eq!(edited.id, "forge");
         assert_eq!(edited.name.as_deref(), Some("The Forge"));
+    }
+
+    #[test]
+    fn new_hosts_default_to_the_remote_home_directory() {
+        assert_eq!(HostDraft::new().default_cwd, "~");
     }
 
     #[test]

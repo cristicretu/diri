@@ -11,7 +11,7 @@
 #![cfg(unix)]
 
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use diri_engine::detect::ManifestEngine;
@@ -20,8 +20,7 @@ use diri_engine::{HeadlessScreen, OutputLog, Pty, PtySpec};
 use diri_proto::{NeedsInputKind, SessionStatus};
 
 fn manifest_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../Sources/DirijorCore/Resources/manifests")
+    diri_engine::detect::bundled_manifest_dir()
         .canonicalize()
         .expect("manifests directory")
 }

@@ -15,6 +15,9 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
+
 use serde_json::{Value, json};
 
 /// No runs for this long → kill the sidecar and reclaim all browser RAM.
@@ -24,8 +27,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone)]
 pub struct BrowserPool {
-    inner: Arc<Mutex<PoolInner>>,
+    shared: Arc<PoolShared>,
     artifact_dir: PathBuf,
+}
+
+struct PoolShared {
+    inner: Mutex<PoolInner>,
 }
 
 struct PoolInner {
@@ -41,15 +48,17 @@ struct PoolInner {
 impl BrowserPool {
     pub fn new(logs_dir: &Path) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(PoolInner {
-                child: None,
-                stdin: None,
-                pending: HashMap::new(),
-                next_id: 0,
-                last_activity: Instant::now(),
-                open_browser_sessions: HashSet::new(),
-                idle_sweeper_running: false,
-            })),
+            shared: Arc::new(PoolShared {
+                inner: Mutex::new(PoolInner {
+                    child: None,
+                    stdin: None,
+                    pending: HashMap::new(),
+                    next_id: 0,
+                    last_activity: Instant::now(),
+                    open_browser_sessions: HashSet::new(),
+                    idle_sweeper_running: false,
+                }),
+            }),
             artifact_dir: logs_dir.join("test-artifacts"),
         }
     }
@@ -85,7 +94,7 @@ impl BrowserPool {
         // Track open pages so the idle sweep never drops one from under an
         // agent mid-use.
         if let (Some(id), Some(action)) = (session_id, action) {
-            let mut inner = self.inner.lock().expect("pool");
+            let mut inner = self.shared.inner.lock().expect("pool");
             match action.as_str() {
                 "open" => {
                     inner.open_browser_sessions.insert(id);
@@ -106,7 +115,7 @@ impl BrowserPool {
         timeout: Option<Duration>,
     ) -> Result<Value, String> {
         let receiver = {
-            let mut inner = self.inner.lock().expect("pool");
+            let mut inner = self.shared.inner.lock().expect("pool");
             self.ensure_running(&mut inner)?;
             inner.last_activity = Instant::now();
             inner.next_id += 1;
@@ -147,11 +156,25 @@ impl BrowserPool {
         let sidecar = locate_sidecar().ok_or("test sidecar not found")?;
         let _ = std::fs::create_dir_all(&self.artifact_dir);
 
-        let mut child = Command::new(&node)
+        let mut command = Command::new(&node);
+        command
             .arg(&sidecar)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: the post-fork closure invokes only the async-signal-safe
+        // `setsid` syscall. A private group lets shutdown reclaim browsers
+        // spawned by the sidecar, not only its direct Node process.
+        #[cfg(unix)]
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command
             .spawn()
             .map_err(|error| format!("failed to launch sidecar: {error}"))?;
         inner.stdin = child.stdin.take();
@@ -159,7 +182,7 @@ impl BrowserPool {
 
         // Route each response line to its waiting request.
         if let Some(stdout) = stdout {
-            let pool = Arc::clone(&self.inner);
+            let pool = Arc::downgrade(&self.shared);
             let _ = std::thread::Builder::new()
                 .name("diri-browser-sidecar".into())
                 .spawn(move || {
@@ -172,7 +195,10 @@ impl BrowserPool {
                         let Some(id) = message.get("id").and_then(Value::as_u64) else {
                             continue;
                         };
-                        let Ok(mut inner) = pool.lock() else { break };
+                        let Some(pool) = pool.upgrade() else { break };
+                        let Ok(mut inner) = pool.inner.lock() else {
+                            break;
+                        };
                         inner.last_activity = Instant::now();
                         if let Some(sender) = inner.pending.remove(&id) {
                             let outcome = match message.get("error").and_then(Value::as_str) {
@@ -183,7 +209,9 @@ impl BrowserPool {
                         }
                     }
                     // Sidecar gone: fail whatever was still waiting.
-                    if let Ok(mut inner) = pool.lock() {
+                    if let Some(pool) = pool.upgrade()
+                        && let Ok(mut inner) = pool.inner.lock()
+                    {
                         for (_, sender) in inner.pending.drain() {
                             let _ = sender.send(Err("sidecar exited".into()));
                         }
@@ -196,27 +224,101 @@ impl BrowserPool {
 
         if !inner.idle_sweeper_running {
             inner.idle_sweeper_running = true;
-            let pool = Arc::clone(&self.inner);
+            let pool = Arc::downgrade(&self.shared);
             let _ = std::thread::Builder::new()
                 .name("diri-browser-idle".into())
                 .spawn(move || {
                     loop {
                         std::thread::sleep(Duration::from_secs(30));
-                        let Ok(mut inner) = pool.lock() else { return };
+                        let Some(pool) = pool.upgrade() else { return };
+                        let Ok(mut inner) = pool.inner.lock() else {
+                            return;
+                        };
                         let idle = inner.pending.is_empty()
                             && inner.open_browser_sessions.is_empty()
                             && inner.last_activity.elapsed() > IDLE_TIMEOUT;
-                        if idle && let Some(mut child) = inner.child.take() {
+                        if idle && inner.child.is_some() {
                             // Recycle: reclaim all browser RAM.
-                            inner.stdin = None;
-                            let _ = child.kill();
-                            let _ = child.wait();
+                            terminate_sidecar(&mut inner, "sidecar recycled after idle timeout");
                         }
                     }
                 });
         }
         Ok(())
     }
+
+    /// Stops the optional Node/Playwright process group and wakes every
+    /// pending caller. Engine shutdown uses this explicitly because
+    /// `std::process::exit` does not run Rust destructors.
+    pub fn shutdown(&self) {
+        if let Ok(mut inner) = self.shared.inner.lock() {
+            terminate_sidecar(&mut inner, "browser sidecar stopped");
+        }
+    }
+}
+
+impl Drop for PoolShared {
+    fn drop(&mut self) {
+        if let Ok(inner) = self.inner.get_mut() {
+            terminate_sidecar(inner, "browser pool dropped");
+        }
+    }
+}
+
+fn terminate_sidecar(inner: &mut PoolInner, reason: &str) {
+    inner.stdin = None;
+    for (_, sender) in inner.pending.drain() {
+        let _ = sender.send(Err(reason.to_owned()));
+    }
+    let Some(mut child) = inner.child.take() else {
+        return;
+    };
+    terminate_child_group(&mut child);
+}
+
+fn terminate_child_group(child: &mut Child) {
+    let process_group = child.id() as i32;
+    #[cfg(unix)]
+    // SAFETY: the sidecar calls `setsid` before exec, so its positive pid is
+    // also the private process-group id. A negative id targets that group.
+    unsafe {
+        libc::kill(-process_group, libc::SIGTERM);
+    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
+
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        #[cfg(unix)]
+        if !process_group_exists(process_group) {
+            return;
+        }
+        #[cfg(not(unix))]
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    #[cfg(unix)]
+    // SAFETY: see the SIGTERM call above. Escalation is bounded and still
+    // limited to the sidecar's private group.
+    unsafe {
+        libc::kill(-process_group, libc::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+fn process_group_exists(process_group: i32) -> bool {
+    // SAFETY: signal zero performs an existence/permission check only.
+    let result = unsafe { libc::kill(-process_group, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 fn inject_artifact_dir(params: &mut Value, artifact_dir: &Path) {
@@ -263,4 +365,46 @@ fn locate_sidecar() -> Option<PathBuf> {
         }
     }
     candidates.into_iter().find(|candidate| candidate.is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_wakes_pending_requests_and_is_idempotent() {
+        let pool = BrowserPool::new(Path::new("/tmp/diri-browser-test"));
+        let (sender, receiver) = mpsc::channel();
+        pool.shared
+            .inner
+            .lock()
+            .expect("pool")
+            .pending
+            .insert(1, sender);
+
+        pool.shutdown();
+        assert!(receiver.recv().expect("shutdown result").is_err());
+        pool.shutdown();
+        assert!(pool.shared.inner.lock().expect("pool").child.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_sidecar_group_is_fully_terminated() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("sleep 30 & wait");
+        // SAFETY: the test child executes only `setsid` between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().expect("sidecar fixture");
+        let process_group = child.id() as i32;
+        terminate_child_group(&mut child);
+        assert!(!process_group_exists(process_group));
+    }
 }
