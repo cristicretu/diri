@@ -28,7 +28,9 @@ use crate::state::{
 };
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
-const DIFF_COALESCE: Duration = Duration::from_millis(16);
+/// One 120 Hz display interval. Remote links still coalesce sustained output,
+/// but never force a ProMotion client down to 60 fps.
+const DIFF_COALESCE: Duration = Duration::from_millis(8);
 const INTERACTIVE_GRID_BUDGET: u8 = 2;
 const MAX_OUTBOUND_BYTES: usize = 20 << 20;
 const MAX_PENDING_INPUT_BYTES: usize = 1 << 20;

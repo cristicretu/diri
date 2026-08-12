@@ -24,10 +24,11 @@ use diri_proto::frames::{Frame, FrameCodec, FrameType};
 use crate::registry::Registry;
 use crate::session::{AttachmentSeed, GridSignature};
 
-/// Background-output ceiling for grid emission, matching the client pacer and
-/// the Swift daemon's flush interval. The first frame after quiet and the
-/// bounded response frames after interactive input go immediately.
-const GRID_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
+/// Background-output ceiling for grid emission. The first frame after quiet
+/// and the bounded response frames after interactive input go immediately;
+/// a continuous producer is capped at the display cadence of a 120 Hz panel.
+/// This transport budget never delays the interactive leading edge.
+const GRID_FLUSH_INTERVAL: Duration = Duration::from_millis(8);
 
 /// One attached client's write half.
 struct Sink {
@@ -203,10 +204,11 @@ impl AttachHub {
         }
     }
 
-    /// The per-session broadcast loop. Grid writers wake it on change;
-    /// background bursts coalesce to 16 ms while interactive responses bypass
-    /// that wait. A quiet attached terminal performs no Registry or Screen
-    /// polling. Ends within one bounded wait after the last sink.
+    /// The per-session broadcast loop. Grid writers wake it after a complete
+    /// PTY output batch. The leading edge and interactive responses publish
+    /// immediately; continuous background output coalesces to 8 ms. A quiet
+    /// attached terminal performs no Registry or Screen polling. Ends within
+    /// one bounded wait after the last sink.
     fn pump(&self, registry: &Arc<Mutex<Registry>>, session_id: &str, seed: AttachmentSeed) {
         let mut signature = seed.signature;
         let mut last_modes = Some(seed.modes);

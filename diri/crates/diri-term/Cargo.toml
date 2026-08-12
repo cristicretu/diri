@@ -10,4 +10,10 @@ diri-proto.workspace = true
 gpui.workspace = true
 
 [dev-dependencies]
-gpui_platform.workspace = true
+criterion = "0.5.1"
+gpui = { workspace = true, features = ["bench"] }
+gpui_platform = { workspace = true, features = ["test-support"] }
+
+[[bench]]
+name = "terminal_renderer"
+harness = false

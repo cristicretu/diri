@@ -3,8 +3,8 @@
 //! The daemon remains authoritative: this module only composes
 //! `diri-client::SessionAttachment`, `diri-term`, and the T9 session store.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use diri_client::attachment::{SessionAttachment, TerminalChunk};
@@ -21,7 +21,6 @@ use diri_term::keys::{
     encode_key, paste,
 };
 use diri_term::metrics::CellMetrics;
-use diri_term::repaint::{RepaintAction, RepaintPacer};
 use diri_term::scrollback::{WheelDelta, WheelEvent, WheelRoute};
 use diri_term::theme::TermTheme;
 use diri_ui::{
@@ -60,16 +59,12 @@ const TOOLBAR_MAX_VISIBLE_LINKS: usize = 4;
 const TOOLBAR_LINK_MAX_WIDTH: f32 = 176.0;
 const TOOLBAR_OVERFLOW_WIDTH: f32 = 50.0;
 const REATTACH_DELAY: Duration = Duration::from_millis(500);
-/// Burst ceiling for repaints (~60fps). The pacer paints the first frame of a
-/// burst and the next response after interactive input immediately; this only
-/// caps sustained output, and background panes never invalidate the window, so
-/// idle budgets are unaffected. Matched to the daemon's `gridFlushInterval`.
-const ACTIVE_REPAINT_INTERVAL: Duration = Duration::from_millis(16);
+const PANE_EVENT_QUEUE_CAPACITY: usize = 256;
 /// How often a live drag is allowed to push a new PTY geometry. Matched to the
-/// daemon's coalesced grid flush (also 16ms): resizing faster produces frames
+/// daemon's coalesced grid flush (also 8ms): resizing faster produces frames
 /// the client can never see, resizing slower makes the drag look like it snaps
 /// at the end instead of reflowing under the cursor.
-const RESIZE_CADENCE: Duration = Duration::from_millis(16);
+const RESIZE_CADENCE: Duration = Duration::from_millis(8);
 /// Two resizes further apart than this belong to different gestures. A drag
 /// steps faster than this and must keep reflowing live; anything slower is a
 /// discrete change -- a panel toggle, a window snap, a font-size change --
@@ -365,7 +360,6 @@ enum AttachmentCommand {
 #[derive(Clone)]
 struct AttachmentControl {
     tx: mpsc::UnboundedSender<AttachmentCommand>,
-    pane_tx: mpsc::UnboundedSender<PaneEvent>,
 }
 
 impl AttachmentControl {
@@ -373,10 +367,6 @@ impl AttachmentControl {
         if bytes.is_empty() {
             return;
         }
-        // Queue the priority marker before the bytes leave for the daemon, so
-        // an echo that returns immediately cannot land behind the UI's
-        // background-output repaint timer.
-        let _ = self.pane_tx.send(PaneEvent::InteractiveInput);
         let _ = self.tx.send(AttachmentCommand::Input(bytes));
     }
 
@@ -399,13 +389,107 @@ impl AttachmentControl {
 }
 
 enum PaneEvent {
-    InteractiveInput,
     AttachmentState(SessionId, AttachmentState),
     Chunk(SessionId, TerminalChunk),
+    GridBatch(SessionId, Vec<GridUpdate>),
     FindSnapshot(SessionId, SearchRequest, FindSnapshot),
     ScrollbackCells(SessionId, diri_proto::ReadScrollbackCellsResult, usize),
     ScrollbackFailed(SessionId),
     ClipboardUploadFinished(SessionId, Result<String, String>),
+}
+
+/// Bounded, grid-aware handoff from transport tasks to the GPUI thread.
+/// Terminal grids are state, not a log: one coalesced final update per session
+/// is sufficient, while semantic events retain their order in a fixed queue.
+#[derive(Clone)]
+struct PaneEventSender {
+    state: Arc<Mutex<PaneMailboxState>>,
+    wake: mpsc::Sender<()>,
+}
+
+struct PaneEventReceiver {
+    state: Arc<Mutex<PaneMailboxState>>,
+    wake: mpsc::Receiver<()>,
+}
+
+#[derive(Default)]
+struct PaneMailboxState {
+    events: VecDeque<PaneEvent>,
+    /// At most a new baseline plus its final trailing diff. The two-frame
+    /// boundary is observable by resize reflow holds and must not be erased.
+    grids: HashMap<SessionId, Vec<GridUpdate>>,
+    grid_order: VecDeque<SessionId>,
+}
+
+fn pane_event_channel() -> (PaneEventSender, PaneEventReceiver) {
+    let state = Arc::new(Mutex::new(PaneMailboxState::default()));
+    let (wake_tx, wake_rx) = mpsc::channel(1);
+    (
+        PaneEventSender {
+            state: Arc::clone(&state),
+            wake: wake_tx,
+        },
+        PaneEventReceiver {
+            state,
+            wake: wake_rx,
+        },
+    )
+}
+
+impl PaneEventSender {
+    fn send(&self, event: PaneEvent) -> Result<(), ()> {
+        if self.wake.is_closed() {
+            return Err(());
+        }
+        let mut state = self.state.lock().expect("pane event mailbox");
+        match event {
+            PaneEvent::Chunk(id, TerminalChunk::Grid(update)) => {
+                if let Some(batch) = state.grids.get_mut(&id) {
+                    let starts_new_baseline = update.is_full_snapshot
+                        || batch.last().is_some_and(|last| {
+                            last.cols != update.cols || last.rows != update.rows
+                        });
+                    if starts_new_baseline {
+                        batch.clear();
+                        batch.push(update);
+                    } else if batch.len() == 1 && batch[0].is_full_snapshot {
+                        batch.push(update);
+                    } else if let Some(pending) = batch.last_mut() {
+                        pending.coalesce(update);
+                    }
+                } else {
+                    state.grid_order.push_back(id.clone());
+                    state.grids.insert(id, vec![update]);
+                }
+            }
+            event => {
+                if state.events.len() >= PANE_EVENT_QUEUE_CAPACITY {
+                    return Err(());
+                }
+                state.events.push_back(event);
+            }
+        }
+        drop(state);
+        // Capacity one turns any number of producer writes into one GPUI wake.
+        let _ = self.wake.try_send(());
+        Ok(())
+    }
+}
+
+impl PaneEventReceiver {
+    async fn recv_batch(&mut self, batch: &mut Vec<PaneEvent>) -> bool {
+        if self.wake.recv().await.is_none() {
+            return false;
+        }
+        let mut state = self.state.lock().expect("pane event mailbox");
+        batch.extend(state.events.drain(..));
+        while let Some(id) = state.grid_order.pop_front() {
+            if let Some(updates) = state.grids.remove(&id) {
+                batch.push(PaneEvent::GridBatch(id, updates));
+            }
+        }
+        true
+    }
 }
 
 struct ResidentTerminal {
@@ -481,14 +565,14 @@ pub struct TerminalPane {
     /// then overwrites the same buffer in place. This is what makes session
     /// switching read as instant with a residency of one.
     parked_grids: Vec<(SessionId, SharedGridBuffer)>,
-    pane_tx: mpsc::UnboundedSender<PaneEvent>,
+    pane_tx: PaneEventSender,
     focus: FocusHandle,
     glyphs: HashMap<SessionId, Entity<StatusGlyph>>,
     open_checks_for: Option<String>,
     overflow_open: bool,
     /// Paced PTY resizes: window and sidebar drags relayout every frame, but
-    /// grid frames only leave the daemon every 50ms, so intermediate sizes are
-    /// coalesced onto that cadence rather than dropped (see [`RESIZE_CADENCE`]).
+    /// sustained grid frames leave the daemon at up to 120 Hz, so intermediate
+    /// sizes coalesce onto that cadence (see [`RESIZE_CADENCE`]).
     pending_resizes: HashMap<SessionId, (u16, u16)>,
     resize_flush: Option<Task<()>>,
     /// A cadence tick is already armed; further changes fold into it instead of
@@ -501,7 +585,6 @@ pub struct TerminalPane {
     /// resized.
     reflow_holds: HashMap<SessionId, ReflowHold>,
     started_at: Instant,
-    repaint_pacer: RepaintPacer,
     session_source: SessionSource,
     /// Last selection observed by the primary pane. Spawn responses select the
     /// daemon-created id asynchronously, so this transition is also the
@@ -562,18 +645,10 @@ impl TerminalPane {
         if matches!(session_source, SessionSource::FollowSelection) {
             window.focus(&focus, cx);
         }
-        let (pane_tx, mut pane_rx) = mpsc::unbounded_channel();
+        let (pane_tx, mut pane_rx) = pane_event_channel();
         let pane_events = cx.spawn_in(window, async move |this, cx| {
             let mut batch = Vec::new();
-            while let Some(event) = pane_rx.recv().await {
-                // Drain whatever else has queued and cross to the main thread
-                // once per burst, not once per frame: with several attached
-                // sessions streaming, per-event hops made the UI thread wake
-                // at frame-rate × session-count.
-                batch.push(event);
-                while let Ok(next) = pane_rx.try_recv() {
-                    batch.push(next);
-                }
+            while pane_rx.recv_batch(&mut batch).await {
                 if this
                     .update_in(cx, |this, window, cx| {
                         for event in batch.drain(..) {
@@ -634,7 +709,6 @@ impl TerminalPane {
             last_resize_sent: None,
             reflow_holds: HashMap::new(),
             started_at: Instant::now(),
-            repaint_pacer: RepaintPacer::new(ACTIVE_REPAINT_INTERVAL),
             session_source,
             observed_selected_id,
             viewport: None,
@@ -873,7 +947,6 @@ impl TerminalPane {
 
     fn handle_pane_event(&mut self, event: PaneEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
-            PaneEvent::InteractiveInput => self.repaint_pacer.prioritize_interactive_damage(),
             PaneEvent::AttachmentState(id, state) => {
                 if let Some(resident) = self.residents.get_mut(&id) {
                     resident.attachment_state = state;
@@ -890,6 +963,21 @@ impl TerminalPane {
                     return;
                 }
                 self.apply_grid_updates(id, [update], window, cx);
+            }
+            PaneEvent::GridBatch(id, updates) => {
+                if self.reflow_holds.contains_key(&id) {
+                    for update in updates {
+                        let release = self
+                            .reflow_holds
+                            .get_mut(&id)
+                            .is_some_and(|hold| hold.park(update));
+                        if release {
+                            self.release_reflow_hold(&id, window, cx);
+                        }
+                    }
+                    return;
+                }
+                self.apply_grid_updates(id, updates, window, cx);
             }
             PaneEvent::Chunk(
                 id,
@@ -966,9 +1054,13 @@ impl TerminalPane {
         let mut changed = false;
         let mut applied = false;
         if let Some(resident) = self.residents.get_mut(&id) {
-            for update in updates {
+            let mut updates = updates.into_iter();
+            if let Some(mut update) = updates.next() {
                 applied = true;
-                changed |= resident.element.apply_damage(update).changed;
+                for newer in updates {
+                    update.coalesce(newer);
+                }
+                changed = resident.element.apply_damage(update).changed;
             }
             if applied && let Some(find) = resident.find.as_mut() {
                 schedule_find = find.on_output(now);
@@ -1025,22 +1117,12 @@ impl TerminalPane {
         self.apply_grid_updates(id.clone(), hold.parked, window, cx);
     }
 
-    fn request_terminal_repaint(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.repaint_pacer.on_damage(self.started_at.elapsed()) {
-            RepaintAction::RepaintNow => cx.notify(),
-            RepaintAction::Schedule(delay) => {
-                cx.spawn_in(window, async move |this, cx| {
-                    cx.background_executor().timer(delay).await;
-                    let _ = this.update_in(cx, |this, _window, cx| {
-                        if this.repaint_pacer.on_timer(this.started_at.elapsed()) {
-                            cx.notify();
-                        }
-                    });
-                })
-                .detach();
-            }
-            RepaintAction::None => {}
-        }
+    fn request_terminal_repaint(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        // GPUI coalesces dirty entities and presents them from the platform's
+        // CVDisplayLink. A second fixed-rate timer here can only miss the next
+        // display deadline (and capped ProMotion at 60 fps), so terminal
+        // damage has exactly one pacing authority: the display itself.
+        cx.notify();
     }
 
     fn schedule_find(
@@ -2939,13 +3021,10 @@ fn spawn_attachment(
     runtime: &Handle,
     socket: std::path::PathBuf,
     id: SessionId,
-    pane_tx: mpsc::UnboundedSender<PaneEvent>,
+    pane_tx: PaneEventSender,
 ) -> AttachmentControl {
     let (command_tx, mut commands) = mpsc::unbounded_channel();
-    let control = AttachmentControl {
-        tx: command_tx,
-        pane_tx: pane_tx.clone(),
-    };
+    let control = AttachmentControl { tx: command_tx };
     runtime.spawn(async move {
         // The first resize must be the measured pane geometry: deferred agent
         // launch waits for it. Do not seed an arbitrary 80×24 size.
@@ -3286,12 +3365,68 @@ fn exit_description(session: &SessionRecord) -> String {
 
 #[cfg(test)]
 mod tests {
+    use diri_proto::grid::{ChangedRow, GridCell};
     use diri_proto::{
         DateMillis, ExitInfo, NeedsInputDetail, NeedsInputKind, NeedsInputSource, SessionListResult,
     };
     use gpui::{Image, ImageFormat, KeyDownEvent, Keystroke, Modifiers, TestAppContext, point};
 
     use super::*;
+
+    #[tokio::test]
+    async fn pane_mailbox_retains_one_exact_final_grid_per_session() {
+        let (sender, mut receiver) = pane_event_channel();
+        let id = SessionId::new("mailbox");
+        let mut first_cells = vec![GridCell::BLANK; 2];
+        first_cells[0].scalar = u32::from('a');
+        let first = GridUpdate {
+            cols: 2,
+            rows: 1,
+            cursor_col: 1,
+            cursor_row: 0,
+            cursor_visible: true,
+            is_full_snapshot: true,
+            changed_rows: vec![ChangedRow::new(0, first_cells)],
+        };
+        let mut final_cells = vec![GridCell::BLANK; 2];
+        final_cells[1].scalar = u32::from('b');
+        let second = GridUpdate {
+            cols: 2,
+            rows: 1,
+            cursor_col: 0,
+            cursor_row: 0,
+            cursor_visible: false,
+            is_full_snapshot: false,
+            changed_rows: vec![ChangedRow::new(0, final_cells.clone())],
+        };
+
+        assert!(
+            sender
+                .send(PaneEvent::Chunk(id.clone(), TerminalChunk::Grid(first)))
+                .is_ok()
+        );
+        assert!(
+            sender
+                .send(PaneEvent::Chunk(id.clone(), TerminalChunk::Grid(second)))
+                .is_ok()
+        );
+
+        let mut batch = Vec::new();
+        assert!(receiver.recv_batch(&mut batch).await);
+        assert_eq!(batch.len(), 1);
+        let PaneEvent::GridBatch(batch_id, updates) = batch.pop().expect("grid batch") else {
+            panic!("mailbox did not return a grid batch");
+        };
+        assert_eq!(batch_id, id);
+        assert_eq!(updates.len(), 2, "the post-snapshot boundary is retained");
+        let mut applied = Vec::new();
+        for update in &updates {
+            update.apply(&mut applied);
+        }
+        assert_eq!(applied, final_cells);
+        assert_eq!(updates.last().expect("final update").cursor_col, 0);
+        assert!(!updates.last().expect("final update").cursor_visible);
+    }
 
     /// Replays a drag as the render loop sees it -- a geometry change every
     /// `frame`, for `frames` frames -- and returns when each size reached the
@@ -3330,12 +3465,13 @@ mod tests {
 
     #[test]
     fn a_live_drag_keeps_resizing_the_pty_at_the_cadence() {
-        // One second of dragging at 120Hz. The trailing-edge debounce this
+        // Roughly one second of dragging at 120Hz. The trailing-edge debounce this
         // replaced sent exactly one resize here -- after the mouse stopped --
         // which is why the terminal appeared to reflow only on drop. The
         // expected count derives from the cadence so it moves with it.
         let sent = simulate_drag(120, Duration::from_millis(8));
-        let expected = (1000 / RESIZE_CADENCE.as_millis()) as usize;
+        let expected =
+            (120 * Duration::from_millis(8).as_millis() / RESIZE_CADENCE.as_millis()) as usize;
         assert!(
             sent.len().abs_diff(expected) <= 3,
             "expected ~{expected} resizes in a second of dragging, got {}",

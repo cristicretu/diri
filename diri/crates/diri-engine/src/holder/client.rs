@@ -1,16 +1,21 @@
 //! Daemon-side clients: one for a session holder, one for the shared manager.
 //!
-//! One connection per request, by design — the protocol is a single
-//! request/response line, and connectionless clients survive the holder
-//! outliving any number of daemons.
+//! Control requests remain connectionless so a Holder can outlive any number
+//! of daemons. High-frequency input and resize operations negotiate one
+//! acknowledged binary stream; clients fall back to the legacy request shape
+//! when adopting an older live Holder.
 
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 
 use super::protocol::{
-    HolderLaunchSpec, HolderManagerRequest, HolderManagerResponse, HolderOperation,
-    HolderProcessSample, HolderRequest, HolderResponse, HolderStat,
+    HOLDER_STREAM_ACK, HOLDER_STREAM_INPUT, HOLDER_STREAM_MAX_PAYLOAD, HOLDER_STREAM_RESIZE,
+    HOLDER_STREAM_VERSION, HolderLaunchSpec, HolderManagerRequest, HolderManagerResponse,
+    HolderOperation, HolderProcessSample, HolderRequest, HolderResponse, HolderStat,
 };
 use super::socket;
 use super::{HolderError, HolderResult};
@@ -19,23 +24,51 @@ use super::{HolderError, HolderResult};
 #[derive(Clone, Debug)]
 pub struct HolderClient {
     pub socket_path: PathBuf,
+    input: Arc<Mutex<InputTransport>>,
+}
+
+#[derive(Debug)]
+enum InputTransport {
+    Unknown,
+    Stream(HolderInputStream),
+    Legacy,
+}
+
+#[derive(Debug)]
+struct HolderInputStream {
+    stream: UnixStream,
+    encoded: Vec<u8>,
 }
 
 impl HolderClient {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             socket_path: socket_path.into(),
+            input: Arc::new(Mutex::new(InputTransport::Unknown)),
         }
     }
 
     /// Sends bytes to the held child, as if typed.
     pub fn write(&self, data: &[u8]) -> HolderResult<()> {
+        if self.send_stream(HOLDER_STREAM_INPUT, data)? {
+            return Ok(());
+        }
+        self.write_legacy(data)
+    }
+
+    fn write_legacy(&self, data: &[u8]) -> HolderResult<()> {
         let mut request = HolderRequest::op(HolderOperation::Write);
         request.data = Some(base64::engine::general_purpose::STANDARD.encode(data));
         self.request(&request).map(drop)
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> HolderResult<()> {
+        let mut payload = [0_u8; 4];
+        payload[..2].copy_from_slice(&cols.to_be_bytes());
+        payload[2..].copy_from_slice(&rows.to_be_bytes());
+        if self.send_stream(HOLDER_STREAM_RESIZE, &payload)? {
+            return Ok(());
+        }
         let mut request = HolderRequest::op(HolderOperation::Resize);
         request.cols = Some(cols);
         request.rows = Some(rows);
@@ -75,6 +108,82 @@ impl HolderClient {
             ));
         }
         Ok(response)
+    }
+
+    /// Sends one acknowledged operation over the negotiated binary stream.
+    /// `Ok(false)` means the live Holder predates this additive protocol and
+    /// the caller must issue the equivalent legacy request. Once a stream has
+    /// accepted a frame, a missing acknowledgement is returned as an error and
+    /// the frame is never retried, avoiding duplicate keystrokes.
+    fn send_stream(&self, kind: u8, payload: &[u8]) -> HolderResult<bool> {
+        let mut transport = self
+            .input
+            .lock()
+            .map_err(|_| HolderError::Transport("input stream lock poisoned".into()))?;
+        if matches!(*transport, InputTransport::Unknown) {
+            *transport = match HolderInputStream::connect(&self.socket_path)? {
+                Some(stream) => InputTransport::Stream(stream),
+                None => InputTransport::Legacy,
+            };
+        }
+        match &mut *transport {
+            InputTransport::Stream(stream) => match stream.send(kind, payload) {
+                Ok(()) => Ok(true),
+                Err(error) => {
+                    *transport = InputTransport::Unknown;
+                    Err(error)
+                }
+            },
+            InputTransport::Legacy => Ok(false),
+            InputTransport::Unknown => unreachable!("negotiation resolved the transport"),
+        }
+    }
+}
+
+impl HolderInputStream {
+    fn connect(path: &Path) -> HolderResult<Option<Self>> {
+        let mut stream = socket::connect(path)?;
+        let mut request = HolderRequest::op(HolderOperation::Stream);
+        request.stream_version = Some(HOLDER_STREAM_VERSION);
+        socket::write_json_line(&mut stream, &request)?;
+        let response: HolderResponse = socket::read_json_line(&mut stream)?;
+        if !response.ok || response.stream_version != Some(HOLDER_STREAM_VERSION) {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            stream,
+            encoded: Vec::with_capacity(256),
+        }))
+    }
+
+    fn send(&mut self, kind: u8, payload: &[u8]) -> HolderResult<()> {
+        if payload.len() > HOLDER_STREAM_MAX_PAYLOAD {
+            return Err(HolderError::InvalidRequest(format!(
+                "input stream payload is {} bytes; maximum is {HOLDER_STREAM_MAX_PAYLOAD}",
+                payload.len()
+            )));
+        }
+        let length = u32::try_from(payload.len())
+            .map_err(|_| HolderError::InvalidRequest("input stream payload is too large".into()))?;
+        self.encoded.clear();
+        self.encoded.reserve(5 + payload.len());
+        self.encoded.push(kind);
+        self.encoded.extend_from_slice(&length.to_be_bytes());
+        self.encoded.extend_from_slice(payload);
+        self.stream
+            .write_all(&self.encoded)
+            .map_err(|error| HolderError::io("write input stream", error))?;
+        let mut acknowledgement = [0_u8; 1];
+        self.stream
+            .read_exact(&mut acknowledgement)
+            .map_err(|error| HolderError::io("read input acknowledgement", error))?;
+        if acknowledgement[0] != HOLDER_STREAM_ACK {
+            return Err(HolderError::Rejected(format!(
+                "input stream returned acknowledgement {}",
+                acknowledgement[0]
+            )));
+        }
+        Ok(())
     }
 }
 

@@ -7,10 +7,11 @@
 //! that wasn't running at the time still learns how the child died — then
 //! removes its control files and stops serving.
 
-use std::io::Read;
+use std::io::{Read, Write};
+use std::net::Shutdown;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -21,8 +22,9 @@ use crate::pty::{Pty, PtySpec};
 use super::client::HolderClient;
 use super::process_tree;
 use super::protocol::{
-    HolderExitMarker, HolderExitReason, HolderExitStatus, HolderLaunchSpec, HolderOperation,
-    HolderRequest, HolderResponse, HolderStat,
+    HOLDER_STREAM_ACK, HOLDER_STREAM_INPUT, HOLDER_STREAM_MAX_PAYLOAD, HOLDER_STREAM_RESIZE,
+    HOLDER_STREAM_VERSION, HolderExitMarker, HolderExitReason, HolderExitStatus, HolderLaunchSpec,
+    HolderOperation, HolderRequest, HolderResponse, HolderStat,
 };
 use super::socket;
 use super::{HolderError, HolderResult};
@@ -48,6 +50,9 @@ struct Shared {
     epoch_offset: u64,
     finished: AtomicBool,
     listen_fd: AtomicI32,
+    /// Weak handles let the exit path interrupt blocking input reads without
+    /// making idle Holder streams wake on a timer.
+    input_streams: Mutex<Vec<Weak<std::os::unix::net::UnixStream>>>,
 }
 
 impl HolderServer {
@@ -118,6 +123,7 @@ impl HolderServer {
             epoch_offset,
             finished: AtomicBool::new(false),
             listen_fd: AtomicI32::new(listen_fd),
+            input_streams: Mutex::new(Vec::new()),
             spec,
         });
 
@@ -144,6 +150,25 @@ impl HolderServer {
             socket::accept_raw(listen_fd, || shared.finished.load(Ordering::SeqCst))?
         {
             let response = match socket::read_json_line::<HolderRequest>(&mut client) {
+                Ok(request) if request.op == HolderOperation::Stream => {
+                    if request.stream_version != Some(HOLDER_STREAM_VERSION) {
+                        HolderResponse::failure("unsupported Holder input stream version")
+                    } else {
+                        let response = HolderResponse::stream(HOLDER_STREAM_VERSION);
+                        if socket::write_json_line(&mut client, &response).is_ok() {
+                            let client = Arc::new(client);
+                            let mut streams = shared.input_streams.lock().expect("input streams");
+                            streams.retain(|stream| stream.strong_count() > 0);
+                            streams.push(Arc::downgrade(&client));
+                            drop(streams);
+                            let shared = Arc::clone(&shared);
+                            let _ = std::thread::Builder::new()
+                                .name(format!("holder-input-{}", shared.spec.session_id))
+                                .spawn(move || serve_input_stream(&shared, client));
+                        }
+                        continue;
+                    }
+                }
                 Ok(request) => handle(&shared, &request)
                     .unwrap_or_else(|error| HolderResponse::failure(error.to_string())),
                 Err(error) => HolderResponse::failure(error.to_string()),
@@ -237,6 +262,15 @@ fn watch_exit(shared: &Shared, pump: std::thread::JoinHandle<()>) {
     if shared.finished.swap(true, Ordering::SeqCst) {
         return;
     }
+    for stream in shared
+        .input_streams
+        .lock()
+        .expect("input streams")
+        .drain(..)
+        .filter_map(|stream| stream.upgrade())
+    {
+        let _ = stream.shutdown(Shutdown::Both);
+    }
     // The pump must stop before the final drain, or a straggler byte could
     // land after the exit marker.
     let _ = pump.join();
@@ -280,6 +314,9 @@ fn watch_exit(shared: &Shared, pump: std::thread::JoinHandle<()>) {
 
 fn handle(shared: &Shared, request: &HolderRequest) -> HolderResult<HolderResponse> {
     match request.op {
+        HolderOperation::Stream => Err(HolderError::InvalidRequest(
+            "stream negotiation must be the first operation".into(),
+        )),
         HolderOperation::Write => {
             let data = request
                 .data
@@ -331,6 +368,89 @@ fn handle(shared: &Shared, request: &HolderRequest) -> HolderResult<HolderRespon
 
         HolderOperation::Stat => Ok(HolderResponse::with_stat(current_stat(shared))),
     }
+}
+
+/// Serves the negotiated high-frequency input lane. Each operation is
+/// acknowledged only after it has reached the PTY, preserving the delivery
+/// guarantee of the legacy request/response protocol without reconnecting or
+/// encoding base64 for every key.
+fn serve_input_stream(shared: &Shared, stream: Arc<std::os::unix::net::UnixStream>) {
+    prioritize_interactive_io();
+    let mut stream = &*stream;
+    let mut payload = Vec::with_capacity(256);
+    loop {
+        let mut header = [0_u8; 5];
+        if !read_stream_exact(shared, &mut stream, &mut header) {
+            return;
+        }
+        let length = u32::from_be_bytes(header[1..].try_into().expect("four-byte length")) as usize;
+        if length > HOLDER_STREAM_MAX_PAYLOAD {
+            let _ = stream.write_all(&[1]);
+            return;
+        }
+        payload.resize(length, 0);
+        if !read_stream_exact(shared, &mut stream, &mut payload) {
+            return;
+        }
+        let result = match header[0] {
+            HOLDER_STREAM_INPUT => write_pty(shared, &payload),
+            HOLDER_STREAM_RESIZE if payload.len() == 4 => {
+                let cols = u16::from_be_bytes([payload[0], payload[1]]);
+                let rows = u16::from_be_bytes([payload[2], payload[3]]);
+                if cols < 2 || rows < 2 {
+                    Err(HolderError::InvalidRequest(
+                        "resize requires cols/rows >= 2".into(),
+                    ))
+                } else {
+                    let _ = shared.pty.lock().expect("pty").resize(cols, rows);
+                    Ok(())
+                }
+            }
+            _ => Err(HolderError::InvalidRequest(
+                "unknown Holder input stream frame".into(),
+            )),
+        };
+        if result.is_err() {
+            let _ = stream.write_all(&[1]);
+            return;
+        }
+        if stream.write_all(&[HOLDER_STREAM_ACK]).is_err() {
+            return;
+        }
+    }
+}
+
+/// A persistent socket moves keystrokes off the Holder's accept thread. Keep
+/// that dedicated, mostly-sleeping lane at interactive QoS on Apple platforms
+/// so waking it does not add latency ahead of the PTY and renderer pipeline.
+#[cfg(target_vendor = "apple")]
+fn prioritize_interactive_io() {
+    // SAFETY: this changes only the calling thread's QoS class. Priority zero
+    // is the documented relative priority for the selected class.
+    let _ = unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0)
+    };
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn prioritize_interactive_io() {}
+
+fn read_stream_exact(shared: &Shared, stream: &mut impl Read, mut bytes: &mut [u8]) -> bool {
+    while !bytes.is_empty() && !shared.finished.load(Ordering::SeqCst) {
+        match stream.read(bytes) {
+            Ok(0) => return false,
+            Ok(count) => bytes = &mut bytes[count..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => return false,
+        }
+    }
+    bytes.is_empty()
 }
 
 /// Writes with the same bounded semantics the Swift holder used: retry

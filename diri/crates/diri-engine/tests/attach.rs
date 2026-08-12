@@ -173,7 +173,7 @@ fn an_attach_is_seeded_then_streams_diffs_and_answers_input() {
     // single scheduler hiccup cannot fail the test, while a fixed 16 ms frame
     // boundary on every keystroke still does.
     let mut interactive_latencies = Vec::new();
-    for index in 0..5 {
+    for index in 0..101 {
         let marker = format!("typed-over-attach-{index}");
         let sent_at = Instant::now();
         data.write_all(

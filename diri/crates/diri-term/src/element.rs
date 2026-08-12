@@ -199,6 +199,7 @@ struct ElementSharedState {
     modes: Mutex<TerminalModes>,
     scroll_router: Mutex<ScrollRouter>,
     history_lines: Mutex<HistoryLineCache>,
+    metrics: Mutex<Option<(Font, u32, CellMetrics)>>,
 }
 
 /// Shaped lines for history rows, keyed by absolute row and content-addressed
@@ -337,6 +338,7 @@ impl TerminalElement {
                 modes: Mutex::new(TerminalModes::default()),
                 scroll_router: Mutex::new(ScrollRouter::default()),
                 history_lines: Mutex::new(HistoryLineCache::default()),
+                metrics: Mutex::new(None),
             }),
             theme: TermTheme::default(),
             font: terminal_font,
@@ -654,21 +656,14 @@ impl TerminalElement {
         window: &mut Window,
     ) -> CachedRow {
         let mut background_quads = Vec::new();
-        append_background_quads(
+        let mut decoration_quads = Vec::new();
+        append_row_quads(
             &cells,
             row,
             origin,
             metrics,
             self.theme,
             &mut background_quads,
-        );
-        let mut decoration_quads = Vec::new();
-        append_decoration_quads(
-            &cells,
-            row,
-            origin,
-            metrics,
-            self.theme,
             &mut decoration_quads,
         );
         let line = self.shape_row(&cells, metrics, window);
@@ -825,7 +820,22 @@ impl Element for TerminalElement {
         }
 
         let started_at = Instant::now();
-        let metrics = CellMetrics::measure(window.text_system(), &self.font, self.font_size);
+        let font_size_bits = f32::from(self.font_size).to_bits();
+        let metrics = {
+            let mut cached = mutex_lock(&self.shared.metrics);
+            if let Some((cached_font, cached_size, metrics)) = cached.as_ref()
+                && cached_font == &self.font
+                && *cached_size == font_size_bits
+            {
+                *metrics
+            } else {
+                let font_id = window.text_system().resolve_font(&self.font);
+                let metrics =
+                    CellMetrics::measure_font(window.text_system(), font_id, self.font_size);
+                *cached = Some((self.font.clone(), font_size_bits, metrics));
+                metrics
+            }
+        };
         let visible_rows =
             usize::from(grid_rows).min(usize::from(metrics.rows_for_height(bounds.size.height)));
         let visible_cols =
@@ -865,20 +875,13 @@ impl Element for TerminalElement {
                 let absolute = viewport.absolute_row(row_index);
                 let mut cells = viewport.window_row(&buffer, row_index);
                 cells.truncate(visible_cols);
-                append_background_quads(
+                append_row_quads(
                     &cells,
                     row_index as u16,
                     bounds.origin,
                     metrics,
                     self.theme,
                     &mut background_quads,
-                );
-                append_decoration_quads(
-                    &cells,
-                    row_index as u16,
-                    bounds.origin,
-                    metrics,
-                    self.theme,
                     &mut decoration_quads,
                 );
                 let is_history = absolute < viewport.live_start_row();
@@ -1233,6 +1236,33 @@ fn append_background_quads(
         ));
         col = end;
     }
+}
+
+fn append_row_quads(
+    row: &[GridCell],
+    row_index: u16,
+    origin: Point<Pixels>,
+    metrics: CellMetrics,
+    theme: TermTheme,
+    background_quads: &mut Vec<PaintQuad>,
+    decoration_quads: &mut Vec<PaintQuad>,
+) {
+    // Plain terminal output is overwhelmingly default-background text with
+    // no decorations. Recognize the entire row in one cheap pass instead of
+    // scanning it once for backgrounds and again for decorations.
+    let is_plain = row.iter().all(|cell| {
+        !cell.style.contains(diri_proto::grid::TermStyle::INVERSE)
+            && is_default_background(cell.bg)
+            && !cell.style.contains(diri_proto::grid::TermStyle::UNDERLINE)
+            && !cell
+                .style
+                .contains(diri_proto::grid::TermStyle::CROSSED_OUT)
+    });
+    if is_plain {
+        return;
+    }
+    append_background_quads(row, row_index, origin, metrics, theme, background_quads);
+    append_decoration_quads(row, row_index, origin, metrics, theme, decoration_quads);
 }
 
 fn append_decoration_quads(

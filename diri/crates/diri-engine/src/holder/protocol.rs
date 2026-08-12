@@ -36,6 +36,15 @@ pub struct HolderLaunchSpec {
 /// Default output-log spill cap, matching the Swift spec default.
 pub const DEFAULT_DISK_CAPACITY: i64 = 32 << 20;
 
+/// Additive local Holder input protocol negotiated over the legacy NDJSON
+/// connection. Version 1 frames are `[kind u8][length u32][payload]` and each
+/// frame receives one acknowledgement byte after the PTY operation completes.
+pub const HOLDER_STREAM_VERSION: u16 = 1;
+pub const HOLDER_STREAM_INPUT: u8 = 1;
+pub const HOLDER_STREAM_RESIZE: u8 = 2;
+pub const HOLDER_STREAM_ACK: u8 = 0;
+pub const HOLDER_STREAM_MAX_PAYLOAD: usize = 1 << 20;
+
 /// A (pid, start time) pair. The start time is the identity check that makes
 /// signalling a recycled pid safe.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -96,6 +105,11 @@ pub enum HolderExitReason {
 /// The per-session request set.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum HolderOperation {
+    /// Upgrade this connection to the acknowledged binary input protocol.
+    /// Older live holders reject the unknown operation, which is the explicit
+    /// signal for a new daemon to keep using one-request NDJSON.
+    #[serde(rename = "stream")]
+    Stream,
     #[serde(rename = "write")]
     Write,
     #[serde(rename = "resize")]
@@ -111,6 +125,12 @@ pub enum HolderOperation {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HolderRequest {
     pub op: HolderOperation,
+    #[serde(
+        rename = "streamVersion",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stream_version: Option<u16>,
     /// base64 payload for `write`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<String>,
@@ -126,6 +146,7 @@ impl HolderRequest {
     pub fn op(op: HolderOperation) -> Self {
         Self {
             op,
+            stream_version: None,
             data: None,
             cols: None,
             rows: None,
@@ -137,6 +158,12 @@ impl HolderRequest {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HolderResponse {
     pub ok: bool,
+    #[serde(
+        rename = "streamVersion",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stream_version: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -149,6 +176,7 @@ impl HolderResponse {
     pub fn success() -> Self {
         Self {
             ok: true,
+            stream_version: None,
             error: None,
             stat: None,
             tree: None,
@@ -172,9 +200,17 @@ impl HolderResponse {
     pub fn failure(message: impl Into<String>) -> Self {
         Self {
             ok: false,
+            stream_version: None,
             error: Some(message.into()),
             stat: None,
             tree: None,
+        }
+    }
+
+    pub fn stream(version: u16) -> Self {
+        Self {
+            stream_version: Some(version),
+            ..Self::success()
         }
     }
 }

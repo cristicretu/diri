@@ -291,8 +291,17 @@ pub struct HeadlessScreen {
     progress_value: Option<i64>,
 
     content_seq: u64,
-    last_digest: u64,
     filled_cells: usize,
+    /// Per-row text fingerprints let status detection distinguish real text
+    /// changes from cursor/mode damage without hashing the full viewport.
+    row_digests: Vec<u64>,
+    row_filled_cells: Vec<usize>,
+    /// Damage produced by the current parser advance, reused to avoid a fresh
+    /// allocation for every PTY read.
+    current_damage_rows: Vec<bool>,
+    /// Damage accumulated until the next attached-client grid publication.
+    /// This remains valid across multiple parser advances in one output batch.
+    pending_damage_rows: Vec<bool>,
     /// Trailing bytes of the previous chunk, so an OSC split across a read
     /// boundary is still recognized.
     progress_carry: Vec<u8>,
@@ -318,7 +327,7 @@ impl HeadlessScreen {
             ..Config::default()
         };
         let term = Term::new(config, &geometry, Collector(sender));
-        Self {
+        let mut screen = Self {
             term,
             parser: Processor::new(),
             events,
@@ -327,13 +336,18 @@ impl HeadlessScreen {
             progress_state: None,
             progress_value: None,
             content_seq: 0,
-            last_digest: 0,
             filled_cells: 0,
+            row_digests: Vec::new(),
+            row_filled_cells: Vec::new(),
+            current_damage_rows: vec![false; geometry.rows],
+            pending_damage_rows: vec![true; geometry.rows],
             progress_carry: Vec::new(),
             last_cells: Vec::new(),
             last_grid_cols: 0,
             last_grid_rows: 0,
-        }
+        };
+        screen.rebuild_content_cache();
+        screen
     }
 
     /// Feeds raw PTY output into the emulator.
@@ -374,24 +388,53 @@ impl HeadlessScreen {
 
     /// Post-parse bookkeeping shared by `feed` and `flush_expired_sync`.
     ///
-    /// Damage is the cheap gate: when the emulator reports nothing touched,
-    /// skip fingerprinting entirely. When it does (which includes invisible
-    /// changes like a cursor toggle), a direct cell hash — no per-line String
-    /// allocation — decides whether the *content* changed.
+    /// Damage is preserved at row granularity for both status detection and
+    /// the next wire diff. Cursor-only damage hashes at most the touched rows;
+    /// a one-line echo never scans the rest of the viewport.
     fn settle(&mut self, title_before: Option<String>) {
         self.drain_events();
-        let damaged = match self.term.damage() {
-            alacritty_terminal::term::TermDamage::Full => true,
-            alacritty_terminal::term::TermDamage::Partial(mut lines) => lines.next().is_some(),
-        };
-        self.term.reset_damage();
-        if damaged || self.title != title_before {
-            let (digest, filled) = self.fingerprint_cells();
-            self.filled_cells = filled;
-            if digest != self.last_digest {
-                self.last_digest = digest;
-                self.content_seq += 1;
+        let rows = self.geometry.rows;
+        self.current_damage_rows.resize(rows, false);
+        self.current_damage_rows.fill(false);
+        self.pending_damage_rows.resize(rows, false);
+        match self.term.damage() {
+            alacritty_terminal::term::TermDamage::Full => {
+                self.current_damage_rows.fill(true);
+                self.pending_damage_rows.fill(true);
             }
+            alacritty_terminal::term::TermDamage::Partial(lines) => {
+                for damage in lines {
+                    if damage.line < rows {
+                        self.current_damage_rows[damage.line] = true;
+                        self.pending_damage_rows[damage.line] = true;
+                    }
+                }
+            }
+        }
+        self.term.reset_damage();
+        let mut content_changed = self.title != title_before;
+        if self.row_digests.len() != rows || self.row_filled_cells.len() != rows {
+            self.rebuild_content_cache();
+            content_changed = true;
+        } else {
+            for row in 0..rows {
+                if !self.current_damage_rows[row] {
+                    continue;
+                }
+                let (digest, filled) = self.fingerprint_row(row);
+                if self.row_digests[row] != digest {
+                    self.row_digests[row] = digest;
+                    self.filled_cells = self
+                        .filled_cells
+                        .saturating_sub(self.row_filled_cells[row])
+                        .saturating_add(filled);
+                    self.row_filled_cells[row] = filled;
+                    content_changed = true;
+                }
+            }
+        }
+        if content_changed {
+            self.content_seq = self.content_seq.saturating_add(1);
         }
     }
 
@@ -407,11 +450,13 @@ impl HeadlessScreen {
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
+        let title_before = self.title.clone();
         self.geometry = Geometry {
             cols: cols.max(1),
             rows: rows.max(1),
         };
         self.term.resize(self.geometry);
+        self.settle(title_before);
     }
 
     pub fn content_seq(&self) -> u64 {
@@ -474,8 +519,19 @@ impl HeadlessScreen {
         }
 
         let grid = self.term.grid();
-        let mut changed = Vec::new();
+        let candidate_count = if force_full {
+            rows
+        } else {
+            self.pending_damage_rows
+                .iter()
+                .filter(|dirty| **dirty)
+                .count()
+        };
+        let mut changed = Vec::with_capacity(candidate_count);
         for y in 0..rows {
+            if !force_full && !self.pending_damage_rows.get(y).copied().unwrap_or(false) {
+                continue;
+            }
             let line = Line(y as i32);
             let base = y * cols;
             let mut row = Vec::with_capacity(cols);
@@ -493,6 +549,7 @@ impl HeadlessScreen {
             self.last_cells[base..base + cols].copy_from_slice(&row);
             changed.push(ChangedRow::new(y as u16, row));
         }
+        self.pending_damage_rows.fill(false);
 
         let cursor = grid.cursor.point;
         GridUpdate {
@@ -796,28 +853,39 @@ impl HeadlessScreen {
 
     // (cell mapping lives at module level; see `wire_cell`)
 
-    /// Content fingerprint hashed straight off the grid cells, so
-    /// `content_seq` only advances when the visible screen actually changed.
-    /// Detection uses that to skip re-evaluating a frame it has already
-    /// judged. The non-blank count rides the same walk — see
-    /// [`filled_cells`](Self::filled_cells).
-    fn fingerprint_cells(&self) -> (u64, usize) {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    fn fingerprint_row(&self, row: usize) -> (u64, usize) {
+        // FNV-1a is sufficient for change detection and much cheaper than
+        // constructing SipHash state for every damaged row. Grid publication
+        // still compares the actual cells, so this fingerprint never decides
+        // wire correctness.
+        let mut digest = 0xcbf2_9ce4_8422_2325u64;
         let mut filled = 0;
         let grid = self.term.grid();
-        for row in 0..self.geometry.rows {
-            let line = Line(row as i32);
-            for column in 0..self.geometry.cols {
-                let character = grid[line][Column(column)].c;
-                character.hash(&mut hasher);
-                if character != ' ' && character != '\0' {
-                    filled += 1;
-                }
+        let line = Line(row as i32);
+        for column in 0..self.geometry.cols {
+            let character = grid[line][Column(column)].c;
+            digest ^= u64::from(character);
+            digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+            if character != ' ' && character != '\0' {
+                filled += 1;
             }
         }
-        self.title.hash(&mut hasher);
-        (hasher.finish(), filled)
+        (digest, filled)
+    }
+
+    fn rebuild_content_cache(&mut self) {
+        self.row_digests.clear();
+        self.row_filled_cells.clear();
+        self.row_digests.reserve(self.geometry.rows);
+        self.row_filled_cells.reserve(self.geometry.rows);
+        let mut total_filled = 0;
+        for row in 0..self.geometry.rows {
+            let (digest, filled) = self.fingerprint_row(row);
+            self.row_digests.push(digest);
+            self.row_filled_cells.push(filled);
+            total_filled += filled;
+        }
+        self.filled_cells = total_filled;
     }
 
     /// Extracts `ESC ] 9 ; 4 ; state ; value` progress reports.
@@ -826,12 +894,18 @@ impl HeadlessScreen {
     /// concept of it and would silently drop the sequence.
     fn scan_progress(&mut self, bytes: &[u8]) {
         const PREFIX: &[u8] = b"\x1b]9;4;";
+        const MAX_INCOMPLETE_BYTES: usize = 64;
+        if self.progress_carry.is_empty() && !bytes.contains(&0x1b) {
+            return;
+        }
         let mut haystack = std::mem::take(&mut self.progress_carry);
         haystack.extend_from_slice(bytes);
 
         let mut search_from = 0;
+        let mut incomplete = None;
         while let Some(found) = find(&haystack[search_from..], PREFIX) {
-            let start = search_from + found + PREFIX.len();
+            let prefix_start = search_from + found;
+            let start = prefix_start + PREFIX.len();
             // Terminated by BEL or ST (ESC \).
             let Some(end) = haystack[start..]
                 .iter()
@@ -839,6 +913,7 @@ impl HeadlessScreen {
                 .map(|offset| start + offset)
             else {
                 // Truncated: keep it for the next chunk.
+                incomplete = Some(prefix_start);
                 break;
             };
             let payload = String::from_utf8_lossy(&haystack[start..end]);
@@ -848,9 +923,28 @@ impl HeadlessScreen {
             search_from = end;
         }
 
-        // Keep a tail long enough to rejoin a sequence split across reads.
-        let keep = haystack.len().saturating_sub(64);
-        self.progress_carry = haystack[keep..].to_vec();
+        if let Some(start) = incomplete
+            && haystack.len() - start <= MAX_INCOMPLETE_BYTES
+        {
+            haystack.drain(..start);
+            self.progress_carry = haystack;
+            return;
+        }
+        // A malformed unterminated OSC must not turn the scanner into an
+        // unbounded copy of the PTY stream. Fall through and retain only a
+        // possible prefix suffix.
+
+        // Preserve only a suffix that could be the beginning of PREFIX. Plain
+        // terminal output retains no carry and therefore allocates nothing on
+        // the next read.
+        let carry_start = (1..PREFIX.len())
+            .rev()
+            .find(|length| haystack.ends_with(&PREFIX[..*length]))
+            .map(|length| haystack.len() - length);
+        if let Some(start) = carry_start {
+            haystack.drain(..start);
+            self.progress_carry = haystack;
+        }
     }
 }
 
@@ -1076,6 +1170,15 @@ mod tests {
         screen.feed(b"\x1b]9;4;1");
         screen.feed(b";75\x07");
         assert_eq!(screen.progress(), Some((1, 75)));
+    }
+
+    #[test]
+    fn an_unterminated_progress_sequence_has_bounded_carry() {
+        let mut screen = HeadlessScreen::new(80, 24);
+        let mut input = b"\x1b]9;4;1;".to_vec();
+        input.extend(std::iter::repeat_n(b'9', 16 << 10));
+        screen.feed(&input);
+        assert!(screen.progress_carry.len() < 8);
     }
 
     #[test]

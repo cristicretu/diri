@@ -5,7 +5,6 @@ pub mod element;
 pub mod find;
 pub mod keys;
 pub mod metrics;
-pub mod repaint;
 pub mod scrollback;
 pub mod selection;
 pub mod theme;

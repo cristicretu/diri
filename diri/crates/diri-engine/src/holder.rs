@@ -12,8 +12,10 @@
 //! Rust-owned. The socket paths, NDJSON request/response shapes, pid-file
 //! contents and in-band OSC 777 exit marker are versioned internal contracts.
 //!
-//! Wire protocol, per connection: one JSON request line in, one JSON response
-//! line out, connection closed. No framing beyond the newline; no pipelining.
+//! Control protocol, per connection: one JSON request line in, one JSON
+//! response line out, connection closed. Input/resize may negotiate the
+//! additive acknowledged binary stream; older live Holders remain valid and
+//! receive the original one-request form.
 
 pub mod client;
 pub mod launcher;

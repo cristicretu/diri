@@ -51,8 +51,8 @@ pub(crate) fn is_auxiliary_terminal(session: &SessionRecord) -> bool {
 
 // Session titles, badges, and sidebar metadata change at human speed. Publishing
 // daemon bursts at display refresh rate rebuilt the whole sidebar 60 times/sec
-// while several agents were working; terminal grids retain their independent
-// 20fps direct path.
+// while several agents were working. Terminal grids bypass store publication:
+// the selected pane invalidates directly and GPUI presents on its display link.
 const UI_PUBLISH_INTERVAL: Duration = Duration::from_millis(50);
 
 // A stalled remote scan may be overlapped by exactly one forced rescan. Beyond
