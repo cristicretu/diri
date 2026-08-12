@@ -164,9 +164,10 @@ fn main() {
     let scenario = PreviewScenario::from_env(scenario_value.as_deref());
     #[cfg(target_os = "macos")]
     let bundle_id = macos::bundle_identifier();
-    #[cfg(not(target_os = "macos"))]
-    let bundle_id = None;
+    #[cfg(target_os = "macos")]
     let dev_build = DevBuildIdentity::from_process_environment(bundle_id.as_deref());
+    #[cfg(not(target_os = "macos"))]
+    let dev_build = DevBuildIdentity::from_process_environment(None);
 
     // The client runtime multiplexes one daemon socket plus a handful of
     // event-driven housekeeping tasks. The default Tokio constructor creates

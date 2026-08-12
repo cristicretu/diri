@@ -13,9 +13,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use diri_updater::{
-    Release, Result as UpdateResult, StagedUpdate, UpdateError, Updater, UpdaterConfig,
-};
+#[cfg(target_os = "macos")]
+use diri_updater::UpdaterConfig;
+use diri_updater::{Release, Result as UpdateResult, StagedUpdate, UpdateError, Updater};
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, watch};
 

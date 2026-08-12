@@ -377,9 +377,9 @@ impl RootView {
                     changed = snapshots.changed() => {
                         if changed.is_err() { break; }
                         let _ = snapshots.borrow_and_update();
-                        let _ = this.update(cx, |this, _cx| {
+                        let _ = this.update(cx, |_this, _cx| {
                             #[cfg(target_os = "macos")]
-                            if let Some(menu_bar) = &mut this.menu_bar {
+                            if let Some(menu_bar) = &mut _this.menu_bar {
                                 menu_bar.refresh();
                             }
                         });
