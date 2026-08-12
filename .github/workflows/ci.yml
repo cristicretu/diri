@@ -120,22 +120,27 @@ jobs:
         run: cargo build --locked --workspace --release
       - name: Smoke GUI under X11
         run: xvfb-run -a env -u WAYLAND_DISPLAY DIRI_UI_SMOKE_TEST=1 target/release/diri
-      - name: Smoke GUI under headless Wayland
+      - name: Smoke GUI under Wayland
         run: |
           export XDG_RUNTIME_DIR="${RUNNER_TEMP}/diri-wayland-runtime"
           mkdir -p "${XDG_RUNTIME_DIR}"
           chmod 700 "${XDG_RUNTIME_DIR}"
-          weston --backend=headless-backend.so --socket=diri-ci-wayland \
-            --idle-time=0 --log="${RUNNER_TEMP}/weston.log" &
-          weston_pid=$!
-          trap 'kill "${weston_pid}" 2>/dev/null || true' EXIT
-          for attempt in $(seq 1 100); do
-            test -S "${XDG_RUNTIME_DIR}/diri-ci-wayland" && break
-            sleep 0.05
-          done
-          test -S "${XDG_RUNTIME_DIR}/diri-ci-wayland"
-          env -u DISPLAY WAYLAND_DISPLAY=diri-ci-wayland \
-            DIRI_UI_SMOKE_TEST=1 target/release/diri
+          # GPUI requires a wl_seat. Weston's pure headless backend advertises
+          # none, so run its Wayland compositor nested in Xvfb to provide a
+          # virtual keyboard/pointer while the app still connects via Wayland.
+          xvfb-run -a bash -euo pipefail -c '
+            weston --backend=x11-backend.so --socket=diri-ci-wayland \
+              --idle-time=0 --log="${RUNNER_TEMP}/weston.log" &
+            weston_pid=$!
+            trap '\''kill "${weston_pid}" 2>/dev/null || true'\'' EXIT
+            for attempt in $(seq 1 100); do
+              test -S "${XDG_RUNTIME_DIR}/diri-ci-wayland" && break
+              sleep 0.05
+            done
+            test -S "${XDG_RUNTIME_DIR}/diri-ci-wayland"
+            WAYLAND_DISPLAY=diri-ci-wayland DIRI_UI_SMOKE_TEST=1 \
+              target/release/diri
+          '
 
   remote-helper-native:
     name: Remote Helper (${{ matrix.target }})
