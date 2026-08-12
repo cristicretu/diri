@@ -610,6 +610,49 @@ impl Registry {
     /// and Claude's generated `ai-title` when it becomes available. Returns
     /// whether anything changed.
     pub fn apply_hook_metadata(&mut self, id: &str, meta: &crate::hooks::HookMetadata) -> bool {
+        let Ok(home) = std::env::var("HOME") else {
+            return self.apply_hook_metadata_with_home(id, meta, None);
+        };
+        self.apply_hook_metadata_with_home(id, meta, Some(Path::new(&home)))
+    }
+
+    fn apply_hook_metadata_with_home(
+        &mut self,
+        id: &str,
+        meta: &crate::hooks::HookMetadata,
+        home: Option<&Path>,
+    ) -> bool {
+        let mut transcript = self.records.get(id).and_then(|record| {
+            if record.host.is_some() {
+                return None;
+            }
+            let home = home?;
+            let agent_id = meta
+                .agent_session_id
+                .as_deref()
+                .or(record.agent_session_id.as_deref())?;
+            let kind = record.effective_kind();
+            let validate = |candidate: &str| {
+                crate::history::validate_transcript_path(
+                    home,
+                    kind,
+                    agent_id,
+                    &record.cwd,
+                    Path::new(candidate),
+                )
+            };
+            meta.transcript_path
+                .as_deref()
+                .and_then(validate)
+                .or_else(|| record.transcript_path.as_deref().and_then(validate))
+                .or_else(|| {
+                    (kind.id() == diri_proto::AgentKind::CODEX_ID)
+                        .then(|| {
+                            crate::history::find_live_codex_transcript(home, agent_id, &record.cwd)
+                        })
+                        .flatten()
+                })
+        });
         let generated_title = self.records.get(id).and_then(|record| {
             let accepts_generated_title = record.kind == diri_proto::AgentKind::CLAUDE_CODE
                 && matches!(
@@ -617,13 +660,9 @@ impl Registry {
                     TitleSource::Placeholder | TitleSource::FirstPrompt | TitleSource::Unknown
                 );
             accepts_generated_title
-                .then(|| {
-                    meta.transcript_path
-                        .as_deref()
-                        .or(record.transcript_path.as_deref())
-                })
+                .then_some(transcript.as_mut())
                 .flatten()
-                .and_then(|path| crate::history::latest_claude_ai_title(Path::new(path)))
+                .and_then(|transcript| transcript.latest_claude_ai_title())
                 .and_then(|title| normalize_agent_title(&title))
         });
         let Some(record) = self.records.get_mut(id) else {
@@ -637,10 +676,11 @@ impl Registry {
             record.resumability = diri_proto::Resumability::Live;
             changed = true;
         }
-        if let Some(transcript) = &meta.transcript_path
-            && record.transcript_path.as_ref() != Some(transcript)
+        if let Some(transcript) =
+            transcript.map(|transcript| transcript.path().to_string_lossy().into_owned())
+            && record.transcript_path.as_ref() != Some(&transcript)
         {
-            record.transcript_path = Some(transcript.clone());
+            record.transcript_path = Some(transcript);
             changed = true;
         }
         if let Some(title) = &meta.first_prompt_title
@@ -1506,7 +1546,12 @@ mod tests {
     #[test]
     fn live_claude_metadata_promotes_the_generated_conversation_title() {
         let temp = tempfile::tempdir().expect("temp");
-        let transcript = temp.path().join("conversation.jsonl");
+        let agent_id = "0199f2c4-1a2b-4c3d-8e9f-000000000009";
+        let transcript = temp
+            .path()
+            .join(".claude/projects/-tmp")
+            .join(format!("{agent_id}.jsonl"));
+        std::fs::create_dir_all(transcript.parent().expect("parent")).expect("mkdir");
         std::fs::write(
             &transcript,
             "{\"type\":\"user\",\"message\":{\"content\":\"vague prompt\"}}\n\
@@ -1516,21 +1561,112 @@ mod tests {
         let mut registry = Registry::new(engine(), temp.path().join("state.json"));
         let mut session = record("claude");
         session.kind = AgentKind::CLAUDE_CODE;
+        session.agent_session_id = Some(agent_id.to_owned());
         session.title = "vague prompt".to_owned();
         session.title_source = TitleSource::FirstPrompt;
         registry.insert_record(session);
 
-        assert!(registry.apply_hook_metadata(
+        assert!(registry.apply_hook_metadata_with_home(
             "claude",
             &crate::hooks::HookMetadata {
                 transcript_path: Some(transcript.to_string_lossy().into_owned()),
                 ..crate::hooks::HookMetadata::default()
-            }
+            },
+            Some(temp.path()),
         ));
 
         let updated = registry.record("claude").expect("record");
         assert_eq!(updated.title, "Repair remote session recovery");
         assert_eq!(updated.title_source, TitleSource::AgentProvided);
+    }
+
+    #[test]
+    fn first_codex_notify_associates_the_matching_live_rollout() {
+        let temp = tempfile::tempdir().expect("temp");
+        let transcript = temp
+            .path()
+            .join(".codex/sessions/2026/08/13/rollout-now-thread-9.jsonl");
+        std::fs::create_dir_all(transcript.parent().expect("parent")).expect("mkdir");
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-9\",\"cwd\":\"/tmp\"}}\n",
+        )
+        .expect("write transcript");
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let mut session = record("codex");
+        session.kind = AgentKind::CODEX;
+        registry.insert_record(session);
+
+        assert!(registry.apply_hook_metadata_with_home(
+            "codex",
+            &crate::hooks::HookMetadata {
+                agent_session_id: Some("thread-9".to_owned()),
+                ..crate::hooks::HookMetadata::default()
+            },
+            Some(temp.path()),
+        ));
+        let updated = registry.record("codex").expect("record");
+        assert_eq!(updated.agent_session_id.as_deref(), Some("thread-9"));
+        assert_eq!(
+            updated.transcript_path.as_deref(),
+            Some(transcript.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn arbitrary_hook_transcript_paths_never_enter_the_record() {
+        let temp = tempfile::tempdir().expect("temp");
+        let outside = temp.path().join("outside.jsonl");
+        std::fs::write(&outside, "{}\n").expect("write");
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let mut session = record("claude");
+        session.kind = AgentKind::CLAUDE_CODE;
+        session.agent_session_id = Some("0199f2c4-1a2b-4c3d-8e9f-000000000009".to_owned());
+        registry.insert_record(session);
+
+        assert!(!registry.apply_hook_metadata_with_home(
+            "claude",
+            &crate::hooks::HookMetadata {
+                transcript_path: Some(outside.to_string_lossy().into_owned()),
+                ..crate::hooks::HookMetadata::default()
+            },
+            Some(temp.path()),
+        ));
+        assert!(
+            registry
+                .record("claude")
+                .expect("record")
+                .transcript_path
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn legacy_arbitrary_transcript_paths_never_feed_generated_titles() {
+        let temp = tempfile::tempdir().expect("temp");
+        let outside = temp.path().join("outside.jsonl");
+        std::fs::write(
+            &outside,
+            "{\"type\":\"ai-title\",\"aiTitle\":\"untrusted promoted title\"}\n",
+        )
+        .expect("write");
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let mut session = record("claude");
+        session.kind = AgentKind::CLAUDE_CODE;
+        session.agent_session_id = Some("0199f2c4-1a2b-4c3d-8e9f-000000000009".to_owned());
+        session.transcript_path = Some(outside.to_string_lossy().into_owned());
+        session.title = "safe existing title".to_owned();
+        session.title_source = TitleSource::FirstPrompt;
+        registry.insert_record(session);
+
+        assert!(!registry.apply_hook_metadata_with_home(
+            "claude",
+            &crate::hooks::HookMetadata::default(),
+            Some(temp.path()),
+        ));
+        let updated = registry.record("claude").expect("record");
+        assert_eq!(updated.title, "safe existing title");
+        assert_eq!(updated.title_source, TitleSource::FirstPrompt);
     }
 
     #[test]

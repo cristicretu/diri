@@ -265,7 +265,7 @@ impl RootView {
                         insertion,
                     } => {
                         this.launcher.update(cx, |launcher, cx| {
-                            launcher.open_for_session(
+                            launcher.open_local_paths_for_session(
                                 session_id.clone(),
                                 insertion,
                                 notice,

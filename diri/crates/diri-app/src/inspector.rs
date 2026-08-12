@@ -39,11 +39,12 @@ use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
 use crate::quote::{Quote, QuoteSource};
 use crate::review_prompt::{ReviewEvidence, ReviewLayer, ReviewPrompt};
 use crate::store::{InspectorTab, StoreRuntime};
-use crate::transcript::{TranscriptDocument, load as load_transcript};
+use crate::transcript::{TranscriptDocument, TranscriptVersion, load as load_transcript};
 
 const DIFF_ROW_HEIGHT: f32 = 20.0;
 const GUTTER_WIDTH: f32 = 68.0;
 const REFRESH_INTERVAL: Duration = Duration::from_millis(1400);
+const TRANSCRIPT_REFRESH_DEBOUNCE: Duration = Duration::from_millis(120);
 const SCROLLBAR_INSET: f32 = 4.0;
 const SCROLLBAR_MIN_THUMB: f32 = 34.0;
 
@@ -111,6 +112,7 @@ struct DiffContext {
     id: SessionId,
     cwd: PathBuf,
     remote: bool,
+    agent_session_id: Option<String>,
     transcript_path: Option<PathBuf>,
     kind: ProtoAgentKind,
 }
@@ -181,8 +183,10 @@ pub struct WorkbenchInspector {
     review_generation: u64,
     review_task: Option<Task<()>>,
     transcript_state: TranscriptLoadState,
+    transcript_version: Option<TranscriptVersion>,
     transcript_generation: u64,
     transcript_task: Option<Task<()>>,
+    transcript_home: PathBuf,
     review_action_task: Option<Task<()>>,
     review_action_busy: bool,
     review_feedback: Option<(bool, String)>,
@@ -269,8 +273,12 @@ impl WorkbenchInspector {
             review_generation: 0,
             review_task: None,
             transcript_state: TranscriptLoadState::Unavailable,
+            transcript_version: None,
             transcript_generation: 0,
             transcript_task: None,
+            transcript_home: std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_default(),
             review_action_task: None,
             review_action_busy: false,
             review_feedback: None,
@@ -441,6 +449,7 @@ impl WorkbenchInspector {
             id: session.id.clone(),
             cwd: PathBuf::from(&session.cwd),
             remote: session.host.is_some(),
+            agent_session_id: session.agent_session_id.clone(),
             transcript_path: session.transcript_path.as_deref().map(PathBuf::from),
             kind: session.effective_kind().clone(),
         })
@@ -468,7 +477,11 @@ impl WorkbenchInspector {
             self.refresh(true, cx);
         } else {
             // Info and Artifacts are projections of the live session record,
-            // so same-session store changes still need to repaint the panel.
+            // so same-session store changes repaint and schedule one bounded
+            // transcript mtime check without installing an idle poll.
+            if let Some(context) = self.context.clone() {
+                self.refresh_transcript(&context, true, cx);
+            }
             cx.notify();
         }
     }
@@ -498,6 +511,13 @@ impl WorkbenchInspector {
         self.tab_transition_generation = self.tab_transition_generation.wrapping_add(1);
         if tab == InspectorTab::Changes {
             self.refresh(true, cx);
+        } else if tab == InspectorTab::Info
+            && let Some(context) = self.context.clone()
+        {
+            // Info can have been hidden while the provider appended turns.
+            // Activation performs one version check; it does not start a
+            // transcript poll.
+            self.refresh_transcript(&context, false, cx);
         }
         self.reconcile_diff_polling(cx);
         cx.notify();
@@ -549,6 +569,7 @@ impl WorkbenchInspector {
             self.state = LoadState::NoSession;
             self.review_state = ReviewLoadState::NoSession;
             self.transcript_state = TranscriptLoadState::Unavailable;
+            self.transcript_version = None;
             self.transcript_task = None;
             self.code_viewer
                 .update(cx, |viewer, cx| viewer.set_workspace(None, cx));
@@ -568,13 +589,14 @@ impl WorkbenchInspector {
             self.ask_feedback = None;
             self.ask_query.clear();
             self.status_evidence_open = false;
+            self.transcript_version = None;
             let workspace = (!context.remote).then(|| context.cwd.clone());
             self.code_viewer
                 .update(cx, |viewer, cx| viewer.set_workspace(workspace, cx));
         }
         self.context = Some(context.clone());
-        if context_changed {
-            self.refresh_transcript(&context, cx);
+        if context_changed || force {
+            self.refresh_transcript(&context, false, cx);
         }
         self.refresh_review(&context, force, cx);
         if !force && !context_changed && matches!(self.state, LoadState::NoSession) {
@@ -634,7 +656,12 @@ impl WorkbenchInspector {
         }));
     }
 
-    fn refresh_transcript(&mut self, context: &DiffContext, cx: &mut Context<Self>) {
+    fn refresh_transcript(
+        &mut self,
+        context: &DiffContext,
+        debounce: bool,
+        cx: &mut Context<Self>,
+    ) {
         self.transcript_task = None;
         self.transcript_generation = self.transcript_generation.wrapping_add(1);
         let generation = self.transcript_generation;
@@ -642,30 +669,51 @@ impl WorkbenchInspector {
             context.kind.id(),
             ProtoAgentKind::CLAUDE_CODE_ID | ProtoAgentKind::CODEX_ID
         );
-        let Some(path) = context
+        let Some((path, agent_id)) = context
             .transcript_path
             .clone()
+            .zip(context.agent_session_id.clone())
             .filter(|_| !context.remote && supported)
         else {
             self.transcript_state = TranscriptLoadState::Unavailable;
+            self.transcript_version = None;
             return;
         };
         let kind = context.kind.clone();
-        self.transcript_state = TranscriptLoadState::Loading;
+        let cwd = context.cwd.to_string_lossy().into_owned();
+        let home = self.transcript_home.clone();
+        let previous = self.transcript_version;
+        if previous.is_none() {
+            self.transcript_state = TranscriptLoadState::Loading;
+        }
         self.transcript_task = Some(cx.spawn(async move |this, cx| {
+            if debounce {
+                cx.background_executor()
+                    .timer(TRANSCRIPT_REFRESH_DEBOUNCE)
+                    .await;
+            }
             let result = cx
-                .background_spawn(async move { load_transcript(&path, &kind) })
+                .background_spawn(async move {
+                    load_transcript(&home, &path, &kind, &agent_id, &cwd, previous)
+                })
                 .await
-                .map_err(|_| ())
-                .map(Arc::new);
+                .map_err(|_| ());
             let _ = this.update(cx, |this, cx| {
                 if this.transcript_generation != generation {
                     return;
                 }
-                this.transcript_state = match result {
-                    Ok(document) => TranscriptLoadState::Ready(document),
-                    Err(()) => TranscriptLoadState::Error,
-                };
+                match result {
+                    Ok(Some(snapshot)) => {
+                        this.transcript_version = Some(snapshot.version);
+                        this.transcript_state =
+                            TranscriptLoadState::Ready(Arc::new(snapshot.document));
+                    }
+                    Ok(None) => {}
+                    Err(()) => {
+                        this.transcript_version = None;
+                        this.transcript_state = TranscriptLoadState::Error;
+                    }
+                }
                 cx.notify();
             });
         }));
@@ -5210,10 +5258,15 @@ mod tests {
             inspector.select_tab(InspectorTab::Changes, cx);
         });
         assert!(inspector.read_with(cx, |inspector, _| inspector.poll_task.is_some()));
+        let transcript_generation =
+            inspector.read_with(cx, |inspector, _| inspector.transcript_generation);
         inspector.update(cx, |inspector, cx| {
             inspector.select_tab(InspectorTab::Info, cx);
         });
         assert!(inspector.read_with(cx, |inspector, _| inspector.poll_task.is_none()));
+        assert!(inspector.read_with(cx, |inspector, _| {
+            inspector.transcript_generation > transcript_generation
+        }));
         // Cancel any leftover refresh/review tasks on this thread before the
         // TestAppContext tears the window down.
         inspector.update(cx, |inspector, _| {
@@ -5227,7 +5280,14 @@ mod tests {
 
     #[gpui::test]
     fn claude_transcript_turns_are_selectable_quotes_in_the_info_surface(cx: &mut TestAppContext) {
-        let mut transcript = tempfile::NamedTempFile::new().expect("transcript");
+        let transcript_home = tempfile::tempdir().expect("transcript home");
+        let agent_id = "77777777-7777-4777-8777-777777777777";
+        let transcript_path = transcript_home
+            .path()
+            .join(".claude/projects/-tmp-project")
+            .join(format!("{agent_id}.jsonl"));
+        std::fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
+        let mut transcript = std::fs::File::create(&transcript_path).expect("transcript");
         writeln!(
             transcript,
             r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"The parser drops UTF-8"}}]}}}}"#
@@ -5248,7 +5308,8 @@ mod tests {
             .expect("selected record");
         session.kind = ProtoAgentKind::CLAUDE_CODE;
         session.foreground_agent = None;
-        session.transcript_path = Some(transcript.path().to_string_lossy().into_owned());
+        session.agent_session_id = Some(agent_id.to_owned());
+        session.transcript_path = Some(transcript_path.to_string_lossy().into_owned());
         {
             let mut store = runtime.store.write().expect("session store lock poisoned");
             store.hydrate(fixture.list);
@@ -5274,7 +5335,8 @@ mod tests {
             let context = inspector.selected_context().expect("selected context");
             inspector.visible = true;
             inspector.context = Some(context.clone());
-            inspector.refresh_transcript(&context, cx);
+            inspector.transcript_home = transcript_home.path().to_path_buf();
+            inspector.refresh_transcript(&context, false, cx);
             cx.notify();
         });
         cx.run_until_parked();
@@ -5301,6 +5363,24 @@ mod tests {
                 turn: "Claude turn near line 1".to_owned(),
             }
         );
+
+        writeln!(
+            transcript,
+            r#"{{"type":"assistant","message":{{"content":"The appended turn is visible"}}}}"#
+        )
+        .unwrap();
+        transcript.flush().unwrap();
+        inspector.update(cx, |inspector, cx| inspector.refresh_if_context_changed(cx));
+        cx.executor().advance_clock(TRANSCRIPT_REFRESH_DEBOUNCE);
+        cx.run_until_parked();
+        let appended_turns = inspector.read_with(cx, |inspector, _| {
+            let TranscriptLoadState::Ready(document) = &inspector.transcript_state else {
+                panic!("transcript not ready after same-session append");
+            };
+            document.turns.clone()
+        });
+        assert_eq!(appended_turns.len(), 2);
+        assert_eq!(appended_turns[1].text, "The appended turn is visible");
 
         inspector.update(cx, |inspector, _| {
             inspector.refresh_task = None;

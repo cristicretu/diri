@@ -3972,7 +3972,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hook_report_folds_identity_into_the_record() {
+    fn a_hook_report_folds_identity_but_rejects_an_untrusted_transcript_path() {
         let temp = tempfile::tempdir().expect("temp");
         let registry = Arc::new(Mutex::new(Registry::new(
             engine(),
@@ -4005,7 +4005,7 @@ mod tests {
         let list = ok_of(call(&server, "session.list", None));
         let record = &list["sessions"][0];
         assert_eq!(record["agentSessionID"], "uuid-from-hook");
-        assert_eq!(record["transcriptPath"], "/tmp/t.jsonl");
+        assert_eq!(record["transcriptPath"], Value::Null);
         assert_eq!(
             record["title"], "fix the flaky test in ci",
             "the first prompt titles a placeholder session"

@@ -16,10 +16,15 @@
 //!
 //! Ported from the Swift `HistoryScanner`.
 
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+use diri_proto::AgentKind;
 use serde_json::Value;
 
 /// Defensive cap on returned entries.
@@ -32,6 +37,9 @@ const CLAUDE_TAIL_BYTES: usize = 16 << 10;
 /// Cap on a Codex `session_meta` first line.
 const CODEX_FIRST_LINE_CAP: usize = 512 << 10;
 const CHUNK: usize = 64 << 10;
+const CODEX_ASSOCIATION_DATE_DIRS: usize = 8;
+const CODEX_ASSOCIATION_ENTRIES: usize = 1_024;
+const CODEX_ASSOCIATION_DIRECTORY_ENTRIES: usize = 1_024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HistoryKind {
@@ -64,6 +72,23 @@ pub struct HistoryEntry {
     pub cwd_exists: bool,
 }
 
+/// A provider transcript whose containment, ownership, file type, and identity
+/// were established against the same descriptor consumers must read from.
+pub(crate) struct TrustedTranscript {
+    path: PathBuf,
+    file: File,
+}
+
+impl TrustedTranscript {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn latest_claude_ai_title(&mut self) -> Option<String> {
+        latest_claude_ai_title_from(&mut self.file)
+    }
+}
+
 /// Scans both stores under `home`, newest first, skipping ids already tracked.
 pub fn scan(home: &Path, tracked: &[String]) -> Vec<HistoryEntry> {
     scan_roots(
@@ -88,6 +113,171 @@ pub fn scan_roots(claude_root: &Path, codex_root: &Path, tracked: &[String]) -> 
     deduped.sort_by_key(|entry| std::cmp::Reverse(entry.last_active_at));
     deduped.truncate(MAX_ENTRIES);
     deduped
+}
+
+/// Resolve the provider-owned transcript for a live Codex thread. Codex puts
+/// the thread id in both the rollout filename and its first `session_meta`
+/// record. We inspect only the newest bounded set of strict YYYY/MM/DD
+/// directories and require both identities plus the launch cwd to match.
+pub(crate) fn find_live_codex_transcript(
+    home: &Path,
+    agent_id: &str,
+    cwd: &str,
+) -> Option<TrustedTranscript> {
+    if !safe_agent_id(agent_id) {
+        return None;
+    }
+    let root = home.join(".codex/sessions");
+    let suffix = format!("-{agent_id}.jsonl");
+    let mut seen = 0usize;
+    let mut matches = Vec::new();
+    for date in newest_codex_date_dirs(&root) {
+        let Ok(entries) = std::fs::read_dir(date) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            if seen >= CODEX_ASSOCIATION_ENTRIES {
+                break;
+            }
+            seen += 1;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with("rollout-") || !name.ends_with(&suffix) {
+                continue;
+            }
+            let path = entry.path();
+            if let Some(transcript) =
+                validate_transcript_path(home, &AgentKind::CODEX, agent_id, cwd, &path)
+            {
+                let modified = transcript
+                    .file
+                    .metadata()
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok())
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                matches.push((modified, transcript));
+            }
+        }
+        if seen >= CODEX_ASSOCIATION_ENTRIES {
+            break;
+        }
+    }
+    matches.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    matches.into_iter().next().map(|(_, path)| path)
+}
+
+/// Validate an agent-reported transcript path before it enters SessionRecord.
+/// The path must resolve inside the provider's transcript root, must not be a
+/// symlink or non-regular file, must belong to this user, and must be tied to
+/// the provider conversation identity.
+pub(crate) fn validate_transcript_path(
+    home: &Path,
+    kind: &AgentKind,
+    agent_id: &str,
+    cwd: &str,
+    path: &Path,
+) -> Option<TrustedTranscript> {
+    if !safe_agent_id(agent_id) {
+        return None;
+    }
+    let root = match kind.id() {
+        AgentKind::CLAUDE_CODE_ID => home.join(".claude/projects"),
+        AgentKind::CODEX_ID => home.join(".codex/sessions"),
+        _ => return None,
+    };
+    let mut file = open_trusted_regular_file(&root, path)?;
+    match kind.id() {
+        AgentKind::CLAUDE_CODE_ID => {
+            let expected = format!("{agent_id}.jsonl");
+            (path.file_name()?.to_str()? == expected).then(|| TrustedTranscript {
+                path: path.to_path_buf(),
+                file,
+            })
+        }
+        AgentKind::CODEX_ID => {
+            let (found_id, found_cwd) = codex_identity_from(&mut file)?;
+            (found_id == agent_id && found_cwd == cwd).then(|| TrustedTranscript {
+                path: path.to_path_buf(),
+                file,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn safe_agent_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn open_trusted_regular_file(root: &Path, path: &Path) -> Option<File> {
+    let canonical_root = root.canonicalize().ok()?;
+    let file = open_regular_readonly(path)?;
+    let opened_metadata = file.metadata().ok()?;
+    let link_metadata = std::fs::symlink_metadata(path).ok()?;
+    let canonical_path = path.canonicalize().ok()?;
+    if link_metadata.file_type().is_symlink()
+        || !link_metadata.is_file()
+        || !canonical_path.starts_with(&canonical_root)
+    {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        if opened_metadata.dev() != link_metadata.dev()
+            || opened_metadata.ino() != link_metadata.ino()
+        {
+            return None;
+        }
+    }
+    Some(file)
+}
+
+fn newest_codex_date_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut dates = Vec::new();
+    for year in numeric_child_dirs(root, 4, 1970, 9999, CODEX_ASSOCIATION_DATE_DIRS) {
+        for month in numeric_child_dirs(&year, 2, 1, 12, 12) {
+            for day in numeric_child_dirs(&month, 2, 1, 31, 31) {
+                dates.push(day);
+            }
+        }
+    }
+    dates.sort_by(|left, right| right.cmp(left));
+    dates.truncate(CODEX_ASSOCIATION_DATE_DIRS);
+    dates
+}
+
+fn numeric_child_dirs(
+    root: &Path,
+    width: usize,
+    minimum: u16,
+    maximum: u16,
+    keep: usize,
+) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut children = entries
+        .take(CODEX_ASSOCIATION_DIRECTORY_ENTRIES)
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            let number = name.parse::<u16>().ok()?;
+            (name.len() == width && (minimum..=maximum).contains(&number))
+                .then(|| (number, entry.path()))
+        })
+        .collect::<Vec<_>>();
+    children.sort_by_key(|(number, _)| std::cmp::Reverse(*number));
+    children
+        .into_iter()
+        .take(keep)
+        .map(|(_, path)| path)
+        .collect()
 }
 
 // MARK: Claude
@@ -183,7 +373,7 @@ fn claude_user_text(object: &Value) -> Option<String> {
 /// reached. Stopping early matters: the alternative is reading megabytes of
 /// transcript to learn one field.
 fn read_claude_head(path: &Path) -> Vec<String> {
-    let Ok(mut handle) = std::fs::File::open(path) else {
+    let Some(mut handle) = open_regular_readonly(path) else {
         return Vec::new();
     };
     let mut data: Vec<u8> = Vec::new();
@@ -211,13 +401,18 @@ fn read_claude_head(path: &Path) -> Vec<String> {
 /// The newest `ai-title` in the tail — the title Claude generated for the
 /// conversation.
 pub(crate) fn latest_claude_ai_title(path: &Path) -> Option<String> {
-    let mut handle = std::fs::File::open(path).ok()?;
+    let mut handle = open_regular_readonly(path)?;
+    latest_claude_ai_title_from(&mut handle)
+}
+
+fn latest_claude_ai_title_from(handle: &mut File) -> Option<String> {
     let end = handle.seek(SeekFrom::End(0)).ok()?;
     let start = end.saturating_sub(CLAUDE_TAIL_BYTES as u64);
     handle.seek(SeekFrom::Start(start)).ok()?;
 
     let mut data = Vec::new();
     handle
+        .by_ref()
         .take((CLAUDE_TAIL_BYTES + (4 << 10)) as u64)
         .read_to_end(&mut data)
         .ok()?;
@@ -270,24 +465,17 @@ fn scan_codex(root: &Path) -> Vec<HistoryEntry> {
 }
 
 fn codex_entry(path: &Path) -> Option<HistoryEntry> {
-    let first = read_first_line(path, CODEX_FIRST_LINE_CAP)?;
-    let object: Value = serde_json::from_str(&first).ok()?;
-    if object.get("type").and_then(Value::as_str) != Some("session_meta") {
-        return None;
-    }
-    let payload = object.get("payload")?;
-    let id = payload.get("id").and_then(Value::as_str)?.to_string();
-    let cwd = payload.get("cwd").and_then(Value::as_str)?;
-    if cwd.is_empty() {
-        return None;
-    }
+    let mut handle = open_regular_readonly(path)?;
+    let (id, cwd) = codex_identity_from(&mut handle)?;
+    let metadata = handle.metadata().ok()?;
 
-    let (modified, created) = timestamps(path);
+    let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let created = metadata.created().ok();
     Some(HistoryEntry {
         id,
         kind: HistoryKind::Codex,
-        cwd_exists: Path::new(cwd).exists(),
-        cwd: cwd.to_string(),
+        cwd_exists: Path::new(&cwd).exists(),
+        cwd,
         // Codex has no ai-title record; the caller can fall back to a
         // placeholder built from cwd and date.
         title: None,
@@ -295,6 +483,22 @@ fn codex_entry(path: &Path) -> Option<HistoryEntry> {
         last_active_at: modified,
         created_at: created,
     })
+}
+
+fn codex_identity_from(handle: &mut File) -> Option<(String, String)> {
+    handle.seek(SeekFrom::Start(0)).ok()?;
+    let first = read_first_line_from(handle, CODEX_FIRST_LINE_CAP)?;
+    let object: Value = serde_json::from_str(&first).ok()?;
+    if object.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    let payload = object.get("payload")?;
+    let id = payload.get("id").and_then(Value::as_str)?.to_string();
+    let cwd = payload.get("cwd").and_then(Value::as_str)?.to_string();
+    if cwd.is_empty() {
+        return None;
+    }
+    Some((id, cwd))
 }
 
 // MARK: Shared
@@ -310,8 +514,7 @@ fn child_dirs(path: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn read_first_line(path: &Path, cap: usize) -> Option<String> {
-    let mut handle = std::fs::File::open(path).ok()?;
+fn read_first_line_from(handle: &mut File, cap: usize) -> Option<String> {
     let mut data: Vec<u8> = Vec::new();
     let mut buffer = vec![0u8; CHUNK];
 
@@ -326,6 +529,26 @@ fn read_first_line(path: &Path, cap: usize) -> Option<String> {
         }
     }
     (!data.is_empty()).then(|| String::from_utf8_lossy(&data).to_string())
+}
+
+/// Provider history is local user data. A nonblocking, no-follow open keeps a
+/// malformed or raced path from turning any history/metadata read into a FIFO
+/// wait or symlink traversal; metadata and bytes come from the same handle.
+fn open_regular_readonly(path: &Path) -> Option<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return None;
+    }
+    Some(file)
 }
 
 fn timestamps(path: &Path) -> (SystemTime, Option<SystemTime>) {
@@ -476,6 +699,105 @@ mod tests {
         assert_eq!(entries[0].id, "thread-9");
         assert_eq!(entries[0].kind, HistoryKind::Codex);
         assert_eq!(entries[0].cwd, "/tmp");
+    }
+
+    #[test]
+    fn live_codex_transcript_resolution_is_bounded_and_identity_associated() {
+        let home = tempfile::tempdir().expect("home");
+        let root = home.path().join(".codex/sessions");
+        write(
+            &root.join("2026/08/12/rollout-old-thread-9.jsonl"),
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"other\",\"cwd\":\"/tmp\"}}\n",
+        );
+        let expected = root.join("2026/08/13/rollout-now-thread-9.jsonl");
+        write(
+            &expected,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-9\",\"cwd\":\"/work/app\"}}\n",
+        );
+
+        assert_eq!(
+            find_live_codex_transcript(home.path(), "thread-9", "/work/app")
+                .map(|transcript| transcript.path().to_path_buf()),
+            Some(expected)
+        );
+        assert!(find_live_codex_transcript(home.path(), "thread-9", "/wrong").is_none());
+        assert!(find_live_codex_transcript(home.path(), "../escape", "/work/app").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transcript_validation_rejects_symlinks_and_paths_outside_provider_roots() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::symlink;
+
+        let home = tempfile::tempdir().expect("home");
+        let outside = home.path().join("outside.jsonl");
+        write(
+            &outside,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-9\",\"cwd\":\"/tmp\"}}\n",
+        );
+        let link = home
+            .path()
+            .join(".codex/sessions/2026/08/13/rollout-now-thread-9.jsonl");
+        std::fs::create_dir_all(link.parent().expect("parent")).expect("mkdir");
+        symlink(&outside, &link).expect("symlink");
+
+        assert!(
+            validate_transcript_path(home.path(), &AgentKind::CODEX, "thread-9", "/tmp", &link,)
+                .is_none()
+        );
+        assert!(
+            validate_transcript_path(home.path(), &AgentKind::CODEX, "thread-9", "/tmp", &outside,)
+                .is_none()
+        );
+
+        let fifo = link.with_file_name("rollout-fifo-thread-9.jsonl");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).expect("fifo path");
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        assert!(
+            validate_transcript_path(home.path(), &AgentKind::CODEX, "thread-9", "/tmp", &fifo,)
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_transcript_reads_the_validated_inode_after_path_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let home = tempfile::tempdir().expect("home");
+        let agent_id = "0199f2c4-1a2b-4c3d-8e9f-000000000099";
+        let path = home
+            .path()
+            .join(".claude/projects/-tmp")
+            .join(format!("{agent_id}.jsonl"));
+        write(
+            &path,
+            "{\"type\":\"ai-title\",\"aiTitle\":\"validated inode\"}\n",
+        );
+        let mut trusted = validate_transcript_path(
+            home.path(),
+            &AgentKind::CLAUDE_CODE,
+            agent_id,
+            "/tmp",
+            &path,
+        )
+        .expect("trusted transcript");
+
+        let moved = path.with_extension("validated");
+        std::fs::rename(&path, &moved).expect("move validated inode");
+        let replacement = home.path().join("replacement.jsonl");
+        write(
+            &replacement,
+            "{\"type\":\"ai-title\",\"aiTitle\":\"swapped path\"}\n",
+        );
+        symlink(&replacement, &path).expect("swap final component");
+
+        assert_eq!(
+            trusted.latest_claude_ai_title().as_deref(),
+            Some("validated inode")
+        );
     }
 
     #[test]

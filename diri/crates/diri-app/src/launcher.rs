@@ -1,6 +1,6 @@
 //! Compact new-session destination opened in the main pane by Command-N.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -102,6 +102,9 @@ pub(crate) struct LauncherOverlay {
     /// The active destination draft survives a temporary handoff proposal.
     saved_new_prompt: Option<String>,
     handoff_delivery: HandoffDeliveryState,
+    /// Drafts containing paths validated on this Mac cannot be submitted to a
+    /// remote Agent. Pure text/quotes do not carry this restriction.
+    session_drafts_with_local_paths: HashSet<SessionId>,
     selected_harness: AgentKind,
     selected_root: String,
     selected_host: Option<String>,
@@ -220,6 +223,7 @@ impl LauncherOverlay {
             mode: LauncherMode::NewSession,
             saved_new_prompt: None,
             handoff_delivery: HandoffDeliveryState::default(),
+            session_drafts_with_local_paths: HashSet::new(),
             selected_harness,
             selected_root,
             selected_host,
@@ -308,6 +312,22 @@ impl LauncherOverlay {
         self.open = true;
         window.focus(&self.focus, cx);
         cx.notify();
+    }
+
+    /// Finder paths are meaningful only on this Mac. Keep that provenance
+    /// attached to the identity-keyed draft so a later target transition
+    /// cannot accidentally make it submittable to a remote host.
+    pub(crate) fn open_local_paths_for_session(
+        &mut self,
+        session_id: SessionId,
+        insertion: &str,
+        notice: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.session_drafts_with_local_paths
+            .insert(session_id.clone());
+        self.open_for_session(session_id, insertion, notice, window, cx);
     }
 
     fn activate_new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -548,9 +568,7 @@ impl LauncherOverlay {
             let Some(session) = store.sessions().get(id) else {
                 return Some("This session is no longer available".to_owned());
             };
-            return session
-                .host
-                .is_some()
+            return (session.host.is_some() && self.session_drafts_with_local_paths.contains(id))
                 .then(|| "Local paths cannot be used on a remote session".to_owned());
         }
         if self.selected_root.is_empty() {
@@ -682,6 +700,7 @@ impl LauncherOverlay {
                         submit: true,
                     });
                 self.session_drafts.remove(id);
+                self.session_drafts_with_local_paths.remove(id);
             }
         }
         self.prompt.clear();
@@ -864,6 +883,14 @@ impl LauncherOverlay {
                     self.prompt.insert_multiline(&text);
                 }
             }
+        }
+        if self.prompt.text().is_empty()
+            && let LauncherTarget::Session(id) = &self.target
+        {
+            // A remote user can recover from a rejected Finder drop by
+            // clearing the draft, without weakening provenance while any of
+            // the local insertion remains.
+            self.session_drafts_with_local_paths.remove(id);
         }
         cx.notify();
         true
@@ -2292,6 +2319,7 @@ mod tests {
         fixture.list.sessions[1].kind = AgentKind::CLAUDE_CODE;
         fixture.list.sessions[0].foreground_agent = None;
         fixture.list.sessions[1].foreground_agent = None;
+        fixture.list.sessions[1].host = Some("build-box".to_owned());
         fixture.list.sessions[1].hibernation = Some(diri_proto::HibernationInfo {
             since: diri_proto::DateMillis(1.0),
             reason: diri_proto::HibernationReason::Manual,
@@ -2345,12 +2373,33 @@ mod tests {
             "an app-owned draft cannot wake or rewrite hibernation state"
         );
         launcher.read_with(cx, |launcher, _| {
-            assert_eq!(launcher.target, LauncherTarget::Session(target));
+            assert_eq!(launcher.target, LauncherTarget::Session(target.clone()));
+            assert_eq!(
+                launcher.blocker(),
+                None,
+                "plain quoted text must remain submittable to a remote agent"
+            );
             assert_eq!(
                 launcher.prompt.text(),
                 "first quoted turn\nsecond quoted turn"
             );
             assert!(launcher.open);
+        });
+
+        launcher.update_in(cx, |launcher, window, cx| {
+            launcher.open_local_paths_for_session(
+                target.clone(),
+                "'/Users/me/local.png'",
+                None,
+                window,
+                cx,
+            );
+        });
+        launcher.read_with(cx, |launcher, _| {
+            assert_eq!(
+                launcher.blocker().as_deref(),
+                Some("Local paths cannot be used on a remote session")
+            );
         });
     }
 }
