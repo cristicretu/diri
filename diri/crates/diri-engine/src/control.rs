@@ -4267,6 +4267,16 @@ mod tests {
         assert_eq!(result["worktreePath"], target.to_string_lossy().as_ref());
         assert_eq!(result["gitBranch"], "feature/reparent");
         assert!(temp.path().join("state.json").is_file(), "move is durable");
+        let state: JsonValue = serde_json::from_slice(
+            &std::fs::read(temp.path().join("state.json")).expect("read durable state"),
+        )
+        .expect("decode durable state");
+        let persisted = state["sessions"]
+            .as_array()
+            .and_then(|sessions| sessions.iter().find(|session| session["id"] == "s_move"))
+            .expect("persisted moved session");
+        assert_eq!(persisted["cwd"], target.to_string_lossy().as_ref());
+        assert_eq!(persisted["worktreePath"], target.to_string_lossy().as_ref());
     }
 
     #[test]

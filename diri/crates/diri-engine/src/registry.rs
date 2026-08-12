@@ -855,7 +855,10 @@ impl Registry {
             previous
         };
 
-        if let Err(error) = self.persist() {
+        // A confirmed move is user-visible identity metadata, not a sampled
+        // field that may wait for the normal debounce. Force the atomic write
+        // now so an `Ok` response means this exact checkout survived a crash.
+        if let Err(error) = self.persist_now() {
             let record = self
                 .records
                 .get_mut(id)
