@@ -35,11 +35,14 @@ use crate::updates::{UpdateCommand, UpdatePhase, UpdateState};
 use crate::usage::{UsageFormat, UsageSnapshot};
 
 use super::{
-    CursorMove, DragItem, Popover, PreviewScenario, SidebarPreviewFixture, SidebarUiState,
-    move_before, move_to_end,
+    CursorMove, DragItem, PeekSource, Popover, PreviewScenario, SidebarPreviewFixture,
+    SidebarUiState, move_before, move_to_end,
 };
 
 const PREVIEW_USAGE: f64 = 4.82;
+/// Long enough that a normal click or an intentional reorder wins, short
+/// enough that comparing several sessions still feels like one gesture.
+const SESSION_PEEK_DELAY: Duration = Duration::from_millis(320);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FocusRow {
@@ -73,6 +76,9 @@ pub(crate) enum SidebarEvent {
     /// Escape left keyboard-navigation mode without changing the active
     /// session. Root owns the terminal entity, so it completes the handoff.
     FocusTerminal,
+    /// Borrow the terminal presentation for a read-only identity, or restore
+    /// the real selected session. This never travels through SessionStore.
+    PeekChanged(Option<SessionId>),
     /// The user acted on the update pill. The sidebar holds no updater of its
     /// own; RootView owns the handle and forwards these.
     Update(UpdateCommand),
@@ -93,11 +99,13 @@ struct DraggedSidebarItem(DragItem);
 struct DragPreview {
     label: SharedString,
     colors: SemanticColors,
+    visible: bool,
 }
 
 impl Render for DragPreview {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .opacity(if self.visible { 1.0 } else { 0.0 })
             .px(px(10.0))
             .h(px(28.0))
             .flex()
@@ -131,6 +139,11 @@ pub struct Sidebar {
     shortcut_ranks: HashMap<SessionId, usize>,
     focus_handle: FocusHandle,
     hover_generation: u64,
+    /// Invalidates delayed pointer holds without keeping a timer task alive in
+    /// the entity. A moved/released gesture simply advances the generation.
+    peek_generation: u64,
+    pending_pointer_peek: Option<SessionId>,
+    pointer_press: Option<SessionId>,
     usage: Option<UsageSnapshot>,
     update: UpdateState,
     /// When visibility last flipped, so a held ⌘B cannot outrun the slide.
@@ -214,6 +227,9 @@ impl Sidebar {
             shortcut_ranks: HashMap::new(),
             focus_handle: cx.focus_handle(),
             hover_generation: 0,
+            peek_generation: 0,
+            pending_pointer_peek: None,
+            pointer_press: None,
             usage: None,
             update: UpdateState::default(),
             last_toggle: None,
@@ -328,6 +344,7 @@ impl Sidebar {
             return;
         }
         self.last_toggle = Some(now);
+        self.cancel_peek(cx);
         self.ui.toggle();
         let visible = self.ui.visible;
         if let Err(error) = self
@@ -474,6 +491,141 @@ impl Sidebar {
         self.focus_handle.is_focused(window)
     }
 
+    pub fn has_peek_in_flight(&self) -> bool {
+        self.pending_pointer_peek.is_some() || self.ui.peek.is_some()
+    }
+
+    pub fn is_peeking(&self) -> bool {
+        self.ui.peek.is_some()
+    }
+
+    fn emit_peek(&mut self, cx: &mut Context<Self>) {
+        cx.emit(SidebarEvent::PeekChanged(
+            self.ui.peek.as_ref().map(|peek| peek.id.clone()),
+        ));
+        cx.notify();
+    }
+
+    fn begin_peek(&mut self, id: SessionId, source: PeekSource, cx: &mut Context<Self>) {
+        self.pending_pointer_peek = None;
+        self.hover_generation = self.hover_generation.wrapping_add(1);
+        self.ui.hover_card = None;
+        if self.ui.begin_peek(id, source) {
+            self.emit_peek(cx);
+        }
+    }
+
+    fn follow_peek(&mut self, id: SessionId, source: PeekSource, cx: &mut Context<Self>) {
+        if self.ui.follow_peek(id, source) {
+            self.emit_peek(cx);
+        }
+    }
+
+    fn cancel_pending_pointer_peek(&mut self) {
+        self.peek_generation = self.peek_generation.wrapping_add(1);
+        self.pending_pointer_peek = None;
+    }
+
+    fn schedule_pointer_peek(
+        &mut self,
+        id: SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // A keyboard peek owns Space until key-up. A click during it is a
+        // commit, not the start of a second gesture.
+        if self.ui.peek.is_some() {
+            return;
+        }
+        self.ui.suppress_pointer_click = false;
+        self.ui.suppress_pointer_drop = false;
+        self.cancel_pending_pointer_peek();
+        self.pointer_press = Some(id.clone());
+        self.pending_pointer_peek = Some(id.clone());
+        let generation = self.peek_generation;
+        cx.spawn_in(window, async move |this, cx| {
+            let executor = cx.background_executor();
+            executor.timer(SESSION_PEEK_DELAY).await;
+            let _ = this.update_in(cx, |this, _window, cx| {
+                if this.peek_generation == generation
+                    && this.pending_pointer_peek.as_ref() == Some(&id)
+                {
+                    this.begin_peek(id, PeekSource::Pointer, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn finish_pointer_gesture(&mut self, released_row: Option<&SessionId>, cx: &mut Context<Self>) {
+        let was_pointer_peek = self
+            .ui
+            .peek
+            .as_ref()
+            .is_some_and(|peek| peek.source == PeekSource::Pointer);
+        let should_suppress_click = released_row.is_some()
+            && released_row == self.pointer_press.as_ref()
+            && was_pointer_peek;
+        self.cancel_pending_pointer_peek();
+        self.pointer_press = None;
+        if self.ui.end_peek(Some(PeekSource::Pointer)) {
+            // Mouse-up is followed by Click on the pressed row. That Click is
+            // part of this release and must not turn restoration into a commit.
+            self.ui.suppress_pointer_click = should_suppress_click;
+            self.ui.suppress_pointer_drop = was_pointer_peek;
+            self.emit_peek(cx);
+        }
+    }
+
+    fn finish_pointer_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let released_row = self
+            .row_bounds
+            .borrow()
+            .iter()
+            .find(|(_, bounds)| bounds.contains(&position))
+            .map(|(id, _)| id.clone());
+        self.finish_pointer_gesture(released_row.as_ref(), cx);
+    }
+
+    pub fn cancel_peek(&mut self, cx: &mut Context<Self>) -> bool {
+        let pending = self.pending_pointer_peek.is_some();
+        self.cancel_pending_pointer_peek();
+        self.pointer_press = None;
+        self.ui.space_held = false;
+        if self.ui.end_peek(None) {
+            self.emit_peek(cx);
+            true
+        } else {
+            if pending {
+                cx.notify();
+            }
+            pending
+        }
+    }
+
+    pub fn commit_peek(&mut self, cx: &mut Context<Self>) -> bool {
+        self.cancel_pending_pointer_peek();
+        self.pointer_press = None;
+        self.ui.space_held = false;
+        let Some(peek) = self.ui.take_peek() else {
+            return false;
+        };
+        let exists = {
+            let mut store = self.store.write().expect("session store lock poisoned");
+            let exists = store.sessions().contains_key(&peek.id);
+            if exists {
+                store.select(peek.id.clone());
+            }
+            exists
+        };
+        self.emit_peek(cx);
+        if exists {
+            self.ui.focus_cursor = Some(peek.id);
+            cx.emit(SidebarEvent::SessionActivated);
+        }
+        true
+    }
+
     /// Enters keyboard-navigation mode from any other surface. An active row
     /// is the initial landmark, while an existing identity cursor survives
     /// subsequent trips to the terminal.
@@ -527,6 +679,9 @@ impl Sidebar {
         let visible = focus_row_ids(&rows);
         self.ui.reconcile_focus_cursor(&visible, selected.as_ref());
         self.ui.move_focus_cursor(movement, &visible);
+        if let Some(id) = self.ui.focus_cursor.clone() {
+            self.follow_peek(id, PeekSource::Keyboard, cx);
+        }
         self.scroll_focus_cursor_into_view(window);
         cx.notify();
         true
@@ -558,12 +713,18 @@ impl Sidebar {
         let (next_rows, _) = self.focus_rows_snapshot();
         self.ui
             .reconcile_focus_cursor(&focus_row_ids(&next_rows), None);
+        if let Some(id) = self.ui.focus_cursor.clone() {
+            self.follow_peek(id, PeekSource::Keyboard, cx);
+        }
         self.scroll_focus_cursor_into_view(window);
         cx.notify();
         true
     }
 
     fn activate_focus_cursor(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.ui.peek.is_some() {
+            return self.commit_peek(cx);
+        }
         let Some(id) = self.ui.focus_cursor.clone() else {
             return true;
         };
@@ -645,6 +806,9 @@ impl Sidebar {
         let key = event.keystroke.key.as_str();
         if key == "escape" {
             cx.stop_propagation();
+            if self.cancel_peek(cx) {
+                return;
+            }
             if self.ui.popover.take().is_none() {
                 cx.emit(SidebarEvent::FocusTerminal);
             }
@@ -663,14 +827,36 @@ impl Sidebar {
             "left" => self.move_focus_horizontally(false, window, cx),
             "right" => self.move_focus_horizontally(true, window, cx),
             "enter" => self.activate_focus_cursor(cx),
-            // Deliberately consumed but unbound. Hold-to-peek owns Space in
-            // the follow-up issue, and activation must remain Enter-only.
-            "space" => true,
+            "space" => {
+                if !self.ui.space_held {
+                    self.ui.space_held = true;
+                    if let Some(id) = self.ui.focus_cursor.clone() {
+                        self.begin_peek(id, PeekSource::Keyboard, cx);
+                    }
+                }
+                true
+            }
             _ => false,
         };
         if handled {
             cx.stop_propagation();
         }
+    }
+
+    fn on_key_up(
+        &mut self,
+        event: &gpui::KeyUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.keystroke.key.as_str() != "space" || !self.ui.space_held {
+            return;
+        }
+        self.ui.space_held = false;
+        if self.ui.end_peek(Some(PeekSource::Keyboard)) {
+            self.emit_peek(cx);
+        }
+        cx.stop_propagation();
     }
 
     fn schedule_hover_card(
@@ -682,6 +868,10 @@ impl Sidebar {
     ) {
         self.hover_generation = self.hover_generation.wrapping_add(1);
         let generation = self.hover_generation;
+        if self.ui.peek.is_some() {
+            self.ui.hover_card = None;
+            return;
+        }
         if !hovering {
             if self
                 .ui
@@ -1086,6 +1276,7 @@ impl Sidebar {
                         cx.new(|_| DragPreview {
                             label: drag_label.clone(),
                             colors,
+                            visible: true,
                         })
                     },
                 )
@@ -1295,6 +1486,7 @@ impl Sidebar {
         let focused = self.focus_handle.is_focused(window)
             && self.ui.renaming.is_none()
             && self.ui.focus_cursor.as_ref() == Some(&id);
+        let peeked = self.ui.peek.as_ref().is_some_and(|peek| peek.id == id);
         let archived = session.is_archived();
         let hibernated = session.hibernation.is_some();
         let session_is_remote = session.host.is_some();
@@ -1408,6 +1600,7 @@ impl Sidebar {
         let rename_session = Arc::clone(session);
         let close_id = id.clone();
         let hover_id = id.clone();
+        let press_id = id.clone();
         let drag_item = if multi && let Some(selection) = drag_selection {
             DragItem::Sessions(selection)
         } else {
@@ -1421,6 +1614,7 @@ impl Sidebar {
         let drag_payload = DraggedSidebarItem(drag_item);
         let drag_label: SharedString = title.clone().into();
         let entity = cx.entity();
+        let drag_entity = entity.clone();
         let row = div()
             .id(format!("session:{}", id.0))
             .pl(px(Space::ROW_H))
@@ -1430,9 +1624,15 @@ impl Sidebar {
             .items_center()
             .gap(px(8.0))
             .rounded(px(Radius::ROW))
-            .bg(fill.color(colors))
+            .bg(if peeked {
+                Palette::CLAY.alpha(0.11)
+            } else {
+                fill.color(colors)
+            })
             .border_1()
-            .border_color(if focused {
+            .border_color(if peeked {
+                Palette::CLAY.alpha(0.92)
+            } else if focused {
                 Ink::FRESH.alpha(0.82)
             } else {
                 colors.primary.alpha(0.0)
@@ -1447,13 +1647,30 @@ impl Sidebar {
             .cursor_pointer()
             .on_hover(cx.listener(move |this, is_hovered: &bool, window, cx| {
                 this.ui.hovered_session = is_hovered.then(|| hover_id.clone());
+                if *is_hovered {
+                    this.follow_peek(hover_id.clone(), PeekSource::Pointer, cx);
+                }
                 this.schedule_hover_card(hover_id.clone(), *is_hovered, window, cx);
                 cx.notify();
             }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    this.schedule_pointer_peek(press_id.clone(), window, cx);
+                }),
+            )
             .on_click(
                 cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                    if std::mem::take(&mut this.ui.suppress_pointer_click) {
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
                     this.commit_rename();
                     this.ui.focus_cursor = Some(row_session.id.clone());
+                    // A click made while Space is borrowing the pane is an
+                    // explicit activation of the clicked row.
+                    this.cancel_peek(cx);
                     if event.click_count() == 2 {
                         this.begin_rename(&row_session, window, cx);
                         return;
@@ -1498,9 +1715,22 @@ impl Sidebar {
                 }),
             )
             .on_drag(drag_payload, move |_, _, _, cx| {
+                let visible = drag_entity.update(cx, |this, _| {
+                    let pointer_peek = this
+                        .ui
+                        .peek
+                        .as_ref()
+                        .is_some_and(|peek| peek.source == PeekSource::Pointer);
+                    if !pointer_peek {
+                        this.ui.suppress_pointer_drop = false;
+                        this.cancel_pending_pointer_peek();
+                    }
+                    !pointer_peek
+                });
                 cx.new(|_| DragPreview {
                     label: drag_label.clone(),
                     colors,
+                    visible,
                 })
             })
             .drag_over::<DraggedSidebarItem>({
@@ -1508,6 +1738,22 @@ impl Sidebar {
                 let target_project = session.project_id.clone();
                 let target_parent = session.parent.clone();
                 move |element, dragged, _, cx| {
+                    let peeking = entity.update(cx, |this, cx| {
+                        if this
+                            .ui
+                            .peek
+                            .as_ref()
+                            .is_some_and(|peek| peek.source == PeekSource::Pointer)
+                        {
+                            this.follow_peek(target.clone(), PeekSource::Pointer, cx);
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    if peeking {
+                        return element.bg(Palette::CLAY.alpha(0.11));
+                    }
                     // Siblings only. A row dropped on a cousin would shuffle
                     // the manual order without moving anything on screen,
                     // because each sibling run is sorted among itself.
@@ -1534,6 +1780,22 @@ impl Sidebar {
             .on_drop(cx.listener({
                 let target_project = session.project_id.clone();
                 move |this, dragged: &DraggedSidebarItem, _, cx| {
+                    let pointer_peek = this
+                        .ui
+                        .peek
+                        .as_ref()
+                        .is_some_and(|peek| peek.source == PeekSource::Pointer);
+                    if std::mem::take(&mut this.ui.suppress_pointer_drop) || pointer_peek {
+                        if pointer_peek {
+                            this.finish_pointer_gesture(None, cx);
+                            // `finish_pointer_gesture` protects a later drop;
+                            // this is that drop, so consume the guard now.
+                            this.ui.suppress_pointer_drop = false;
+                        }
+                        this.finish_drag();
+                        cx.notify();
+                        return;
+                    }
                     if let DragItem::Session {
                         id,
                         project,
@@ -1895,6 +2157,7 @@ impl Sidebar {
         let focused = self.focus_handle.is_focused(window)
             && self.ui.renaming.is_none()
             && self.ui.focus_cursor.as_ref() == Some(&id);
+        let peeked = self.ui.peek.as_ref().is_some_and(|peek| peek.id == id);
         let selected = self
             .store
             .read()
@@ -1903,8 +2166,10 @@ impl Sidebar {
             == Some(&id);
         let row_session = session.clone();
         let revive_id = id.clone();
+        let press_id = id.clone();
         let title = display_title(session);
         let drag_label: SharedString = title.clone().into();
+        let entity = cx.entity();
         div()
             .id(format!("archived-session:{}", id.0))
             .pl(px(Space::ROW_H + Space::INDENT))
@@ -1914,8 +2179,16 @@ impl Sidebar {
             .items_center()
             .gap(px(8.0))
             .rounded(px(Radius::ROW))
-            .opacity(if focused { 0.82 } else { 0.58 })
-            .bg(if selected {
+            .opacity(if peeked {
+                1.0
+            } else if focused {
+                0.82
+            } else {
+                0.58
+            })
+            .bg(if peeked {
+                Palette::CLAY.alpha(0.11)
+            } else if selected {
                 RowFill::Selected.color(colors)
             } else if hovered {
                 RowFill::Hover.color(colors)
@@ -1923,7 +2196,9 @@ impl Sidebar {
                 RowFill::Clear.color(colors)
             })
             .border_1()
-            .border_color(if focused {
+            .border_color(if peeked {
+                Palette::CLAY.alpha(0.92)
+            } else if focused {
                 Ink::FRESH.alpha(0.82)
             } else {
                 colors.primary.alpha(0.0)
@@ -1933,12 +2208,27 @@ impl Sidebar {
                 let id = id.clone();
                 move |this, is_hovered: &bool, _, cx| {
                     this.ui.hovered_session = is_hovered.then(|| id.clone());
+                    if *is_hovered {
+                        this.follow_peek(id.clone(), PeekSource::Pointer, cx);
+                    }
                     cx.notify();
                 }
             }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    this.schedule_pointer_peek(press_id.clone(), window, cx);
+                }),
+            )
             .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                if std::mem::take(&mut this.ui.suppress_pointer_click) {
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
                 let modifiers = event.modifiers();
                 this.ui.focus_cursor = Some(row_session.id.clone());
+                this.cancel_peek(cx);
                 this.store
                     .write()
                     .expect("session store lock poisoned")
@@ -1962,9 +2252,22 @@ impl Sidebar {
                     archived: true,
                 }),
                 move |_, _, _, cx| {
+                    let visible = entity.update(cx, |this, _| {
+                        let pointer_peek = this
+                            .ui
+                            .peek
+                            .as_ref()
+                            .is_some_and(|peek| peek.source == PeekSource::Pointer);
+                        if !pointer_peek {
+                            this.ui.suppress_pointer_drop = false;
+                            this.cancel_pending_pointer_peek();
+                        }
+                        !pointer_peek
+                    });
                     cx.new(|_| DragPreview {
                         label: drag_label.clone(),
                         colors,
+                        visible,
                     })
                 },
             )
@@ -4114,6 +4417,18 @@ impl Render for Sidebar {
             .bg(Self::surface_fill(colors))
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
+            .on_key_up(cx.listener(Self::on_key_up))
+            .capture_any_mouse_up(cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
+                if event.button == MouseButton::Left {
+                    this.finish_pointer_at(event.position, cx);
+                }
+            }))
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
+                    this.finish_pointer_at(event.position, cx);
+                }),
+            )
             .child(self.top_bar(colors, cx))
             .child(self.new_agent_row(colors, cx));
         if projection.projects.is_empty() {
@@ -4630,7 +4945,10 @@ fn compact_duration(seconds: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use gpui::{Modifiers, TestAppContext};
+    use gpui::{
+        KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent,
+        TestAppContext,
+    };
 
     use super::*;
 
@@ -4992,6 +5310,208 @@ mod tests {
                 Some(&cursor)
             );
         });
+    }
+
+    #[gpui::test]
+    fn pointer_hold_waits_then_release_restores_without_acknowledging(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        sidebar.update(cx, |sidebar, _| {
+            let effects = sidebar
+                ._preview_effects
+                .as_mut()
+                .expect("preview effect queue");
+            while effects.try_recv().is_ok() {}
+        });
+        let (active_before, target, attention_before, residency_before) =
+            sidebar.read_with(cx, |sidebar, _| {
+                let store = sidebar.store.read().expect("session store lock poisoned");
+                let active = store
+                    .selected_session_id()
+                    .cloned()
+                    .expect("preview selection");
+                let target = store
+                    .sessions()
+                    .keys()
+                    .find(|id| *id != &active && id.0 == "preview-claude")
+                    .cloned()
+                    .expect("visible target");
+                let attention = store.sessions()[&target].attention();
+                let residency = store
+                    .terminal_residency()
+                    .resident()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (active, target, attention, residency)
+            });
+        let row = sidebar.read_with(cx, |sidebar, _| {
+            sidebar
+                .row_bounds
+                .borrow()
+                .get(&target)
+                .copied()
+                .expect("target row")
+        });
+        let down = MouseDownEvent {
+            button: MouseButton::Left,
+            position: row.center(),
+            ..Default::default()
+        };
+        cx.simulate_event(down);
+
+        assert!(!sidebar.read_with(cx, |sidebar, _| sidebar.is_peeking()));
+        cx.executor()
+            .advance_clock(SESSION_PEEK_DELAY - Duration::from_millis(1));
+        cx.run_until_parked();
+        assert!(!sidebar.read_with(cx, |sidebar, _| sidebar.is_peeking()));
+
+        cx.executor().advance_clock(Duration::from_millis(1));
+        cx.run_until_parked();
+        sidebar.read_with(cx, |sidebar, _| {
+            assert_eq!(sidebar.ui.peek.as_ref().map(|peek| &peek.id), Some(&target));
+            let store = sidebar.store.read().expect("session store lock poisoned");
+            assert_eq!(store.selected_session_id(), Some(&active_before));
+            assert_eq!(store.sessions()[&target].attention(), attention_before);
+            assert_eq!(
+                store
+                    .terminal_residency()
+                    .resident()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                residency_before
+            );
+        });
+        sidebar.update(cx, |sidebar, _| {
+            assert!(
+                matches!(
+                    sidebar
+                        ._preview_effects
+                        .as_mut()
+                        .expect("preview effect queue")
+                        .try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ),
+                "peek must emit no Store effect, including MarkSeen or residency changes"
+            );
+        });
+
+        cx.simulate_event(MouseUpEvent {
+            button: MouseButton::Left,
+            position: row.center(),
+            click_count: 1,
+            ..Default::default()
+        });
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(sidebar.ui.peek.is_none());
+            assert!(
+                sidebar.ui.suppress_pointer_drop,
+                "the release cannot fall through into session reordering"
+            );
+            let store = sidebar.store.read().expect("session store lock poisoned");
+            assert_eq!(store.selected_session_id(), Some(&active_before));
+            assert_eq!(store.sessions()[&target].attention(), attention_before);
+        });
+    }
+
+    #[gpui::test]
+    fn held_space_follows_commits_and_release_or_escape_restore(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        sidebar.update_in(cx, |sidebar, window, cx| sidebar.focus(window, cx));
+        let active_before = sidebar.read_with(cx, |sidebar, _| {
+            sidebar
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .selected_session_id()
+                .cloned()
+                .expect("preview selection")
+        });
+        let key_down = |key: &str| KeyDownEvent {
+            keystroke: Keystroke::parse(key).expect("keystroke"),
+            is_held: false,
+            prefer_character_input: false,
+        };
+
+        cx.simulate_event(key_down("space"));
+        cx.simulate_event(key_down("down"));
+        let followed = sidebar.read_with(cx, |sidebar, _| {
+            let peek = sidebar.ui.peek.as_ref().expect("keyboard peek");
+            assert_eq!(peek.source, PeekSource::Keyboard);
+            assert_eq!(Some(&peek.id), sidebar.ui.focus_cursor.as_ref());
+            assert_ne!(peek.id, active_before);
+            assert_eq!(
+                sidebar
+                    .store
+                    .read()
+                    .expect("session store lock poisoned")
+                    .selected_session_id(),
+                Some(&active_before)
+            );
+            peek.id.clone()
+        });
+        cx.simulate_event(KeyUpEvent {
+            keystroke: Keystroke::parse("space").expect("keystroke"),
+        });
+        sidebar.update_in(cx, |sidebar, window, _| {
+            assert!(sidebar.ui.peek.is_none());
+            assert!(sidebar.is_focused(window));
+            assert_eq!(
+                sidebar
+                    .store
+                    .read()
+                    .expect("session store lock poisoned")
+                    .selected_session_id(),
+                Some(&active_before)
+            );
+        });
+
+        cx.simulate_event(key_down("space"));
+        cx.simulate_event(key_down("escape"));
+        assert!(sidebar.read_with(cx, |sidebar, _| sidebar.ui.peek.is_none()));
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .selected_session_id()
+                .cloned()),
+            Some(active_before.clone())
+        );
+
+        cx.simulate_event(key_down("space"));
+        cx.simulate_event(key_down("enter"));
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(sidebar.ui.peek.is_none());
+            assert_eq!(
+                sidebar
+                    .store
+                    .read()
+                    .expect("session store lock poisoned")
+                    .selected_session_id(),
+                Some(&followed)
+            );
+        });
+        // The key-up belonging to the committed gesture cannot restore the
+        // old identity after Enter made the preview durable.
+        cx.simulate_event(KeyUpEvent {
+            keystroke: Keystroke::parse("space").expect("keystroke"),
+        });
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .selected_session_id()
+                .cloned()),
+            Some(followed)
+        );
     }
 
     #[gpui::test]

@@ -24,14 +24,14 @@ use diri_term::metrics::CellMetrics;
 use diri_term::scrollback::{WheelDelta, WheelEvent, WheelRoute};
 use diri_term::theme::TermTheme;
 use diri_ui::{
-    AgentKind as UiAgentKind, Fill, FloatingSurface, Ink, Metrics, Radius, SemanticColors,
-    StatusGlyph, StatusState, Typo,
+    AgentKind as UiAgentKind, AgentLogo, Fill, FloatingSurface, Ink, Metrics, Palette, Radius,
+    SemanticColors, StatusGlyph, StatusState, Typo,
 };
 use gpui::{
     AnyElement, ClickEvent, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter,
-    FocusHandle, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton, Render, ScrollDelta,
-    ScrollWheelEvent, SharedString, StatefulInteractiveElement, Task, Window, div, font,
-    prelude::*, px, rgba,
+    FocusHandle, FontWeight, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton, Render,
+    ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Task, Window, div,
+    font, prelude::*, px, rgba,
 };
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
@@ -509,6 +509,14 @@ enum SessionSource {
     Fixed(SessionId),
 }
 
+/// Read-only presentation borrowed by the sidebar. It owns no attachment and
+/// has no relationship to Store selection/residency; its optional element is
+/// a view over a buffer the primary pane already had in memory.
+struct PeekPresentation {
+    id: SessionId,
+    element: Option<TerminalElement>,
+}
+
 /// Grid frames parked while a column change round-trips through the daemon,
 /// so the re-wrap and the program's repaint reach the screen as one paint
 /// rather than as a jump and a correction. See [`REFLOW_HOLD`].
@@ -586,6 +594,7 @@ pub struct TerminalPane {
     reflow_holds: HashMap<SessionId, ReflowHold>,
     started_at: Instant,
     session_source: SessionSource,
+    peek: Option<PeekPresentation>,
     /// Last selection observed by the primary pane. Spawn responses select the
     /// daemon-created id asynchronously, so this transition is also the
     /// reliable point at which keyboard focus can leave the picker.
@@ -710,6 +719,7 @@ impl TerminalPane {
             reflow_holds: HashMap::new(),
             started_at: Instant::now(),
             session_source,
+            peek: None,
             observed_selected_id,
             viewport: None,
             sidebar_visible: true,
@@ -865,6 +875,44 @@ impl TerminalPane {
         window.focus(&self.focus, cx);
     }
 
+    pub fn is_peeking(&self) -> bool {
+        self.peek.is_some()
+    }
+
+    /// Changes only what this pane paints. In particular, this does not touch
+    /// terminal residency, open an attachment, resize a PTY, select a session,
+    /// acknowledge attention, or auto-resume a hibernated process.
+    pub fn set_peeked_session(&mut self, id: Option<SessionId>, cx: &mut Context<Self>) {
+        if self.peek.as_ref().map(|peek| &peek.id) == id.as_ref() {
+            return;
+        }
+        self.peek = id.map(|id| {
+            let buffer = self
+                .residents
+                .get(&id)
+                .map(|resident| resident.element.buffer())
+                .or_else(|| {
+                    self.parked_grids
+                        .iter()
+                        .find(|(parked, _)| parked == &id)
+                        .map(|(_, buffer)| Arc::clone(buffer))
+                });
+            let element = buffer.map(|buffer| {
+                let mut mono = font(crate::fonts::mono_family());
+                mono.fallbacks = Some(gpui::FontFallbacks::from_fonts(vec![
+                    ".SF NS Mono".to_owned(),
+                    "Menlo".to_owned(),
+                    "Apple Symbols".to_owned(),
+                    "STIX Two Math".to_owned(),
+                    "Apple Color Emoji".to_owned(),
+                ]));
+                TerminalElement::new(buffer).font(mono).focused(false)
+            });
+            PeekPresentation { id, element }
+        });
+        cx.notify();
+    }
+
     pub fn set_viewport(&mut self, viewport: TerminalViewport, cx: &mut Context<Self>) {
         if self.viewport == Some(viewport) {
             return;
@@ -951,7 +999,7 @@ impl TerminalPane {
                 if let Some(resident) = self.residents.get_mut(&id) {
                     resident.attachment_state = state;
                 }
-                if self.selected_id().as_ref() == Some(&id) {
+                if self.visible_id().as_ref() == Some(&id) {
                     cx.notify();
                 }
             }
@@ -989,13 +1037,13 @@ impl TerminalPane {
                 if let Some(resident) = self.residents.get_mut(&id) {
                     resident.element.set_modes(alt_screen, mouse_reporting);
                 }
-                if self.selected_id().as_ref() == Some(&id) {
+                if self.visible_id().as_ref() == Some(&id) {
                     cx.notify();
                 }
             }
             PaneEvent::Chunk(_, TerminalChunk::Pong) => {}
             PaneEvent::FindSnapshot(id, request, snapshot) => {
-                let visible = self.selected_id().as_ref() == Some(&id);
+                let visible = self.visible_id().as_ref() == Some(&id);
                 if let Some(resident) = self.residents.get_mut(&id)
                     && let Some(find) = resident.find.as_mut()
                     && resident
@@ -1015,7 +1063,7 @@ impl TerminalPane {
                         .complete_scrollback_fetch(result, visible_rows);
                 }
                 self.pump_scrollback_fetch(&id, visible_rows);
-                if self.selected_id().as_ref() == Some(&id) {
+                if self.visible_id().as_ref() == Some(&id) {
                     cx.notify();
                 }
             }
@@ -1023,7 +1071,7 @@ impl TerminalPane {
                 if let Some(resident) = self.residents.get_mut(&id) {
                     resident.element.fail_scrollback_fetch();
                 }
-                if self.selected_id().as_ref() == Some(&id) {
+                if self.visible_id().as_ref() == Some(&id) {
                     cx.notify();
                 }
             }
@@ -1049,7 +1097,7 @@ impl TerminalPane {
         cx: &mut Context<Self>,
     ) {
         let now = self.started_at.elapsed();
-        let selected = self.selected_id();
+        let selected = self.visible_id();
         let mut schedule_find = false;
         let mut changed = false;
         let mut applied = false;
@@ -1183,7 +1231,29 @@ impl TerminalPane {
             .map(Arc::clone)
     }
 
+    fn visible_id(&self) -> Option<SessionId> {
+        self.peek
+            .as_ref()
+            .map(|peek| peek.id.clone())
+            .or_else(|| self.selected_id())
+    }
+
+    fn visible_session(&self) -> Option<Arc<SessionRecord>> {
+        let id = self.visible_id()?;
+        self.runtime
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .sessions()
+            .get(&id)
+            .map(Arc::clone)
+    }
+
     fn open_find(&mut self, _: &OpenFind, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_peeking() {
+            cx.stop_propagation();
+            return;
+        }
         let Some(id) = self.selected_id() else {
             return;
         };
@@ -1202,6 +1272,10 @@ impl TerminalPane {
     }
 
     fn close_find(&mut self, _: &CloseFind, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_peeking() {
+            cx.stop_propagation();
+            return;
+        }
         if self.close_find_for_selected() {
             cx.stop_propagation();
             cx.notify();
@@ -1233,6 +1307,10 @@ impl TerminalPane {
     }
 
     fn navigate_find(&mut self, backwards: bool, cx: &mut Context<Self>) {
+        if self.is_peeking() {
+            cx.stop_propagation();
+            return;
+        }
         let Some(id) = self.selected_id() else {
             return;
         };
@@ -1365,6 +1443,10 @@ impl TerminalPane {
     }
 
     fn copy_selection(&mut self, _: &CopySelection, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_peeking() {
+            cx.stop_propagation();
+            return;
+        }
         let Some(id) = self.selected_id() else {
             return;
         };
@@ -1378,6 +1460,10 @@ impl TerminalPane {
     }
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_peeking() {
+            cx.stop_propagation();
+            return;
+        }
         let Some(item) = cx.read_from_clipboard() else {
             return;
         };
@@ -1463,6 +1549,10 @@ impl TerminalPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.is_peeking() {
+            cx.stop_propagation();
+            return;
+        }
         if let Some(navigation) = &self.navigation
             && navigation.read(cx).is_open()
         {
@@ -1593,6 +1683,10 @@ impl TerminalPane {
     }
 
     fn handle_key_up(&mut self, event: &KeyUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_peeking() {
+            cx.stop_propagation();
+            return;
+        }
         if matches!(event.keystroke.key.as_str(), "control" | "ctrl") {
             self.runtime
                 .store
@@ -1609,6 +1703,10 @@ impl TerminalPane {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.is_peeking() {
+            cx.stop_propagation();
+            return;
+        }
         let mut store = self
             .runtime
             .store
@@ -1658,6 +1756,10 @@ impl TerminalPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.is_peeking() {
+            cx.stop_propagation();
+            return;
+        }
         let Some(id) = self.selected_id() else {
             return;
         };
@@ -2055,6 +2157,141 @@ impl TerminalPane {
                     cx.open_url(url);
                 }
             }))
+            .into_any_element()
+    }
+
+    fn render_peek_header(&self, session: &SessionRecord, colors: SemanticColors) -> AnyElement {
+        let glyph = self.glyphs.get(&session.id).cloned();
+        let branch = session.git_branch.clone();
+        div()
+            .h(px(Metrics::TITLE_BAR))
+            .flex_none()
+            .px(px(Metrics::TOOLBAR_EDGE_INSET))
+            .flex()
+            .items_center()
+            .gap(px(Metrics::TOOLBAR_ITEM_GAP))
+            .bg(colors.sidebar_surface())
+            .child(
+                div()
+                    .flex_none()
+                    .px(px(6.0))
+                    .py(px(2.0))
+                    .rounded(px(Radius::CHIP))
+                    .bg(Palette::CLAY.alpha(0.14))
+                    .border_1()
+                    .border_color(Palette::CLAY.alpha(0.55))
+                    .text_size(px(Typo::META.size - 1.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(Palette::CLAY)
+                    .child("PEEK"),
+            )
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .flex_1()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_size(px(Typo::TITLE.size))
+                    .font_weight(Typo::TITLE.weight)
+                    .text_color(colors.primary)
+                    .child(session.title.clone()),
+            )
+            .when_some(branch, |header, branch| {
+                header.child(
+                    div()
+                        .max_w(px(160.0))
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .text_size(px(Typo::META.size))
+                        .text_color(colors.tertiary)
+                        .child(branch),
+                )
+            })
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(Metrics::TOOLBAR_ITEM_GAP))
+                    .when_some(glyph, |identity, glyph| identity.child(glyph))
+                    .child(
+                        div()
+                            .text_size(px(Typo::META.size))
+                            .text_color(colors.tertiary)
+                            .child("Release to return · Enter to switch"),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_peek_surface(
+        &self,
+        session: &SessionRecord,
+        theme: TermTheme,
+        font_size: f32,
+        colors: SemanticColors,
+    ) -> AnyElement {
+        let element = self
+            .peek
+            .as_ref()
+            .filter(|peek| peek.id == session.id)
+            .and_then(|peek| peek.element.clone());
+        let content = element.map_or_else(
+            || {
+                let message = if session.hibernation.is_some() {
+                    "Hibernated · showing the best available session state"
+                } else if session.is_archived() {
+                    "Archived · no resident terminal snapshot"
+                } else {
+                    "No resident terminal snapshot yet"
+                };
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(12.0))
+                    .bg(theme.background)
+                    .child(
+                        AgentLogo::new(ui_agent_kind(session.effective_kind()), 48.0, colors)
+                            .badged(false),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(Typo::ROW.size))
+                            .text_color(colors.secondary)
+                            .child(message),
+                    )
+                    .into_any_element()
+            },
+            |element| {
+                div()
+                    .size_full()
+                    .pt(px(2.0))
+                    .pb(px(10.0))
+                    .px(px(12.0))
+                    .bg(theme.background)
+                    .child(element.theme(theme).font_size(px(font_size)).focused(false))
+                    .into_any_element()
+            },
+        );
+        div()
+            .debug_selector(|| "TERMINAL_PEEK_SURFACE".into())
+            .relative()
+            .min_h(px(0.0))
+            .flex_1()
+            .overflow_hidden()
+            .rounded_tl(px(Radius::CARD))
+            .rounded_tr(px(Radius::CARD))
+            .border_l_2()
+            .border_color(Palette::CLAY.alpha(0.72))
+            .bg(theme.background)
+            .occlude()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .child(content)
             .into_any_element()
     }
 
@@ -2746,57 +2983,75 @@ impl Render for TerminalPane {
         self.sync_status_glyphs(colors, window, cx);
         self.update_selected_geometry(window, cx);
 
-        let selected = self.selected_session();
+        let selected = self.visible_session();
 
         let content = if let Some(session) = selected {
-            let chips = PaneChip::for_session(&session);
-            let visible_chip_count = toolbar_visible_chip_count(
-                &chips,
-                self.viewport.map_or(900.0, |viewport| viewport.width),
-                self.sidebar_visible,
-            );
-            if visible_chip_count >= chips.len() {
-                self.overflow_open = false;
-            }
-            let mut pane = div()
-                .relative()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .h_full()
-                .overflow_hidden()
-                .border_l_1()
-                .border_color(sidebar_colors.primary.alpha(0.08))
-                .bg(sidebar_colors.sidebar_surface())
-                .child(self.render_header(
-                    &session,
+            if self.is_peeking() {
+                div()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .h_full()
+                    .overflow_hidden()
+                    .border_l_1()
+                    .border_color(sidebar_colors.primary.alpha(0.08))
+                    .bg(sidebar_colors.sidebar_surface())
+                    .child(self.render_peek_header(&session, sidebar_colors))
+                    .child(self.render_peek_surface(&session, theme, font_size, colors))
+                    .into_any_element()
+            } else {
+                let chips = PaneChip::for_session(&session);
+                let visible_chip_count = toolbar_visible_chip_count(
                     &chips,
-                    visible_chip_count,
-                    sidebar_colors,
-                    cx,
-                ));
-            let terminal_surface = div()
-                .relative()
-                .min_h(px(0.0))
-                .flex_1()
-                .flex()
-                .flex_col()
-                .rounded_tl(px(Radius::CARD))
-                .rounded_tr(px(Radius::CARD))
-                .overflow_hidden()
-                .bg(theme.background)
-                .child(self.render_grid_and_overlays(&session, theme, font_size, window, cx));
-            pane = pane.child(terminal_surface);
-            if let Some(find) = self.render_find_bar(&session, colors, cx) {
-                pane = pane.child(find);
+                    self.viewport.map_or(900.0, |viewport| viewport.width),
+                    self.sidebar_visible,
+                );
+                if visible_chip_count >= chips.len() {
+                    self.overflow_open = false;
+                }
+                let mut pane = div()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .h_full()
+                    .overflow_hidden()
+                    .border_l_1()
+                    .border_color(sidebar_colors.primary.alpha(0.08))
+                    .bg(sidebar_colors.sidebar_surface())
+                    .child(self.render_header(
+                        &session,
+                        &chips,
+                        visible_chip_count,
+                        sidebar_colors,
+                        cx,
+                    ));
+                let terminal_surface = div()
+                    .relative()
+                    .min_h(px(0.0))
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .rounded_tl(px(Radius::CARD))
+                    .rounded_tr(px(Radius::CARD))
+                    .overflow_hidden()
+                    .bg(theme.background)
+                    .child(self.render_grid_and_overlays(&session, theme, font_size, window, cx));
+                pane = pane.child(terminal_surface);
+                if let Some(find) = self.render_find_bar(&session, colors, cx) {
+                    pane = pane.child(find);
+                }
+                if let Some(popover) = self.render_checks_popover(&session, colors, cx) {
+                    pane = pane.child(popover);
+                }
+                if let Some(overflow) =
+                    self.render_overflow(&session, visible_chip_count, colors, cx)
+                {
+                    pane = pane.child(overflow);
+                }
+                pane.into_any_element()
             }
-            if let Some(popover) = self.render_checks_popover(&session, colors, cx) {
-                pane = pane.child(popover);
-            }
-            if let Some(overflow) = self.render_overflow(&session, visible_chip_count, colors, cx) {
-                pane = pane.child(overflow);
-            }
-            pane.into_any_element()
         } else {
             let show_sidebar = matches!(self.session_source, SessionSource::FollowSelection)
                 && !self.sidebar_visible;
@@ -3367,7 +3622,8 @@ fn exit_description(session: &SessionRecord) -> String {
 mod tests {
     use diri_proto::grid::{ChangedRow, GridCell};
     use diri_proto::{
-        DateMillis, ExitInfo, NeedsInputDetail, NeedsInputKind, NeedsInputSource, SessionListResult,
+        DateMillis, ExitInfo, HibernationInfo, HibernationReason, NeedsInputDetail, NeedsInputKind,
+        NeedsInputSource, SessionListResult,
     };
     use gpui::{Image, ImageFormat, KeyDownEvent, Keystroke, Modifiers, TestAppContext, point};
 
@@ -3755,6 +4011,105 @@ mod tests {
         assert!(
             cx.debug_bounds("show-sidebar").is_some(),
             "collapsing the sidebar must leave a way to reveal it"
+        );
+    }
+
+    #[gpui::test]
+    fn peek_is_read_only_preserves_focus_and_does_not_wake_a_nonresident_session(
+        cx: &mut TestAppContext,
+    ) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let active = fixture_session();
+        let mut sleeping = fixture_session();
+        sleeping.id = SessionId::new("sleeping-peek");
+        sleeping.title = "Sleeping preview".to_owned();
+        sleeping.hibernation = Some(HibernationInfo {
+            since: DateMillis(1.0),
+            reason: HibernationReason::Idle,
+            tree_pids: vec![42],
+            tree_start_times: None,
+        });
+        let attention_before = sleeping.attention();
+        {
+            let mut store = runtime.store.write().expect("session store lock poisoned");
+            store.upsert_session(active.clone());
+            store.upsert_session(sleeping.clone());
+            store.select(active.id.clone());
+        }
+
+        let runtime_for_view = Arc::clone(&runtime);
+        let (pane, cx) = cx.add_window_view(move |window, cx| {
+            TerminalPane::new(runtime_for_view, tokio, window, cx)
+        });
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let active_offset = pane.update_in(cx, |pane, window, cx| {
+            pane.focus(window, cx);
+            let active_offset = pane.residents[&active.id].element.view_offset();
+            let pane_tx = pane.pane_tx.clone();
+            pane.residents
+                .get_mut(&active.id)
+                .expect("active resident")
+                .attachment = AttachmentControl {
+                tx: input_tx,
+                pane_tx,
+            };
+
+            pane.set_peeked_session(Some(sleeping.id.clone()), cx);
+            assert!(pane.is_peeking());
+            assert!(pane.is_focused(window));
+            assert_eq!(pane.visible_id(), Some(sleeping.id.clone()));
+            assert!(!pane.residents.contains_key(&sleeping.id));
+            assert!(
+                pane.peek
+                    .as_ref()
+                    .is_some_and(|peek| peek.element.is_none())
+            );
+            active_offset
+        });
+        assert!(
+            cx.debug_bounds("TERMINAL_PEEK_SURFACE").is_some(),
+            "a hibernated session without a grid still paints its metadata fallback"
+        );
+
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_key_down(
+                &KeyDownEvent {
+                    keystroke: Keystroke::parse("x").expect("keystroke"),
+                    is_held: false,
+                    prefer_character_input: false,
+                },
+                window,
+                cx,
+            );
+            assert!(
+                input_rx.try_recv().is_err(),
+                "peek must deliver no PTY input"
+            );
+
+            pane.set_peeked_session(None, cx);
+            assert!(pane.is_focused(window));
+            assert_eq!(
+                pane.residents[&active.id].element.view_offset(),
+                active_offset
+            );
+        });
+        let store = runtime.store.read().expect("session store lock poisoned");
+        assert_eq!(store.selected_session_id(), Some(&active.id));
+        assert_eq!(store.sessions()[&sleeping.id].attention(), attention_before);
+        assert!(store.sessions()[&sleeping.id].hibernation.is_some());
+        assert_eq!(
+            store
+                .terminal_residency()
+                .resident()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![active.id]
         );
     }
 

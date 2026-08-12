@@ -15,6 +15,21 @@ pub enum CursorMove {
     End,
 }
 
+/// The gesture currently borrowing the main pane for a transient session
+/// preview. Keeping this in sidebar-only state is deliberate: a peek must
+/// never masquerade as the Store's durable selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeekSource {
+    Pointer,
+    Keyboard,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionPeek {
+    pub id: SessionId,
+    pub source: PeekSource,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DragItem {
     Project(ProjectId),
@@ -75,6 +90,17 @@ pub struct SidebarUiState {
     /// previous row at the end) if that session disappears.
     pub focus_cursor: Option<SessionId>,
     focus_order: Vec<SessionId>,
+    /// Transient presentation identity. `SessionStore::selected_session_id`
+    /// remains the sole active identity while this is set.
+    pub peek: Option<SessionPeek>,
+    /// A Space key-down may repeat; only the matching key-up ends the peek.
+    pub space_held: bool,
+    /// A completed pointer hold produces a platform click after mouse-up. The
+    /// click belongs to the release gesture and must not commit the preview.
+    pub suppress_pointer_click: bool,
+    /// Drag-and-drop dispatch may follow capture-phase mouse-up. Remember
+    /// that this gesture was a peek so its release cannot reorder sessions.
+    pub suppress_pointer_drop: bool,
 }
 
 impl SidebarUiState {
@@ -96,7 +122,37 @@ impl SidebarUiState {
             preview_account: false,
             focus_cursor: None,
             focus_order: Vec::new(),
+            peek: None,
+            space_held: false,
+            suppress_pointer_click: false,
+            suppress_pointer_drop: false,
         }
+    }
+
+    pub fn begin_peek(&mut self, id: SessionId, source: PeekSource) -> bool {
+        let next = SessionPeek { id, source };
+        let changed = self.peek.as_ref() != Some(&next);
+        self.peek = Some(next);
+        changed
+    }
+
+    pub fn follow_peek(&mut self, id: SessionId, source: PeekSource) -> bool {
+        if self.peek.as_ref().is_none_or(|peek| peek.source != source) {
+            return false;
+        }
+        self.begin_peek(id, source)
+    }
+
+    pub fn end_peek(&mut self, source: Option<PeekSource>) -> bool {
+        if source.is_some_and(|source| self.peek.as_ref().is_none_or(|peek| peek.source != source))
+        {
+            return false;
+        }
+        self.peek.take().is_some()
+    }
+
+    pub fn take_peek(&mut self) -> Option<SessionPeek> {
+        self.peek.take()
     }
 
     /// Reconciles the identity cursor with the rows the sidebar is actually
@@ -257,6 +313,37 @@ mod tests {
         assert_eq!(state.focus_cursor, Some(rows[2].clone()));
         assert!(state.move_focus_cursor(CursorMove::Home, &rows));
         assert_eq!(state.focus_cursor, Some(rows[0].clone()));
+    }
+
+    #[test]
+    fn peek_follows_by_identity_and_release_restores_no_selection_state() {
+        let one = SessionId::new("one");
+        let two = SessionId::new("two");
+        let mut state = SidebarUiState::new(DEFAULT_SIDEBAR_WIDTH);
+
+        assert!(state.begin_peek(one.clone(), PeekSource::Pointer));
+        assert!(state.follow_peek(two.clone(), PeekSource::Pointer));
+        assert_eq!(
+            state.peek,
+            Some(SessionPeek {
+                id: two,
+                source: PeekSource::Pointer,
+            })
+        );
+        assert!(state.end_peek(Some(PeekSource::Pointer)));
+        assert!(state.peek.is_none());
+    }
+
+    #[test]
+    fn one_gesture_cannot_release_another_gestures_peek() {
+        let mut state = SidebarUiState::new(DEFAULT_SIDEBAR_WIDTH);
+        state.begin_peek(SessionId::new("one"), PeekSource::Keyboard);
+
+        assert!(!state.end_peek(Some(PeekSource::Pointer)));
+        assert_eq!(
+            state.peek.as_ref().map(|peek| peek.source),
+            Some(PeekSource::Keyboard)
+        );
     }
 
     #[test]

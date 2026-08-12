@@ -257,6 +257,13 @@ impl RootView {
                     launcher.update(cx, |launcher, cx| launcher.focus(window, cx));
                 });
             }
+            if let SidebarEvent::PeekChanged(id) = event
+                && let Some(terminal) = &this.terminal
+            {
+                terminal.update(cx, |terminal, cx| {
+                    terminal.set_peeked_session(id.clone(), cx);
+                });
+            }
             if matches!(event, SidebarEvent::SessionActivated) {
                 if this.launcher.read(cx).is_open() {
                     this.launcher
@@ -641,10 +648,38 @@ impl RootView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let sidebar_focused = self.sidebar.read(cx).is_focused(_window);
+        let peek_in_flight = self.sidebar.read(cx).has_peek_in_flight();
+        // A pointer peek leaves the terminal's focus exactly where it was, so
+        // Root capture is the only safe place to keep typed input out of the
+        // preview. Escape also cancels the delayed pre-peek window.
+        if !sidebar_focused && peek_in_flight {
+            match event.keystroke.key.as_str() {
+                "escape" => {
+                    self.sidebar.update(cx, |sidebar, cx| {
+                        sidebar.cancel_peek(cx);
+                    });
+                    cx.stop_propagation();
+                    return;
+                }
+                "enter" if self.sidebar.read(cx).is_peeking() => {
+                    self.sidebar.update(cx, |sidebar, cx| {
+                        sidebar.commit_peek(cx);
+                    });
+                    cx.stop_propagation();
+                    return;
+                }
+                _ if self.sidebar.read(cx).is_peeking() => {
+                    cx.stop_propagation();
+                    return;
+                }
+                _ => {}
+            }
+        }
         // The sidebar is a real keyboard surface. Let its bubble handler own
         // navigation and rename input instead of mirroring the same keystroke
         // into the live terminal during root capture.
-        if self.sidebar.read(cx).is_focused(_window) {
+        if sidebar_focused {
             return;
         }
         if self.launcher.read(cx).is_open() {
@@ -1082,6 +1117,10 @@ impl RootView {
     }
 
     fn on_key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.sidebar.read(cx).is_focused(window) && self.sidebar.read(cx).is_peeking() {
+            cx.stop_propagation();
+            return;
+        }
         if let Some(surfaces) = &self.session_surfaces {
             surfaces.update(cx, |surfaces, cx| {
                 surfaces.handle_key_up(event, window, cx);
@@ -1095,6 +1134,10 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.sidebar.read(cx).is_focused(window) && self.sidebar.read(cx).is_peeking() {
+            cx.stop_propagation();
+            return;
+        }
         if let Some(surfaces) = &self.session_surfaces {
             surfaces.update(cx, |surfaces, cx| {
                 surfaces.handle_modifiers_changed(event, window, cx);
@@ -1487,10 +1530,15 @@ impl RootView {
             .expect("session store lock poisoned")
             .selected_session_id()
             .cloned();
-        let split_open = self.auxiliary_terminal.is_some()
-            || selected
-                .as_ref()
-                .is_some_and(|id| self.auxiliary_spawn_parent.as_ref() == Some(id));
+        let peeking = self
+            .terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.read(cx).is_peeking());
+        let split_open = !peeking
+            && (self.auxiliary_terminal.is_some()
+                || selected
+                    .as_ref()
+                    .is_some_and(|id| self.auxiliary_spawn_parent.as_ref() == Some(id)));
         let mut card = div()
             .relative()
             .flex_1()
