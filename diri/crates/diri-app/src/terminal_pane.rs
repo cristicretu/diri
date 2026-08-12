@@ -360,29 +360,87 @@ enum PointerOwner {
     Ignored,
 }
 
+#[derive(Debug)]
+struct PendingMouseMotion {
+    cell: (u16, u16),
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum MotionDispatch {
+    SendNow(Vec<u8>),
+    Schedule { delay: Duration, generation: u64 },
+    None,
+}
+
 #[derive(Default)]
 struct MouseMotionLimiter {
     last_sent_at: Option<Instant>,
     last_cell: Option<(u16, u16)>,
+    pending: Option<PendingMouseMotion>,
+    timer_generation: u64,
+    timer_armed: bool,
 }
 
 impl MouseMotionLimiter {
     fn reset(&mut self) {
         self.last_sent_at = None;
         self.last_cell = None;
+        self.cancel_pending();
     }
 
-    fn should_send(&mut self, now: Instant, cell: (u16, u16)) -> bool {
-        if self.last_cell == Some(cell)
-            || self
-                .last_sent_at
-                .is_some_and(|sent| now.duration_since(sent) < MOUSE_MOTION_CADENCE)
-        {
-            return false;
+    fn push(&mut self, now: Instant, cell: (u16, u16), bytes: Vec<u8>) -> MotionDispatch {
+        if self.last_cell == Some(cell) {
+            // A pending intermediate cell is obsolete if the pointer returned
+            // to the last position the child already observed.
+            self.cancel_pending();
+            return MotionDispatch::None;
         }
+        let Some(elapsed) = self.last_sent_at.map(|sent| now.duration_since(sent)) else {
+            self.last_sent_at = Some(now);
+            self.last_cell = Some(cell);
+            return MotionDispatch::SendNow(bytes);
+        };
+        if elapsed >= MOUSE_MOTION_CADENCE {
+            self.cancel_pending();
+            self.last_sent_at = Some(now);
+            self.last_cell = Some(cell);
+            return MotionDispatch::SendNow(bytes);
+        }
+        self.pending = Some(PendingMouseMotion { cell, bytes });
+        if self.timer_armed {
+            return MotionDispatch::None;
+        }
+        self.timer_armed = true;
+        self.timer_generation = self.timer_generation.wrapping_add(1);
+        MotionDispatch::Schedule {
+            delay: MOUSE_MOTION_CADENCE - elapsed,
+            generation: self.timer_generation,
+        }
+    }
+
+    fn flush(&mut self, generation: u64, now: Instant) -> Option<Vec<u8>> {
+        if !self.timer_armed || generation != self.timer_generation {
+            return None;
+        }
+        self.timer_armed = false;
+        let pending = self.pending.take()?;
         self.last_sent_at = Some(now);
-        self.last_cell = Some(cell);
-        true
+        self.last_cell = Some(pending.cell);
+        Some(pending.bytes)
+    }
+
+    /// Drains the latest held motion before a release, preserving PTY order.
+    fn take_pending(&mut self) -> Option<Vec<u8>> {
+        let pending = self.pending.take().map(|pending| pending.bytes);
+        self.reset();
+        pending
+    }
+
+    fn cancel_pending(&mut self) {
+        self.pending = None;
+        self.timer_armed = false;
+        self.timer_generation = self.timer_generation.wrapping_add(1);
     }
 }
 
@@ -886,6 +944,12 @@ impl TerminalPane {
         self.observed_selected_id = selected_id.clone();
 
         self.reconcile_residency();
+        if selection_changed {
+            for resident in self.residents.values_mut() {
+                resident.pointer_owner = None;
+                resident.mouse_motion.reset();
+            }
+        }
         self.sync_status_glyphs(self.current_colors(), window, cx);
 
         // Explicit sidebar clicks already focus through SessionActivated, but
@@ -1003,6 +1067,10 @@ impl TerminalPane {
         match event {
             PaneEvent::AttachmentState(id, state) => {
                 if let Some(resident) = self.residents.get_mut(&id) {
+                    if resident.attachment_state != state {
+                        resident.pointer_owner = None;
+                        resident.mouse_motion.reset();
+                    }
                     resident.attachment_state = state;
                 }
                 if self.selected_id().as_ref() == Some(&id) {
@@ -1038,6 +1106,10 @@ impl TerminalPane {
                 TerminalChunk::Modes { alt_screen, mouse },
             ) => {
                 if let Some(resident) = self.residents.get_mut(&id) {
+                    if resident.element.mouse_modes() != mouse {
+                        resident.pointer_owner = None;
+                        resident.mouse_motion.reset();
+                    }
                     resident.element.set_modes(alt_screen, mouse);
                 }
                 if self.selected_id().as_ref() == Some(&id) {
@@ -1483,7 +1555,13 @@ impl TerminalPane {
             .map(|(_, owner)| owner);
         resident.pointer_owner = None;
         if owner != Some(PointerOwner::Terminal) {
+            resident.mouse_motion.reset();
             return;
+        }
+        if let Some(bytes) = resident.mouse_motion.take_pending() {
+            // A cadence-held drag must precede its release. Letting the timer
+            // fire afterward would resurrect a button that is already up.
+            resident.attachment.mouse(bytes);
         }
         let Some(button) = terminal_mouse_button(event.button) else {
             return;
@@ -1512,47 +1590,83 @@ impl TerminalPane {
         let Some((col, row)) = self.grid_cell_at(event.position, window) else {
             return;
         };
-        let Some(resident) = self.residents.get_mut(&id) else {
-            return;
+        let (dispatch, attachment) = {
+            let Some(resident) = self.residents.get_mut(&id) else {
+                return;
+            };
+            let owner = event.pressed_button.and_then(|button| {
+                resident
+                    .pointer_owner
+                    .filter(|(owned, _)| *owned == button)
+                    .map(|(_, owner)| owner)
+            });
+            if owner == Some(PointerOwner::LocalSelection) {
+                resident.element.drag_selection(col, row);
+                cx.notify();
+                return;
+            }
+            if event.pressed_button.is_some() && owner != Some(PointerOwner::Terminal) {
+                return;
+            }
+            let button = match event.pressed_button {
+                Some(button) => terminal_mouse_button(button).map(Some),
+                None => Some(None),
+            };
+            let Some(button) = button else {
+                return;
+            };
+            let Some(bytes) = encode_mouse_event(
+                resident.element.mouse_modes(),
+                TerminalMouseEvent::Motion(button),
+                terminal_mouse_modifiers(&event.modifiers),
+                col as u16,
+                row as u16,
+            ) else {
+                return;
+            };
+            (
+                resident
+                    .mouse_motion
+                    .push(Instant::now(), (col as u16, row as u16), bytes),
+                resident.attachment.clone(),
+            )
         };
-        let owner = event.pressed_button.and_then(|button| {
-            resident
-                .pointer_owner
-                .filter(|(owned, _)| *owned == button)
-                .map(|(_, owner)| owner)
-        });
-        if owner == Some(PointerOwner::LocalSelection) {
-            resident.element.drag_selection(col, row);
-            cx.notify();
-            return;
+        match dispatch {
+            MotionDispatch::SendNow(bytes) => attachment.mouse(bytes),
+            MotionDispatch::Schedule { delay, generation } => {
+                self.schedule_mouse_motion_flush(id, delay, generation, cx);
+            }
+            MotionDispatch::None => return,
         }
-        if event.pressed_button.is_some() && owner != Some(PointerOwner::Terminal) {
-            return;
-        }
-        let button = match event.pressed_button {
-            Some(button) => terminal_mouse_button(button).map(Some),
-            None => Some(None),
-        };
-        let Some(button) = button else {
-            return;
-        };
-        let Some(bytes) = encode_mouse_event(
-            resident.element.mouse_modes(),
-            TerminalMouseEvent::Motion(button),
-            terminal_mouse_modifiers(&event.modifiers),
-            col as u16,
-            row as u16,
-        ) else {
-            return;
-        };
-        if !resident
-            .mouse_motion
-            .should_send(Instant::now(), (col as u16, row as u16))
-        {
-            return;
-        }
-        resident.attachment.mouse(bytes);
         cx.stop_propagation();
+    }
+
+    fn schedule_mouse_motion_flush(
+        &mut self,
+        id: SessionId,
+        delay: Duration,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let timer = cx.background_executor().timer(delay);
+        cx.spawn(async move |this, cx| {
+            timer.await;
+            let _ = this.update(cx, |this, _cx| {
+                if this.selected_id().as_ref() != Some(&id) {
+                    if let Some(resident) = this.residents.get_mut(&id) {
+                        resident.mouse_motion.reset();
+                    }
+                    return;
+                }
+                let Some(resident) = this.residents.get_mut(&id) else {
+                    return;
+                };
+                if let Some(bytes) = resident.mouse_motion.flush(generation, Instant::now()) {
+                    resident.attachment.mouse(bytes);
+                }
+            });
+        })
+        .detach();
     }
 
     /// The height the mirrored grid needs when the daemon's screen is taller
@@ -3069,7 +3183,8 @@ fn pointer_owner(
             PointerOwner::Ignored
         };
     }
-    if mouse.is_reporting() && terminal_mouse_button(button).is_some() {
+    if mouse.is_reporting() && mouse.has_known_details() && terminal_mouse_button(button).is_some()
+    {
         PointerOwner::Terminal
     } else if button == MouseButton::Left {
         PointerOwner::LocalSelection
@@ -3747,6 +3862,11 @@ mod tests {
             PointerOwner::Ignored,
             "no Command-modified button is forwarded"
         );
+        assert_eq!(
+            pointer_owner(MouseModes::UNKNOWN, MouseButton::Left, &plain),
+            PointerOwner::LocalSelection,
+            "an old remote Holder must not receive a guessed click encoding"
+        );
     }
 
     #[test]
@@ -3795,18 +3915,67 @@ mod tests {
     }
 
     #[test]
-    fn unrestricted_motion_is_rate_limited_and_cell_deduplicated() {
+    fn unrestricted_motion_coalesces_to_the_latest_cell_at_the_trailing_edge() {
         let started = Instant::now();
         let mut limiter = MouseMotionLimiter::default();
-        assert!(
-            limiter.should_send(started, (1, 1)),
-            "first motion is immediate"
+        assert_eq!(
+            limiter.push(started, (1, 1), b"one".to_vec()),
+            MotionDispatch::SendNow(b"one".to_vec())
         );
-        assert!(!limiter.should_send(started + Duration::from_millis(1), (2, 1)));
-        assert!(!limiter.should_send(started + MOUSE_MOTION_CADENCE, (1, 1)));
-        assert!(limiter.should_send(started + MOUSE_MOTION_CADENCE, (2, 1)));
-        limiter.reset();
-        assert!(limiter.should_send(started + Duration::from_secs(1), (2, 1)));
+        let MotionDispatch::Schedule { generation, .. } =
+            limiter.push(started + Duration::from_millis(1), (2, 1), b"two".to_vec())
+        else {
+            panic!("second cell should arm the trailing edge");
+        };
+        assert_eq!(
+            limiter.push(
+                started + Duration::from_millis(2),
+                (3, 1),
+                b"three".to_vec(),
+            ),
+            MotionDispatch::None,
+            "the armed timer folds newer cells"
+        );
+        assert_eq!(
+            limiter.flush(generation, started + MOUSE_MOTION_CADENCE),
+            Some(b"three".to_vec()),
+            "the destination is not dropped when pointer events stop"
+        );
+        assert_eq!(limiter.flush(generation, started), None);
+        assert_eq!(
+            limiter.push(
+                started + MOUSE_MOTION_CADENCE,
+                (3, 1),
+                b"duplicate".to_vec(),
+            ),
+            MotionDispatch::None
+        );
+    }
+
+    #[test]
+    fn a_pending_drag_is_drained_before_release_and_its_timer_is_cancelled() {
+        let started = Instant::now();
+        let mut limiter = MouseMotionLimiter::default();
+        assert!(matches!(
+            limiter.push(started, (1, 1), b"first".to_vec()),
+            MotionDispatch::SendNow(_)
+        ));
+        let MotionDispatch::Schedule { generation, .. } = limiter.push(
+            started + Duration::from_millis(1),
+            (2, 1),
+            b"pending-before-release".to_vec(),
+        ) else {
+            panic!("pending motion");
+        };
+        assert_eq!(
+            limiter.take_pending(),
+            Some(b"pending-before-release".to_vec())
+        );
+        assert_eq!(
+            limiter.flush(generation, started + MOUSE_MOTION_CADENCE),
+            None,
+            "no motion may be emitted after the release"
+        );
     }
 
     #[test]

@@ -1327,7 +1327,7 @@ mod tests {
     }
 
     #[test]
-    fn full_snapshot_decodes_the_historical_mouse_boolean() {
+    fn full_snapshot_keeps_pre_1_4_mouse_details_unknown() {
         let message = RemoteMessage::FullSnapshot(snapshot());
         let mut encoded = RemoteCodec::encode(&message).expect("encode");
         // Header (5), sequence (8), then the historical flags byte. Strip
@@ -1337,13 +1337,24 @@ mod tests {
         let RemoteMessage::FullSnapshot(decoded) = &decoded[0] else {
             panic!("snapshot");
         };
-        assert_eq!(
-            decoded.mouse,
-            MouseModes::new(
-                crate::terminal::MouseTrackingMode::ButtonEvents,
-                crate::terminal::MouseEncoding::Sgr,
-            )
-        );
+        assert_eq!(decoded.mouse, MouseModes::UNKNOWN);
+    }
+
+    #[test]
+    fn each_pre_1_4_mouse_regime_decodes_without_a_false_guess() {
+        // Protocol 1.3 represented all of these states with the same bit. A
+        // new peer must therefore preserve that ambiguity instead of choosing
+        // a tracking mode or coordinate encoding that may be wrong.
+        for legacy_state in ["1000-legacy", "1002-sgr", "1003-legacy"] {
+            let message = RemoteMessage::FullSnapshot(snapshot());
+            let mut encoded = RemoteCodec::encode(&message).expect("encode");
+            encoded[13] = 0b100;
+            let decoded = RemoteCodec::new().feed(&encoded).expect("decode");
+            let RemoteMessage::FullSnapshot(decoded) = &decoded[0] else {
+                panic!("snapshot");
+            };
+            assert_eq!(decoded.mouse, MouseModes::UNKNOWN, "{legacy_state}");
+        }
     }
 
     #[test]

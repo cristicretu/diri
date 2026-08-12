@@ -1255,6 +1255,14 @@ impl Session {
     /// asked for mouse reporting, otherwise ignored (the client scrolls its
     /// own scrollback).
     pub fn scroll(&self, up: bool, lines: usize, col: usize, row: usize) -> std::io::Result<()> {
+        if let Transport::Remote(client) = &self.transport {
+            return client.scroll(
+                u8::from(!up),
+                u16::try_from(lines).unwrap_or(u16::MAX),
+                u16::try_from(col).unwrap_or(u16::MAX),
+                u16::try_from(row).unwrap_or(u16::MAX),
+            );
+        }
         let bytes = self
             .shared
             .screen

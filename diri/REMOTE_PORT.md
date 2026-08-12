@@ -420,7 +420,10 @@ updates. A snapshot contains only the visible grid, cursor, modes, dimensions,
 and sequence. Mouse state preserves the selected tracking regime (off, DECSET
 1000, 1002, or 1003) independently from legacy/SGR coordinate encoding. The
 wire mode byte retains its historical any-mouse bit and uses previously unused
-bits for those details. Scrollback is bounded to 4 MiB and served on demand
+bits for those details. A live protocol 1.3 Holder exposes only the historical
+bit, so the Engine preserves those details as unknown: it does not synthesize
+button or motion reports, while wheel intent remains encoded by that Holder's
+authoritative parser. Scrollback is bounded to 4 MiB and served on demand
 through `Scroll`. Raw output is bounded to 32 MiB.
 
 The PTY reader must never block on a client. The Holder uses bounded queues. It

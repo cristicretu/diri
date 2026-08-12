@@ -386,6 +386,7 @@ mod tests {
         for alt_screen in [false, true] {
             for mouse in [
                 MouseModes::OFF,
+                MouseModes::UNKNOWN,
                 MouseModes::new(
                     crate::terminal::MouseTrackingMode::Off,
                     crate::terminal::MouseEncoding::Sgr,
@@ -418,13 +419,7 @@ mod tests {
     fn modes_decode_the_historical_boolean_wire_format() {
         assert_eq!(
             Frame::new(FrameType::Modes, vec![0b11]).modes_payload(),
-            Some((
-                true,
-                MouseModes::new(
-                    crate::terminal::MouseTrackingMode::ButtonEvents,
-                    crate::terminal::MouseEncoding::Sgr,
-                )
-            ))
+            Some((true, MouseModes::UNKNOWN))
         );
     }
 

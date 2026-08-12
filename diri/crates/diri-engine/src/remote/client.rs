@@ -171,6 +171,31 @@ impl RemoteSessionClient {
         self.write_terminal(bytes, true)
     }
 
+    /// Routes wheel intent to the Holder that owns the authoritative parser.
+    /// This remains safe for protocol 1.3 sessions, whose mode byte did not
+    /// expose enough detail for the Engine to encode the report itself.
+    pub fn scroll(&self, direction: u8, lines: u16, col: u16, row: u16) -> io::Result<()> {
+        if lines == 0 {
+            return Ok(());
+        }
+        let mut writer = self.writer.lock().expect("remote writer");
+        if writer.controller_epoch.is_none() || writer.input.is_none() {
+            // Wheel/motion is ephemeral. Replaying it after a reconnect would
+            // target a screen that may already have changed.
+            return Ok(());
+        }
+        if write_message(
+            &mut writer,
+            &RemoteMessage::Terminal(Frame::scroll(direction, lines, col, row)),
+        )
+        .is_err()
+        {
+            terminate_current(&mut writer);
+            writer.controller_epoch = None;
+        }
+        Ok(())
+    }
+
     fn write_terminal(&self, bytes: &[u8], mouse: bool) -> io::Result<()> {
         if bytes.is_empty() {
             return Ok(());

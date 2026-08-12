@@ -19,6 +19,12 @@ pub enum MouseTrackingMode {
     ButtonMotion = 2,
     /// DECSET 1003: button events plus all pointer motion.
     AnyMotion = 3,
+    /// A pre-1.4 peer reported only that some mouse mode was active.
+    ///
+    /// This is deliberately not assigned a wire-detail value: guessing one
+    /// of 1000/1002/1003 would either drop requested motion or send motion a
+    /// program never requested.
+    Unknown = 4,
 }
 
 impl MouseTrackingMode {
@@ -40,6 +46,7 @@ impl MouseTrackingMode {
             Self::ButtonEvents => Some(1000),
             Self::ButtonMotion => Some(1002),
             Self::AnyMotion => Some(1003),
+            Self::Unknown => None,
         }
     }
 }
@@ -52,6 +59,8 @@ pub enum MouseEncoding {
     #[default]
     Legacy = 0,
     Sgr = 1,
+    /// A pre-1.4 peer did not expose whether DECSET 1006 was active.
+    Unknown = 2,
 }
 
 impl MouseEncoding {
@@ -79,6 +88,13 @@ impl MouseModes {
         encoding: MouseEncoding::Legacy,
     };
 
+    /// Some reporting mode is active, but a legacy peer did not preserve its
+    /// tracking granularity or coordinate encoding.
+    pub const UNKNOWN: Self = Self {
+        tracking: MouseTrackingMode::Unknown,
+        encoding: MouseEncoding::Unknown,
+    };
+
     #[must_use]
     pub const fn new(tracking: MouseTrackingMode, encoding: MouseEncoding) -> Self {
         Self { tracking, encoding }
@@ -89,23 +105,34 @@ impl MouseModes {
         !matches!(self.tracking, MouseTrackingMode::Off)
     }
 
+    /// Whether a desktop can safely synthesize button/motion reports.
+    #[must_use]
+    pub const fn has_known_details(self) -> bool {
+        !matches!(self.tracking, MouseTrackingMode::Unknown)
+            && !matches!(self.encoding, MouseEncoding::Unknown)
+    }
+
     /// Packs the granular fields without assigning their position in a wider
     /// protocol mode byte.
     #[must_use]
     pub const fn detail_bits(self) -> u8 {
-        (self.tracking as u8) | ((self.encoding as u8) << 2)
+        match (self.tracking, self.encoding) {
+            (MouseTrackingMode::Unknown, _) | (_, MouseEncoding::Unknown) => 0,
+            _ => (self.tracking as u8) | ((self.encoding as u8) << 2),
+        }
     }
 
-    /// Decodes detailed bits. A historical enabled-only bit maps to the mode
-    /// the old checkpoint restore path synthesized: DECSET 1000 + 1006.
+    /// Decodes additive wire details. An enabled-only legacy value remains
+    /// explicitly unknown: unlike the old checkpoint restore path, a live
+    /// peer may really be using any tracking mode and either encoding.
     #[must_use]
     pub const fn from_detail_bits(bits: u8, historical_enabled: bool) -> Self {
         let tracking = match MouseTrackingMode::from_wire(bits & 0b11) {
-            Some(MouseTrackingMode::Off) if historical_enabled => MouseTrackingMode::ButtonEvents,
+            Some(MouseTrackingMode::Off) if historical_enabled => return Self::UNKNOWN,
             Some(mode) => mode,
             None => MouseTrackingMode::Off,
         };
-        let encoding = if bits & 0b100 != 0 || (bits & 0b11 == 0 && historical_enabled) {
+        let encoding = if bits & 0b100 != 0 {
             MouseEncoding::Sgr
         } else {
             MouseEncoding::Legacy
@@ -186,6 +213,7 @@ pub fn encode_mouse_event(
 ) -> Option<Vec<u8>> {
     match (modes.tracking, event) {
         (MouseTrackingMode::Off, _) => return None,
+        (MouseTrackingMode::Unknown, _) => return None,
         (MouseTrackingMode::ButtonEvents, TerminalMouseEvent::Motion(_)) => return None,
         (MouseTrackingMode::ButtonMotion, TerminalMouseEvent::Motion(None)) => return None,
         _ => {}
@@ -223,6 +251,7 @@ pub fn encode_mouse_event(
                 33 + u8::try_from(row).expect("legacy coordinate checked"),
             ])
         }
+        MouseEncoding::Unknown => None,
     }
 }
 
@@ -352,10 +381,18 @@ mod tests {
     }
 
     #[test]
-    fn legacy_enabled_only_state_migrates_to_the_historical_restore_mode() {
-        assert_eq!(
-            MouseModes::from_detail_bits(0, true),
-            MouseModes::new(MouseTrackingMode::ButtonEvents, MouseEncoding::Sgr)
+    fn legacy_enabled_only_wire_state_keeps_its_details_unknown() {
+        assert_eq!(MouseModes::from_detail_bits(0, true), MouseModes::UNKNOWN);
+        assert!(
+            encode_mouse_event(
+                MouseModes::UNKNOWN,
+                TerminalMouseEvent::Press(TerminalMouseButton::Left),
+                TerminalMouseModifiers::default(),
+                0,
+                0,
+            )
+            .is_none(),
+            "unknown legacy modes must not be guessed for app-generated input"
         );
         assert_eq!(MouseModes::from_detail_bits(0, false), MouseModes::OFF);
     }

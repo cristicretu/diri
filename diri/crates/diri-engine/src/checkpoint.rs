@@ -73,7 +73,14 @@ impl ScreenCheckpoint {
             return None;
         }
         let mouse = if version == PREVIOUS_VERSION {
-            MouseModes::from_detail_bits(0, dict.get("mouseReporting")?.as_boolean()?)
+            if dict.get("mouseReporting")?.as_boolean()? {
+                // Version 2's restore implementation always synthesized this
+                // exact pair. This is checkpoint compatibility, not a claim
+                // about the unknowable details of an old live wire peer.
+                MouseModes::new(MouseTrackingMode::ButtonEvents, MouseEncoding::Sgr)
+            } else {
+                MouseModes::OFF
+            }
         } else {
             MouseModes::new(
                 MouseTrackingMode::from_wire(
