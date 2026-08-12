@@ -397,7 +397,7 @@ jobs:
           DIRI_DIST_DIR="${previous}" DIRI_VERSION=0.5.0 \
             DIRI_LINUX_FORMATS=deb diri/scripts/package-linux.sh
           old_deb="$(find "${previous}" -maxdepth 1 -name '*.deb' -print -quit)"
-          new_deb="$(find diri/dist/linux -maxdepth 1 -name '*.deb' -print -quit)"
+          new_deb="$(find "${PWD}/diri/dist/linux" -maxdepth 1 -name '*.deb' -print -quit)"
           sudo apt-get install --yes "${old_deb}"
           sudo apt-get install --yes "${new_deb}"
           test "$(dpkg-query -W -f='${Version}' diri)" = "$(jq -r .version diri/dist/linux/linux-release.json)"
@@ -442,8 +442,8 @@ jobs:
             mesa-vulkan-drivers xvfb
       - name: Install, launch, recover a session, and uninstall
         run: |
-          deb="$(find diri/dist/linux -maxdepth 1 -name '*.deb' -print -quit)"
-          appimage="$(find diri/dist/linux -maxdepth 1 -name '*.AppImage' -print -quit)"
+          deb="$(find "${PWD}/diri/dist/linux" -maxdepth 1 -name '*.deb' -print -quit)"
+          appimage="$(find "${PWD}/diri/dist/linux" -maxdepth 1 -name '*.AppImage' -print -quit)"
           sudo apt-get install --yes "${deb}"
           xvfb-run -a env -u WAYLAND_DISPLAY DIRI_UI_SMOKE_TEST=1 diri
           diri/scripts/smoke-installed-linux.sh
