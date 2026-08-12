@@ -272,7 +272,7 @@ fn cleanup_supervisor(nonce: &str) {
 fn cleanup_supervisor_label(label: &str) {
     #[cfg(target_os = "linux")]
     let _ = Command::new("systemctl")
-        .args(["--user", "stop", &label])
+        .args(["--user", "stop", label])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
