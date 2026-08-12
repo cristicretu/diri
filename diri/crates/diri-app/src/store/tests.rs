@@ -708,27 +708,22 @@ fn spawn_response_focuses_session_when_event_arrives_first() {
     assert!(store.terminal_residency().contains(&id("spawned")));
 }
 
+/// The menu-bar status item tints from this, so an archived blocker still
+/// colours the glyph even though its row is not in the list. Documented rather
+/// than fixed: the rollup carries one level, and dropping archived sessions
+/// here would also drop a live `DoneUnseen` sitting behind one.
 #[test]
-fn attention_rollup_badges_live_blockers_but_ranks_across_archived_too() {
-    let mut live = session("live", "p", 1.0);
-    live.status = SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Question);
-    let mut shelved = session("shelved", "p", 2.0);
+fn global_attention_ranks_across_archived_sessions_too() {
+    let mut shelved = session("shelved", "p", 1.0);
     shelved.status = SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Question);
     shelved.archived_at = Some(DateMillis(10.0));
-    let (store, _) = hydrated(
-        vec![live, shelved],
-        vec![project("p", "P")],
-        Prefs::default(),
-    );
+    let (store, _) = hydrated(vec![shelved], vec![project("p", "P")], Prefs::default());
 
-    // An archived session still carries NeedsInput, so it keeps the status-item
-    // glyph tinted — but it is not something the user can act on, so counting it
-    // in the badge would send them hunting for a row that is not in the list.
-    assert_eq!(store.attention_rollup(), (AttentionLevel::NeedsInput, 1));
+    assert_eq!(store.global_attention(), AttentionLevel::NeedsInput);
 }
 
 #[test]
-fn attention_rollup_and_needs_input_sort_use_proto_derivation() {
+fn attention_and_needs_input_sort_use_proto_derivation() {
     let mut done = session("done", "p", 1.0);
     done.last_turn_completed_at = Some(DateMillis(50.0));
     done.last_seen_at = Some(DateMillis(40.0));
@@ -745,13 +740,6 @@ fn attention_rollup_and_needs_input_sort_use_proto_derivation() {
     );
 
     assert_eq!(store.global_attention(), AttentionLevel::NeedsInput);
-    // The menu-bar badge counts live blockers only; the level still rolls up
-    // across everything, exactly as `global_attention` always has.
-    assert_eq!(
-        store.attention_rollup(),
-        (AttentionLevel::NeedsInput, 2),
-        "both blocked sessions are live, so both are badged"
-    );
     assert_eq!(
         store
             .needs_input_sessions()

@@ -1638,27 +1638,20 @@ impl SessionStore {
         self.apply_overview_outcome(outcome);
     }
 
+    /// The highest attention across every session. Cheap enough to run on every
+    /// publish, which is what a closed menu-bar panel refreshes from instead of
+    /// paying for a full sidebar projection.
     pub fn global_attention(&self) -> AttentionLevel {
-        self.attention_rollup().0
-    }
-
-    /// Everything the menu-bar status item needs, in one pass: the highest
-    /// attention anywhere, plus how many live sessions are actually blocked on
-    /// the user. A closed panel refreshes off this instead of paying for a full
-    /// sidebar projection on every publish.
-    pub fn attention_rollup(&self) -> (AttentionLevel, usize) {
-        let mut level = AttentionLevel::None;
-        let mut needs_you = 0usize;
-        for session in self.sessions.values() {
-            let attention = session.attention();
-            if attention_rank(&attention) > attention_rank(&level) {
-                level = attention;
-            }
-            if attention == AttentionLevel::NeedsInput && !session.is_archived() {
-                needs_you += 1;
-            }
-        }
-        (level, needs_you)
+        self.sessions
+            .values()
+            .fold(AttentionLevel::None, |rollup, session| {
+                let attention = session.attention();
+                if attention_rank(&attention) > attention_rank(&rollup) {
+                    attention
+                } else {
+                    rollup
+                }
+            })
     }
 
     pub fn needs_input_sessions(&self) -> Vec<SessionRecord> {

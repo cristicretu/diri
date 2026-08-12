@@ -103,8 +103,8 @@ pub struct NativeMenuBar {
     body: Retained<NSView>,
     target: Retained<MenuBarTarget>,
     last_fingerprint: Option<u64>,
-    /// Last (level, badge) pushed to the status item; see [`NativeMenuBar::set_attention`].
-    last_attention: Option<(AttentionLevel, usize)>,
+    /// Last level pushed to the status item; see [`NativeMenuBar::set_attention`].
+    last_attention: Option<AttentionLevel>,
 }
 
 impl Drop for NativeMenuBar {
@@ -200,11 +200,12 @@ impl NativeMenuBar {
             rect(ROW_INSET, 0.0, BRAND_HIT_WIDTH, 28.0),
             target.clone(),
         );
+        // One rasterization, shared by the status item and the panel header:
+        // same fixed vector at the same fixed size, only the tint differs.
+        let logo = brand_raster::template_diri_logo_ns_image(DIRI_LOGO_HEIGHT as f32);
         let header_icon = {
-            let view = if let Some(image) =
-                brand_raster::template_diri_logo_ns_image(DIRI_LOGO_HEIGHT as f32)
-            {
-                NSImageView::imageViewWithImage(&image, mtm)
+            let view = if let Some(image) = &logo {
+                NSImageView::imageViewWithImage(image, mtm)
             } else {
                 NSImageView::initWithFrame(
                     NSImageView::alloc(mtm),
@@ -313,9 +314,9 @@ impl NativeMenuBar {
             button.setTarget(Some(&*target as &AnyObject));
             button.setAction(Some(sel!(toggleDiriMenu:)));
         }
-        // Template mark once; attention only retints (same Ink map as row glyphs).
-        if let Some(image) = brand_raster::template_diri_logo_ns_image(DIRI_LOGO_HEIGHT as f32) {
-            button.setImage(Some(&image));
+        // Template mark set once; attention only retints (same Ink map as row glyphs).
+        if let Some(image) = &logo {
+            button.setImage(Some(image));
         }
         button.setTitle(&NSString::new());
         button.setImagePosition(NSCellImagePosition::ImageOnly);
@@ -339,7 +340,7 @@ impl NativeMenuBar {
             last_fingerprint: None,
             last_attention: None,
         };
-        menu_bar.set_attention(AttentionLevel::None, 0);
+        menu_bar.set_attention(AttentionLevel::None);
         Some(menu_bar)
     }
 
@@ -347,26 +348,26 @@ impl NativeMenuBar {
         // Closed panel: only the status-item tint. Building the inbox first
         // would put the most expensive work on the hottest path.
         if !self.panel.isVisible() {
-            let (attention, needs_you) = self
+            let attention = self
                 .store
                 .read()
                 .expect("session store lock poisoned")
-                .attention_rollup();
-            self.set_attention(attention, needs_you);
+                .global_attention();
+            self.set_attention(attention);
             self.last_fingerprint = None;
             return;
         }
 
         let collapsed = self.target.collapsed_projects();
-        let (model, selected, attention, needs_you) = {
+        let (model, selected, attention) = {
             let mut store = self.store.write().expect("session store lock poisoned");
             let projection = store.menu_bar_projection();
             let model = build_inbox(&projection, &collapsed);
             let selected = store.selected_session_id().cloned();
-            let (attention, needs_you) = store.attention_rollup();
-            (model, selected, attention, needs_you)
+            let attention = store.global_attention();
+            (model, selected, attention)
         };
-        self.apply_model(&model, selected.as_ref(), attention, needs_you);
+        self.apply_model(&model, selected.as_ref(), attention);
     }
 
     fn apply_model(
@@ -374,9 +375,8 @@ impl NativeMenuBar {
         model: &InboxModel,
         selected_session_id: Option<&SessionId>,
         attention: AttentionLevel,
-        needs_you: usize,
     ) {
-        self.set_attention(attention, needs_you);
+        self.set_attention(attention);
         let Some(mtm) = MainThreadMarker::new() else {
             return;
         };
@@ -391,14 +391,15 @@ impl NativeMenuBar {
         let body_height = content_height.min(MAX_BODY_HEIGHT);
         let height = HEADER_HEIGHT + body_height + FOOTER_HEIGHT;
 
-        let old_top_left = self.panel.isVisible().then(|| {
+        // Resizing grows the panel downward from its origin; pin the top-left so
+        // it stays hung off the status item as rows come and go. `refresh` only
+        // reaches here with the panel visible, so there is nothing to guard.
+        let old_top_left = {
             let frame = self.panel.frame();
             NSPoint::new(frame.origin.x, frame.origin.y + frame.size.height)
-        });
+        };
         self.panel.setContentSize(NSSize::new(POPUP_WIDTH, height));
-        if let Some(top_left) = old_top_left {
-            self.panel.setFrameTopLeftPoint(top_left);
-        }
+        self.panel.setFrameTopLeftPoint(old_top_left);
         self.surface.setFrame(rect(0.0, 0.0, POPUP_WIDTH, height));
 
         let header_y = FOOTER_HEIGHT + body_height;
@@ -446,26 +447,24 @@ impl NativeMenuBar {
 
     /// Retint the template status-item / header mark. Same Ink map as row
     /// [`glyph_tint`] / sidebar `StatusGlyph` — logo pixels stay fixed.
-    fn set_attention(&mut self, attention: AttentionLevel, needs_you: usize) {
-        if self.last_attention == Some((attention, needs_you)) {
+    fn set_attention(&mut self, attention: AttentionLevel) {
+        if self.last_attention == Some(attention) {
             return;
         }
-        self.last_attention.replace((attention, needs_you));
+        self.last_attention = Some(attention);
 
-        let tint = match (needs_you > 0, attention) {
-            (true, _) | (_, AttentionLevel::NeedsInput) => Some(rgba_ns(
+        let tint = match attention {
+            AttentionLevel::NeedsInput => Some(rgba_ns(
                 Ink::ATTENTION.r,
                 Ink::ATTENTION.g,
                 Ink::ATTENTION.b,
                 1.0,
             )),
-            (_, AttentionLevel::DoneUnseen) => {
+            AttentionLevel::DoneUnseen => {
                 Some(rgba_ns(Ink::FRESH.r, Ink::FRESH.g, Ink::FRESH.b, 1.0))
             }
-            (_, AttentionLevel::Working) => {
-                Some(NSColor::labelColor().colorWithAlphaComponent(0.82))
-            }
-            _ => None,
+            AttentionLevel::Working => Some(NSColor::labelColor().colorWithAlphaComponent(0.82)),
+            AttentionLevel::IdleSeen | AttentionLevel::None | AttentionLevel::Unknown => None,
         };
         self.button.setContentTintColor(tint.as_deref());
         self.header_icon
@@ -710,11 +709,10 @@ impl NativeMenuBar {
         let mut trailing_chip: Option<Retained<NSBox>> = None;
         if let Some(status) = trailing.as_ref() {
             // Idle position: flush right. On hover, set_hovered slides it left of ✕.
-            // Sidebar StateChip is `.py(Chip::PAD_Y)` on GPUI's META line box.
-            // AppKit has no line box, so size the pill to the same visual height
-            // (~17pt) and center the label with equal top/bottom air.
+            // `Chip::height()` is the painted height of the sidebar's StateChip,
+            // line box included, so this pill needs no fudge to match it.
             let font_size = f64::from(Chip::font_size());
-            let chip_h = f64::from(Chip::height()) + 4.0;
+            let chip_h = f64::from(Chip::height());
             let chip = NSBox::initWithFrame(
                 NSBox::alloc(mtm),
                 rect(
@@ -966,7 +964,7 @@ fn agent_mark_view(
     color: &NSColor,
     x: f64,
     mtm: MainThreadMarker,
-) -> Retained<NSImageView> {
+) -> Retained<NSView> {
     let y = (ROW_HEIGHT - GLYPH_SIZE) / 2.0;
     if let Some(kind) = agent_mark_kind(agent_id)
         && let Some(image) = brand_raster::template_ns_image(kind, GLYPH_SIZE as f32)
@@ -975,9 +973,11 @@ fn agent_mark_view(
         view.setFrame(rect(x, y, GLYPH_SIZE, GLYPH_SIZE));
         view.setImageAlignment(NSImageAlignment::AlignCenter);
         view.setContentTintColor(Some(color));
-        return view;
+        return Retained::into_super(Retained::into_super(view));
     }
-    // Shell / unknown: caret bar matching StatusGlyph::shell_caret.
+    // Shell / unknown: caret bar matching StatusGlyph::shell_caret. A plain
+    // NSView hosts it — an NSImageView here is an NSControl sitting in the glyph
+    // column with no image and no action.
     let caret = NSBox::initWithFrame(
         NSBox::alloc(mtm),
         rect(
@@ -991,8 +991,7 @@ fn agent_mark_view(
     caret.setBorderWidth(0.0);
     caret.setCornerRadius(1.0);
     caret.setFillColor(color);
-    let host =
-        NSImageView::initWithFrame(NSImageView::alloc(mtm), rect(x, y, GLYPH_SIZE, GLYPH_SIZE));
+    let host = NSView::initWithFrame(NSView::alloc(mtm), rect(x, y, GLYPH_SIZE, GLYPH_SIZE));
     host.addSubview(&caret);
     host
 }
@@ -1697,35 +1696,10 @@ define_class!(
             self.show_main_window();
         }
 
-        #[unsafe(method(selectSession:))]
-        fn select_session(&self, sender: Option<&AnyObject>) {
-            if let Some(tag) = sender
-                .and_then(|sender| sender.downcast_ref::<NSButton>())
-                .map(|button| button.tag())
-            {
-                self.select_session_tag(tag);
-            }
-        }
-
-        #[unsafe(method(closeSession:))]
-        fn close_session(&self, sender: Option<&AnyObject>) {
-            if let Some(tag) = sender
-                .and_then(|sender| sender.downcast_ref::<NSButton>())
-                .map(|button| button.tag())
-            {
-                self.close_session_tag(tag);
-            }
-        }
-
-        #[unsafe(method(toggleProject:))]
-        fn toggle_project(&self, sender: Option<&AnyObject>) {
-            if let Some(tag) = sender
-                .and_then(|sender| sender.downcast_ref::<NSButton>())
-                .map(|button| button.tag())
-            {
-                self.toggle_project_tag(tag);
-            }
-        }
+        // Row select / close / project collapse deliberately have no selector:
+        // rows are custom views that call the `*_tag` helpers directly from
+        // mouseUp. `define_class!` hides unused methods from the dead-code lint,
+        // so these have to be kept out by hand.
 
         #[unsafe(method(quitDiri:))]
         fn quit_diri(&self, _sender: Option<&AnyObject>) {
