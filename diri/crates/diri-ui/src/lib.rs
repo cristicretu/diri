@@ -17,13 +17,15 @@ pub use brand::{
     AgentKind, AgentLogo, BrandMark, BrandMarkKind, CLAUDE_PATH, CURSOR_PATH, GEMINI_PATH,
     MarkRasterizer, OPENAI_PATH, set_mark_rasterizer,
 };
-pub use components::{FloatingSurface, HairlineDivider, HoverMarquee, LoadingIndicator, RowFill};
+pub use components::{
+    AlertChip, FloatingSurface, HairlineDivider, HoverMarquee, LoadingIndicator, RowFill, StateChip,
+};
 pub use icon::{Icon, IconAssets, IconName, IconSize, icon_from_system_name};
 pub use status::{
     AnimationPhase, AttentionDot, AttentionLevel, StatusGlyph, StatusState, wall_clock_seconds,
 };
 pub use svg::{PathCommand, SvgPath, SvgPathError};
 pub use tokens::{
-    Appearance, Fill, Ink, MemoryFormat, Metrics, Motion, Palette, Radius, SemanticColors, Space,
-    Spring, TextRole, TextTone, TypeStyle, Typo, rgba_f32,
+    Appearance, Chip, Fill, Ink, MemoryFormat, Metrics, Motion, Palette, Radius, SemanticColors,
+    Space, Spring, TextRole, TextTone, TypeStyle, Typo, rgba_f32,
 };

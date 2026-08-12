@@ -1,14 +1,12 @@
 //! Native menu-bar session list.
 //!
-//! Mirrors the sidebar: project collapse, spawn indent, agent marks, Zzz chip,
-//! and a left-to-right shimmer on working agent titles (not shell/terminal).
-//! Project collapse is local to the menu bar and never writes sidebar prefs.
+//! Mirrors the sidebar: project collapse, spawn indent, agent marks, and Zzz
+//! chip. Project collapse is local to the menu bar and never writes sidebar prefs.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ptr::NonNull;
 use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use block2::RcBlock;
 use objc2::rc::Retained;
@@ -17,32 +15,24 @@ use objc2::{AnyThread, DefinedClass, MainThreadOnly, Message, define_class, msg_
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationOptions, NSAutoresizingMaskOptions, NSBackingStoreType,
     NSBox, NSBoxType, NSButton, NSCellImagePosition, NSColor, NSEvent, NSEventMask,
-    NSEventModifierFlags, NSFocusRingType, NSFont, NSFontAttributeName, NSFontWeightMedium,
-    NSFontWeightRegular, NSFontWeightSemibold, NSForegroundColorAttributeName, NSImage,
-    NSImageAlignment, NSImageScaling, NSImageSymbolConfiguration, NSImageView, NSLineBreakMode,
-    NSMutableParagraphStyle, NSPanel, NSParagraphStyle, NSParagraphStyleAttributeName,
-    NSPopUpMenuWindowLevel, NSRunningApplication, NSScrollView, NSStatusBar, NSStatusBarButton,
-    NSStatusItem, NSTextAlignment, NSTextField, NSTrackingArea, NSTrackingAreaOptions,
-    NSVariableStatusItemLength, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
-    NSVisualEffectState, NSVisualEffectView, NSWindowAnimationBehavior, NSWindowCollectionBehavior,
-    NSWindowStyleMask, NSWorkspace, NSWorkspaceDidActivateApplicationNotification,
+    NSEventModifierFlags, NSFocusRingType, NSFont, NSFontWeightMedium, NSFontWeightRegular,
+    NSFontWeightSemibold, NSImage, NSImageAlignment, NSImageScaling, NSImageSymbolConfiguration,
+    NSImageView, NSLineBreakMode, NSPanel, NSPopUpMenuWindowLevel, NSRunningApplication,
+    NSScrollView, NSStatusBar, NSStatusBarButton, NSStatusItem, NSTextAlignment, NSTextField,
+    NSTrackingArea, NSTrackingAreaOptions, NSVariableStatusItemLength, NSView,
+    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
+    NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
+    NSWorkspaceDidActivateApplicationNotification,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSMutableAttributedString, NSNotification, NSObject, NSObjectProtocol,
-    NSPoint, NSRange, NSRect, NSSize, NSString, NSTimer,
+    MainThreadMarker, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
 };
-use tokio::sync::mpsc;
 
-use diri_proto::{AgentKind, AttentionLevel, ProjectId, SessionId};
-use diri_ui::{BrandMarkKind, Ink};
+use diri_proto::{AgentKind, ProjectId, SessionId};
+use diri_ui::{BrandMarkKind, Chip, Fill, Ink, Radius};
 
 use crate::macos::brand_raster;
-use crate::menu_inbox::{
-    InboxAction, InboxModel, InboxRow, InboxSessionRow, TrailingStatus, build_inbox,
-};
-use crate::notifications::{
-    APPROVE_ACTION_ID, DENY_ACTION_ID, SendTextCommand, command_for_action, permission_action_data,
-};
+use crate::menu_inbox::{InboxModel, InboxRow, InboxSessionRow, TrailingStatus, build_inbox};
 use crate::store::{SessionStore, SpawnOptions};
 
 const POPUP_WIDTH: f64 = 300.0;
@@ -53,8 +43,6 @@ const ROW_HEIGHT: f64 = 28.0;
 const BODY_PADDING: f64 = 4.0;
 const EMPTY_BODY_HEIGHT: f64 = 88.0;
 const MAX_BODY_HEIGHT: f64 = 360.0;
-const ACTION_WIDTH: f64 = 52.0;
-const ACTION_GAP: f64 = 2.0;
 /// Matches `diri_ui::Space::INDENT` / sidebar fold column.
 const INDENT: f64 = 12.0;
 /// Matches `diri_ui::Space::ROW_H` (row padding inside the fill).
@@ -93,17 +81,14 @@ const CLOSE_HIT: f64 = 16.0;
 /// number on an SF Symbol fills the hit and looks oversized, so keep this low.
 const CLOSE_GLYPH_PT: f64 = 9.0;
 /// Matches `diri_ui::Radius::CHIP`.
-const CLOSE_RADIUS: f64 = 5.0;
+const CLOSE_RADIUS: f64 = Radius::CHIP as f64;
 const CLOSE_CHIP_GAP: f64 = 4.0;
 const SELECTED_FILL_ALPHA: f64 = 0.10;
 const HOVER_FILL_ALPHA: f64 = 0.06;
-/// Left-to-right title sweep period (seconds).
-const SHIMMER_PERIOD_SECS: f64 = 1.85;
 
 pub struct NativeMenuBar {
     store: Arc<RwLock<SessionStore>>,
     _status_item: Retained<NSStatusItem>,
-    button: Retained<NSStatusBarButton>,
     panel: Retained<MenuBarPanel>,
     surface: Retained<NSVisualEffectView>,
     brand_hit: Retained<MenuBarBrandHit>,
@@ -117,27 +102,19 @@ pub struct NativeMenuBar {
     body: Retained<NSView>,
     target: Retained<MenuBarTarget>,
     last_fingerprint: Option<u64>,
-    /// Last (level, badge) pushed to the status item; see [`NativeMenuBar::set_attention`].
-    last_attention: Option<(AttentionLevel, usize)>,
 }
 
 impl Drop for NativeMenuBar {
     fn drop(&mut self) {
-        // The dismiss monitors are process-global and the shimmer timer retains
-        // the target, so neither goes away on its own. Left installed they would
-        // keep firing into a menu bar that no longer exists.
+        // The dismiss monitors are process-global and retain this target; clear
+        // them so a rebuilt menu bar cannot stack observers on the same status item.
         self.target.remove_monitors();
-        self.target.stop_shimmer();
     }
 }
 
 impl NativeMenuBar {
     #[must_use]
-    pub fn new(
-        mtm: MainThreadMarker,
-        store: Arc<RwLock<SessionStore>>,
-        action_tx: mpsc::UnboundedSender<SendTextCommand>,
-    ) -> Option<Self> {
+    pub fn new(mtm: MainThreadMarker, store: Arc<RwLock<SessionStore>>) -> Option<Self> {
         let status_item =
             NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
         let button = status_item.button(mtm)?;
@@ -211,13 +188,7 @@ impl NativeMenuBar {
         );
         surface.addSubview(&footer_divider);
 
-        let target = MenuBarTarget::new(
-            mtm,
-            panel.clone(),
-            button.clone(),
-            Arc::clone(&store),
-            action_tx,
-        );
+        let target = MenuBarTarget::new(mtm, panel.clone(), button.clone(), Arc::clone(&store));
 
         // Header brand sits on the row content column so the mark lines up
         // with the project badges below it.
@@ -226,19 +197,11 @@ impl NativeMenuBar {
             rect(ROW_INSET, 0.0, BRAND_HIT_WIDTH, 28.0),
             target.clone(),
         );
-        // One rasterization, shared by the status item and the panel header.
-        // Both are the same fixed vector at the same fixed size, and only their
-        // tint ever changes.
-        let logo = brand_raster::template_diri_logo_ns_image(DIRI_LOGO_HEIGHT as f32);
-        if let Some(image) = &logo {
-            // Status-item templates must stay untinted so AppKit paints them for
-            // the menu bar (white on dark, black on light). Forcing labelColor
-            // resolves against the app window and reads as black on a dark bar.
-            button.setImage(Some(image));
-        }
         let header_icon = {
-            let view = if let Some(image) = &logo {
-                NSImageView::imageViewWithImage(image, mtm)
+            let view = if let Some(image) =
+                brand_raster::template_diri_logo_ns_image(DIRI_LOGO_HEIGHT as f32)
+            {
+                NSImageView::imageViewWithImage(&image, mtm)
             } else {
                 NSImageView::initWithFrame(
                     NSImageView::alloc(mtm),
@@ -347,11 +310,17 @@ impl NativeMenuBar {
             button.setTarget(Some(&*target as &AnyObject));
             button.setAction(Some(sel!(toggleDiriMenu:)));
         }
+        // Static status-item mark: never tint, badge, or swap on attention.
+        if let Some(image) = brand_raster::template_diri_logo_ns_image(DIRI_LOGO_HEIGHT as f32) {
+            button.setImage(Some(&image));
+        }
+        button.setTitle(&NSString::new());
+        button.setImagePosition(NSCellImagePosition::ImageOnly);
+        button.setContentTintColor(None);
 
-        let mut menu_bar = Self {
+        let menu_bar = Self {
             store,
             _status_item: status_item,
-            button,
             panel,
             surface,
             brand_hit,
@@ -365,49 +334,32 @@ impl NativeMenuBar {
             body,
             target,
             last_fingerprint: None,
-            last_attention: None,
         };
-        menu_bar.set_attention(AttentionLevel::None, 0);
         Some(menu_bar)
     }
 
     pub fn refresh(&mut self) {
-        // The panel is closed for almost every publish, and a closed panel only
-        // needs the status-item glyph. Building the inbox — which rebuilds the
-        // sidebar tree — before checking that would put the most expensive work
-        // in the app on the hottest path.
+        // The panel is closed for almost every publish. Building the inbox —
+        // which rebuilds the sidebar tree — before checking that would put the
+        // most expensive work in the app on the hottest path. The status-item
+        // mark is static, so a closed panel needs nothing else.
         if !self.panel.isVisible() {
-            let (attention, needs_you) = self
-                .store
-                .read()
-                .expect("session store lock poisoned")
-                .attention_rollup();
-            self.set_attention(attention, needs_you);
             self.last_fingerprint = None;
-            self.target.stop_shimmer();
             return;
         }
 
         let collapsed = self.target.collapsed_projects();
-        let (model, selected, attention, needs_you) = {
+        let (model, selected) = {
             let mut store = self.store.write().expect("session store lock poisoned");
             let projection = store.menu_bar_projection();
             let model = build_inbox(&projection, &collapsed);
             let selected = store.selected_session_id().cloned();
-            let (attention, needs_you) = store.attention_rollup();
-            (model, selected, attention, needs_you)
+            (model, selected)
         };
-        self.apply_model(&model, selected.as_ref(), attention, needs_you);
+        self.apply_model(&model, selected.as_ref());
     }
 
-    fn apply_model(
-        &mut self,
-        model: &InboxModel,
-        selected_session_id: Option<&SessionId>,
-        attention: AttentionLevel,
-        needs_you: usize,
-    ) {
-        self.set_attention(attention, needs_you);
+    fn apply_model(&mut self, model: &InboxModel, selected_session_id: Option<&SessionId>) {
         let Some(mtm) = MainThreadMarker::new() else {
             return;
         };
@@ -422,14 +374,14 @@ impl NativeMenuBar {
         let body_height = content_height.min(MAX_BODY_HEIGHT);
         let height = HEADER_HEIGHT + body_height + FOOTER_HEIGHT;
 
-        // Resizing grows the panel downward from its origin; pin the top-left so
-        // the panel stays hung off the status item as rows come and go.
-        let old_top_left = {
+        let old_top_left = self.panel.isVisible().then(|| {
             let frame = self.panel.frame();
             NSPoint::new(frame.origin.x, frame.origin.y + frame.size.height)
-        };
+        });
         self.panel.setContentSize(NSSize::new(POPUP_WIDTH, height));
-        self.panel.setFrameTopLeftPoint(old_top_left);
+        if let Some(top_left) = old_top_left {
+            self.panel.setFrameTopLeftPoint(top_left);
+        }
         self.surface.setFrame(rect(0.0, 0.0, POPUP_WIDTH, height));
 
         let header_y = FOOTER_HEIGHT + body_height;
@@ -475,48 +427,6 @@ impl NativeMenuBar {
         self.rebuild_body(model, content_height, selected_session_id, mtm);
     }
 
-    /// Only tint and badge change here. The logo itself is rasterized once in
-    /// `new()` — it is a fixed vector at a fixed size, and re-stroking it into a
-    /// fresh bitmap on every publish was pure waste. This is now the only work a
-    /// closed panel does per publish, so unchanged state exits immediately.
-    fn set_attention(&mut self, attention: AttentionLevel, needs_you: usize) {
-        if self.last_attention == Some((attention, needs_you)) {
-            return;
-        }
-        self.last_attention = Some((attention, needs_you));
-
-        if needs_you > 0 {
-            self.button
-                .setTitle(&NSString::from_str(&needs_you.to_string()));
-            self.button
-                .setImagePosition(NSCellImagePosition::ImageLeading);
-            self.button
-                .setContentTintColor(Some(&NSColor::systemOrangeColor()));
-        } else {
-            self.button.setTitle(&NSString::new());
-            self.button.setImagePosition(NSCellImagePosition::ImageOnly);
-            let attention_tint = match attention {
-                AttentionLevel::NeedsInput => Some(NSColor::systemOrangeColor()),
-                AttentionLevel::DoneUnseen => Some(NSColor::systemGreenColor()),
-                AttentionLevel::Working
-                | AttentionLevel::IdleSeen
-                | AttentionLevel::None
-                | AttentionLevel::Unknown => None,
-            };
-            self.button.setContentTintColor(attention_tint.as_deref());
-        }
-
-        let header_tint = match attention {
-            AttentionLevel::NeedsInput => NSColor::systemOrangeColor(),
-            AttentionLevel::DoneUnseen => NSColor::systemGreenColor(),
-            AttentionLevel::Working => NSColor::secondaryLabelColor(),
-            AttentionLevel::IdleSeen | AttentionLevel::None | AttentionLevel::Unknown => {
-                NSColor::labelColor()
-            }
-        };
-        self.header_icon.setContentTintColor(Some(&header_tint));
-    }
-
     fn rebuild_body(
         &self,
         model: &InboxModel,
@@ -529,7 +439,6 @@ impl NativeMenuBar {
         }
         self.body
             .setFrame(rect(0.0, 0.0, POPUP_WIDTH, content_height));
-        self.target.clear_shimmer_labels();
 
         if model.rows.is_empty() {
             self.target.set_session_ids(Vec::new());
@@ -537,7 +446,6 @@ impl NativeMenuBar {
             self.add_empty_state(content_height, mtm);
             self.scroll.setDocumentView(Some(&self.body));
             self.scroll_body_to_top();
-            self.target.stop_shimmer();
             return;
         }
 
@@ -563,24 +471,23 @@ impl NativeMenuBar {
         let mut y = content_height - BODY_PADDING;
         let mut session_tag = 0isize;
         let mut project_tag = 0isize;
-        let mut has_working = false;
         for row in &model.rows {
             match row {
                 InboxRow::Project {
-                    name, collapsed, ..
+                    name,
+                    count,
+                    collapsed,
+                    ..
                 } => {
                     if project_tag > 0 {
                         y -= 6.0;
                     }
                     y -= PROJECT_HEIGHT;
-                    self.add_project_header(name, *collapsed, project_tag, y, mtm);
+                    self.add_project_header(name, *count, *collapsed, project_tag, y, mtm);
                     project_tag += 1;
                 }
                 InboxRow::Session(session) => {
                     y -= ROW_HEIGHT;
-                    if session.working {
-                        has_working = true;
-                    }
                     self.add_session_row(
                         session,
                         session_tag,
@@ -594,11 +501,6 @@ impl NativeMenuBar {
         }
         self.scroll.setDocumentView(Some(&self.body));
         self.scroll_body_to_top();
-        if has_working {
-            self.target.start_shimmer();
-        } else {
-            self.target.stop_shimmer();
-        }
     }
 
     fn scroll_body_to_top(&self) {
@@ -615,6 +517,7 @@ impl NativeMenuBar {
     fn add_project_header(
         &self,
         name: &str,
+        _count: usize,
         collapsed: bool,
         tag: isize,
         y: f64,
@@ -642,7 +545,6 @@ impl NativeMenuBar {
             hover_fill.clone(),
             None,
             None,
-            0.0,
         );
         row.addSubview(&hover_fill);
 
@@ -724,11 +626,6 @@ impl NativeMenuBar {
         // starting at the shared content column.
         let icon_x = CONTENT_X + f64::from(session.depth) * DEPTH_STEP + INDENT + ROW_GAP;
         let title_x = icon_x + GLYPH_SIZE + ROW_GAP;
-        let actions_width = if session.actions.is_empty() {
-            0.0
-        } else {
-            session.actions.len() as f64 * (ACTION_WIDTH + ACTION_GAP)
-        };
         let trailing = trailing_label(session);
         // Sidebar flex: title absorbs width; chips then trailing ✕ on hover.
         let chip_width = trailing.as_ref().map_or(0.0, |status| status.width);
@@ -737,10 +634,9 @@ impl NativeMenuBar {
         } else {
             CLOSE_HIT + ROW_GAP
         };
-        let title_right = CONTENT_RIGHT - actions_width - trailing_slot;
+        let title_right = CONTENT_RIGHT - trailing_slot;
         let icon_y = (ROW_HEIGHT - GLYPH_SIZE) / 2.0;
-        // Far-right slot, left of Approve/Deny when those are present.
-        let close_x = CONTENT_RIGHT - actions_width - CLOSE_HIT;
+        let close_x = CONTENT_RIGHT - CLOSE_HIT;
 
         let hover_fill = row_fill_box(
             rect(
@@ -771,32 +667,38 @@ impl NativeMenuBar {
         close_button.setHidden(true);
 
         let mut trailing_chip: Option<Retained<NSBox>> = None;
-        if session.actions.is_empty()
-            && let Some(status) = trailing.as_ref()
-        {
+        if let Some(status) = trailing.as_ref() {
             // Idle position: flush right. On hover, set_hovered slides it left of ✕.
+            // Sidebar StateChip is `.py(Chip::PAD_Y)` on GPUI's META line box.
+            // AppKit has no line box, so size the pill to the same visual height
+            // (~17pt) and center the label with equal top/bottom air.
+            let font_size = f64::from(Chip::font_size());
+            let chip_h = f64::from(Chip::height()) + 4.0;
             let chip = NSBox::initWithFrame(
                 NSBox::alloc(mtm),
                 rect(
                     CONTENT_RIGHT - status.width,
-                    (ROW_HEIGHT - 16.0) / 2.0,
+                    (ROW_HEIGHT - chip_h) / 2.0,
                     status.width,
-                    16.0,
+                    chip_h,
                 ),
             );
             chip.setBoxType(NSBoxType::Custom);
             chip.setBorderWidth(0.0);
-            chip.setCornerRadius(CLOSE_RADIUS);
+            chip.setCornerRadius(f64::from(Radius::CHIP));
             chip.setContentViewMargins(NSSize::new(0.0, 0.0));
-            chip.setFillColor(&NSColor::labelColor().colorWithAlphaComponent(0.06));
-            // NSTextField draws slightly high; keep label shorter and lower so
-            // "Zzz" optically centers in the chip.
+            chip.setFillColor(
+                &NSColor::labelColor().colorWithAlphaComponent(f64::from(Fill::SUBTLE_OPACITY)),
+            );
+            // Non-flipped: center the label, then +1pt optical (NSTextField sits low).
+            let label_h = font_size + 2.0;
+            let label_y = ((chip_h - label_h) / 2.0) + 1.0;
             let chip_label = label(
                 status.text,
-                11.0,
+                font_size,
                 FontStyle::Medium,
                 &status.color,
-                rect(0.0, 0.0, status.width, 14.0),
+                rect(0.0, label_y, status.width, label_h),
                 mtm,
             );
             chip_label.setAlignment(NSTextAlignment::Center);
@@ -814,7 +716,6 @@ impl NativeMenuBar {
             hover_fill.clone(),
             Some(close_button.clone()),
             trailing_chip.clone(),
-            actions_width,
         );
         if selected {
             let selected_fill = row_fill_box(
@@ -857,49 +758,11 @@ impl NativeMenuBar {
             mtm,
         );
         row.addSubview(&title);
-        if session.working {
-            self.target.push_shimmer_label(title.clone());
-        }
         unsafe {
             let accessibility_label = NSString::from_str(&session.title);
             let _: () = msg_send![&*row, setAccessibilityLabel: &*accessibility_label];
         }
         self.body.addSubview(&row);
-
-        if !session.actions.is_empty() {
-            let mut action_x = CONTENT_RIGHT;
-            for action in session.actions.iter().rev() {
-                action_x -= ACTION_WIDTH;
-                let (title, selector) = match action {
-                    InboxAction::Approve => ("Approve", sel!(approveSession:)),
-                    InboxAction::Deny => ("Deny", sel!(denySession:)),
-                };
-                let button = unsafe {
-                    NSButton::buttonWithTitle_target_action(
-                        &NSString::from_str(title),
-                        Some(&*self.target as &AnyObject),
-                        Some(selector),
-                        mtm,
-                    )
-                };
-                button.setTag(tag);
-                button.setFrame(rect(action_x, y + 2.0, ACTION_WIDTH, 24.0));
-                button.setBordered(false);
-                button.setFont(Some(&system_font(11.0, FontStyle::Medium)));
-                let tint = match action {
-                    InboxAction::Deny => NSColor::secondaryLabelColor(),
-                    InboxAction::Approve if session.destructive => {
-                        rgba_ns(Ink::DANGER.r, Ink::DANGER.g, Ink::DANGER.b, 1.0)
-                    }
-                    InboxAction::Approve => NSColor::controlAccentColor(),
-                };
-                button.setContentTintColor(Some(&tint));
-                button.setRefusesFirstResponder(true);
-                button.setFocusRingType(NSFocusRingType::None);
-                self.body.addSubview(&button);
-                action_x -= ACTION_GAP;
-            }
-        }
     }
 
     fn add_empty_state(&self, content_height: f64, mtm: MainThreadMarker) {
@@ -949,9 +812,6 @@ struct TrailingLabel {
 }
 
 fn trailing_label(session: &InboxSessionRow) -> Option<TrailingLabel> {
-    if !session.actions.is_empty() {
-        return None;
-    }
     match session.trailing? {
         TrailingStatus::NeedsYou => Some(TrailingLabel {
             text: "needs you",
@@ -1004,11 +864,13 @@ fn panel_fingerprint(model: &InboxModel, selected: Option<&SessionId>) -> u64 {
             InboxRow::Project {
                 id,
                 name,
+                count,
                 collapsed,
             } => {
                 0u8.hash(&mut hasher);
                 id.hash(&mut hasher);
                 name.hash(&mut hasher);
+                count.hash(&mut hasher);
                 collapsed.hash(&mut hasher);
             }
             InboxRow::Session(session) => {
@@ -1020,10 +882,12 @@ fn panel_fingerprint(model: &InboxModel, selected: Option<&SessionId>) -> u64 {
                 session.trailing.hash(&mut hasher);
                 session.working.hash(&mut hasher);
                 session.destructive.hash(&mut hasher);
-                session.actions.len().hash(&mut hasher);
             }
         }
     }
+    model.needs_you.hash(&mut hasher);
+    model.finished.hash(&mut hasher);
+    model.working.hash(&mut hasher);
     selected.map(|id| id.0.as_str()).hash(&mut hasher);
     hasher.finish()
 }
@@ -1066,7 +930,7 @@ fn agent_mark_view(
     color: &NSColor,
     x: f64,
     mtm: MainThreadMarker,
-) -> Retained<NSView> {
+) -> Retained<NSImageView> {
     let y = (ROW_HEIGHT - GLYPH_SIZE) / 2.0;
     if let Some(kind) = agent_mark_kind(agent_id)
         && let Some(image) = brand_raster::template_ns_image(kind, GLYPH_SIZE as f32)
@@ -1075,11 +939,9 @@ fn agent_mark_view(
         view.setFrame(rect(x, y, GLYPH_SIZE, GLYPH_SIZE));
         view.setImageAlignment(NSImageAlignment::AlignCenter);
         view.setContentTintColor(Some(color));
-        return Retained::into_super(Retained::into_super(view));
+        return view;
     }
-    // Shell / unknown: caret bar matching StatusGlyph::shell_caret. A plain
-    // NSView hosts it — an NSImageView here is an NSControl sitting in the glyph
-    // column with no image and no action.
+    // Shell / unknown: caret bar matching StatusGlyph::shell_caret.
     let caret = NSBox::initWithFrame(
         NSBox::alloc(mtm),
         rect(
@@ -1093,7 +955,8 @@ fn agent_mark_view(
     caret.setBorderWidth(0.0);
     caret.setCornerRadius(1.0);
     caret.setFillColor(color);
-    let host = NSView::initWithFrame(NSView::alloc(mtm), rect(x, y, GLYPH_SIZE, GLYPH_SIZE));
+    let host =
+        NSImageView::initWithFrame(NSImageView::alloc(mtm), rect(x, y, GLYPH_SIZE, GLYPH_SIZE));
     host.addSubview(&caret);
     host
 }
@@ -1246,93 +1109,8 @@ fn style_plain_button(button: &NSButton, prominent: bool) {
     button.setFocusRingType(NSFocusRingType::None);
 }
 
-/// Quantization of the shimmer's alpha curve. The band is a soft gradient, so
-/// a couple dozen steps are visually indistinguishable from per-glyph exactness
-/// and let the colors be allocated once instead of per character per frame.
-const SHIMMER_STEPS: usize = 24;
-const SHIMMER_BASE_ALPHA: f64 = 0.50;
-const SHIMMER_PEAK_ALPHA: f64 = 0.96;
-/// Half-width of the travelling highlight, as a fraction of the title.
-const SHIMMER_BAND: f64 = 0.30;
-
-fn shimmer_ramp() -> Vec<Retained<NSColor>> {
-    let label_color = NSColor::labelColor();
-    (0..SHIMMER_STEPS)
-        .map(|step| {
-            let falloff = step as f64 / (SHIMMER_STEPS - 1) as f64;
-            let alpha = SHIMMER_BASE_ALPHA + (SHIMMER_PEAK_ALPHA - SHIMMER_BASE_ALPHA) * falloff;
-            label_color.colorWithAlphaComponent(alpha)
-        })
-        .collect()
-}
-
-/// A cell rendering an attributed string takes its wrapping from the string, not
-/// from the control, so the label's `ByTruncatingTail` is lost unless the style
-/// travels with it. Without this a long working title clips mid-glyph instead of
-/// ellipsizing, then snaps back the moment the agent goes idle.
-fn shimmer_paragraph_style() -> Retained<NSParagraphStyle> {
-    let style = NSMutableParagraphStyle::new();
-    style.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
-    Retained::into_super(style)
-}
-
-/// Soft highlight band that travels left→right across a working-session title.
-fn paint_title_shimmer(
-    label: &NSTextField,
-    phase: f64,
-    ramp: &[Retained<NSColor>],
-    paragraph: &NSParagraphStyle,
-) {
-    let text = label.stringValue();
-    let len = text.length();
-    if len == 0 {
-        return;
-    }
-    let attributed = NSMutableAttributedString::from_nsstring(&text);
-    let full = NSRange::new(0, len);
-    if let Some(font) = label.font() {
-        // SAFETY: NSFont is a valid attribute value for NSFontAttributeName.
-        unsafe {
-            attributed.addAttribute_value_range(NSFontAttributeName, &font, full);
-        }
-    }
-    // SAFETY: NSParagraphStyle is a valid value for NSParagraphStyleAttributeName.
-    unsafe {
-        attributed.addAttribute_value_range(NSParagraphStyleAttributeName, paragraph, full);
-    }
-
-    // Travel fully off both ends so the highlight enters and exits cleanly.
-    let center = phase * (1.0 + 2.0 * SHIMMER_BAND) - SHIMMER_BAND;
-    for i in 0..len {
-        let t = if len == 1 {
-            0.5
-        } else {
-            i as f64 / (len - 1) as f64
-        };
-        let dist = (t - center).abs();
-        let falloff = (1.0 - (dist / SHIMMER_BAND).min(1.0)).powf(1.55);
-        let step = ((falloff * (SHIMMER_STEPS - 1) as f64).round() as usize).min(SHIMMER_STEPS - 1);
-        // SAFETY: NSColor is a valid attribute value for NSForegroundColorAttributeName.
-        unsafe {
-            attributed.addAttribute_value_range(
-                NSForegroundColorAttributeName,
-                &ramp[step],
-                NSRange::new(i, 1),
-            );
-        }
-    }
-    label.setAttributedStringValue(&attributed);
-}
-
 fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
-}
-
-fn wall_clock_seconds() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
 }
 
 fn point_in_rect(point: NSPoint, frame: NSRect) -> bool {
@@ -1371,6 +1149,26 @@ enum MenuShortcut {
     SpawnDefault,
     SpawnShell,
     SpawnCodex,
+}
+fn menu_shortcut_from_event(event: &NSEvent) -> Option<MenuShortcut> {
+    let modifiers = event.modifierFlags();
+    if !modifiers.contains(NSEventModifierFlags::Command) {
+        return None;
+    }
+    let shift = modifiers.contains(NSEventModifierFlags::Shift);
+    let option = modifiers.contains(NSEventModifierFlags::Option);
+    let key = event
+        .charactersIgnoringModifiers()
+        .map(|chars| chars.to_string().to_ascii_lowercase())
+        .unwrap_or_default();
+    match key.as_str() {
+        "t" if option => Some(MenuShortcut::SpawnShell),
+        "t" if !shift => Some(MenuShortcut::SpawnDefault),
+        "n" if shift => Some(MenuShortcut::SpawnCodex),
+        // Matches the app's own `cmd-n` → OpenLauncher binding.
+        "n" => Some(MenuShortcut::NewAgent),
+        _ => None,
+    }
 }
 
 struct MenuBarHoverChromeIvars {
@@ -1661,7 +1459,6 @@ struct MenuBarHoverRowIvars {
     hover_fill: Retained<NSBox>,
     close_button: Option<Retained<MenuBarCloseHit>>,
     trailing_chip: Option<Retained<NSBox>>,
-    actions_width: f64,
 }
 
 define_class!(
@@ -1748,7 +1545,6 @@ impl MenuBarHoverRow {
         hover_fill: Retained<NSBox>,
         close_button: Option<Retained<MenuBarCloseHit>>,
         trailing_chip: Option<Retained<NSBox>>,
-        actions_width: f64,
     ) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(MenuBarHoverRowIvars {
             target,
@@ -1758,7 +1554,6 @@ impl MenuBarHoverRow {
             hover_fill,
             close_button,
             trailing_chip,
-            actions_width,
         });
         // SAFETY: designated NSView initializer.
         unsafe { msg_send![super(this), initWithFrame: frame] }
@@ -1778,9 +1573,9 @@ impl MenuBarHoverRow {
             let width = chip.frame().size.width;
             let y = chip.frame().origin.y;
             let x = if hovered {
-                CONTENT_RIGHT - ivars.actions_width - CLOSE_HIT - CLOSE_CHIP_GAP - width
+                CONTENT_RIGHT - CLOSE_HIT - CLOSE_CHIP_GAP - width
             } else {
-                CONTENT_RIGHT - ivars.actions_width - width
+                CONTENT_RIGHT - width
             };
             chip.setFrameOrigin(NSPoint::new(x, y));
         }
@@ -1827,15 +1622,9 @@ struct MenuBarTargetIvars {
     panel: Retained<MenuBarPanel>,
     button: Retained<NSStatusBarButton>,
     store: Arc<RwLock<SessionStore>>,
-    action_tx: mpsc::UnboundedSender<SendTextCommand>,
     session_ids: RefCell<Vec<SessionId>>,
     project_ids: RefCell<Vec<ProjectId>>,
     collapsed_projects: RefCell<HashSet<String>>,
-    shimmer_labels: RefCell<Vec<Retained<NSTextField>>>,
-    shimmer_timer: RefCell<Option<Retained<NSTimer>>>,
-    /// Allocated once; see [`shimmer_ramp`].
-    shimmer_ramp: Vec<Retained<NSColor>>,
-    shimmer_paragraph: Retained<NSParagraphStyle>,
     /// Outside clicks in other apps.
     global_dismiss_monitor: RefCell<Option<Retained<AnyObject>>>,
     /// Outside clicks in diri's own windows (global monitors never see these).
@@ -1892,34 +1681,33 @@ define_class!(
             self.show_main_window();
         }
 
-        // Row select / close / project collapse have no selector: rows are
-        // custom views that call `*_tag` directly on mouseUp. Only the two
-        // permission buttons below are still real NSControls.
-        #[unsafe(method(approveSession:))]
-        fn approve_session(&self, sender: Option<&AnyObject>) {
-            self.send_permission_action(sender, APPROVE_ACTION_ID);
+        #[unsafe(method(selectSession:))]
+        fn select_session(&self, sender: Option<&AnyObject>) {
+            if let Some(tag) = sender
+                .and_then(|sender| sender.downcast_ref::<NSButton>())
+                .map(|button| button.tag())
+            {
+                self.select_session_tag(tag);
+            }
         }
 
-        #[unsafe(method(denySession:))]
-        fn deny_session(&self, sender: Option<&AnyObject>) {
-            self.send_permission_action(sender, DENY_ACTION_ID);
+        #[unsafe(method(closeSession:))]
+        fn close_session(&self, sender: Option<&AnyObject>) {
+            if let Some(tag) = sender
+                .and_then(|sender| sender.downcast_ref::<NSButton>())
+                .map(|button| button.tag())
+            {
+                self.close_session_tag(tag);
+            }
         }
 
-        #[unsafe(method(tickShimmer:))]
-        fn tick_shimmer(&self, _sender: Option<&AnyObject>) {
-            if !self.ivars().panel.isVisible() {
-                self.stop_shimmer();
-                return;
-            }
-            let labels = self.ivars().shimmer_labels.borrow();
-            if labels.is_empty() {
-                return;
-            }
-            // Linear left→right sweep (not an opacity pulse).
-            let phase = (wall_clock_seconds() / SHIMMER_PERIOD_SECS).fract();
-            let ivars = self.ivars();
-            for label in labels.iter() {
-                paint_title_shimmer(label, phase, &ivars.shimmer_ramp, &ivars.shimmer_paragraph);
+        #[unsafe(method(toggleProject:))]
+        fn toggle_project(&self, sender: Option<&AnyObject>) {
+            if let Some(tag) = sender
+                .and_then(|sender| sender.downcast_ref::<NSButton>())
+                .map(|button| button.tag())
+            {
+                self.toggle_project_tag(tag);
             }
         }
 
@@ -1936,20 +1724,14 @@ impl MenuBarTarget {
         panel: Retained<MenuBarPanel>,
         button: Retained<NSStatusBarButton>,
         store: Arc<RwLock<SessionStore>>,
-        action_tx: mpsc::UnboundedSender<SendTextCommand>,
     ) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(MenuBarTargetIvars {
             panel,
             button,
             store,
-            action_tx,
             session_ids: RefCell::new(Vec::new()),
             project_ids: RefCell::new(Vec::new()),
             collapsed_projects: RefCell::new(HashSet::new()),
-            shimmer_labels: RefCell::new(Vec::new()),
-            shimmer_timer: RefCell::new(None),
-            shimmer_ramp: shimmer_ramp(),
-            shimmer_paragraph: shimmer_paragraph_style(),
             global_dismiss_monitor: RefCell::new(None),
             local_dismiss_monitor: RefCell::new(None),
             key_monitor: RefCell::new(None),
@@ -2020,46 +1802,6 @@ impl MenuBarTarget {
         self.ivars().project_ids.replace(ids);
     }
 
-    fn clear_shimmer_labels(&self) {
-        self.ivars().shimmer_labels.borrow_mut().clear();
-    }
-
-    fn push_shimmer_label(&self, label: Retained<NSTextField>) {
-        self.ivars().shimmer_labels.borrow_mut().push(label);
-    }
-
-    fn start_shimmer(&self) {
-        if self.ivars().shimmer_timer.borrow().is_some() {
-            return;
-        }
-        // SAFETY: target is retained by the timer for its lifetime; we invalidate
-        // on panel close / rebuild so the timer cannot outlive useful work.
-        let timer = unsafe {
-            NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
-                1.0 / 30.0,
-                self,
-                sel!(tickShimmer:),
-                None,
-                true,
-            )
-        };
-        self.ivars().shimmer_timer.replace(Some(timer));
-    }
-
-    fn stop_shimmer(&self) {
-        if let Some(timer) = self.ivars().shimmer_timer.take() {
-            timer.invalidate();
-        }
-        let labels = self.ivars().shimmer_labels.borrow();
-        let color = NSColor::labelColor().colorWithAlphaComponent(0.90);
-        for label in labels.iter() {
-            // Drop per-glyph attributes so the next rebuild starts clean.
-            let text = label.stringValue();
-            label.setStringValue(&text);
-            label.setTextColor(Some(&color));
-        }
-    }
-
     fn show_panel(&self) {
         self.ivars()
             .store
@@ -2086,7 +1828,6 @@ impl MenuBarTarget {
     fn hide_panel(&self) {
         self.remove_monitors();
         self.ivars().panel.orderOut(None);
-        self.stop_shimmer();
     }
 
     fn install_monitors(&self) {

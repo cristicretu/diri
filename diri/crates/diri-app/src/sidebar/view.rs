@@ -8,9 +8,9 @@ use diri_proto::{
     SessionRecord,
 };
 use diri_ui::{
-    AgentKind, AgentLogo, AttentionDot, AttentionLevel, Fill, FloatingSurface, HairlineDivider,
-    HoverMarquee, Ink, LoadingIndicator, Metrics, Radius, RowFill, SemanticColors, Space,
-    StatusGlyph, StatusState, Typo,
+    AgentKind, AgentLogo, AlertChip, AttentionDot, AttentionLevel, Fill, FloatingSurface,
+    HairlineDivider, HoverMarquee, Ink, LoadingIndicator, Metrics, Radius, RowFill, SemanticColors,
+    Space, StateChip, StatusGlyph, StatusState, Typo,
 };
 use gpui::{
     Anchor, AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle,
@@ -1171,26 +1171,26 @@ impl Sidebar {
             // remaining width, so a narrow sidebar truncates the title rather
             // than dropping the reason it is not moving.
             .when(migrating, |element| {
-                element.child(state_chip("Moving…", colors.secondary, colors))
+                element.child(StateChip::new("Moving…", colors.secondary, colors))
             })
             .when(non_persistent, |element| {
                 // Louder than the rest of the lane on purpose: this session
                 // cannot survive a detach, so closing the window loses it.
-                element.child(alert_chip("No detach"))
+                element.child(AlertChip::new("No detach"))
             })
             .when(ended_chip, |element| {
                 // An exited session with a real title otherwise looks alive:
                 // the glyph goes quiet and nothing else says why.
-                element.child(state_chip("Ended", colors.tertiary, colors))
+                element.child(StateChip::new("Ended", colors.tertiary, colors))
             })
             .when(hibernated, |element| {
                 // Hibernation chip. An 8px moon glyph was a smudge at this
                 // size; the chip reads at a glance and matches the host badge.
-                element.child(state_chip("Zzz", colors.tertiary, colors))
+                element.child(StateChip::new("Zzz", colors.tertiary, colors))
             })
             .when_some(host_label, |element, host| {
                 // Remote-host chip: this session's agent runs on another machine.
-                element.child(state_chip(host, colors.tertiary, colors))
+                element.child(StateChip::new(host, colors.tertiary, colors))
             })
             .when(hovered, |element| {
                 let close_id = id.clone();
@@ -3607,40 +3607,6 @@ fn pin_mark(colors: SemanticColors) -> AnyElement {
         .flex()
         .items_center()
         .child(sf_symbol("pin.fill", 9.0, colors.tertiary))
-        .into_any_element()
-}
-
-/// The row's shared chip: one state, stated in the smallest space that still
-/// reads. Every chip on a row is the same shape so they scan as one lane.
-fn state_chip(label: impl Into<SharedString>, tint: Rgba, colors: SemanticColors) -> AnyElement {
-    div()
-        .flex_none()
-        .px(px(5.0))
-        .py(px(1.0))
-        .rounded(px(Radius::CHIP))
-        .bg(Fill::subtle(colors))
-        .text_size(px(Typo::META.size))
-        .font_weight(Typo::META.weight)
-        .text_color(tint)
-        .whitespace_nowrap()
-        .child(label.into())
-        .into_any_element()
-}
-
-/// A chip that has to outrank the rest of the lane. Same geometry as
-/// [`state_chip`] so the row still scans as one lane, tinted so it does not.
-fn alert_chip(label: impl Into<SharedString>) -> AnyElement {
-    div()
-        .flex_none()
-        .px(px(5.0))
-        .py(px(1.0))
-        .rounded(px(Radius::CHIP))
-        .bg(Ink::DANGER.alpha(0.12))
-        .text_size(px(Typo::META.size))
-        .font_weight(Typo::META.weight)
-        .text_color(Ink::DANGER)
-        .whitespace_nowrap()
-        .child(label.into())
         .into_any_element()
 }
 

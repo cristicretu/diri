@@ -276,6 +276,25 @@ impl Fill {
     }
 }
 
+/// Shared geometry for the compact state chips (Zzz, Ended, host, …).
+///
+/// GPUI draws them via [`crate::StateChip`]; AppKit menubar rows must use the
+/// same numbers so the two surfaces stay optically identical.
+pub struct Chip;
+
+impl Chip {
+    pub const PAD_X: f32 = 5.0;
+    pub const PAD_Y: f32 = 1.0;
+
+    pub const fn font_size() -> f32 {
+        Typo::META.size
+    }
+
+    pub const fn height() -> f32 {
+        Typo::META.size + Self::PAD_Y * 2.0
+    }
+}
+
 pub struct Space;
 
 impl Space {

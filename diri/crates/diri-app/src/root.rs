@@ -298,13 +298,8 @@ impl RootView {
         sidebar.update(cx, |sidebar, cx| sidebar.set_update(initial_update, cx));
 
         #[cfg(target_os = "macos")]
-        let mut menu_bar = objc2_foundation::MainThreadMarker::new().and_then(|mtm| {
-            NativeMenuBar::new(
-                mtm,
-                Arc::clone(&services.store.store),
-                services.store.notification_action_sender(),
-            )
-        });
+        let mut menu_bar = objc2_foundation::MainThreadMarker::new()
+            .and_then(|mtm| NativeMenuBar::new(mtm, Arc::clone(&services.store.store)));
         #[cfg(target_os = "macos")]
         if let Some(menu_bar) = &mut menu_bar {
             menu_bar.refresh();

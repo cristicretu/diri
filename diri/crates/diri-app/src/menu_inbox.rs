@@ -7,12 +7,6 @@ use diri_proto::{AttentionLevel, SessionRecord};
 
 use crate::store::{SidebarProject, SidebarProjection};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InboxAction {
-    Approve,
-    Deny,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TrailingStatus {
     NeedsYou,
@@ -29,7 +23,6 @@ pub struct InboxSessionRow {
     pub trailing: Option<TrailingStatus>,
     pub working: bool,
     pub destructive: bool,
-    pub actions: Vec<InboxAction>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,16 +92,6 @@ fn session_row(session: &SessionRecord, depth: u16) -> InboxSessionRow {
         .needs_input
         .as_ref()
         .is_some_and(|detail| detail.risk_hint == diri_proto::RiskHint::Destructive);
-    let actions = if session
-        .needs_input
-        .as_ref()
-        .is_some_and(|detail| detail.kind == diri_proto::NeedsInputKind::Permission)
-    {
-        vec![InboxAction::Approve, InboxAction::Deny]
-    } else {
-        Vec::new()
-    };
-
     InboxSessionRow {
         session_id: session.id.0.clone(),
         title: display_title(session).to_owned(),
@@ -119,7 +102,6 @@ fn session_row(session: &SessionRecord, depth: u16) -> InboxSessionRow {
             && !session.effective_kind().is_terminal()
             && attention == AttentionLevel::Working,
         destructive,
-        actions,
     }
 }
 
@@ -306,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_sessions_do_not_shimmer_as_working() {
+    fn terminal_sessions_are_not_marked_working() {
         let shell = session(
             "sh",
             "alex",
@@ -332,7 +314,7 @@ mod tests {
     }
 
     #[test]
-    fn permission_rows_keep_approve_deny() {
+    fn permission_rows_keep_needs_you_trailing() {
         let mut blocked = session(
             "a",
             "robite",
@@ -368,6 +350,6 @@ mod tests {
         let InboxRow::Session(row) = &model.rows[1] else {
             panic!("expected session");
         };
-        assert_eq!(row.actions, [InboxAction::Approve, InboxAction::Deny]);
+        assert_eq!(row.trailing, Some(TrailingStatus::NeedsYou));
     }
 }

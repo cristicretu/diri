@@ -6,7 +6,7 @@ use gpui::{
     prelude::*, px, svg,
 };
 
-use crate::{Fill, IconName, Radius, SemanticColors, rgba_f32};
+use crate::{Chip, Fill, IconName, Ink, Radius, SemanticColors, Typo, rgba_f32};
 
 /// Shared, platform-independent activity mark for bounded asynchronous work.
 /// Repeating GPUI animations automatically become static when Reduce Motion
@@ -40,6 +40,72 @@ impl RenderOnce for LoadingIndicator {
                 Animation::new(Duration::from_millis(850)).repeat(),
                 |icon, delta| icon.with_transformation(Transformation::rotate(percentage(delta))),
             )
+    }
+}
+
+/// Compact row chip used by the sidebar (and matched by the menubar AppKit
+/// surface via [`Chip`] tokens). One shape for every quiet state label.
+#[derive(IntoElement)]
+pub struct StateChip {
+    label: SharedString,
+    tint: Rgba,
+    colors: SemanticColors,
+}
+
+impl StateChip {
+    pub fn new(label: impl Into<SharedString>, tint: Rgba, colors: SemanticColors) -> Self {
+        Self {
+            label: label.into(),
+            tint,
+            colors,
+        }
+    }
+}
+
+impl RenderOnce for StateChip {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        div()
+            .flex_none()
+            .px(px(Chip::PAD_X))
+            .py(px(Chip::PAD_Y))
+            .rounded(px(Radius::CHIP))
+            .bg(Fill::subtle(self.colors))
+            .text_size(px(Chip::font_size()))
+            .font_weight(Typo::META.weight)
+            .text_color(self.tint)
+            .whitespace_nowrap()
+            .child(self.label)
+    }
+}
+
+/// Same geometry as [`StateChip`], danger tint for blockers that must outrank
+/// the rest of the chip lane.
+#[derive(IntoElement)]
+pub struct AlertChip {
+    label: SharedString,
+}
+
+impl AlertChip {
+    pub fn new(label: impl Into<SharedString>) -> Self {
+        Self {
+            label: label.into(),
+        }
+    }
+}
+
+impl RenderOnce for AlertChip {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        div()
+            .flex_none()
+            .px(px(Chip::PAD_X))
+            .py(px(Chip::PAD_Y))
+            .rounded(px(Radius::CHIP))
+            .bg(Ink::DANGER.alpha(0.12))
+            .text_size(px(Chip::font_size()))
+            .font_weight(Typo::META.weight)
+            .text_color(Ink::DANGER)
+            .whitespace_nowrap()
+            .child(self.label)
     }
 }
 
