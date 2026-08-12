@@ -46,11 +46,12 @@ body:
   - type: textarea
     id: daemon
     attributes:
-      label: Daemon state
+      label: Privacy-safe diagnostics
       description: >
-        Output of `dirijor doctor` if the CLI is on your PATH. Skip if the app
-        will not start.
-      render: shell
+        In Settings → General → Support, choose Copy diagnostics, review the
+        exact report, and paste it here. If the app will not open, use
+        `dirijor doctor` when the CLI is on your PATH.
+      render: markdown
 
   - type: textarea
     id: logs
@@ -58,5 +59,6 @@ body:
       label: Relevant log lines
       description: >
         From `~/Library/Application Support/Dirijor/dirijord.log`. Please skim
-        for paths or prompt text you would rather not post.
+        for paths or prompt text you would rather not post. Raw logs are an
+        optional fallback; Copy diagnostics never includes them.
       render: shell

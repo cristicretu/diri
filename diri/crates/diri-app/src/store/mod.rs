@@ -15,8 +15,8 @@ use diri_proto::paths::DirijorPaths;
 use diri_proto::remote_pty::DirectoryListResult;
 use diri_proto::{
     AgentDescriptor, AgentKind, AgentReadinessResult, AttentionLevel, DateMillis, EventName,
-    ExitReason, GovernorConfigureParams, HostEntry, HostsConfig, Project, ProjectId, Resumability,
-    SessionId, SessionListResult, SessionRecord, SessionSpawnParams, SessionStatus,
+    ExitReason, GovernorConfigureParams, HelloResult, HostEntry, HostsConfig, Project, ProjectId,
+    Resumability, SessionId, SessionListResult, SessionRecord, SessionSpawnParams, SessionStatus,
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -105,6 +105,8 @@ pub enum StoreEffect {
     /// A shell owned by a workbench pane. Unlike a top-level spawn, its
     /// response must not replace the selected sidebar session.
     SpawnAuxiliary(SessionSpawnParams),
+    /// Wake the client's idempotent reconnect loop out of backoff.
+    RetryConnection,
     /// `session.migrate` — move a Claude session between local and a host.
     Migrate {
         id: SessionId,
@@ -136,6 +138,54 @@ pub enum StoreEffect {
     DetachAttachment(SessionId),
     /// T15 consumes this without involving daemon lifecycle operations.
     StatusTransition(StatusTransition),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum RetryAction {
+    Rename { id: SessionId, title: String },
+    SyncPrefs { host: String, host_name: String },
+}
+
+impl RetryAction {
+    fn effect(self) -> StoreEffect {
+        match self {
+            Self::Rename { id, title } => StoreEffect::Rename { id, title },
+            Self::SyncPrefs { host, host_name } => StoreEffect::SyncPrefs { host, host_name },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActionFailure {
+    pub title: String,
+    pub detail: String,
+    pub retrying: bool,
+    retry: Option<RetryAction>,
+}
+
+impl ActionFailure {
+    #[must_use]
+    pub fn can_retry(&self) -> bool {
+        self.retry.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(
+        title: impl Into<String>,
+        detail: impl Into<String>,
+        can_retry: bool,
+        retrying: bool,
+    ) -> Self {
+        Self {
+            title: title.into(),
+            detail: detail.into(),
+            retrying,
+            retry: can_retry.then(|| RetryAction::Rename {
+                id: SessionId::new("fixture"),
+                title: "fixture".to_owned(),
+            }),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -221,6 +271,7 @@ fn repo_target_key(host: Option<&str>) -> String {
 /// Pure application model. Side effects are emitted onto a channel for the daemon adapter.
 pub struct SessionStore {
     daemon_state: DaemonState,
+    daemon_identity: Option<HelloResult>,
     sessions: HashMap<SessionId, Arc<SessionRecord>>,
     projects: HashMap<ProjectId, Project>,
     selected_session_id: Option<SessionId>,
@@ -246,7 +297,7 @@ pub struct SessionStore {
     prefs: Prefs,
     terminal_residency: TerminalResidency,
     app_is_active: bool,
-    last_action_error: Option<String>,
+    last_action_failure: Option<ActionFailure>,
     sidebar_selection_anchor: Option<SessionId>,
     mru_order: Vec<SessionId>,
     switcher: SessionSwitcherState,
@@ -290,6 +341,7 @@ impl SessionStore {
         (
             Self {
                 daemon_state: DaemonState::Connecting,
+                daemon_identity: None,
                 sessions: HashMap::new(),
                 projects: HashMap::new(),
                 selected_session_id: selected_session_id.clone(),
@@ -306,7 +358,7 @@ impl SessionStore {
                 prefs,
                 terminal_residency: TerminalResidency::default(),
                 app_is_active: true,
-                last_action_error: None,
+                last_action_failure: None,
                 sidebar_selection_anchor: None,
                 mru_order: selected_session_id.into_iter().collect(),
                 switcher: SessionSwitcherState::default(),
@@ -431,6 +483,10 @@ impl SessionStore {
 
     pub fn daemon_state(&self) -> &DaemonState {
         &self.daemon_state
+    }
+
+    pub fn daemon_identity(&self) -> Option<&HelloResult> {
+        self.daemon_identity.as_ref()
     }
 
     pub fn sessions(&self) -> &HashMap<SessionId, Arc<SessionRecord>> {
@@ -615,7 +671,33 @@ impl SessionStore {
     }
 
     pub fn last_action_error(&self) -> Option<&str> {
-        self.last_action_error.as_deref()
+        self.last_action_failure
+            .as_ref()
+            .map(|failure| failure.detail.as_str())
+    }
+
+    pub fn action_failure(&self) -> Option<&ActionFailure> {
+        self.last_action_failure.as_ref()
+    }
+
+    pub fn dismiss_action_failure(&mut self) {
+        self.last_action_failure = None;
+        self.emit(StoreEffect::UiChanged);
+    }
+
+    pub fn retry_last_action(&mut self) {
+        let Some(failure) = self.last_action_failure.as_mut() else {
+            return;
+        };
+        let Some(retry) = failure.retry.clone() else {
+            return;
+        };
+        failure.retrying = true;
+        self.emit(retry.effect());
+    }
+
+    pub fn retry_connection(&self) {
+        self.emit(StoreEffect::RetryConnection);
     }
 
     pub fn switcher_state(&self) -> &SessionSwitcherState {
@@ -1617,7 +1699,7 @@ impl SessionStore {
         if self.auxiliary_terminal_for(&parent).is_some() {
             return false;
         }
-        self.last_action_error = None;
+        self.last_action_failure = None;
         self.emit(StoreEffect::SpawnAuxiliary(SessionSpawnParams {
             kind: AgentKind::SHELL,
             cwd: session.cwd.clone(),
@@ -2114,16 +2196,18 @@ impl StoreRuntime {
                             .daemon_state = DaemonState::Connecting;
                     }
                     ConnectionState::Disconnected(error) => {
-                        state_store
-                            .write()
-                            .expect("session store lock poisoned")
-                            .daemon_state = DaemonState::Unreachable(error);
+                        let mut store = state_store.write().expect("session store lock poisoned");
+                        store.daemon_state = DaemonState::Unreachable(error);
+                        store.daemon_identity = None;
                     }
-                    ConnectionState::Connected(_) => {
-                        state_store
-                            .write()
-                            .expect("session store lock poisoned")
-                            .daemon_state = DaemonState::Connected;
+                    ConnectionState::Connected(identity) => {
+                        {
+                            let mut store =
+                                state_store.write().expect("session store lock poisoned");
+                            store.daemon_state = DaemonState::Connected;
+                            store.daemon_identity = Some(identity);
+                            store.last_action_failure = None;
+                        }
                         // The agent catalog first: `hydrate` runs the notification
                         // policy for every arriving session, and that policy reads
                         // descriptors for banner copy and approve keystrokes.
@@ -2256,6 +2340,7 @@ async fn run_effects(
     status_tx: broadcast::Sender<StatusTransition>,
 ) {
     while let Some(effect) = effects.recv().await {
+        let action_context = action_context(&effect);
         let force_snapshot = matches!(
             &effect,
             StoreEffect::SetActive(true) | StoreEffect::PublishSnapshot
@@ -2289,6 +2374,10 @@ async fn run_effects(
                 Err(error) => Err(error),
             },
             StoreEffect::SpawnAuxiliary(params) => client.spawn(params).await.map(|_| ()),
+            StoreEffect::RetryConnection => {
+                client.retry_now();
+                Ok(())
+            }
             StoreEffect::Migrate { id, target_host } => {
                 let destination = {
                     let locked = store.read().expect("session store lock poisoned");
@@ -2405,7 +2494,17 @@ async fn run_effects(
             }
         };
         let mut store = store.write().expect("session store lock poisoned");
-        store.last_action_error = result.err().map(|error| error.to_string());
+        if let Some(context) = action_context {
+            store.last_action_failure = match &result {
+                Ok(()) => None,
+                Err(error) => Some(ActionFailure {
+                    title: context.title.to_owned(),
+                    detail: error.to_string(),
+                    retrying: false,
+                    retry: context.retry,
+                }),
+            };
+        }
         let active = store.app_is_active;
         let activation_snapshot = force_snapshot.then(|| store.snapshot());
         drop(store);
@@ -2416,6 +2515,54 @@ async fn run_effects(
             let _ = change_tx.send(());
         }
     }
+}
+
+struct ActionContext {
+    title: &'static str,
+    retry: Option<RetryAction>,
+}
+
+fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
+    let (title, retry) = match effect {
+        StoreEffect::Remove(_) => ("Close session failed", None),
+        StoreEffect::Resume {
+            automatic: true, ..
+        } => ("Automatic resume failed", None),
+        StoreEffect::Resume {
+            automatic: false, ..
+        } => ("Resume session failed", None),
+        StoreEffect::Archive(_) => ("Archive session failed", None),
+        StoreEffect::Unarchive(_) => ("Restore session failed", None),
+        StoreEffect::Rename { id, title } => (
+            "Rename session failed",
+            Some(RetryAction::Rename {
+                id: id.clone(),
+                title: title.clone(),
+            }),
+        ),
+        StoreEffect::Spawn(_) => ("Create session failed", None),
+        StoreEffect::SpawnAuxiliary(_) => ("Open terminal failed", None),
+        StoreEffect::Migrate { .. } => ("Move session failed", None),
+        StoreEffect::SyncPrefs { host, host_name } => (
+            "Sync preferences failed",
+            Some(RetryAction::SyncPrefs {
+                host: host.clone(),
+                host_name: host_name.clone(),
+            }),
+        ),
+        StoreEffect::ReopenLast => ("Reopen session failed", None),
+        StoreEffect::UiChanged
+        | StoreEffect::PublishSnapshot
+        | StoreEffect::MarkSeen(_)
+        | StoreEffect::RetryConnection
+        | StoreEffect::LocateRepo { .. }
+        | StoreEffect::ListDirectories { .. }
+        | StoreEffect::SetActive(_)
+        | StoreEffect::ConfigureGovernor(_)
+        | StoreEffect::DetachAttachment(_)
+        | StoreEffect::StatusTransition(_) => return None,
+    };
+    Some(ActionContext { title, retry })
 }
 
 pub fn prefs_path_in_home(home: &Path) -> PathBuf {

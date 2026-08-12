@@ -39,6 +39,7 @@ fn session(value: &str, project: &str, created: f64) -> SessionRecord {
         agent_session_id: None,
         transcript_path: None,
         status: SessionStatus::Idle,
+        status_evidence: None,
         needs_input: None,
         resumability: Resumability::Live,
         parent: None,
@@ -1722,4 +1723,37 @@ fn inert_runtime_has_no_background_tasks_or_live_sessions() {
             .is_empty()
     );
     assert!(runtime.snapshots().borrow().sessions.is_empty());
+}
+
+#[test]
+fn action_retry_policy_only_replays_idempotent_operations() {
+    let rename = StoreEffect::Rename {
+        id: id("one"),
+        title: "New title".to_owned(),
+    };
+    let sync = StoreEffect::SyncPrefs {
+        host: "forge".to_owned(),
+        host_name: "Forge".to_owned(),
+    };
+    assert!(super::action_context(&rename).unwrap().retry.is_some());
+    assert!(super::action_context(&sync).unwrap().retry.is_some());
+
+    for unsafe_effect in [
+        StoreEffect::Remove(id("one")),
+        StoreEffect::Archive(id("one")),
+        StoreEffect::Unarchive(id("one")),
+        StoreEffect::Migrate {
+            id: id("one"),
+            target_host: Some("forge".to_owned()),
+        },
+        StoreEffect::ReopenLast,
+    ] {
+        assert!(
+            super::action_context(&unsafe_effect)
+                .expect("user action has failure context")
+                .retry
+                .is_none(),
+            "unsafe operation unexpectedly became replayable: {unsafe_effect:?}"
+        );
+    }
 }

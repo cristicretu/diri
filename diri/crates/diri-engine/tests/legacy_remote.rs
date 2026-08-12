@@ -53,6 +53,7 @@ fn record(id: &str, host: Option<&str>, agent_session_id: Option<&str>) -> Sessi
         // What the old transport left behind: a record that still claims to be
         // running, on a transport that no longer exists.
         status: SessionStatus::Working,
+        status_evidence: None,
         needs_input: None,
         resumability: Resumability::Live,
         parent: None,

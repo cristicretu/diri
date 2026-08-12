@@ -210,6 +210,7 @@ fn record(id: &str) -> diri_proto::SessionRecord {
         agent_session_id: None,
         transcript_path: None,
         status: SessionStatus::Starting,
+        status_evidence: None,
         needs_input: None,
         resumability: Resumability::NotResumable,
         parent: None,

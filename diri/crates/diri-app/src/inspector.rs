@@ -165,6 +165,7 @@ pub struct WorkbenchInspector {
     review_action_task: Option<Task<()>>,
     review_action_busy: bool,
     review_feedback: Option<(bool, String)>,
+    status_evidence_open: bool,
     ask_draft: Option<AskDraft>,
     ask_query: QueryEditor,
     ask_task: Option<Task<()>>,
@@ -246,6 +247,7 @@ impl WorkbenchInspector {
             review_action_task: None,
             review_action_busy: false,
             review_feedback: None,
+            status_evidence_open: false,
             ask_draft: None,
             ask_query: QueryEditor::default(),
             ask_task: None,
@@ -454,6 +456,7 @@ impl WorkbenchInspector {
             self.ask_draft = None;
             self.ask_feedback = None;
             self.ask_query.clear();
+            self.status_evidence_open = false;
             let workspace = (!context.remote).then(|| context.cwd.clone());
             self.code_viewer
                 .update(cx, |viewer, cx| viewer.set_workspace(workspace, cx));
@@ -964,6 +967,8 @@ impl WorkbenchInspector {
             .overflow_y_scroll()
             .child(hero);
 
+        content = content.child(self.render_status_evidence(session, colors, cx));
+
         if let Some(detail) = &session.needs_input {
             let risk_color = if detail.risk_hint == diri_proto::RiskHint::Destructive {
                 Ink::DANGER
@@ -1096,6 +1101,180 @@ impl WorkbenchInspector {
             .child(section_label("Details", colors))
             .child(details)
             .into_any_element()
+    }
+
+    fn render_status_evidence(
+        &self,
+        session: &SessionRecord,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let evidence = session
+            .status_evidence
+            .as_ref()
+            .filter(|evidence| evidence.status == session.status);
+        let open = self.status_evidence_open;
+        let mut disclosure = div()
+            .rounded(px(Radius::CARD))
+            .bg(colors.primary.alpha(0.025))
+            .border_1()
+            .border_color(colors.primary.alpha(0.055))
+            .overflow_hidden()
+            .child(
+                div()
+                    .id("toggle-status-evidence")
+                    .debug_selector(|| "STATUS_EVIDENCE_TOGGLE".to_owned())
+                    .min_h(px(42.0))
+                    .px(px(11.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .cursor_pointer()
+                    .hover(move |row| row.bg(colors.primary.alpha(0.04)))
+                    .child(sf_symbol(
+                        if open {
+                            "chevron.down"
+                        } else {
+                            "chevron.right"
+                        },
+                        9.5,
+                        colors.tertiary,
+                    ))
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .text_size(px(Typo::ROW.size))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(colors.primary)
+                                    .child("Why Diri thinks this"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(Typo::META.size))
+                                    .text_color(colors.tertiary)
+                                    .child(evidence.map_or(
+                                        "No decision evidence from this daemon build",
+                                        |evidence| {
+                                            crate::status_debug::source_name(evidence.source)
+                                        },
+                                    )),
+                            ),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.status_evidence_open = !this.status_evidence_open;
+                        cx.notify();
+                        cx.stop_propagation();
+                    })),
+            );
+
+        if !open {
+            return disclosure.into_any_element();
+        }
+
+        let mut details = div()
+            .px(px(11.0))
+            .pb(px(11.0))
+            .flex()
+            .flex_col()
+            .gap(px(7.0))
+            .border_t_1()
+            .border_color(colors.primary.alpha(0.055));
+        if let Some(evidence) = evidence {
+            details = details
+                .pt(px(10.0))
+                .child(
+                    div()
+                        .text_size(px(Typo::META.size))
+                        .line_height(px(16.0))
+                        .text_color(colors.secondary)
+                        .child(status_evidence_explanation(evidence.source)),
+                )
+                .child(status_evidence_row(
+                    "Signal",
+                    relative_time(evidence.signal_at.0),
+                    colors,
+                ));
+            if let Some(manifest) =
+                crate::status_debug::safe_identifier(evidence.manifest_id.as_deref())
+            {
+                let version =
+                    crate::status_debug::safe_identifier(evidence.manifest_version.as_deref());
+                details = details.child(status_evidence_row(
+                    "Manifest",
+                    version.map_or(manifest.clone(), |version| format!("{manifest}@{version}")),
+                    colors,
+                ));
+            }
+            if let Some(rule) =
+                crate::status_debug::safe_identifier(evidence.matched_rule_id.as_deref())
+            {
+                details = details.child(status_evidence_row("Matched rule", rule, colors));
+            }
+            if evidence.startup_grace_active {
+                details = details.child(status_evidence_row(
+                    "Startup grace",
+                    "Active — holding weak early signals".to_owned(),
+                    colors,
+                ));
+            }
+            if evidence.anti_flicker_active {
+                details = details.child(status_evidence_row(
+                    "Anti-flicker",
+                    "Active — waiting for confirmation".to_owned(),
+                    colors,
+                ));
+            }
+            if let Some(reason) = evidence.fallback_reason {
+                details = details.child(status_evidence_row(
+                    "Fallback",
+                    crate::status_debug::fallback_name(reason).to_owned(),
+                    colors,
+                ));
+            }
+        } else {
+            details = details.pt(px(10.0)).child(
+                div()
+                    .text_size(px(Typo::META.size))
+                    .line_height(px(16.0))
+                    .text_color(colors.secondary)
+                    .child("This session record predates decision evidence. Its normal status remains available above."),
+            );
+        }
+
+        let report = crate::status_debug::StatusDebugInfo::from_session(session)
+            .as_str()
+            .to_owned();
+        details = details.child(
+            div()
+                .id("copy-status-debug-info")
+                .mt(px(3.0))
+                .h(px(28.0))
+                .px(px(9.0))
+                .self_start()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .rounded(px(Radius::ROW))
+                .cursor_pointer()
+                .bg(colors.primary.alpha(0.065))
+                .hover(move |button| button.bg(colors.primary.alpha(0.10)))
+                .text_size(px(Typo::META.size))
+                .font_weight(FontWeight::MEDIUM)
+                .child(sf_symbol("doc.on.doc", 10.5, colors.secondary))
+                .child("Copy status debug info")
+                .on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(report.clone()));
+                    cx.stop_propagation();
+                }),
+        );
+        disclosure = disclosure.child(details);
+        disclosure.into_any_element()
     }
 
     fn render_git_summary(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
@@ -2754,6 +2933,20 @@ impl Render for WorkbenchInspector {
         ));
         let direction = self.tab_direction;
         let ask_composer = self.render_ask_composer(colors, cx);
+        let body = div().relative().size_full().child(body);
+        let body = if cx.reduce_motion() {
+            body.into_any_element()
+        } else {
+            body.with_animation(
+                transition_id,
+                Animation::new(Duration::from_millis(190)).with_easing(ease_out_quint()),
+                move |body, delta| {
+                    body.left(px(direction * (1.0 - delta) * 8.0))
+                        .opacity(0.70 + 0.30 * delta)
+                },
+            )
+            .into_any_element()
+        };
         div()
             .id("workbench-inspector")
             .size_full()
@@ -2765,18 +2958,55 @@ impl Render for WorkbenchInspector {
             .bg(colors.sidebar_surface())
             .text_color(colors.primary)
             .child(self.render_header(session.as_ref(), colors, cx))
-            .child(div().min_h(px(0.0)).flex_1().overflow_hidden().child(
-                div().relative().size_full().child(body).with_animation(
-                    transition_id,
-                    Animation::new(Duration::from_millis(190)).with_easing(ease_out_quint()),
-                    move |body, delta| {
-                        body.left(px(direction * (1.0 - delta) * 8.0))
-                            .opacity(0.70 + 0.30 * delta)
-                    },
-                ),
-            ))
+            .child(div().min_h(px(0.0)).flex_1().overflow_hidden().child(body))
             .when_some(ask_composer, |panel, composer| panel.child(composer))
     }
+}
+
+fn status_evidence_explanation(source: diri_proto::StatusEvidenceSource) -> &'static str {
+    match source {
+        diri_proto::StatusEvidenceSource::Hook => {
+            "A structured lifecycle hook from the agent drove this status."
+        }
+        diri_proto::StatusEvidenceSource::Notify => {
+            "A structured completion notification from the agent drove this status."
+        }
+        diri_proto::StatusEvidenceSource::ScreenRule => {
+            "A privacy-safe manifest rule matched the terminal state; no screen content is included."
+        }
+        diri_proto::StatusEvidenceSource::ProcessLiveness => {
+            "The agent exposes process-only status, so process activity or exit is authoritative."
+        }
+        diri_proto::StatusEvidenceSource::Staleness => {
+            "Authoritative signals stopped arriving, so Diri fell back to unknown instead of guessing."
+        }
+        diri_proto::StatusEvidenceSource::Unknown => {
+            "This daemon reported an evidence source this app does not recognize yet."
+        }
+    }
+}
+
+fn status_evidence_row(label: &'static str, value: String, colors: SemanticColors) -> AnyElement {
+    div()
+        .flex()
+        .items_start()
+        .gap(px(8.0))
+        .text_size(px(Typo::META.size))
+        .child(
+            div()
+                .w(px(86.0))
+                .flex_none()
+                .text_color(colors.tertiary)
+                .child(label),
+        )
+        .child(
+            div()
+                .min_w(px(0.0))
+                .flex_1()
+                .text_color(colors.secondary)
+                .child(value),
+        )
+        .into_any_element()
 }
 
 fn section_label(label: &'static str, colors: SemanticColors) -> AnyElement {
