@@ -471,11 +471,11 @@ impl UtilitySurfaces {
     }
 
     fn resume_history(&mut self, entry: HistoryEntry, cx: &mut Context<Self>) {
-        let Some(params) = crate::history::resume_spawn(&entry) else {
+        if !entry.cwd_exists || !Path::new(&entry.cwd).is_dir() {
             self.history_error = Some("The conversation folder is no longer available".to_owned());
             cx.notify();
             return;
-        };
+        }
         self.history_loading = true;
         self.history_error = None;
         let client = Arc::clone(self.store_runtime.client());
@@ -483,7 +483,7 @@ impl UtilitySurfaces {
         cx.spawn(async move |this, cx| {
             let task = runtime.spawn(async move {
                 client.wait_until_connected(Duration::from_secs(5)).await?;
-                client.spawn(params).await
+                crate::history::resume(&client, &entry).await
             });
             let result = match task.await {
                 Ok(result) => result.map_err(|error| error.to_string()),

@@ -708,9 +708,20 @@ impl DaemonClient {
         &self,
         entry: HistoryEntry,
     ) -> Result<SessionRecord, ClientError> {
+        self.resume_from_history_with_prompt(entry, None).await
+    }
+
+    pub async fn resume_from_history_with_prompt(
+        &self,
+        entry: HistoryEntry,
+        initial_prompt: Option<String>,
+    ) -> Result<SessionRecord, ClientError> {
         self.typed(
             Method::SESSION_RESUME_FROM_HISTORY,
-            &ResumeFromHistoryParams { entry },
+            &ResumeFromHistoryParams {
+                entry,
+                initial_prompt,
+            },
         )
         .await
     }

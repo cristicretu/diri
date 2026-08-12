@@ -357,8 +357,11 @@ pub struct SessionHistoryResult {
 pub type SessionHistoryParams = EmptyParams;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ResumeFromHistoryParams {
     pub entry: HistoryEntry,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_prompt: Option<String>,
 }
 
 pub type ResumeFromHistoryResult = SessionRecord;
