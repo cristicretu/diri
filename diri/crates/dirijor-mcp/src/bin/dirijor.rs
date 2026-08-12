@@ -1121,6 +1121,7 @@ mod tests {
             transcript_path: None,
             status: SessionStatus::Idle,
             needs_input: None,
+            status_evidence: None,
             resumability: Resumability::Live,
             parent: None,
             created_at: DateMillis(0.0),
