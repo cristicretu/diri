@@ -321,6 +321,29 @@ belongs to exactly one top-level Project. The same path on two SSH hosts is two
 different Projects, and project-level Agent creation inherits that Project's
 host and directory.
 
+## Agent executable discovery
+
+Agent availability and executable overrides are target-specific: local and
+each configured SSH host have independent catalog state. The Engine owns the
+catalog and preferences; the Helper only reports filesystem facts from the
+remote account.
+
+Protocol 1.3 adds the required `executable-discovery` capability. One bounded
+`executables` request carries every bundled manifest binary and any configured
+override. The Helper captures the login environment exactly once, resolves all
+queries directly from that PATH without spawning `which` per Agent, validates
+manual paths as executable regular files, and returns both the detected and
+configured resolution. An Agent launch reuses that same captured environment
+and cwd, so discovery does not add a second login-shell startup.
+
+The Engine caches each target catalog for five minutes and single-flights
+concurrent scans per target. Menus render only cached facts and never execute
+filesystem or SSH work. Missing Agents stay in Settings for discovery and
+manual binding but do not appear in quick-create menus. A valid manual path has
+precedence over PATH; an invalid override is reported while a valid PATH result
+remains usable. Executable preferences and quick-create visibility are stored
+in an owner-only, additive Engine configuration file.
+
 ## Holder and process lifecycle
 
 The Holder owns the PTY master, the Agent child/process group, terminal state,
@@ -398,10 +421,12 @@ and sequence. Scrollback is bounded to 4 MiB and served on demand through
 `Scroll`. Raw output is bounded to 32 MiB.
 
 The PTY reader must never block on a client. The Holder uses bounded queues. It
-coalesces active output for no more than 16 ms. When no client is attached, it
-continues parsing terminal state but does not construct or serialize diffs. If
-an attached client falls behind, stale updates are discarded and the connection
-is reseeded from a complete snapshot after reconnect.
+coalesces background output for no more than 16 ms, while up to two grid
+publications after interactive input bypass that wait (one trailing publication
+may already be in flight before the actual response). When no client is
+attached, it continues parsing terminal state but does not construct or
+serialize diffs. If an attached client falls behind, stale updates are discarded
+and the connection is reseeded from a complete snapshot after reconnect.
 
 One owner/event loop handles PTY drain, terminal parsing, diff construction, and
 attach writes. The hot path does not put an `Arc<Mutex<Terminal>>` across tasks.
@@ -426,9 +451,10 @@ are a future enhancement and are not part of the completed baseline.
 
 ## Wire protocol
 
-`diri-proto::remote_pty` is the versioned protocol authority. Protocol 1.2
+`diri-proto::remote_pty` is the versioned protocol authority. Protocol 1.3
 declares terminal, session management, environment capture, directory listing,
-persistence probing, and atomic activation as required capabilities.
+batched executable discovery, persistence probing, and atomic activation as
+required capabilities.
 
 The protocol includes:
 
@@ -493,19 +519,19 @@ Release builds must satisfy the local Helper/UDS gates:
 ```text
 FullSnapshot p90          <= 100 ms
 input-to-PTY p95          <= 10 ms
-output-to-diff p90        <= 50 ms
+output-to-diff p90        <= 8 ms
 loopback interaction p50 <= 75 ms
 loopback interaction p90 <= 150 ms
 ```
 
-The 2026-08-09 local release sample measured:
+The 2026-08-11 local release sample measured:
 
 ```text
-FullSnapshot p90          1 us
-input-to-PTY p95          667 us
-output-to-diff p90        17.319 ms
-loopback interaction p50 179 us
-loopback interaction p90 401 us
+FullSnapshot p90          0 us
+input-to-PTY p95          138 us
+output-to-diff p90        13 us
+loopback interaction p50 76 us
+loopback interaction p90 99 us
 ```
 
 Measured values are printed in CI so regressions are visible rather than hidden
@@ -614,6 +640,8 @@ The completed refactor includes all of the following:
 - account/cwd environment capture and structured `argv`/`cwd`/environment
   execution;
 - bounded remote directory selection and host-aware project identity;
+- target-aware local/remote Agent discovery, manual executable binding, and
+  shared availability-filtered quick-create surfaces;
 - location-aware working-tree inspection with non-Git compatibility;
 - explicit persistence probing with no privilege escalation;
 - native artifacts and release gates for Linux x86_64, Linux aarch64, and

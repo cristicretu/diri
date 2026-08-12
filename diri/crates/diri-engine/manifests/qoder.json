@@ -15,6 +15,11 @@
       "qoder-cli"
     ],
     "firstClass": true,
+    "setup": {
+      "url": "https://docs.qoder.com/en/cli/quick-start",
+      "installHint": "Install Qoder CLI with its official installer or a supported package manager.",
+      "signInHint": "Run qodercli, then use /login."
+    },
     "statusAuthority": "screen",
     "binary": "qodercli",
     "resume": {

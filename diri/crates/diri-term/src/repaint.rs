@@ -13,7 +13,10 @@ pub struct RepaintPacer {
     minimum_interval: Duration,
     last_repaint: Option<Duration>,
     scheduled_for: Option<Duration>,
+    interactive_damage_budget: u8,
 }
+
+const INTERACTIVE_DAMAGE_BUDGET: u8 = 2;
 
 impl RepaintPacer {
     #[must_use]
@@ -22,7 +25,18 @@ impl RepaintPacer {
             minimum_interval,
             last_repaint: None,
             scheduled_for: None,
+            interactive_damage_budget: 0,
         }
+    }
+
+    /// Make the next two damage publications paint immediately.
+    ///
+    /// Keyboard input uses this to avoid making its echo wait behind a timer
+    /// armed for unrelated streaming output. Two covers one trailing update
+    /// already in flight plus the actual response. The existing timer becomes
+    /// a harmless no-op when it fires.
+    pub fn prioritize_interactive_damage(&mut self) {
+        self.interactive_damage_budget = INTERACTIVE_DAMAGE_BUDGET;
     }
 
     /// Record newly applied damage.
@@ -30,6 +44,12 @@ impl RepaintPacer {
     /// The first frame paints immediately. Bursts receive one trailing timer,
     /// so every grid update reaches the buffer while host rendering is capped.
     pub fn on_damage(&mut self, now: Duration) -> RepaintAction {
+        if self.interactive_damage_budget > 0 {
+            self.interactive_damage_budget -= 1;
+            self.last_repaint = Some(now);
+            self.scheduled_for = None;
+            return RepaintAction::RepaintNow;
+        }
         let Some(last_repaint) = self.last_repaint else {
             self.last_repaint = Some(now);
             return RepaintAction::RepaintNow;
@@ -106,5 +126,32 @@ mod tests {
             repaint_count >= 19,
             "pacing should remain responsive, got only {repaint_count} paints"
         );
+    }
+
+    #[test]
+    fn interactive_damage_bypasses_an_armed_background_timer() {
+        let interval = Duration::from_millis(16);
+        let mut pacer = RepaintPacer::new(interval);
+        assert_eq!(pacer.on_damage(Duration::ZERO), RepaintAction::RepaintNow);
+        assert_eq!(
+            pacer.on_damage(Duration::from_millis(2)),
+            RepaintAction::Schedule(Duration::from_millis(14))
+        );
+
+        pacer.prioritize_interactive_damage();
+        assert_eq!(
+            pacer.on_damage(Duration::from_millis(4)),
+            RepaintAction::RepaintNow
+        );
+        assert_eq!(
+            pacer.on_damage(Duration::from_millis(5)),
+            RepaintAction::RepaintNow
+        );
+        assert_eq!(
+            pacer.on_damage(Duration::from_millis(6)),
+            RepaintAction::Schedule(Duration::from_millis(15))
+        );
+        assert!(!pacer.on_timer(Duration::from_millis(16)));
+        assert!(pacer.on_timer(Duration::from_millis(21)));
     }
 }

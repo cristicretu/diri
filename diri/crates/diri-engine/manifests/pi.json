@@ -13,6 +13,10 @@
       "pi"
     ],
     "firstClass": false,
+    "setup": {
+      "url": "https://github.com/earendil-works/pi",
+      "installHint": "Follow Pi's coding-agent installation guide."
+    },
     "statusAuthority": "process",
     "binary": "pi",
     "resume": {

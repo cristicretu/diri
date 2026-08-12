@@ -40,7 +40,15 @@ pub fn ensure_daemon_running(socket_path: &Path) {
         return;
     }
 
-    let daemon = resolve_daemon_path();
+    let boot_log = boot_log_path();
+    ensure_daemon_running_with(socket_path, resolve_daemon_path(), boot_log.as_deref());
+}
+
+fn ensure_daemon_running_with(
+    socket_path: &Path,
+    daemon: Option<PathBuf>,
+    boot_log: Option<&Path>,
+) {
     match probe_daemon(socket_path) {
         Ok(hello) if hello.engine_kind.as_deref() == Some(RUST_ENGINE_KIND) => {
             let Some(daemon) = daemon.as_ref() else {
@@ -66,7 +74,7 @@ pub fn ensure_daemon_running(socket_path: &Path) {
                 hello.build,
                 daemon.display()
             );
-            if let Err(error) = stop_daemon_for_upgrade(socket_path) {
+            if let Err(error) = stop_daemon_for_upgrade(socket_path, Some(hello.pid)) {
                 eprintln!(
                     "diri: could not stop the outdated Rust Engine at {}: {error}",
                     socket_path.display()
@@ -95,7 +103,7 @@ pub fn ensure_daemon_running(socket_path: &Path) {
                 );
                 return;
             }
-            if let Err(error) = stop_daemon_for_upgrade(socket_path) {
+            if let Err(error) = stop_daemon_for_upgrade(socket_path, Some(hello.pid)) {
                 eprintln!(
                     "diri: could not stop the previous daemon at {}: {error}",
                     socket_path.display()
@@ -131,7 +139,7 @@ pub fn ensure_daemon_running(socket_path: &Path) {
                 eprintln!("diri: no bundled Engine to replace it with; leaving it alone");
                 return;
             }
-            if let Err(error) = stop_daemon_for_upgrade(socket_path) {
+            if let Err(error) = stop_daemon_for_upgrade(socket_path, None) {
                 eprintln!(
                     "diri: could not stop the unidentified Engine at {}: {error}",
                     socket_path.display()
@@ -149,7 +157,7 @@ pub fn ensure_daemon_running(socket_path: &Path) {
     }
 
     match daemon {
-        Some(daemon) => match spawn_detached(&daemon) {
+        Some(daemon) => match spawn_detached(&daemon, boot_log) {
             Ok(()) => eprintln!("diri: launched bundled daemon at {}", daemon.display()),
             Err(err) => {
                 eprintln!(
@@ -169,11 +177,23 @@ fn daemon_needs_refresh(hello: &HelloResult, expected_hash: &str) -> bool {
     hello.executable_hash.as_deref() != Some(expected_hash)
 }
 
-fn stop_daemon_for_upgrade(socket_path: &Path) -> io::Result<()> {
+fn stop_daemon_for_upgrade(socket_path: &Path, pid: Option<i32>) -> io::Result<()> {
     control_request(socket_path, 2, Method::DAEMON_SHUTDOWN, None)?;
     for _ in 0..30 {
         if !socket_is_live(socket_path) {
-            return Ok(());
+            if let Some(pid) = pid {
+                if !process_is_alive(pid) {
+                    return Ok(());
+                }
+            } else {
+                // Old Engines that predate Hello do not reveal a pid. Give
+                // their singleton lock one scheduling turn after the socket is
+                // removed, then verify that the endpoint stayed down.
+                std::thread::sleep(Duration::from_millis(100));
+                if !socket_is_live(socket_path) {
+                    return Ok(());
+                }
+            }
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -181,6 +201,16 @@ fn stop_daemon_for_upgrade(socket_path: &Path) -> io::Result<()> {
         io::ErrorKind::TimedOut,
         "the outdated Engine did not release its socket within 3 seconds",
     ))
+}
+
+fn process_is_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 does not deliver a signal; it only probes whether this
+    // process id still exists and is visible to the current user.
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 fn executable_sha256(path: &Path) -> io::Result<String> {
@@ -318,16 +348,16 @@ fn resolve_daemon_path_from(
 /// Spawn the Engine in its own process group so it outlives diri, with
 /// stdout/stderr appended to `dirijord-rs.boot.log`. We never wait on the
 /// child: the daemon is meant to run independently.
-fn spawn_detached(daemon: &Path) -> io::Result<()> {
+fn spawn_detached(daemon: &Path, boot_log: Option<&Path>) -> io::Result<()> {
     let mut command = Command::new(daemon);
     command.stdin(Stdio::null());
 
-    match boot_log_path() {
+    match boot_log {
         Some(log_path) => {
             let out = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(&log_path)?;
+                .open(log_path)?;
             let err = out.try_clone()?;
             command.stdout(Stdio::from(out)).stderr(Stdio::from(err));
         }
@@ -465,10 +495,56 @@ mod tests {
         let socket = tmp.path().join("daemon.sock");
         let server = serve_control(&socket, vec![serde_json::json!({})]);
 
-        stop_daemon_for_upgrade(&socket).expect("fixture daemon releases its listener");
+        stop_daemon_for_upgrade(&socket, None).expect("fixture daemon releases its listener");
         assert_eq!(
             server.join().expect("fixture server"),
             vec![Method::DAEMON_SHUTDOWN]
+        );
+    }
+
+    #[test]
+    fn an_outdated_live_daemon_is_replaced_by_the_resolved_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("daemon.sock");
+        let marker = tmp.path().join("new-daemon-launched");
+        let daemon = tmp.path().join("dirijord-rs");
+        std::fs::write(
+            &daemon,
+            format!("#!/bin/sh\nprintf launched > '{}'\n", marker.display()),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&daemon).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&daemon, permissions).unwrap();
+
+        let server = serve_control(
+            &socket,
+            vec![
+                serde_json::json!({
+                    "proto": diri_proto::WIRE_VERSION,
+                    "build": "outdated",
+                    "pid": i32::MAX,
+                    "engineKind": RUST_ENGINE_KIND,
+                    "executableHash": "old-bytes",
+                }),
+                serde_json::json!({}),
+            ],
+        );
+
+        ensure_daemon_running_with(&socket, Some(daemon), None);
+        assert_eq!(
+            server.join().expect("fixture server"),
+            vec![Method::HELLO, Method::DAEMON_SHUTDOWN]
+        );
+        for _ in 0..50 {
+            if marker.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read_to_string(marker).expect("new daemon marker"),
+            "launched"
         );
     }
 

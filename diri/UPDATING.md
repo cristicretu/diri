@@ -44,15 +44,19 @@ feed as an asset, so one stable URL works with no server to run.
 
 ## What the user sees
 
-Checks are automatic (20 s after launch, then every 6 h, toggleable in
-**Settings → General → Updates**). Downloading and restarting are not:
+Checks, downloads, and verification are automatic (20 s after launch, then
+every 6 h, toggleable in **Settings → General → Updates**). Installation waits
+for a safe app boundary and never interrupts a live session:
 
-1. A background check finds a release → the sidebar footer lights an
-   **Update to 0.2.0** pill. Nothing else happens.
-2. Click it → **Downloading… 43%** → the bundle is verified and staged.
-3. Click **Restart to update to 0.2.0** → diri hands off to a helper and quits.
+1. A background check finds a release and downloads it from GitHub Releases.
+2. The bundle is checksum-checked, signature-checked, and staged; the sidebar
+   footer shows **Restart to update to 0.2.0**.
+3. A normal quit installs it without reopening diri. The next launch is the
+   new app. Clicking **Restart to update to 0.2.0** installs and relaunches it
+   immediately.
 
-diri holds live agent sessions, so it never relaunches itself uninvited.
+diri holds live agent sessions, so it never quits or relaunches itself
+uninvited.
 **⌘K → Check for Updates…** and the version row in the account popover both
 run a manual check, which reports "up to date" rather than staying silent.
 
@@ -61,10 +65,10 @@ run a manual check, which reports "up to date" rather than staying silent.
 A process cannot reliably delete the bundle it is executing from, so
 `install.rs` generates a small `/bin/sh` helper, spawns it detached in its own
 process group, and quits. The helper waits (up to 60 s) for diri's pid to
-disappear, renames the old bundle to `diri.app.diri-previous`, unpacks the
-staged one with `ditto`, and relaunches. If the unpack fails it restores the
-old bundle and relaunches that instead — an interrupted install leaves a
-working app, never a hole.
+disappear, renames the old bundle to `diri.app.diri-previous`, and copies the
+staged bundle into place with `ditto`. An explicit update restart relaunches it;
+a normal quit does not. If the copy fails it restores the old bundle — an
+interrupted install leaves a working app, never a hole.
 
 Staging lives in `~/Library/Caches/diri/updates/<version>/`, with the helper's
 log at `install.log` there. Directories for versions at or below the running
@@ -87,7 +91,7 @@ diri/scripts/release.sh 0.4.1
 
 The script refuses to release a version that does not match the manifest, a
 dirty checkout, or a commit other than the current `origin/main`. It runs
-clippy + tests, builds a universal binary, bundles the Swift daemon, signs it,
+clippy + tests, builds the universal Rust executables, signs them,
 **notarizes and staples the .app first**, then builds and notarizes the DMG
 from that stapled bundle, produces the update zip, rebuilds `appcast.json` from
 the currently published feed, generates `SHA256SUMS` and a reviewed dependency
@@ -113,15 +117,19 @@ Release notes come from `dist/notes-<version>.md`. The script writes a default
 one if it is missing, so writing that file first — and re-running — is how you
 customize them.
 
-### The bundled daemon does not update with the app
+### The bundled Engine updates safely with the app
 
-`diri.app` carries `dirijord` + `dirijord-holder` in `Contents/Resources/bin`,
-and the update zip carries them too — but `daemon_launch` is launch-only by
-design (PLAN.md §3.1: never restart a live daemon, to avoid ping-pong with a
-still-installed `Dirijor.app`). After a self-update the *old* daemon keeps
-running from the replaced bundle, so a release that changes `dirijord` does not
-take effect until that daemon is restarted by other means. The app half updates
-immediately; the daemon half waits.
+`diri.app` carries `dirijord-rs` + `diri-holder` in `Contents/Resources/bin`,
+and the update zip carries those exact binaries. On every launch, the app
+verifies the running Engine's identity and compares its executable hash with
+the bundled Engine. A mismatch asks the old process to persist and shut down,
+waits for it to exit, then launches the new binary. Holder processes retain
+their PTYs across that handoff, so updating the Engine does not terminate live
+agent sessions.
+
+This is content-based rather than version-string-based: rebuilding the same app
+version with different Engine bytes still refreshes the Engine, while an exact
+match avoids needless churn.
 
 The canonical release tag is `v<version>`. `gh release create` creates that tag
 at the verified `origin/main` commit; do not create a second `diri-v<version>`
@@ -149,8 +157,10 @@ The acceptance test is that an old build updates itself:
 
 1. Keep a copy of the previous `diri.app` (or install the previous DMG).
 2. Launch it and run **⌘K → Check for Updates…**.
-3. The pill should offer the new version; click through download and restart.
-4. Confirm the relaunched app reports the new version in the account popover.
+3. Wait for the pill to reach **Restart to update**, then click it.
+4. Confirm the relaunched app reports the new version in the account popover,
+   its Hello response reports the new bundled Engine hash, and every session
+   that was live before the restart is still present and interactive.
 
 To rehearse against a staging feed before publishing, point the app at one:
 
@@ -173,8 +183,8 @@ be a real notarized bundle.
   published zip's contents.
 - **"diri can't write to its own folder."** The app is in `/Applications` on a
   machine where this user is not an admin. Download the DMG by hand.
-- **"Couldn't reach the releases host."** Usually the Basic-auth password was
-  rotated without shipping a new build; old installs must redownload.
+- **"Couldn't reach the releases host."** Confirm GitHub is reachable and that
+  `releases/latest/download/appcast.json` resolves for the public repository.
 - **The pill never appears.** Confirm the feed lists a strictly-newer version
   than `CARGO_PKG_VERSION` and that its `minimum_system_version` is not above
   this machine's `sw_vers -productVersion`.

@@ -13,6 +13,11 @@
       "openai-codex"
     ],
     "firstClass": true,
+    "setup": {
+      "url": "https://developers.openai.com/codex/cli/",
+      "installHint": "Follow OpenAI's Codex CLI installation guide.",
+      "signInHint": "Run codex and choose Sign in with ChatGPT or another offered method."
+    },
     "statusAuthority": "screen",
     "binary": "codex",
     "returnToLoginShell": true,

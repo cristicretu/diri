@@ -108,11 +108,9 @@ impl SessionSurfaces {
         }
     }
 
-    pub(crate) fn open_overview(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_overview(&mut self, cx: &mut Context<Self>) {
         let mut store = self.store.write().expect("session store lock poisoned");
-        if !store.overview_state().is_visible() {
-            store.toggle_overview();
-        }
+        store.toggle_overview();
         cx.notify();
     }
 }
@@ -186,13 +184,6 @@ impl SessionSurfaces {
         }
 
         let modifiers = event.keystroke.modifiers;
-        if event.keystroke.key == "o" && modifiers.platform && modifiers.shift {
-            store.toggle_overview();
-            cx.stop_propagation();
-            cx.notify();
-            return;
-        }
-
         if !store.overview_state().is_visible() {
             if event.keystroke.key == "escape" && !store.sidebar_selection().is_empty() {
                 // Match Swift: clear Finder-style sidebar gathering, but do not
@@ -1520,6 +1511,7 @@ mod tests {
             agent_session_id: None,
             transcript_path: None,
             status: SessionStatus::Working,
+            status_evidence: None,
             needs_input: None,
             resumability: Resumability::Live,
             parent: None,
@@ -1554,6 +1546,7 @@ mod tests {
                     root: "/work/overview".into(),
                     name: "Overview".into(),
                     pinned_order: None,
+                    host: None,
                 }],
             });
         runtime

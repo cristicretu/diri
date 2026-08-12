@@ -21,6 +21,7 @@ use std::time::{Duration, SystemTime};
 
 use diri_proto::{
     ExitInfo, ExitReason, NeedsInputDetail, NeedsInputKind, NeedsInputSource, SessionStatus,
+    StatusEvidence, StatusEvidenceSource, StatusFallbackReason,
 };
 
 use crate::detect::{ManifestState, ScreenObservation, redact};
@@ -108,6 +109,10 @@ pub enum StatusSignal {
 pub struct ReducerOutcome {
     /// Set when the canonical status changed.
     pub status_change: Option<SessionStatus>,
+    /// A privacy-safe explanation of the canonical status. Emitted only when
+    /// its structured meaning changes, so evidence does not turn every screen
+    /// scan into a persisted/UI record update.
+    pub status_evidence: Option<StatusEvidence>,
     /// Set when a needs-input detail was produced or updated.
     pub needs_input: Option<NeedsInputDetail>,
     /// Set when a turn just completed.
@@ -142,6 +147,7 @@ struct InternalState {
     // Screen belief.
     screen_belief: Option<ManifestState>,
     last_screen_seq: Option<u64>,
+    last_matched_rule_id: Option<String>,
 
     /// A `skip` screen (transcript viewer, model picker) is being held.
     skip_active: bool,
@@ -166,6 +172,7 @@ impl InternalState {
             blocker_miss_scans: 0,
             screen_belief: None,
             last_screen_seq: None,
+            last_matched_rule_id: None,
             skip_active: false,
             responding_since: None,
             pending_needs_input: None,
@@ -178,6 +185,9 @@ pub struct StatusReducer {
     authority: Authority,
     timing: ReducerTiming,
     state: InternalState,
+    manifest_id: Option<String>,
+    manifest_version: Option<String>,
+    evidence: Option<StatusEvidence>,
 }
 
 impl StatusReducer {
@@ -187,7 +197,23 @@ impl StatusReducer {
             authority,
             timing: ReducerTiming::default(),
             state: InternalState::new(spawned_at),
+            manifest_id: None,
+            manifest_version: None,
+            evidence: None,
         }
+    }
+
+    /// Associates the reducer with manifest metadata safe to expose over the
+    /// control protocol. Manifest contents and terminal captures stay inside
+    /// the detection engine.
+    pub fn with_manifest(
+        mut self,
+        id: impl Into<String>,
+        version: Option<impl Into<String>>,
+    ) -> Self {
+        self.manifest_id = Some(id.into());
+        self.manifest_version = version.map(Into::into);
+        self
     }
 
     pub fn with_timing(mut self, timing: ReducerTiming) -> Self {
@@ -201,6 +227,10 @@ impl StatusReducer {
 
     pub fn authority(&self) -> Authority {
         self.authority
+    }
+
+    pub fn evidence(&self) -> Option<&StatusEvidence> {
+        self.evidence.as_ref()
     }
 
     pub fn active_subagents(&self) -> usize {
@@ -240,6 +270,13 @@ impl StatusReducer {
                 }),
                 &mut outcome,
             );
+            self.publish_evidence(
+                StatusEvidenceSource::ProcessLiveness,
+                None,
+                Some(StatusFallbackReason::ProcessExited),
+                now,
+                &mut outcome,
+            );
             return outcome;
         }
 
@@ -251,9 +288,30 @@ impl StatusReducer {
                     self.set_status(SessionStatus::Working, &mut outcome);
                 }
                 self.state.last_signal_at = now;
+                self.publish_evidence(
+                    StatusEvidenceSource::ProcessLiveness,
+                    None,
+                    Some(StatusFallbackReason::ProcessOnly),
+                    now,
+                    &mut outcome,
+                );
             }
             return outcome;
         }
+
+        let evidence_hint = match &signal {
+            StatusSignal::ClaudeHook { .. } => Some((StatusEvidenceSource::Hook, None, None)),
+            StatusSignal::CodexTurnComplete => Some((StatusEvidenceSource::Notify, None, None)),
+            StatusSignal::Screen(observation) => Some((
+                StatusEvidenceSource::ScreenRule,
+                Some(observation.matched_rule_id.clone()),
+                None,
+            )),
+            StatusSignal::Tick => None,
+            StatusSignal::PtyOutputActivity
+            | StatusSignal::UserKeystroke
+            | StatusSignal::ProcessExit { .. } => None,
+        };
 
         match signal {
             StatusSignal::ProcessExit { .. } => {} // handled above
@@ -279,7 +337,120 @@ impl StatusReducer {
             StatusSignal::Tick => self.handle_tick(now, &mut outcome),
         }
 
+        if self.status == SessionStatus::Unknown {
+            self.publish_evidence(
+                StatusEvidenceSource::Staleness,
+                None,
+                Some(StatusFallbackReason::StaleSignals),
+                now,
+                &mut outcome,
+            );
+        } else if let Some((source, rule, fallback)) = evidence_hint {
+            let source_is_authoritative = outcome.status_change.is_some()
+                || (source == StatusEvidenceSource::ScreenRule
+                    && self.authority == Authority::ScreenPrimary)
+                || matches!(self.status, SessionStatus::NeedsInput(_))
+                || self.state.idle_candidate_since.is_some();
+            if source_is_authoritative {
+                self.publish_evidence(source, rule, fallback, now, &mut outcome);
+            }
+        } else if self.status == SessionStatus::Starting {
+            self.publish_evidence(
+                StatusEvidenceSource::ProcessLiveness,
+                None,
+                Some(StatusFallbackReason::StartupGrace),
+                now,
+                &mut outcome,
+            );
+        } else if outcome.status_change.is_some()
+            && let Some(previous) = self.evidence.clone()
+            && previous.anti_flicker_active
+            && matches!(
+                previous.source,
+                StatusEvidenceSource::Hook | StatusEvidenceSource::Notify
+            )
+        {
+            // The Tick only closes an anti-flicker window opened by this
+            // strong signal. A previously matched screen rule may describe
+            // the old status, so the initiating hook/notify wins here.
+            self.publish_evidence(
+                previous.source,
+                previous.matched_rule_id,
+                previous.fallback_reason,
+                now,
+                &mut outcome,
+            );
+        } else if outcome.status_change.is_some()
+            && let Some(rule) = self.state.last_matched_rule_id.clone()
+        {
+            // A Tick can commit an already-observed screen decision after the
+            // startup grace or anti-flicker window. Preserve that rule rather
+            // than labelling the timer itself as the authority.
+            self.publish_evidence(
+                StatusEvidenceSource::ScreenRule,
+                Some(rule),
+                None,
+                now,
+                &mut outcome,
+            );
+        } else if outcome.status_change.is_some()
+            && let Some(previous) = self.evidence.clone()
+        {
+            // A delayed hook/notify idle decision is committed by a Tick, but
+            // the timer is not the reason for the decision. Carry the source
+            // which opened the anti-flicker window into the final status.
+            self.publish_evidence(
+                previous.source,
+                previous.matched_rule_id,
+                previous.fallback_reason,
+                now,
+                &mut outcome,
+            );
+        }
+
         outcome
+    }
+
+    fn publish_evidence(
+        &mut self,
+        source: StatusEvidenceSource,
+        matched_rule_id: Option<String>,
+        fallback_reason: Option<StatusFallbackReason>,
+        now: SystemTime,
+        outcome: &mut ReducerOutcome,
+    ) {
+        let startup_grace_active = self.status == SessionStatus::Starting
+            && now
+                .duration_since(self.state.spawned_at)
+                .unwrap_or_default()
+                < self.timing.startup_grace;
+        let anti_flicker_active = self.state.idle_candidate_since.is_some()
+            || (self.state.screen_blocker_active && self.state.blocker_miss_scans > 0);
+        let candidate = StatusEvidence {
+            status: self.status.clone(),
+            source,
+            signal_at: now.into(),
+            matched_rule_id,
+            startup_grace_active,
+            anti_flicker_active,
+            manifest_id: self.manifest_id.clone(),
+            manifest_version: self.manifest_version.clone(),
+            fallback_reason,
+        };
+        let meaning_changed = self.evidence.as_ref().is_none_or(|previous| {
+            previous.status != candidate.status
+                || previous.source != candidate.source
+                || previous.matched_rule_id != candidate.matched_rule_id
+                || previous.startup_grace_active != candidate.startup_grace_active
+                || previous.anti_flicker_active != candidate.anti_flicker_active
+                || previous.manifest_id != candidate.manifest_id
+                || previous.manifest_version != candidate.manifest_version
+                || previous.fallback_reason != candidate.fallback_reason
+        });
+        if meaning_changed {
+            self.evidence = Some(candidate.clone());
+            outcome.status_evidence = Some(candidate);
+        }
     }
 
     fn set_status(&mut self, new: SessionStatus, outcome: &mut ReducerOutcome) {
@@ -515,6 +686,7 @@ impl StatusReducer {
         }
         self.state.last_screen_seq = Some(observation.content_seq);
         self.state.screen_belief = Some(observation.state);
+        self.state.last_matched_rule_id = Some(observation.matched_rule_id.clone());
 
         // A visible blocker beats everything except process exit.
         if let Some(kind) = needs_input_kind(observation.state) {

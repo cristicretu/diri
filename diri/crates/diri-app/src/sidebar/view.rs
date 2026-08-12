@@ -20,6 +20,7 @@ use gpui::{
 };
 use tokio::sync::mpsc;
 
+use crate::commands::OpenSettings;
 use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::query_label;
 use crate::query_editor::{self, ClipboardEdit, Edit};
@@ -41,9 +42,10 @@ const PREVIEW_USAGE: f64 = 4.82;
 pub enum SidebarEvent {
     VisibilityChanged,
     WidthChanged,
-    /// The title-bar gear is a settings affordance. RootView owns the settings
-    /// surface, so the sidebar requests it instead of opening its account menu.
-    OpenSettings,
+    /// The Agents page of Settings, for one target host. Plain Settings goes
+    /// through the typed `OpenSettings` action; this event carries the host
+    /// the picker row was about, which an action cannot.
+    OpenAgentSettings(Option<String>),
     /// One-click path from the footer menu into the Remote host editor.
     AddRemoteHost,
     /// A plain click (or shortcut) selected a session: hand keyboard focus
@@ -510,7 +512,12 @@ impl Sidebar {
         let hovering = self.ui.hovered_control == Some("new-agent");
         let (agent, location) = {
             let store = self.store.read().expect("session store lock poisoned");
-            let agent = store.preferences().default_agent.display_name().to_owned();
+            let agent = store.agent_catalog(None).map_or_else(
+                || crate::agent_catalog::title_case_id(store.preferences().default_agent.id()),
+                |catalog| {
+                    crate::agent_catalog::display_name(&store.preferences().default_agent, catalog)
+                },
+            );
             let location = store
                 .default_spawn_host()
                 .map_or_else(|| "This Mac".to_owned(), |id| store.host_display_name(&id));
@@ -595,9 +602,9 @@ impl Sidebar {
                 "gearshape",
                 settings_hover,
                 colors,
-                cx.listener(|this, _, _, cx| {
+                cx.listener(|this, _, window, cx| {
                     this.ui.popover = None;
-                    cx.emit(SidebarEvent::OpenSettings);
+                    window.dispatch_action(Box::new(OpenSettings), cx);
                 }),
                 cx.listener(|this, hovered: &bool, _, cx| {
                     this.ui.hovered_control = hovered.then_some("settings");
@@ -669,78 +676,9 @@ impl Sidebar {
             .into_any_element()
     }
 
-    fn pinned_section(
-        &mut self,
-        projects: &[crate::store::SidebarProject],
-        colors: SemanticColors,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let (pinned_projects, pinned_sessions) = {
-            let store = self.store.read().expect("session store lock poisoned");
-            (
-                store.preferences().sidebar_pinned_projects.clone(),
-                store.preferences().sidebar_pinned_sessions.clone(),
-            )
-        };
-        if pinned_projects.is_empty() && pinned_sessions.is_empty() {
-            return None;
-        }
-        let mut section = div().flex().flex_col().gap(px(1.0)).child(
-            div()
-                .px(px(Space::ROW_H))
-                .pt(px(4.0))
-                .pb(px(2.0))
-                .text_size(px(Typo::SECTION_HEADER.size))
-                .font_weight(Typo::SECTION_HEADER.weight)
-                .text_color(colors.tertiary)
-                .child("Pinned"),
-        );
-        for group in projects
-            .iter()
-            .filter(|group| pinned_projects.contains(&group.project.id))
-        {
-            section = section.child(self.project_section(group, true, colors, window, cx));
-        }
-        for id in pinned_sessions {
-            let session = projects
-                .iter()
-                .flat_map(|group| group.sessions.iter().chain(&group.archived))
-                .find(|session| session.id == id)
-                .cloned();
-            if let Some(session) = session {
-                let project_name = projects
-                    .iter()
-                    .find(|group| group.project.id == session.project_id)
-                    .map(|group| group.project.name.clone());
-                section = section.child(self.session_row(
-                    &session,
-                    project_name.as_deref(),
-                    None,
-                    true,
-                    colors,
-                    window,
-                    cx,
-                ));
-            }
-        }
-        Some(
-            section
-                .child(
-                    div()
-                        .mx(px(Space::ROW_H))
-                        .my(px(4.0))
-                        .h(px(1.0))
-                        .bg(colors.primary.alpha(0.06)),
-                )
-                .into_any_element(),
-        )
-    }
-
     fn project_section(
         &mut self,
         group: &crate::store::SidebarProject,
-        pinned_copy: bool,
         colors: SemanticColors,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -767,15 +705,7 @@ impl Sidebar {
         let drag_label: SharedString = group.project.name.clone().into();
         let mut section = div().flex().flex_col().gap(px(1.0)).child(
             div()
-                .id(format!(
-                    "{}:{}",
-                    if pinned_copy {
-                        "pinned-project"
-                    } else {
-                        "project"
-                    },
-                    id.0
-                ))
+                .id(format!("project:{}", id.0))
                 .debug_selector({
                     let id = id.clone();
                     move || format!("PROJECT_{}", id.0)
@@ -867,6 +797,7 @@ impl Sidebar {
                         .text_color(colors.primary.alpha(0.90))
                         .child(group.project.name.clone()),
                 )
+                .when(group.pinned, |row| row.child(pin_mark(colors)))
                 .when_some(project_host_label, |row, host| {
                     row.child(
                         div()
@@ -960,34 +891,31 @@ impl Sidebar {
                     )
                 })
                 .when(!is_hovered && collapsed, |row| {
-                    row.child(AttentionDot::new(rollup_attention(&group.sessions), colors))
+                    row.child(AttentionDot::new(rollup_attention(&group.active), colors))
                 }),
         );
 
-        if !collapsed {
-            for session in &group.sessions {
-                let shortcut = self.shortcut_for(&session.id);
-                section = section
-                    .child(self.session_row(session, None, shortcut, false, colors, window, cx));
-            }
-            if !group.archived.is_empty() {
-                section = section.child(self.archived_bucket(group, colors, window, cx));
-            }
+        // The projection already folds a collapsed project away, so an empty
+        // row list here means "collapsed" without asking a second source.
+        for row in &group.sessions {
+            let shortcut = self.shortcut_for(row.id());
+            section = section.child(self.session_row(row, shortcut, colors, window, cx));
+        }
+        if !collapsed && !group.archived.is_empty() {
+            section = section.child(self.archived_bucket(group, colors, window, cx));
         }
         section.into_any_element()
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn session_row(
         &mut self,
-        session: &Arc<SessionRecord>,
-        project_name: Option<&str>,
+        row: &crate::store::SidebarRow,
         shortcut: Option<usize>,
-        pinned_copy: bool,
         colors: SemanticColors,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let session = &row.session;
         let id = session.id.clone();
         let (selected, multi, drag_selection, migrating) = {
             let mut store = self.store.write().expect("session store lock poisoned");
@@ -1001,6 +929,7 @@ impl Sidebar {
         let hovered = self.ui.hovered_session.as_ref() == Some(&id);
         let archived = session.is_archived();
         let hibernated = session.hibernation.is_some();
+        let ended = matches!(session.status, diri_proto::SessionStatus::Exited(_)) && !archived;
         let host_label = session.host.as_ref().map(|host| {
             self.store
                 .read()
@@ -1008,14 +937,20 @@ impl Sidebar {
                 .host_display_name(host)
         });
         let title = display_title(session);
+        let non_persistent =
+            session.remote_persistence == Some(PersistenceCapability::NonPersistent);
+        // Read before the title moves into the marquee below.
+        let ended_chip = ended && title != ENDED_TITLE;
         let title_available_width = session_title_available_width(
             self.ui.width,
+            row.depth,
             migrating,
-            session.remote_persistence == Some(PersistenceCapability::NonPersistent),
+            non_persistent,
+            ended_chip,
             host_label.as_deref(),
-            project_name,
             hibernated,
-            (hovered || selected) && !pinned_copy && shortcut.is_some(),
+            row.pinned,
+            !hovered && selected && shortcut.is_some(),
         );
         let title_marquee_id = format!("session-title-marquee:{}", id.0);
         let fill = if selected {
@@ -1031,7 +966,7 @@ impl Sidebar {
         if self.ui.renaming.as_ref() == Some(&id) {
             return div()
                 .id(format!("rename:{}", id.0))
-                .pl(px(Space::ROW_H + Space::INDENT))
+                .pl(px(Space::ROW_H))
                 .pr(px(Space::ROW_H))
                 .h(px(Metrics::ROW_HEIGHT))
                 .flex()
@@ -1039,7 +974,19 @@ impl Sidebar {
                 .gap(px(8.0))
                 .rounded(px(Radius::ROW))
                 .bg(RowFill::Selected.color(colors))
-                .child(self.status_glyph(session, migrating, colors, window, cx))
+                .children(indent_rails(row, colors))
+                // The fold control is inert mid-rename, but its column stays so
+                // the text does not slide sideways the moment editing starts.
+                .child(div().w(px(Space::INDENT)).flex_none())
+                .child(
+                    div()
+                        .size(px(16.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(self.status_glyph(session, migrating, colors, window, cx)),
+                )
                 .child(
                     div()
                         .min_w(px(0.0))
@@ -1063,6 +1010,7 @@ impl Sidebar {
             DragItem::Session {
                 id: id.clone(),
                 project: session.project_id.clone(),
+                parent: session.parent.clone(),
                 archived,
             }
         };
@@ -1070,16 +1018,8 @@ impl Sidebar {
         let drag_label: SharedString = title.clone().into();
         let entity = cx.entity();
         div()
-            .id(format!(
-                "{}:{}",
-                if pinned_copy {
-                    "pinned-session"
-                } else {
-                    "session"
-                },
-                id.0
-            ))
-            .pl(px(Space::ROW_H + Space::INDENT))
+            .id(format!("session:{}", id.0))
+            .pl(px(Space::ROW_H))
             .pr(px(Space::ROW_H))
             .h(px(Metrics::ROW_HEIGHT))
             .flex()
@@ -1154,13 +1094,19 @@ impl Sidebar {
             .drag_over::<DraggedSidebarItem>({
                 let target = id.clone();
                 let target_project = session.project_id.clone();
+                let target_parent = session.parent.clone();
                 move |element, dragged, _, cx| {
+                    // Siblings only. A row dropped on a cousin would shuffle
+                    // the manual order without moving anything on screen,
+                    // because each sibling run is sorted among itself.
                     if let DragItem::Session {
                         id: moved,
                         project,
+                        parent,
                         archived: false,
                     } = &dragged.0
                         && project == &target_project
+                        && parent == &target_parent
                     {
                         entity.update(cx, |this, cx| {
                             this.reorder_session(moved, &target);
@@ -1180,6 +1126,7 @@ impl Sidebar {
                         id,
                         project,
                         archived: true,
+                        ..
                     } = &dragged.0
                         && project == &target_project
                     {
@@ -1192,55 +1139,21 @@ impl Sidebar {
                     cx.notify();
                 }
             }))
-            .child({
-                let slot = div()
-                    .relative()
+            .children(indent_rails(row, colors))
+            .child(self.disclosure(row, colors, cx))
+            // The status glyph is the row's whole reason for existing at a
+            // glance, so it no longer yields its slot to the close button on
+            // hover -- pointing at a working agent used to hide the fact that
+            // it was working. The ✕ lives at the trailing edge instead.
+            .child(
+                div()
                     .size(px(16.0))
                     .flex_none()
                     .flex()
                     .items_center()
-                    .justify_center();
-                // On hover the identity mark yields its slot to a close
-                // button -- Safari-tab style; the glyph returns on mouse-out.
-                if hovered {
-                    let close_id = id.clone();
-                    slot.child(
-                        div()
-                            .id(format!("close:{}", id.0))
-                            // Spills 4px past the 16px slot so the target is a
-                            // comfortable 24px; the glyph stays centered.
-                            .absolute()
-                            .inset(px(-4.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(Radius::CHIP))
-                            .cursor_pointer()
-                            .text_color(colors.secondary)
-                            .hover(move |button| button.bg(Fill::subtle(colors)))
-                            // The row is draggable, and a press that wanders
-                            // 2px turns into a drag that swallows the click.
-                            // Keeping mouse-down off the row makes every press
-                            // on the ✕ a close.
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                cx.stop_propagation();
-                            })
-                            .child(sf_symbol_weighted(
-                                "xmark",
-                                8.5,
-                                SymbolWeight::Bold,
-                                colors.secondary,
-                            ))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.close_sessions(vec![close_id.clone()], cx);
-                                cx.notify();
-                            })),
-                    )
-                } else {
-                    slot.child(self.status_glyph(session, migrating, colors, window, cx))
-                }
-            })
+                    .justify_center()
+                    .child(self.status_glyph(session, migrating, colors, window, cx)),
+            )
             .child(
                 HoverMarquee::new(
                     title_marquee_id,
@@ -1252,97 +1165,122 @@ impl Sidebar {
                 )
                 .font_weight(Typo::ROW.weight),
             )
-            .when(migrating, |row| {
-                row.child(
-                    div()
-                        .flex_none()
-                        .px(px(5.0))
-                        .py(px(1.0))
-                        .rounded(px(Radius::CHIP))
-                        .bg(Fill::subtle(colors))
-                        .text_size(px(Typo::META.size))
-                        .font_weight(Typo::META.weight)
-                        .text_color(colors.secondary)
-                        .whitespace_nowrap()
-                        .child("Moving…"),
-                )
+            .when(row.pinned, |element| element.child(pin_mark(colors)))
+            // Chips, in descending order of how much they explain an otherwise
+            // inert-looking row. Each is flex_none and the title absorbs the
+            // remaining width, so a narrow sidebar truncates the title rather
+            // than dropping the reason it is not moving.
+            .when(migrating, |element| {
+                element.child(state_chip("Moving…", colors.secondary, colors))
             })
-            .when(
-                session.remote_persistence == Some(PersistenceCapability::NonPersistent),
-                |row| {
-                    row.child(
-                        div()
-                            .flex_none()
-                            .px(px(5.0))
-                            .py(px(1.0))
-                            .rounded(px(Radius::CHIP))
-                            .bg(diri_ui::Ink::DANGER.alpha(0.12))
-                            .text_size(px(Typo::META.size))
-                            .font_weight(Typo::META.weight)
-                            .text_color(diri_ui::Ink::DANGER)
-                            .whitespace_nowrap()
-                            .child("No detach"),
-                    )
-                },
-            )
-            .when_some(host_label, |row, host| {
-                // Remote-host chip: this session's agent runs on another machine.
-                row.child(
-                    div()
-                        .flex_none()
-                        .px(px(5.0))
-                        .py(px(1.0))
-                        .rounded(px(Radius::CHIP))
-                        .bg(Fill::subtle(colors))
-                        .text_size(px(Typo::META.size))
-                        .font_weight(Typo::META.weight)
-                        .text_color(colors.tertiary)
-                        .whitespace_nowrap()
-                        .child(host),
-                )
+            .when(non_persistent, |element| {
+                // Louder than the rest of the lane on purpose: this session
+                // cannot survive a detach, so closing the window loses it.
+                element.child(alert_chip("No detach"))
             })
-            .when_some(project_name.map(str::to_owned), |row, project_name| {
-                row.child(
-                    div()
-                        .max_w(px(72.0))
-                        .whitespace_nowrap()
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .text_size(px(Typo::META.size))
-                        .text_color(colors.tertiary)
-                        .child(project_name),
-                )
+            .when(ended_chip, |element| {
+                // An exited session with a real title otherwise looks alive:
+                // the glyph goes quiet and nothing else says why.
+                element.child(state_chip("Ended", colors.tertiary, colors))
             })
-            .when(hibernated, |row| {
+            .when(hibernated, |element| {
                 // Hibernation chip. An 8px moon glyph was a smudge at this
                 // size; the chip reads at a glance and matches the host badge.
-                row.child(
+                element.child(state_chip("Zzz", colors.tertiary, colors))
+            })
+            .when_some(host_label, |element, host| {
+                // Remote-host chip: this session's agent runs on another machine.
+                element.child(state_chip(host, colors.tertiary, colors))
+            })
+            .when(hovered, |element| {
+                let close_id = id.clone();
+                element.child(
                     div()
+                        .id(format!("close:{}", id.0))
+                        .size(px(16.0))
                         .flex_none()
-                        .px(px(5.0))
-                        .py(px(1.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
                         .rounded(px(Radius::CHIP))
-                        .bg(Fill::subtle(colors))
-                        .text_size(px(Typo::META.size - 1.0))
-                        .font_weight(Typo::META.weight)
-                        .text_color(colors.tertiary)
-                        .whitespace_nowrap()
-                        .child("Zzz"),
+                        .cursor_pointer()
+                        .text_color(colors.secondary)
+                        .hover(move |button| button.bg(Fill::subtle(colors)))
+                        // The row is draggable, and a press that wanders
+                        // 2px turns into a drag that swallows the click.
+                        // Keeping mouse-down off the row makes every press
+                        // on the ✕ a close.
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                            cx.stop_propagation();
+                        })
+                        .child(sf_symbol_weighted(
+                            "xmark",
+                            8.5,
+                            SymbolWeight::Bold,
+                            colors.secondary,
+                        ))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.close_sessions(vec![close_id.clone()], cx);
+                            cx.notify();
+                        })),
                 )
             })
+            // The hint and the ✕ share the trailing edge and never both apply:
+            // hovering a row is the moment you want to close it, not the
+            // moment you need to be told how to reach it from the keyboard.
             .when_some(
-                ((hovered || selected) && !pinned_copy)
-                    .then_some(shortcut)
-                    .flatten(),
-                |row, index| {
-                    row.child(
+                (!hovered && selected).then_some(shortcut).flatten(),
+                |element, index| {
+                    element.child(
                         div()
+                            .flex_none()
                             .text_size(px(Typo::META.size))
                             .text_color(colors.tertiary)
                             .child(format!("⌘{index}")),
                     )
                 },
             )
+            .into_any_element()
+    }
+
+    /// The fold control for a row that spawned children, drawn in the same
+    /// column a deeper row's rail occupies so titles stay on one axis whether
+    /// or not a row has children.
+    fn disclosure(
+        &self,
+        row: &crate::store::SidebarRow,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let slot = div().w(px(Space::INDENT)).flex_none().flex().items_center();
+        if !row.has_children {
+            return slot.into_any_element();
+        }
+        let id = row.id().clone();
+        slot.id(format!("fold:{}", id.0))
+            .justify_center()
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                let _ = this
+                    .store
+                    .write()
+                    .expect("session store lock poisoned")
+                    .toggle_session_collapsed(id.clone());
+                cx.notify();
+            }))
+            .child(sf_symbol_weighted(
+                if row.collapsed {
+                    "chevron.right"
+                } else {
+                    "chevron.down"
+                },
+                8.0,
+                SymbolWeight::Bold,
+                colors.tertiary,
+            ))
             .into_any_element()
     }
 
@@ -1404,6 +1342,7 @@ impl Sidebar {
                             id,
                             project,
                             archived: false,
+                            ..
                         } if project == &project_id => vec![id.clone()],
                         DragItem::Sessions(ids) => ids.clone(),
                         _ => Vec::new(),
@@ -1536,6 +1475,7 @@ impl Sidebar {
                 DraggedSidebarItem(DragItem::Session {
                     id: id.clone(),
                     project: session.project_id.clone(),
+                    parent: session.parent.clone(),
                     archived: true,
                 }),
                 move |_, _, _, cx| {
@@ -1881,6 +1821,12 @@ impl Sidebar {
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        {
+            let mut store = self.store.write().expect("session store lock poisoned");
+            if store.agent_catalog(host.as_deref()).is_none() {
+                store.request_agent_catalog(host.clone(), false);
+            }
+        }
         let (local_target, default_kind, hosts, active_session, repo_state, syncing, options) = {
             let store = self.store.read().expect("session store lock poisoned");
             let selected_host_id = host.as_deref();
@@ -1888,12 +1834,12 @@ impl Sidebar {
                 directory
                     .clone()
                     .unwrap_or_else(|| store.default_new_agent_directory()),
-                store.preferences().default_agent.kind(),
+                store.preferences().default_agent.clone(),
                 store.hosts().to_vec(),
                 store.selected_session().cloned(),
                 store.repo_target(selected_host_id).cloned(),
                 store.syncing_prefs().clone(),
-                agent_picker_options(store.agent_catalog()),
+                agent_picker_options(store.agent_catalog(host.as_deref())),
             )
         };
         let selected_host = host
@@ -2125,6 +2071,10 @@ impl Sidebar {
                                 .write()
                                 .expect("session store lock poisoned")
                                 .set_default_spawn_host(target_host.clone());
+                            this.store
+                                .write()
+                                .expect("session store lock poisoned")
+                                .request_agent_catalog(target_host.clone(), false);
                             // Only remote -> local needs a matching checkout.
                             // A remote destination starts at its configured cwd.
                             if should_resolve_active_repo(
@@ -2222,17 +2172,20 @@ impl Sidebar {
         } else {
             None
         };
-        for (index, (title, kind, shortcut)) in options.into_iter().enumerate() {
+        for (index, option) in options.into_iter().enumerate() {
             let row_id = format!("agent-option-{index}");
             let target = target.clone();
             let spawn_host = selected_host.as_ref().map(|entry| entry.id.clone());
             let same_repo_as = same_repo_reference.clone();
             // The picker selection is also the global shortcut destination,
             // so every shortcut stays visible and follows the checkmark.
-            let shortcut = agent_picker_shortcut(&kind, &default_kind, shortcut);
+            let shortcut = agent_picker_shortcut(&option.kind, &default_kind, option.shortcut);
             let shortcut = shortcut.to_owned();
-            let agent_kind = ui_agent_kind(&kind);
-            let spawn_kind = kind.clone();
+            let agent_kind = ui_agent_kind(&option.kind);
+            let spawn_kind = option.kind.clone();
+            let available = selected_host.is_some() || option.available;
+            let unavailable = (!available).then_some(option.unavailable_detail).flatten();
+            let setup_url = (!available).then_some(option.setup_url).flatten();
             content = content.child(
                 div()
                     .id(row_id)
@@ -2240,29 +2193,31 @@ impl Sidebar {
                     .mx(px(6.0))
                     .my(px(1.0))
                     .px(px(8.0))
-                    .h(px(34.0))
+                    .h(px(32.0))
                     .flex()
                     .items_center()
-                    .gap(px(10.0))
+                    .gap(px(8.0))
                     .rounded(px(Radius::ROW))
-                    .cursor_pointer()
-                    .hover(move |element| element.bg(colors.primary.alpha(0.06)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.store
-                            .write()
-                            .expect("session store lock poisoned")
-                            .spawn_kind(
-                                spawn_kind.clone(),
-                                SpawnOptions {
-                                    cwd: Some(target.clone()),
-                                    host: spawn_host.clone(),
-                                    same_repo_as: same_repo_as.clone(),
-                                    ..SpawnOptions::default()
-                                },
-                            );
-                        this.ui.popover = None;
-                        cx.notify();
-                    }))
+                    .when(available, |row| {
+                        row.cursor_pointer()
+                            .hover(move |element| element.bg(colors.primary.alpha(0.06)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.store
+                                    .write()
+                                    .expect("session store lock poisoned")
+                                    .spawn_kind(
+                                        spawn_kind.clone(),
+                                        SpawnOptions {
+                                            cwd: Some(target.clone()),
+                                            host: spawn_host.clone(),
+                                            same_repo_as: same_repo_as.clone(),
+                                            ..SpawnOptions::default()
+                                        },
+                                    );
+                                this.ui.popover = None;
+                                cx.notify();
+                            }))
+                    })
                     .child(
                         div()
                             .w(px(24.0))
@@ -2274,11 +2229,45 @@ impl Sidebar {
                     )
                     .child(
                         div()
+                            .min_w_0()
                             .flex_1()
+                            .flex()
+                            .flex_col()
                             .text_size(px(Typo::ROW.size))
-                            .text_color(colors.primary)
-                            .child(title),
+                            .text_color(if available {
+                                colors.primary
+                            } else {
+                                colors.secondary
+                            })
+                            .child(option.title)
+                            .when_some(unavailable, |label, unavailable| {
+                                label.child(
+                                    div()
+                                        .whitespace_nowrap()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .text_size(px(Typo::META.size))
+                                        .text_color(colors.tertiary)
+                                        .child(unavailable),
+                                )
+                            }),
                     )
+                    .when_some(setup_url, |row, url| {
+                        row.child(
+                            div()
+                                .id(format!("agent-setup-{index}"))
+                                .px(px(6.0))
+                                .py(px(3.0))
+                                .rounded(px(Radius::CHIP))
+                                .cursor_pointer()
+                                .text_size(px(Typo::META.size))
+                                .text_color(colors.secondary)
+                                .bg(Fill::subtle(colors))
+                                .hover(move |button| button.bg(colors.primary.alpha(0.10)))
+                                .on_click(move |_, _, cx| cx.open_url(&url))
+                                .child("Setup…"),
+                        )
+                    })
                     .when(!shortcut.is_empty(), |row| {
                         row.child(
                             div()
@@ -2294,6 +2283,33 @@ impl Sidebar {
                     }),
             );
         }
+        let manage_host = selected_host.as_ref().map(|host| host.id.clone());
+        content = content.child(HairlineDivider::horizontal(colors)).child(
+            div()
+                .id("manage-agents")
+                .mx(px(6.0))
+                .my(px(1.0))
+                .px(px(8.0))
+                .h(px(32.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .rounded(px(Radius::ROW))
+                .cursor_pointer()
+                .hover(move |row| row.bg(colors.primary.alpha(0.06)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.ui.popover = None;
+                    cx.emit(SidebarEvent::OpenAgentSettings(manage_host.clone()));
+                    cx.notify();
+                }))
+                .child(sf_symbol("gearshape", 11.0, colors.secondary))
+                .child(
+                    div()
+                        .text_size(px(Typo::ROW.size))
+                        .text_color(colors.secondary)
+                        .child("Manage Agents…"),
+                ),
+        );
         self.popover_shell(70.0, content.pb(px(6.0)), colors, cx)
     }
 
@@ -3163,16 +3179,14 @@ impl Sidebar {
 
     fn reorder_project(&mut self, moved: &ProjectId, target: &ProjectId) {
         let mut store = self.store.write().expect("session store lock poisoned");
-        let mut order = store.preferences().sidebar_project_order.clone();
-        ensure_present(&mut order, store.projects().keys().cloned());
+        let mut order = store.sidebar_project_order();
         move_before(&mut order, moved, target);
         self.ui.order_dirty |= store.stage_project_order(order);
     }
 
     fn reorder_session(&mut self, moved: &SessionId, target: &SessionId) {
         let mut store = self.store.write().expect("session store lock poisoned");
-        let mut order = store.preferences().sidebar_session_order.clone();
-        ensure_present(&mut order, store.sessions().keys().cloned());
+        let mut order = store.sidebar_session_order();
         move_before(&mut order, moved, target);
         self.ui.order_dirty |= store.stage_session_order(order);
     }
@@ -3197,8 +3211,7 @@ impl Sidebar {
     /// its own group" — which is what ⌃⌘↓ on the bottom-but-one row means.
     fn reorder_session_to_end(&mut self, moved: &SessionId) {
         let mut store = self.store.write().expect("session store lock poisoned");
-        let mut order = store.preferences().sidebar_session_order.clone();
-        ensure_present(&mut order, store.sessions().keys().cloned());
+        let mut order = store.sidebar_session_order();
         move_to_end(&mut order, moved);
         let _ = store.set_session_order(order);
     }
@@ -3322,9 +3335,11 @@ impl Sidebar {
         true
     }
 
-    /// ⌃⌘↑/⌃⌘↓: move the selected session one row inside its own project
-    /// group. Clamps at the group edges — a reorder that wrapped would
-    /// teleport the row past every other project.
+    /// ⌃⌘↑/⌃⌘↓: move the selected session one place among its own siblings —
+    /// the rows sharing its parent inside its project. Clamps at the ends of
+    /// that run: a reorder that wrapped would teleport the row past every
+    /// other project, and one that crossed levels would silently re-parent a
+    /// session, which is the daemon's call to make, not a keystroke's.
     pub fn reorder_selected(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
         self.commit_rename();
         let (moved, target) = {
@@ -3336,28 +3351,38 @@ impl Sidebar {
             let Some(group) = projection
                 .projects
                 .iter()
-                .find(|group| group.sessions.iter().any(|session| session.id == selected))
+                .find(|group| group.sessions.iter().any(|row| row.id() == &selected))
             else {
                 return false;
             };
-            let index = group
+            let parent = group
                 .sessions
                 .iter()
-                .position(|session| session.id == selected)
+                .find(|row| row.id() == &selected)
+                .and_then(|row| row.session.parent.clone());
+            let siblings: Vec<&SessionId> = group
+                .sessions
+                .iter()
+                .filter(|row| row.session.parent == parent)
+                .map(|row| row.id())
+                .collect();
+            let index = siblings
+                .iter()
+                .position(|id| *id == &selected)
                 .expect("the group was found by this id");
             let destination = index as isize + delta;
-            if destination < 0 || destination >= group.sessions.len() as isize {
+            if destination < 0 || destination >= siblings.len() as isize {
                 return false;
             }
-            // Moving up lands before the row above; moving down lands before
-            // the row two below, i.e. just after the row it swaps with. Off
-            // the end there is no anchor, so the move goes to the tail.
+            // Moving up lands before the sibling above; moving down lands
+            // before the one two below, i.e. just after the row it swaps with.
+            // Off the end there is no anchor, so the move goes to the tail.
             let target = if delta < 0 {
-                group.sessions.get(destination as usize)
+                siblings.get(destination as usize)
             } else {
-                group.sessions.get(destination as usize + 1)
+                siblings.get(destination as usize + 1)
             }
-            .map(|session| session.id.clone());
+            .map(|id| (*id).clone());
             (selected, target)
         };
         match target {
@@ -3471,11 +3496,8 @@ impl Render for Sidebar {
             .flex()
             .flex_col()
             .gap(px(2.0));
-        if let Some(pinned) = self.pinned_section(&projection.projects, colors, window, cx) {
-            list = list.child(pinned);
-        }
         for group in &projection.projects {
-            list = list.child(self.project_section(group, false, colors, window, cx));
+            list = list.child(self.project_section(group, colors, window, cx));
         }
 
         let mut root = div()
@@ -3539,6 +3561,86 @@ fn icon_button(
         .on_click(on_click)
         .on_hover(on_hover)
         .child(sf_symbol(system_image, 15.0, colors.secondary))
+        .into_any_element()
+}
+
+/// Title `display_title` gives a placeholder-named session that has exited.
+/// The "Ended" chip stands down when the title already says it.
+const ENDED_TITLE: &str = "Ended";
+
+/// One leading column per ancestor level. A column is drawn full height while
+/// that ancestor still has siblings below, and stops halfway on the last child
+/// so a subtree visibly closes instead of trailing a rail into the next row.
+fn indent_rails(row: &crate::store::SidebarRow, colors: SemanticColors) -> Vec<AnyElement> {
+    (0..row.depth)
+        .map(|column| {
+            let continues = row.rails & (1u32 << column.min(31)) != 0;
+            let last_column = column + 1 == row.depth;
+            div()
+                .w(px(Space::INDENT))
+                .h(px(Metrics::ROW_HEIGHT))
+                .flex_none()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .w(px(1.0))
+                        // A rail that neither continues nor elbows into this
+                        // row has no business being drawn at all.
+                        .h(px(if continues {
+                            Metrics::ROW_HEIGHT
+                        } else if last_column {
+                            Metrics::ROW_HEIGHT / 2.0
+                        } else {
+                            0.0
+                        }))
+                        .bg(colors.primary.alpha(0.10)),
+                )
+                .into_any_element()
+        })
+        .collect()
+}
+
+fn pin_mark(colors: SemanticColors) -> AnyElement {
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .child(sf_symbol("pin.fill", 9.0, colors.tertiary))
+        .into_any_element()
+}
+
+/// The row's shared chip: one state, stated in the smallest space that still
+/// reads. Every chip on a row is the same shape so they scan as one lane.
+fn state_chip(label: impl Into<SharedString>, tint: Rgba, colors: SemanticColors) -> AnyElement {
+    div()
+        .flex_none()
+        .px(px(5.0))
+        .py(px(1.0))
+        .rounded(px(Radius::CHIP))
+        .bg(Fill::subtle(colors))
+        .text_size(px(Typo::META.size))
+        .font_weight(Typo::META.weight)
+        .text_color(tint)
+        .whitespace_nowrap()
+        .child(label.into())
+        .into_any_element()
+}
+
+/// A chip that has to outrank the rest of the lane. Same geometry as
+/// [`state_chip`] so the row still scans as one lane, tinted so it does not.
+fn alert_chip(label: impl Into<SharedString>) -> AnyElement {
+    div()
+        .flex_none()
+        .px(px(5.0))
+        .py(px(1.0))
+        .rounded(px(Radius::CHIP))
+        .bg(Ink::DANGER.alpha(0.12))
+        .text_size(px(Typo::META.size))
+        .font_weight(Typo::META.weight)
+        .text_color(Ink::DANGER)
+        .whitespace_nowrap()
+        .child(label.into())
         .into_any_element()
 }
 
@@ -3778,39 +3880,50 @@ fn status_state(session: &SessionRecord, migrating: bool) -> StatusState {
     }
 }
 
-/// Rows for the new-agent picker: the hand-branded agents in their pinned
-/// order, then every OTHER catalog agent whose CLI is actually installed.
-///
-/// Sourcing the tail from the daemon's catalog is what makes a new agent
-/// manifest reachable without a client release. Gating it on `available()` is
-/// what keeps the menu from becoming a nineteen-row wall of CLIs the user has
-/// never installed — the four pinned rows stay visible either way because they
-/// are what the app is *about*.
+/// Rows for the new-agent picker come from the selected target's runtime
+/// catalog. Unavailable and user-hidden Agents stay out of this high-frequency
+/// surface; Settings remains the complete supported-Agent inventory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AgentPickerOption {
+    title: String,
+    kind: ProtoAgentKind,
+    shortcut: &'static str,
+    binary: String,
+    available: bool,
+    setup_url: Option<String>,
+    unavailable_detail: Option<String>,
+}
+
 fn agent_picker_options(
-    catalog: &diri_proto::AgentReadinessResult,
-) -> Vec<(String, ProtoAgentKind, &'static str)> {
-    let pinned = [
-        ("Claude Code", ProtoAgentKind::CLAUDE_CODE, ""),
-        ("Codex", ProtoAgentKind::CODEX, "⌘⇧N"),
-        ("Cursor", ProtoAgentKind::CURSOR, ""),
-        ("Gemini", ProtoAgentKind::GEMINI, ""),
-    ];
-    let mut options: Vec<(String, ProtoAgentKind, &'static str)> = pinned
-        .iter()
-        .map(|(title, kind, shortcut)| ((*title).to_owned(), kind.clone(), *shortcut))
+    catalog: Option<&diri_proto::AgentReadinessResult>,
+) -> Vec<AgentPickerOption> {
+    let mut options: Vec<_> = crate::agent_catalog::quick_agent_options(catalog)
+        .into_iter()
+        .filter(|option| option.kind != ProtoAgentKind::SHELL)
+        .map(|option| AgentPickerOption {
+            title: option.display_name,
+            shortcut: if option.kind == ProtoAgentKind::CODEX {
+                "⌘⇧N"
+            } else {
+                ""
+            },
+            kind: option.kind,
+            binary: option.binary,
+            available: true,
+            setup_url: None,
+            unavailable_detail: None,
+        })
         .collect();
-    for item in &catalog.agents {
-        if pinned.iter().any(|(_, kind, _)| kind == &item.kind) || !item.available() {
-            continue;
-        }
-        let title = item
-            .descriptor
-            .as_ref()
-            .map_or_else(|| item.kind.id().to_owned(), |d| d.display_name.clone());
-        options.push((title, item.kind.clone(), ""));
-    }
     // Terminal is last on purpose: it is the escape hatch, not an agent.
-    options.push(("Terminal".to_owned(), ProtoAgentKind::SHELL, "⌥⌘T"));
+    options.push(AgentPickerOption {
+        title: "Terminal".to_owned(),
+        kind: ProtoAgentKind::SHELL,
+        shortcut: "⌥⌘T",
+        binary: "login shell".to_owned(),
+        available: true,
+        setup_url: None,
+        unavailable_detail: None,
+    });
     options
 }
 
@@ -3871,14 +3984,6 @@ const fn attention_rank(level: AttentionLevel) -> u8 {
     }
 }
 
-fn ensure_present<T: Clone + PartialEq>(order: &mut Vec<T>, values: impl IntoIterator<Item = T>) {
-    for value in values {
-        if !order.contains(&value) {
-            order.push(value);
-        }
-    }
-}
-
 fn retain_live_glyphs<T>(glyphs: &mut HashMap<SessionId, T>, live: &[SessionId]) {
     let live: std::collections::HashSet<_> = live.iter().collect();
     glyphs.retain(|id, _| live.contains(id));
@@ -3896,34 +4001,45 @@ fn clamp_path(path: &str) -> String {
     )
 }
 
+/// Overflow threshold for a session title. Individual badges reserve their
+/// content estimate, padding, and following gap; HoverMarquee shapes the title
+/// itself exactly. Rows carry a fixed disclosure column and one indent column
+/// per ancestor, so nesting costs title width and has to be counted here or a
+/// deep row marquees a title that was never actually clipped.
+#[allow(clippy::too_many_arguments)]
 fn session_title_available_width(
     sidebar_width: f32,
+    depth: u16,
     migrating: bool,
     non_persistent: bool,
+    ended: bool,
     host_label: Option<&str>,
-    project_name: Option<&str>,
     hibernated: bool,
+    pinned: bool,
     shortcut_visible: bool,
 ) -> f32 {
-    // Row insets + identity glyph + the first flex gap. Individual badges
-    // reserve their content estimate, padding, and following gap. This is only
-    // the overflow threshold; HoverMarquee shapes the title itself exactly.
-    let mut available = sidebar_width - 60.0;
+    // Row insets + fold column + identity glyph + the gaps between them.
+    let mut available = sidebar_width - 68.0 - f32::from(depth) * (Space::INDENT + 8.0);
     if migrating {
         available -= 66.0;
     }
     if non_persistent {
         available -= 72.0;
     }
+    if ended {
+        available -= 48.0;
+    }
     if let Some(host) = host_label {
         available -= host.chars().count() as f32 * 6.2 + 18.0;
-    }
-    if project_name.is_some() {
-        available -= 80.0;
     }
     if hibernated {
         available -= 42.0;
     }
+    if pinned {
+        available -= 18.0;
+    }
+    // The close button and the shortcut hint share the trailing slot and are
+    // near enough the same width that one reservation covers both.
     if shortcut_visible {
         available -= 28.0;
     }
@@ -3972,17 +4088,33 @@ mod tests {
 
     #[test]
     fn title_overflow_threshold_accounts_for_sidebar_badges() {
-        let plain = session_title_available_width(248.0, false, false, None, None, false, false);
-        let remote =
-            session_title_available_width(248.0, false, false, Some("mini-b"), None, false, true);
+        let plain =
+            session_title_available_width(248.0, 0, false, false, false, None, false, false, false);
+        let remote = session_title_available_width(
+            248.0,
+            0,
+            false,
+            false,
+            false,
+            Some("mini-b"),
+            false,
+            false,
+            true,
+        );
         assert!(plain > remote);
+        // A nested row pays for every indent column it sits behind.
+        let nested =
+            session_title_available_width(248.0, 2, false, false, false, None, false, false, false);
+        assert!(plain > nested);
         assert_eq!(
             session_title_available_width(
                 200.0,
+                1,
+                true,
                 true,
                 true,
                 Some("very-long-host"),
-                Some("project"),
+                true,
                 true,
                 true,
             ),
@@ -4007,6 +4139,54 @@ mod tests {
         assert_eq!(
             agent_picker_shortcut(&ProtoAgentKind::SHELL, &ProtoAgentKind::CLAUDE_CODE, "⌥⌘T"),
             "⌥⌘T"
+        );
+    }
+
+    #[test]
+    fn agent_picker_keeps_installed_manifest_agents_and_hides_unavailable_rows() {
+        let catalog = diri_proto::AgentReadinessResult {
+            agents: vec![
+                diri_proto::AgentReadinessItem {
+                    kind: ProtoAgentKind::new("amp"),
+                    binary: "amp".into(),
+                    path: Some("/bin/amp".into()),
+                    show_in_quick_create: true,
+                    descriptor: Some(diri_proto::AgentDescriptor {
+                        id: "amp".into(),
+                        display_name: "Amp".into(),
+                        ..diri_proto::AgentDescriptor::default()
+                    }),
+                    ..diri_proto::AgentReadinessItem::default()
+                },
+                diri_proto::AgentReadinessItem {
+                    kind: ProtoAgentKind::new("opencode"),
+                    binary: "opencode".into(),
+                    path: None,
+                    descriptor: Some(diri_proto::AgentDescriptor {
+                        id: "opencode".into(),
+                        display_name: "OpenCode".into(),
+                        setup: Some(diri_proto::AgentSetup {
+                            url: Some("https://opencode.ai/docs".into()),
+                            install_hint: Some("Install OpenCode.".into()),
+                            sign_in_hint: Some("Run /connect.".into()),
+                        }),
+                        ..diri_proto::AgentDescriptor::default()
+                    }),
+                    ..diri_proto::AgentReadinessItem::default()
+                },
+            ],
+            ..diri_proto::AgentReadinessResult::default()
+        };
+        let options = agent_picker_options(Some(&catalog));
+        let amp = options
+            .iter()
+            .find(|option| option.kind == ProtoAgentKind::new("amp"))
+            .expect("manifest-only option");
+        assert!(amp.available);
+        assert!(
+            !options
+                .iter()
+                .any(|option| option.kind == ProtoAgentKind::new("opencode"))
         );
     }
 
@@ -4131,7 +4311,37 @@ mod tests {
     #[gpui::test]
     fn project_plus_opens_the_agent_kind_menu_in_that_project(cx: &mut TestAppContext) {
         let (view, cx) = cx.add_window_view(|_, cx| {
-            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+            let sidebar = cx.new(|cx| {
+                let sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                let installed =
+                    |kind: diri_proto::AgentKind, label: &str| diri_proto::AgentReadinessItem {
+                        binary: kind.id().to_owned(),
+                        kind,
+                        path: Some(format!("/usr/local/bin/{label}")),
+                        detected_path: None,
+                        configured_path: None,
+                        path_source: Some(diri_proto::AgentPathSource::SystemPath),
+                        show_in_quick_create: true,
+                        error: None,
+                        descriptor: Some(diri_proto::AgentDescriptor {
+                            display_name: label.to_owned(),
+                            ..Default::default()
+                        }),
+                    };
+                sidebar
+                    .store
+                    .write()
+                    .expect("session store lock poisoned")
+                    .set_agent_catalog(diri_proto::AgentReadinessResult {
+                        host: None,
+                        scanned_at: None,
+                        agents: vec![
+                            installed(diri_proto::AgentKind::CLAUDE_CODE, "Claude Code"),
+                            installed(diri_proto::AgentKind::CODEX, "Codex"),
+                        ],
+                    });
+                sidebar
+            });
             SidebarPopoverHarness { sidebar }
         });
         let project = cx

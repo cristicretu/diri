@@ -1,0 +1,179 @@
+{
+  "_notice": "Screen predicates adapted from Herdr's Apache-2.0 Maki manifest, whose rules were authored against Maki's persistent mode bar, permission form, and plan-complete form. Launch and resume behavior was cross-checked against Maki's official CLI documentation on 2026-08-11; the agent capability block is Diri's own.",
+  "schemaVersion": 2,
+  "id": "maki",
+  "version": "2026.08.11.1",
+  "statusModel": "full",
+  "agent": {
+    "id": "maki",
+    "displayName": "Maki",
+    "shortLabel": "maki",
+    "glyph": "M",
+    "aliases": [
+      "maki"
+    ],
+    "firstClass": true,
+    "setup": {
+      "url": "https://github.com/tontinton/maki#installation",
+      "installHint": "Follow Maki's official installation guide and add maki to PATH.",
+      "signInHint": "Configure a supported provider API key; OpenAI users can run maki auth login openai."
+    },
+    "statusAuthority": "screen",
+    "binary": "maki",
+    "returnToLoginShell": true,
+    "resume": {
+      "style": "flag",
+      "token": "--continue"
+    },
+    "_resumeNotice": "Maki's official CLI reference defines -c/--continue as resuming the most recent session in the current directory.",
+    "_resumeStyleNotice": "Rust uses the flag style without a session id to emit the bare --continue token, matching Maki's latest-session semantics.",
+    "foregroundExecNames": [
+      "maki"
+    ],
+    "envScrubPrefixes": [
+      "DIRI_",
+      "DIRIJOR_"
+    ],
+    "approve": {
+      "text": "y",
+      "submit": true
+    },
+    "deny": {
+      "text": "n",
+      "submit": true
+    }
+  },
+  "rules": [
+    {
+      "id": "permission-prompt",
+      "state": "blockedPermission",
+      "priority": 980,
+      "region": "whole_recent",
+      "when": {
+        "all": [
+          {
+            "contains": "permission required"
+          },
+          {
+            "any": [
+              {
+                "all": [
+                  {
+                    "contains": "y allow"
+                  },
+                  {
+                    "contains": "n deny"
+                  }
+                ]
+              },
+              {
+                "contains": "confirm allow"
+              },
+              {
+                "contains": "confirm deny"
+              },
+              {
+                "all": [
+                  {
+                    "contains": "enter deny"
+                  },
+                  {
+                    "contains": "esc cancel"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "plan-complete-form",
+      "state": "blockedQuestion",
+      "priority": 970,
+      "region": "whole_recent",
+      "when": {
+        "all": [
+          {
+            "contains": "plan complete"
+          },
+          {
+            "contains": "enter confirm"
+          },
+          {
+            "any": [
+              {
+                "contains": "space toggle parallel"
+              },
+              {
+                "contains": "edit plan"
+              }
+            ]
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "status-bar-spinner-working",
+      "state": "working",
+      "priority": 900,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 1,
+      "when": {
+        "lineRegex": "^( [⠀-⣿]){1,2} \\[(BUILD|PLAN|BASH)\\]"
+      },
+      "_notice": "Maki prefixes its persistent mode label with one or two braille spinner cells while streaming."
+    },
+    {
+      "id": "status-bar-idle",
+      "state": "idle",
+      "priority": 850,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 1,
+      "when": {
+        "lineRegex": "^ \\[(BUILD|PLAN|BASH)\\]"
+      }
+    },
+    {
+      "id": "prompt-box-idle",
+      "state": "idle",
+      "priority": 840,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 3,
+      "when": {
+        "all": [
+          {
+            "lineRegex": "^❯ "
+          },
+          {
+            "not": {
+              "contains": "queue another prompt"
+            }
+          },
+          {
+            "not": {
+              "lineRegex": "^( [⠀-⣿]){1,2} "
+            }
+          }
+        ]
+      },
+      "_notice": "Fallback for narrow panes where the right side of the status bar overwrites the mode label."
+    }
+  ]
+}

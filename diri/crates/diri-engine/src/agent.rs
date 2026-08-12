@@ -51,6 +51,13 @@ pub struct InjectionSpec {
     pub codex_notify: bool,
     #[serde(default, rename = "codexMCP")]
     pub codex_mcp: bool,
+    /// Cursor has no `--mcp-config`. Launch a session-local `--plugin-dir`
+    /// whose `mcp.json` advertises the `dirijor` stdio server.
+    #[serde(default, rename = "cursorMCP")]
+    pub cursor_mcp: bool,
+    /// Same plugin ships hooks: Cursor `stop` → `dirijor hook Stop`.
+    #[serde(default, rename = "cursorHooks")]
+    pub cursor_hooks: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -60,6 +67,19 @@ pub struct ApproveSpec {
     pub text: Option<String>,
     #[serde(default)]
     pub submit: bool,
+}
+
+/// Display-only setup metadata. It is parsed here so user overrides can carry
+/// it, but the Engine never executes the hint or opens the URL.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupSpec {
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub install_hint: Option<String>,
+    #[serde(default)]
+    pub sign_in_hint: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -105,6 +125,8 @@ pub struct AgentDescriptor {
     pub env_scrub_prefixes: Vec<String>,
     #[serde(default)]
     pub approve: Option<ApproveSpec>,
+    #[serde(default)]
+    pub setup: Option<SetupSpec>,
 }
 
 impl AgentDescriptor {
@@ -415,7 +437,7 @@ mod tests {
         );
     }
 
-    /// Sixteen of the twenty shipped manifests declare `returnToLoginShell`;
+    /// Eighteen of the twenty-two shipped manifests declare `returnToLoginShell`;
     /// only `cursor`, `gemini` and the two command-less manifests do not. The
     /// flag has been lost wholesale once already, so assert the whole set
     /// rather than a sample: a port that drops it fails here.
@@ -443,6 +465,7 @@ mod tests {
                 "amp",
                 "antigravity",
                 "claude-code",
+                "cline",
                 "codex",
                 "copilot",
                 "devin",
@@ -452,10 +475,39 @@ mod tests {
                 "kilo",
                 "kimi",
                 "kiro",
+                "maki",
                 "opencode",
                 "pi",
                 "qoder",
             ]
+        );
+    }
+
+    #[test]
+    fn every_shipped_cli_agent_has_an_https_setup_url() {
+        let (engine, failed) = ManifestEngine::load_dir(&manifest_dir()).expect("load");
+        assert!(failed.is_empty(), "manifests failed to decode: {failed:?}");
+
+        let missing = engine
+            .ids()
+            .into_iter()
+            .filter(|id| {
+                engine
+                    .manifest(id)
+                    .and_then(|manifest| manifest.agent.as_ref())
+                    .is_some_and(|agent| {
+                        agent.binary.is_some()
+                            && !agent
+                                .setup
+                                .as_ref()
+                                .and_then(|setup| setup.url.as_deref())
+                                .is_some_and(|url| url.starts_with("https://"))
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            missing.is_empty(),
+            "CLI Agents without setup URLs: {missing:?}"
         );
     }
 

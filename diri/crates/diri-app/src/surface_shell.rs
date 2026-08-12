@@ -8,25 +8,27 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::query_label;
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
-use crate::settings::{HostDraft, SettingsTab, default_agent_label, theme};
-use crate::store::{DefaultAgent, Prefs, SessionStore, StoreRuntime};
+use crate::settings::{HostDraft, SettingsTab, theme};
+use crate::store::{Prefs, SessionStore, StoreRuntime};
 use crate::updates::{UpdateCommand, UpdateHandle, UpdatePhase};
 use crate::worktrees::WorktreesSheet;
 use diri_proto::{AgentKind as ProtoAgentKind, HistoryEntry, HostEntry, HostsConfig};
-use diri_term::theme::TermTheme;
+use diri_term::theme::{TermTheme, ThemeAppearance};
 use diri_ui::{
     AgentLogo, Fill, FloatingSurface, HairlineDivider, Ink, LoadingIndicator, Metrics, Palette,
     Radius, SemanticColors, Space, Typo,
 };
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, FocusHandle, Focusable, FontWeight,
-    IntoElement, KeyDownEvent, MouseButton, Pixels, Render, Rgba, SharedString, Task, TextRun,
-    Window, actions, canvas, deferred, div, font, prelude::*, px, rgba,
+    IntoElement, KeyDownEvent, MouseButton, PathPromptOptions, Pixels, Render, Rgba, SharedString,
+    Task, TextRun, Window, canvas, deferred, div, font, prelude::*, px, rgba,
 };
 use tokio::runtime::Runtime;
 
-const COLORS: SemanticColors = SemanticColors::dark();
-const SETTINGS_COLORS: SemanticColors = SemanticColors::sidebar(diri_ui::Appearance::Dark);
+use crate::commands::{
+    Activate, CloseSurface, MoveDown, MoveUp, OpenSettings, OpenWorktrees, ToggleHistory,
+    UTILITY_CONTEXT,
+};
 const SETTINGS_WIDTH: f32 = 600.0;
 const SETTINGS_HEIGHT: f32 = 420.0;
 const SETTINGS_NAV_WIDTH: f32 = 150.0;
@@ -37,19 +39,6 @@ const RESULT_LIMIT: usize = 200;
 /// actionable and first-time setup keeps its "Use by default" action.
 const HOST_REINSTALL_SUCCESS_VISIBILITY: Duration = Duration::from_secs(3);
 
-actions!(
-    diri,
-    [
-        ToggleHistory,
-        OpenWorktrees,
-        OpenSettings,
-        CloseSurface,
-        MoveUp,
-        MoveDown,
-        Activate
-    ]
-);
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Surface {
     #[default]
@@ -57,6 +46,7 @@ enum Surface {
     History,
     Worktrees,
     Settings,
+    Diagnostics,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,6 +123,14 @@ struct HostEditor {
     active_field: HostFormField,
     error: Option<String>,
     confirm_remove: bool,
+}
+
+struct AgentPathEditor {
+    kind: ProtoAgentKind,
+    host: Option<String>,
+    path: QueryEditor,
+    show_in_quick_create: bool,
+    error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -262,6 +260,8 @@ pub struct UtilitySurfaces {
     worktrees: WorktreesSheet,
     settings_tab: SettingsTab,
     settings_menu: Option<SettingsMenu>,
+    agents_host: Option<String>,
+    agent_path_editor: Option<AgentPathEditor>,
     hosts_path: PathBuf,
     hosts: Vec<HostEntry>,
     host_editor: Option<HostEditor>,
@@ -274,6 +274,7 @@ pub struct UtilitySurfaces {
     runtime: Arc<Runtime>,
     updates: UpdateHandle,
     activity: String,
+    diagnostics_report: Option<String>,
     _update_changes: Task<()>,
     _store_changes: Task<()>,
 }
@@ -291,22 +292,35 @@ impl UtilitySurfaces {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         let hosts_path = diri_proto::paths::DirijorPaths::hosts_config_file(&home);
-        let (prefs, hosts) = {
+        let (prefs, hosts, agents_host) = {
             let store = store_runtime
                 .store
                 .read()
                 .expect("session store lock poisoned");
-            (store.preferences().clone(), store.hosts().to_vec())
+            (
+                store.preferences().clone(),
+                store.hosts().to_vec(),
+                store.default_spawn_host(),
+            )
         };
         let settings_preview = std::env::var("DIRI_SETTINGS_PREVIEW")
             .ok()
             .map(|value| value.to_ascii_lowercase());
         let settings_tab = match settings_preview.as_deref() {
             Some("terminal") => SettingsTab::Terminal,
+            Some("agents") => SettingsTab::Agents,
             Some("resources") => SettingsTab::Resources,
             Some("remote") => SettingsTab::Remote,
             _ => SettingsTab::General,
         };
+        let diagnostics_preview = settings_preview.as_deref() == Some("diagnostics");
+        let diagnostics_report = diagnostics_preview.then(|| {
+            let store = store_runtime
+                .store
+                .read()
+                .expect("session store lock poisoned");
+            build_diagnostics_report(&store)
+        });
         // The Settings pane renders update state it does not own, so it has to
         // be woken when that state moves.
         let update_changes = {
@@ -338,7 +352,9 @@ impl UtilitySurfaces {
         };
         Self {
             focus,
-            surface: if settings_preview.is_some() {
+            surface: if diagnostics_preview {
+                Surface::Diagnostics
+            } else if settings_preview.is_some() {
                 Surface::Settings
             } else {
                 Surface::None
@@ -351,6 +367,8 @@ impl UtilitySurfaces {
             worktrees: WorktreesSheet::default(),
             settings_tab,
             settings_menu: None,
+            agents_host,
+            agent_path_editor: None,
             hosts_path,
             hosts,
             host_editor: None,
@@ -363,6 +381,7 @@ impl UtilitySurfaces {
             runtime,
             updates,
             activity: "Connected client · shared daemon remains untouched".to_owned(),
+            diagnostics_report,
             _update_changes: update_changes,
             _store_changes: store_changes,
         }
@@ -460,11 +479,11 @@ impl UtilitySurfaces {
     }
 
     fn resume_history(&mut self, entry: HistoryEntry, cx: &mut Context<Self>) {
-        let Some(params) = crate::history::resume_spawn(&entry) else {
+        if !entry.cwd_exists || !Path::new(&entry.cwd).is_dir() {
             self.history_error = Some("The conversation folder is no longer available".to_owned());
             cx.notify();
             return;
-        };
+        }
         self.history_loading = true;
         self.history_error = None;
         let client = Arc::clone(self.store_runtime.client());
@@ -472,7 +491,7 @@ impl UtilitySurfaces {
         cx.spawn(async move |this, cx| {
             let task = runtime.spawn(async move {
                 client.wait_until_connected(Duration::from_secs(5)).await?;
-                client.spawn(params).await
+                crate::history::resume(&client, &entry).await
             });
             let result = match task.await {
                 Ok(result) => result.map_err(|error| error.to_string()),
@@ -661,6 +680,10 @@ impl UtilitySurfaces {
                 }
                 match outcome {
                     Ok(result) => {
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .request_agent_catalog(Some(host.id.clone()), true);
                         this.activity = match kind {
                             HostPreparationKind::Initialize => {
                                 format!("{} is ready", host.display_name())
@@ -862,6 +885,72 @@ impl UtilitySurfaces {
         true
     }
 
+    fn handle_agent_path_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.surface != Surface::Settings
+            || self.settings_tab != SettingsTab::Agents
+            || self.agent_path_editor.is_none()
+        {
+            return false;
+        }
+        let key = &event.keystroke;
+        match key.key.as_str() {
+            "escape" => {
+                self.agent_path_editor = None;
+                cx.notify();
+            }
+            "enter" => {
+                let Some(editor) = &self.agent_path_editor else {
+                    return true;
+                };
+                let path = editor.path.text().trim();
+                if path.is_empty() {
+                    if let Some(editor) = &mut self.agent_path_editor {
+                        editor.error = Some("Enter an executable path.".into());
+                    }
+                } else {
+                    self.store
+                        .write()
+                        .expect("session store lock poisoned")
+                        .configure_agent(diri_proto::AgentConfigureParams {
+                            host: editor.host.clone(),
+                            kind: editor.kind.clone(),
+                            executable_path: Some(path.to_owned()),
+                            show_in_quick_create: editor.show_in_quick_create,
+                        });
+                    self.agent_path_editor = None;
+                }
+                cx.notify();
+            }
+            _ => {
+                let Some(edit) = query_editor::edit_for(key) else {
+                    return false;
+                };
+                let Some(editor) = &mut self.agent_path_editor else {
+                    return false;
+                };
+                match edit {
+                    Edit::Local(local) => {
+                        editor.path.apply(local);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Copy) => {
+                        query_editor::copy_selection(&editor.path, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Cut) => {
+                        query_editor::cut_selection(&mut editor.path, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Paste) => {
+                        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                            editor.path.insert(&text);
+                        }
+                    }
+                }
+                editor.error = None;
+                cx.notify();
+            }
+        }
+        true
+    }
+
     fn visible_history(&self) -> Vec<HistoryEntry> {
         self.history
             .iter()
@@ -900,6 +989,7 @@ impl UtilitySurfaces {
             self.surface = Surface::None;
             self.settings_menu = None;
             self.host_editor = None;
+            self.agent_path_editor = None;
         }
         cx.notify();
     }
@@ -918,6 +1008,28 @@ impl UtilitySurfaces {
         self.surface = Surface::Settings;
         self.settings_menu = None;
         self.host_editor = None;
+        self.agent_path_editor = None;
+        cx.notify();
+    }
+
+    pub(crate) fn open_agent_settings(&mut self, host: Option<String>, cx: &mut Context<Self>) {
+        self.open_settings(cx);
+        self.settings_tab = SettingsTab::Agents;
+        self.agents_host = host.clone();
+        self.store
+            .write()
+            .expect("session store lock poisoned")
+            .request_agent_catalog(host, false);
+        cx.notify();
+    }
+
+    fn open_diagnostics(&mut self, cx: &mut Context<Self>) {
+        let store = self.store.read().expect("session store lock poisoned");
+        let report = build_diagnostics_report(&store);
+        drop(store);
+        self.diagnostics_report = Some(report);
+        self.surface = Surface::Diagnostics;
+        self.settings_menu = None;
         cx.notify();
     }
 
@@ -945,7 +1057,7 @@ impl UtilitySurfaces {
         if self.surface == Surface::None {
             return;
         }
-        if self.handle_host_editor_key(event, cx) {
+        if self.handle_agent_path_key(event, cx) || self.handle_host_editor_key(event, cx) {
             return;
         }
         let key = &event.keystroke;
@@ -987,6 +1099,7 @@ impl UtilitySurfaces {
     }
 
     fn render_history(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.colors();
         let entries = self.visible_history();
         let empty = entries.is_empty() && !self.history_loading;
         let rows = entries.into_iter().enumerate().map(|(index, entry)| {
@@ -1009,15 +1122,15 @@ impl UtilitySurfaces {
                 .items_center()
                 .gap(px(9.0))
                 .opacity(if resumable { 1.0 } else { 0.45 })
-                .bg(Fill::selected(COLORS, selected))
+                .bg(Fill::selected(colors, selected))
                 .cursor_pointer()
-                .hover(|style| style.bg(Fill::hover(COLORS, true)))
+                .hover(move |style| style.bg(Fill::hover(colors, true)))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if resumable {
                         this.resume_history(entry.clone(), cx);
                     }
                 }))
-                .child(AgentLogo::new(agent, 18.0, COLORS))
+                .child(AgentLogo::new(agent, 18.0, colors))
                 .child(
                     div()
                         .flex()
@@ -1028,7 +1141,7 @@ impl UtilitySurfaces {
                         .child(
                             div()
                                 .text_size(px(13.0))
-                                .text_color(COLORS.primary)
+                                .text_color(colors.primary)
                                 .overflow_hidden()
                                 .child(title),
                         )
@@ -1037,17 +1150,20 @@ impl UtilitySurfaces {
                                 .flex()
                                 .gap(px(5.0))
                                 .text_size(px(11.0))
-                                .child(div().text_color(COLORS.secondary).child(folder))
-                                .child(div().text_color(COLORS.tertiary).child(parent)),
+                                .child(div().text_color(colors.secondary).child(folder))
+                                .child(div().text_color(colors.tertiary).child(parent)),
                         ),
                 )
-                .child(chip(if !resumable {
-                    "folder gone".to_owned()
-                } else if selected {
-                    "↵ resume".to_owned()
-                } else {
-                    age
-                }))
+                .child(chip(
+                    if !resumable {
+                        "folder gone".to_owned()
+                    } else if selected {
+                        "↵ resume".to_owned()
+                    } else {
+                        age
+                    },
+                    colors,
+                ))
         });
 
         FloatingSurface::new(
@@ -1065,14 +1181,14 @@ impl UtilitySurfaces {
                         .items_center()
                         .gap(px(10.0))
                         .text_size(px(15.0))
-                        .child(sf_symbol("magnifyingglass", 13.0, COLORS.tertiary))
+                        .child(sf_symbol("magnifyingglass", 13.0, colors.tertiary))
                         .child(
                             div()
                                 .flex_1()
                                 .text_color(if self.history_query.is_empty() {
-                                    COLORS.tertiary
+                                    colors.tertiary
                                 } else {
-                                    COLORS.primary
+                                    colors.primary
                                 })
                                 .child(if self.history_query.is_empty() {
                                     div().child("Search past conversations…").into_any_element()
@@ -1080,9 +1196,9 @@ impl UtilitySurfaces {
                                     query_label(&self.history_query)
                                 }),
                         )
-                        .child(chip("esc".to_owned())),
+                        .child(chip("esc".to_owned(), colors)),
                 )
-                .child(HairlineDivider::horizontal(COLORS))
+                .child(HairlineDivider::horizontal(colors))
                 .child(
                     div()
                         .id("history-results")
@@ -1093,17 +1209,23 @@ impl UtilitySurfaces {
                         .flex_col()
                         .gap(px(1.0))
                         .when(self.history_loading, |view| {
-                            view.child(empty_label("Scanning Claude and Codex transcripts…"))
+                            view.child(empty_label(
+                                "Scanning Claude and Codex transcripts…",
+                                colors,
+                            ))
                         })
                         .when_some(self.history_error.clone(), |view, error| {
-                            view.child(empty_label(&error))
+                            view.child(empty_label(&error, colors))
                         })
                         .when(empty, |view| {
-                            view.child(empty_label(if self.history_query.is_empty() {
-                                "No past conversations"
-                            } else {
-                                "No matches"
-                            }))
+                            view.child(empty_label(
+                                if self.history_query.is_empty() {
+                                    "No past conversations"
+                                } else {
+                                    "No matches"
+                                },
+                                colors,
+                            ))
                         })
                         .children(rows),
                 ),
@@ -1111,6 +1233,7 @@ impl UtilitySurfaces {
     }
 
     fn render_worktrees(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.colors();
         let cards = self
             .worktrees
             .entries
@@ -1132,9 +1255,9 @@ impl UtilitySurfaces {
                     .border_color(if stale {
                         Ink::ATTENTION.alpha(0.6)
                     } else {
-                        COLORS.primary.alpha(0.06)
+                        colors.primary.alpha(0.06)
                     })
-                    .bg(Fill::subtle(COLORS))
+                    .bg(Fill::subtle(colors))
                     .flex()
                     .flex_col()
                     .gap(px(8.0))
@@ -1145,13 +1268,13 @@ impl UtilitySurfaces {
                             .gap(px(6.0))
                             .text_size(px(13.0))
                             .font_weight(FontWeight::MEDIUM)
-                            .child(sf_symbol("arrow.branch", 13.0, COLORS.secondary))
+                            .child(sf_symbol("arrow.branch", 13.0, colors.secondary))
                             .child(branch),
                     )
                     .child(
                         div()
                             .text_size(px(11.0))
-                            .text_color(COLORS.tertiary)
+                            .text_color(colors.tertiary)
                             .child(project),
                     )
                     .child(
@@ -1164,7 +1287,7 @@ impl UtilitySurfaces {
                             .when(entry.merged, |row| {
                                 row.child(colored_badge("merged", Ink::FRESH))
                             })
-                            .child(chip(format!("{}d", entry.age_days))),
+                            .child(chip(format!("{}d", entry.age_days), colors)),
                     )
                     .when(stale, |card| {
                         card.child(
@@ -1220,17 +1343,24 @@ impl UtilitySurfaces {
                                 .child(surface_button(
                                     "Refresh",
                                     "refresh-worktrees",
+                                    colors,
                                     cx,
                                     |this, cx| {
                                         this.refresh_worktrees(cx);
                                     },
                                 ))
-                                .child(surface_button("Done", "done-worktrees", cx, |this, cx| {
-                                    this.close_surface(cx);
-                                })),
+                                .child(surface_button(
+                                    "Done",
+                                    "done-worktrees",
+                                    colors,
+                                    cx,
+                                    |this, cx| {
+                                        this.close_surface(cx);
+                                    },
+                                )),
                         ),
                 )
-                .child(HairlineDivider::horizontal(COLORS))
+                .child(HairlineDivider::horizontal(colors))
                 .child(
                     div()
                         .id("worktree-cards")
@@ -1242,14 +1372,14 @@ impl UtilitySurfaces {
                         .content_start()
                         .gap(px(12.0))
                         .when(self.worktrees.loading, |view| {
-                            view.child(empty_label("Refreshing worktrees…"))
+                            view.child(empty_label("Refreshing worktrees…", colors))
                         })
                         .when_some(self.worktrees.error.clone(), |view, error| {
-                            view.child(empty_label(&error))
+                            view.child(empty_label(&error, colors))
                         })
                         .when(
                             self.worktrees.entries.is_empty() && !self.worktrees.loading,
-                            |view| view.child(empty_label("No worktrees")),
+                            |view| view.child(empty_label("No worktrees", colors)),
                         )
                         .children(cards),
                 )
@@ -1297,7 +1427,7 @@ impl UtilitySurfaces {
                                             .child(
                                                 div()
                                                     .text_size(px(11.0))
-                                                    .text_color(COLORS.secondary)
+                                                    .text_color(colors.secondary)
                                                     .child(format!(
                                                         "{} is merged and clean.",
                                                         entry.path
@@ -1307,6 +1437,7 @@ impl UtilitySurfaces {
                                     .child(surface_button(
                                         "Cancel",
                                         "cancel-cleanup",
+                                        colors,
                                         cx,
                                         |this, cx| {
                                             this.worktrees.cancel_cleanup();
@@ -1323,6 +1454,7 @@ impl UtilitySurfaces {
     }
 
     fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
         let tabs = SettingsTab::ALL
             .into_iter()
             .map(|tab| {
@@ -1335,20 +1467,26 @@ impl UtilitySurfaces {
                     .flex()
                     .items_center()
                     .gap(px(8.0))
-                    .bg(Fill::selected(SETTINGS_COLORS, selected))
+                    .bg(Fill::selected(colors, selected))
                     .text_color(if selected {
-                        SETTINGS_COLORS.primary
+                        colors.primary
                     } else {
-                        SETTINGS_COLORS.secondary
+                        colors.secondary
                     })
                     .cursor_pointer()
-                    .hover(|style| style.bg(Fill::hover(SETTINGS_COLORS, true)))
+                    .hover(move |style| style.bg(Fill::hover(colors, true)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.settings_tab = tab;
                         this.settings_menu = None;
                         this.host_editor = None;
+                        this.agent_path_editor = None;
                         if tab == SettingsTab::Remote {
                             this.reload_hosts();
+                        } else if tab == SettingsTab::Agents {
+                            this.store
+                                .write()
+                                .expect("session store lock poisoned")
+                                .request_agent_catalog(this.agents_host.clone(), false);
                         }
                         cx.notify();
                     }))
@@ -1356,9 +1494,9 @@ impl UtilitySurfaces {
                         tab.icon(),
                         13.0,
                         if selected {
-                            SETTINGS_COLORS.primary
+                            colors.primary
                         } else {
-                            SETTINGS_COLORS.tertiary
+                            colors.tertiary
                         },
                     ))
                     .child(
@@ -1376,12 +1514,13 @@ impl UtilitySurfaces {
             .collect::<Vec<_>>();
         let pane = match self.settings_tab {
             SettingsTab::General => self.general_settings(cx).into_any_element(),
+            SettingsTab::Agents => self.agents_settings(cx).into_any_element(),
             SettingsTab::Terminal => self.terminal_settings(cx).into_any_element(),
             SettingsTab::Resources => self.resource_settings(cx).into_any_element(),
             SettingsTab::Remote => self.remote_settings(cx).into_any_element(),
         };
         FloatingSurface::new(
-            self.settings_colors(),
+            colors,
             div()
                 .id("settings-dialog")
                 .debug_selector(|| "settings-dialog".into())
@@ -1406,7 +1545,7 @@ impl UtilitySurfaces {
                     div()
                         .w(px(SETTINGS_NAV_WIDTH))
                         .h_full()
-                        .bg(SETTINGS_COLORS.primary.alpha(0.018))
+                        .bg(colors.primary.alpha(0.018))
                         .flex()
                         .flex_col()
                         .child(
@@ -1416,7 +1555,7 @@ impl UtilitySurfaces {
                                 .flex()
                                 .items_center()
                                 .gap(px(Metrics::TOOLBAR_ITEM_GAP))
-                                .child(sf_symbol("gearshape", 15.0, SETTINGS_COLORS.secondary))
+                                .child(sf_symbol("gearshape", 15.0, colors.secondary))
                                 .child(
                                     div()
                                         .text_size(px(Typo::TITLE.size))
@@ -1440,11 +1579,11 @@ impl UtilitySurfaces {
                                 .px(px(Metrics::TOOLBAR_EDGE_INSET))
                                 .pb(px(10.0))
                                 .text_size(px(Typo::META.size))
-                                .text_color(SETTINGS_COLORS.tertiary)
+                                .text_color(colors.tertiary)
                                 .child(format!("diri {}", crate::updates::CURRENT_VERSION)),
                         ),
                 )
-                .child(HairlineDivider::vertical(SETTINGS_COLORS))
+                .child(HairlineDivider::vertical(colors))
                 .child(
                     div()
                         .relative()
@@ -1473,7 +1612,7 @@ impl UtilitySurfaces {
                                 .items_center()
                                 .justify_center()
                                 .cursor_pointer()
-                                .hover(|style| style.bg(Fill::subtle(SETTINGS_COLORS)))
+                                .hover(move |style| style.bg(Fill::subtle(colors)))
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.close_surface(cx);
@@ -1482,7 +1621,7 @@ impl UtilitySurfaces {
                                     "xmark",
                                     13.5,
                                     SymbolWeight::Bold,
-                                    SETTINGS_COLORS.secondary,
+                                    colors.secondary,
                                 )),
                         ),
                 ),
@@ -1490,6 +1629,7 @@ impl UtilitySurfaces {
     }
 
     fn general_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
         let quick_open_roots = if self.prefs.quick_open_roots.is_empty() {
             "~/fun".to_owned()
         } else {
@@ -1507,7 +1647,9 @@ impl UtilitySurfaces {
                         "Default agent",
                         "Used by ⌘T and Quick Open.",
                         self.default_agent_dropdown(cx),
+                        colors,
                     ),
+                    colors,
                 ))
                 .child(setting_section(
                     "Behavior",
@@ -1519,6 +1661,7 @@ impl UtilitySurfaces {
                             "Open diri automatically after you sign in.",
                             self.prefs.start_at_login,
                             "toggle-login",
+                            colors,
                             cx,
                             |this, cx| {
                                 this.prefs.start_at_login = !this.prefs.start_at_login;
@@ -1526,12 +1669,13 @@ impl UtilitySurfaces {
                                 cx.notify();
                             },
                         ))
-                        .child(setting_divider())
+                        .child(setting_divider(colors))
                         .child(toggle_row(
                             "Confirm before closing a session",
                             "Ask before closing a session with a running process.",
                             self.prefs.confirm_before_closing_session,
                             "toggle-close-confirm",
+                            colors,
                             cx,
                             |this, cx| {
                                 this.prefs.confirm_before_closing_session =
@@ -1540,12 +1684,13 @@ impl UtilitySurfaces {
                                 cx.notify();
                             },
                         ))
-                        .child(setting_divider())
+                        .child(setting_divider(colors))
                         .child(toggle_row(
-                            "Chime on agent status changes",
-                            "Play a sound when an agent needs input or finishes.",
+                            "Gentle status chimes",
+                            "Quiet cues for input, completion, and memory pauses.",
                             self.prefs.status_sounds,
                             "toggle-status-sounds",
+                            colors,
                             cx,
                             |this, cx| {
                                 this.prefs.status_sounds = !this.prefs.status_sounds;
@@ -1553,8 +1698,25 @@ impl UtilitySurfaces {
                                 cx.notify();
                             },
                         )),
+                    colors,
                 ))
                 .child(self.update_settings(cx))
+                .child(setting_section(
+                    "Support",
+                    setting_row(
+                        "Copy diagnostics",
+                        "Preview a privacy-safe report before copying it.",
+                        surface_button(
+                            "Preview…",
+                            "preview-diagnostics",
+                            colors,
+                            cx,
+                            |this, cx| this.open_diagnostics(cx),
+                        ),
+                        colors,
+                    ),
+                    colors,
+                ))
                 .child(setting_section(
                     "Quick Open",
                     div()
@@ -1575,11 +1737,11 @@ impl UtilitySurfaces {
                                 .whitespace_normal()
                                 .p(px(10.0))
                                 .rounded(px(Radius::BADGE))
-                                .bg(SETTINGS_COLORS.primary.alpha(0.055))
+                                .bg(colors.primary.alpha(0.055))
                                 .font_family(crate::fonts::mono_family())
                                 .text_size(px(11.0))
                                 .line_height(px(17.0))
-                                .text_color(SETTINGS_COLORS.secondary)
+                                .text_color(colors.secondary)
                                 .child(wrappable_setting_copy(quick_open_roots.into())),
                         )
                         .child(
@@ -1589,7 +1751,7 @@ impl UtilitySurfaces {
                                 .whitespace_normal()
                                 .text_size(px(11.0))
                                 .line_height(px(16.0))
-                                .text_color(SETTINGS_COLORS.tertiary)
+                                .text_color(colors.tertiary)
                                 .child(wrappable_setting_copy(
                                     if self.prefs.quick_open_roots.is_empty() {
                                         "Using the default folder plus project parent folders."
@@ -1599,66 +1761,535 @@ impl UtilitySurfaces {
                                     .into(),
                                 )),
                         ),
+                    colors,
                 )),
+            colors,
         )
     }
 
+    fn agents_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        let host = self.agents_host.clone();
+        let (catalog, loading, error, hosts) = {
+            let store = self.store.read().expect("session store lock poisoned");
+            (
+                store.agent_catalog(host.as_deref()).cloned(),
+                store.agent_catalog_is_loading(host.as_deref()),
+                store
+                    .agent_catalog_error(host.as_deref())
+                    .map(str::to_owned),
+                store.hosts().to_vec(),
+            )
+        };
+        let mut targets = div().p(px(8.0)).flex().flex_wrap().gap(px(6.0));
+        let mut choices = vec![(None, "This Mac".to_owned(), "desktopcomputer")];
+        choices.extend(hosts.iter().map(|entry| {
+            (
+                Some(entry.id.clone()),
+                entry.display_name().to_owned(),
+                "network",
+            )
+        }));
+        for (index, (target, label, symbol)) in choices.into_iter().enumerate() {
+            let selected = target == host;
+            targets = targets.child(
+                div()
+                    .id(format!("agent-target-{index}"))
+                    .h(px(28.0))
+                    .px(px(8.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .rounded(px(Radius::CHIP))
+                    .border_1()
+                    .border_color(colors.primary.alpha(if selected { 0.18 } else { 0.07 }))
+                    .bg(Fill::selected(colors, selected))
+                    .cursor_pointer()
+                    .hover(move |row| row.bg(colors.primary.alpha(0.07)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.agents_host.clone_from(&target);
+                        this.agent_path_editor = None;
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .request_agent_catalog(target.clone(), false);
+                        cx.notify();
+                    }))
+                    .child(sf_symbol(symbol, 10.0, colors.secondary))
+                    .child(div().text_size(px(11.0)).child(label)),
+            );
+        }
+
+        let mut catalog_rows = div().flex().flex_col();
+        if let Some(catalog) = catalog {
+            let agent_count = catalog.agents.len();
+            for (index, item) in catalog.agents.into_iter().enumerate() {
+                catalog_rows = catalog_rows.child(self.agent_settings_row(index, item, colors, cx));
+                if index + 1 < agent_count {
+                    catalog_rows = catalog_rows.child(setting_divider(colors));
+                }
+            }
+        } else if loading {
+            catalog_rows = catalog_rows.child(empty_label("Checking installed Agents…", colors));
+        } else {
+            catalog_rows = catalog_rows.child(empty_label(
+                "Agent detection has not run for this host.",
+                colors,
+            ));
+        }
+        if let Some(error) = error {
+            catalog_rows = catalog_rows.child(
+                div()
+                    .px(px(12.0))
+                    .py(px(9.0))
+                    .whitespace_normal()
+                    .text_size(px(11.0))
+                    .text_color(Ink::DANGER)
+                    .child(error),
+            );
+        }
+        if let Some(editor) = &self.agent_path_editor {
+            catalog_rows = catalog_rows.child(self.agent_path_editor_row(editor, colors, cx));
+        }
+
+        let refresh_host = host.clone();
+        settings_page(
+            "Agents",
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(SETTINGS_SECTION_GAP))
+                .child(setting_section("Execution target", targets, colors))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(colors.tertiary)
+                                .child("Detected from the account login PATH."),
+                        )
+                        .child(surface_button(
+                            if loading { "Checking…" } else { "Refresh" },
+                            "refresh-agent-catalog",
+                            colors,
+                            cx,
+                            move |this, cx| {
+                                this.store
+                                    .write()
+                                    .expect("session store lock poisoned")
+                                    .request_agent_catalog(refresh_host.clone(), true);
+                                cx.notify();
+                            },
+                        )),
+                )
+                .child(setting_section("Supported Agents", catalog_rows, colors)),
+            colors,
+        )
+    }
+
+    fn agent_settings_row(
+        &self,
+        index: usize,
+        item: diri_proto::AgentReadinessItem,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let label = item
+            .descriptor
+            .as_ref()
+            .map(|descriptor| descriptor.display_name.clone())
+            .filter(|label| !label.is_empty())
+            .unwrap_or_else(|| item.kind.id().to_owned());
+        let path = item.path.clone().unwrap_or_else(|| "Not found".into());
+        let status = match item.path_source {
+            Some(diri_proto::AgentPathSource::Manual) => "Manual",
+            Some(diri_proto::AgentPathSource::SystemPath) => "Installed",
+            None => "Not found",
+        };
+        let status_color = if item.available() {
+            Ink::FRESH
+        } else {
+            colors.tertiary
+        };
+        let host = self.agents_host.clone();
+        let toggle_kind = item.kind.clone();
+        let toggle_path = item.configured_path.clone();
+        let show = item.show_in_quick_create;
+        let mut actions = div().flex_none().flex().items_center().gap(px(6.0));
+        if item.available() {
+            actions = actions.child(
+                div()
+                    .id(format!("agent-quick-toggle-{index}"))
+                    .h(px(24.0))
+                    .px(px(7.0))
+                    .rounded(px(Radius::CHIP))
+                    .bg(if show {
+                        Ink::FRESH.alpha(0.12)
+                    } else {
+                        colors.primary.alpha(0.06)
+                    })
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .configure_agent(diri_proto::AgentConfigureParams {
+                                host: host.clone(),
+                                kind: toggle_kind.clone(),
+                                executable_path: toggle_path.clone(),
+                                show_in_quick_create: !show,
+                            });
+                        cx.notify();
+                    }))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(sf_symbol(
+                        if show {
+                            "checkmark.circle.fill"
+                        } else {
+                            "circle"
+                        },
+                        10.0,
+                        if show { Ink::FRESH } else { colors.tertiary },
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(colors.secondary)
+                            .child("Quick"),
+                    ),
+            );
+        }
+        if let Some(url) = item
+            .descriptor
+            .as_ref()
+            .and_then(|descriptor| descriptor.setup.as_ref())
+            .and_then(|setup| setup.url.as_deref())
+            .and_then(crate::agent_catalog::normal_web_url)
+        {
+            actions = actions.child(
+                div()
+                    .id(format!("agent-website-{index}"))
+                    .size(px(24.0))
+                    .rounded(px(Radius::CHIP))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(move |button| button.bg(colors.primary.alpha(0.07)))
+                    .on_click(move |_, _, cx| cx.open_url(&url))
+                    .child(sf_symbol("arrow.up.right.square", 10.0, colors.secondary)),
+            );
+        }
+        let edit_kind = item.kind.clone();
+        let edit_path = item.configured_path.clone().unwrap_or_default();
+        let edit_host = self.agents_host.clone();
+        let edit_show = !item.available() || item.show_in_quick_create;
+        actions = actions.child(
+            div()
+                .id(format!("agent-bind-{index}"))
+                .h(px(24.0))
+                .px(px(7.0))
+                .rounded(px(Radius::CHIP))
+                .bg(colors.primary.alpha(0.06))
+                .cursor_pointer()
+                .hover(move |button| button.bg(colors.primary.alpha(0.09)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if edit_host.is_none() {
+                        let paths = cx.prompt_for_paths(PathPromptOptions {
+                            files: true,
+                            directories: false,
+                            multiple: false,
+                            prompt: Some("Choose Agent Executable".into()),
+                        });
+                        let kind = edit_kind.clone();
+                        cx.spawn_in(window, async move |this, cx| {
+                            let Ok(Ok(Some(mut paths))) = paths.await else {
+                                return;
+                            };
+                            let Some(path) = paths.pop() else {
+                                return;
+                            };
+                            let _ = this.update_in(cx, |this, _, cx| {
+                                this.store
+                                    .write()
+                                    .expect("session store lock poisoned")
+                                    .configure_agent(diri_proto::AgentConfigureParams {
+                                        host: None,
+                                        kind: kind.clone(),
+                                        executable_path: Some(path.to_string_lossy().into_owned()),
+                                        show_in_quick_create: edit_show,
+                                    });
+                                cx.notify();
+                            });
+                        })
+                        .detach();
+                    } else {
+                        this.agent_path_editor = Some(AgentPathEditor {
+                            kind: edit_kind.clone(),
+                            host: edit_host.clone(),
+                            path: text_editor(&edit_path),
+                            show_in_quick_create: edit_show,
+                            error: None,
+                        });
+                        cx.notify();
+                    }
+                }))
+                .flex()
+                .items_center()
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(colors.secondary)
+                        .child(if item.available() { "Change" } else { "Add…" }),
+                ),
+        );
+        if item.configured_path.is_some() {
+            let reset_host = self.agents_host.clone();
+            let reset_kind = item.kind.clone();
+            let reset_show = item.show_in_quick_create;
+            actions = actions.child(
+                div()
+                    .id(format!("agent-reset-{index}"))
+                    .size(px(24.0))
+                    .rounded(px(Radius::CHIP))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(move |button| button.bg(colors.primary.alpha(0.07)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .configure_agent(diri_proto::AgentConfigureParams {
+                                host: reset_host.clone(),
+                                kind: reset_kind.clone(),
+                                executable_path: None,
+                                show_in_quick_create: reset_show,
+                            });
+                        cx.notify();
+                    }))
+                    .child(sf_symbol("arrow.uturn.backward", 10.0, colors.secondary)),
+            );
+        }
+
+        div()
+            .id(format!("agent-settings-row-{index}"))
+            .min_h(px(58.0))
+            .px(px(12.0))
+            .py(px(8.0))
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .child(AgentLogo::new(ui_agent(&item.kind), 22.0, colors).badged(false))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(colors.primary)
+                                    .child(label),
+                            )
+                            .child(colored_status_badge(status, status_color)),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_size(px(10.0))
+                            .text_color(if item.error.is_some() {
+                                Ink::DANGER
+                            } else {
+                                colors.tertiary
+                            })
+                            .child(item.error.unwrap_or(path)),
+                    ),
+            )
+            .child(actions)
+            .into_any_element()
+    }
+
+    fn agent_path_editor_row(
+        &self,
+        editor: &AgentPathEditor,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut row = div()
+            .px(px(12.0))
+            .py(px(10.0))
+            .border_t_1()
+            .border_color(colors.primary.alpha(0.06))
+            .flex()
+            .flex_col()
+            .gap(px(7.0))
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(colors.secondary)
+                    .child("Remote executable path (absolute or ~/…)"),
+            )
+            .child(
+                div()
+                    .h(px(30.0))
+                    .px(px(8.0))
+                    .rounded(px(Radius::CHIP))
+                    .border_1()
+                    .border_color(colors.primary.alpha(0.14))
+                    .flex()
+                    .items_center()
+                    .text_size(px(11.0))
+                    .text_color(colors.primary)
+                    .child(query_label(&editor.path)),
+            );
+        if let Some(error) = &editor.error {
+            row = row.child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(Ink::DANGER)
+                    .child(error.clone()),
+            );
+        }
+        row.child(
+            div()
+                .flex()
+                .justify_end()
+                .gap(px(7.0))
+                .child(surface_button(
+                    "Cancel",
+                    "cancel-agent-path",
+                    colors,
+                    cx,
+                    |this, cx| {
+                        this.agent_path_editor = None;
+                        cx.notify();
+                    },
+                ))
+                .child(surface_button(
+                    "Save Path",
+                    "save-agent-path",
+                    colors,
+                    cx,
+                    |this, cx| {
+                        let Some(editor) = &this.agent_path_editor else {
+                            return;
+                        };
+                        let path = editor.path.text().trim();
+                        if path.is_empty() {
+                            if let Some(editor) = &mut this.agent_path_editor {
+                                editor.error = Some("Enter an executable path.".into());
+                            }
+                            cx.notify();
+                            return;
+                        }
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .configure_agent(diri_proto::AgentConfigureParams {
+                                host: editor.host.clone(),
+                                kind: editor.kind.clone(),
+                                executable_path: Some(path.to_owned()),
+                                show_in_quick_create: editor.show_in_quick_create,
+                            });
+                        this.agent_path_editor = None;
+                        cx.notify();
+                    },
+                )),
+        )
+        .into_any_element()
+    }
+
     fn default_agent_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
-        let selected = self.prefs.default_agent;
+        let colors = self.settings_colors();
+        let selected = self.prefs.default_agent.clone();
+        let agents = {
+            let store = self.store.read().expect("session store lock poisoned");
+            // The default agent is a global preference repaired against the
+            // local catalog (see set_agent_catalog); listing the default spawn
+            // host's catalog instead would let a remote host's thinner install
+            // set — or its not-yet-fetched catalog — shrink the choices.
+            crate::agent_catalog::installed_agent_options(store.agent_catalog(None))
+        };
+        let selected_label = agents
+            .iter()
+            .find(|agent| agent.kind == selected)
+            .map(|agent| agent.display_name.clone())
+            .unwrap_or_else(|| crate::agent_catalog::title_case_id(selected.id()));
         let open = self.settings_menu == Some(SettingsMenu::DefaultAgent);
         let trigger = settings_select_button(
-            default_agent_label(selected),
+            selected_label,
             "default-agent-dropdown",
             open,
             SettingsMenu::DefaultAgent,
+            colors,
             cx,
         );
 
         let mut control = div().relative().min_w(px(154.0)).child(trigger);
         if open {
             let mut options = div().p(px(4.0)).flex().flex_col();
-            for (index, agent) in DefaultAgent::ALL.into_iter().enumerate() {
-                let is_selected = agent == selected;
+            for (index, option) in agents.into_iter().enumerate() {
+                let is_selected = option.kind == selected;
+                let agent = option.kind.clone();
                 options = options.child(
                     div()
                         .id(SharedString::from(format!("default-agent-option-{index}")))
-                        .h(px(Metrics::ROW_HEIGHT))
+                        .min_h(px(Metrics::ROW_HEIGHT))
                         .px(px(8.0))
+                        .py(px(5.0))
                         .flex()
                         .items_center()
                         .gap(px(8.0))
                         .rounded(px(Radius::ROW))
-                        .bg(Fill::selected(SETTINGS_COLORS, is_selected))
+                        .bg(Fill::selected(colors, is_selected))
                         .cursor_pointer()
-                        .hover(|style| style.bg(SETTINGS_COLORS.primary.alpha(0.08)))
+                        .hover(move |style| style.bg(colors.primary.alpha(0.08)))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.prefs.default_agent = agent;
+                            this.prefs.default_agent = agent.clone();
                             this.settings_menu = None;
                             this.persist_prefs();
                             cx.notify();
                         }))
-                        .child(
-                            AgentLogo::new(ui_default_agent(agent), 16.0, SETTINGS_COLORS)
-                                .badged(false),
-                        )
+                        .child(AgentLogo::new(ui_agent(&option.kind), 16.0, colors).badged(false))
                         .child(
                             div()
+                                .min_w_0()
                                 .flex_1()
+                                .flex()
+                                .flex_col()
                                 .text_size(px(Typo::ROW.size))
-                                .text_color(SETTINGS_COLORS.primary)
-                                .child(default_agent_label(agent)),
+                                .text_color(colors.primary)
+                                .child(option.display_name),
                         )
                         .when(is_selected, |row| {
                             row.child(sf_symbol_weighted(
                                 "checkmark",
                                 10.0,
                                 SymbolWeight::Semibold,
-                                SETTINGS_COLORS.secondary,
+                                colors.secondary,
                             ))
                         }),
                 );
             }
-            control = control.child(settings_dropdown(options, 204.0, self.settings_colors()));
+            control = control.child(settings_dropdown(options, 204.0, colors));
         }
         control.into_any_element()
     }
@@ -1669,6 +2300,7 @@ impl UtilitySurfaces {
     /// the button here (and the sidebar pill), because diri holds live agent
     /// sessions and relaunching underneath them uninvited would be hostile.
     fn update_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
         let state = self.updates.state();
         let unsupported = matches!(state.phase, UpdatePhase::Unsupported(_));
         let action = match &state.phase {
@@ -1695,6 +2327,7 @@ impl UtilitySurfaces {
             control.child(surface_button(
                 label,
                 "update-action",
+                colors,
                 cx,
                 move |this, _| {
                     this.updates.send(command.clone());
@@ -1705,29 +2338,32 @@ impl UtilitySurfaces {
             summary,
             update_detail(&state, unsupported),
             action_control,
+            colors,
         ));
 
         // "Skip" only makes sense for a release that is offered but not yet
         // downloaded; once it is staged the bytes are already on disk.
         if let UpdatePhase::Available(release) = &state.phase {
             let version = release.version.clone();
-            rows = rows.child(setting_divider()).child(setting_row(
+            rows = rows.child(setting_divider(colors)).child(setting_row(
                 "Skip this version",
                 "Hide this release until a newer version is available.",
-                surface_button("Skip", "skip-update", cx, move |this, cx| {
+                surface_button("Skip", "skip-update", colors, cx, move |this, cx| {
                     this.prefs.skipped_update_version = version.clone();
                     this.persist_prefs();
                     this.updates.send(UpdateCommand::Skip);
                     cx.notify();
                 }),
+                colors,
             ));
         }
         if !unsupported {
-            rows = rows.child(setting_divider()).child(toggle_row(
-                "Check automatically",
-                "Look for new releases in the background.",
+            rows = rows.child(setting_divider(colors)).child(toggle_row(
+                "Update automatically",
+                "Download verified GitHub releases and install when diri quits.",
                 self.prefs.automatic_updates,
                 "toggle-automatic-updates",
+                colors,
                 cx,
                 |this, cx| {
                     this.prefs.automatic_updates = !this.prefs.automatic_updates;
@@ -1738,17 +2374,18 @@ impl UtilitySurfaces {
                 },
             ));
         }
-        setting_section("Software updates", rows)
+        setting_section("Software updates", rows, colors)
     }
 
     fn terminal_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
         let selected = theme(&self.prefs.terminal_theme);
         let font_control = div()
             .h(px(28.0))
             .rounded(px(Radius::BADGE))
             .border_1()
-            .border_color(SETTINGS_COLORS.primary.alpha(0.11))
-            .bg(SETTINGS_COLORS.primary.alpha(0.045))
+            .border_color(colors.primary.alpha(0.11))
+            .bg(colors.primary.alpha(0.045))
             .flex()
             .items_center()
             .child(
@@ -1761,7 +2398,7 @@ impl UtilitySurfaces {
                     .justify_center()
                     .text_size(px(15.0))
                     .cursor_pointer()
-                    .hover(|style| style.bg(SETTINGS_COLORS.primary.alpha(0.08)))
+                    .hover(move |style| style.bg(colors.primary.alpha(0.08)))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.prefs.zoom_terminal(-1.0);
                         this.persist_prefs();
@@ -1769,7 +2406,7 @@ impl UtilitySurfaces {
                     }))
                     .child("−"),
             )
-            .child(HairlineDivider::vertical(SETTINGS_COLORS))
+            .child(HairlineDivider::vertical(colors))
             .child(
                 div()
                     .w(px(52.0))
@@ -1778,10 +2415,10 @@ impl UtilitySurfaces {
                     .justify_center()
                     .font_family(crate::fonts::mono_family())
                     .text_size(px(11.0))
-                    .text_color(SETTINGS_COLORS.secondary)
+                    .text_color(colors.secondary)
                     .child(format!("{:.0} pt", self.prefs.terminal_font_size)),
             )
-            .child(HairlineDivider::vertical(SETTINGS_COLORS))
+            .child(HairlineDivider::vertical(colors))
             .child(
                 div()
                     .id("font-larger")
@@ -1792,7 +2429,7 @@ impl UtilitySurfaces {
                     .justify_center()
                     .text_size(px(15.0))
                     .cursor_pointer()
-                    .hover(|style| style.bg(SETTINGS_COLORS.primary.alpha(0.08)))
+                    .hover(move |style| style.bg(colors.primary.alpha(0.08)))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.prefs.zoom_terminal(1.0);
                         this.persist_prefs();
@@ -1816,9 +2453,11 @@ impl UtilitySurfaces {
                             "Color theme",
                             "Applies immediately across the app and every open terminal.",
                             self.terminal_theme_dropdown(cx),
+                            colors,
                         ))
-                        .child(setting_divider())
-                        .child(div().p(px(12.0)).child(theme_preview(selected))),
+                        .child(setting_divider(colors))
+                        .child(div().p(px(12.0)).child(theme_preview(selected, colors))),
+                    colors,
                 ))
                 .child(setting_section(
                     "Text",
@@ -1826,12 +2465,16 @@ impl UtilitySurfaces {
                         "Font size",
                         "Adjust terminal text without changing the rest of the app.",
                         font_control,
+                        colors,
                     ),
+                    colors,
                 )),
+            colors,
         )
     }
 
     fn resource_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
         settings_page(
             "Resources",
             div()
@@ -1847,28 +2490,34 @@ impl UtilitySurfaces {
                             "Hibernate idle sessions",
                             "Freeze inactive sessions after this amount of time.",
                             self.hibernate_dropdown(cx),
+                            colors,
                         ))
-                        .child(setting_divider())
+                        .child(setting_divider(colors))
                         .child(setting_row(
                             "Memory limit",
                             "Freeze an individual session when it reaches this size.",
                             self.memory_dropdown(cx),
+                            colors,
                         )),
+                    colors,
                 ))
                 .child(
                     settings_note(
                         "moon.fill",
                         None,
                         "Frozen sessions are never killed. Opening one wakes it immediately, exactly where you left it.",
-                        SETTINGS_COLORS.tertiary,
-                        SETTINGS_COLORS.primary.alpha(0.07),
-                        SETTINGS_COLORS.primary.alpha(0.035),
+                        colors.tertiary,
+                        colors.primary.alpha(0.07),
+                        colors.primary.alpha(0.035),
+                        colors,
                     ),
                 ),
+            colors,
         )
     }
 
     fn remote_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
         settings_page(
             "Remote",
             div()
@@ -1881,15 +2530,18 @@ impl UtilitySurfaces {
                         "lock.shield",
                         Some("OpenSSH transport"),
                         "Diri uses your SSH configuration without changing the host. Private-network and Tailscale names work transparently when OpenSSH can resolve them.",
-                        SETTINGS_COLORS.secondary,
-                        SETTINGS_COLORS.primary.alpha(0.08),
-                        SETTINGS_COLORS.primary.alpha(0.035),
+                        colors.secondary,
+                        colors.primary.alpha(0.08),
+                        colors.primary.alpha(0.035),
+                        colors,
                     ),
                 ),
+            colors,
         )
     }
 
     fn remote_hosts_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
         let default_host = self
             .store
             .read()
@@ -1898,8 +2550,8 @@ impl UtilitySurfaces {
         let mut catalog = div()
             .rounded(px(Radius::ROW))
             .border_1()
-            .border_color(SETTINGS_COLORS.primary.alpha(0.065))
-            .bg(SETTINGS_COLORS.primary.alpha(0.02))
+            .border_color(colors.primary.alpha(0.065))
+            .bg(colors.primary.alpha(0.02))
             .overflow_hidden();
 
         if let Some(editor) = &self.host_editor {
@@ -1916,11 +2568,11 @@ impl UtilitySurfaces {
                         div()
                             .size(px(34.0))
                             .rounded(px(10.0))
-                            .bg(SETTINGS_COLORS.primary.alpha(0.065))
+                            .bg(colors.primary.alpha(0.065))
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(sf_symbol("network", 17.0, SETTINGS_COLORS.tertiary)),
+                            .child(sf_symbol("network", 17.0, colors.tertiary)),
                     )
                     .child(
                         div()
@@ -1936,7 +2588,7 @@ impl UtilitySurfaces {
                             .child(
                                 div()
                                     .text_size(px(11.0))
-                                    .text_color(SETTINGS_COLORS.tertiary)
+                                    .text_color(colors.tertiary)
                                     .child("Add any machine you can reach over SSH."),
                             ),
                     ),
@@ -1944,7 +2596,7 @@ impl UtilitySurfaces {
         } else {
             for (index, host) in self.hosts.iter().enumerate() {
                 if index > 0 {
-                    catalog = catalog.child(setting_divider());
+                    catalog = catalog.child(setting_divider(colors));
                 }
                 let id = host.id.clone();
                 let name = host.display_name().to_owned();
@@ -1961,7 +2613,7 @@ impl UtilitySurfaces {
                         .items_center()
                         .gap(px(11.0))
                         .cursor_pointer()
-                        .hover(|style| style.bg(SETTINGS_COLORS.primary.alpha(0.055)))
+                        .hover(move |style| style.bg(colors.primary.alpha(0.055)))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.begin_editing_host(&id, window, cx);
                         }))
@@ -1969,11 +2621,11 @@ impl UtilitySurfaces {
                             div()
                                 .size(px(30.0))
                                 .rounded(px(9.0))
-                                .bg(SETTINGS_COLORS.primary.alpha(0.06))
+                                .bg(colors.primary.alpha(0.06))
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .child(sf_symbol("network", 15.0, SETTINGS_COLORS.secondary)),
+                                .child(sf_symbol("network", 15.0, colors.secondary)),
                         )
                         .child(
                             div()
@@ -2037,19 +2689,19 @@ impl UtilitySurfaces {
                                         .text_ellipsis()
                                         .font_family(crate::fonts::mono_family())
                                         .text_size(px(10.5))
-                                        .text_color(SETTINGS_COLORS.tertiary)
+                                        .text_color(colors.tertiary)
                                         .child(destination)
                                         .when_some(folder, |line, folder| {
                                             line.child(
                                                 div()
-                                                    .text_color(SETTINGS_COLORS.primary.alpha(0.22))
+                                                    .text_color(colors.primary.alpha(0.22))
                                                     .child("·"),
                                             )
                                             .child(folder)
                                         }),
                                 ),
                         )
-                        .child(sf_symbol("chevron.right", 10.0, SETTINGS_COLORS.tertiary)),
+                        .child(sf_symbol("chevron.right", 10.0, colors.tertiary)),
                 );
             }
         }
@@ -2069,7 +2721,7 @@ impl UtilitySurfaces {
                         div()
                             .text_size(px(Typo::SECTION_HEADER.size))
                             .font_weight(Typo::SECTION_HEADER.weight)
-                            .text_color(SETTINGS_COLORS.tertiary)
+                            .text_color(colors.tertiary)
                             .child("Execution hosts"),
                     )
                     .when(self.host_editor.is_none(), |header| {
@@ -2093,6 +2745,7 @@ impl UtilitySurfaces {
         state: HostInitialization,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let colors = self.settings_colors();
         let HostInitializationCardModel {
             id,
             name,
@@ -2224,7 +2877,7 @@ impl UtilitySurfaces {
                         div()
                             .text_size(px(11.5))
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(SETTINGS_COLORS.primary)
+                            .text_color(colors.primary)
                             .child(title),
                     )
                     .child(
@@ -2234,7 +2887,7 @@ impl UtilitySurfaces {
                             .whitespace_normal()
                             .text_size(px(10.5))
                             .line_height(px(15.0))
-                            .text_color(SETTINGS_COLORS.tertiary)
+                            .text_color(colors.tertiary)
                             .child(wrappable_setting_copy(detail.into())),
                     ),
             )
@@ -2245,6 +2898,7 @@ impl UtilitySurfaces {
                         .child(surface_button(
                             label,
                             "host-initialization-action",
+                            colors,
                             cx,
                             move |this, cx| {
                                 if let Some(kind) = retry_kind {
@@ -2266,6 +2920,7 @@ impl UtilitySurfaces {
     }
 
     fn host_editor_panel(&self, editor: &HostEditor, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
         let editing = editor.original_id.is_some();
         let title = if editing { "Edit host" } else { "Add a host" };
         let mut form = div()
@@ -2295,7 +2950,7 @@ impl UtilitySurfaces {
                             .child(
                                 div()
                                     .text_size(px(11.0))
-                                    .text_color(SETTINGS_COLORS.tertiary)
+                                    .text_color(colors.tertiary)
                                     .child("SSH aliases from ~/.ssh/config work too."),
                             ),
                     )
@@ -2308,12 +2963,12 @@ impl UtilitySurfaces {
                             .items_center()
                             .justify_center()
                             .cursor_pointer()
-                            .hover(|style| style.bg(SETTINGS_COLORS.primary.alpha(0.08)))
+                            .hover(move |style| style.bg(colors.primary.alpha(0.08)))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.host_editor = None;
                                 cx.notify();
                             }))
-                            .child(sf_symbol("xmark", 11.0, SETTINGS_COLORS.secondary)),
+                            .child(sf_symbol("xmark", 11.0, colors.secondary)),
                     ),
             )
             .child(
@@ -2356,7 +3011,7 @@ impl UtilitySurfaces {
                             .pt(px(2.0))
                             .text_size(px(10.0))
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(SETTINGS_COLORS.secondary)
+                            .text_color(colors.secondary)
                             .child("First-party node (optional)"),
                     )
                     .child(
@@ -2396,7 +3051,7 @@ impl UtilitySurfaces {
                             .whitespace_normal()
                             .text_size(px(10.0))
                             .line_height(px(15.0))
-                            .text_color(SETTINGS_COLORS.tertiary)
+                            .text_color(colors.tertiary)
                             .child(wrappable_setting_copy(
                                 "The token stays in that owner-only file. SSH remains available for install and recovery."
                                     .into(),
@@ -2447,7 +3102,7 @@ impl UtilitySurfaces {
                             .min_w(px(0.0))
                             .whitespace_normal()
                             .text_size(px(11.0))
-                            .text_color(SETTINGS_COLORS.secondary)
+                            .text_color(colors.secondary)
                             .child(wrappable_setting_copy(
                                 format!("Remove {name}? Existing sessions must be moved first.")
                                     .into(),
@@ -2458,12 +3113,18 @@ impl UtilitySurfaces {
                             .flex()
                             .items_center()
                             .gap(px(7.0))
-                            .child(surface_button("Keep Host", "keep-host", cx, |this, cx| {
-                                if let Some(editor) = &mut this.host_editor {
-                                    editor.confirm_remove = false;
-                                }
-                                cx.notify();
-                            }))
+                            .child(surface_button(
+                                "Keep Host",
+                                "keep-host",
+                                colors,
+                                cx,
+                                |this, cx| {
+                                    if let Some(editor) = &mut this.host_editor {
+                                        editor.confirm_remove = false;
+                                    }
+                                    cx.notify();
+                                },
+                            ))
                             .child(settings_danger_button(
                                 "Remove Host",
                                 "confirm-remove-host",
@@ -2499,6 +3160,7 @@ impl UtilitySurfaces {
                                     .child(surface_button(
                                         "Reinstall Environment",
                                         "reinstall-remote-environment",
+                                        colors,
                                         cx,
                                         move |this, cx| this.reinstall_host(&host_id, cx),
                                     )),
@@ -2509,10 +3171,16 @@ impl UtilitySurfaces {
                             .flex()
                             .items_center()
                             .gap(px(7.0))
-                            .child(surface_button("Cancel", "cancel-host", cx, |this, cx| {
-                                this.host_editor = None;
-                                cx.notify();
-                            }))
+                            .child(surface_button(
+                                "Cancel",
+                                "cancel-host",
+                                colors,
+                                cx,
+                                |this, cx| {
+                                    this.host_editor = None;
+                                    cx.notify();
+                                },
+                            ))
                             .child(settings_primary_button(
                                 if editing { "Save Host" } else { "Add Host" },
                                 "save-host",
@@ -2534,11 +3202,12 @@ impl UtilitySurfaces {
         field: HostFormField,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let colors = self.settings_colors();
         let active = self
             .host_editor
             .as_ref()
             .is_some_and(|host_editor| host_editor.active_field == field);
-        let value = host_field_value(editor, placeholder, active, field);
+        let value = host_field_value(editor, placeholder, active, field, colors);
         let bounds_slot = Rc::clone(&self.host_field_bounds[field.index()]);
         div()
             .min_w(px(0.0))
@@ -2549,7 +3218,7 @@ impl UtilitySurfaces {
                 div()
                     .text_size(px(10.0))
                     .font_weight(FontWeight::MEDIUM)
-                    .text_color(SETTINGS_COLORS.secondary)
+                    .text_color(colors.secondary)
                     .child(label),
             )
             .child({
@@ -2563,20 +3232,14 @@ impl UtilitySurfaces {
                     .px(px(10.0))
                     .rounded(px(Radius::BADGE))
                     .border_1()
-                    .border_color(
-                        SETTINGS_COLORS
-                            .primary
-                            .alpha(if active { 0.26 } else { 0.11 }),
-                    )
-                    .bg(SETTINGS_COLORS
-                        .primary
-                        .alpha(if active { 0.075 } else { 0.04 }))
+                    .border_color(colors.primary.alpha(if active { 0.26 } else { 0.11 }))
+                    .bg(colors.primary.alpha(if active { 0.075 } else { 0.04 }))
                     .flex()
                     .items_center()
                     .overflow_hidden()
                     .font_family(crate::fonts::mono_family())
                     .text_size(px(11.0))
-                    .text_color(SETTINGS_COLORS.primary)
+                    .text_color(colors.primary)
                     .cursor(CursorStyle::IBeam)
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         this.select_host_field(field, window, cx);
@@ -2585,7 +3248,7 @@ impl UtilitySurfaces {
                         };
                         let x = (event.position().x - bounds.left() - px(10.0)).max(px(0.0));
                         let offset = this.host_editor.as_ref().map_or(0, |editor| {
-                            text_offset_for_x(editor.field(field).text(), x, window)
+                            text_offset_for_x(editor.field(field).text(), x, window, colors)
                         });
                         if let Some(editor) = &mut this.host_editor {
                             editor
@@ -2608,6 +3271,7 @@ impl UtilitySurfaces {
 
     fn terminal_theme_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
         let selected = theme(&self.prefs.terminal_theme);
+        let colors = self.settings_colors();
         let open = self.settings_menu == Some(SettingsMenu::TerminalTheme);
         let mut control = div()
             .relative()
@@ -2617,50 +3281,89 @@ impl UtilitySurfaces {
                 "terminal-theme-dropdown",
                 open,
                 SettingsMenu::TerminalTheme,
+                colors,
                 cx,
             ));
         if open {
-            let mut options = div().p(px(4.0)).flex().flex_col();
-            for (index, candidate) in TermTheme::CATALOG.into_iter().enumerate() {
-                let is_selected = candidate.id == selected.id;
+            let mut options = div()
+                .id("terminal-theme-options")
+                .max_h(px(300.0))
+                .overflow_y_scroll()
+                .p(px(4.0))
+                .flex()
+                .flex_col();
+            for appearance in ThemeAppearance::ALL {
                 options = options.child(
                     div()
-                        .id(SharedString::from(format!("terminal-theme-option-{index}")))
-                        .h(px(Metrics::ROW_HEIGHT))
+                        .h(px(24.0))
                         .px(px(8.0))
-                        .rounded(px(Radius::ROW))
                         .flex()
                         .items_center()
-                        .gap(px(8.0))
-                        .bg(Fill::selected(SETTINGS_COLORS, is_selected))
-                        .cursor_pointer()
-                        .hover(|style| style.bg(SETTINGS_COLORS.primary.alpha(0.08)))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.prefs.terminal_theme = candidate.id.to_owned();
-                            this.settings_menu = None;
-                            this.persist_prefs();
-                            cx.notify();
-                        }))
-                        .child(
-                            div()
-                                .size(px(12.0))
-                                .rounded(px(4.0))
-                                .bg(candidate.background)
-                                .border_1()
-                                .border_color(SETTINGS_COLORS.primary.alpha(0.14)),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_size(px(Typo::ROW.size))
-                                .child(candidate.name),
-                        )
-                        .when(is_selected, |row| {
-                            row.child(sf_symbol("checkmark", 10.0, SETTINGS_COLORS.secondary))
-                        }),
+                        .text_size(px(Typo::META.size - 1.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(colors.tertiary)
+                        .child(appearance.label()),
                 );
+                for (index, candidate) in TermTheme::CATALOG
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, theme)| theme.appearance == appearance)
+                {
+                    let is_selected = candidate.id == selected.id;
+                    options =
+                        options.child(
+                            div()
+                                .id(SharedString::from(format!("terminal-theme-option-{index}")))
+                                .h(px(Metrics::ROW_HEIGHT))
+                                .px(px(8.0))
+                                .rounded(px(Radius::ROW))
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .bg(Fill::selected(colors, is_selected))
+                                .cursor_pointer()
+                                .hover(move |style| style.bg(colors.primary.alpha(0.08)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.prefs.terminal_theme = candidate.id.to_owned();
+                                    this.settings_menu = None;
+                                    this.persist_prefs();
+                                    cx.notify();
+                                }))
+                                .child(
+                                    div()
+                                        .size(px(16.0))
+                                        .rounded(px(5.0))
+                                        .bg(candidate.background)
+                                        .border_1()
+                                        .border_color(colors.primary.alpha(0.16))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(
+                                            div()
+                                                .size(px(5.0))
+                                                .rounded(px(2.5))
+                                                .bg(candidate.foreground),
+                                        ),
+                                )
+                                .child(div().flex().gap(px(2.0)).children(
+                                    [candidate.ansi[2], candidate.ansi[4], candidate.ansi[5]].map(
+                                        |color| div().size(px(5.0)).rounded(px(2.5)).bg(color),
+                                    ),
+                                ))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_size(px(Typo::ROW.size))
+                                        .child(candidate.name),
+                                )
+                                .when(is_selected, |row| {
+                                    row.child(sf_symbol("checkmark", 10.0, colors.secondary))
+                                }),
+                        );
+                }
             }
-            control = control.child(settings_dropdown(options, 218.0, self.settings_colors()));
+            control = control.child(settings_dropdown(options, 252.0, colors));
         }
         control.into_any_element()
     }
@@ -2673,6 +3376,7 @@ impl UtilitySurfaces {
             (30, "30 minutes"),
             (60, "1 hour"),
         ];
+        let colors = self.settings_colors();
         let selected_label = OPTIONS
             .into_iter()
             .find_map(|(value, label)| {
@@ -2688,6 +3392,7 @@ impl UtilitySurfaces {
                 "hibernate-dropdown",
                 open,
                 SettingsMenu::HibernateAfter,
+                colors,
                 cx,
             ));
         if open {
@@ -2698,6 +3403,7 @@ impl UtilitySurfaces {
                     format!("hibernate-option-{index}"),
                     label,
                     is_selected,
+                    colors,
                     cx,
                     move |this, cx| {
                         this.prefs.hibernate_after_minutes = value;
@@ -2707,13 +3413,14 @@ impl UtilitySurfaces {
                     },
                 ));
             }
-            control = control.child(settings_dropdown(options, 172.0, self.settings_colors()));
+            control = control.child(settings_dropdown(options, 172.0, colors));
         }
         control.into_any_element()
     }
 
     fn memory_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
         const OPTIONS: [u64; 4] = [2, 4, 6, 8];
+        let colors = self.settings_colors();
         let open = self.settings_menu == Some(SettingsMenu::MemoryLimit);
         let mut control = div()
             .relative()
@@ -2723,6 +3430,7 @@ impl UtilitySurfaces {
                 "memory-dropdown",
                 open,
                 SettingsMenu::MemoryLimit,
+                colors,
                 cx,
             ));
         if open {
@@ -2733,6 +3441,7 @@ impl UtilitySurfaces {
                     format!("memory-option-{index}"),
                     format!("{value} GB"),
                     is_selected,
+                    colors,
                     cx,
                     move |this, cx| {
                         this.prefs.memory_hard_limit_gb = value;
@@ -2742,10 +3451,172 @@ impl UtilitySurfaces {
                     },
                 ));
             }
-            control = control.child(settings_dropdown(options, 132.0, self.settings_colors()));
+            control = control.child(settings_dropdown(options, 132.0, colors));
         }
         control.into_any_element()
     }
+
+    fn render_diagnostics(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        let report = self.diagnostics_report.clone().unwrap_or_else(|| {
+            "Diagnostics are not available yet. Close this preview and try again.".to_owned()
+        });
+        FloatingSurface::new(
+            colors,
+            div()
+                .id("diagnostics-preview")
+                .debug_selector(|| "diagnostics-preview".into())
+                .w(px(620.0))
+                .h(px(500.0))
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .h(px(54.0))
+                        .px(px(16.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.0))
+                        .child(sf_symbol("stethoscope", 15.0, colors.secondary))
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .flex_1()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .child(
+                                    div()
+                                        .text_size(px(Typo::TITLE.size))
+                                        .font_weight(Typo::TITLE.weight)
+                                        .child("Copy Diagnostics"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(Typo::META.size))
+                                        .text_color(colors.tertiary)
+                                        .child("This is the exact text that will be copied."),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("close-diagnostics")
+                                .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(Radius::BADGE))
+                                .cursor_pointer()
+                                .hover(move |style| style.bg(Fill::subtle(colors)))
+                                .child(sf_symbol_weighted(
+                                    "xmark",
+                                    13.5,
+                                    SymbolWeight::Bold,
+                                    colors.secondary,
+                                ))
+                                .on_click(cx.listener(|this, _, _, cx| this.close_surface(cx))),
+                        ),
+                )
+                .child(HairlineDivider::horizontal(colors))
+                .child(
+                    div()
+                        .id("diagnostics-report-scroll")
+                        .min_h(px(0.0))
+                        .flex_1()
+                        .overflow_y_scroll()
+                        .p(px(16.0))
+                        .child(
+                            div()
+                                .w_full()
+                                .p(px(14.0))
+                                .rounded(px(Radius::CARD))
+                                .bg(colors.primary.alpha(0.035))
+                                .border_1()
+                                .border_color(colors.primary.alpha(0.065))
+                                .font_family(crate::fonts::mono_family())
+                                .text_size(px(11.0))
+                                .line_height(px(17.0))
+                                .text_color(colors.secondary)
+                                .whitespace_normal()
+                                .child(wrappable_setting_copy(report.clone().into())),
+                        ),
+                )
+                .child(HairlineDivider::horizontal(colors))
+                .child(
+                    div()
+                        .px(px(16.0))
+                        .h(px(62.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .max_w(px(390.0))
+                                .text_size(px(Typo::META.size))
+                                .text_color(colors.tertiary)
+                                .child("Diagnostics exclude terminal content and paths by design. Review them before posting anyway."),
+                        )
+                        .child(
+                            div()
+                                .id("copy-diagnostics")
+                                .h(px(32.0))
+                                .px(px(12.0))
+                                .flex()
+                                .items_center()
+                                .gap(px(7.0))
+                                .rounded(px(Radius::ROW))
+                                .cursor_pointer()
+                                .bg(colors.primary.alpha(0.10))
+                                .hover(move |button| button.bg(colors.primary.alpha(0.14)))
+                                .text_size(px(Typo::ROW_EMPHASIZED.size))
+                                .font_weight(Typo::ROW_EMPHASIZED.weight)
+                                .child(sf_symbol("doc.on.doc", 12.0, colors.secondary))
+                                .child("Copy report")
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        report.clone(),
+                                    ));
+                                })),
+                        ),
+                ),
+        )
+    }
+}
+
+fn build_diagnostics_report(store: &SessionStore) -> String {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/nonexistent"));
+    let platform = crate::diagnostics::PlatformMetadata::current();
+    let active_host_ids = store
+        .sessions()
+        .values()
+        .filter_map(|session| session.host.clone())
+        .collect::<HashSet<_>>();
+    // The report describes this Mac; remote hosts appear via their sessions.
+    let empty_catalog = diri_proto::AgentReadinessResult::default();
+    let local_catalog = store.agent_catalog(None).unwrap_or(&empty_catalog);
+    crate::diagnostics::DiagnosticsReport::generate(crate::diagnostics::DiagnosticsInput {
+        app_version: crate::updates::CURRENT_VERSION,
+        app_build: option_env!("DIRI_BUILD_ID").unwrap_or(env!("CARGO_PKG_VERSION")),
+        update_channel: if cfg!(debug_assertions) {
+            "development"
+        } else {
+            "stable"
+        },
+        platform: &platform,
+        daemon_state: store.daemon_state(),
+        daemon_identity: store.daemon_identity(),
+        agents: local_catalog,
+        hosts: store.hosts(),
+        active_host_ids: &active_host_ids,
+        storage_reachable: crate::diagnostics::storage_reachable(&home),
+    })
+    .as_str()
+    .to_owned()
 }
 
 impl Focusable for UtilitySurfaces {
@@ -2761,11 +3632,12 @@ impl Render for UtilitySurfaces {
             Surface::History => Some(self.render_history(cx).into_any_element()),
             Surface::Worktrees => Some(self.render_worktrees(cx).into_any_element()),
             Surface::Settings => Some(self.render_settings(cx).into_any_element()),
+            Surface::Diagnostics => Some(self.render_diagnostics(cx).into_any_element()),
         };
         let root = div()
             .id("utility-surfaces")
             .track_focus(&self.focus)
-            .key_context("Diri")
+            .key_context(UTILITY_CONTEXT)
             .on_key_down(cx.listener(Self::key_down))
             .on_action(cx.listener(|this, _: &ToggleHistory, _, cx| {
                 if this.surface == Surface::History {
@@ -2829,6 +3701,7 @@ impl Render for UtilitySurfaces {
 fn surface_button(
     label: impl Into<SharedString>,
     id: impl Into<SharedString>,
+    colors: SemanticColors,
     cx: &mut Context<UtilitySurfaces>,
     handler: impl Fn(&mut UtilitySurfaces, &mut Context<UtilitySurfaces>) + 'static,
 ) -> impl IntoElement {
@@ -2838,13 +3711,13 @@ fn surface_button(
         .px(px(9.0))
         .rounded(px(Radius::BADGE))
         .border_1()
-        .border_color(COLORS.primary.alpha(0.10))
-        .bg(COLORS.primary.alpha(0.04))
+        .border_color(colors.primary.alpha(0.10))
+        .bg(colors.primary.alpha(0.04))
         .flex()
         .items_center()
         .text_size(px(11.0))
         .cursor_pointer()
-        .hover(|style| style.bg(COLORS.primary.alpha(0.09)))
+        .hover(move |style| style.bg(colors.primary.alpha(0.09)))
         .on_click(cx.listener(move |this, _, _, cx| handler(this, cx)))
         .child(label.into())
 }
@@ -2910,6 +3783,7 @@ fn host_field_value(
     placeholder: &'static str,
     active: bool,
     field: HostFormField,
+    colors: SemanticColors,
 ) -> AnyElement {
     let debug_name = field.debug_name();
     let content = if active {
@@ -2920,7 +3794,7 @@ fn host_field_value(
     } else if editor.is_empty() {
         div()
             .debug_selector(move || format!("HOST_FIELD_PLACEHOLDER_{debug_name}"))
-            .text_color(SETTINGS_COLORS.tertiary)
+            .text_color(colors.tertiary)
             .child(placeholder)
             .into_any_element()
     } else {
@@ -2936,14 +3810,14 @@ fn host_field_value(
         .into_any_element()
 }
 
-fn text_offset_for_x(text: &str, x: Pixels, window: &Window) -> usize {
+fn text_offset_for_x(text: &str, x: Pixels, window: &Window, colors: SemanticColors) -> usize {
     if text.is_empty() {
         return 0;
     }
     let run = TextRun {
         len: text.len(),
         font: font(crate::fonts::mono_family()),
-        color: SETTINGS_COLORS.primary.into(),
+        color: colors.primary.into(),
         ..TextRun::default()
     };
     window
@@ -2977,6 +3851,7 @@ fn toggle_row(
     detail: &'static str,
     enabled: bool,
     id: &'static str,
+    colors: SemanticColors,
     cx: &mut Context<UtilitySurfaces>,
     handler: impl Fn(&mut UtilitySurfaces, &mut Context<UtilitySurfaces>) + 'static,
 ) -> impl IntoElement {
@@ -2989,9 +3864,9 @@ fn toggle_row(
         .justify_between()
         .gap(px(12.0))
         .cursor_pointer()
-        .hover(|style| style.bg(SETTINGS_COLORS.primary.alpha(0.025)))
+        .hover(move |style| style.bg(colors.primary.alpha(0.025)))
         .on_click(cx.listener(move |this, _, _, cx| handler(this, cx)))
-        .child(setting_text_stack(label.into(), detail.into()))
+        .child(setting_text_stack(label.into(), detail.into(), colors))
         .child(
             div()
                 .flex_none()
@@ -3002,21 +3877,20 @@ fn toggle_row(
                 .bg(if enabled {
                     Ink::FRESH.alpha(0.72)
                 } else {
-                    SETTINGS_COLORS.primary.alpha(0.14)
+                    colors.primary.alpha(0.14)
                 })
                 .flex()
                 .justify_end()
                 .when(!enabled, |toggle| toggle.justify_start())
-                .child(
-                    div()
-                        .size(px(14.0))
-                        .rounded(px(7.0))
-                        .bg(SETTINGS_COLORS.primary),
-                ),
+                .child(div().size(px(14.0)).rounded(px(7.0)).bg(colors.primary)),
         )
 }
 
-fn setting_section(title: &'static str, content: impl IntoElement) -> impl IntoElement {
+fn setting_section(
+    title: &'static str,
+    content: impl IntoElement,
+    colors: SemanticColors,
+) -> impl IntoElement {
     div()
         .flex()
         .flex_col()
@@ -3026,15 +3900,15 @@ fn setting_section(title: &'static str, content: impl IntoElement) -> impl IntoE
                 .px(px(1.0))
                 .text_size(px(Typo::SECTION_HEADER.size))
                 .font_weight(Typo::SECTION_HEADER.weight)
-                .text_color(SETTINGS_COLORS.tertiary)
+                .text_color(colors.tertiary)
                 .child(title),
         )
         .child(
             div()
                 .rounded(px(Radius::ROW))
                 .border_1()
-                .border_color(SETTINGS_COLORS.primary.alpha(0.065))
-                .bg(SETTINGS_COLORS.primary.alpha(0.02))
+                .border_color(colors.primary.alpha(0.065))
+                .bg(colors.primary.alpha(0.02))
                 .overflow_hidden()
                 .child(content),
         )
@@ -3044,6 +3918,7 @@ fn setting_row(
     label: impl Into<SharedString>,
     detail: impl Into<SharedString>,
     control: impl IntoElement,
+    colors: SemanticColors,
 ) -> impl IntoElement {
     let label = label.into();
     let detail = detail.into();
@@ -3055,11 +3930,15 @@ fn setting_row(
         .items_center()
         .justify_between()
         .gap(px(12.0))
-        .child(setting_text_stack(label, detail))
+        .child(setting_text_stack(label, detail, colors))
         .child(control)
 }
 
-fn setting_text_stack(label: SharedString, detail: SharedString) -> AnyElement {
+fn setting_text_stack(
+    label: SharedString,
+    detail: SharedString,
+    colors: SemanticColors,
+) -> AnyElement {
     div()
         .flex_1()
         .min_w(px(0.0))
@@ -3073,7 +3952,7 @@ fn setting_text_stack(label: SharedString, detail: SharedString) -> AnyElement {
                 .whitespace_normal()
                 .text_size(px(Typo::ROW_EMPHASIZED.size))
                 .font_weight(Typo::ROW_EMPHASIZED.weight)
-                .text_color(SETTINGS_COLORS.primary)
+                .text_color(colors.primary)
                 .child(wrappable_setting_copy(label)),
         )
         .child(
@@ -3084,7 +3963,7 @@ fn setting_text_stack(label: SharedString, detail: SharedString) -> AnyElement {
                 .whitespace_normal()
                 .text_size(px(Typo::META.size))
                 .line_height(px(14.0))
-                .text_color(SETTINGS_COLORS.tertiary)
+                .text_color(colors.tertiary)
                 .child(wrappable_setting_copy(detail)),
         )
         .into_any_element()
@@ -3119,6 +3998,7 @@ fn settings_note(
     icon_color: Rgba,
     border_color: Rgba,
     background: Rgba,
+    colors: SemanticColors,
 ) -> AnyElement {
     div()
         .p(px(12.0))
@@ -3156,14 +4036,18 @@ fn settings_note(
                         .whitespace_normal()
                         .text_size(px(11.0))
                         .line_height(px(17.0))
-                        .text_color(SETTINGS_COLORS.secondary)
+                        .text_color(colors.secondary)
                         .child(wrappable_setting_copy(body.into())),
                 ),
         )
         .into_any_element()
 }
 
-fn settings_page(title: &'static str, content: impl IntoElement) -> impl IntoElement {
+fn settings_page(
+    title: &'static str,
+    content: impl IntoElement,
+    colors: SemanticColors,
+) -> impl IntoElement {
     div()
         .w_full()
         .px(px(20.0))
@@ -3180,17 +4064,17 @@ fn settings_page(title: &'static str, content: impl IntoElement) -> impl IntoEle
                 .items_center()
                 .text_size(px(Typo::DISPLAY_TITLE.size))
                 .font_weight(Typo::DISPLAY_TITLE.weight)
-                .text_color(SETTINGS_COLORS.primary)
+                .text_color(colors.primary)
                 .child(title),
         )
         .child(content)
 }
 
-fn setting_divider() -> impl IntoElement {
+fn setting_divider(colors: SemanticColors) -> impl IntoElement {
     div()
         .h(px(1.0))
         .mx(px(12.0))
-        .bg(SETTINGS_COLORS.primary.alpha(0.055))
+        .bg(colors.primary.alpha(0.055))
 }
 
 fn settings_select_button(
@@ -3198,6 +4082,7 @@ fn settings_select_button(
     id: impl Into<SharedString>,
     open: bool,
     menu: SettingsMenu,
+    colors: SemanticColors,
     cx: &mut Context<UtilitySurfaces>,
 ) -> impl IntoElement {
     div()
@@ -3206,19 +4091,13 @@ fn settings_select_button(
         .px(px(9.0))
         .rounded(px(Radius::BADGE))
         .border_1()
-        .border_color(
-            SETTINGS_COLORS
-                .primary
-                .alpha(if open { 0.20 } else { 0.10 }),
-        )
-        .bg(SETTINGS_COLORS
-            .primary
-            .alpha(if open { 0.08 } else { 0.04 }))
+        .border_color(colors.primary.alpha(if open { 0.20 } else { 0.10 }))
+        .bg(colors.primary.alpha(if open { 0.08 } else { 0.04 }))
         .flex()
         .items_center()
         .gap(px(8.0))
         .cursor_pointer()
-        .hover(|style| style.bg(SETTINGS_COLORS.primary.alpha(0.075)))
+        .hover(move |style| style.bg(colors.primary.alpha(0.075)))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(cx.listener(move |this, _, _, cx| {
             this.settings_menu = if this.settings_menu == Some(menu) {
@@ -3233,14 +4112,14 @@ fn settings_select_button(
                 .flex_1()
                 .text_size(px(Typo::META.size))
                 .font_weight(Typo::META.weight)
-                .text_color(SETTINGS_COLORS.primary)
+                .text_color(colors.primary)
                 .child(label.into()),
         )
         .child(sf_symbol_weighted(
             if open { "chevron.up" } else { "chevron.down" },
             8.0,
             SymbolWeight::Semibold,
-            SETTINGS_COLORS.tertiary,
+            colors.tertiary,
         ))
 }
 
@@ -3266,6 +4145,7 @@ fn settings_choice_row(
     id: impl Into<SharedString>,
     label: impl Into<SharedString>,
     selected: bool,
+    colors: SemanticColors,
     cx: &mut Context<UtilitySurfaces>,
     handler: impl Fn(&mut UtilitySurfaces, &mut Context<UtilitySurfaces>) + 'static,
 ) -> impl IntoElement {
@@ -3277,9 +4157,9 @@ fn settings_choice_row(
         .flex()
         .items_center()
         .gap(px(8.0))
-        .bg(Fill::selected(SETTINGS_COLORS, selected))
+        .bg(Fill::selected(colors, selected))
         .cursor_pointer()
-        .hover(|style| style.bg(SETTINGS_COLORS.primary.alpha(0.08)))
+        .hover(move |style| style.bg(colors.primary.alpha(0.08)))
         .on_click(cx.listener(move |this, _, _, cx| handler(this, cx)))
         .child(
             div()
@@ -3288,16 +4168,16 @@ fn settings_choice_row(
                 .child(label.into()),
         )
         .when(selected, |row| {
-            row.child(sf_symbol("checkmark", 10.0, SETTINGS_COLORS.secondary))
+            row.child(sf_symbol("checkmark", 10.0, colors.secondary))
         })
 }
 
-fn theme_preview(theme: TermTheme) -> impl IntoElement {
+fn theme_preview(theme: TermTheme, colors: SemanticColors) -> impl IntoElement {
     div()
         .p(px(10.0))
         .rounded(px(Radius::BADGE))
         .border_1()
-        .border_color(SETTINGS_COLORS.primary.alpha(0.10))
+        .border_color(colors.primary.alpha(0.10))
         .bg(theme.background)
         .flex()
         .flex_col()
@@ -3322,14 +4202,14 @@ fn theme_preview(theme: TermTheme) -> impl IntoElement {
         )
 }
 
-fn chip(label: String) -> impl IntoElement {
+fn chip(label: String, colors: SemanticColors) -> impl IntoElement {
     div()
         .px(px(5.0))
         .py(px(2.0))
         .rounded(px(Radius::CHIP))
-        .bg(COLORS.primary.alpha(0.09))
+        .bg(colors.primary.alpha(0.09))
         .text_size(px(11.0))
-        .text_color(COLORS.secondary)
+        .text_color(colors.secondary)
         .child(label)
 }
 
@@ -3344,14 +4224,18 @@ fn colored_badge(label: &'static str, color: Rgba) -> impl IntoElement {
         .child(label)
 }
 
-fn empty_label(label: &str) -> impl IntoElement {
+fn colored_status_badge(label: &'static str, color: Rgba) -> impl IntoElement {
+    colored_badge(label, color)
+}
+
+fn empty_label(label: &str, colors: SemanticColors) -> impl IntoElement {
     div()
         .h(px(42.0))
         .px(px(10.0))
         .flex()
         .items_center()
         .text_size(px(13.0))
-        .text_color(COLORS.tertiary)
+        .text_color(colors.tertiary)
         .child(label.to_owned())
 }
 
@@ -3365,15 +4249,6 @@ fn ui_agent(kind: &ProtoAgentKind) -> diri_ui::AgentKind {
         ProtoAgentKind::GEMINI_ID => diri_ui::AgentKind::Gemini,
         ProtoAgentKind::SHELL_ID => diri_ui::AgentKind::Shell,
         _ => diri_ui::AgentKind::Generic,
-    }
-}
-
-fn ui_default_agent(agent: DefaultAgent) -> diri_ui::AgentKind {
-    match agent {
-        DefaultAgent::ClaudeCode => diri_ui::AgentKind::ClaudeCode,
-        DefaultAgent::Codex => diri_ui::AgentKind::Codex,
-        DefaultAgent::Cursor => diri_ui::AgentKind::Cursor,
-        DefaultAgent::Gemini => diri_ui::AgentKind::Gemini,
     }
 }
 
@@ -3465,8 +4340,12 @@ fn relative_time(milliseconds: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[cfg(target_os = "macos")]
+    use gpui::HeadlessAppContext;
     use gpui::{
         Entity, Modifiers, MouseDownEvent, ScrollDelta, ScrollWheelEvent, StyleRefinement,
         TestAppContext, point, size,
@@ -3488,6 +4367,62 @@ mod tests {
                     .cached(StyleRefinement::default().absolute().inset_0()),
             )
         }
+    }
+
+    /// Regenerates the issue/PR screenshot without Screen Recording access or
+    /// live user state. It is ignored because its only output is an artifact;
+    /// the ordinary layout assertions below remain part of every test run.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes the deterministic diagnostics screenshot artifact"]
+    fn render_diagnostics_preview_screenshot() {
+        let output = std::env::var_os("DIRI_VISUAL_OUTPUT")
+            .map(PathBuf::from)
+            .expect("set DIRI_VISUAL_OUTPUT to the target PNG path");
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| crate::fonts::init(cx));
+
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let updates = crate::updates::inert();
+        let window = cx
+            .open_window(size(px(1100.0), px(700.0)), move |window, cx| {
+                let surfaces = cx.new(|cx| {
+                    let mut surfaces =
+                        UtilitySurfaces::new(runtime, tokio, updates, window, cx);
+                    surfaces.surface = Surface::Diagnostics;
+                    surfaces.diagnostics_report = Some(
+                        "# Diri diagnostics\nReview this report before posting it publicly.\n\nApp: 0.5.0 (build preview, channel development)\nmacOS: 15.5 (aarch64)\nDaemon: connecting automatically\nSession/state storage: reachable\n\nAgents:\n- codex: installed\n- claude-code: unavailable\n\nRemote hosts:\n- none configured\n\nExcluded by design: terminal content, prompts, logs, environment variables, paths, SSH destinations, tokens, and account identifiers."
+                            .to_owned(),
+                    );
+                    surfaces
+                });
+                cx.new(|_| CachedOverlayHarness { surfaces })
+            })
+            .expect("open headless diagnostics window");
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, _| window.refresh())
+            .expect("refresh diagnostics window");
+        cx.run_until_parked();
+        let screenshot = cx
+            .capture_screenshot(window.into())
+            .expect("capture diagnostics screenshot");
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent).expect("create screenshot directory");
+        }
+        screenshot
+            .save(output)
+            .expect("save diagnostics screenshot");
     }
 
     struct SettingsModalHarness {
@@ -3562,6 +4497,7 @@ mod tests {
                     "Long setting",
                     "averylongremotehostdestinationwithoutnaturalwhitespaceorlinebreaks.example.internal",
                     div().w(px(92.0)).child("Control"),
+                    SemanticColors::dark(),
                 ))
         }
     }

@@ -102,6 +102,7 @@ const LIVENESS_INTERVAL: Duration = Duration::from_secs(2);
 pub struct SessionView {
     pub id: String,
     pub status: SessionStatus,
+    pub status_evidence: Option<diri_proto::StatusEvidence>,
     pub needs_input: Option<NeedsInputDetail>,
     pub title: Option<String>,
     pub title_source: Option<diri_proto::TitleSource>,
@@ -264,45 +265,95 @@ pub(crate) struct GridWake {
 }
 
 struct GridWakeInner {
-    generation: Mutex<u64>,
+    state: Mutex<GridWakeState>,
     changed: Condvar,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GridWakeEvent {
+    pub generation: u64,
+    pub interactive: bool,
+}
+
+struct GridWakeState {
+    generation: u64,
+    interactive_budget: u8,
+}
+
+const INTERACTIVE_GRID_BUDGET: u8 = 2;
 
 impl GridWake {
     fn new() -> Self {
         Self {
             inner: Arc::new(GridWakeInner {
-                generation: Mutex::new(0),
+                state: Mutex::new(GridWakeState {
+                    generation: 0,
+                    interactive_budget: 0,
+                }),
                 changed: Condvar::new(),
             }),
         }
     }
 
     fn notify(&self) {
-        let mut generation = self.inner.generation.lock().expect("grid wake");
-        *generation = generation.wrapping_add(1);
+        let mut state = self.inner.state.lock().expect("grid wake");
+        state.generation = state.generation.saturating_add(1);
         self.inner.changed.notify_all();
     }
 
-    pub(crate) fn generation(&self) -> u64 {
-        *self.inner.generation.lock().expect("grid wake")
+    fn prioritize_interactive_changes(&self) {
+        let mut state = self.inner.state.lock().expect("grid wake");
+        state.interactive_budget = INTERACTIVE_GRID_BUDGET;
+        self.inner.changed.notify_all();
     }
 
-    pub(crate) fn wait_for_change(&self, observed: u64, timeout: Duration) -> u64 {
-        let generation = self.inner.generation.lock().expect("grid wake");
-        if *generation != observed {
-            return *generation;
+    pub(crate) fn consume_interactive_priority(&self) {
+        let mut state = self.inner.state.lock().expect("grid wake");
+        state.interactive_budget = state.interactive_budget.saturating_sub(1);
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.inner.state.lock().expect("grid wake").generation
+    }
+
+    pub(crate) fn wait_for_change(&self, observed: u64, timeout: Duration) -> GridWakeEvent {
+        let state = self.inner.state.lock().expect("grid wake");
+        if state.generation != observed {
+            return grid_wake_event(&state, observed);
         }
-        let (generation, _) = self
+        let (state, _) = self
             .inner
             .changed
-            .wait_timeout_while(generation, timeout, |generation| *generation == observed)
+            .wait_timeout_while(state, timeout, |state| state.generation == observed)
             .expect("grid wake");
-        *generation
+        grid_wake_event(&state, observed)
+    }
+
+    pub(crate) fn wait_for_priority_or_timeout(
+        &self,
+        observed: u64,
+        timeout: Duration,
+    ) -> GridWakeEvent {
+        let state = self.inner.state.lock().expect("grid wake");
+        let (state, _) = self
+            .inner
+            .changed
+            .wait_timeout_while(state, timeout, |state| {
+                state.interactive_budget == 0 || state.generation == observed
+            })
+            .expect("grid wake");
+        grid_wake_event(&state, observed)
     }
 
     pub(crate) fn same_source(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+fn grid_wake_event(state: &GridWakeState, observed: u64) -> GridWakeEvent {
+    GridWakeEvent {
+        generation: state.generation,
+        interactive: state.interactive_budget > 0 && state.generation != observed,
     }
 }
 
@@ -584,7 +635,7 @@ impl Session {
             0,
         ));
         let log = OutputLog::writer(&spec.logs_dir, &spec.id)?;
-        let shared = new_shared(&spec, log);
+        let shared = new_shared(&spec, log, &engine);
         *shared.remote_grid.lock().expect("remote grid") = Some(RemoteGridState {
             mirror: GridMirror::new(),
             revision: 0,
@@ -642,7 +693,7 @@ impl Session {
             remote.output_offset,
         ));
         let log = OutputLog::writer(&spec.logs_dir, &spec.id)?;
-        let shared = new_shared(&spec, log);
+        let shared = new_shared(&spec, log, &engine);
         shared
             .remote_output_offset
             .store(remote.output_offset, Ordering::SeqCst);
@@ -681,7 +732,7 @@ impl Session {
     fn spawn_direct(spec: SessionSpec, engine: Arc<ManifestEngine>) -> std::io::Result<Self> {
         let pty = Pty::spawn(&spec.pty)?;
         let log = OutputLog::writer(&spec.logs_dir, &spec.id)?;
-        let shared = new_shared(&spec, log);
+        let shared = new_shared(&spec, log, &engine);
         shared.child_pid.store(pty.pid() as i32, Ordering::SeqCst);
 
         let reader = pty.reader()?;
@@ -757,7 +808,7 @@ impl Session {
         let paths = HolderPaths::new(&holder.holders_dir, &spec.id);
         let client = HolderClient::new(paths.socket());
         let log = OutputLog::reader(&spec.logs_dir, &spec.id)?;
-        let shared = new_shared(&spec, log);
+        let shared = new_shared(&spec, log, &engine);
         let deferred = Arc::new(DeferredLaunch::new());
 
         let pump = {
@@ -898,7 +949,7 @@ impl Session {
         engine: Arc<ManifestEngine>,
     ) -> std::io::Result<Self> {
         let log = OutputLog::reader(&spec.logs_dir, &spec.id)?;
-        let shared = new_shared(&spec, log);
+        let shared = new_shared(&spec, log, &engine);
         if let Ok(stat) = client.stat() {
             shared.child_pid.store(stat.child_pid, Ordering::SeqCst);
         }
@@ -948,6 +999,13 @@ impl Session {
         SessionView {
             id: self.shared.id.clone(),
             status: self.shared.status.lock().expect("status").clone(),
+            status_evidence: self
+                .shared
+                .reducer
+                .lock()
+                .expect("reducer")
+                .evidence()
+                .cloned(),
             needs_input: self.shared.needs_input.lock().expect("needs input").clone(),
             title,
             title_source,
@@ -1265,15 +1323,40 @@ impl Session {
         if !submit {
             return self.write_input(text.as_bytes());
         }
+        self.paste_text(text)?;
+        std::thread::sleep(Duration::from_millis(30));
+        self.submit_input()
+    }
+
+    /// Types `text` into the composer WITHOUT submitting it, framed as a
+    /// bracketed paste when the child has that mode on. Separated from
+    /// [`Self::send_text`] so a caller that cannot see the composer — the
+    /// initial-prompt injector — can watch the text echo back before it
+    /// commits to an Enter it can never take back.
+    ///
+    /// Titling happens here rather than at submit, so a prompt the injector
+    /// types names its session the same way one the user types does. It is
+    /// idempotent, which matters because the injector may retype.
+    pub fn paste_text(&self, text: &str) -> std::io::Result<()> {
         self.capture_prompt_title(text);
         let framed = if self.bracketed_paste() {
             format!("\x1b[200~{text}\x1b[201~")
         } else {
-            text.to_string()
+            text.to_owned()
         };
-        self.write_input(framed.as_bytes())?;
-        std::thread::sleep(Duration::from_millis(30));
+        self.write_input(framed.as_bytes())
+    }
+
+    /// The Enter that submits whatever is in the composer.
+    pub fn submit_input(&self) -> std::io::Result<()> {
         self.write_input(b"\r")
+    }
+
+    /// Kill-line (⌃U): what every one of these TUIs uses to empty its
+    /// composer. Sent before a retyped prompt so a half-landed first attempt
+    /// cannot concatenate with the second.
+    pub fn clear_input_line(&self) -> std::io::Result<()> {
+        self.write_input(b"\x15")
     }
 
     /// Sends bytes to the child, as if typed.
@@ -1281,6 +1364,13 @@ impl Session {
         // Input means someone is interacting: keep the pump on its fast tick
         // so the echo renders promptly.
         self.shared.note_hot();
+        if !bytes.is_empty() {
+            // The next grid changes are likely a trailing echo already in
+            // flight and the TUI's response. Let the attachment pump interrupt
+            // its background coalescing wait instead of making typed input
+            // cross a 16 ms frame boundary before the host can render it.
+            self.shared.grid_wake.prioritize_interactive_changes();
+        }
         self.observe_prompt_input(bytes);
         // Typed before the deferred exec: queue for the launch flush, and
         // still count as a keystroke for the reducer.
@@ -1511,7 +1601,10 @@ impl Drop for Session {
     }
 }
 
-fn new_shared(spec: &SessionSpec, log: OutputLog) -> Arc<Shared> {
+fn new_shared(spec: &SessionSpec, log: OutputLog, engine: &ManifestEngine) -> Arc<Shared> {
+    let manifest_version = engine
+        .manifest(&spec.manifest_id)
+        .map(|manifest| manifest.version.clone());
     Arc::new(Shared {
         id: spec.id.clone(),
         status: Mutex::new(SessionStatus::Starting),
@@ -1524,7 +1617,10 @@ fn new_shared(spec: &SessionSpec, log: OutputLog) -> Arc<Shared> {
             spec.pty.cols as usize,
             spec.pty.rows as usize,
         )),
-        reducer: Mutex::new(StatusReducer::new(spec.authority, SystemTime::now())),
+        reducer: Mutex::new(
+            StatusReducer::new(spec.authority, SystemTime::now())
+                .with_manifest(spec.manifest_id.clone(), manifest_version),
+        ),
         exit: Mutex::new(None),
         exited: AtomicBool::new(false),
         stop: AtomicBool::new(false),
@@ -1599,6 +1695,9 @@ fn apply(shared: &Shared, outcome: &ReducerOutcome) {
             changed = true;
         }
     }
+    // The reducer already suppresses evidence with unchanged structured
+    // meaning, so an emitted value always warrants a record/UI refresh.
+    changed |= outcome.status_evidence.is_some();
     // Leaving a needs-input state clears the pending detail, so the UI does not
     // keep showing a prompt that has been answered.
     if matches!(
@@ -2770,10 +2869,37 @@ mod grid_wake_tests {
 
         let changed = wake.wait_for_change(observed, Duration::from_secs(1));
         thread.join().expect("notifier");
-        assert!(changed > observed);
+        assert!(changed.generation > observed);
+        assert!(!changed.interactive);
         assert_eq!(
-            wake.wait_for_change(changed, Duration::from_millis(5)),
+            wake.wait_for_change(changed.generation, Duration::from_millis(5)),
             changed
         );
+    }
+
+    #[test]
+    fn interactive_priority_covers_two_grid_changes_then_expires() {
+        let wake = GridWake::new();
+        let observed = wake.generation();
+        wake.prioritize_interactive_changes();
+
+        let unchanged = wake.wait_for_priority_or_timeout(observed, Duration::from_millis(1));
+        assert_eq!(unchanged.generation, observed);
+        assert!(!unchanged.interactive);
+
+        wake.notify();
+        let changed = wake.wait_for_priority_or_timeout(observed, Duration::from_secs(1));
+        assert!(changed.generation > observed);
+        assert!(changed.interactive);
+
+        wake.consume_interactive_priority();
+        wake.notify();
+        let trailing = wake.wait_for_change(changed.generation, Duration::from_secs(1));
+        assert!(trailing.interactive);
+
+        wake.consume_interactive_priority();
+        wake.notify();
+        let background = wake.wait_for_change(trailing.generation, Duration::from_secs(1));
+        assert!(!background.interactive);
     }
 }

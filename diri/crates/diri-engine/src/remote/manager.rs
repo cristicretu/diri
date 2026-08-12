@@ -13,9 +13,10 @@ use std::time::{Duration, Instant};
 use diri_proto::HostEntry;
 use diri_proto::remote_pty::{
     DirectoryListRequest, DirectoryListResult, EnvironmentCaptureRequest, EnvironmentCaptureResult,
-    GcResult, HelperProbe, LaunchRequest, LaunchResult, PHASE_ONE_HELPER_CAPABILITIES,
-    PersistenceCapability, PersistenceProbeAction, PersistenceProbeRequest, PersistenceProbeResult,
-    ProtocolVersion, SessionInspection, SessionSelector,
+    ExecutableDiscoveryRequest, ExecutableDiscoveryResult, GcResult, HelperProbe, LaunchRequest,
+    LaunchResult, PHASE_ONE_HELPER_CAPABILITIES, PersistenceCapability, PersistenceProbeAction,
+    PersistenceProbeRequest, PersistenceProbeResult, ProtocolVersion, SessionInspection,
+    SessionSelector,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -33,7 +34,9 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(120);
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(180);
 const RPC_TIMEOUT: Duration = Duration::from_secs(120);
 const PERSISTENCE_LOGOUT_SETTLE: Duration = Duration::from_secs(1);
-const MAX_RPC_OUTPUT: usize = 1024 * 1024;
+// Environment capture alone is bounded at 1 MiB; executable discovery adds a
+// bounded result row per query to that same response.
+const MAX_RPC_OUTPUT: usize = 2 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 // macOS sockaddr_un.sun_path is 104 bytes. OpenSSH briefly appends a dot and
 // 16-byte nonce while creating a multiplex socket, so leave room for the
@@ -474,6 +477,24 @@ impl RemoteManager {
                 self.forget_current_helper(host);
                 let helper = self.ensure_helper(host)?;
                 self.rpc(&helper, HelperCommand::Directories, request, RPC_TIMEOUT)
+            }
+        }
+    }
+
+    /// Resolves every manifest executable in one login-environment capture and
+    /// one Helper RPC. A warm retry still verifies the exact packaged build.
+    pub fn discover_executables(
+        &self,
+        host: &HostEntry,
+        request: &ExecutableDiscoveryRequest,
+    ) -> io::Result<ExecutableDiscoveryResult> {
+        let helper = self.ensure_helper(host)?;
+        match self.rpc(&helper, HelperCommand::Executables, request, RPC_TIMEOUT) {
+            Ok(result) => Ok(result),
+            Err(_) => {
+                self.forget_current_helper(host);
+                let helper = self.ensure_helper(host)?;
+                self.rpc(&helper, HelperCommand::Executables, request, RPC_TIMEOUT)
             }
         }
     }
@@ -1015,7 +1036,7 @@ mod tests {
         let target = RemoteTarget::MacosAarch64;
         let artifact_path = temporary.path().join("diri-remote-fixture");
         let artifact_script = format!(
-            "#!/bin/sh\ncase \"$1\" in\nprobe) printf '%s\\n' '{{\"protocol\":{{\"major\":1,\"minor\":2}},\"buildId\":\"test-build\",\"artifactSha256\":\"'$TEST_ARTIFACT_SHA'\",\"target\":\"{}\",\"os\":\"test\",\"arch\":\"test\",\"supported\":true,\"holderAvailable\":true,\"capabilities\":[\"full-snapshot\",\"incremental-grid\",\"process-exit\",\"signal\",\"controller-lease\",\"scrollback\",\"session-management\",\"environment-capture\",\"directory-list\",\"persistence-probe\",\"atomic-activation\"]}}';;\nactivate) final=$(dirname \"$0\")/diri-remote; ln \"$0\" \"$final\" 2>/dev/null || true; rm -f \"$0\"; exec \"$final\" probe --format=json;;\n*) exit 64;;\nesac\n",
+            "#!/bin/sh\ncase \"$1\" in\nprobe) printf '%s\\n' '{{\"protocol\":{{\"major\":1,\"minor\":3}},\"buildId\":\"test-build\",\"artifactSha256\":\"'$TEST_ARTIFACT_SHA'\",\"target\":\"{}\",\"os\":\"test\",\"arch\":\"test\",\"supported\":true,\"holderAvailable\":true,\"capabilities\":[\"full-snapshot\",\"incremental-grid\",\"process-exit\",\"signal\",\"controller-lease\",\"scrollback\",\"session-management\",\"environment-capture\",\"directory-list\",\"executable-discovery\",\"persistence-probe\",\"atomic-activation\"]}}';;\nactivate) final=$(dirname \"$0\")/diri-remote; ln \"$0\" \"$final\" 2>/dev/null || true; rm -f \"$0\"; exec \"$final\" probe --format=json;;\n*) exit 64;;\nesac\n",
             target.artifact_name()
         );
         fs::write(&artifact_path, artifact_script).expect("artifact");

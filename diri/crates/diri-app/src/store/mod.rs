@@ -8,33 +8,38 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use diri_client::{ClientError, ConnectionState, DaemonClient, EventEnvelope};
 use diri_proto::paths::DirijorPaths;
 use diri_proto::remote_pty::DirectoryListResult;
 use diri_proto::{
     AgentDescriptor, AgentKind, AgentReadinessResult, AttentionLevel, DateMillis, EventName,
-    ExitReason, GovernorConfigureParams, HostEntry, HostsConfig, Project, ProjectId, Resumability,
-    SessionId, SessionListResult, SessionRecord, SessionSpawnParams, SessionStatus,
+    ExitReason, GovernorConfigureParams, HelloResult, HostEntry, HostsConfig, Project, ProjectId,
+    Resumability, SessionId, SessionListResult, SessionRecord, SessionSpawnParams, SessionStatus,
 };
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::notifications::{
-    SendTextCommand, StatusTransition, migration_transition, prefs_sync_transition,
-    reach_failure_transition, transitions_for_update,
+    PendingAttention, SendTextCommand, StatusTransition, attention_signal,
+    immediate_transitions_for_update, migration_transition, prefs_sync_transition,
+    reach_failure_transition, settled_attention_transition,
 };
 use crate::switcher::{
     OverviewArrow, OverviewFilter, OverviewMode, OverviewOutcome, SessionOverviewState,
     SessionSwitcherState, SwitcherKey, SwitcherOutcome,
 };
 
-pub use prefs::{DefaultAgent, InspectorTab, Prefs, WindowMode, WindowPlacement};
-pub use projection::{SidebarProject, SidebarProjection};
+pub use prefs::{InspectorTab, Prefs, WindowMode, WindowPlacement};
+pub use projection::{SidebarProject, SidebarProjection, SidebarRow};
 pub use residency::{ResidencyUpdate, TerminalResidency};
 
 pub const AUXILIARY_TERMINAL_TITLE: &str = "Terminal";
+
+fn agent_target_key(host: Option<&str>) -> String {
+    host.unwrap_or("local").to_owned()
+}
 
 pub(crate) fn is_auxiliary_terminal(session: &SessionRecord) -> bool {
     // `parent` was previously written to the wire but had no UI semantics.
@@ -105,6 +110,8 @@ pub enum StoreEffect {
     /// A shell owned by a workbench pane. Unlike a top-level spawn, its
     /// response must not replace the selected sidebar session.
     SpawnAuxiliary(SessionSpawnParams),
+    /// Wake the client's idempotent reconnect loop out of backoff.
+    RetryConnection,
     /// `session.migrate` — move a Claude session between local and a host.
     Migrate {
         id: SessionId,
@@ -129,6 +136,11 @@ pub enum StoreEffect {
         host: Option<String>,
         path: String,
     },
+    RefreshAgents {
+        host: Option<String>,
+        force: bool,
+    },
+    ConfigureAgent(diri_proto::AgentConfigureParams),
     ReopenLast,
     SetActive(bool),
     ConfigureGovernor(GovernorConfigureParams),
@@ -136,6 +148,54 @@ pub enum StoreEffect {
     DetachAttachment(SessionId),
     /// T15 consumes this without involving daemon lifecycle operations.
     StatusTransition(StatusTransition),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum RetryAction {
+    Rename { id: SessionId, title: String },
+    SyncPrefs { host: String, host_name: String },
+}
+
+impl RetryAction {
+    fn effect(self) -> StoreEffect {
+        match self {
+            Self::Rename { id, title } => StoreEffect::Rename { id, title },
+            Self::SyncPrefs { host, host_name } => StoreEffect::SyncPrefs { host, host_name },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActionFailure {
+    pub title: String,
+    pub detail: String,
+    pub retrying: bool,
+    retry: Option<RetryAction>,
+}
+
+impl ActionFailure {
+    #[must_use]
+    pub fn can_retry(&self) -> bool {
+        self.retry.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(
+        title: impl Into<String>,
+        detail: impl Into<String>,
+        can_retry: bool,
+        retrying: bool,
+    ) -> Self {
+        Self {
+            title: title.into(),
+            detail: detail.into(),
+            retrying,
+            retry: can_retry.then(|| RetryAction::Rename {
+                id: SessionId::new("fixture"),
+                title: "fixture".to_owned(),
+            }),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -221,6 +281,7 @@ fn repo_target_key(host: Option<&str>) -> String {
 /// Pure application model. Side effects are emitted onto a channel for the daemon adapter.
 pub struct SessionStore {
     daemon_state: DaemonState,
+    daemon_identity: Option<HelloResult>,
     sessions: HashMap<SessionId, Arc<SessionRecord>>,
     projects: HashMap<ProjectId, Project>,
     selected_session_id: Option<SessionId>,
@@ -246,7 +307,7 @@ pub struct SessionStore {
     prefs: Prefs,
     terminal_residency: TerminalResidency,
     app_is_active: bool,
-    last_action_error: Option<String>,
+    last_action_failure: Option<ActionFailure>,
     sidebar_selection_anchor: Option<SessionId>,
     mru_order: Vec<SessionId>,
     switcher: SessionSwitcherState,
@@ -262,7 +323,16 @@ pub struct SessionStore {
     /// whether their CLI is installed, and each one's manifest descriptor.
     /// Empty until the first successful connect, and empty forever against a
     /// daemon too old to send descriptors — every reader must have a fallback.
-    agents: AgentReadinessResult,
+    agents: HashMap<String, AgentReadinessResult>,
+    agent_catalog_loading: HashSet<String>,
+    agent_catalog_errors: HashMap<String, String>,
+    /// Attention states serving out their settle window, newest arming wins.
+    /// Drained by the settle task in `StoreHandle`, which is what turns one of
+    /// these into a chime and a banner — see `drain_settled_attention`.
+    attention_settle: HashMap<SessionId, PendingAttention>,
+    /// Wakes the settle task when a window is armed early enough to beat the
+    /// one it is currently sleeping on.
+    attention_wake: Arc<Notify>,
     effects: mpsc::UnboundedSender<StoreEffect>,
 }
 
@@ -290,6 +360,7 @@ impl SessionStore {
         (
             Self {
                 daemon_state: DaemonState::Connecting,
+                daemon_identity: None,
                 sessions: HashMap::new(),
                 projects: HashMap::new(),
                 selected_session_id: selected_session_id.clone(),
@@ -306,7 +377,7 @@ impl SessionStore {
                 prefs,
                 terminal_residency: TerminalResidency::default(),
                 app_is_active: true,
-                last_action_error: None,
+                last_action_failure: None,
                 sidebar_selection_anchor: None,
                 mru_order: selected_session_id.into_iter().collect(),
                 switcher: SessionSwitcherState::default(),
@@ -316,7 +387,11 @@ impl SessionStore {
                 cached_projection: None,
                 prefs_path,
                 hosts: Vec::new(),
-                agents: AgentReadinessResult::default(),
+                agents: HashMap::new(),
+                agent_catalog_loading: HashSet::new(),
+                agent_catalog_errors: HashMap::new(),
+                attention_settle: HashMap::new(),
+                attention_wake: Arc::new(Notify::new()),
                 effects,
             },
             receiver,
@@ -334,16 +409,76 @@ impl SessionStore {
 
     /// Installs the agent catalog fetched on connect.
     pub fn set_agent_catalog(&mut self, agents: AgentReadinessResult) {
-        self.agents = agents;
+        let local = agents.host.is_none();
+        let key = agent_target_key(agents.host.as_deref());
+        self.agent_catalog_loading.remove(&key);
+        self.agent_catalog_errors.remove(&key);
+        self.agents.insert(key, agents);
+        // Preserve Main's repair policy for the local preference. A remote
+        // target may legitimately have a different installed set and must not
+        // rewrite the user's global default merely because one host lacks it.
+        if local && let Some(catalog) = self.agent_catalog(None) {
+            let repaired =
+                crate::agent_catalog::resolved_default_agent(&self.prefs.default_agent, catalog);
+            if repaired != self.prefs.default_agent {
+                self.prefs.default_agent = repaired;
+                let _ = self.persist_preferences();
+                self.invalidate_projection();
+            }
+        }
     }
 
-    pub fn agent_catalog(&self) -> &AgentReadinessResult {
+    pub fn agent_catalog(&self, host: Option<&str>) -> Option<&AgentReadinessResult> {
+        self.agents.get(&agent_target_key(host))
+    }
+
+    pub fn agent_catalogs(&self) -> &HashMap<String, AgentReadinessResult> {
         &self.agents
+    }
+
+    pub fn request_agent_catalog(&mut self, host: Option<String>, force: bool) {
+        let key = agent_target_key(host.as_deref());
+        // A failed scan leaves the catalog absent, and the failure's change
+        // broadcast re-renders the surfaces that ask for absent catalogs; a
+        // non-forced request after an error would therefore retry in a loop
+        // for as long as such a surface stays open. Only an explicit rescan
+        // gets past a recorded failure.
+        if !force && self.agent_catalog_errors.contains_key(&key) {
+            return;
+        }
+        if self.agent_catalog_loading.insert(key) {
+            self.emit(StoreEffect::RefreshAgents { host, force });
+        }
+    }
+
+    pub fn configure_agent(&mut self, params: diri_proto::AgentConfigureParams) {
+        // Configuration is a user mutation, not a cache refresh: it must reach
+        // the engine even while a scan for the same target is in flight, or a
+        // toggle flipped during a slow remote scan silently reverts.
+        self.agent_catalog_loading
+            .insert(agent_target_key(params.host.as_deref()));
+        self.emit(StoreEffect::ConfigureAgent(params));
+    }
+
+    pub fn agent_catalog_is_loading(&self, host: Option<&str>) -> bool {
+        self.agent_catalog_loading.contains(&agent_target_key(host))
+    }
+
+    pub fn agent_catalog_error(&self, host: Option<&str>) -> Option<&str> {
+        self.agent_catalog_errors
+            .get(&agent_target_key(host))
+            .map(String::as_str)
     }
 
     /// Manifest descriptor for a kind, when the daemon shipped one.
     pub fn agent_descriptor(&self, kind: &AgentKind) -> Option<&AgentDescriptor> {
-        self.agents.descriptor(kind)
+        self.agent_catalog(None)
+            .and_then(|catalog| catalog.descriptor(kind))
+            .or_else(|| {
+                self.agents
+                    .values()
+                    .find_map(|catalog| catalog.descriptor(kind))
+            })
     }
 
     /// Test/preview seam: inject a host catalog without touching the disk.
@@ -424,6 +559,10 @@ impl SessionStore {
 
     pub fn daemon_state(&self) -> &DaemonState {
         &self.daemon_state
+    }
+
+    pub fn daemon_identity(&self) -> Option<&HelloResult> {
+        self.daemon_identity.as_ref()
     }
 
     pub fn sessions(&self) -> &HashMap<SessionId, Arc<SessionRecord>> {
@@ -608,7 +747,33 @@ impl SessionStore {
     }
 
     pub fn last_action_error(&self) -> Option<&str> {
-        self.last_action_error.as_deref()
+        self.last_action_failure
+            .as_ref()
+            .map(|failure| failure.detail.as_str())
+    }
+
+    pub fn action_failure(&self) -> Option<&ActionFailure> {
+        self.last_action_failure.as_ref()
+    }
+
+    pub fn dismiss_action_failure(&mut self) {
+        self.last_action_failure = None;
+        self.emit(StoreEffect::UiChanged);
+    }
+
+    pub fn retry_last_action(&mut self) {
+        let Some(failure) = self.last_action_failure.as_mut() else {
+            return;
+        };
+        let Some(retry) = failure.retry.clone() else {
+            return;
+        };
+        failure.retrying = true;
+        self.emit(retry.effect());
+    }
+
+    pub fn retry_connection(&self) {
+        self.emit(StoreEffect::RetryConnection);
     }
 
     pub fn switcher_state(&self) -> &SessionSwitcherState {
@@ -645,6 +810,114 @@ impl SessionStore {
     pub fn reset_terminal_zoom(&mut self) -> io::Result<()> {
         self.prefs.reset_terminal_zoom();
         self.persist_preferences()
+    }
+
+    /// Brings the persisted sidebar order back in line with what actually
+    /// exists: dead ids are dropped, and anything new is appended.
+    ///
+    /// This is what makes the order a *total* one. Before it existed the
+    /// comparator split rows into "manually ordered" and "everything else",
+    /// which had two visible costs: a new session sorted into the middle of
+    /// the list rather than the end, and a row dragged to the bottom of a
+    /// group snapped back above its unordered siblings on the next frame.
+    ///
+    /// New ids are appended in arrival order — the same order the projection
+    /// falls back to — so materialising the order never moves a single row.
+    /// Runs on membership changes only, and reports whether it wrote anything.
+    fn reconcile_sidebar_order(&mut self) -> bool {
+        let live_sessions: HashSet<&SessionId> = self.sessions.keys().collect();
+        let live_projects: HashSet<&ProjectId> = self.projects.keys().collect();
+        let mut arrivals: Vec<(f64, &SessionId)> = self
+            .sessions
+            .values()
+            .map(|session| (session.created_at.0, &session.id))
+            .collect();
+        arrivals.sort_by(|(left, left_id), (right, right_id)| {
+            left.total_cmp(right)
+                .then_with(|| left_id.0.cmp(&right_id.0))
+        });
+
+        // A project arrives with its oldest session, matching the projection.
+        let mut project_arrivals: HashMap<&ProjectId, f64> = HashMap::new();
+        for session in self.sessions.values() {
+            let arrival = project_arrivals
+                .entry(&session.project_id)
+                .or_insert(f64::INFINITY);
+            *arrival = arrival.min(session.created_at.0);
+        }
+        let mut projects: Vec<(f64, &ProjectId)> = self
+            .projects
+            .keys()
+            .map(|id| {
+                (
+                    project_arrivals.get(id).copied().unwrap_or(f64::INFINITY),
+                    id,
+                )
+            })
+            .collect();
+        projects.sort_by(|(left, left_id), (right, right_id)| {
+            left.total_cmp(right)
+                .then_with(|| left_id.0.cmp(&right_id.0))
+        });
+
+        let sessions = reconcile_order(
+            &self.prefs.sidebar_session_order,
+            &live_sessions,
+            arrivals.into_iter().map(|(_, id)| id),
+        );
+        let ordered_projects = reconcile_order(
+            &self.prefs.sidebar_project_order,
+            &live_projects,
+            projects.into_iter().map(|(_, id)| id),
+        );
+        // Collapse and pin state for rows that no longer exist would otherwise
+        // accumulate in prefs.json forever and reattach to a recycled id.
+        let collapsed_sessions =
+            retain_live(&self.prefs.sidebar_collapsed_sessions, &live_sessions);
+        let pinned_sessions = retain_live(&self.prefs.sidebar_pinned_sessions, &live_sessions);
+
+        let mut changed = false;
+        if let Some(order) = sessions {
+            self.prefs.sidebar_session_order = order;
+            changed = true;
+        }
+        if let Some(order) = ordered_projects {
+            self.prefs.sidebar_project_order = order;
+            changed = true;
+        }
+        if let Some(collapsed) = collapsed_sessions {
+            self.prefs.sidebar_collapsed_sessions = collapsed;
+            changed = true;
+        }
+        if let Some(pinned) = pinned_sessions {
+            self.prefs.sidebar_pinned_sessions = pinned;
+            changed = true;
+        }
+        if changed {
+            self.invalidate_projection();
+        }
+        changed
+    }
+
+    /// [`Self::reconcile_sidebar_order`] plus the one prefs write it earns.
+    /// Session membership changes at human speed, so this is not hot.
+    fn sync_sidebar_order(&mut self) {
+        if self.reconcile_sidebar_order() {
+            let _ = self.persist_preferences();
+        }
+    }
+
+    /// The manual session order, guaranteed to name every live session, for a
+    /// caller about to move one row within it.
+    pub fn sidebar_session_order(&mut self) -> Vec<SessionId> {
+        self.reconcile_sidebar_order();
+        self.prefs.sidebar_session_order.clone()
+    }
+
+    /// See [`Self::sidebar_session_order`].
+    pub fn sidebar_project_order(&mut self) -> Vec<ProjectId> {
+        self.reconcile_sidebar_order();
+        self.prefs.sidebar_project_order.clone()
     }
 
     pub fn set_project_order(&mut self, order: Vec<ProjectId>) -> io::Result<()> {
@@ -692,6 +965,43 @@ impl SessionStore {
         self.update_preferences(|prefs| {
             toggle_vec_member(&mut prefs.sidebar_collapsed_projects, id)
         })
+    }
+
+    /// Folds or unfolds a session's spawned children. Collapsing the ancestor
+    /// of the current selection would hide it, so the selection moves up to
+    /// the row doing the folding rather than disappearing under it.
+    pub fn toggle_session_collapsed(&mut self, id: SessionId) -> io::Result<()> {
+        let collapsing = !self.prefs.sidebar_collapsed_sessions.contains(&id);
+        if collapsing
+            && let Some(selected) = self.selected_session_id.clone()
+            && self.is_descendant_of(&selected, &id)
+        {
+            self.select(id.clone());
+        }
+        self.update_preferences(|prefs| {
+            toggle_vec_member(&mut prefs.sidebar_collapsed_sessions, id)
+        })
+    }
+
+    fn is_descendant_of(&self, candidate: &SessionId, ancestor: &SessionId) -> bool {
+        let mut seen = HashSet::from([candidate.clone()]);
+        let mut cursor = self
+            .sessions
+            .get(candidate)
+            .and_then(|session| session.parent.clone());
+        while let Some(node) = cursor {
+            if &node == ancestor {
+                return true;
+            }
+            if !seen.insert(node.clone()) {
+                return false;
+            }
+            cursor = self
+                .sessions
+                .get(&node)
+                .and_then(|session| session.parent.clone());
+        }
+        false
     }
 
     pub fn toggle_archive_expanded(&mut self, id: ProjectId) -> io::Result<()> {
@@ -770,6 +1080,7 @@ impl SessionStore {
             self.selected_session_id = None;
         }
         self.invalidate_projection();
+        self.sync_sidebar_order();
         self.auto_select_if_needed();
         // A restored selection did not travel through `focus_session`, so it
         // still needs terminal residency before the pane can attach.
@@ -864,6 +1175,7 @@ impl SessionStore {
                     }
                     self.projects.insert(project.id.clone(), project);
                     self.invalidate_projection();
+                    self.sync_sidebar_order();
                     return StoreEventChange::Model;
                 }
             }
@@ -876,14 +1188,13 @@ impl SessionStore {
         let previous = self.sessions.get(&session.id).cloned();
         let is_new = previous.is_none();
         let id = session.id.clone();
-        let transitions = transitions_for_update(
+        let transitions = immediate_transitions_for_update(
             previous.as_deref(),
             &session,
-            self.selected_session_id.as_ref(),
-            self.app_is_active,
             self.prefs.status_sounds,
-            self.agents.descriptor(session.effective_kind()),
         );
+        let attention = attention_signal(previous.as_deref(), &session);
+        let arriving_attention = session.attention();
         let arriving_archived = session.is_archived();
         // Closing the tab also drops the Engine record and deletes the
         // session's output log, so it may only happen where nothing is lost.
@@ -905,6 +1216,7 @@ impl SessionStore {
                 .as_deref()
                 .is_none_or(|record| !matches!(record.status, SessionStatus::Exited(_)));
         self.sessions.insert(id.clone(), Arc::new(session));
+        self.settle_attention(&id, attention, arriving_attention, arriving_archived);
         // Spawn selects the id before the authoritative record arrives, and
         // only focus_session grants terminal residency -- without this, a
         // session created from the UI stays "Preparing terminal" forever.
@@ -919,6 +1231,11 @@ impl SessionStore {
             }
         }
         self.invalidate_projection();
+        // Only membership moves the order, and a session record is republished
+        // on every title, status, and resource tick.
+        if is_new {
+            self.sync_sidebar_order();
+        }
         for transition in transitions {
             self.emit(StoreEffect::StatusTransition(transition));
         }
@@ -940,11 +1257,88 @@ impl SessionStore {
         self.reconcile_navigation();
     }
 
+    /// Arms, replaces, or abandons a session's settle window after an update.
+    ///
+    /// A fresh signal always re-arms: the newest reason to interrupt is the one
+    /// worth waiting on. Without a signal, a window whose state the session no
+    /// longer holds is dropped here rather than at the deadline, so a blip that
+    /// resolves immediately never even keeps the settle task awake.
+    fn settle_attention(
+        &mut self,
+        id: &SessionId,
+        signal: Option<AttentionLevel>,
+        attention: AttentionLevel,
+        archived: bool,
+    ) {
+        if let Some(level) = signal {
+            self.attention_settle.insert(
+                id.clone(),
+                PendingAttention::armed_at(level, Instant::now()),
+            );
+            self.attention_wake.notify_one();
+        } else if self
+            .attention_settle
+            .get(id)
+            .is_some_and(|pending| archived || pending.level != attention)
+        {
+            self.attention_settle.remove(id);
+        }
+    }
+
+    /// The earliest settle window still to run, for the task that sleeps on it.
+    #[must_use]
+    pub fn next_attention_deadline(&self) -> Option<Instant> {
+        self.attention_settle
+            .values()
+            .map(|pending| pending.deadline)
+            .min()
+    }
+
+    /// Handle to the signal raised whenever a settle window is armed.
+    #[must_use]
+    pub fn attention_wake(&self) -> Arc<Notify> {
+        Arc::clone(&self.attention_wake)
+    }
+
+    /// Turns every expired settle window into the chime and banner it earned,
+    /// judged against the session as it is now — not as it was when the window
+    /// was armed. States that did not survive produce nothing.
+    #[must_use]
+    pub fn drain_settled_attention(&mut self, now: Instant) -> Vec<StatusTransition> {
+        let due: Vec<SessionId> = self
+            .attention_settle
+            .iter()
+            .filter(|(_, pending)| pending.deadline <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut transitions = Vec::with_capacity(due.len());
+        for id in due {
+            let Some(pending) = self.attention_settle.remove(&id) else {
+                continue;
+            };
+            let Some(session) = self.sessions.get(&id) else {
+                continue;
+            };
+            if let Some(transition) = settled_attention_transition(
+                session,
+                pending.level,
+                self.selected_session_id.as_ref(),
+                self.app_is_active,
+                self.prefs.status_sounds,
+                self.agent_descriptor(session.effective_kind()),
+            ) {
+                transitions.push(transition);
+            }
+        }
+        transitions
+    }
+
     pub fn remove_session_record(&mut self, id: &SessionId) {
         if self.selected_session_id.as_ref() == Some(id) {
             self.focus_neighbor(&HashSet::from([id.clone()]));
         }
         self.sessions.remove(id);
+        self.attention_settle.remove(id);
         self.closing.remove(id);
         self.sidebar_selection.remove(id);
         self.mru_order.retain(|candidate| candidate != id);
@@ -954,6 +1348,7 @@ impl SessionStore {
             self.emit(StoreEffect::DetachAttachment(id.clone()));
         }
         self.invalidate_projection();
+        self.sync_sidebar_order();
         self.reconcile_navigation();
     }
 
@@ -1436,7 +1831,7 @@ impl SessionStore {
         if options.host.is_none() && options.cwd.is_none() && options.same_repo_as.is_none() {
             options.host = self.default_spawn_host();
         }
-        self.spawn_kind(self.prefs.default_agent.kind(), options);
+        self.spawn_kind(self.prefs.default_agent.clone(), options);
     }
 
     pub fn spawn_shell(&mut self, mut options: SpawnOptions) {
@@ -1457,7 +1852,7 @@ impl SessionStore {
         if self.auxiliary_terminal_for(&parent).is_some() {
             return false;
         }
-        self.last_action_error = None;
+        self.last_action_failure = None;
         self.emit(StoreEffect::SpawnAuxiliary(SessionSpawnParams {
             kind: AgentKind::SHELL,
             cwd: session.cwd.clone(),
@@ -1559,8 +1954,7 @@ impl SessionStore {
             &self.closing,
         );
         projection
-            .ordered_sessions
-            .first()
+            .first_active()
             .map(|session| session.cwd.clone())
             .or_else(|| {
                 projection
@@ -1583,7 +1977,8 @@ impl SessionStore {
     fn focus_session(&mut self, id: SessionId) {
         let selection_changed = self.selected_session_id.as_ref() != Some(&id);
         self.selected_session_id = Some(id.clone());
-        if selection_changed || self.prefs.last_selected_session.as_ref() != Some(&id) {
+        let revealed = self.reveal(&id);
+        if selection_changed || revealed || self.prefs.last_selected_session.as_ref() != Some(&id) {
             self.prefs.last_selected_session = Some(id.clone());
             if let Err(error) = self.persist_preferences() {
                 eprintln!("diri: could not remember the selected session: {error}");
@@ -1636,8 +2031,7 @@ impl SessionStore {
         }
         let first = self
             .sidebar_projection()
-            .ordered_sessions
-            .first()
+            .first_active()
             .map(|session| session.id.clone());
         self.set_selected_survivor(first);
     }
@@ -1670,6 +2064,61 @@ impl SessionStore {
         self.overview.reconcile(&sessions);
     }
 
+    /// Unfolds whatever is hiding `id` so the selected row is on screen: its
+    /// project, every session up its spawn chain, and the archive bucket when
+    /// the row is parked. Reports whether anything actually moved.
+    ///
+    /// This is the invariant that keeps collapse honest. Without it ⌘J, the
+    /// switcher, and an MCP focus can all land on a row the user cannot see,
+    /// and the sidebar shows no selection at all while the workbench shows a
+    /// session — which reads as the app losing track of itself.
+    fn reveal(&mut self, id: &SessionId) -> bool {
+        let Some(session) = self.sessions.get(id).cloned() else {
+            return false;
+        };
+        let mut changed = false;
+        let project = session.project_id.clone();
+        if let Some(index) = self
+            .prefs
+            .sidebar_collapsed_projects
+            .iter()
+            .position(|candidate| candidate == &project)
+        {
+            self.prefs.sidebar_collapsed_projects.remove(index);
+            changed = true;
+        }
+        if session.is_archived() && !self.prefs.sidebar_expanded_archives.contains(&project) {
+            self.prefs.sidebar_expanded_archives.push(project);
+            changed = true;
+        }
+        // Walk up the spawn chain. `seen` guards against a cycle the daemon
+        // should never produce but which would spin here if it did.
+        let mut seen = HashSet::from([id.clone()]);
+        let mut cursor = session.parent.clone();
+        while let Some(ancestor) = cursor {
+            if !seen.insert(ancestor.clone()) {
+                break;
+            }
+            if let Some(index) = self
+                .prefs
+                .sidebar_collapsed_sessions
+                .iter()
+                .position(|candidate| candidate == &ancestor)
+            {
+                self.prefs.sidebar_collapsed_sessions.remove(index);
+                changed = true;
+            }
+            cursor = self
+                .sessions
+                .get(&ancestor)
+                .and_then(|record| record.parent.clone());
+        }
+        if changed {
+            self.invalidate_projection();
+        }
+        changed
+    }
+
     fn sidebar_visible_order(&mut self) -> Vec<SessionId> {
         let expanded: HashSet<_> = self
             .prefs
@@ -1681,14 +2130,14 @@ impl SessionStore {
             .projects
             .iter()
             .flat_map(|group| {
-                group.sessions.iter().chain(
+                group.sessions.iter().map(|row| row.id().clone()).chain(
                     group
                         .archived
                         .iter()
-                        .filter(|_| expanded.contains(&group.project.id)),
+                        .filter(|_| expanded.contains(&group.project.id))
+                        .map(|session| session.id.clone()),
                 )
             })
-            .map(|session| session.id.clone())
             .collect()
     }
 
@@ -1710,6 +2159,47 @@ fn attention_rank(attention: &AttentionLevel) -> u8 {
         AttentionLevel::DoneUnseen => 3,
         AttentionLevel::NeedsInput => 4,
     }
+}
+
+/// Drops ids that no longer exist and appends the ones the order has not seen,
+/// in `arriving` order. Returns `None` when the order already agreed, so a
+/// caller can skip a prefs write on the overwhelmingly common no-op.
+fn reconcile_order<'a, T>(
+    order: &[T],
+    live: &HashSet<&T>,
+    arriving: impl Iterator<Item = &'a T>,
+) -> Option<Vec<T>>
+where
+    T: Clone + Eq + std::hash::Hash + 'a,
+{
+    let mut next: Vec<T> = order
+        .iter()
+        .filter(|id| live.contains(id))
+        .cloned()
+        .collect();
+    let known: HashSet<&T> = order.iter().collect();
+    let appended: Vec<T> = arriving
+        .filter(|id| !known.contains(*id))
+        .cloned()
+        .collect();
+    if next.len() == order.len() && appended.is_empty() {
+        return None;
+    }
+    next.extend(appended);
+    Some(next)
+}
+
+/// Prunes ids that no longer exist, or `None` when there was nothing to prune.
+fn retain_live<T: Clone + Eq + std::hash::Hash>(
+    values: &[T],
+    live: &HashSet<&T>,
+) -> Option<Vec<T>> {
+    let kept: Vec<T> = values
+        .iter()
+        .filter(|id| live.contains(id))
+        .cloned()
+        .collect();
+    (kept.len() != values.len()).then_some(kept)
 }
 
 fn toggle_vec_member<T: PartialEq>(values: &mut Vec<T>, value: T) {
@@ -1859,22 +2349,27 @@ impl StoreRuntime {
                             .daemon_state = DaemonState::Connecting;
                     }
                     ConnectionState::Disconnected(error) => {
-                        state_store
-                            .write()
-                            .expect("session store lock poisoned")
-                            .daemon_state = DaemonState::Unreachable(error);
+                        let mut store = state_store.write().expect("session store lock poisoned");
+                        store.daemon_state = DaemonState::Unreachable(error);
+                        store.daemon_identity = None;
                     }
-                    ConnectionState::Connected(_) => {
-                        state_store
-                            .write()
-                            .expect("session store lock poisoned")
-                            .daemon_state = DaemonState::Connected;
+                    ConnectionState::Connected(identity) => {
+                        {
+                            let mut store =
+                                state_store.write().expect("session store lock poisoned");
+                            store.daemon_state = DaemonState::Connected;
+                            store.daemon_identity = Some(identity);
+                            store.last_action_failure = None;
+                        }
                         // The agent catalog first: `hydrate` runs the notification
                         // policy for every arriving session, and that policy reads
                         // descriptors for banner copy and approve keystrokes.
                         // Failure is non-fatal — an old daemon has no descriptors
                         // to give and every reader falls back.
-                        if let Ok(agents) = state_client.agent_readiness().await {
+                        if let Ok(agents) = state_client
+                            .agent_readiness(diri_proto::AgentReadinessParams::default())
+                            .await
+                        {
                             state_store
                                 .write()
                                 .expect("session store lock poisoned")
@@ -1895,6 +2390,33 @@ impl StoreRuntime {
                         };
                         let _ = state_client.set_active(active).await;
                         let _ = state_client.configure_governor(governor).await;
+                        // Warm the default remote only after local catalog,
+                        // session hydration and lifecycle state have completed.
+                        // A slow SSH login can then never delay first paint.
+                        let default_host = state_store
+                            .read()
+                            .expect("session store lock poisoned")
+                            .default_spawn_host();
+                        if let Some(host) = default_host {
+                            let client = Arc::clone(&state_client);
+                            let store = Arc::clone(&state_store);
+                            let changes = state_changes.clone();
+                            tokio::spawn(async move {
+                                if let Ok(catalog) = client
+                                    .agent_readiness(diri_proto::AgentReadinessParams {
+                                        host: Some(host),
+                                        force_refresh: false,
+                                    })
+                                    .await
+                                {
+                                    store
+                                        .write()
+                                        .expect("session store lock poisoned")
+                                        .set_agent_catalog(catalog);
+                                    let _ = changes.send(());
+                                }
+                            });
+                        }
                     }
                 }
                 let _ = state_changes.send(());
@@ -1916,6 +2438,11 @@ impl StoreRuntime {
             effect_detach,
             effect_changes,
             effect_snapshots,
+            status_tx.clone(),
+        )));
+
+        tasks.push(tokio::spawn(run_attention_settle(
+            Arc::clone(&store),
             status_tx.clone(),
         )));
 
@@ -1991,6 +2518,47 @@ impl Drop for StoreRuntime {
     }
 }
 
+/// Announces attention states that outlived their settle window.
+///
+/// Every chime and banner for a blocked or finished session comes from here,
+/// one window after the transition and only if the session still holds the
+/// state — see `SessionStore::drain_settled_attention`. The loop sleeps on the
+/// nearest deadline and is woken early whenever a closer one is armed, so a
+/// quiet fleet costs no timer at all.
+async fn run_attention_settle(
+    store: Arc<RwLock<SessionStore>>,
+    status_tx: broadcast::Sender<StatusTransition>,
+) {
+    let wake = store
+        .read()
+        .expect("session store lock poisoned")
+        .attention_wake();
+    loop {
+        let deadline = store
+            .read()
+            .expect("session store lock poisoned")
+            .next_attention_deadline();
+        match deadline {
+            Some(deadline) => {
+                tokio::select! {
+                    () = tokio::time::sleep_until(deadline.into()) => {}
+                    // A window closer than the one being slept on, or one that
+                    // replaced it: recompute rather than oversleep.
+                    () = wake.notified() => continue,
+                }
+            }
+            None => wake.notified().await,
+        }
+        let transitions = store
+            .write()
+            .expect("session store lock poisoned")
+            .drain_settled_attention(Instant::now());
+        for transition in transitions {
+            let _ = status_tx.send(transition);
+        }
+    }
+}
+
 async fn run_effects(
     mut effects: mpsc::UnboundedReceiver<StoreEffect>,
     client: Arc<DaemonClient>,
@@ -2001,6 +2569,7 @@ async fn run_effects(
     status_tx: broadcast::Sender<StatusTransition>,
 ) {
     while let Some(effect) = effects.recv().await {
+        let action_context = action_context(&effect);
         let force_snapshot = matches!(
             &effect,
             StoreEffect::SetActive(true) | StoreEffect::PublishSnapshot
@@ -2034,6 +2603,10 @@ async fn run_effects(
                 Err(error) => Err(error),
             },
             StoreEffect::SpawnAuxiliary(params) => client.spawn(params).await.map(|_| ()),
+            StoreEffect::RetryConnection => {
+                client.retry_now();
+                Ok(())
+            }
             StoreEffect::Migrate { id, target_host } => {
                 let destination = {
                     let locked = store.read().expect("session store lock poisoned");
@@ -2128,6 +2701,61 @@ async fn run_effects(
                 });
                 Ok(())
             }
+            StoreEffect::RefreshAgents { host, force } => {
+                let client = Arc::clone(&client);
+                let store = Arc::clone(&store);
+                let change_tx = change_tx.clone();
+                tokio::spawn(async move {
+                    let result = client
+                        .agent_readiness(diri_proto::AgentReadinessParams {
+                            host: host.clone(),
+                            force_refresh: force,
+                        })
+                        .await;
+                    let mut locked = store.write().expect("session store lock poisoned");
+                    let key = agent_target_key(host.as_deref());
+                    // Clear the requested key, not the one the response names:
+                    // a daemon too old for per-host params echoes no host, and
+                    // keying off the response would leave this target loading
+                    // (and every further request suppressed) forever.
+                    locked.agent_catalog_loading.remove(&key);
+                    match result {
+                        Ok(catalog) => {
+                            locked.agent_catalog_errors.remove(&key);
+                            locked.set_agent_catalog(catalog);
+                        }
+                        Err(error) => {
+                            locked.agent_catalog_errors.insert(key, error.to_string());
+                        }
+                    }
+                    let _ = change_tx.send(());
+                });
+                Ok(())
+            }
+            StoreEffect::ConfigureAgent(params) => {
+                let client = Arc::clone(&client);
+                let store = Arc::clone(&store);
+                let change_tx = change_tx.clone();
+                tokio::spawn(async move {
+                    let host = params.host.clone();
+                    let result = client.configure_agent(params).await;
+                    let mut locked = store.write().expect("session store lock poisoned");
+                    let key = agent_target_key(host.as_deref());
+                    // Requested key, not response key — see RefreshAgents.
+                    locked.agent_catalog_loading.remove(&key);
+                    match result {
+                        Ok(catalog) => {
+                            locked.agent_catalog_errors.remove(&key);
+                            locked.set_agent_catalog(catalog);
+                        }
+                        Err(error) => {
+                            locked.agent_catalog_errors.insert(key, error.to_string());
+                        }
+                    }
+                    let _ = change_tx.send(());
+                });
+                Ok(())
+            }
             StoreEffect::ReopenLast => match client.reopen_last().await {
                 Ok(record) => {
                     let id = record.id.clone();
@@ -2150,7 +2778,17 @@ async fn run_effects(
             }
         };
         let mut store = store.write().expect("session store lock poisoned");
-        store.last_action_error = result.err().map(|error| error.to_string());
+        if let Some(context) = action_context {
+            store.last_action_failure = match &result {
+                Ok(()) => None,
+                Err(error) => Some(ActionFailure {
+                    title: context.title.to_owned(),
+                    detail: error.to_string(),
+                    retrying: false,
+                    retry: context.retry,
+                }),
+            };
+        }
         let active = store.app_is_active;
         let activation_snapshot = force_snapshot.then(|| store.snapshot());
         drop(store);
@@ -2161,6 +2799,58 @@ async fn run_effects(
             let _ = change_tx.send(());
         }
     }
+}
+
+struct ActionContext {
+    title: &'static str,
+    retry: Option<RetryAction>,
+}
+
+fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
+    let (title, retry) = match effect {
+        StoreEffect::Remove(_) => ("Close session failed", None),
+        StoreEffect::Resume {
+            automatic: true, ..
+        } => ("Automatic resume failed", None),
+        StoreEffect::Resume {
+            automatic: false, ..
+        } => ("Resume session failed", None),
+        StoreEffect::Archive(_) => ("Archive session failed", None),
+        StoreEffect::Unarchive(_) => ("Restore session failed", None),
+        StoreEffect::Rename { id, title } => (
+            "Rename session failed",
+            Some(RetryAction::Rename {
+                id: id.clone(),
+                title: title.clone(),
+            }),
+        ),
+        StoreEffect::Spawn(_) => ("Create session failed", None),
+        StoreEffect::SpawnAuxiliary(_) => ("Open terminal failed", None),
+        StoreEffect::Migrate { .. } => ("Move session failed", None),
+        StoreEffect::SyncPrefs { host, host_name } => (
+            "Sync preferences failed",
+            Some(RetryAction::SyncPrefs {
+                host: host.clone(),
+                host_name: host_name.clone(),
+            }),
+        ),
+        StoreEffect::ReopenLast => ("Reopen session failed", None),
+        StoreEffect::UiChanged
+        | StoreEffect::PublishSnapshot
+        | StoreEffect::MarkSeen(_)
+        | StoreEffect::RetryConnection
+        | StoreEffect::LocateRepo { .. }
+        | StoreEffect::ListDirectories { .. }
+        | StoreEffect::SetActive(_)
+        | StoreEffect::ConfigureGovernor(_)
+        | StoreEffect::DetachAttachment(_)
+        | StoreEffect::StatusTransition(_) => return None,
+        // Catalog failures land in `agent_catalog_errors`, which the Agents
+        // settings page and launch surfaces render in place — a toast on top
+        // would double-report every unreachable host.
+        StoreEffect::RefreshAgents { .. } | StoreEffect::ConfigureAgent(_) => return None,
+    };
+    Some(ActionContext { title, retry })
 }
 
 pub fn prefs_path_in_home(home: &Path) -> PathBuf {

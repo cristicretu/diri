@@ -13,7 +13,7 @@ in [Issues](https://github.com/cristicretu/diri/issues).
 
 ## Next
 
-- Bring the Rust engine to feature parity with the shipped Swift daemon.
+- Harden the Rust Engine upgrade path and expand cross-platform coverage.
 - Improve remote-node setup, diagnostics, and least-privilege guidance.
 - Add deeper end-to-end tests for app updates and session recovery.
 - Move more release provenance into reproducible, attestable CI steps while

@@ -19,6 +19,7 @@
 //!   sessions.
 
 pub mod agent;
+pub mod agent_catalog;
 pub mod artifacts;
 pub mod attach;
 pub mod browser;

@@ -48,7 +48,13 @@ fn engine_lists_remote_directories_through_the_verified_helper() {
 
     manager.ensure_helper(&host).expect("bootstrap");
     let listing = manager
-        .list_directories(&host, &DirectoryListRequest { path: "~".into() })
+        .list_directories(
+            &host,
+            &DirectoryListRequest {
+                path: "~".into(),
+                mode: Default::default(),
+            },
+        )
         .expect("remote directory listing");
     let names = listing
         .entries

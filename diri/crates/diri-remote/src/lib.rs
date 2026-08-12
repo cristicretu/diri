@@ -3,6 +3,7 @@
 mod bridge;
 mod directories;
 mod environment;
+mod executables;
 mod holder;
 mod output_log;
 mod paths;
@@ -48,6 +49,7 @@ kill                   Stop an authenticated Holder and its process tree\n  \
 gc                     Remove dead, unreferenced session state\n  \
 environment            Capture the remote login/cwd environment\n  \
 directories            List one bounded directory level\n  \
+executables            Resolve a bounded Agent executable batch\n  \
 persistence            Run a persistence capability probe step\n  \
 activate               Atomically activate this uploaded Helper build\n";
 
@@ -83,6 +85,7 @@ enum Invocation {
     Gc,
     Environment,
     Directories,
+    Executables,
     Persistence,
     Activate,
     HiddenHolder,
@@ -158,6 +161,12 @@ pub fn execute<W: Write + Send>(
         >(stdin, 8 * 1024)
         .and_then(|request| directories::list(&request))
         .and_then(|result| write_json(stdout, &result)),
+        Invocation::Executables => holder::read_limited_json::<
+            _,
+            diri_proto::remote_pty::ExecutableDiscoveryRequest,
+        >(stdin, diri_proto::remote_pty::MAX_LAUNCH_BYTES)
+        .and_then(|request| executables::discover(&request, executable))
+        .and_then(|result| write_json(stdout, &result)),
         Invocation::Persistence => holder::read_limited_json::<
             _,
             diri_proto::remote_pty::PersistenceProbeRequest,
@@ -224,6 +233,7 @@ fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, Stri
         "gc" => no_more(arguments, Invocation::Gc),
         "environment" => no_more(arguments, Invocation::Environment),
         "directories" => no_more(arguments, Invocation::Directories),
+        "executables" => no_more(arguments, Invocation::Executables),
         "persistence" => no_more(arguments, Invocation::Persistence),
         "activate" => no_more(arguments, Invocation::Activate),
         "__holder" => no_more(arguments, Invocation::HiddenHolder),

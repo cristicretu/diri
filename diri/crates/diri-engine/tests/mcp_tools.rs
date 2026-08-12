@@ -46,6 +46,7 @@ fn record(id: &str, parent: Option<&str>) -> SessionRecord {
         agent_session_id: None,
         transcript_path: None,
         status: SessionStatus::Starting,
+        status_evidence: None,
         needs_input: None,
         resumability: Resumability::Live,
         parent: parent.map(|value| SessionId(value.into())),

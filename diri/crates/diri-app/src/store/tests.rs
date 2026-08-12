@@ -1,9 +1,11 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use diri_proto::{
-    AgentKind, AttentionLevel, DateMillis, ExitInfo, ExitReason, Project, ProjectId, Resumability,
-    SessionId, SessionListResult, SessionRecord, SessionStatus, TitleSource,
+    AgentDescriptor, AgentKind, AgentReadinessItem, AgentReadinessResult, AttentionLevel,
+    DateMillis, ExitInfo, ExitReason, Project, ProjectId, Resumability, SessionId,
+    SessionListResult, SessionRecord, SessionStatus, TitleSource,
 };
 use tempfile::tempdir;
 use tokio::sync::mpsc;
@@ -11,8 +13,9 @@ use tokio::sync::mpsc;
 use crate::notifications::NotificationSound;
 
 use super::{
-    ClickModifiers, DefaultAgent, EventEnvelope, InspectorTab, Prefs, SessionStore, StoreEffect,
-    StoreEventChange, TerminalResidency, WindowMode, WindowPlacement, event_publication_policy,
+    ClickModifiers, EventEnvelope, InspectorTab, Prefs, SessionStore, SidebarProjection,
+    StoreEffect, StoreEventChange, TerminalResidency, WindowMode, WindowPlacement,
+    event_publication_policy,
 };
 use crate::switcher::{OverviewFilter, OverviewLane, SwitcherKey};
 
@@ -37,6 +40,7 @@ fn session(value: &str, project: &str, created: f64) -> SessionRecord {
         agent_session_id: None,
         transcript_path: None,
         status: SessionStatus::Idle,
+        status_evidence: None,
         needs_input: None,
         resumability: Resumability::Live,
         parent: None,
@@ -63,6 +67,7 @@ fn project(value: &str, name: &str) -> Project {
         root: format!("/work/{value}"),
         name: name.to_owned(),
         pinned_order: None,
+        host: None,
     }
 }
 
@@ -155,7 +160,7 @@ fn stale_restored_selection_falls_back_and_is_replaced() {
         ..Prefs::default()
     };
     let (store, _) = hydrated(
-        vec![session("one", "a", 2.0), session("two", "a", 1.0)],
+        vec![session("one", "a", 1.0), session("two", "a", 2.0)],
         vec![project("a", "A")],
         prefs,
     );
@@ -166,8 +171,8 @@ fn stale_restored_selection_falls_back_and_is_replaced() {
 
 #[test]
 fn overview_store_integration_filters_selects_and_bulk_closes() {
-    let live = session("live", "a", 2.0);
-    let mut ended = session("ended", "a", 1.0);
+    let live = session("live", "a", 1.0);
+    let mut ended = session("ended", "a", 2.0);
     ended.status = SessionStatus::Exited(ExitInfo {
         reason: ExitReason::Exited,
         code: Some(0),
@@ -190,7 +195,7 @@ fn overview_store_integration_filters_selects_and_bulk_closes() {
 }
 
 #[test]
-fn projection_uses_manual_ranks_then_created_at_fallback() {
+fn projection_keeps_manual_ranks_and_appends_the_rest_in_arrival_order() {
     let prefs = Prefs {
         sidebar_project_order: vec![pid("z")],
         sidebar_session_order: vec![id("old-ranked")],
@@ -210,13 +215,299 @@ fn projection_uses_manual_ranks_then_created_at_fallback() {
     let projection = store.sidebar_projection();
     assert_eq!(projection.projects[0].project.id, pid("z"));
     assert_eq!(
-        projection.projects[1]
+        rows(&projection, 1),
+        // Oldest first behind the one row that was ranked by hand. The newest
+        // session is last, which is the whole point: a session created now
+        // belongs at the bottom, not wherever its timestamp happens to sort.
+        vec![id("old-ranked"), id("middle"), id("new")]
+    );
+}
+
+/// The reported bug, from both ends: a session and a project created after the
+/// sidebar already has contents must land at the bottom, not in the middle.
+#[test]
+fn a_new_session_and_a_new_project_land_at_the_bottom() {
+    let (mut store, _) = hydrated(
+        vec![session("first", "a", 1.0), session("second", "a", 2.0)],
+        vec![project("a", "Alpha")],
+        Prefs::default(),
+    );
+    assert_eq!(
+        rows(&store.sidebar_projection(), 0),
+        vec![id("first"), id("second")]
+    );
+
+    // "Zed" sorts after "Alpha" alphabetically and "Ada" sorts before it; the
+    // old projection put a new project wherever its name fell, so use a name
+    // that would have jumped the queue.
+    store.upsert_session(session("third", "a", 3.0));
+    store.upsert_session(session("fresh", "ada", 4.0));
+
+    let projection = store.sidebar_projection();
+    assert_eq!(
+        rows(&projection, 0),
+        vec![id("first"), id("second"), id("third")],
+        "a new session appends to its project"
+    );
+    assert_eq!(
+        projection
+            .projects
+            .iter()
+            .map(|group| group.project.id.clone())
+            .collect::<Vec<_>>(),
+        vec![pid("a"), pid("ada")],
+        "a new project appends to the list, whatever it is called"
+    );
+}
+
+/// The order is total, so a row dragged to the end of its group stays there.
+/// Under the old ranked-before-unranked comparator it sprang back above every
+/// sibling that had never been dragged.
+#[test]
+fn a_session_dragged_to_the_end_stays_at_the_end() {
+    let (mut store, _) = hydrated(
+        vec![
+            session("one", "a", 1.0),
+            session("two", "a", 2.0),
+            session("three", "a", 3.0),
+        ],
+        vec![project("a", "Alpha")],
+        Prefs::default(),
+    );
+
+    let mut order = store.sidebar_session_order();
+    super::super::sidebar::move_to_end(&mut order, &id("one"));
+    store.set_session_order(order).expect("persist order");
+
+    assert_eq!(
+        rows(&store.sidebar_projection(), 0),
+        vec![id("two"), id("three"), id("one")]
+    );
+}
+
+/// Order and collapse state for departed sessions would otherwise pile up in
+/// prefs.json forever and reattach to a recycled id.
+#[test]
+fn removing_a_session_prunes_it_from_the_persisted_order() {
+    let (mut store, _) = hydrated(
+        vec![session("one", "a", 1.0), session("two", "a", 2.0)],
+        vec![project("a", "Alpha")],
+        Prefs::default(),
+    );
+    store
+        .toggle_session_collapsed(id("one"))
+        .expect("collapse one");
+    assert!(
+        store
+            .preferences()
+            .sidebar_session_order
+            .contains(&id("one"))
+    );
+
+    store.remove_session_record(&id("one"));
+
+    assert_eq!(store.preferences().sidebar_session_order, vec![id("two")]);
+    assert!(store.preferences().sidebar_collapsed_sessions.is_empty());
+}
+
+/// An MCP-spawned agent hangs off the session that spawned it, and a new child
+/// arrives at the bottom of its own sibling run rather than the project's.
+#[test]
+fn spawned_sessions_nest_under_their_parent() {
+    let child = |name: &str, parent: &str, created: f64| {
+        let mut record = session(name, "p", created);
+        record.parent = Some(id(parent));
+        record
+    };
+    let (mut store, _) = hydrated(
+        vec![
+            session("root", "p", 1.0),
+            child("child-b", "root", 3.0),
+            child("child-a", "root", 2.0),
+            child("grandchild", "child-a", 4.0),
+            session("sibling", "p", 5.0),
+        ],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+
+    let projection = store.sidebar_projection();
+    let shape: Vec<_> = projection.projects[0]
+        .sessions
+        .iter()
+        .map(|row| (row.id().0.as_str().to_owned(), row.depth))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            ("root".to_owned(), 0),
+            ("child-a".to_owned(), 1),
+            ("grandchild".to_owned(), 2),
+            ("child-b".to_owned(), 1),
+            ("sibling".to_owned(), 0),
+        ]
+    );
+    assert!(projection.projects[0].sessions[0].has_children);
+    assert!(!projection.projects[0].sessions[4].has_children);
+}
+
+/// Collapsing a parent hides its whole subtree from the rows and from ⌘1…⌘9,
+/// but the sessions stay addressable for selection ranges.
+#[test]
+fn collapsing_a_parent_folds_away_its_subtree() {
+    let mut child = session("child", "p", 2.0);
+    child.parent = Some(id("root"));
+    let (mut store, _) = hydrated(
+        vec![session("root", "p", 1.0), child, session("other", "p", 3.0)],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+
+    store
+        .toggle_session_collapsed(id("root"))
+        .expect("collapse");
+
+    let projection = store.sidebar_projection();
+    assert_eq!(rows(&projection, 0), vec![id("root"), id("other")]);
+    assert!(projection.projects[0].sessions[0].collapsed);
+    assert!(
+        !projection
+            .ordered_sessions
+            .iter()
+            .any(|session| session.id == id("child")),
+        "a folded row must not consume a ⌘1…⌘9 slot"
+    );
+    assert!(
+        projection.display_order.contains(&id("child")),
+        "it is hidden, not gone"
+    );
+}
+
+/// Selecting a hidden session unfolds whatever is covering it. Without this a
+/// ⌘J or an MCP focus lands on a row the sidebar never shows.
+#[test]
+fn selecting_a_folded_session_reveals_it() {
+    let mut child = session("child", "p", 2.0);
+    child.parent = Some(id("root"));
+    let prefs = Prefs {
+        sidebar_collapsed_projects: vec![pid("p")],
+        sidebar_collapsed_sessions: vec![id("root")],
+        ..Prefs::default()
+    };
+    let (mut store, _) = hydrated(
+        vec![session("root", "p", 1.0), child],
+        vec![project("p", "P")],
+        prefs,
+    );
+
+    store.select(id("child"));
+
+    assert!(store.preferences().sidebar_collapsed_projects.is_empty());
+    assert!(store.preferences().sidebar_collapsed_sessions.is_empty());
+    assert_eq!(
+        rows(&store.sidebar_projection(), 0),
+        vec![id("root"), id("child")]
+    );
+}
+
+/// Folding the ancestor of the selection would hide it, so the selection walks
+/// up to the row being folded instead of vanishing under it.
+#[test]
+fn folding_over_the_selection_moves_it_to_the_fold() {
+    let mut child = session("child", "p", 2.0);
+    child.parent = Some(id("root"));
+    let (mut store, _) = hydrated(
+        vec![session("root", "p", 1.0), child],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    store.select(id("child"));
+
+    store
+        .toggle_session_collapsed(id("root"))
+        .expect("collapse");
+
+    assert_eq!(store.selected_session_id(), Some(&id("root")));
+    assert_eq!(rows(&store.sidebar_projection(), 0), vec![id("root")]);
+}
+
+/// A parent in another project, or one that points back at its own descendant,
+/// must leave the row at the top level rather than dropping or hanging it.
+#[test]
+fn unusable_parents_leave_the_row_at_the_root() {
+    let mut foreign = session("foreign", "p", 2.0);
+    foreign.parent = Some(id("elsewhere"));
+    let mut left = session("left", "p", 3.0);
+    left.parent = Some(id("right"));
+    let mut right = session("right", "p", 4.0);
+    right.parent = Some(id("left"));
+    let (mut store, _) = hydrated(
+        vec![session("elsewhere", "other", 1.0), foreign, left, right],
+        vec![project("p", "P"), project("other", "Other")],
+        Prefs::default(),
+    );
+
+    let projection = store.sidebar_projection();
+    let group = projection
+        .projects
+        .iter()
+        .find(|group| group.project.id == pid("p"))
+        .expect("project p");
+    assert_eq!(
+        group
             .sessions
             .iter()
-            .map(|session| session.id.clone())
+            .map(|row| row.depth)
             .collect::<Vec<_>>(),
-        vec![id("old-ranked"), id("new"), id("middle")]
+        vec![0, 0, 1],
+        "the cross-project child roots, and the cycle keeps exactly one edge"
     );
+    assert_eq!(group.sessions.len(), 3, "no row is lost to a cycle");
+}
+
+/// Pinning sorts a row to the top of its own siblings instead of cloning it
+/// into a separate section, so one session is never two rows.
+#[test]
+fn pinned_rows_lead_their_siblings() {
+    let prefs = Prefs {
+        sidebar_pinned_sessions: vec![id("third")],
+        sidebar_pinned_projects: vec![pid("b")],
+        ..Prefs::default()
+    };
+    let (mut store, _) = hydrated(
+        vec![
+            session("first", "a", 1.0),
+            session("second", "a", 2.0),
+            session("third", "a", 3.0),
+            session("only", "b", 4.0),
+        ],
+        vec![project("a", "Alpha"), project("b", "Beta")],
+        prefs,
+    );
+
+    let projection = store.sidebar_projection();
+    assert_eq!(
+        projection
+            .projects
+            .iter()
+            .map(|group| group.project.id.clone())
+            .collect::<Vec<_>>(),
+        vec![pid("b"), pid("a")],
+        "a pinned project leads even though it arrived last"
+    );
+    assert_eq!(
+        rows(&projection, 1),
+        vec![id("third"), id("first"), id("second")]
+    );
+    assert!(projection.projects[1].sessions[0].pinned);
+}
+
+fn rows(projection: &SidebarProjection, group: usize) -> Vec<SessionId> {
+    projection.projects[group]
+        .sessions
+        .iter()
+        .map(|row| row.id().clone())
+        .collect()
 }
 
 #[test]
@@ -264,7 +555,7 @@ fn projection_reuses_one_session_record_per_sidebar_row() {
     );
 
     let projection = store.sidebar_projection();
-    let grouped: &SessionRecord = &projection.projects[0].sessions[0];
+    let grouped: &SessionRecord = &projection.projects[0].sessions[0].session;
     let ordered: &SessionRecord = &projection.ordered_sessions[0];
     assert!(
         std::ptr::eq(grouped, ordered),
@@ -282,9 +573,9 @@ fn multi_select_matches_finder_command_and_visible_shift_ranges() {
     };
     let (mut store, _) = hydrated(
         vec![
-            session("one", "p", 3.0),
+            session("one", "p", 1.0),
             session("two", "p", 2.0),
-            session("three", "p", 1.0),
+            session("three", "p", 3.0),
             archived,
         ],
         vec![project("p", "Project")],
@@ -325,10 +616,10 @@ fn multi_select_matches_finder_command_and_visible_shift_ranges() {
 #[test]
 fn focus_neighbor_prefers_same_project_below_then_above_then_global() {
     let records = vec![
-        session("a-top", "a", 4.0),
-        session("a-mid", "a", 3.0),
-        session("a-low", "a", 2.0),
-        session("b-top", "b", 1.0),
+        session("a-top", "a", 1.0),
+        session("a-mid", "a", 2.0),
+        session("a-low", "a", 3.0),
+        session("b-top", "b", 4.0),
     ];
     let projects = vec![project("a", "A"), project("b", "B")];
 
@@ -357,10 +648,10 @@ fn focus_neighbor_prefers_same_project_below_then_above_then_global() {
 fn selection_drives_mru_and_residency_eviction_signals_detach() {
     let (mut store, mut effects) = hydrated(
         vec![
-            session("one", "p", 4.0),
-            session("two", "p", 3.0),
-            session("three", "p", 2.0),
-            session("four", "p", 1.0),
+            session("one", "p", 1.0),
+            session("two", "p", 2.0),
+            session("three", "p", 3.0),
+            session("four", "p", 4.0),
         ],
         vec![project("p", "P")],
         Prefs::default(),
@@ -446,7 +737,7 @@ fn attention_rollup_and_needs_input_sort_use_proto_derivation() {
 }
 
 #[test]
-fn hidden_needs_input_update_emits_chime_and_notification_effect() {
+fn hidden_needs_input_update_chimes_and_posts_once_its_window_expires() {
     let (mut store, mut effects) = hydrated(
         vec![session("visible", "p", 2.0)],
         vec![project("p", "P")],
@@ -458,15 +749,117 @@ fn hidden_needs_input_update_emits_chime_and_notification_effect() {
     hidden.status = SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Permission);
     store.upsert_session(hidden);
 
-    let transition = drain(&mut effects)
-        .into_iter()
-        .find_map(|effect| match effect {
-            StoreEffect::StatusTransition(transition) => Some(transition),
-            _ => None,
-        })
-        .expect("needs-input update should emit a status transition");
+    // Nothing is announced on the transition itself, and nothing is due yet.
+    assert!(
+        drain(&mut effects)
+            .into_iter()
+            .all(|effect| !matches!(effect, StoreEffect::StatusTransition(_)))
+    );
+    assert!(store.drain_settled_attention(Instant::now()).is_empty());
+
+    let transitions = store.drain_settled_attention(
+        store
+            .next_attention_deadline()
+            .expect("needs-input update should arm a settle window"),
+    );
+    let transition = transitions
+        .first()
+        .expect("a session still blocked at its deadline is announced");
     assert_eq!(transition.sound, Some(NotificationSound::NeedsInput));
     assert!(transition.notification.is_some());
+    assert!(store.next_attention_deadline().is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_settle_task_sleeps_on_the_window_and_then_publishes() {
+    let (store, _effects) = SessionStore::headless(Prefs::default());
+    let store = Arc::new(std::sync::RwLock::new(store));
+    let (status_tx, mut status_rx) = tokio::sync::broadcast::channel(8);
+    let task = tokio::spawn(super::run_attention_settle(
+        Arc::clone(&store),
+        status_tx.clone(),
+    ));
+
+    // The session the user is looking at, so the blocked one is not the
+    // selected row and earns a banner as well as a chime.
+    store
+        .write()
+        .expect("session store lock poisoned")
+        .upsert_session(session("visible", "p", 2.0));
+    let mut blocked = session("blocked", "p", 1.0);
+    blocked.status = SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Permission);
+    store
+        .write()
+        .expect("session store lock poisoned")
+        .upsert_session(blocked);
+
+    // Nothing is published until the window is served — the task is asleep on
+    // the deadline it was woken to install.
+    assert!(status_rx.try_recv().is_err());
+
+    let transition = tokio::time::timeout(Duration::from_secs(30), status_rx.recv())
+        .await
+        .expect("the settle task must publish once the window expires")
+        .expect("status channel stays open");
+    assert_eq!(transition.sound, Some(NotificationSound::NeedsInput));
+    assert!(transition.notification.is_some());
+
+    task.abort();
+}
+
+#[test]
+fn a_session_that_unblocks_inside_its_window_is_never_announced() {
+    let (mut store, mut effects) = hydrated(
+        vec![session("visible", "p", 2.0)],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    drain(&mut effects);
+
+    let mut blocked = session("hidden", "p", 1.0);
+    blocked.status = SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Permission);
+    store.upsert_session(blocked.clone());
+    assert!(store.next_attention_deadline().is_some());
+
+    // Answered before the window expired: the pending state goes with it, so
+    // the settle task is not even kept awake for it.
+    blocked.status = SessionStatus::Working;
+    blocked.needs_input = None;
+    store.upsert_session(blocked);
+
+    assert!(store.next_attention_deadline().is_none());
+    assert!(
+        store
+            .drain_settled_attention(Instant::now() + Duration::from_secs(60))
+            .is_empty()
+    );
+}
+
+#[test]
+fn selecting_a_session_inside_its_window_leaves_the_chime_but_drops_the_banner() {
+    let (mut store, mut effects) = hydrated(
+        vec![session("visible", "p", 2.0)],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    drain(&mut effects);
+
+    let mut blocked = session("hidden", "p", 1.0);
+    blocked.status = SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Permission);
+    store.upsert_session(blocked);
+    store.select(id("hidden"));
+
+    let transitions = store.drain_settled_attention(
+        store
+            .next_attention_deadline()
+            .expect("needs-input update should arm a settle window"),
+    );
+    let transition = transitions.first().expect("the chime still fires");
+    assert_eq!(transition.sound, Some(NotificationSound::NeedsInput));
+    assert!(
+        transition.notification.is_none(),
+        "the session the user is looking at needs no system banner"
+    );
 }
 
 #[test]
@@ -524,7 +917,9 @@ fn cold_boot_only_auto_resumes_the_selected_session() {
         Prefs::default(),
     );
 
-    assert_eq!(store.selected_session_id(), Some(&id("newest")));
+    // Nothing was remembered, so the selection falls to the top of the sidebar
+    // — which is the oldest session now that rows arrive at the bottom.
+    assert_eq!(store.selected_session_id(), Some(&id("oldest")));
     let automatic_resumes: Vec<_> = drain(&mut effects)
         .into_iter()
         .filter_map(|effect| match effect {
@@ -537,7 +932,7 @@ fn cold_boot_only_auto_resumes_the_selected_session() {
         .collect();
     assert_eq!(
         automatic_resumes,
-        vec![id("newest")],
+        vec![id("oldest")],
         "cold boot must not revive every previously running agent"
     );
 
@@ -810,7 +1205,7 @@ fn prefs_round_trip_and_zoom_clamp() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("nested/prefs.json");
     let prefs = Prefs {
-        default_agent: DefaultAgent::Gemini,
+        default_agent: AgentKind::GEMINI,
         default_spawn_host: Some("forge".to_owned()),
         terminal_font_size: 19.5,
         window_placement: Some(WindowPlacement {
@@ -844,6 +1239,124 @@ fn prefs_round_trip_and_zoom_clamp() {
 }
 
 #[test]
+fn default_agent_preferences_migrate_legacy_values_and_persist_manifest_ids() {
+    for (saved, expected) in [
+        ("claudeCode", AgentKind::CLAUDE_CODE),
+        ("codex", AgentKind::CODEX),
+        ("cursor", AgentKind::CURSOR),
+        ("gemini", AgentKind::GEMINI),
+    ] {
+        let prefs: Prefs = serde_json::from_value(serde_json::json!({
+            "defaultAgent": saved
+        }))
+        .expect("legacy prefs decode");
+        assert_eq!(prefs.default_agent, expected);
+    }
+
+    let prefs = Prefs {
+        default_agent: AgentKind::new("amp"),
+        ..Prefs::default()
+    };
+    let encoded = serde_json::to_value(&prefs).expect("prefs encode");
+    assert_eq!(encoded["defaultAgent"], "amp");
+    let decoded: Prefs = serde_json::from_value(encoded).expect("manifest id decodes");
+    assert_eq!(decoded.default_agent, AgentKind::new("amp"));
+}
+
+#[test]
+fn unknown_saved_default_repairs_to_available_first_class_then_shell() {
+    let prefs = Prefs {
+        default_agent: AgentKind::new("removed-agent"),
+        ..Prefs::default()
+    };
+    let (mut store, _) = SessionStore::headless(prefs);
+    store.set_agent_catalog(AgentReadinessResult {
+        agents: vec![AgentReadinessItem {
+            kind: AgentKind::CODEX,
+            binary: "codex".into(),
+            path: Some("/bin/codex".into()),
+            descriptor: Some(AgentDescriptor {
+                id: AgentKind::CODEX_ID.into(),
+                display_name: "Codex".into(),
+                first_class: true,
+                ..AgentDescriptor::default()
+            }),
+            ..AgentReadinessItem::default()
+        }],
+        ..AgentReadinessResult::default()
+    });
+    assert_eq!(store.preferences().default_agent, AgentKind::CODEX);
+
+    store
+        .update_preferences(|prefs| prefs.default_agent = AgentKind::new("removed-again"))
+        .expect("headless prefs update");
+    store.set_agent_catalog(AgentReadinessResult {
+        agents: vec![AgentReadinessItem {
+            kind: AgentKind::new("amp"),
+            binary: "amp".into(),
+            path: Some("/bin/amp".into()),
+            descriptor: Some(AgentDescriptor {
+                id: "amp".into(),
+                display_name: "Amp".into(),
+                first_class: false,
+                ..AgentDescriptor::default()
+            }),
+            ..AgentReadinessItem::default()
+        }],
+        ..AgentReadinessResult::default()
+    });
+    assert_eq!(store.preferences().default_agent, AgentKind::SHELL);
+}
+
+#[test]
+fn a_configure_issued_during_an_inflight_scan_still_reaches_the_engine() {
+    let (mut store, mut effects) = SessionStore::headless(Prefs::default());
+    store.request_agent_catalog(Some("forge".into()), false);
+    assert!(matches!(
+        effects.try_recv(),
+        Ok(StoreEffect::RefreshAgents { .. })
+    ));
+    // The scan has not answered yet. A settings toggle flipped in that window
+    // is a user mutation, not a cache refresh — dropping it would silently
+    // revert the control on the next catalog paint.
+    store.configure_agent(diri_proto::AgentConfigureParams {
+        host: Some("forge".into()),
+        kind: AgentKind::CLAUDE_CODE,
+        executable_path: None,
+        show_in_quick_create: false,
+    });
+    assert!(matches!(
+        effects.try_recv(),
+        Ok(StoreEffect::ConfigureAgent(_))
+    ));
+}
+
+#[test]
+fn a_failed_scan_is_retried_only_by_an_explicit_rescan() {
+    let (mut store, mut effects) = SessionStore::headless(Prefs::default());
+    store.request_agent_catalog(Some("forge".into()), false);
+    assert!(matches!(
+        effects.try_recv(),
+        Ok(StoreEffect::RefreshAgents { .. })
+    ));
+    // The effect loop reports the failure: loading cleared, error recorded.
+    store.agent_catalog_loading.remove("forge");
+    store
+        .agent_catalog_errors
+        .insert("forge".into(), "ssh: connect timed out".into());
+    // Render paths ask again on every paint of a surface whose catalog is
+    // absent; after a failure that must not become a scan loop against an
+    // unreachable host.
+    store.request_agent_catalog(Some("forge".into()), false);
+    assert!(effects.try_recv().is_err());
+    store.request_agent_catalog(Some("forge".into()), true);
+    assert!(matches!(
+        effects.try_recv(),
+        Ok(StoreEffect::RefreshAgents { force: true, .. })
+    ));
+}
+
+#[test]
 fn legacy_last_spawn_host_migrates_to_the_explicit_default() {
     let prefs: Prefs = serde_json::from_str(r#"{"lastSpawnHost":"forge"}"#).unwrap();
     assert_eq!(prefs.default_spawn_host.as_deref(), Some("forge"));
@@ -874,7 +1387,7 @@ fn selected_session_persists_across_store_reloads() {
 #[test]
 fn synthetic_events_upsert_project_and_remove_with_neighbor_focus() {
     let (mut store, _) = hydrated(
-        vec![session("one", "p", 2.0), session("two", "p", 1.0)],
+        vec![session("one", "p", 1.0), session("two", "p", 2.0)],
         vec![],
         Prefs::default(),
     );
@@ -1366,4 +1879,37 @@ fn inert_runtime_has_no_background_tasks_or_live_sessions() {
             .is_empty()
     );
     assert!(runtime.snapshots().borrow().sessions.is_empty());
+}
+
+#[test]
+fn action_retry_policy_only_replays_idempotent_operations() {
+    let rename = StoreEffect::Rename {
+        id: id("one"),
+        title: "New title".to_owned(),
+    };
+    let sync = StoreEffect::SyncPrefs {
+        host: "forge".to_owned(),
+        host_name: "Forge".to_owned(),
+    };
+    assert!(super::action_context(&rename).unwrap().retry.is_some());
+    assert!(super::action_context(&sync).unwrap().retry.is_some());
+
+    for unsafe_effect in [
+        StoreEffect::Remove(id("one")),
+        StoreEffect::Archive(id("one")),
+        StoreEffect::Unarchive(id("one")),
+        StoreEffect::Migrate {
+            id: id("one"),
+            target_host: Some("forge".to_owned()),
+        },
+        StoreEffect::ReopenLast,
+    ] {
+        assert!(
+            super::action_context(&unsafe_effect)
+                .expect("user action has failure context")
+                .retry
+                .is_none(),
+            "unsafe operation unexpectedly became replayable: {unsafe_effect:?}"
+        );
+    }
 }

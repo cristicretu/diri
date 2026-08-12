@@ -168,24 +168,39 @@ fn an_attach_is_seeded_then_streams_diffs_and_answers_input() {
                 .is_some_and(|update| grid_text(&update).contains("warm-up-pump"))
     });
 
-    // Typing through the established data channel: cat echoes, and the echo
-    // comes back as a grid DIFF (not a full snapshot).
-    data.write_all(
-        &FrameCodec::encode(&Frame::input(b"typed-over-attach\n".to_vec())).expect("encode"),
-    )
-    .expect("send input");
-    let diff = frames.until("the echo diff", |frame| {
-        frame.frame_type == FrameType::Grid
-            && frame
-                .grid_payload()
-                .ok()
-                .flatten()
-                .is_some_and(|update| grid_text(&update).contains("typed-over-attach"))
-    });
-    let update = diff.grid_payload().expect("decode").expect("grid");
+    // Typing through the established data channel: cat echoes, and each echo
+    // comes back as a grid DIFF (not a full snapshot). Use the median so a
+    // single scheduler hiccup cannot fail the test, while a fixed 16 ms frame
+    // boundary on every keystroke still does.
+    let mut interactive_latencies = Vec::new();
+    for index in 0..5 {
+        let marker = format!("typed-over-attach-{index}");
+        let sent_at = Instant::now();
+        data.write_all(
+            &FrameCodec::encode(&Frame::input(format!("{marker}\n").into_bytes())).expect("encode"),
+        )
+        .expect("send input");
+        let diff = frames.until("the echo diff", |frame| {
+            frame.frame_type == FrameType::Grid
+                && frame
+                    .grid_payload()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|update| grid_text(&update).contains(&marker))
+        });
+        interactive_latencies.push(sent_at.elapsed());
+        let update = diff.grid_payload().expect("decode").expect("grid");
+        assert!(
+            !update.is_full_snapshot,
+            "steady-state frames are diffs, not full repaints"
+        );
+    }
+    interactive_latencies.sort_unstable();
+    let median = interactive_latencies[interactive_latencies.len() / 2];
+    eprintln!("local input-to-grid median: {}us", median.as_micros());
     assert!(
-        !update.is_full_snapshot,
-        "steady-state frames are diffs, not full repaints"
+        median <= Duration::from_millis(8),
+        "local input-to-grid median was {median:?}; expected no fixed 16 ms frame boundary"
     );
 
     // Ping answers pong on the same channel.
