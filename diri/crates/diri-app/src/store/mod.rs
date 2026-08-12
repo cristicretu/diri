@@ -255,6 +255,10 @@ pub struct SessionStore {
     revision: u64,
     cached_projection: Option<(u64, Arc<SidebarProjection>)>,
     prefs_path: Option<PathBuf>,
+    /// Set by the menu bar's New Agent action; drained by Root on UI sync.
+    pending_open_launcher: bool,
+    /// Set by the menu bar's Settings action; drained by Root on UI sync.
+    pending_open_settings: bool,
     /// Remote host catalog from hosts.json. Empty when the file is absent or
     /// invalid (pickers show Local only). Reloaded on picker open.
     hosts: Vec<HostEntry>,
@@ -315,6 +319,8 @@ impl SessionStore {
                 revision: 0,
                 cached_projection: None,
                 prefs_path,
+                pending_open_launcher: false,
+                pending_open_settings: false,
                 hosts: Vec::new(),
                 agents: AgentReadinessResult::default(),
                 effects,
@@ -876,6 +882,21 @@ impl SessionStore {
         ));
         self.cached_projection = Some((self.revision, Arc::clone(&projection)));
         projection
+    }
+
+    /// Same tree as the sidebar, but ignoring sidebar fold prefs so the menu
+    /// bar can keep its own independent project collapse state.
+    pub fn menu_bar_projection(&self) -> SidebarProjection {
+        let mut prefs = self.prefs.clone();
+        prefs.sidebar_collapsed_projects.clear();
+        prefs.sidebar_collapsed_sessions.clear();
+        projection::build_projection(
+            &self.sessions,
+            &self.projects,
+            &prefs,
+            self.selected_session_id.as_ref(),
+            &self.closing,
+        )
     }
 
     pub fn ordered_sessions(&mut self) -> Vec<SessionRecord> {
@@ -1568,6 +1589,28 @@ impl SessionStore {
             id,
             automatic: false,
         });
+    }
+
+    pub fn request_open_launcher(&mut self) {
+        self.pending_open_launcher = true;
+        // Menu bar can open the launcher while another app still owns focus;
+        // mark active so the UI sync channel wakes and Root can drain this.
+        self.set_active(true);
+        self.emit(StoreEffect::PublishSnapshot);
+    }
+
+    pub fn take_open_launcher_request(&mut self) -> bool {
+        std::mem::take(&mut self.pending_open_launcher)
+    }
+
+    pub fn request_open_settings(&mut self) {
+        self.pending_open_settings = true;
+        self.set_active(true);
+        self.emit(StoreEffect::PublishSnapshot);
+    }
+
+    pub fn take_open_settings_request(&mut self) -> bool {
+        std::mem::take(&mut self.pending_open_settings)
     }
 
     pub fn rename(&mut self, id: SessionId, title: impl Into<String>) {

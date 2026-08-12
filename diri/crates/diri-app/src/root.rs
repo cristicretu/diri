@@ -261,11 +261,15 @@ impl RootView {
             .detach();
         }
         cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
-            if matches!(event, SidebarEvent::SessionActivated)
-                && let Some(terminal) = &this.terminal
-            {
-                terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
-                this.sync_auxiliary_terminal(window, cx);
+            if matches!(event, SidebarEvent::SessionActivated) {
+                if this.launcher.read(cx).is_open() {
+                    this.launcher
+                        .update(cx, |launcher, cx| launcher.dismiss(cx));
+                }
+                if let Some(terminal) = &this.terminal {
+                    terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+                    this.sync_auxiliary_terminal(window, cx);
+                }
             }
             if let SidebarEvent::Update(command) = event {
                 this.services.updates.send(command.clone());
@@ -349,11 +353,16 @@ impl RootView {
         sidebar.update(cx, |sidebar, cx| sidebar.set_update(initial_update, cx));
 
         #[cfg(target_os = "macos")]
-        let mut menu_bar = objc2_foundation::MainThreadMarker::new()
-            .and_then(|mtm| NativeMenuBar::new(mtm, Arc::clone(&services.store.store)));
+        let mut menu_bar = objc2_foundation::MainThreadMarker::new().and_then(|mtm| {
+            NativeMenuBar::new(
+                mtm,
+                Arc::clone(&services.store.store),
+                services.store.notification_action_sender(),
+            )
+        });
         #[cfg(target_os = "macos")]
         if let Some(menu_bar) = &mut menu_bar {
-            menu_bar.update(&snapshots.borrow());
+            menu_bar.refresh();
         }
         #[cfg(target_os = "macos")]
         let notifier = NativeNotifier::new(services.store.notification_action_sender());
@@ -427,11 +436,11 @@ impl RootView {
                     }
                     changed = snapshots.changed() => {
                         if changed.is_err() { break; }
-                        let snapshot = snapshots.borrow_and_update().clone();
+                        let _ = snapshots.borrow_and_update();
                         let _ = this.update(cx, |this, _cx| {
                             #[cfg(target_os = "macos")]
                             if let Some(menu_bar) = &mut this.menu_bar {
-                                menu_bar.update(&snapshot);
+                                menu_bar.refresh();
                             }
                         });
                     }
@@ -489,6 +498,24 @@ impl RootView {
                     Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         if this
                             .update_in(cx, |this, window, cx| {
+                                let (open_launcher, open_settings) = {
+                                    let mut store = this
+                                        .services
+                                        .store
+                                        .store
+                                        .write()
+                                        .expect("session store lock poisoned");
+                                    (
+                                        store.take_open_launcher_request(),
+                                        store.take_open_settings_request(),
+                                    )
+                                };
+                                if open_launcher {
+                                    this.open_launcher(&OpenLauncher, window, cx);
+                                }
+                                if open_settings && let Some(surfaces) = &this.utility_surfaces {
+                                    surfaces.update(cx, |surfaces, cx| surfaces.open_settings(cx));
+                                }
                                 this.sync_auxiliary_terminal(window, cx);
                             })
                             .is_err()
