@@ -626,6 +626,50 @@ impl Sidebar {
         true
     }
 
+    /// Finishes only a keyboard-owned borrow. Root also calls this when a
+    /// modified shortcut moves focus before the Space key-up reaches us.
+    pub fn release_keyboard_peek(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.ui.space_held {
+            return false;
+        }
+        self.ui.space_held = false;
+        if self.ui.end_peek(Some(PeekSource::Keyboard)) {
+            self.emit_peek(cx);
+        }
+        true
+    }
+
+    fn guards_pointer_peek_drop(&self) -> bool {
+        self.ui.suppress_pointer_drop
+            || self
+                .ui
+                .peek
+                .as_ref()
+                .is_some_and(|peek| peek.source == PeekSource::Pointer)
+    }
+
+    /// Consumes either ordering of GPUI's release/drop dispatch. If capture
+    /// mouse-up ran first, `suppress_pointer_drop` is set; if drop ran first,
+    /// the live pointer peek is ended here. Neither path may mutate the model.
+    fn consume_pointer_peek_drop(&mut self, cx: &mut Context<Self>) -> bool {
+        let pointer_peek = self
+            .ui
+            .peek
+            .as_ref()
+            .is_some_and(|peek| peek.source == PeekSource::Pointer);
+        if pointer_peek {
+            self.finish_pointer_gesture(None, cx);
+        }
+        if pointer_peek || std::mem::take(&mut self.ui.suppress_pointer_drop) {
+            self.ui.suppress_pointer_drop = false;
+            self.finish_drag();
+            cx.notify();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Enters keyboard-navigation mode from any other surface. An active row
     /// is the initial landmark, while an existing identity cursor survives
     /// subsequent trips to the terminal.
@@ -849,12 +893,8 @@ impl Sidebar {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if event.keystroke.key.as_str() != "space" || !self.ui.space_held {
+        if event.keystroke.key.as_str() != "space" || !self.release_keyboard_peek(cx) {
             return;
-        }
-        self.ui.space_held = false;
-        if self.ui.end_peek(Some(PeekSource::Keyboard)) {
-            self.emit_peek(cx);
         }
         cx.stop_propagation();
     }
@@ -1780,20 +1820,7 @@ impl Sidebar {
             .on_drop(cx.listener({
                 let target_project = session.project_id.clone();
                 move |this, dragged: &DraggedSidebarItem, _, cx| {
-                    let pointer_peek = this
-                        .ui
-                        .peek
-                        .as_ref()
-                        .is_some_and(|peek| peek.source == PeekSource::Pointer);
-                    if std::mem::take(&mut this.ui.suppress_pointer_drop) || pointer_peek {
-                        if pointer_peek {
-                            this.finish_pointer_gesture(None, cx);
-                            // `finish_pointer_gesture` protects a later drop;
-                            // this is that drop, so consume the guard now.
-                            this.ui.suppress_pointer_drop = false;
-                        }
-                        this.finish_drag();
-                        cx.notify();
+                    if this.consume_pointer_peek_drop(cx) {
                         return;
                     }
                     if let DragItem::Session {
@@ -1961,7 +1988,10 @@ impl Sidebar {
         // a sweep down the sidebar; selection changes once per click. An
         // unselected row therefore carries no animation state at all, rather
         // than animating an invisible zero-alpha fill.
-        if !selected && !multi {
+        // Peek owns the row fill while it temporarily borrows the main pane.
+        // Letting the selection animation repaint this background would make
+        // a selected row lose its distinct peek affordance.
+        if peeked || (!selected && !multi) {
             return row.into_any_element();
         }
         row.with_animation(
@@ -2049,6 +2079,9 @@ impl Sidebar {
                 let entity = cx.entity();
                 let project_id = project_id.clone();
                 move |element, dragged, _, cx| {
+                    if entity.read(cx).guards_pointer_peek_drop() {
+                        return element;
+                    }
                     let valid = match &dragged.0 {
                         DragItem::Session {
                             project, archived, ..
@@ -2070,19 +2103,7 @@ impl Sidebar {
             .on_drop(cx.listener({
                 let project_id = project_id.clone();
                 move |this, dragged: &DraggedSidebarItem, _, cx| {
-                    let ids = match &dragged.0 {
-                        DragItem::Session {
-                            id,
-                            project,
-                            archived: false,
-                            ..
-                        } if project == &project_id => vec![id.clone()],
-                        DragItem::Sessions(ids) => ids.clone(),
-                        _ => Vec::new(),
-                    };
-                    this.archive_sessions(ids);
-                    this.finish_drag();
-                    cx.notify();
+                    this.drop_into_archive(&project_id, dragged, cx);
                 }
             }))
             .child(
@@ -2286,6 +2307,7 @@ impl Sidebar {
                     })
                     .text_size(px(if hovered { 9.0 } else { 10.0 }))
                     .text_color(colors.secondary)
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(sf_symbol_weighted(
                         if hovered {
                             "tray.and.arrow.up.fill"
@@ -2303,11 +2325,7 @@ impl Sidebar {
                     .when(hovered, |button| {
                         button.on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
-                            this.store
-                                .write()
-                                .expect("session store lock poisoned")
-                                .revive_sessions(vec![revive_id.clone()]);
-                            cx.notify();
+                            this.revive_from_control(revive_id.clone(), cx);
                         }))
                     }),
             )
@@ -4012,6 +4030,42 @@ impl Sidebar {
             .archive_sessions(ids);
     }
 
+    fn revive_from_control(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        // The nested control stops mouse-down propagation, and this explicit
+        // cancellation is defense in depth for platforms that synthesize the
+        // click after rerendering the hovered row.
+        self.cancel_peek(cx);
+        self.store
+            .write()
+            .expect("session store lock poisoned")
+            .revive_sessions(vec![id]);
+        cx.notify();
+    }
+
+    fn drop_into_archive(
+        &mut self,
+        project_id: &ProjectId,
+        dragged: &DraggedSidebarItem,
+        cx: &mut Context<Self>,
+    ) {
+        if self.consume_pointer_peek_drop(cx) {
+            return;
+        }
+        let ids = match &dragged.0 {
+            DragItem::Session {
+                id,
+                project,
+                archived: false,
+                ..
+            } if project == project_id => vec![id.clone()],
+            DragItem::Sessions(ids) => ids.clone(),
+            _ => Vec::new(),
+        };
+        self.archive_sessions(ids);
+        self.finish_drag();
+        cx.notify();
+    }
+
     fn close_sessions(&mut self, ids: Vec<SessionId>, cx: &mut Context<Self>) {
         let mut store = self.store.write().expect("session store lock poisoned");
         store.request_close(ids.clone());
@@ -5417,6 +5471,99 @@ mod tests {
     }
 
     #[gpui::test]
+    fn pointer_peek_drop_cannot_archive_in_either_release_order(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        let session = sidebar.read_with(cx, |sidebar, _| {
+            sidebar
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .sessions()[&SessionId::new("preview-sleeping")]
+                .as_ref()
+                .clone()
+        });
+        let dragged = DraggedSidebarItem(DragItem::Session {
+            id: session.id.clone(),
+            project: session.project_id.clone(),
+            parent: session.parent.clone(),
+            archived: false,
+        });
+
+        sidebar.update(cx, |sidebar, cx| {
+            // Drop dispatch before capture-phase mouse-up.
+            sidebar.pointer_press = Some(session.id.clone());
+            sidebar.begin_peek(session.id.clone(), PeekSource::Pointer, cx);
+            sidebar.drop_into_archive(&session.project_id, &dragged, cx);
+            assert!(sidebar.ui.peek.is_none());
+            assert!(!sidebar.ui.suppress_pointer_drop);
+            assert!(
+                sidebar
+                    .store
+                    .read()
+                    .expect("session store lock poisoned")
+                    .sessions()[&session.id]
+                    .archived_at
+                    .is_none()
+            );
+
+            // Capture-phase mouse-up before drop dispatch.
+            sidebar.pointer_press = Some(session.id.clone());
+            sidebar.begin_peek(session.id.clone(), PeekSource::Pointer, cx);
+            sidebar.finish_pointer_gesture(Some(&session.id), cx);
+            assert!(sidebar.ui.suppress_pointer_drop);
+            sidebar.drop_into_archive(&session.project_id, &dragged, cx);
+            assert!(!sidebar.ui.suppress_pointer_drop);
+            assert!(
+                sidebar
+                    .store
+                    .read()
+                    .expect("session store lock poisoned")
+                    .sessions()[&session.id]
+                    .archived_at
+                    .is_none()
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn archived_revive_click_cancels_any_bubbled_row_peek(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        let archived = SessionId::new("preview-archived");
+        sidebar.update_in(cx, |sidebar, window, cx| {
+            // Model the worst event order: a bubbled row mouse-down managed to
+            // arm the hold immediately before the nested revive click.
+            sidebar.schedule_pointer_peek(archived.clone(), window, cx);
+            assert!(sidebar.pending_pointer_peek.is_some());
+            sidebar.revive_from_control(archived.clone(), cx);
+        });
+
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(sidebar.pending_pointer_peek.is_none());
+            assert!(sidebar.pointer_press.is_none());
+            assert!(
+                sidebar
+                    .store
+                    .read()
+                    .expect("session store lock poisoned")
+                    .sessions()[&archived]
+                    .archived_at
+                    .is_none()
+            );
+        });
+        cx.executor().advance_clock(SESSION_PEEK_DELAY);
+        cx.run_until_parked();
+        assert!(!sidebar.read_with(cx, |sidebar, _| sidebar.is_peeking()));
+    }
+
+    #[gpui::test]
     fn held_space_follows_commits_and_release_or_escape_restore(cx: &mut TestAppContext) {
         let (view, cx) = cx.add_window_view(|_, cx| {
             let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
@@ -5512,6 +5659,32 @@ mod tests {
                 .cloned()),
             Some(followed)
         );
+    }
+
+    #[gpui::test]
+    fn keyboard_peek_release_survives_focus_transfer_before_space_up(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        sidebar.update_in(cx, |sidebar, window, cx| sidebar.focus(window, cx));
+        cx.simulate_event(KeyDownEvent {
+            keystroke: Keystroke::parse("space").expect("keystroke"),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        assert!(sidebar.read_with(cx, |sidebar, _| sidebar.is_peeking()));
+
+        let transferred_focus = sidebar.update(cx, |_, cx| cx.focus_handle());
+        sidebar.update_in(cx, |sidebar, window, cx| {
+            transferred_focus.focus(window, cx);
+            assert!(!sidebar.is_focused(window));
+            // This is the Root capture route for an unfocused Space key-up.
+            assert!(sidebar.release_keyboard_peek(cx));
+            assert!(!sidebar.ui.space_held);
+            assert!(sidebar.ui.peek.is_none());
+        });
     }
 
     #[gpui::test]

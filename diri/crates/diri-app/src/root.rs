@@ -40,6 +40,18 @@ use crate::workbench::WorkbenchLayout;
 
 const WINDOW_BOUNDS_SAVE_DELAY: Duration = Duration::from_millis(150);
 
+/// Whether the workbench owns a second vertical pane. Peek presentation is
+/// deliberately absent from this decision: borrowing the primary pane must
+/// not collapse the split and resize the real terminal underneath it.
+fn workbench_split_open(
+    auxiliary_present: bool,
+    selected: Option<&SessionId>,
+    auxiliary_spawn_parent: Option<&SessionId>,
+) -> bool {
+    auxiliary_present
+        || selected.is_some_and(|id| auxiliary_spawn_parent.is_some_and(|parent| parent == id))
+}
+
 pub(crate) fn cached_window_overlay<T: Render>(view: Entity<T>) -> impl IntoElement {
     view.cached(StyleRefinement::default().absolute().inset_0())
 }
@@ -1117,7 +1129,17 @@ impl RootView {
     }
 
     fn on_key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.sidebar.read(cx).is_focused(window) && self.sidebar.read(cx).is_peeking() {
+        let sidebar_focused = self.sidebar.read(cx).is_focused(window);
+        if !sidebar_focused && event.keystroke.key.as_str() == "space" {
+            let released = self
+                .sidebar
+                .update(cx, |sidebar, cx| sidebar.release_keyboard_peek(cx));
+            if released {
+                cx.stop_propagation();
+                return;
+            }
+        }
+        if !sidebar_focused && self.sidebar.read(cx).is_peeking() {
             cx.stop_propagation();
             return;
         }
@@ -1530,15 +1552,11 @@ impl RootView {
             .expect("session store lock poisoned")
             .selected_session_id()
             .cloned();
-        let peeking = self
-            .terminal
-            .as_ref()
-            .is_some_and(|terminal| terminal.read(cx).is_peeking());
-        let split_open = !peeking
-            && (self.auxiliary_terminal.is_some()
-                || selected
-                    .as_ref()
-                    .is_some_and(|id| self.auxiliary_spawn_parent.as_ref() == Some(id)));
+        let split_open = workbench_split_open(
+            self.auxiliary_terminal.is_some(),
+            selected.as_ref(),
+            self.auxiliary_spawn_parent.as_ref(),
+        );
         let mut card = div()
             .relative()
             .flex_1()
@@ -2435,4 +2453,21 @@ fn preview_hint(system_image: &str, label: &str, colors: SemanticColors) -> AnyE
                 .child(label.to_owned()),
         )
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peek_presentation_never_collapses_an_existing_or_pending_split() {
+        let selected = SessionId::new("selected");
+        assert!(workbench_split_open(true, Some(&selected), None));
+        assert!(workbench_split_open(
+            false,
+            Some(&selected),
+            Some(&selected)
+        ));
+        assert!(!workbench_split_open(false, Some(&selected), None));
+    }
 }

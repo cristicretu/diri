@@ -1813,6 +1813,12 @@ impl TerminalPane {
     }
 
     fn update_selected_geometry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Peek borrows presentation only. Even if a surrounding layout sends
+        // a transient viewport while it is active, do not update the selected
+        // terminal's size bookkeeping or send a PTY resize/reflow.
+        if self.is_peeking() {
+            return;
+        }
         let Some(session) = self.selected_session() else {
             return;
         };
@@ -4051,14 +4057,10 @@ mod tests {
         let active_offset = pane.update_in(cx, |pane, window, cx| {
             pane.focus(window, cx);
             let active_offset = pane.residents[&active.id].element.view_offset();
-            let pane_tx = pane.pane_tx.clone();
             pane.residents
                 .get_mut(&active.id)
                 .expect("active resident")
-                .attachment = AttachmentControl {
-                tx: input_tx,
-                pane_tx,
-            };
+                .attachment = AttachmentControl { tx: input_tx };
 
             pane.set_peeked_session(Some(sleeping.id.clone()), cx);
             assert!(pane.is_peeking());
@@ -4069,6 +4071,20 @@ mod tests {
                 pane.peek
                     .as_ref()
                     .is_some_and(|peek| peek.element.is_none())
+            );
+            pane.set_viewport(
+                TerminalViewport {
+                    x: 40.0,
+                    y: 0.0,
+                    width: 520.0,
+                    height: 260.0,
+                },
+                cx,
+            );
+            pane.update_selected_geometry(window, cx);
+            assert!(
+                input_rx.try_recv().is_err(),
+                "a viewport update during peek must not resize the selected PTY"
             );
             active_offset
         });
