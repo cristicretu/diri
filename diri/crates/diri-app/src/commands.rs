@@ -4,7 +4,7 @@
 //! presentation live together here. Views execute actions; they do not decode
 //! keystrokes or maintain their own copies of shortcut labels.
 
-use gpui::{Action, App, KeyBinding, actions};
+use gpui::{Action, App, KeyBinding, Keystroke, actions};
 
 pub const APP_CONTEXT: &str = "Diri";
 pub const SESSION_NAVIGATION_CONTEXT: &str = "DiriSessionNavigation";
@@ -496,6 +496,22 @@ pub fn command(id: CommandId) -> &'static CommandSpec {
         .expect("every CommandId must have a registry entry")
 }
 
+/// Returns whether a platform key event is one of this command's registered
+/// bindings. Modal surfaces use this to decide which application commands may
+/// continue through capture without duplicating raw shortcut strings.
+pub fn matches_keystroke(id: CommandId, keystroke: &Keystroke) -> bool {
+    command(id)
+        .keystroke
+        .into_iter()
+        .chain(command(id).alternate_keystrokes.iter().copied())
+        .filter_map(|binding| Keystroke::parse(binding).ok())
+        .any(|binding| {
+            binding.modifiers == keystroke.modifiers
+                && (binding.key == keystroke.key
+                    || keystroke.key_char.as_ref() == Some(&binding.key))
+        })
+}
+
 pub fn bind_default_keys(cx: &mut App) {
     cx.bind_keys(COMMANDS.iter().flat_map(CommandSpec::key_bindings));
 }
@@ -698,5 +714,21 @@ mod tests {
             .map(|command| command.key_bindings().len())
             .sum();
         assert!(binding_count > COMMANDS.len());
+    }
+
+    #[test]
+    fn modal_passthrough_matching_uses_registry_bindings() {
+        assert!(matches_keystroke(
+            CommandId::OpenLauncher,
+            &Keystroke::parse("cmd-n").unwrap()
+        ));
+        assert!(matches_keystroke(
+            CommandId::SelectPreviousSession,
+            &Keystroke::parse("cmd-[").unwrap()
+        ));
+        assert!(!matches_keystroke(
+            CommandId::OpenLauncher,
+            &Keystroke::parse("cmd-t").unwrap()
+        ));
     }
 }

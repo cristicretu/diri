@@ -1,3 +1,4 @@
+mod agent_catalog;
 mod app_theme;
 mod clipboard_transfer;
 mod code_intelligence;

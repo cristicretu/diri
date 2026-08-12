@@ -9,55 +9,8 @@ permissions:
   contents: read
 
 jobs:
-  engine:
-    name: Swift engine (daemon + CLI)
-    runs-on: macos-15
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.0.0
-      - name: Validate shell scripts
-        run: bash -n scripts/*.sh diri/scripts/*.sh
-      - name: Verify reviewed regressions stay fixed
-        run: diri/scripts/verify-remote-refactor.sh
-      - name: Test release publishing guards
-        run: |
-          bash diri/scripts/test-publish-github-release.sh
-          bash diri/scripts/test-publish-homebrew-cask.sh
-      - name: Install and audit browser sidecar
-        working-directory: sidecar
-        run: |
-          npm ci
-          npm audit --omit=dev
-      # --no-parallel is load-bearing on CI. Run in parallel, every test starts
-      # at once, and the suite then stalls indefinitely on a 3-core runner: the
-      # PTY and holder tests block inside async contexts, and with that few
-      # cores the cooperative pool has no thread left to make progress on.
-      # A developer Mac has enough cores to hide it. Serial costs ~30s.
-      #
-      # SwiftPM also block-buffers when stdout is a pipe, so a test process that
-      # dies takes most of its console output with it — hence the xunit file.
-      # `script` gives the run a pty, which makes SwiftPM line-buffer. Piped, it
-      # block-buffers, and a test process that dies takes the tail of its output
-      # with it — so the log's last line is wherever the buffer happened to
-      # flush, not where the run actually stopped. That cost real debugging
-      # time. The xunit file is no help either: it is only written at the end.
-      - name: Test
-        env:
-          # Runner spawns and socket binds are far slower than on a dev Mac; the
-          # 5s liveness waits time out there. See waitUntil in the test helpers.
-          DIRIJOR_TEST_TIMEOUT_SCALE: "6"
-        run: |
-          set -o pipefail
-          script -q /dev/null swift test --no-parallel | tee "${RUNNER_TEMP}/test.log"
-          grep -q "Test run with .* passed" "${RUNNER_TEMP}/test.log"
-      - name: Where it stopped
-        if: failure()
-        run: tail -40 "${RUNNER_TEMP}/test.log" || true
-      - name: Release build
-        run: swift build -c release
-
   app:
-    name: Rust app (diri)
+    name: Rust workspace
     runs-on: macos-15
     timeout-minutes: 60
     defaults:
@@ -75,6 +28,12 @@ jobs:
             diri/target
           key: ${{ runner.os }}-cargo-${{ hashFiles('diri/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
+      - name: Validate shell and release scripts
+        run: |
+          bash -n ../scripts/*.sh scripts/*.sh
+          bash scripts/verify-remote-refactor.sh
+          bash scripts/test-publish-github-release.sh
+          bash scripts/test-publish-homebrew-cask.sh
       - name: Check dependency license policy
         run: python3 ../scripts/check-licenses.py
       - name: Format
@@ -226,11 +185,14 @@ jobs:
           app="${RUNNER_TEMP}/diri-dist/diri.app"
           plutil -lint "${app}/Contents/Info.plist"
           test -x "${app}/Contents/Resources/bin/dirijor"
+          test -x "${app}/Contents/Resources/bin/dirijor-mcp"
           test -x "${app}/Contents/Resources/bin/dirijord-rs"
           test -x "${app}/Contents/Resources/bin/diri-holder"
           test -x "${app}/Contents/Resources/bin/diri-ssh-askpass"
           test -f "${app}/Contents/Resources/bin/manifests/codex.json"
           lipo "${app}/Contents/Resources/bin/dirijord-rs" -verify_arch arm64 x86_64
+          lipo "${app}/Contents/Resources/bin/dirijor" -verify_arch arm64 x86_64
+          lipo "${app}/Contents/Resources/bin/dirijor-mcp" -verify_arch arm64 x86_64
           lipo "${app}/Contents/Resources/bin/diri-holder" -verify_arch arm64 x86_64
           lipo "${app}/Contents/Resources/bin/diri-ssh-askpass" -verify_arch arm64 x86_64
           test -f "${app}/Contents/Resources/bin/remote-helpers/manifest.json"
@@ -247,8 +209,10 @@ jobs:
         working-directory: sidecar
         run: |
           npm ci
+          npm audit --omit=dev
           npx playwright install chromium webkit firefox
       - name: Run browser integration tests
+        working-directory: diri
         env:
           DIRIJOR_RUN_BROWSER_TESTS: "1"
-        run: swift test --filter BrowserPoolTests
+        run: cargo test --package diri-engine browser_integration_runs_across_engines -- --nocapture

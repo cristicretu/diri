@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use diri_proto::SessionId;
+use diri_proto::{AgentKind, SessionId};
 use diri_ui::{FloatingSurface, Ink, Radius, SemanticColors, Typo};
 use gpui::{
     AnyElement, App, Context, CursorStyle, DragMoveEvent, Entity, FocusHandle, Focusable,
@@ -12,7 +12,7 @@ use gpui::{
 
 use crate::AppServices;
 use crate::commands::{
-    APP_CONTEXT, ArchiveSelectedSession, CheckForUpdates, CloseSession, CommandId,
+    self, APP_CONTEXT, ArchiveSelectedSession, CheckForUpdates, CloseSession, CommandId,
     MoveSelectedSessionDown, MoveSelectedSessionUp, NewCodexSession, NewDefaultSession,
     NewTerminal, OpenLauncher, OpenSettings, OpenWorktrees, RenameSelectedSession, ReopenSession,
     SESSION_NAVIGATION_CONTEXT, SelectLastSession, SelectNextAttentionSession, SelectNextSession,
@@ -30,7 +30,7 @@ use crate::seam::{SeamSlide, toggle_has_settled};
 use crate::session_surfaces::SessionSurfaces;
 use crate::sidebar::{PreviewScenario, Sidebar, SidebarEvent};
 use crate::sounds::{self, AfplayPlayer, SoundGate, StatusSound};
-use crate::store::{DefaultAgent, SpawnOptions};
+use crate::store::SpawnOptions;
 use crate::surface_shell::UtilitySurfaces;
 use crate::terminal_pane::{TerminalPane, TerminalPaneEvent, TerminalViewport};
 use crate::updates::UpdatePhase;
@@ -551,20 +551,33 @@ impl RootView {
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         if self.launcher.read(cx).is_open() {
+            let reopen = commands::matches_keystroke(CommandId::OpenLauncher, &event.keystroke);
             self.launcher.update(cx, |launcher, cx| {
                 launcher.handle_key_down(event, _window, cx);
             });
-            cx.stop_propagation();
+            if !reopen {
+                cx.stop_propagation();
+            }
             return;
         }
         if let Some(surfaces) = &self.utility_surfaces
             && surfaces.read(cx).is_open()
         {
-            surfaces.update(cx, |surfaces, cx| {
-                surfaces.key_down(event, _window, cx);
-            });
-            cx.stop_propagation();
-            return;
+            let global_overlay_command = [
+                CommandId::ToggleHistory,
+                CommandId::OpenSettings,
+                CommandId::ToggleCommandPalette,
+                CommandId::ToggleQuickOpen,
+            ]
+            .into_iter()
+            .any(|command| commands::matches_keystroke(command, &event.keystroke));
+            if !global_overlay_command {
+                surfaces.update(cx, |surfaces, cx| {
+                    surfaces.key_down(event, _window, cx);
+                });
+                cx.stop_propagation();
+                return;
+            }
         }
         if let Some(surfaces) = &self.session_surfaces {
             surfaces.update(cx, |surfaces, cx| {
@@ -585,7 +598,7 @@ impl RootView {
                 self.spawn(None);
             }
             CommandId::NewCodexSession => {
-                self.spawn(Some(DefaultAgent::Codex));
+                self.spawn(Some(AgentKind::CODEX));
             }
             CommandId::ToggleCommandPalette => {
                 if let Some(navigation) = &self.navigation {
@@ -681,7 +694,7 @@ impl RootView {
     /// Spawns a shell (`None`) or a specific agent straight from a shortcut,
     /// bypassing the sidebar's picker. No-ops in preview, which has no daemon
     /// to spawn into. Reports whether the spawn was dispatched.
-    fn spawn(&self, agent: Option<DefaultAgent>) -> bool {
+    fn spawn(&self, agent: Option<AgentKind>) -> bool {
         if self.preview {
             return false;
         }
@@ -695,7 +708,7 @@ impl RootView {
             Some(agent) => {
                 let host = store.default_spawn_host();
                 store.spawn_kind(
-                    agent.kind(),
+                    agent,
                     SpawnOptions {
                         host,
                         ..SpawnOptions::default()

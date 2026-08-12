@@ -191,7 +191,11 @@ impl<'de> Deserialize<'de> for AgentKind {
     where
         D: Deserializer<'de>,
     {
-        let (case, payload) = decode_keyed_enum(deserializer)?;
+        let value = Value::deserialize(deserializer)?;
+        if let Some(id) = value.as_str() {
+            return Ok(Self::new(id));
+        }
+        let (case, payload) = decode_keyed_enum_value(value).map_err(de::Error::custom)?;
         #[derive(Default, Deserialize)]
         struct Payload {
             id: Option<String>,
@@ -750,13 +754,15 @@ where
     D: Deserializer<'de>,
 {
     let value = Value::deserialize(deserializer)?;
+    decode_keyed_enum_value(value).map_err(de::Error::custom)
+}
+
+fn decode_keyed_enum_value(value: Value) -> Result<(String, Value), &'static str> {
     let object = value
         .as_object()
-        .ok_or_else(|| de::Error::custom("Swift enum must be a keyed JSON object"))?;
+        .ok_or("Swift enum must be a keyed JSON object")?;
     if object.len() != 1 {
-        return Err(de::Error::custom(
-            "Swift enum object must contain exactly one case",
-        ));
+        return Err("Swift enum object must contain exactly one case");
     }
     let (case, payload) = object.iter().next().expect("length checked above");
     Ok((case.clone(), payload.clone()))

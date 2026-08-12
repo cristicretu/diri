@@ -15,6 +15,11 @@
       "kimi-cli"
     ],
     "firstClass": true,
+    "setup": {
+      "url": "https://moonshotai.github.io/kimi-code/en/guides/getting-started.html",
+      "installHint": "Install Kimi Code CLI with its official installer or npm.",
+      "signInHint": "Run kimi, then use /login."
+    },
     "statusAuthority": "screen",
     "binary": "kimi",
     "resume": {

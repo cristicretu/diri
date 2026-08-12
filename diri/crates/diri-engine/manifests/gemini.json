@@ -13,6 +13,11 @@
       "gemini-cli"
     ],
     "firstClass": true,
+    "setup": {
+      "url": "https://github.com/google-gemini/gemini-cli",
+      "installHint": "Follow Google's Gemini CLI installation guide.",
+      "signInHint": "Run gemini and choose an available Google or API-key authentication method."
+    },
     "statusAuthority": "screen",
     "binary": "gemini",
     "sessionIDFlag": "--session-id",

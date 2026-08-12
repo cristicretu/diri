@@ -30,7 +30,7 @@ use crate::switcher::{
     SessionSwitcherState, SwitcherKey, SwitcherOutcome,
 };
 
-pub use prefs::{DefaultAgent, InspectorTab, Prefs, WindowMode, WindowPlacement};
+pub use prefs::{InspectorTab, Prefs, WindowMode, WindowPlacement};
 pub use projection::{SidebarProject, SidebarProjection, SidebarRow};
 pub use residency::{ResidencyUpdate, TerminalResidency};
 
@@ -335,6 +335,13 @@ impl SessionStore {
     /// Installs the agent catalog fetched on connect.
     pub fn set_agent_catalog(&mut self, agents: AgentReadinessResult) {
         self.agents = agents;
+        let repaired =
+            crate::agent_catalog::resolved_default_agent(&self.prefs.default_agent, &self.agents);
+        if repaired != self.prefs.default_agent {
+            self.prefs.default_agent = repaired;
+            let _ = self.persist_preferences();
+            self.invalidate_projection();
+        }
     }
 
     pub fn agent_catalog(&self) -> &AgentReadinessResult {
@@ -1589,7 +1596,7 @@ impl SessionStore {
         if options.host.is_none() && options.cwd.is_none() && options.same_repo_as.is_none() {
             options.host = self.default_spawn_host();
         }
-        self.spawn_kind(self.prefs.default_agent.kind(), options);
+        self.spawn_kind(self.prefs.default_agent.clone(), options);
     }
 
     pub fn spawn_shell(&mut self, mut options: SpawnOptions) {

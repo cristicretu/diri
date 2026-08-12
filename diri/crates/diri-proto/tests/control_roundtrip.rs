@@ -1,6 +1,6 @@
 use diri_proto::{
-    AgentKind, AgentReadinessResult, AttachRequest, ClientRole, ControlMessage, DateMillis,
-    EventName, EventsSubscribeParams, ExitReason, HostInitializeParams, Method,
+    AgentDescriptor, AgentKind, AgentReadinessResult, AttachRequest, ClientRole, ControlMessage,
+    DateMillis, EventName, EventsSubscribeParams, ExitReason, HostInitializeParams, Method,
     ReadScrollbackCellsResult, SessionDiffBase, SessionId, SessionListResult,
     SessionReadDiffParams, SessionReadDiffResult, SessionStatus, StateSnapshotResult,
     WorktreeListResult,
@@ -87,6 +87,11 @@ fn swift_associated_value_shapes_match_real_data() {
         serde_json::from_value::<AgentKind>(json!({"agent": {"id": "amp"}})).unwrap(),
         amp
     );
+    // The Rust Engine's live manifest catalog uses the manifest id directly.
+    assert_eq!(
+        serde_json::from_value::<AgentKind>(json!("amp")).unwrap(),
+        amp
+    );
 
     let exited: SessionStatus = serde_json::from_value(json!({
         "exited": {"_0": {"reason": "daemonRestart"}}
@@ -130,6 +135,30 @@ fn additive_unknown_variants_fall_back_and_unknown_fields_are_ignored() {
     }))
     .unwrap();
     assert_eq!(worktree.path, "/tmp/wt");
+}
+
+#[test]
+fn setup_metadata_is_additive_for_old_and_new_catalog_entries() {
+    let old: AgentDescriptor = serde_json::from_value(json!({
+        "id": "amp",
+        "displayName": "Amp"
+    }))
+    .expect("old daemon descriptor");
+    assert_eq!(old.setup, None);
+
+    let guided: AgentDescriptor = serde_json::from_value(json!({
+        "id": "amp",
+        "displayName": "Amp",
+        "setup": {
+            "url": "https://ampcode.com/manual",
+            "installHint": "Install Amp.",
+            "signInHint": "Run amp and sign in."
+        }
+    }))
+    .expect("new descriptor");
+    let setup = guided.setup.as_ref().expect("setup metadata");
+    assert_eq!(setup.url.as_deref(), Some("https://ampcode.com/manual"));
+    typed_round_trip(&guided);
 }
 
 #[test]

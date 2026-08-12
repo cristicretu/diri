@@ -15,6 +15,11 @@
       "ghcs"
     ],
     "firstClass": true,
+    "setup": {
+      "url": "https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli",
+      "installHint": "Install Copilot CLI with GitHub's installer or a supported package manager.",
+      "signInHint": "Run copilot login and complete GitHub OAuth."
+    },
     "statusAuthority": "screen",
     "binary": "copilot",
     "resume": {

@@ -13,6 +13,7 @@ use gpui::{
 };
 
 use crate::AppServices;
+use crate::agent_catalog::{AgentOption, default_agent_options, title_case_id};
 use crate::composer::PromptComposer;
 use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::CARET;
@@ -57,13 +58,6 @@ const fn composer_text_height(lines: usize) -> f32 {
     visible as f32 * COMPOSER_LINE_HEIGHT + COMPOSER_PAD_TOP + COMPOSER_PAD_BOTTOM
 }
 
-#[derive(Clone)]
-struct HarnessChoice {
-    kind: AgentKind,
-    label: String,
-    available: bool,
-}
-
 pub(crate) enum LauncherEvent {
     Closed,
 }
@@ -87,6 +81,12 @@ pub(crate) struct LauncherOverlay {
 enum Picker {
     Harness,
     Project,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectCommit {
+    Recent(usize),
+    ChooseFolder,
 }
 
 impl EventEmitter<LauncherEvent> for LauncherOverlay {}
@@ -157,44 +157,14 @@ impl LauncherOverlay {
         cx.notify();
     }
 
-    fn harness_choices(&self) -> Vec<HarnessChoice> {
+    fn harness_choices(&self) -> Vec<AgentOption> {
         let store = self
             .services
             .store
             .store
             .read()
             .expect("session store lock poisoned");
-        let catalog = &store.agent_catalog().agents;
-        if catalog.is_empty() {
-            return [
-                (AgentKind::CLAUDE_CODE, "Claude Code"),
-                (AgentKind::CODEX, "Codex"),
-                (AgentKind::CURSOR, "Cursor"),
-                (AgentKind::GEMINI, "Gemini"),
-            ]
-            .into_iter()
-            .map(|(kind, label)| HarnessChoice {
-                kind,
-                label: label.to_owned(),
-                available: true,
-            })
-            .collect();
-        }
-
-        catalog
-            .iter()
-            .filter(|item| !item.kind.is_terminal())
-            .map(|item| HarnessChoice {
-                kind: item.kind.clone(),
-                label: item
-                    .descriptor
-                    .as_ref()
-                    .map(|descriptor| descriptor.display_name.clone())
-                    .filter(|label| !label.is_empty())
-                    .unwrap_or_else(|| title_case_id(item.kind.id())),
-                available: item.available(),
-            })
-            .collect()
+        default_agent_options(store.agent_catalog())
     }
 
     fn projects(&self) -> Vec<Project> {
@@ -218,7 +188,7 @@ impl LauncherOverlay {
         self.harness_choices()
             .into_iter()
             .find(|choice| choice.kind == self.selected_harness)
-            .map(|choice| choice.label)
+            .map(|choice| choice.display_name)
             .unwrap_or_else(|| title_case_id(self.selected_harness.id()))
     }
 
@@ -250,7 +220,13 @@ impl LauncherOverlay {
             .find(|choice| choice.kind == self.selected_harness)
         {
             Some(choice) if choice.available => None,
-            Some(choice) => Some(format!("{} is not installed", choice.label)),
+            Some(choice) => Some(format!(
+                "{}: {}",
+                choice.display_name,
+                choice
+                    .unavailable_label()
+                    .expect("unavailable choice has a missing-binary label")
+            )),
             None => Some(format!(
                 "{} is not available on this machine",
                 self.selected_harness_label()
@@ -288,10 +264,10 @@ impl LauncherOverlay {
     pub(crate) fn handle_key_down(
         &mut self,
         event: &KeyDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.picker.is_some() && self.handle_picker_key(event, cx) {
+        if self.picker.is_some() && self.handle_picker_key(event, window, cx) {
             return true;
         }
         let shift = event.keystroke.modifiers.shift;
@@ -329,10 +305,15 @@ impl LauncherOverlay {
     }
 
     /// Arrow keys drive the open picker instead of the prompt behind it.
-    fn handle_picker_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+    fn handle_picker_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let count = match self.picker {
             Some(Picker::Harness) => self.harness_choices().len(),
-            Some(Picker::Project) => self.projects().len(),
+            Some(Picker::Project) => self.projects().len() + 1,
             None => return false,
         };
         match event.keystroke.key.as_str() {
@@ -351,7 +332,7 @@ impl LauncherOverlay {
                 true
             }
             "enter" => {
-                self.commit_highlight();
+                self.commit_highlight(window, cx);
                 cx.notify();
                 true
             }
@@ -359,7 +340,7 @@ impl LauncherOverlay {
         }
     }
 
-    fn commit_highlight(&mut self) {
+    fn commit_highlight(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.picker {
             Some(Picker::Harness) => {
                 if let Some(choice) = self
@@ -371,9 +352,18 @@ impl LauncherOverlay {
                 }
             }
             Some(Picker::Project) => {
-                if let Some(project) = self.projects().get(self.highlight) {
-                    self.selected_root.clone_from(&project.root);
+                let projects = self.projects();
+                match project_commit(projects.len(), self.highlight) {
+                    ProjectCommit::Recent(index) => {
+                        self.selected_root.clone_from(&projects[index].root);
+                        self.picker = None;
+                        window.focus(&self.focus, cx);
+                    }
+                    ProjectCommit::ChooseFolder => {
+                        self.choose_folder(window, cx);
+                    }
                 }
+                return;
             }
             None => return,
         }
@@ -443,7 +433,11 @@ impl LauncherOverlay {
     }
 
     fn choose_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.picker = None;
+        close_picker_for_folder_choice(&mut self.picker);
+        // The native sheet temporarily owns focus. Keep the composer focused
+        // on both sides so a cancel or completion returns keyboard input to
+        // the untouched draft.
+        window.focus(&self.focus, cx);
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -451,14 +445,13 @@ impl LauncherOverlay {
             prompt: Some("Start Here".into()),
         });
         cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(mut paths))) = paths.await else {
-                return;
+            let selected = match paths.await {
+                Ok(Ok(Some(mut paths))) => paths.pop(),
+                _ => None,
             };
-            let Some(path) = paths.pop() else {
-                return;
-            };
-            let _ = this.update_in(cx, |this, _window, cx| {
-                this.selected_root = path.to_string_lossy().into_owned();
+            let _ = this.update_in(cx, |this, window, cx| {
+                apply_folder_choice(&mut this.selected_root, selected.as_deref());
+                window.focus(&this.focus, cx);
                 cx.notify();
             });
         })
@@ -469,7 +462,7 @@ impl LauncherOverlay {
         let mut list = div()
             .id("launcher-harness-list")
             .py(px(6.0))
-            .w(px(260.0))
+            .w(px(350.0))
             .max_h(px(PICKER_HEIGHT))
             .overflow_y_scroll();
         for (index, choice) in self.harness_choices().into_iter().enumerate() {
@@ -478,11 +471,13 @@ impl LauncherOverlay {
             let highlighted = self.highlight == index;
             let kind = choice.kind.clone();
             let logo = ui_agent_kind(&choice.kind);
+            let setup_url = choice.setup_url.clone();
+            let unavailable = choice.unavailable_detail();
             list = list.child(
                 div()
                     .id(format!("launcher-harness-{index}"))
                     .mx(px(6.0))
-                    .h(px(38.0))
+                    .min_h(px(48.0))
                     .px(px(9.0))
                     .flex()
                     .items_center()
@@ -507,13 +502,39 @@ impl LauncherOverlay {
                             }))
                     })
                     .child(AgentLogo::new(logo, 21.0, colors))
-                    .child(div().flex_1().child(choice.label))
-                    .when(!enabled, |row| {
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .child(choice.display_name)
+                            .when_some(unavailable, |label, unavailable| {
+                                label.child(
+                                    div()
+                                        .whitespace_nowrap()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .text_size(px(9.5))
+                                        .text_color(colors.tertiary)
+                                        .child(unavailable),
+                                )
+                            }),
+                    )
+                    .when_some(setup_url, |row, url| {
                         row.child(
                             div()
-                                .text_size(px(9.0))
-                                .text_color(colors.tertiary)
-                                .child("Unavailable"),
+                                .id(format!("launcher-harness-setup-{index}"))
+                                .px(px(6.0))
+                                .py(px(3.0))
+                                .rounded(px(Radius::CHIP))
+                                .cursor_pointer()
+                                .text_size(px(9.5))
+                                .text_color(colors.secondary)
+                                .bg(Fill::subtle(colors))
+                                .hover(move |button| button.bg(colors.primary.alpha(0.10)))
+                                .on_click(move |_, _, cx| cx.open_url(&url))
+                                .child("Setup…"),
                         )
                     })
                     .when(selected, |row| {
@@ -537,18 +558,6 @@ impl LauncherOverlay {
             .w(px(310.0))
             .max_h(px(PICKER_HEIGHT))
             .overflow_y_scroll();
-        if projects.is_empty() {
-            list = list.child(
-                div()
-                    .h(px(38.0))
-                    .px(px(11.0))
-                    .flex()
-                    .items_center()
-                    .text_size(px(11.0))
-                    .text_color(colors.tertiary)
-                    .child("No recent projects"),
-            );
-        }
         for (index, project) in projects.into_iter().enumerate() {
             let selected = project.root == self.selected_root;
             let highlighted = self.highlight == index;
@@ -605,6 +614,32 @@ impl LauncherOverlay {
                     }),
             );
         }
+        let choose_index = self.projects().len();
+        let highlighted = self.highlight == choose_index;
+        list = list.child(
+            div()
+                .id("launcher-project-choose-folder")
+                .mx(px(6.0))
+                .h(px(42.0))
+                .px(px(9.0))
+                .flex()
+                .items_center()
+                .gap(px(9.0))
+                .rounded(px(8.0))
+                .cursor_pointer()
+                .when(highlighted, |row| row.bg(colors.primary.alpha(0.08)))
+                .hover(move |row| row.bg(colors.primary.alpha(0.06)))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.choose_folder(window, cx);
+                }))
+                .child(sf_symbol("folder.badge.plus", 12.0, colors.secondary))
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(colors.primary)
+                        .child("Choose Folder…"),
+                ),
+        );
         FloatingSurface::new(colors, list).into_any_element()
     }
 
@@ -737,10 +772,12 @@ impl LauncherOverlay {
                                     .child(
                                         div()
                                             .id("launcher-add-project")
-                                            .size(px(CONTROL_SIZE))
+                                            .h(px(CONTROL_SIZE))
+                                            .px(px(9.0))
                                             .flex()
                                             .items_center()
                                             .justify_center()
+                                            .gap(px(6.0))
                                             .rounded(px(CONTROL_RADIUS))
                                             .cursor_pointer()
                                             .hover(move |button| button.bg(Fill::subtle(colors)))
@@ -748,6 +785,12 @@ impl LauncherOverlay {
                                                 button.bg(colors.primary.alpha(0.10))
                                             })
                                             .child(sf_symbol("plus", 11.0, colors.secondary))
+                                            .child(
+                                                div()
+                                                    .text_size(px(10.0))
+                                                    .text_color(colors.secondary)
+                                                    .child("Choose folder"),
+                                            )
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 this.choose_folder(window, cx);
                                             })),
@@ -894,7 +937,7 @@ impl LauncherOverlay {
                             .hover(move |button| button.bg(colors.primary.alpha(0.08)))
                             .active(move |button| button.bg(colors.primary.alpha(0.11)))
                             .child(sf_symbol("plus", 9.0, colors.tertiary))
-                            .child("New project")
+                            .child("Choose folder…")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.choose_folder(window, cx);
                             })),
@@ -1007,7 +1050,7 @@ fn initial_target(services: &AppServices) -> (AgentKind, String) {
                 .map(|project| project.root.clone())
         })
         .unwrap_or_default();
-    (store.preferences().default_agent.kind(), selected_root)
+    (store.preferences().default_agent.clone(), selected_root)
 }
 
 fn ui_agent_kind(kind: &AgentKind) -> UiAgentKind {
@@ -1021,17 +1064,24 @@ fn ui_agent_kind(kind: &AgentKind) -> UiAgentKind {
     }
 }
 
-fn title_case_id(id: &str) -> String {
-    id.split(['-', '_'])
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            let mut chars = part.chars();
-            chars.next().map_or_else(String::new, |first| {
-                first.to_uppercase().collect::<String>() + chars.as_str()
-            })
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+fn project_commit(project_count: usize, highlight: usize) -> ProjectCommit {
+    if highlight < project_count {
+        ProjectCommit::Recent(highlight)
+    } else {
+        ProjectCommit::ChooseFolder
+    }
+}
+
+fn close_picker_for_folder_choice(picker: &mut Option<Picker>) {
+    *picker = None;
+}
+
+fn apply_folder_choice(selected_root: &mut String, chosen: Option<&Path>) -> bool {
+    let Some(chosen) = chosen else {
+        return false;
+    };
+    *selected_root = chosen.to_string_lossy().into_owned();
+    true
 }
 
 #[cfg(test)]
@@ -1042,5 +1092,34 @@ mod tests {
     fn manifest_ids_have_readable_fallback_labels() {
         assert_eq!(title_case_id("claude-code"), "Claude Code");
         assert_eq!(title_case_id("open_code"), "Open Code");
+    }
+
+    #[test]
+    fn project_picker_always_ends_with_choose_folder() {
+        assert_eq!(project_commit(0, 0), ProjectCommit::ChooseFolder);
+        assert_eq!(project_commit(2, 0), ProjectCommit::Recent(0));
+        assert_eq!(project_commit(2, 1), ProjectCommit::Recent(1));
+        assert_eq!(project_commit(2, 2), ProjectCommit::ChooseFolder);
+    }
+
+    #[test]
+    fn folder_chooser_closes_picker_and_preserves_draft_across_cancel_and_completion() {
+        let mut prompt = PromptComposer::default();
+        prompt.insert_multiline("keep this\nunfinished prompt");
+        let mut picker = Some(Picker::Project);
+        let mut selected = "/work/current".to_owned();
+
+        close_picker_for_folder_choice(&mut picker);
+        assert!(picker.is_none(), "native chooser must dismiss the popover");
+        assert!(!apply_folder_choice(&mut selected, None));
+        assert_eq!(selected, "/work/current");
+        assert_eq!(prompt.text(), "keep this\nunfinished prompt");
+
+        assert!(apply_folder_choice(
+            &mut selected,
+            Some(Path::new("/work/chosen"))
+        ));
+        assert_eq!(selected, "/work/chosen");
+        assert_eq!(prompt.text(), "keep this\nunfinished prompt");
     }
 }

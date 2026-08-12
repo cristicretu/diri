@@ -14,6 +14,11 @@
       "kilo-code"
     ],
     "firstClass": true,
+    "setup": {
+      "url": "https://kilo.ai/docs/code-with-ai/platforms/cli",
+      "installHint": "Install Kilo Code CLI with npm.",
+      "signInHint": "Run kilo, then use /connect to configure credentials."
+    },
     "statusAuthority": "screen",
     "binary": "kilo",
     "resume": {

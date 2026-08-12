@@ -14,6 +14,11 @@
       "kiro-cli"
     ],
     "firstClass": true,
+    "setup": {
+      "url": "https://kiro.dev/docs/cli/installation/",
+      "installHint": "Install Kiro CLI with its official platform installer.",
+      "signInHint": "Run kiro-cli login."
+    },
     "statusAuthority": "screen",
     "binary": "kiro-cli",
     "resume": {

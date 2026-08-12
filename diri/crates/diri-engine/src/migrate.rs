@@ -1,6 +1,13 @@
 //! The git + transcript legwork of `session.migrate`: one-click handoff of a
 //! live Claude session between machines, preserving conversation context
-//! (`claude --resume`) and code state (WIP commit + push + hard-sync).
+//! (`claude --resume`) and code state.
+//!
+//! Code state moves losslessly in both directions: committed work travels by
+//! push + hard-sync of the target checkout, while uncommitted work travels as
+//! a binary diff applied to the target tree — so dirty state arrives dirty,
+//! origin only ever sees real commits, and a session can bounce between local
+//! and a host without leaving `WIP:` commits on the branch. A snapshot commit
+//! of the dirty state is left behind on the source as a recovery net.
 //!
 //! Ported from `SessionMigrator`. Both sides run through the same bounded
 //! shell, so "source" and "target" can each be the local machine or a remote
@@ -40,6 +47,12 @@ pub struct Prepared {
     pub source_repo_root: String,
     pub target_repo_root: String,
     pub wip_committed: bool,
+    /// The target checkout is a linked worktree (the moved record keeps its
+    /// worktree identity).
+    pub target_is_worktree: bool,
+    /// Uncommitted source changes traveled as a patch and arrived
+    /// uncommitted.
+    pub carried_dirty: bool,
 }
 
 pub struct TranscriptShuttle {
@@ -49,12 +62,17 @@ pub struct TranscriptShuttle {
     pub warning: Option<String>,
 }
 
+/// Subject prefix that marks a source-side snapshot commit. `prepare` detects
+/// it on the tip so a retried run still carries the same changes as dirty
+/// state instead of pushing them as a commit.
+const HANDOFF_SUBJECT_PREFIX: &str = "WIP: handoff to ";
+
 pub fn wip_commit_message(target_name: &str) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    format!("WIP: handoff to {target_name} @{now}")
+    format!("{HANDOFF_SUBJECT_PREFIX}{target_name} @{now}")
 }
 
 /// Runs a command and maps any failure to a clear precondition error that
@@ -79,10 +97,11 @@ fn require(
 }
 
 /// Phase 1 — code state, safe while the source agent is still alive and
-/// idempotent throughout: WIP-commit a dirty source tree on its CURRENT
-/// branch, push (setting upstream; never force), then fetch + hard-sync the
-/// target checkout — refusing a dirty target, and giving a linked source
-/// worktree its own worktree next to the target clone.
+/// idempotent throughout: snapshot-commit a dirty source tree on its CURRENT
+/// branch, push the real commits (never the snapshot, never force), fetch +
+/// hard-sync the target checkout — refusing a dirty target, and giving a
+/// linked source worktree its own worktree next to the target clone — then
+/// re-apply the snapshot's changes to the target tree as uncommitted state.
 pub fn prepare(
     source_cwd: &str,
     source_host: Option<&HostEntry>,
@@ -130,17 +149,44 @@ pub fn prepare(
                 "git -C {root_q} add -A && git -C {root_q} commit -m {}",
                 shell_quote(&message)
             ),
-            "could not create the WIP handoff commit",
+            "could not create the snapshot commit",
             thirty,
         )?;
         wip_committed = true;
     }
-    require(
+    // A snapshot tip means dirty state should travel as dirty state — whether
+    // the commit was made just above or by an earlier run that failed later
+    // (idempotent retry).
+    let tip_subject = require(
         source_host,
-        &format!("git -C {root_q} push -u origin {branch_q}"),
-        "git push to origin failed",
-        two_minutes,
+        &format!("git -C {root_q} log -1 --format=%s"),
+        "could not read the source tip commit",
+        thirty,
     )?;
+    let carry_dirty = tip_subject.starts_with(HANDOFF_SUBJECT_PREFIX);
+
+    // Push only real commits; the snapshot stays behind on the source. When
+    // the branch already matches origin this is a no-op, and a genuinely
+    // diverged origin still fails loudly here, before anything mutates.
+    if carry_dirty {
+        require(
+            source_host,
+            &format!(
+                "git -C {root_q} push origin {} && git -C {root_q} branch --set-upstream-to {} {branch_q}",
+                shell_quote(&format!("HEAD~1:refs/heads/{branch}")),
+                shell_quote(&format!("origin/{branch}"))
+            ),
+            "git push to origin failed",
+            two_minutes,
+        )?;
+    } else {
+        require(
+            source_host,
+            &format!("git -C {root_q} push -u origin {branch_q}"),
+            "git push to origin failed",
+            two_minutes,
+        )?;
+    }
 
     // A linked source worktree gets its own worktree next to the target
     // clone; parallel worktree agents would otherwise fight over the one
@@ -151,7 +197,8 @@ pub fn prepare(
         "could not inspect the source checkout",
         thirty,
     )?;
-    let final_target_root = if git_dir.contains("/.git/worktrees/") {
+    let source_is_worktree = git_dir.contains("/.git/worktrees/");
+    let final_target_root = if source_is_worktree {
         ensure_target_worktree(target_host, target_repo_root, &branch)?
     } else {
         let target_q = shell_quote(target_repo_root);
@@ -186,12 +233,71 @@ pub fn prepare(
         target_repo_root.to_string()
     };
 
+    if carry_dirty {
+        carry_dirty_state(source_host, &root, target_host, &final_target_root)?;
+    }
+
     Ok(Prepared {
         branch,
         source_repo_root: root,
         target_repo_root: final_target_root,
         wip_committed,
+        target_is_worktree: source_is_worktree,
+        carried_dirty: carry_dirty,
     })
+}
+
+/// Ships the snapshot commit's changes to the target as uncommitted state: a
+/// binary diff generated beside the source repo, copied across, applied to
+/// the just-synced (and verified clean) target tree, and removed on both
+/// sides. The target tree sits at exactly the commit the diff is against, so
+/// a failure here means plumbing, not conflicts — and the source snapshot
+/// commit still holds everything.
+fn carry_dirty_state(
+    source_host: Option<&HostEntry>,
+    source_root: &str,
+    target_host: Option<&HostEntry>,
+    target_root: &str,
+) -> Result<(), MigrateError> {
+    let thirty = Duration::from_secs(30);
+    let root_q = shell_quote(source_root);
+    let source_patch = require(
+        source_host,
+        &format!(
+            "t=$(mktemp -t diri-handoff.XXXXXX) && git -C {root_q} diff --binary --full-index 'HEAD~1' HEAD > \"$t\" && echo \"$t\""
+        ),
+        "could not capture the uncommitted changes",
+        thirty,
+    )?;
+    let target_patch = require(
+        target_host,
+        "mktemp -t diri-handoff.XXXXXX",
+        "could not stage the uncommitted changes on the target",
+        thirty,
+    )?;
+    let copied = copy_file(&source_patch, source_host, &target_patch, target_host);
+    let _ = run_shell(
+        source_host,
+        &format!("rm -f {}", shell_quote(&source_patch)),
+        thirty,
+    );
+    copied.map_err(|detail| {
+        MigrateError::Internal(format!(
+            "could not carry the uncommitted changes to the target ({detail})"
+        ))
+    })?;
+    let patch_q = shell_quote(&target_patch);
+    let applied = require(
+        target_host,
+        &format!(
+            "git -C {} apply --whitespace=nowarn {patch_q}",
+            shell_quote(target_root)
+        ),
+        "could not restore the uncommitted changes on the target",
+        thirty,
+    );
+    let _ = run_shell(target_host, &format!("rm -f {patch_q}"), thirty);
+    applied.map(|_| ())
 }
 
 /// Creates or re-syncs the dedicated worktree for `branch` next to the
@@ -211,7 +317,13 @@ fn ensure_target_worktree(
         .parent()
         .map(|parent| parent.to_string_lossy().into_owned())
         .unwrap_or_else(|| ".".into());
-    let path = format!("{parent}/{repo_name}-{}", branch.replace('/', "-"));
+    // The same naming rule `git::create_worktree` uses, so a session moving
+    // back home lands in the worktree diri originally made for it instead of
+    // a near-duplicate beside it.
+    let path = format!(
+        "{parent}/{repo_name}-{}",
+        crate::git::branch_to_path_slug(branch)
+    );
     let path_q = shell_quote(&path);
     let main_q = shell_quote(main_clone);
     let branch_q = shell_quote(branch);
@@ -461,6 +573,7 @@ fn copy_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn host(id: &str) -> HostEntry {
         HostEntry {
@@ -485,108 +598,180 @@ mod tests {
         assert!(relay.contains(&"-3".to_string()), "remote→remote relays");
     }
 
-    /// The whole prepare flow against two LOCAL repos — no ssh involved,
-    /// exactly how the Swift tests exercised it.
-    #[test]
-    fn prepare_moves_a_dirty_branch_between_local_checkouts() {
-        let temp = tempfile::tempdir().expect("temp");
-        let git = |dir: &Path, args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .env("GIT_AUTHOR_NAME", "t")
-                .env("GIT_AUTHOR_EMAIL", "t@t")
-                .env("GIT_COMMITTER_NAME", "t")
-                .env("GIT_COMMITTER_EMAIL", "t@t")
-                .status()
-                .expect("git");
-            assert!(status.success(), "git {args:?}");
-        };
+    fn git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?}");
+    }
 
-        // A bare origin, a source clone with WIP, an empty target clone.
-        let origin = temp.path().join("origin.git");
+    fn git_out(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git");
+        assert!(output.status.success(), "git {args:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A bare origin plus a seeded `source` clone (one `root` commit holding
+    /// `file.txt`) and an empty `target` clone.
+    fn seeded_repos(temp: &Path) -> (PathBuf, PathBuf) {
+        let origin = temp.join("origin.git");
         std::fs::create_dir_all(&origin).unwrap();
         git(&origin, &["init", "-q", "--bare", "-b", "main"]);
-        let source = temp.path().join("source");
-        git(
-            temp.path(),
-            &["clone", "-q", origin.to_str().unwrap(), "source"],
-        );
+        let source = temp.join("source");
+        git(temp, &["clone", "-q", origin.to_str().unwrap(), "source"]);
         std::fs::write(source.join("file.txt"), "v1\n").unwrap();
         git(&source, &["add", "."]);
         git(&source, &["commit", "-q", "-m", "root"]);
         git(&source, &["push", "-q", "-u", "origin", "main"]);
-        let target = temp.path().join("target");
-        git(
-            temp.path(),
-            &["clone", "-q", origin.to_str().unwrap(), "target"],
-        );
+        let target = temp.join("target");
+        git(temp, &["clone", "-q", origin.to_str().unwrap(), "target"]);
+        (source, target)
+    }
 
-        // Dirty the source; prepare must WIP-commit, push, and sync target.
-        std::fs::write(source.join("file.txt"), "wip changes\n").unwrap();
-        let prepared = prepare(
+    /// The whole flow against LOCAL repos — no ssh involved — through a full
+    /// round trip: uncommitted work must arrive uncommitted on every leg,
+    /// real commits must arrive committed, and origin must never see a
+    /// snapshot commit.
+    #[test]
+    fn prepare_round_trips_dirty_state_between_local_checkouts() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (source, target) = seeded_repos(temp.path());
+
+        // Leg 1: a tracked edit plus a brand-new file move out.
+        std::fs::write(source.join("file.txt"), "local edit\n").unwrap();
+        std::fs::write(source.join("notes.md"), "scratch\n").unwrap();
+        let out = prepare(
             source.to_str().unwrap(),
             None,
             None,
             target.to_str().unwrap(),
-            "local",
+            "forge",
         )
-        .expect("prepare");
-        assert_eq!(prepared.branch, "main");
-        assert!(prepared.wip_committed);
+        .expect("leg 1");
+        assert_eq!(out.branch, "main");
+        assert!(out.wip_committed && out.carried_dirty);
+        assert!(!out.target_is_worktree);
         assert_eq!(
             std::fs::read_to_string(target.join("file.txt")).unwrap(),
-            "wip changes\n",
-            "the target hard-synced to the pushed WIP"
+            "local edit\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("notes.md")).unwrap(),
+            "scratch\n"
+        );
+        assert!(
+            !git_out(&target, &["status", "--porcelain"]).is_empty(),
+            "dirty state arrives dirty"
+        );
+        assert_eq!(
+            git_out(&target, &["log", "-1", "--format=%s", "origin/main"]),
+            "root",
+            "origin never sees the snapshot"
+        );
+        assert!(
+            git_out(&source, &["log", "-1", "--format=%s"]).starts_with(HANDOFF_SUBJECT_PREFIX),
+            "the source keeps a recovery snapshot"
         );
 
-        // Idempotent: a second run with a clean source is a no-op success.
-        let again = prepare(
+        // Work "in the cloud": one real commit plus further uncommitted edits.
+        std::fs::write(target.join("real.md"), "done\n").unwrap();
+        git(&target, &["add", "real.md"]);
+        git(&target, &["commit", "-q", "-m", "real work"]);
+        std::fs::write(target.join("notes.md"), "scratch v2\n").unwrap();
+
+        // Leg 2: back home, into the original checkout.
+        let back = prepare(
+            target.to_str().unwrap(),
+            None,
+            None,
             source.to_str().unwrap(),
+            "local",
+        )
+        .expect("leg 2");
+        assert!(back.carried_dirty);
+        assert_eq!(git_out(&source, &["log", "-1", "--format=%s"]), "real work");
+        assert_eq!(
+            std::fs::read_to_string(source.join("file.txt")).unwrap(),
+            "local edit\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source.join("notes.md")).unwrap(),
+            "scratch v2\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source.join("real.md")).unwrap(),
+            "done\n"
+        );
+        assert!(!git_out(&source, &["status", "--porcelain"]).is_empty());
+        assert!(
+            !git_out(&source, &["log", "--format=%s", "origin/main"]).contains("WIP:"),
+            "no snapshot ever lands on origin"
+        );
+    }
+
+    /// A linked source worktree gets a worktree on the target, named by the
+    /// same slug rule `git::create_worktree` uses — so moving back home later
+    /// reuses the worktree diri originally created rather than growing a
+    /// near-duplicate beside it.
+    #[test]
+    fn a_linked_worktree_source_gets_a_slugged_target_worktree() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (source, target) = seeded_repos(temp.path());
+        let worktree = temp.path().join("source-feature");
+        git(
+            &source,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "Feature/X",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(worktree.join("wip.txt"), "wt dirt\n").unwrap();
+
+        let out = prepare(
+            worktree.to_str().unwrap(),
             None,
             None,
             target.to_str().unwrap(),
-            "local",
+            "forge",
         )
-        .expect("re-run");
-        assert!(!again.wip_committed);
+        .expect("prepare");
+        assert!(out.target_is_worktree && out.carried_dirty);
+        assert!(
+            out.target_repo_root.ends_with("target-feature-x"),
+            "slugged like create_worktree: {}",
+            out.target_repo_root
+        );
+        let landed = Path::new(&out.target_repo_root);
+        assert_eq!(
+            git_out(landed, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "Feature/X"
+        );
+        assert_eq!(
+            std::fs::read_to_string(landed.join("wip.txt")).unwrap(),
+            "wt dirt\n"
+        );
+        assert!(!git_out(landed, &["status", "--porcelain"]).is_empty());
     }
 
     #[test]
     fn a_dirty_target_is_a_hard_stop() {
         let temp = tempfile::tempdir().expect("temp");
-        let git = |dir: &Path, args: &[&str]| {
-            assert!(
-                std::process::Command::new("git")
-                    .args(args)
-                    .current_dir(dir)
-                    .env("GIT_AUTHOR_NAME", "t")
-                    .env("GIT_AUTHOR_EMAIL", "t@t")
-                    .env("GIT_COMMITTER_NAME", "t")
-                    .env("GIT_COMMITTER_EMAIL", "t@t")
-                    .status()
-                    .expect("git")
-                    .success()
-            );
-        };
-        let origin = temp.path().join("origin.git");
-        std::fs::create_dir_all(&origin).unwrap();
-        git(&origin, &["init", "-q", "--bare", "-b", "main"]);
-        let source = temp.path().join("source");
-        git(
-            temp.path(),
-            &["clone", "-q", origin.to_str().unwrap(), "source"],
-        );
-        std::fs::write(source.join("f"), "x").unwrap();
-        git(&source, &["add", "."]);
-        git(&source, &["commit", "-q", "-m", "root"]);
-        git(&source, &["push", "-q", "-u", "origin", "main"]);
-        let target = temp.path().join("target");
-        git(
-            temp.path(),
-            &["clone", "-q", origin.to_str().unwrap(), "target"],
-        );
-        std::fs::write(target.join("f"), "target work in progress").unwrap();
+        let (source, target) = seeded_repos(temp.path());
+        std::fs::write(target.join("file.txt"), "target work in progress").unwrap();
 
         let error = prepare(
             source.to_str().unwrap(),

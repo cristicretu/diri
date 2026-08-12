@@ -4385,6 +4385,11 @@ mod tests {
             InspectorTab::Info
         );
         inspector.update(cx, |inspector, cx| inspector.set_visible(true, cx));
+        // Drain the Info refresh before asserts/teardown. Leaving a live
+        // `cx.spawn` + `tokio.spawn_blocking` task lets GPUI's test scheduler
+        // abort it on a worker thread ("local task dropped by a thread that
+        // didn't spawn it") after the test already reported ok.
+        cx.run_until_parked();
 
         let (generation, context, polling) = inspector.read_with(cx, |inspector, _| {
             (
@@ -4405,6 +4410,7 @@ mod tests {
             store.select(ids[1].clone());
         }
         inspector.update(cx, |inspector, cx| inspector.refresh_if_context_changed(cx));
+        cx.run_until_parked();
 
         let (next_generation, next_context, still_polling) = inspector.read_with(cx, |i, _| {
             (i.generation, i.context.clone(), i.poll_task.is_some())
@@ -4425,6 +4431,14 @@ mod tests {
             inspector.select_tab(InspectorTab::Info, cx);
         });
         assert!(inspector.read_with(cx, |inspector, _| inspector.poll_task.is_none()));
+        // Cancel any leftover refresh/review tasks on this thread before the
+        // TestAppContext tears the window down.
+        inspector.update(cx, |inspector, _| {
+            inspector.refresh_task = None;
+            inspector.review_task = None;
+            inspector.poll_task = None;
+        });
+        cx.run_until_parked();
     }
 
     #[test]
