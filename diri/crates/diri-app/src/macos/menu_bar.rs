@@ -25,7 +25,8 @@ use objc2_app_kit::{
     NSWorkspaceDidActivateApplicationNotification,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
+    MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
+    NSString,
 };
 
 use diri_proto::{AgentKind, ProjectId, SessionId};
@@ -475,7 +476,6 @@ impl NativeMenuBar {
             match row {
                 InboxRow::Project {
                     name,
-                    count,
                     collapsed,
                     ..
                 } => {
@@ -483,7 +483,7 @@ impl NativeMenuBar {
                         y -= 6.0;
                     }
                     y -= PROJECT_HEIGHT;
-                    self.add_project_header(name, *count, *collapsed, project_tag, y, mtm);
+                    self.add_project_header(name, *collapsed, project_tag, y, mtm);
                     project_tag += 1;
                 }
                 InboxRow::Session(session) => {
@@ -517,7 +517,6 @@ impl NativeMenuBar {
     fn add_project_header(
         &self,
         name: &str,
-        _count: usize,
         collapsed: bool,
         tag: isize,
         y: f64,
@@ -864,13 +863,11 @@ fn panel_fingerprint(model: &InboxModel, selected: Option<&SessionId>) -> u64 {
             InboxRow::Project {
                 id,
                 name,
-                count,
                 collapsed,
             } => {
                 0u8.hash(&mut hasher);
                 id.hash(&mut hasher);
                 name.hash(&mut hasher);
-                count.hash(&mut hasher);
                 collapsed.hash(&mut hasher);
             }
             InboxRow::Session(session) => {
@@ -885,9 +882,6 @@ fn panel_fingerprint(model: &InboxModel, selected: Option<&SessionId>) -> u64 {
             }
         }
     }
-    model.needs_you.hash(&mut hasher);
-    model.finished.hash(&mut hasher);
-    model.working.hash(&mut hasher);
     selected.map(|id| id.0.as_str()).hash(&mut hasher);
     hasher.finish()
 }
@@ -1149,26 +1143,6 @@ enum MenuShortcut {
     SpawnDefault,
     SpawnShell,
     SpawnCodex,
-}
-fn menu_shortcut_from_event(event: &NSEvent) -> Option<MenuShortcut> {
-    let modifiers = event.modifierFlags();
-    if !modifiers.contains(NSEventModifierFlags::Command) {
-        return None;
-    }
-    let shift = modifiers.contains(NSEventModifierFlags::Shift);
-    let option = modifiers.contains(NSEventModifierFlags::Option);
-    let key = event
-        .charactersIgnoringModifiers()
-        .map(|chars| chars.to_string().to_ascii_lowercase())
-        .unwrap_or_default();
-    match key.as_str() {
-        "t" if option => Some(MenuShortcut::SpawnShell),
-        "t" if !shift => Some(MenuShortcut::SpawnDefault),
-        "n" if shift => Some(MenuShortcut::SpawnCodex),
-        // Matches the app's own `cmd-n` → OpenLauncher binding.
-        "n" => Some(MenuShortcut::NewAgent),
-        _ => None,
-    }
 }
 
 struct MenuBarHoverChromeIvars {
@@ -2001,43 +1975,7 @@ impl MenuBarTarget {
         }
     }
 
-    fn session_id_from(&self, sender: Option<&AnyObject>) -> Option<SessionId> {
-        let tag = sender
-            .and_then(|sender| sender.downcast_ref::<NSButton>())
-            .map(|button| button.tag())?;
-        self.ivars().session_ids.borrow().get(tag as usize).cloned()
-    }
 
-    fn send_permission_action(&self, sender: Option<&AnyObject>, action_id: &str) {
-        let Some(id) = self.session_id_from(sender) else {
-            return;
-        };
-        let command = {
-            let store = self
-                .ivars()
-                .store
-                .read()
-                .expect("session store lock poisoned");
-            let Some(session) = store.sessions().get(&id).map(AsRef::as_ref) else {
-                return;
-            };
-            let descriptor = store.agent_descriptor(session.effective_kind());
-            permission_action_data(session, descriptor)
-                .and_then(|data| command_for_action(action_id, &data))
-        };
-        if let Some(command) = command {
-            let _ = self.ivars().action_tx.send(command);
-        } else if action_id == APPROVE_ACTION_ID {
-            self.ivars()
-                .store
-                .write()
-                .expect("session store lock poisoned")
-                .select(id);
-            self.show_main_window();
-            return;
-        }
-        self.hide_panel();
-    }
 
     fn show_main_window(&self) {
         self.hide_panel();
