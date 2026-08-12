@@ -669,6 +669,13 @@ impl NativeMenuBar {
             rect(0.0, 0.0, FOLDER_BADGE, FOLDER_BADGE),
             mtm,
         );
+        // SF Symbol folder.fill carries its mass below the geometric mid;
+        // nudge up one point so it reads centered in the 18pt badge.
+        let folder_frame = folder.frame();
+        folder.setFrameOrigin(NSPoint::new(
+            folder_frame.origin.x,
+            folder_frame.origin.y + 1.0,
+        ));
         badge.addSubview(&folder);
         row.addSubview(&badge);
 
