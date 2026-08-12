@@ -1,8 +1,9 @@
 //! Compact new-session destination opened in the main pane by Command-N.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use diri_proto::{AgentKind, Project, SessionId};
 use diri_ui::{
@@ -10,17 +11,19 @@ use diri_ui::{
     SemanticColors,
 };
 use gpui::{
-    AnyElement, App, Context, EventEmitter, ExternalPaths, FocusHandle, Focusable, FontWeight,
-    HighlightStyle, KeyDownEvent, MouseButton, PathPromptOptions, Render, Task, Window, div,
-    prelude::*, px, rgba,
+    AnyElement, App, ClipboardEntry, Context, EventEmitter, ExternalPaths, FocusHandle, Focusable,
+    FontWeight, HighlightStyle, KeyDownEvent, MouseButton, PathPromptOptions, Render, Task, Window,
+    div, prelude::*, px, rgba,
 };
 
 use crate::AppServices;
 use crate::agent_catalog::{AgentOption, quick_agent_options, title_case_id};
 use crate::composer::PromptComposer;
+use crate::delegation::HandoffProposal;
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::image_attachments::{
-    PendingImage, capability, delivery_blocker, delivery_prompt, inspect_path, rejection_feedback,
+    PendingImage, can_add_image, capability, delivery_blocker, delivery_prompt,
+    inspect_path_for_drag, rejection_feedback,
 };
 use crate::navigation::CARET;
 use crate::notifications::SendTextCommand;
@@ -34,6 +37,7 @@ const CONTROL_SIZE: f32 = 32.0;
 const CONTROL_RADIUS: f32 = 9.0;
 const SHELF_HEIGHT: f32 = 40.0;
 const PICKER_HEIGHT: f32 = 200.0;
+const DELIVERY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Composer metrics. The text area is sized from the wrapped line count
 /// rather than pinned at one height: a one-line prompt should not sit in a
@@ -103,6 +107,20 @@ pub(crate) struct LauncherOverlay {
     pending_images: Vec<PendingImage>,
     new_session_images: Vec<PendingImage>,
     session_images: HashMap<SessionId, Vec<PendingImage>>,
+    delivery: TurnDeliveryState,
+    /// Slow file-provider reads and image copies run away from GPUI. A target
+    /// generation prevents an old completion from attaching to a composer the
+    /// user switched to while it was in flight.
+    staging_generation: u64,
+    staging_jobs: usize,
+    mode: LauncherMode,
+    /// The active destination draft survives a temporary handoff proposal.
+    saved_new_prompt: Option<String>,
+    handoff_delivery: HandoffDeliveryState,
+    /// Drafts containing paths validated on this Mac cannot be submitted to a
+    /// remote Agent. Pure text, quotes, and private image copies do not carry
+    /// this restriction.
+    session_drafts_with_local_paths: HashSet<SessionId>,
     selected_harness: AgentKind,
     selected_root: String,
     selected_host: Option<String>,
@@ -132,10 +150,94 @@ enum LauncherTarget {
     Session(SessionId),
 }
 
+/// One acknowledged existing-session turn at a time. Tickets ensure that a
+/// late RPC result cannot clear a newer draft or a different session.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TurnDeliveryState {
+    next_ticket: u64,
+    pending: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+enum LauncherMode {
+    NewSession,
+    Handoff(HandoffProposal),
+}
+
+/// One acknowledged handoff at a time. Tickets prevent a late completion
+/// from an old proposal from closing or annotating a newer composer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HandoffDeliveryState {
+    next_ticket: u64,
+    pending: Option<u64>,
+}
+
+impl TurnDeliveryState {
+    fn begin(&mut self) -> Option<u64> {
+        if self.pending.is_some() {
+            return None;
+        }
+        self.next_ticket = self.next_ticket.wrapping_add(1);
+        self.pending = Some(self.next_ticket);
+        self.pending
+    }
+
+    fn settle(&mut self, ticket: u64) -> bool {
+        if self.pending != Some(ticket) {
+            return false;
+        }
+        self.pending = None;
+        true
+    }
+
+    fn invalidate(&mut self) {
+        self.next_ticket = self.next_ticket.wrapping_add(1);
+        self.pending = None;
+    }
+
+    const fn is_sending(self) -> bool {
+        self.pending.is_some()
+    }
+}
+
+impl HandoffDeliveryState {
+    fn begin(&mut self) -> Option<u64> {
+        if self.pending.is_some() {
+            return None;
+        }
+        self.next_ticket = self.next_ticket.wrapping_add(1);
+        self.pending = Some(self.next_ticket);
+        self.pending
+    }
+
+    fn settle(&mut self, ticket: u64) -> bool {
+        if self.pending != Some(ticket) {
+            return false;
+        }
+        self.pending = None;
+        true
+    }
+
+    fn invalidate(&mut self) {
+        self.next_ticket = self.next_ticket.wrapping_add(1);
+        self.pending = None;
+    }
+
+    const fn is_sending(self) -> bool {
+        self.pending.is_some()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProjectCommit {
     Recent(usize),
     ChooseFolder,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttachmentShortcut {
+    RemoveLast,
+    Clear,
 }
 
 impl EventEmitter<LauncherEvent> for LauncherOverlay {}
@@ -151,7 +253,40 @@ impl LauncherOverlay {
                     Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         if this
                             .update(cx, |this, cx| {
-                                if this.open && matches!(this.target, LauncherTarget::NewSession) {
+                                let live_sessions = this
+                                    .services
+                                    .store
+                                    .store
+                                    .read()
+                                    .expect("session store lock poisoned")
+                                    .sessions()
+                                    .keys()
+                                    .cloned()
+                                    .collect::<HashSet<_>>();
+                                prune_session_state(
+                                    &live_sessions,
+                                    &mut this.session_drafts,
+                                    &mut this.session_images,
+                                    &mut this.session_drafts_with_local_paths,
+                                );
+                                if matches!(
+                                    &this.target,
+                                    LauncherTarget::Session(id) if !live_sessions.contains(id)
+                                ) {
+                                    this.delivery.invalidate();
+                                    this.staging_generation = this.staging_generation.wrapping_add(1);
+                                    this.staging_jobs = 0;
+                                    this.pending_images.clear();
+                                    this.prompt.clear();
+                                    this.drop_notice = Some(
+                                        "This session was removed; its draft attachments were cleared."
+                                            .to_owned(),
+                                    );
+                                }
+                                if this.open
+                                    && matches!(this.target, LauncherTarget::NewSession)
+                                    && matches!(this.mode, LauncherMode::NewSession)
+                                {
                                     this.reconcile_harness();
                                 }
                                 cx.notify();
@@ -176,6 +311,13 @@ impl LauncherOverlay {
             pending_images: Vec::new(),
             new_session_images: Vec::new(),
             session_images: HashMap::new(),
+            delivery: TurnDeliveryState::default(),
+            staging_generation: 0,
+            staging_jobs: 0,
+            mode: LauncherMode::NewSession,
+            saved_new_prompt: None,
+            handoff_delivery: HandoffDeliveryState::default(),
+            session_drafts_with_local_paths: HashSet::new(),
             selected_harness,
             selected_root,
             selected_host,
@@ -194,7 +336,11 @@ impl LauncherOverlay {
     }
 
     pub(crate) fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.switch_target(LauncherTarget::NewSession);
+        self.restore_new_prompt();
+        if !self.switch_target(LauncherTarget::NewSession) {
+            cx.notify();
+            return;
+        }
         self.drop_notice = None;
         // A half-written prompt survives Escape. This used to clear on every
         // open, so closing the launcher by reflex — or bouncing off it to
@@ -234,7 +380,11 @@ impl LauncherOverlay {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.switch_target(LauncherTarget::NewSession);
+        self.restore_new_prompt();
+        if !self.switch_target(LauncherTarget::NewSession) {
+            cx.notify();
+            return;
+        }
         self.selected_root = root;
         self.selected_host = None;
         self.fallback_notice = None;
@@ -254,16 +404,35 @@ impl LauncherOverlay {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.switch_target(LauncherTarget::Session(session_id.clone()));
+        self.restore_new_prompt();
+        if !self.switch_target(LauncherTarget::Session(session_id.clone())) {
+            cx.notify();
+            return;
+        }
         self.prompt.append_context(insertion);
-        let image_notice = self
-            .attachment_blocker(image_paths.len())
-            .or_else(|| self.stage_image_paths(image_paths));
-        self.drop_notice = combine_notices(notice, image_notice);
+        self.drop_notice = notice;
+        self.queue_image_paths(image_paths.to_vec(), cx);
         self.picker = None;
         self.open = true;
         window.focus(&self.focus, cx);
         cx.notify();
+    }
+
+    /// Finder paths are meaningful only on this Mac. Preserve that provenance
+    /// on the identity-keyed draft so a later target transition cannot make
+    /// the draft submittable to a remote Agent.
+    pub(crate) fn open_local_paths_for_session(
+        &mut self,
+        session_id: SessionId,
+        insertion: &str,
+        image_paths: &[PathBuf],
+        notice: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.session_drafts_with_local_paths
+            .insert(session_id.clone());
+        self.open_for_session(session_id, insertion, image_paths, notice, window, cx);
     }
 
     /// Clipboard images and Finder paths converge here. The paste gesture
@@ -276,59 +445,165 @@ impl LauncherOverlay {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.switch_target(LauncherTarget::Session(session_id));
-        if let Some(reason) = self.attachment_blocker(1) {
-            self.drop_notice = Some(reason);
-        } else {
-            match PendingImage::stage_bytes(bytes, extension, "Clipboard image") {
-                Ok(image) => {
-                    self.pending_images.push(image);
-                    self.drop_notice = None;
-                }
-                Err(reason) => {
-                    self.drop_notice = Some(format!(
-                        "Couldn't attach the clipboard image: {}.",
-                        reason.explanation()
-                    ))
-                }
-            }
+        self.restore_new_prompt();
+        if !self.switch_target(LauncherTarget::Session(session_id)) {
+            cx.notify();
+            return;
         }
+        self.queue_clipboard_image(bytes.to_vec(), extension.to_owned(), cx);
         self.picker = None;
         self.open = true;
         window.focus(&self.focus, cx);
         cx.notify();
     }
 
-    fn stage_image_paths(&mut self, paths: &[PathBuf]) -> Option<String> {
+    fn queue_image_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            return;
+        }
+        if let Some(reason) = self.attachment_blocker(paths.len()) {
+            self.drop_notice = combine_notices(self.drop_notice.take(), Some(reason));
+            cx.notify();
+            return;
+        }
+        let generation = self.staging_generation;
+        let target = self.target.clone();
+        let remaining_slots =
+            crate::image_attachments::MAX_IMAGE_COUNT.saturating_sub(self.pending_images.len());
+        let remaining_bytes = crate::image_attachments::MAX_TOTAL_IMAGE_BYTES
+            .saturating_sub(self.pending_images.iter().map(PendingImage::byte_len).sum());
+        self.staging_jobs += 1;
+        let task = cx
+            .background_executor()
+            .spawn(async move { stage_path_batch(paths, remaining_slots, remaining_bytes) });
+        cx.spawn(async move |this, cx| {
+            let results = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.staging_generation != generation || this.target != target {
+                    return;
+                }
+                this.staging_jobs = this.staging_jobs.saturating_sub(1);
+                let notice = this.accept_staged_paths(results);
+                this.drop_notice = combine_notices(this.drop_notice.take(), notice);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn can_stage_image_paths(paths: &ExternalPaths) -> bool {
+        paths
+            .paths()
+            .iter()
+            .any(|path| inspect_path_for_drag(path).is_ok())
+    }
+
+    fn drop_image_paths(&mut self, paths: &ExternalPaths, cx: &mut Context<Self>) {
+        self.queue_image_paths(paths.paths().to_vec(), cx);
+    }
+
+    fn queue_clipboard_image(&mut self, bytes: Vec<u8>, extension: String, cx: &mut Context<Self>) {
+        if let Some(reason) = self.attachment_blocker(1) {
+            self.drop_notice = combine_notices(self.drop_notice.take(), Some(reason));
+            cx.notify();
+            return;
+        }
+        let existing_bytes = self.pending_images.iter().map(PendingImage::byte_len).sum();
+        if let Err(reason) = can_add_image(
+            self.pending_images.len(),
+            existing_bytes,
+            bytes.len() as u64,
+        ) {
+            self.drop_notice = combine_notices(
+                self.drop_notice.take(),
+                Some(format!(
+                    "Couldn't attach the clipboard image: {}.",
+                    reason.explanation()
+                )),
+            );
+            cx.notify();
+            return;
+        }
+        let generation = self.staging_generation;
+        let target = self.target.clone();
+        self.staging_jobs += 1;
+        let task = cx
+            .background_executor()
+            .spawn(async move { PendingImage::stage_bytes(&bytes, &extension, "Clipboard image") });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.staging_generation != generation || this.target != target {
+                    return;
+                }
+                this.staging_jobs = this.staging_jobs.saturating_sub(1);
+                let notice = match result {
+                    Ok(image) => this.accept_staged_image(image).err().map(|reason| {
+                        format!(
+                            "Couldn't attach the clipboard image: {}.",
+                            reason.explanation()
+                        )
+                    }),
+                    Err(reason) => Some(format!(
+                        "Couldn't attach the clipboard image: {}.",
+                        reason.explanation()
+                    )),
+                };
+                this.drop_notice = combine_notices(this.drop_notice.take(), notice);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn accept_staged_paths(
+        &mut self,
+        results: Vec<(
+            PathBuf,
+            Result<PendingImage, crate::image_attachments::ImageRejection>,
+        )>,
+    ) -> Option<String> {
         let mut rejected = Vec::new();
-        for path in paths {
-            match PendingImage::stage_path(path) {
-                Ok(image) => self.pending_images.push(image),
-                Err(reason) => rejected.push(rejection_feedback(path, &reason)),
+        for (path, result) in results {
+            match result {
+                Ok(image) => {
+                    if let Err(reason) = self.accept_staged_image(image) {
+                        rejected.push(rejection_feedback(&path, &reason));
+                    }
+                }
+                Err(reason) => rejected.push(rejection_feedback(&path, &reason)),
             }
         }
         (!rejected.is_empty()).then(|| rejected.join(" "))
     }
 
-    fn can_stage_image_paths(paths: &ExternalPaths) -> bool {
-        paths.paths().iter().any(|path| inspect_path(path).is_ok())
-    }
-
-    fn drop_image_paths(&mut self, paths: &ExternalPaths, cx: &mut Context<Self>) {
-        let notice = self
-            .attachment_blocker(paths.paths().len())
-            .or_else(|| self.stage_image_paths(paths.paths()));
-        self.drop_notice = combine_notices(self.drop_notice.take(), notice);
-        cx.notify();
+    fn accept_staged_image(
+        &mut self,
+        image: PendingImage,
+    ) -> Result<(), crate::image_attachments::ImageRejection> {
+        let bytes = self.pending_images.iter().map(PendingImage::byte_len).sum();
+        can_add_image(self.pending_images.len(), bytes, image.byte_len())?;
+        self.pending_images.push(image);
+        Ok(())
     }
 
     fn remove_image(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.delivery.is_sending() {
+            return;
+        }
         if remove_pending_image(&mut self.pending_images, index).is_some() {
             cx.notify();
         }
     }
 
     fn clear_images(&mut self, cx: &mut Context<Self>) {
+        if self.delivery.is_sending() {
+            return;
+        }
+        self.staging_generation = self.staging_generation.wrapping_add(1);
+        self.staging_jobs = 0;
         self.pending_images.clear();
         cx.notify();
     }
@@ -347,10 +622,19 @@ impl LauncherOverlay {
         cx.notify();
     }
 
-    fn switch_target(&mut self, target: LauncherTarget) {
-        if self.target == target {
-            return;
+    fn switch_target(&mut self, target: LauncherTarget) -> bool {
+        if self.delivery.is_sending() {
+            self.drop_notice = Some(
+                "This turn is still sending. Wait for it to finish before switching drafts."
+                    .to_owned(),
+            );
+            return false;
         }
+        if self.target == target {
+            return true;
+        }
+        self.staging_generation = self.staging_generation.wrapping_add(1);
+        self.staging_jobs = 0;
         let saved = transition_draft(
             &self.target,
             &target,
@@ -372,6 +656,29 @@ impl LauncherOverlay {
         self.target = target;
         self.pending_images = images;
         self.picker = None;
+        true
+    }
+
+    /// Opens an identity-targeted review surface. Merely opening it cannot
+    /// write to either session; the only send path is the labelled confirmation
+    /// control rendered by `render_handoff_panel`.
+    pub(crate) fn open_handoff(
+        &mut self,
+        proposal: HandoffProposal,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.restore_new_prompt();
+        self.saved_new_prompt = Some(self.prompt.text().to_owned());
+        self.prompt.clear();
+        self.prompt.insert_multiline(&proposal.summary);
+        self.mode = LauncherMode::Handoff(proposal);
+        self.handoff_delivery.invalidate();
+        self.fallback_notice = None;
+        self.picker = None;
+        self.open = true;
+        window.focus(&self.focus, cx);
+        cx.notify();
     }
 
     pub(crate) fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -382,8 +689,17 @@ impl LauncherOverlay {
         if !self.open {
             return;
         }
+        if self.delivery.is_sending() {
+            self.drop_notice = Some(
+                "This turn is still sending. The draft will close after it is delivered."
+                    .to_owned(),
+            );
+            cx.notify();
+            return;
+        }
         self.open = false;
         self.picker = None;
+        self.restore_new_prompt();
         cx.emit(LauncherEvent::Closed);
         cx.notify();
     }
@@ -391,6 +707,20 @@ impl LauncherOverlay {
     /// Close from outside the launcher (sidebar session click, menu bar, etc.).
     pub(crate) fn dismiss(&mut self, cx: &mut Context<Self>) {
         self.close(cx);
+    }
+
+    fn restore_new_prompt(&mut self) {
+        if !matches!(self.mode, LauncherMode::Handoff(_)) {
+            return;
+        }
+        self.handoff_delivery.invalidate();
+        self.prompt.clear();
+        if let Some(prompt) = self.saved_new_prompt.take()
+            && !prompt.is_empty()
+        {
+            self.prompt.insert_multiline(&prompt);
+        }
+        self.mode = LauncherMode::NewSession;
     }
 
     fn harness_choices(&self) -> Vec<AgentOption> {
@@ -513,11 +843,46 @@ impl LauncherOverlay {
     /// `None` means it can. The submit button used to just sit there dimmed
     /// with no explanation, which reads as "broken" rather than "not yet".
     fn blocker(&self) -> Option<String> {
+        if let LauncherMode::Handoff(proposal) = &self.mode {
+            if self.handoff_delivery.is_sending() {
+                return Some("Sending handoff…".to_owned());
+            }
+            let store = self
+                .services
+                .store
+                .store
+                .read()
+                .expect("session store lock poisoned");
+            let Some(target) = store.sessions().get(&proposal.target_id) else {
+                return Some("The target session is no longer available".to_owned());
+            };
+            if target.is_archived() || matches!(target.status, diri_proto::SessionStatus::Exited(_))
+            {
+                return Some("The target session has ended".to_owned());
+            }
+            return None;
+        }
+        if self.delivery.is_sending() {
+            return Some("Sending this turn…".to_owned());
+        }
+        if self.staging_jobs > 0 {
+            return Some("Preparing image attachments…".to_owned());
+        }
         if let Some(reason) = self.attachment_blocker(self.pending_images.len()) {
             return Some(reason);
         }
-        if matches!(self.target, LauncherTarget::Session(_)) {
-            return None;
+        if let LauncherTarget::Session(id) = &self.target {
+            let store = self
+                .services
+                .store
+                .store
+                .read()
+                .expect("session store lock poisoned");
+            let Some(session) = store.sessions().get(id) else {
+                return Some("This session is no longer available".to_owned());
+            };
+            return (session.host.is_some() && self.session_drafts_with_local_paths.contains(id))
+                .then(|| "Local paths cannot be used on a remote session".to_owned());
         }
         if self.selected_root.is_empty() {
             return Some("Choose a project to start in".to_owned());
@@ -562,6 +927,12 @@ impl LauncherOverlay {
     }
 
     fn attachment_blocker(&self, attachment_count: usize) -> Option<String> {
+        if self.delivery.is_sending() {
+            return Some("This turn is already sending".to_owned());
+        }
+        if self.staging_jobs > 0 {
+            return Some("Wait for the current image attachments to finish preparing".to_owned());
+        }
         if let LauncherTarget::Session(id) = &self.target {
             let store = self
                 .services
@@ -588,6 +959,11 @@ impl LauncherOverlay {
     }
 
     fn can_submit(&self) -> bool {
+        if matches!(self.mode, LauncherMode::Handoff(_)) {
+            return !self.preview
+                && !self.prompt.text().trim().is_empty()
+                && self.blocker().is_none();
+        }
         !self.preview && self.blocker().is_none() && self.submission_prompt().is_ok()
     }
 
@@ -621,6 +997,46 @@ impl LauncherOverlay {
         if !self.can_submit() {
             return false;
         }
+        if let Some(command) = handoff_command(&self.mode, self.prompt.text()) {
+            let Some(ticket) = self.handoff_delivery.begin() else {
+                return false;
+            };
+            self.fallback_notice = None;
+            let client = Arc::clone(self.services.store.client());
+            let runtime = Arc::clone(&self.services.tokio);
+            cx.spawn(async move |this, cx| {
+                let task = runtime.spawn(async move {
+                    client.wait_until_connected(Duration::from_secs(5)).await?;
+                    client
+                        .send_text(&command.session_id, command.text, command.submit)
+                        .await
+                });
+                let result = match task.await {
+                    Ok(result) => result.map_err(|error| error.to_string()),
+                    Err(error) => Err(format!("handoff task stopped: {error}")),
+                };
+                let _ = this.update(cx, |this, cx| {
+                    if !this.handoff_delivery.settle(ticket) {
+                        return;
+                    }
+                    match result {
+                        Ok(()) => {
+                            this.prompt.clear();
+                            this.close(cx);
+                        }
+                        Err(error) => {
+                            this.fallback_notice = Some(format!(
+                                "The handoff was not sent: {error}. Review it and try again."
+                            ));
+                            cx.notify();
+                        }
+                    }
+                });
+            })
+            .detach();
+            cx.notify();
+            return true;
+        }
         let Ok(prompt) = self.submission_prompt() else {
             return false;
         };
@@ -642,45 +1058,80 @@ impl LauncherOverlay {
                     );
                 self.new_session_draft.clear();
                 self.new_session_images.clear();
+                self.prompt.clear();
+                for image in std::mem::take(&mut self.pending_images) {
+                    image.cleanup_after_delivery(self.services.tokio.handle());
+                }
+                self.drop_notice = None;
+                self.close(cx);
+                true
             }
             LauncherTarget::Session(id) => {
-                // Selection can attach or resume terminal state, so it belongs
-                // to explicit confirmation—not the Finder release that merely
-                // opened this draft.
-                if self
-                    .services
-                    .store
-                    .notification_action_sender()
-                    .send(SendTextCommand {
-                        session_id: id.clone(),
-                        text: prompt,
-                        submit: true,
-                    })
-                    .is_err()
-                {
-                    self.drop_notice = Some(
-                        "Couldn't queue this turn. The draft and images are still here.".to_owned(),
-                    );
-                    cx.notify();
+                let Some(ticket) = self.delivery.begin() else {
                     return false;
-                }
-                self.services
-                    .store
-                    .store
-                    .write()
-                    .expect("session store lock poisoned")
-                    .select(id.clone());
-                self.session_drafts.remove(id);
-                self.session_images.remove(id);
+                };
+                let session_id = id.clone();
+                let client = Arc::clone(self.services.store.client());
+                let runtime = Arc::clone(&self.services.tokio);
+                self.drop_notice = None;
+                cx.spawn(async move |this, cx| {
+                    let task = runtime.spawn(send_existing_turn(
+                        client,
+                        session_id,
+                        prompt,
+                        DELIVERY_CONNECT_TIMEOUT,
+                    ));
+                    let result = match task.await {
+                        Ok(result) => result,
+                        Err(error) => Err(format!("delivery task stopped: {error}")),
+                    };
+                    let _ = this.update(cx, |this, cx| {
+                        this.finish_existing_delivery(ticket, result, cx);
+                    });
+                })
+                .detach();
+                cx.notify();
+                true
             }
         }
-        self.prompt.clear();
-        for image in std::mem::take(&mut self.pending_images) {
-            image.cleanup_after_delivery(self.services.tokio.handle());
+    }
+
+    fn finish_existing_delivery(
+        &mut self,
+        ticket: u64,
+        result: Result<(), String>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.delivery.settle(ticket) {
+            return;
         }
-        self.drop_notice = None;
-        self.close(cx);
-        true
+        match result {
+            Ok(()) => {
+                if let LauncherTarget::Session(id) = &self.target {
+                    self.services
+                        .store
+                        .store
+                        .write()
+                        .expect("session store lock poisoned")
+                        .select(id.clone());
+                    self.session_drafts.remove(id);
+                    self.session_images.remove(id);
+                    self.session_drafts_with_local_paths.remove(id);
+                }
+                self.prompt.clear();
+                for image in std::mem::take(&mut self.pending_images) {
+                    image.cleanup_after_delivery(self.services.tokio.handle());
+                }
+                self.drop_notice = None;
+                self.close(cx);
+            }
+            Err(error) => {
+                self.drop_notice = Some(format!(
+                    "This turn was not sent: {error}. The draft and images are still here."
+                ));
+                cx.notify();
+            }
+        }
     }
 
     pub(crate) fn handle_key_down(
@@ -689,10 +1140,30 @@ impl LauncherOverlay {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.delivery.is_sending() {
+            if event.keystroke.key == "escape" {
+                self.close(cx);
+            }
+            return true;
+        }
+        // A submitted handoff is immutable until the daemon acknowledges it;
+        // even Escape cannot claim to cancel bytes already in flight.
+        if self.handoff_delivery.is_sending() {
+            return true;
+        }
         if self.picker.is_some() && self.handle_picker_key(event, window, cx) {
             return true;
         }
-        let shift = event.keystroke.modifiers.shift;
+        let modifiers = event.keystroke.modifiers;
+        if let Some(shortcut) = attachment_shortcut(event) {
+            if shortcut == AttachmentShortcut::Clear {
+                self.clear_images(cx);
+            } else if !self.pending_images.is_empty() {
+                self.remove_image(self.pending_images.len() - 1, cx);
+            }
+            return true;
+        }
+        let shift = modifiers.shift;
         match event.keystroke.key.as_str() {
             "escape" => {
                 self.close(cx);
@@ -846,8 +1317,12 @@ impl LauncherOverlay {
                 query_editor::cut_selection(self.prompt.editor_mut(), cx);
             }
             Edit::Clipboard(ClipboardEdit::Paste) => {
-                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                    self.prompt.insert_multiline(&text);
+                if let Some(item) = cx.read_from_clipboard() {
+                    if let Some((bytes, extension)) = clipboard_image(&item) {
+                        self.queue_clipboard_image(bytes, extension, cx);
+                    } else if let Some(text) = item.text() {
+                        self.prompt.insert_multiline(&text);
+                    }
                 }
             }
         }
@@ -1078,6 +1553,9 @@ impl LauncherOverlay {
         focused: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if matches!(self.mode, LauncherMode::Handoff(_)) {
+            return self.render_handoff_panel(colors, focused, cx);
+        }
         if matches!(self.target, LauncherTarget::Session(_)) {
             return self.render_session_panel(colors, focused, cx);
         }
@@ -1426,6 +1904,256 @@ impl LauncherOverlay {
         panel.into_any_element()
     }
 
+    fn render_handoff_panel(
+        &self,
+        colors: SemanticColors,
+        focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let LauncherMode::Handoff(proposal) = &self.mode else {
+            unreachable!("handoff panel requires a handoff proposal");
+        };
+        let sending = self.handoff_delivery.is_sending();
+        let can_submit = self.can_submit();
+        let blocker = self.blocker();
+        let text_height = composer_text_height(self.prompt.line_count());
+        let composer_height = text_height + COMPOSER_CONTROLS_HEIGHT;
+        let composer_fill = if colors.appearance == diri_ui::Appearance::Dark {
+            rgba(0x26282dff)
+        } else {
+            rgba(0xf2f1efff)
+        };
+        let remote_label = {
+            let store = self
+                .services
+                .store
+                .store
+                .read()
+                .expect("session store lock poisoned");
+            store
+                .sessions()
+                .get(&proposal.target_id)
+                .and_then(|target| target.host.as_deref())
+                .map(|host| format!("Remote · {}", store.host_display_name(host)))
+        };
+        let prompt = if self.prompt.is_empty() {
+            div()
+                .h(px(COMPOSER_LINE_HEIGHT))
+                .flex()
+                .items_center()
+                .when(focused, |line| {
+                    line.child(div().text_color(colors.primary.alpha(0.92)).child(CARET))
+                })
+                .child(
+                    div()
+                        .text_color(colors.tertiary)
+                        .child("Describe the handoff…"),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .id("handoff-prompt-lines")
+                .size_full()
+                .flex()
+                .flex_col()
+                .overflow_y_scroll()
+                .track_scroll(self.prompt.scroll_handle())
+                .children(self.prompt.render_lines(
+                    px(COMPOSER_LINE_HEIGHT),
+                    focused.then_some(CARET),
+                    HighlightStyle {
+                        background_color: Some(Palette::CLAY.alpha(0.35).into()),
+                        ..HighlightStyle::default()
+                    },
+                ))
+                .into_any_element()
+        };
+
+        div()
+            .relative()
+            .w(px(PANEL_WIDTH))
+            .flex()
+            .flex_col()
+            .gap(px(14.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(7.0))
+                    .child(
+                        div()
+                            .text_size(px(22.0))
+                            .font_weight(FontWeight::NORMAL)
+                            .text_color(colors.primary.alpha(0.94))
+                            .child("Review handoff"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(7.0))
+                            .text_size(px(11.0))
+                            .text_color(colors.secondary)
+                            .child(proposal.source_title.clone())
+                            .child(sf_symbol("arrow.right", 9.0, colors.tertiary))
+                            .child(proposal.target_title.clone())
+                            .when_some(remote_label, |row, label| {
+                                row.child(
+                                    div()
+                                        .ml(px(3.0))
+                                        .px(px(7.0))
+                                        .py(px(3.0))
+                                        .rounded(px(Radius::CHIP))
+                                        .bg(Ink::ATTENTION.alpha(0.11))
+                                        .border_1()
+                                        .border_color(Ink::ATTENTION.alpha(0.28))
+                                        .text_size(px(9.0))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(Ink::ATTENTION)
+                                        .child(label),
+                                )
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .relative()
+                    .mx(px(COMPOSER_INSET))
+                    .h(px(composer_height))
+                    .rounded(px(Radius::PANEL))
+                    .bg(composer_fill)
+                    .border_1()
+                    .border_color(if focused {
+                        Palette::CLAY.alpha(0.42)
+                    } else {
+                        colors.primary.alpha(0.09)
+                    })
+                    .cursor_text()
+                    .on_mouse_down(MouseButton::Left, {
+                        let focus = self.focus.clone();
+                        move |_, window, cx| window.focus(&focus, cx)
+                    })
+                    .child(
+                        div()
+                            .h(px(text_height))
+                            .px(px(COMPOSER_PADDING))
+                            .pt(px(COMPOSER_PAD_TOP))
+                            .pb(px(COMPOSER_PAD_BOTTOM))
+                            .text_size(px(COMPOSER_FONT_SIZE))
+                            .line_height(px(COMPOSER_LINE_HEIGHT))
+                            .text_color(colors.primary)
+                            .child(prompt),
+                    )
+                    .child(
+                        div()
+                            .h(px(COMPOSER_CONTROLS_HEIGHT))
+                            .px(px(10.0))
+                            .pb(px(8.0))
+                            .flex()
+                            .items_end()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .min_w(px(0.0))
+                                    .text_size(px(10.0))
+                                    .text_color(if self.fallback_notice.is_some() {
+                                        Ink::ATTENTION
+                                    } else {
+                                        colors.tertiary
+                                    })
+                                    .child(
+                                        blocker
+                                            .or_else(|| self.fallback_notice.clone())
+                                            .unwrap_or_else(|| {
+                                                "Review and edit before sending · ⇧↵ new line"
+                                                    .to_owned()
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(7.0))
+                                    .child(
+                                        div()
+                                            .id("handoff-cancel")
+                                            .h(px(CONTROL_SIZE))
+                                            .px(px(10.0))
+                                            .flex()
+                                            .items_center()
+                                            .rounded(px(CONTROL_RADIUS))
+                                            .text_size(px(11.0))
+                                            .text_color(if sending {
+                                                colors.tertiary
+                                            } else {
+                                                colors.secondary
+                                            })
+                                            .when(!sending, |button| {
+                                                button
+                                                    .cursor_pointer()
+                                                    .hover(move |button| {
+                                                        button.bg(Fill::subtle(colors))
+                                                    })
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.close(cx);
+                                                    }))
+                                            })
+                                            .child("Cancel"),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("handoff-submit")
+                                            .h(px(CONTROL_SIZE))
+                                            .px(px(12.0))
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(6.0))
+                                            .rounded(px(CONTROL_RADIUS))
+                                            .bg(if can_submit {
+                                                colors.primary
+                                            } else {
+                                                Fill::subtle(colors)
+                                            })
+                                            .when(can_submit, |button| {
+                                                button
+                                                    .cursor_pointer()
+                                                    .hover(move |button| button.opacity(0.86))
+                                                    .active(move |button| button.opacity(0.72))
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.submit(cx);
+                                                    }))
+                                            })
+                                            .text_size(px(11.0))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(if can_submit {
+                                                colors.background
+                                            } else {
+                                                colors.tertiary
+                                            })
+                                            .child(sf_symbol_weighted(
+                                                "paperplane.fill",
+                                                10.0,
+                                                SymbolWeight::Semibold,
+                                                if can_submit {
+                                                    colors.background
+                                                } else {
+                                                    colors.tertiary
+                                                },
+                                            ))
+                                            .child(if sending {
+                                                "Sending…"
+                                            } else {
+                                                "Send handoff"
+                                            }),
+                                    ),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_session_panel(
         &self,
         colors: SemanticColors,
@@ -1679,6 +2407,7 @@ impl LauncherOverlay {
             .gap(px(6.0));
         for (index, image) in self.pending_images.iter().enumerate() {
             let label = image.display_name().to_owned();
+            let remove_label = format!("Remove image {label}");
             let size = format_image_size(image.byte_len());
             rail = rail.child(
                 div()
@@ -1716,6 +2445,12 @@ impl LauncherOverlay {
                     .child(
                         div()
                             .id(format!("remove-pending-image-{index}"))
+                            .role(gpui::Role::Button)
+                            .aria_label(remove_label)
+                            .aria_description("Removes this image without sending the draft")
+                            .when(index + 1 == self.pending_images.len(), |button| {
+                                button.aria_keyshortcuts("Alt+Meta+Backspace")
+                            })
                             .size(px(18.0))
                             .flex_none()
                             .flex()
@@ -1734,6 +2469,10 @@ impl LauncherOverlay {
         rail.child(
             div()
                 .id("clear-pending-images")
+                .role(gpui::Role::Button)
+                .aria_label("Clear all image attachments")
+                .aria_description("Clears this draft only and does not send it")
+                .aria_keyshortcuts("Shift+Alt+Meta+Backspace")
                 .h(px(24.0))
                 .px(px(7.0))
                 .flex()
@@ -1903,6 +2642,57 @@ fn format_image_size(bytes: u64) -> String {
     }
 }
 
+fn stage_path_batch(
+    paths: Vec<PathBuf>,
+    remaining_slots: usize,
+    mut remaining_bytes: u64,
+) -> Vec<(
+    PathBuf,
+    Result<PendingImage, crate::image_attachments::ImageRejection>,
+)> {
+    paths
+        .into_iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let result = if index >= remaining_slots {
+                Err(crate::image_attachments::ImageRejection::TooMany)
+            } else {
+                PendingImage::stage_path_with_budget(&path, remaining_bytes)
+            };
+            if let Ok(image) = &result {
+                remaining_bytes = remaining_bytes.saturating_sub(image.byte_len());
+            }
+            (path, result)
+        })
+        .collect()
+}
+
+fn clipboard_image(item: &gpui::ClipboardItem) -> Option<(Vec<u8>, String)> {
+    item.entries().iter().find_map(|entry| {
+        if let ClipboardEntry::Image(image) = entry {
+            Some((image.bytes.clone(), image.format.extension().to_owned()))
+        } else {
+            None
+        }
+    })
+}
+
+async fn send_existing_turn(
+    client: Arc<diri_client::DaemonClient>,
+    session_id: SessionId,
+    prompt: String,
+    connect_timeout: Duration,
+) -> Result<(), String> {
+    client
+        .wait_until_connected(connect_timeout)
+        .await
+        .map_err(|error| error.to_string())?;
+    client
+        .send_text(&session_id, prompt, true)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 fn remove_pending_image(images: &mut Vec<PendingImage>, index: usize) -> Option<PendingImage> {
     (index < images.len()).then(|| images.remove(index))
 }
@@ -1951,6 +2741,29 @@ fn transition_images(
     }
 }
 
+fn prune_session_state(
+    live_sessions: &HashSet<SessionId>,
+    session_drafts: &mut HashMap<SessionId, String>,
+    session_images: &mut HashMap<SessionId, Vec<PendingImage>>,
+    session_drafts_with_local_paths: &mut HashSet<SessionId>,
+) {
+    session_drafts.retain(|id, _| live_sessions.contains(id));
+    session_images.retain(|id, _| live_sessions.contains(id));
+    session_drafts_with_local_paths.retain(|id| live_sessions.contains(id));
+}
+
+fn handoff_command(mode: &LauncherMode, text: &str) -> Option<SendTextCommand> {
+    let LauncherMode::Handoff(proposal) = mode else {
+        return None;
+    };
+    let text = text.trim();
+    (!text.is_empty()).then(|| SendTextCommand {
+        session_id: proposal.target_id.clone(),
+        text: text.to_owned(),
+        submit: true,
+    })
+}
+
 fn ui_agent_kind(kind: &AgentKind) -> UiAgentKind {
     match kind.id() {
         AgentKind::CLAUDE_CODE_ID => UiAgentKind::ClaudeCode,
@@ -1974,6 +2787,17 @@ fn close_picker_for_folder_choice(picker: &mut Option<Picker>) {
     *picker = None;
 }
 
+fn attachment_shortcut(event: &KeyDownEvent) -> Option<AttachmentShortcut> {
+    let modifiers = event.keystroke.modifiers;
+    (modifiers.platform && modifiers.alt && event.keystroke.key == "backspace").then_some(
+        if modifiers.shift {
+            AttachmentShortcut::Clear
+        } else {
+            AttachmentShortcut::RemoveLast
+        },
+    )
+}
+
 fn apply_folder_choice(selected_root: &mut String, chosen: Option<&Path>) -> bool {
     let Some(chosen) = chosen else {
         return false;
@@ -1985,14 +2809,16 @@ fn apply_folder_choice(selected_root: &mut String, chosen: Option<&Path>) -> boo
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::{BufRead as _, BufReader, Write as _};
+    use std::os::unix::net::UnixListener;
 
     use diri_proto::SessionListResult;
     use gpui::TestAppContext;
 
     use super::*;
+    use crate::sidebar::{PreviewScenario, SidebarPreviewFixture};
     use crate::store::StoreRuntime;
     use crate::usage::UsageSnapshot;
-    use gpui::TestAppContext;
 
     fn fixture_session() -> diri_proto::SessionRecord {
         let envelope: serde_json::Value = serde_json::from_str(include_str!(
@@ -2071,6 +2897,24 @@ mod tests {
         assert_eq!(project_commit(2, 0), ProjectCommit::Recent(0));
         assert_eq!(project_commit(2, 1), ProjectCommit::Recent(1));
         assert_eq!(project_commit(2, 2), ProjectCommit::ChooseFolder);
+    }
+
+    #[test]
+    fn attachment_removal_shortcuts_are_explicit_and_do_not_match_plain_editing() {
+        let event = |keystroke: &str| KeyDownEvent {
+            keystroke: gpui::Keystroke::parse(keystroke).unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        };
+        assert_eq!(
+            attachment_shortcut(&event("alt-cmd-backspace")),
+            Some(AttachmentShortcut::RemoveLast)
+        );
+        assert_eq!(
+            attachment_shortcut(&event("shift-alt-cmd-backspace")),
+            Some(AttachmentShortcut::Clear)
+        );
+        assert_eq!(attachment_shortcut(&event("backspace")), None);
     }
 
     #[test]
@@ -2202,12 +3046,228 @@ mod tests {
         assert!(remove_pending_image(&mut images, 9).is_none());
     }
 
+    #[test]
+    fn batch_preflight_never_opens_paths_past_the_remaining_slot_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.png");
+        let past_limit = directory.path().join("missing.png");
+        fs::write(&first, b"\x89PNG\r\n\x1a\nfirst").unwrap();
+
+        let staged = stage_path_batch(vec![first, past_limit], 1, 1024);
+        assert!(staged[0].1.is_ok());
+        assert_eq!(
+            staged[1].1.as_ref().unwrap_err(),
+            &crate::image_attachments::ImageRejection::TooMany,
+            "the extra path must be rejected by preflight, before opening it"
+        );
+    }
+
+    #[test]
+    fn batch_staging_spends_one_shared_aggregate_byte_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.png");
+        let second = directory.path().join("second.png");
+        let bytes = b"\x89PNG\r\n\x1a\nimage";
+        fs::write(&first, bytes).unwrap();
+        fs::write(&second, bytes).unwrap();
+
+        let staged = stage_path_batch(vec![first, second], 2, bytes.len() as u64);
+        assert!(staged[0].1.is_ok());
+        assert_eq!(
+            staged[1].1.as_ref().unwrap_err(),
+            &crate::image_attachments::ImageRejection::TotalTooLarge
+        );
+    }
+
+    #[test]
+    fn clipboard_image_detection_precedes_text_paste_in_the_open_composer() {
+        let item = gpui::ClipboardItem {
+            entries: vec![
+                ClipboardEntry::String(gpui::ClipboardString::new("fallback text".to_owned())),
+                ClipboardEntry::Image(gpui::Image {
+                    format: gpui::ImageFormat::Png,
+                    bytes: b"\x89PNG\r\n\x1a\nclipboard".to_vec(),
+                    id: 7,
+                }),
+            ],
+        };
+        assert_eq!(
+            clipboard_image(&item),
+            Some((b"\x89PNG\r\n\x1a\nclipboard".to_vec(), "png".to_owned()))
+        );
+    }
+
+    #[test]
+    fn handoff_is_inert_until_explicit_submit_builds_one_targeted_command() {
+        let proposal = HandoffProposal {
+            source_id: SessionId("source".into()),
+            target_id: SessionId("target".into()),
+            source_title: "Source".into(),
+            target_title: "Target".into(),
+            summary: "cached summary".into(),
+        };
+        assert_eq!(handoff_command(&LauncherMode::NewSession, "edited"), None);
+        assert_eq!(
+            handoff_command(&LauncherMode::Handoff(proposal), "  edited summary  "),
+            Some(SendTextCommand {
+                session_id: SessionId("target".into()),
+                text: "edited summary".into(),
+                submit: true,
+            })
+        );
+    }
+
+    #[test]
+    fn removed_sessions_release_saved_drafts_and_private_images() {
+        let live = SessionId("live".into());
+        let removed = SessionId("removed".into());
+        let mut drafts = HashMap::from([
+            (live.clone(), "keep".to_owned()),
+            (removed.clone(), "discard".to_owned()),
+        ]);
+        let removed_image =
+            PendingImage::stage_bytes(b"\x89PNG\r\n\x1a\nimage", "png", "removed.png").unwrap();
+        let removed_path = removed_image.local_path().to_path_buf();
+        let mut images = HashMap::from([(removed, vec![removed_image])]);
+        let mut local_paths = HashSet::new();
+
+        prune_session_state(
+            &HashSet::from([live.clone()]),
+            &mut drafts,
+            &mut images,
+            &mut local_paths,
+        );
+
+        assert_eq!(drafts, HashMap::from([(live, "keep".to_owned())]));
+        assert!(images.is_empty());
+        assert!(!removed_path.exists());
+    }
+
+    #[test]
+    fn delivery_tickets_refuse_double_submit_and_ignore_stale_results() {
+        let mut delivery = TurnDeliveryState::default();
+        let first = delivery.begin().unwrap();
+        assert!(delivery.is_sending());
+        assert_eq!(delivery.begin(), None);
+        delivery.invalidate();
+        let replacement = delivery.begin().unwrap();
+        assert!(!delivery.settle(first));
+        assert!(delivery.is_sending());
+        assert!(delivery.settle(replacement));
+        assert!(!delivery.is_sending());
+    }
+
+    #[test]
+    fn handoff_delivery_accepts_one_send_and_ignores_stale_completions() {
+        let mut delivery = HandoffDeliveryState::default();
+        let first = delivery.begin().expect("first send");
+        assert!(delivery.is_sending());
+        assert_eq!(delivery.begin(), None, "double submit must be refused");
+
+        delivery.invalidate();
+        let replacement = delivery.begin().expect("replacement proposal send");
+        assert_ne!(first, replacement);
+        assert!(
+            !delivery.settle(first),
+            "an old RPC must not close a replacement composer"
+        );
+        assert!(delivery.is_sending());
+        assert!(delivery.settle(replacement));
+        assert!(!delivery.is_sending());
+    }
+
     #[gpui::test]
-    fn opening_with_dropped_images_does_not_send_until_one_explicit_submit(
-        cx: &mut TestAppContext,
-    ) {
-        let (runtime, mut actions) = crate::store::StoreRuntime::inert_with_action_receiver();
-        let runtime = Arc::new(runtime);
+    fn quote_staging_preserves_session_identity_and_local_path_provenance(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let mut fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        assert!(fixture.list.sessions.len() >= 2);
+        let active = fixture.list.sessions[0].id.clone();
+        let target = fixture.list.sessions[1].id.clone();
+        fixture.list.sessions[0].kind = AgentKind::CODEX;
+        fixture.list.sessions[1].kind = AgentKind::CLAUDE_CODE;
+        fixture.list.sessions[0].foreground_agent = None;
+        fixture.list.sessions[1].foreground_agent = None;
+        fixture.list.sessions[1].host = Some("build-box".to_owned());
+        fixture.list.sessions[1].hibernation = Some(diri_proto::HibernationInfo {
+            since: diri_proto::DateMillis(1.0),
+            reason: diri_proto::HibernationReason::Manual,
+            tree_pids: vec![42],
+            tree_start_times: None,
+        });
+        {
+            let mut store = runtime.store.write().expect("session store lock poisoned");
+            store.hydrate(fixture.list);
+            store.select(active.clone());
+        }
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let services = launcher_services(Arc::clone(&runtime), tokio);
+        let (launcher, cx) =
+            cx.add_window_view(move |_window, cx| LauncherOverlay::new(services, true, cx));
+
+        launcher.update_in(cx, |launcher, window, cx| {
+            launcher.open_for_session(target.clone(), "first quoted turn", &[], None, window, cx);
+            launcher.open_for_session(target.clone(), "second quoted turn", &[], None, window, cx);
+        });
+
+        assert_eq!(
+            runtime
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .selected_session_id(),
+            Some(&active),
+            "staging a different target must not switch the active session"
+        );
+        assert!(
+            runtime
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .sessions()
+                .get(&target)
+                .is_some_and(|record| record.hibernation.is_some()),
+            "an app-owned draft cannot wake or rewrite hibernation state"
+        );
+        launcher.read_with(cx, |launcher, _| {
+            assert_eq!(launcher.target, LauncherTarget::Session(target.clone()));
+            assert_eq!(
+                launcher.blocker(),
+                None,
+                "plain quoted text must remain submittable to a remote agent"
+            );
+            assert_eq!(
+                launcher.prompt.text(),
+                "first quoted turn\nsecond quoted turn"
+            );
+            assert!(launcher.open);
+        });
+
+        launcher.update_in(cx, |launcher, window, cx| {
+            launcher.open_local_paths_for_session(
+                target.clone(),
+                "'/Users/me/local.png'",
+                &[],
+                None,
+                window,
+                cx,
+            );
+        });
+        launcher.read_with(cx, |launcher, _| {
+            assert_eq!(
+                launcher.blocker().as_deref(),
+                Some("Local paths cannot be used on a remote session")
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn opening_with_dropped_images_stages_without_sending(cx: &mut TestAppContext) {
+        let runtime = Arc::new(crate::store::StoreRuntime::inert());
         let session = fixture_session();
         runtime
             .store
@@ -2226,8 +3286,6 @@ mod tests {
         let second = directory.path().join("second.png");
         fs::write(&first, b"\x89PNG\r\n\x1a\nfirst").unwrap();
         fs::write(&second, b"\x89PNG\r\n\x1a\nsecond").unwrap();
-        let session_id = session.id.clone();
-
         let (launcher, cx) =
             cx.add_window_view(move |_window, cx| LauncherOverlay::new(services, false, cx));
         launcher.update_in(cx, |launcher, window, cx| {
@@ -2239,42 +3297,113 @@ mod tests {
                 window,
                 cx,
             );
-            assert_eq!(launcher.pending_images.len(), 2);
+            assert!(launcher.pending_images.is_empty());
+            assert_eq!(launcher.staging_jobs, 1);
+            assert!(!launcher.delivery.is_sending());
             assert_eq!(launcher.prompt.text(), "compare these");
         });
-        assert!(
-            actions.try_recv().is_err(),
-            "opening from a drop must not enqueue a turn"
-        );
-        let staged_paths = launcher.read_with(cx, |launcher, _| {
-            launcher
-                .pending_images
-                .iter()
-                .map(|image| image.local_path().to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
+        for _ in 0..100 {
+            cx.run_until_parked();
+            if launcher.read_with(cx, |launcher, _| launcher.staging_jobs == 0) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        launcher.read_with(cx, |launcher, _| {
+            assert_eq!(launcher.staging_jobs, 0);
+            assert_eq!(launcher.pending_images.len(), 2);
+            assert!(!launcher.delivery.is_sending());
+            let prompt = launcher.submission_prompt().unwrap();
+            let first = launcher.pending_images[0].local_path().to_string_lossy();
+            let second = launcher.pending_images[1].local_path().to_string_lossy();
+            assert!(prompt.find(first.as_ref()).unwrap() < prompt.find(second.as_ref()).unwrap());
         });
-
-        launcher.update(cx, |launcher, cx| assert!(launcher.submit(cx)));
-
-        let command = actions.try_recv().expect("explicit submit queues one turn");
-        assert_eq!(command.session_id, session_id);
-        assert!(command.submit);
-        let first_offset = command.text.find(&staged_paths[0]).unwrap();
-        let second_offset = command.text.find(&staged_paths[1]).unwrap();
-        assert!(
-            first_offset < second_offset,
-            "attachment order must survive submit"
-        );
-        assert!(
-            actions.try_recv().is_err(),
-            "submit queues exactly one turn"
-        );
     }
 
     #[gpui::test]
-    fn enqueue_failure_preserves_the_image_and_text_draft(cx: &mut TestAppContext) {
-        // `inert` deliberately drops its action receiver, exercising the
-        // launcher's send-failure branch without a daemon or timing race.
+    fn a_slow_drop_cannot_attach_to_a_newly_selected_session(cx: &mut TestAppContext) {
+        let runtime = Arc::new(crate::store::StoreRuntime::inert());
+        let first = fixture_session();
+        let mut second = first.clone();
+        second.id = SessionId("second-session".into());
+        {
+            let mut store = runtime.store.write().expect("session store lock poisoned");
+            store.upsert_session(first.clone());
+            store.upsert_session(second.clone());
+        }
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let services = launcher_services(runtime, tokio);
+        let directory = tempfile::tempdir().unwrap();
+        let image = directory.path().join("first-session.png");
+        fs::write(&image, b"\x89PNG\r\n\x1a\nimage").unwrap();
+        let (launcher, cx) =
+            cx.add_window_view(move |_window, cx| LauncherOverlay::new(services, false, cx));
+
+        launcher.update_in(cx, |launcher, window, cx| {
+            launcher.open_for_session(first.id, "first draft", &[image], None, window, cx);
+            assert_eq!(launcher.staging_jobs, 1);
+            launcher.open_for_session(second.id.clone(), "second draft", &[], None, window, cx);
+            assert_eq!(launcher.target, LauncherTarget::Session(second.id.clone()));
+            assert_eq!(launcher.staging_jobs, 0);
+        });
+        cx.run_until_parked();
+        launcher.read_with(cx, |launcher, _| {
+            assert_eq!(launcher.target, LauncherTarget::Session(second.id));
+            assert_eq!(launcher.prompt.text(), "second draft");
+            assert!(launcher.pending_images.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn clear_images_cancels_a_pending_staging_completion(cx: &mut TestAppContext) {
+        let runtime = Arc::new(crate::store::StoreRuntime::inert());
+        let session = fixture_session();
+        runtime
+            .store
+            .write()
+            .expect("session store lock poisoned")
+            .upsert_session(session.clone());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let services = launcher_services(runtime, tokio);
+        let directory = tempfile::tempdir().unwrap();
+        let incoming = directory.path().join("incoming.png");
+        fs::write(&incoming, b"\x89PNG\r\n\x1a\nincoming").unwrap();
+        let (launcher, cx) =
+            cx.add_window_view(move |_window, cx| LauncherOverlay::new(services, false, cx));
+
+        launcher.update_in(cx, |launcher, window, cx| {
+            launcher.open_for_session(session.id, "draft", &[incoming], None, window, cx);
+            assert_eq!(launcher.staging_jobs, 1);
+            launcher.pending_images.push(
+                PendingImage::stage_bytes(b"\x89PNG\r\n\x1a\nexisting", "png", "existing.png")
+                    .unwrap(),
+            );
+            launcher.clear_images(cx);
+            assert_eq!(launcher.staging_jobs, 0);
+            assert!(launcher.pending_images.is_empty());
+        });
+        cx.run_until_parked();
+        launcher.read_with(cx, |launcher, _| {
+            assert_eq!(launcher.staging_jobs, 0);
+            assert!(
+                launcher.pending_images.is_empty(),
+                "a completion from before Clear must not resurrect an attachment"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn acknowledged_rpc_failure_preserves_the_image_and_text_draft(cx: &mut TestAppContext) {
         let runtime = Arc::new(crate::store::StoreRuntime::inert());
         let session = fixture_session();
         runtime
@@ -2296,14 +3425,33 @@ mod tests {
         let (launcher, cx) =
             cx.add_window_view(move |_window, cx| LauncherOverlay::new(services, false, cx));
         launcher.update_in(cx, |launcher, window, cx| {
-            launcher.open_for_session(session.id, "keep this draft", &[image], None, window, cx);
+            launcher.open_for_session(session.id, "keep this draft", &[], None, window, cx);
+            launcher.pending_images = stage_path_batch(vec![image], 1, 1024)
+                .into_iter()
+                .map(|(_, image)| image.unwrap())
+                .collect();
         });
         let private_path = launcher.read_with(cx, |launcher, _| {
             launcher.pending_images[0].local_path().to_path_buf()
         });
 
         launcher.update(cx, |launcher, cx| {
-            assert!(!launcher.submit(cx));
+            let ticket = launcher.delivery.begin().unwrap();
+            assert!(launcher.delivery.is_sending());
+            assert_eq!(launcher.prompt.text(), "keep this draft");
+            assert_eq!(launcher.pending_images.len(), 1);
+            assert!(launcher.open);
+            launcher.close(cx);
+            assert!(
+                launcher.open,
+                "click-away and Escape must not hide an in-flight draft"
+            );
+            launcher.finish_existing_delivery(
+                ticket,
+                Err("daemon rejected the request".to_owned()),
+                cx,
+            );
+            assert!(!launcher.delivery.is_sending());
             assert_eq!(launcher.prompt.text(), "keep this draft");
             assert_eq!(launcher.pending_images.len(), 1);
             assert!(launcher.open);
@@ -2315,5 +3463,87 @@ mod tests {
             );
         });
         assert!(private_path.exists());
+    }
+
+    #[tokio::test]
+    async fn disconnected_daemon_is_reported_as_an_async_delivery_failure() {
+        let result = send_existing_turn(
+            Arc::new(diri_client::DaemonClient::with_socket_path(
+                "/nonexistent/diri-launcher-image-test.sock",
+            )),
+            SessionId("session".into()),
+            "prompt".to_owned(),
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(
+            result.is_err_and(|error| error.contains("waiting for daemon connection")),
+            "the acknowledged path must surface connection failure, not report queue success"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn acknowledged_delivery_sends_exactly_one_submitted_turn() {
+        use diri_proto::{ControlMessage, HelloResult, Method, RUST_ENGINE_KIND, WIRE_VERSION};
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (request_tx, request_rx) = std::sync::mpsc::sync_channel(1);
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                let ControlMessage::Request { id, method, params } =
+                    serde_json::from_str(&line).unwrap()
+                else {
+                    continue;
+                };
+                let result = if method == Method::HELLO {
+                    serde_json::to_value(HelloResult {
+                        proto: WIRE_VERSION,
+                        build: "test-engine".to_owned(),
+                        pid: std::process::id() as i32,
+                        engine_kind: Some(RUST_ENGINE_KIND.to_owned()),
+                        executable_hash: None,
+                    })
+                    .unwrap()
+                } else {
+                    request_tx.send((method, params)).unwrap();
+                    serde_json::json!({})
+                };
+                let response = ControlMessage::Response {
+                    id,
+                    result: Ok(result),
+                };
+                writeln!(writer, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+            }
+        });
+
+        let client = Arc::new(diri_client::DaemonClient::with_socket_path(socket));
+        client.connect();
+        send_existing_turn(
+            Arc::clone(&client),
+            SessionId("target-session".into()),
+            "compare the two images".to_owned(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        let (method, params) = request_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(method, Method::SESSION_SEND_TEXT);
+        let params = params.unwrap();
+        assert_eq!(params["sessionID"], "target-session");
+        assert_eq!(params["text"], "compare the two images");
+        assert_eq!(params["submit"], true);
+        assert!(request_rx.try_recv().is_err(), "one click sends one turn");
+        client.shutdown().await;
+        server.join().unwrap();
     }
 }

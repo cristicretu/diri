@@ -2421,34 +2421,6 @@ impl StoreRuntime {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn inert_with_action_receiver() -> (Self, mpsc::UnboundedReceiver<SendTextCommand>) {
-        let (store, _effects) = SessionStore::headless(Prefs::default());
-        let store = Arc::new(RwLock::new(store));
-        let (detach_tx, _) = broadcast::channel(1);
-        let (change_tx, _) = broadcast::channel(1);
-        let (status_tx, _) = broadcast::channel(1);
-        let snapshot = store
-            .read()
-            .expect("session store lock poisoned")
-            .snapshot();
-        let (snapshot_tx, _) = tokio::sync::watch::channel(snapshot);
-        let (action_tx, action_rx) = mpsc::unbounded_channel();
-        (
-            Self {
-                store,
-                client: Arc::new(DaemonClient::new()),
-                detach_tx,
-                change_tx,
-                status_tx,
-                snapshot_tx,
-                action_tx,
-                tasks: Mutex::new(Vec::new()),
-            },
-            action_rx,
-        )
-    }
-
     fn start_with_store(
         client: Arc<DaemonClient>,
         store: SessionStore,

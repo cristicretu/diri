@@ -915,7 +915,7 @@ impl RootView {
         }
         let text = quote.framed();
         self.launcher.update(cx, |launcher, cx| {
-            launcher.open_for_session(target, &text, None, window, cx);
+            launcher.open_for_session(target, &text, &[], None, window, cx);
         });
         // Mount the app-owned composer before focusing its insertion caret.
         // This changes no sidebar/session selection and does not touch the PTY.

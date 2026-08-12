@@ -2462,7 +2462,7 @@ impl TerminalPane {
                     && paths
                         .paths()
                         .iter()
-                        .any(|path| crate::image_attachments::inspect_path(path).is_ok())
+                        .any(|path| crate::image_attachments::inspect_path_for_drag(path).is_ok())
                 {
                     element
                         .bg(Palette::GEMINI_BLUE.alpha(0.08))
