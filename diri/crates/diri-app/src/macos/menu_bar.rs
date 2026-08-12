@@ -28,7 +28,7 @@ use objc2_foundation::{
     MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
 };
 
-use diri_proto::{AgentKind, ProjectId, SessionId};
+use diri_proto::{AgentKind, AttentionLevel, ProjectId, SessionId};
 use diri_ui::{BrandMarkKind, Chip, Fill, Ink, Radius};
 
 use crate::macos::brand_raster;
@@ -89,6 +89,7 @@ const HOVER_FILL_ALPHA: f64 = 0.06;
 pub struct NativeMenuBar {
     store: Arc<RwLock<SessionStore>>,
     _status_item: Retained<NSStatusItem>,
+    button: Retained<NSStatusBarButton>,
     panel: Retained<MenuBarPanel>,
     surface: Retained<NSVisualEffectView>,
     brand_hit: Retained<MenuBarBrandHit>,
@@ -102,6 +103,8 @@ pub struct NativeMenuBar {
     body: Retained<NSView>,
     target: Retained<MenuBarTarget>,
     last_fingerprint: Option<u64>,
+    /// Last (level, badge) pushed to the status item; see [`NativeMenuBar::set_attention`].
+    last_attention: Option<(AttentionLevel, usize)>,
 }
 
 impl Drop for NativeMenuBar {
@@ -310,17 +313,17 @@ impl NativeMenuBar {
             button.setTarget(Some(&*target as &AnyObject));
             button.setAction(Some(sel!(toggleDiriMenu:)));
         }
-        // Static status-item mark: never tint, badge, or swap on attention.
+        // Template mark once; attention only retints (same Ink map as row glyphs).
         if let Some(image) = brand_raster::template_diri_logo_ns_image(DIRI_LOGO_HEIGHT as f32) {
             button.setImage(Some(&image));
         }
         button.setTitle(&NSString::new());
         button.setImagePosition(NSCellImagePosition::ImageOnly);
-        button.setContentTintColor(None);
 
-        let menu_bar = Self {
+        let mut menu_bar = Self {
             store,
             _status_item: status_item,
+            button,
             panel,
             surface,
             brand_hit,
@@ -334,32 +337,46 @@ impl NativeMenuBar {
             body,
             target,
             last_fingerprint: None,
+            last_attention: None,
         };
+        menu_bar.set_attention(AttentionLevel::None, 0);
         Some(menu_bar)
     }
 
     pub fn refresh(&mut self) {
-        // The panel is closed for almost every publish. Building the inbox —
-        // which rebuilds the sidebar tree — before checking that would put the
-        // most expensive work in the app on the hottest path. The status-item
-        // mark is static, so a closed panel needs nothing else.
+        // Closed panel: only the status-item tint. Building the inbox first
+        // would put the most expensive work on the hottest path.
         if !self.panel.isVisible() {
+            let (attention, needs_you) = self
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .attention_rollup();
+            self.set_attention(attention, needs_you);
             self.last_fingerprint = None;
             return;
         }
 
         let collapsed = self.target.collapsed_projects();
-        let (model, selected) = {
+        let (model, selected, attention, needs_you) = {
             let mut store = self.store.write().expect("session store lock poisoned");
             let projection = store.menu_bar_projection();
             let model = build_inbox(&projection, &collapsed);
             let selected = store.selected_session_id().cloned();
-            (model, selected)
+            let (attention, needs_you) = store.attention_rollup();
+            (model, selected, attention, needs_you)
         };
-        self.apply_model(&model, selected.as_ref());
+        self.apply_model(&model, selected.as_ref(), attention, needs_you);
     }
 
-    fn apply_model(&mut self, model: &InboxModel, selected_session_id: Option<&SessionId>) {
+    fn apply_model(
+        &mut self,
+        model: &InboxModel,
+        selected_session_id: Option<&SessionId>,
+        attention: AttentionLevel,
+        needs_you: usize,
+    ) {
+        self.set_attention(attention, needs_you);
         let Some(mtm) = MainThreadMarker::new() else {
             return;
         };
@@ -425,6 +442,34 @@ impl NativeMenuBar {
         ));
 
         self.rebuild_body(model, content_height, selected_session_id, mtm);
+    }
+
+    /// Retint the template status-item / header mark. Same Ink map as row
+    /// [`glyph_tint`] / sidebar `StatusGlyph` — logo pixels stay fixed.
+    fn set_attention(&mut self, attention: AttentionLevel, needs_you: usize) {
+        if self.last_attention == Some((attention, needs_you)) {
+            return;
+        }
+        self.last_attention.replace((attention, needs_you));
+
+        let tint = match (needs_you > 0, attention) {
+            (true, _) | (_, AttentionLevel::NeedsInput) => Some(rgba_ns(
+                Ink::ATTENTION.r,
+                Ink::ATTENTION.g,
+                Ink::ATTENTION.b,
+                1.0,
+            )),
+            (_, AttentionLevel::DoneUnseen) => {
+                Some(rgba_ns(Ink::FRESH.r, Ink::FRESH.g, Ink::FRESH.b, 1.0))
+            }
+            (_, AttentionLevel::Working) => {
+                Some(NSColor::labelColor().colorWithAlphaComponent(0.82))
+            }
+            _ => None,
+        };
+        self.button.setContentTintColor(tint.as_deref());
+        self.header_icon
+            .setContentTintColor(Some(tint.as_deref().unwrap_or(&*NSColor::labelColor())));
     }
 
     fn rebuild_body(
