@@ -97,6 +97,36 @@ const LAUNCH_DEBOUNCE: Duration = Duration::from_millis(120);
 /// Elapsed-based so the probe cadence is the same on fast and idle ticks.
 const LIVENESS_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How long a half-erased screen waits for the rest of its repaint.
+///
+/// A TUI repaint is not one write. Ink, Ratatui and friends erase the old
+/// frame and draw the new one in separate `write`s, and a PTY hands each one
+/// over the instant it lands — so a reader that publishes per read publishes
+/// the half-erased screen in between, which is the flash users see as
+/// flickering. A terminal emulator never shows that state because its reader
+/// drains everything queued before it renders. Draining alone is not enough
+/// here: the daemon is usually parked in `poll` and wakes on the *first* write
+/// of a repaint, with the rest microseconds behind. This is the quiet window
+/// that lets the rest arrive. It is only ever waited out by a screen that
+/// just lost content, so typed echo is not slowed by it.
+const OUTPUT_SETTLE: Duration = Duration::from_millis(3);
+
+/// Ceiling on how long one batch may hold back a repaint. Output that never
+/// goes quiet (a build log) would otherwise wait on `OUTPUT_SETTLE` forever.
+/// Well under the 16ms grid flush interval, so continuous streaming publishes
+/// at exactly the same rate it did before.
+const OUTPUT_BATCH_CEILING: Duration = Duration::from_millis(8);
+
+/// Byte ceiling on one batch, matching `alacritty_terminal`'s
+/// `MAX_LOCKED_READ`. A child that writes faster than it can be parsed must
+/// not starve the grid indefinitely.
+const OUTPUT_BATCH_BYTES: usize = 1 << 20;
+
+/// How much of a held session's log the follow pump reads per pass. A full
+/// read means more is already waiting, which is how that pump recognizes a
+/// repaint it has only half consumed.
+const LOG_READ_BUDGET: usize = 64 << 10;
+
 /// What a session looks like from the outside.
 #[derive(Clone, Debug)]
 pub struct SessionView {
@@ -2239,16 +2269,11 @@ fn pump(
             Ok(usize::MAX) => {}
             Ok(0) => break, // the child closed the terminal
             Ok(n) => {
-                let chunk = &buffer[..n];
-                {
-                    let mut log = shared.log.lock().expect("log");
-                    // A failed disk write must not stop the session: the child
-                    // is still running and its status still matters.
-                    let _ = log.append(chunk);
-                }
+                let closed = feed_output_batch(&shared, &mut reader, &mut buffer, n);
+                // One detection pass per batch, not per read: the reducer
+                // discards observations it has already judged anyway.
                 let observation = {
                     let mut screen = shared.screen.lock().expect("screen");
-                    screen.feed(chunk);
                     evaluate_if_screen_changed(
                         &shared,
                         &mut screen,
@@ -2268,10 +2293,15 @@ fn pump(
                     drop(reducer);
                     apply(&shared, &outcome);
                 }
+                if closed {
+                    break;
+                }
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         }
+
+        release_stalled_sync(&shared);
 
         // Ticks drive the debounce timers even when the child is quiet.
         if last_tick.elapsed().unwrap_or_default() >= TICK_INTERVAL {
@@ -2300,6 +2330,81 @@ fn pump(
     apply(&shared, &outcome);
     shared.exited.store(true, Ordering::SeqCst);
     let _ = shared.log.lock().expect("log").flush();
+}
+
+/// Feeds one batch of PTY output: the read the caller already made, plus every
+/// continuation that arrives before the batch settles.
+///
+/// The point of the batch is that the caller publishes the grid *once*, after
+/// it returns. A repaint the child split across several writes therefore
+/// reaches attached clients as one frame instead of as an erase followed by a
+/// redraw, which is what a pane paints as a flicker. See [`OUTPUT_SETTLE`].
+///
+/// The screen lock is released between chunks so the grid can still be read
+/// mid-batch, which is safe because nothing wakes a reader until the caller
+/// publishes.
+///
+/// Returns true when the child closed the terminal.
+fn feed_output_batch(
+    shared: &Shared,
+    reader: &mut crate::pty::PtyStream,
+    buffer: &mut [u8],
+    first: usize,
+) -> bool {
+    let deadline = Instant::now() + OUTPUT_BATCH_CEILING;
+    let mut count = first;
+    let mut total = 0usize;
+    let mut filled_before = None;
+    loop {
+        {
+            let mut log = shared.log.lock().expect("log");
+            // A failed disk write must not stop the session: the child is
+            // still running and its status still matters.
+            let _ = log.append(&buffer[..count]);
+        }
+        let mid_repaint = {
+            let mut screen = shared.screen.lock().expect("screen");
+            let before = *filled_before.get_or_insert_with(|| screen.filled_cells());
+            screen.feed(&buffer[..count]);
+            screen.filled_cells() < before
+        };
+        total += count;
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if total >= OUTPUT_BATCH_BYTES || remaining.is_zero() {
+            return false;
+        }
+        // Bytes already queued are always folded in — that costs nothing and
+        // is what a terminal emulator's reader does. Waiting for bytes that
+        // have not arrived is reserved for a screen that currently holds less
+        // than it did when the batch opened, which is a repaint caught between
+        // its erase and its redraw. An echo, which only adds, never waits.
+        let settle = if mid_repaint {
+            OUTPUT_SETTLE
+        } else {
+            Duration::ZERO
+        };
+        if !matches!(reader.wait_readable(remaining.min(settle)), Ok(true)) {
+            return false;
+        }
+        count = match reader.read(buffer) {
+            Ok(0) => return true, // the child closed the terminal
+            Ok(next) => next,
+            // Ending the batch here is safe: the caller polls again straight
+            // away and picks the rest up.
+            Err(_) => return false,
+        };
+    }
+}
+
+/// Publishes a synchronized update the child opened and never closed.
+///
+/// Cheap enough to run every loop iteration: it is an `Option<Instant>` test
+/// unless an update is actually overdue.
+fn release_stalled_sync(shared: &Shared) {
+    if shared.screen.lock().expect("screen").flush_expired_sync() {
+        shared.grid_wake.notify();
+    }
 }
 
 /// Runs manifest detection only when the visible screen actually changed.
@@ -2399,6 +2504,8 @@ fn pump_held(
     let mut last_scan_at = None;
     let mut last_scan_seq = 0u64;
     let mut exit_status: Option<HolderExitStatus> = None;
+    // Set while a repaint is being assembled across more than one log read.
+    let mut publish_pending: Option<Instant> = None;
     // Until the tail is first caught up, bytes are history, not activity:
     // they must render, but not flip a quiet adopted session to Working.
     let mut replaying = true;
@@ -2408,10 +2515,19 @@ fn pump_held(
         let (start, chunk) = {
             let mut log = shared.log.lock().expect("log");
             log.refresh_from_disk();
-            log.read(offset, 64 << 10)
+            log.read(offset, LOG_READ_BUDGET)
         };
+        // A full read means the tail is not caught up, so this pass may hold
+        // half a repaint. Publishing it would flicker; fold the rest into the
+        // same frame instead — bounded, so a holder streaming faster than we
+        // parse still updates.
+        let caught_up = chunk.len() < LOG_READ_BUDGET;
 
         if chunk.is_empty() {
+            if publish_pending.take().is_some() {
+                shared.grid_wake.notify();
+            }
+            release_stalled_sync(&shared);
             if replaying {
                 replaying = false;
                 // The replay tail is drained: checkpoint immediately, as the
@@ -2521,7 +2637,11 @@ fn pump_held(
                     &mut last_eval_seq,
                 )
             };
-            shared.grid_wake.notify();
+            let batch_started = *publish_pending.get_or_insert_with(Instant::now);
+            if caught_up || batch_started.elapsed() >= OUTPUT_BATCH_CEILING {
+                publish_pending = None;
+                shared.grid_wake.notify();
+            }
             let now = SystemTime::now();
             let mut reducer = shared.reducer.lock().expect("reducer");
             if !replaying {
@@ -2534,6 +2654,12 @@ fn pump_held(
                 apply(&shared, &outcome);
             }
         }
+    }
+
+    // A repaint still being assembled when the holder exited is the last thing
+    // clients will ever see of this session: publish it.
+    if publish_pending.take().is_some() {
+        shared.grid_wake.notify();
     }
 
     // Detaching or exiting: capture the final screen, so the next daemon

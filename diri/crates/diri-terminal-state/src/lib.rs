@@ -292,6 +292,7 @@ pub struct HeadlessScreen {
 
     content_seq: u64,
     last_digest: u64,
+    filled_cells: usize,
     /// Trailing bytes of the previous chunk, so an OSC split across a read
     /// boundary is still recognized.
     progress_carry: Vec<u8>,
@@ -327,6 +328,7 @@ impl HeadlessScreen {
             progress_value: None,
             content_seq: 0,
             last_digest: 0,
+            filled_cells: 0,
             progress_carry: Vec::new(),
             last_cells: Vec::new(),
             last_grid_cols: 0,
@@ -343,24 +345,65 @@ impl HeadlessScreen {
         self.scan_progress(bytes);
         let title_before = self.title.clone();
         self.parser.advance(&mut self.term, bytes);
-        self.drain_events();
+        self.settle(title_before);
+    }
 
-        // Damage is the cheap gate: when the emulator reports nothing
-        // touched, skip fingerprinting entirely. When it does (which includes
-        // invisible changes like a cursor toggle), a direct cell hash — no
-        // per-line String allocation — decides whether the *content* changed.
+    /// Ends a synchronized update (DECSET 2026) whose deadline has passed.
+    ///
+    /// Between `\e[?2026h` and `\e[?2026l` the parser holds every byte back so
+    /// the repaint lands as one atomic screen — which is exactly what we want,
+    /// and the reason a TUI that speaks this protocol never flickers. But the
+    /// escape hatch is the host's job: vte's timeout only records a deadline,
+    /// and nothing expires it. A child that opens a synchronized update and
+    /// then dies, stalls, or simply overruns 150ms would otherwise freeze the
+    /// pane until 2 MiB of output had piled up behind it. Callers tick this.
+    ///
+    /// Returns true when a held update was released.
+    pub fn flush_expired_sync(&mut self) -> bool {
+        let Some(deadline) = self.parser.sync_timeout().sync_timeout() else {
+            return false;
+        };
+        if std::time::Instant::now() < deadline {
+            return false;
+        }
+        let title_before = self.title.clone();
+        self.parser.stop_sync(&mut self.term);
+        self.settle(title_before);
+        true
+    }
+
+    /// Post-parse bookkeeping shared by `feed` and `flush_expired_sync`.
+    ///
+    /// Damage is the cheap gate: when the emulator reports nothing touched,
+    /// skip fingerprinting entirely. When it does (which includes invisible
+    /// changes like a cursor toggle), a direct cell hash — no per-line String
+    /// allocation — decides whether the *content* changed.
+    fn settle(&mut self, title_before: Option<String>) {
+        self.drain_events();
         let damaged = match self.term.damage() {
             alacritty_terminal::term::TermDamage::Full => true,
             alacritty_terminal::term::TermDamage::Partial(mut lines) => lines.next().is_some(),
         };
         self.term.reset_damage();
         if damaged || self.title != title_before {
-            let digest = self.digest_cells();
+            let (digest, filled) = self.fingerprint_cells();
+            self.filled_cells = filled;
             if digest != self.last_digest {
                 self.last_digest = digest;
                 self.content_seq += 1;
             }
         }
+    }
+
+    /// How many cells currently hold something other than a blank.
+    ///
+    /// A repaint that has erased but not yet redrawn is the one screen state
+    /// no observer should ever see, and this is what makes it recognizable:
+    /// output that only *removes* content is a repaint caught halfway. Free to
+    /// maintain — it falls out of the fingerprint walk already done per feed.
+    #[must_use]
+    pub fn filled_cells(&self) -> usize {
+        self.filled_cells
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -756,19 +799,25 @@ impl HeadlessScreen {
     /// Content fingerprint hashed straight off the grid cells, so
     /// `content_seq` only advances when the visible screen actually changed.
     /// Detection uses that to skip re-evaluating a frame it has already
-    /// judged.
-    fn digest_cells(&self) -> u64 {
+    /// judged. The non-blank count rides the same walk — see
+    /// [`filled_cells`](Self::filled_cells).
+    fn fingerprint_cells(&self) -> (u64, usize) {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut filled = 0;
         let grid = self.term.grid();
         for row in 0..self.geometry.rows {
             let line = Line(row as i32);
             for column in 0..self.geometry.cols {
-                grid[line][Column(column)].c.hash(&mut hasher);
+                let character = grid[line][Column(column)].c;
+                character.hash(&mut hasher);
+                if character != ' ' && character != '\0' {
+                    filled += 1;
+                }
             }
         }
         self.title.hash(&mut hasher);
-        hasher.finish()
+        (hasher.finish(), filled)
     }
 
     /// Extracts `ESC ] 9 ; 4 ; state ; value` progress reports.
@@ -1027,6 +1076,45 @@ mod tests {
         screen.feed(b"\x1b]9;4;1");
         screen.feed(b";75\x07");
         assert_eq!(screen.progress(), Some((1, 75)));
+    }
+
+    #[test]
+    fn a_synchronized_repaint_never_shows_its_erased_half() {
+        // What DECSET 2026 exists for: the child erases and redraws inside the
+        // bracket, and no observer may see the gap between the two.
+        let mut screen = screen_with(b"before the repaint\r\n");
+        let quiet = screen.content_seq();
+
+        screen.feed(b"\x1b[?2026h\x1b[2J\x1b[H");
+        assert_eq!(
+            screen.lines(),
+            vec!["before the repaint"],
+            "the erase is held back until the update closes"
+        );
+        assert_eq!(screen.content_seq(), quiet);
+
+        screen.feed(b"after the repaint\r\n\x1b[?2026l");
+        assert_eq!(screen.lines(), vec!["after the repaint"]);
+        assert!(screen.content_seq() > quiet);
+    }
+
+    #[test]
+    fn a_synchronized_update_the_child_never_closes_is_released() {
+        // vte records the 150ms deadline but nothing expires it, so without a
+        // host-side flush an abandoned bracket freezes the pane until 2 MiB of
+        // output has piled up behind it.
+        let mut screen = screen_with(b"before the repaint\r\n");
+        screen.feed(b"\x1b[?2026h\x1b[2J\x1b[Hafter the repaint\r\n");
+        assert!(!screen.flush_expired_sync(), "the deadline has not passed");
+        assert_eq!(screen.lines(), vec!["before the repaint"]);
+
+        std::thread::sleep(std::time::Duration::from_millis(160));
+        assert!(screen.flush_expired_sync(), "an overdue update is released");
+        assert_eq!(screen.lines(), vec!["after the repaint"]);
+        assert!(
+            !screen.flush_expired_sync(),
+            "releasing it once clears the deadline"
+        );
     }
 
     #[test]
