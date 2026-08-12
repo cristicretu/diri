@@ -47,6 +47,7 @@ use crate::commands::{
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::{NavigationOverlay, query_label};
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
+use crate::quote::{Quote, QuoteSource};
 use crate::session_surfaces::switcher_key;
 use crate::store::StoreRuntime;
 use crate::surface_shell::UtilitySurfaces;
@@ -1026,6 +1027,11 @@ impl TerminalPane {
         self.focus.is_focused(window)
     }
 
+    #[must_use]
+    pub fn quote_focus_handle(&self) -> FocusHandle {
+        self.focus.clone()
+    }
+
     fn sync_status_glyphs(
         &mut self,
         colors: SemanticColors,
@@ -1751,6 +1757,15 @@ impl TerminalPane {
         if !text.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
+    }
+
+    /// Captures terminal text together with the stable absolute scrollback
+    /// rows that locate it approximately within the source session.
+    #[must_use]
+    pub fn quote_selection(&self) -> Option<Quote> {
+        let id = self.selected_id()?;
+        let resident = self.residents.get(&id)?;
+        quote_from_terminal_element(id, &resident.element)
     }
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
@@ -3055,6 +3070,18 @@ impl TerminalPane {
     }
 }
 
+fn quote_from_terminal_element(session_id: SessionId, element: &TerminalElement) -> Option<Quote> {
+    let range = element.selection_range()?;
+    Quote::new(
+        QuoteSource::Terminal {
+            session_id,
+            start_row: range.start.row,
+            end_row: range.end.row,
+        },
+        element.selected_text(),
+    )
+}
+
 impl Render for TerminalPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.reconcile_residency();
@@ -3786,7 +3813,7 @@ fn exit_description(session: &SessionRecord) -> String {
 
 #[cfg(test)]
 mod tests {
-    use diri_proto::grid::{ChangedRow, GridCell};
+    use diri_proto::grid::{ChangedRow, GridCell, TermColor, TermStyle};
     use diri_proto::{
         DateMillis, ExitInfo, NeedsInputDetail, NeedsInputKind, NeedsInputSource, SessionListResult,
     };
@@ -4164,6 +4191,33 @@ mod tests {
         assert_eq!(
             plan_resize(true, Some(Duration::ZERO), true),
             ResizePlan::SendNow
+        );
+    }
+
+    #[test]
+    fn terminal_element_selection_becomes_a_session_provenance_quote() {
+        let mut buffer = GridBuffer::new(8, 1);
+        for (index, character) in "hello".chars().enumerate() {
+            buffer.cells[index] = GridCell::new(
+                u32::from(character),
+                TermColor::Default,
+                TermColor::DefaultInverted,
+                TermStyle::empty(),
+            );
+        }
+        let element = TerminalElement::with_buffer(buffer);
+        element.begin_selection(0, 0);
+        element.drag_selection(5, 0);
+        let quote = quote_from_terminal_element(SessionId::new("source-terminal"), &element)
+            .expect("terminal quote");
+        assert_eq!(quote.content, "hello");
+        assert_eq!(
+            quote.source,
+            QuoteSource::Terminal {
+                session_id: SessionId::new("source-terminal"),
+                start_row: 0,
+                end_row: 0,
+            }
         );
     }
 

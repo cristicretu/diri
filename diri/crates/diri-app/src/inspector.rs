@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -28,16 +28,18 @@ use gpui::{
 
 use crate::code_viewer::CodeViewer;
 use crate::diff::{
-    DiffFile, DiffHunk, DiffLayer, DiffRow, DiffRowKind, DiffSnapshot, load_local_diff,
-    snapshot_from_read_diff,
+    DiffFile, DiffHunk, DiffLayer, DiffRow, DiffRowKind, DiffSelection, DiffSnapshot,
+    load_local_diff, snapshot_from_read_diff,
 };
 use crate::git_review::{GitRepository, GitReviewError, PatchMutation, ReviewStatus};
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::markdown::MarkdownDocument;
 use crate::markdown_view::render_markdown;
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
+use crate::quote::{Quote, QuoteSource};
 use crate::review_prompt::{ReviewEvidence, ReviewLayer, ReviewPrompt};
 use crate::store::{InspectorTab, StoreRuntime};
+use crate::transcript::{TranscriptDocument, load as load_transcript};
 
 const DIFF_ROW_HEIGHT: f32 = 20.0;
 const GUTTER_WIDTH: f32 = 68.0;
@@ -109,6 +111,8 @@ struct DiffContext {
     id: SessionId,
     cwd: PathBuf,
     remote: bool,
+    transcript_path: Option<PathBuf>,
+    kind: ProtoAgentKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,6 +133,14 @@ enum ReviewLoadState {
 }
 
 #[derive(Clone, Debug)]
+enum TranscriptLoadState {
+    Unavailable,
+    Loading,
+    Ready(Arc<TranscriptDocument>),
+    Error,
+}
+
+#[derive(Clone, Debug)]
 enum ReviewAction {
     Stage(Vec<PathBuf>),
     Unstage(Vec<PathBuf>),
@@ -144,6 +156,12 @@ enum ReviewAction {
 struct AskDraft {
     evidence: Vec<ReviewEvidence>,
     label: String,
+}
+
+#[derive(Clone, Debug)]
+struct SelectedTurn {
+    key: String,
+    quote: Quote,
 }
 
 pub struct WorkbenchInspector {
@@ -162,6 +180,9 @@ pub struct WorkbenchInspector {
     review_state: ReviewLoadState,
     review_generation: u64,
     review_task: Option<Task<()>>,
+    transcript_state: TranscriptLoadState,
+    transcript_generation: u64,
+    transcript_task: Option<Task<()>>,
     review_action_task: Option<Task<()>>,
     review_action_busy: bool,
     review_feedback: Option<(bool, String)>,
@@ -175,6 +196,8 @@ pub struct WorkbenchInspector {
     commit_query: QueryEditor,
     discard_armed: bool,
     armed_hunk: Option<u64>,
+    diff_selection: DiffSelection,
+    selected_turn: Option<SelectedTurn>,
     diff_layer: DiffLayer,
     files_open: bool,
     comparison: SessionDiffBase,
@@ -245,6 +268,9 @@ impl WorkbenchInspector {
             review_state: ReviewLoadState::NoSession,
             review_generation: 0,
             review_task: None,
+            transcript_state: TranscriptLoadState::Unavailable,
+            transcript_generation: 0,
+            transcript_task: None,
             review_action_task: None,
             review_action_busy: false,
             review_feedback: None,
@@ -258,6 +284,8 @@ impl WorkbenchInspector {
             commit_query: QueryEditor::default(),
             discard_armed: false,
             armed_hunk: None,
+            diff_selection: DiffSelection::default(),
+            selected_turn: None,
             diff_layer: DiffLayer::Branch,
             files_open: false,
             comparison: SessionDiffBase::DefaultBranch,
@@ -293,6 +321,68 @@ impl WorkbenchInspector {
         }
         self.reconcile_diff_polling(cx);
         cx.notify();
+    }
+
+    #[must_use]
+    pub fn is_focused(&self, window: &Window) -> bool {
+        self.focus.is_focused(window)
+    }
+
+    /// Returns the selection owned by the inspector's active surface.
+    #[must_use]
+    pub fn quote_selection(&self) -> Option<Quote> {
+        match self.selected_tab {
+            InspectorTab::Changes => {
+                let LoadState::Ready(snapshot) = &self.state else {
+                    return None;
+                };
+                let session_id = self.context.as_ref()?.id.clone();
+                self.diff_selection.quote(snapshot, session_id)
+            }
+            InspectorTab::Info | InspectorTab::Artifacts => {
+                self.selected_turn.as_ref().map(|turn| turn.quote.clone())
+            }
+            InspectorTab::Code => None,
+        }
+    }
+
+    fn select_diff_row(
+        &mut self,
+        row: usize,
+        extend: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let LoadState::Ready(snapshot) = &self.state else {
+            return;
+        };
+        self.selected_turn = None;
+        self.diff_selection.select(snapshot, row, extend);
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    fn select_turn(
+        &mut self,
+        key: String,
+        source: QuoteSource,
+        content: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(quote) = Quote::new(source, content) else {
+            return;
+        };
+        self.diff_selection.clear();
+        self.selected_turn = Some(SelectedTurn { key, quote });
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    fn selected_turn_key(&self) -> Option<&str> {
+        self.selected_turn
+            .as_ref()
+            .map(|selection| selection.key.as_str())
     }
 
     fn reconcile_diff_polling(&mut self, cx: &mut Context<Self>) {
@@ -351,6 +441,8 @@ impl WorkbenchInspector {
             id: session.id.clone(),
             cwd: PathBuf::from(&session.cwd),
             remote: session.host.is_some(),
+            transcript_path: session.transcript_path.as_deref().map(PathBuf::from),
+            kind: session.effective_kind().clone(),
         })
     }
 
@@ -401,6 +493,8 @@ impl WorkbenchInspector {
             eprintln!("diri: could not remember inspector tab: {error}");
         }
         self.comparison_menu_open = false;
+        self.diff_selection.clear();
+        self.selected_turn = None;
         self.tab_transition_generation = self.tab_transition_generation.wrapping_add(1);
         if tab == InspectorTab::Changes {
             self.refresh(true, cx);
@@ -425,6 +519,8 @@ impl WorkbenchInspector {
     fn select_diff_layer(&mut self, layer: DiffLayer, cx: &mut Context<Self>) {
         self.files_open = false;
         self.armed_hunk = None;
+        self.diff_selection.clear();
+        self.selected_turn = None;
         self.discard_armed = false;
         self.commit_open = false;
         if self.diff_layer == layer {
@@ -452,6 +548,8 @@ impl WorkbenchInspector {
             self.context = None;
             self.state = LoadState::NoSession;
             self.review_state = ReviewLoadState::NoSession;
+            self.transcript_state = TranscriptLoadState::Unavailable;
+            self.transcript_task = None;
             self.code_viewer
                 .update(cx, |viewer, cx| viewer.set_workspace(None, cx));
             cx.notify();
@@ -464,6 +562,8 @@ impl WorkbenchInspector {
             self.scrollbar_layout_primed = false;
             self.files_open = false;
             self.armed_hunk = None;
+            self.diff_selection.clear();
+            self.selected_turn = None;
             self.ask_draft = None;
             self.ask_feedback = None;
             self.ask_query.clear();
@@ -473,6 +573,9 @@ impl WorkbenchInspector {
                 .update(cx, |viewer, cx| viewer.set_workspace(workspace, cx));
         }
         self.context = Some(context.clone());
+        if context_changed {
+            self.refresh_transcript(&context, cx);
+        }
         self.refresh_review(&context, force, cx);
         if !force && !context_changed && matches!(self.state, LoadState::NoSession) {
             return;
@@ -520,9 +623,50 @@ impl WorkbenchInspector {
                 };
                 if this.state != next {
                     this.state = next;
+                    // Row indices are only meaningful for the snapshot they
+                    // came from. Clearing avoids silently quoting a different
+                    // hunk after a live Git refresh inserts or removes rows.
+                    this.diff_selection.clear();
                     this.scrollbar_layout_primed = false;
                     cx.notify();
                 }
+            });
+        }));
+    }
+
+    fn refresh_transcript(&mut self, context: &DiffContext, cx: &mut Context<Self>) {
+        self.transcript_task = None;
+        self.transcript_generation = self.transcript_generation.wrapping_add(1);
+        let generation = self.transcript_generation;
+        let supported = matches!(
+            context.kind.id(),
+            ProtoAgentKind::CLAUDE_CODE_ID | ProtoAgentKind::CODEX_ID
+        );
+        let Some(path) = context
+            .transcript_path
+            .clone()
+            .filter(|_| !context.remote && supported)
+        else {
+            self.transcript_state = TranscriptLoadState::Unavailable;
+            return;
+        };
+        let kind = context.kind.clone();
+        self.transcript_state = TranscriptLoadState::Loading;
+        self.transcript_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { load_transcript(&path, &kind) })
+                .await
+                .map_err(|_| ())
+                .map(Arc::new);
+            let _ = this.update(cx, |this, cx| {
+                if this.transcript_generation != generation {
+                    return;
+                }
+                this.transcript_state = match result {
+                    Ok(document) => TranscriptLoadState::Ready(document),
+                    Err(()) => TranscriptLoadState::Error,
+                };
+                cx.notify();
             });
         }));
     }
@@ -980,6 +1124,12 @@ impl WorkbenchInspector {
 
         content = content.child(self.render_status_evidence(session, colors, cx));
 
+        if let Some(transcript) = self.render_transcript(session, colors, cx) {
+            content = content
+                .child(section_label("Recent conversation", colors))
+                .child(transcript);
+        }
+
         if let Some(detail) = &session.needs_input {
             let risk_color = if detail.risk_hint == diri_proto::RiskHint::Destructive {
                 Ink::DANGER
@@ -1045,9 +1195,11 @@ impl WorkbenchInspector {
                     .map(|body| self.markdown_document(body));
                 content = content.child(render_pull_request(
                     pull_request,
+                    session.id.clone(),
                     colors,
                     inspector.clone(),
                     body,
+                    self.selected_turn_key().map(str::to_owned),
                 ));
             }
         }
@@ -1112,6 +1264,90 @@ impl WorkbenchInspector {
             .child(section_label("Details", colors))
             .child(details)
             .into_any_element()
+    }
+
+    fn render_transcript(
+        &mut self,
+        session: &SessionRecord,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let TranscriptLoadState::Ready(document) = &self.transcript_state else {
+            return None;
+        };
+        if document.turns.is_empty() {
+            return None;
+        }
+        let turns = Arc::clone(document);
+        let first = turns.turns.len().saturating_sub(8);
+        let selected_key = self.selected_turn_key().map(str::to_owned);
+        let inspector = cx.entity();
+        let mut list = div().flex().flex_col().gap(px(6.0));
+        for (index, turn) in turns.turns.iter().enumerate().skip(first) {
+            let key = format!("transcript:{}:{}", session.id.0, turn.line);
+            let selected = selected_key.as_deref() == Some(key.as_str());
+            let source = QuoteSource::Transcript {
+                session_id: session.id.clone(),
+                turn: format!("{} turn near line {}", turn.role, turn.line),
+            };
+            let selection_content = turn.text.clone();
+            let selection_inspector = inspector.clone();
+            let document = self.markdown_document(&turn.text);
+            list = list.child(
+                div()
+                    .id(("transcript-turn", index))
+                    .debug_selector(move || format!("INSPECTOR_TRANSCRIPT_TURN_{index}"))
+                    .p(px(10.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(7.0))
+                    .rounded(px(Radius::BADGE))
+                    .border_1()
+                    .border_color(if selected {
+                        rgba(0x8bb9e8aa)
+                    } else {
+                        colors.primary.alpha(0.07)
+                    })
+                    .bg(if selected {
+                        rgba(0x5b8fd12f)
+                    } else {
+                        colors.primary.alpha(0.025)
+                    })
+                    .cursor_pointer()
+                    .hover(move |card| card.bg(rgba(0x5b8fd122)))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .text_size(px(Typo::META.size))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(colors.secondary)
+                            .child(turn.role)
+                            .child(
+                                div()
+                                    .ml_auto()
+                                    .font_weight(FontWeight::NORMAL)
+                                    .text_color(colors.tertiary)
+                                    .child(format!("Transcript line {}", turn.line)),
+                            ),
+                    )
+                    .child(render_markdown(&document, colors))
+                    .on_click(move |_, window, cx| {
+                        selection_inspector.update(cx, |inspector, cx| {
+                            inspector.select_turn(
+                                key.clone(),
+                                source.clone(),
+                                selection_content.clone(),
+                                window,
+                                cx,
+                            );
+                        });
+                        cx.stop_propagation();
+                    }),
+            );
+        }
+        Some(list.into_any_element())
     }
 
     fn render_status_evidence(
@@ -1455,9 +1691,11 @@ impl WorkbenchInspector {
                     .map(|body| self.markdown_document(body));
                 content = content.child(render_pull_request(
                     pull_request,
+                    session.id.clone(),
                     colors,
                     inspector.clone(),
                     body,
+                    self.selected_turn_key().map(str::to_owned),
                 ));
             }
         }
@@ -1663,8 +1901,8 @@ impl WorkbenchInspector {
         let content_width =
             (GUTTER_WIDTH + 28.0 + snapshot.max_text_columns as f32 * 7.1).clamp(320.0, 3700.0);
         let inspector = cx.entity();
-        let repo_root = snapshot.repo_root.clone();
         let armed_hunk = self.armed_hunk;
+        let selection = self.diff_selection.clone();
         let list = uniform_list("inspector-diff", row_count, move |range, _, _| {
             render_rows(
                 &snapshot,
@@ -1672,8 +1910,8 @@ impl WorkbenchInspector {
                 content_width,
                 colors,
                 inspector.clone(),
-                &repo_root,
                 armed_hunk,
+                &selection,
             )
         })
         .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
@@ -2370,6 +2608,35 @@ impl WorkbenchInspector {
             }
             cx.stop_propagation();
             return;
+        }
+        if !self.commit_open && self.selected_tab == InspectorTab::Changes {
+            let moved = match event.keystroke.key.as_str() {
+                "up" => match &self.state {
+                    LoadState::Ready(snapshot) => {
+                        self.diff_selection
+                            .move_by(snapshot, -1, event.keystroke.modifiers.shift)
+                    }
+                    _ => false,
+                },
+                "down" => match &self.state {
+                    LoadState::Ready(snapshot) => {
+                        self.diff_selection
+                            .move_by(snapshot, 1, event.keystroke.modifiers.shift)
+                    }
+                    _ => false,
+                },
+                "escape" if !self.diff_selection.is_empty() => {
+                    self.diff_selection.clear();
+                    true
+                }
+                _ => false,
+            };
+            if moved {
+                self.selected_turn = None;
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
         }
         if !self.commit_open {
             return;
@@ -3073,9 +3340,11 @@ fn detail_row(
 
 fn render_pull_request(
     pull_request: &PullRequestStatus,
+    session_id: SessionId,
     colors: SemanticColors,
     inspector: Entity<WorkbenchInspector>,
     body: Option<Arc<MarkdownDocument>>,
+    selected_turn: Option<String>,
 ) -> AnyElement {
     let number = if pull_request.number > 0 {
         format!("PR #{}", pull_request.number)
@@ -3292,14 +3561,50 @@ fn render_pull_request(
                         }),
                 )
                 .when_some(body, |header, body| {
+                    let key = format!("pr:{}:body", pull_request.url);
+                    let selected = selected_turn.as_deref() == Some(key.as_str());
+                    let content = body.plain_text();
+                    let source = QuoteSource::Markdown {
+                        session_id: session_id.clone(),
+                        document: number.clone(),
+                        turn: 0,
+                    };
+                    let selection_inspector = inspector.clone();
                     header.child(
                         div()
+                            .id(SharedString::from(format!(
+                                "inspector-pr-{}-body",
+                                pull_request.number
+                            )))
+                            .debug_selector(|| "INSPECTOR_PR_BODY".to_owned())
                             .mt(px(1.0))
                             .p(px(11.0))
                             .rounded(px(Radius::BADGE))
-                            .bg(colors.primary.alpha(0.035))
+                            .bg(if selected {
+                                rgba(0x5b8fd12f)
+                            } else {
+                                colors.primary.alpha(0.035)
+                            })
                             .border_1()
-                            .border_color(colors.primary.alpha(0.055))
+                            .border_color(if selected {
+                                rgba(0x8bb9e8aa)
+                            } else {
+                                colors.primary.alpha(0.055)
+                            })
+                            .cursor_pointer()
+                            .hover(move |turn| turn.bg(rgba(0x5b8fd122)))
+                            .on_click(move |_, window, cx| {
+                                selection_inspector.update(cx, |inspector, cx| {
+                                    inspector.select_turn(
+                                        key.clone(),
+                                        source.clone(),
+                                        content.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                });
+                                cx.stop_propagation();
+                            })
                             .child(render_markdown(&body, colors)),
                     )
                 }),
@@ -3368,8 +3673,10 @@ fn render_pull_request(
                     item,
                     index,
                     discussion.len(),
-                    pull_request.number,
+                    session_id.clone(),
                     colors,
+                    inspector.clone(),
+                    selected_turn.as_deref(),
                 ));
             }
         }
@@ -3587,8 +3894,10 @@ fn render_discussion_item(
     item: &PrDiscussionItem,
     index: usize,
     total: usize,
-    pr_number: i64,
+    session_id: SessionId,
     colors: SemanticColors,
+    inspector: Entity<WorkbenchInspector>,
+    selected_turn: Option<&str>,
 ) -> AnyElement {
     let author = item.author.clone();
     let initial = author
@@ -3608,11 +3917,22 @@ fn render_discussion_item(
     };
     let time = item.created_at.as_ref().map(|date| relative_time(date.0));
     let url = item.url.clone();
+    let key = format!("discussion:{index}:{}", url.as_deref().unwrap_or("local"));
+    let selected = selected_turn == Some(key.as_str());
+    let selection_content = if item.body.trim().is_empty() {
+        body_fallback.clone()
+    } else {
+        body.plain_text()
+    };
+    let source = QuoteSource::Markdown {
+        session_id,
+        document: format!("pull request discussion by {author}"),
+        turn: index,
+    };
+    let selection_inspector = inspector;
 
     div()
-        .id(SharedString::from(format!(
-            "inspector-pr-{pr_number}-comment-{index}"
-        )))
+        .id(SharedString::from(format!("inspector-pr-comment-{index}")))
         .debug_selector(move || format!("INSPECTOR_PR_COMMENT_{index}"))
         .flex()
         .items_stretch()
@@ -3660,19 +3980,25 @@ fn render_discussion_item(
         .child(
             div()
                 .id(SharedString::from(format!(
-                    "inspector-pr-{pr_number}-comment-card-{index}"
+                    "inspector-pr-comment-card-{index}"
                 )))
                 .min_w(px(0.0))
                 .flex_1()
                 .mb(px(if index + 1 < total { 2.0 } else { 0.0 }))
                 .rounded(px(Radius::BADGE))
                 .border_1()
-                .border_color(colors.primary.alpha(0.07))
-                .bg(colors.primary.alpha(0.025))
-                .when(url.is_some(), |card| {
-                    card.cursor_pointer()
-                        .hover(move |card| card.bg(colors.primary.alpha(0.05)))
+                .border_color(if selected {
+                    rgba(0x8bb9e8aa)
+                } else {
+                    colors.primary.alpha(0.07)
                 })
+                .bg(if selected {
+                    rgba(0x5b8fd12f)
+                } else {
+                    colors.primary.alpha(0.025)
+                })
+                .cursor_pointer()
+                .hover(move |card| card.bg(rgba(0x5b8fd122)))
                 .child(
                     div()
                         .min_h(px(29.0))
@@ -3712,6 +4038,25 @@ fn render_discussion_item(
                                     .text_color(colors.tertiary)
                                     .child(time),
                             )
+                        })
+                        .when_some(url, |header, url| {
+                            header.child(
+                                div()
+                                    .id(("open-discussion-item", index))
+                                    .size(px(19.0))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(Radius::CHIP))
+                                    .cursor_pointer()
+                                    .hover(move |button| button.bg(colors.primary.alpha(0.07)))
+                                    .child(sf_symbol("arrow.up.right", 8.5, colors.tertiary))
+                                    .on_click(move |_, _, cx| {
+                                        cx.open_url(&url);
+                                        cx.stop_propagation();
+                                    }),
+                            )
                         }),
                 )
                 .child(
@@ -3728,8 +4073,17 @@ fn render_discussion_item(
                                 .into_any_element()
                         }),
                 )
-                .when_some(url, |card, url| {
-                    card.on_click(move |_, _, cx| cx.open_url(&url))
+                .on_click(move |_, window, cx| {
+                    selection_inspector.update(cx, |inspector, cx| {
+                        inspector.select_turn(
+                            key.clone(),
+                            source.clone(),
+                            selection_content.clone(),
+                            window,
+                            cx,
+                        );
+                    });
+                    cx.stop_propagation();
                 }),
         )
         .into_any_element()
@@ -4139,14 +4493,14 @@ fn render_rows(
     content_width: f32,
     colors: SemanticColors,
     inspector: Entity<WorkbenchInspector>,
-    repo_root: &Path,
     armed_hunk: Option<u64>,
+    selection: &DiffSelection,
 ) -> Vec<AnyElement> {
     let context = DiffRowRenderContext {
         content_width,
         colors,
         inspector,
-        repo_root: repo_root.to_path_buf(),
+        repo_root: snapshot.repo_root.clone(),
         layer: snapshot.layer,
         armed_hunk,
     };
@@ -4170,7 +4524,14 @@ fn render_rows(
                     })
                 })
                 .flatten();
-            render_row(index, &snapshot.rows[index], &context, file, hunk)
+            render_row(
+                index,
+                &snapshot.rows[index],
+                &context,
+                file,
+                hunk,
+                selection.contains(snapshot, index),
+            )
         })
         .collect()
 }
@@ -4195,6 +4556,7 @@ fn render_row(
     context: &DiffRowRenderContext,
     file: Option<DiffFile>,
     hunk: Option<(PathBuf, DiffHunk)>,
+    selected: bool,
 ) -> AnyElement {
     let content_width = context.content_width;
     let colors = context.colors;
@@ -4217,6 +4579,11 @@ fn render_row(
     let reference = row.text.clone();
     let cwd = repo_root.to_path_buf();
     let open_inspector = inspector.clone();
+    let select_inspector = inspector.clone();
+    let selectable = matches!(
+        row.kind,
+        DiffRowKind::Hunk | DiffRowKind::Context | DiffRowKind::Addition | DiffRowKind::Deletion
+    );
     let mut actions = div()
         .absolute()
         .right(px(6.0))
@@ -4478,7 +4845,24 @@ fn render_row(
         .w_full()
         .flex()
         .items_center()
-        .bg(background)
+        .bg(if selected {
+            rgba(0x5b8fd13d)
+        } else {
+            background
+        })
+        .when(selected, |line| {
+            line.border_l_2().border_color(rgba(0x8bb9e8dd))
+        })
+        .when(selectable, |line| {
+            line.cursor_pointer()
+                .hover(move |line| line.bg(rgba(0x5b8fd129)))
+                .on_click(move |event: &gpui::ClickEvent, window, cx| {
+                    select_inspector.update(cx, |inspector, cx| {
+                        inspector.select_diff_row(index, event.modifiers().shift, window, cx);
+                    });
+                    cx.stop_propagation();
+                })
+        })
         .when(row.kind == DiffRowKind::File, |line| {
             line.border_t_1()
                 .border_color(colors.primary.alpha(0.08))
@@ -4576,6 +4960,7 @@ mod tests {
     use crate::sidebar::{PreviewScenario, SidebarPreviewFixture};
     use diri_proto::DateMillis;
     use gpui::{Entity, Modifiers, TestAppContext};
+    use std::io::Write;
 
     struct InspectorHarness {
         inspector: Entity<WorkbenchInspector>,
@@ -4834,6 +5219,93 @@ mod tests {
         inspector.update(cx, |inspector, _| {
             inspector.refresh_task = None;
             inspector.review_task = None;
+            inspector.transcript_task = None;
+            inspector.poll_task = None;
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn claude_transcript_turns_are_selectable_quotes_in_the_info_surface(cx: &mut TestAppContext) {
+        let mut transcript = tempfile::NamedTempFile::new().expect("transcript");
+        writeln!(
+            transcript,
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"The parser drops UTF-8"}}]}}}}"#
+        )
+        .unwrap();
+
+        let runtime = Arc::new(StoreRuntime::inert());
+        let mut fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let selected = fixture
+            .selected_session_id
+            .clone()
+            .expect("selected session");
+        let session = fixture
+            .list
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == selected)
+            .expect("selected record");
+        session.kind = ProtoAgentKind::CLAUDE_CODE;
+        session.foreground_agent = None;
+        session.transcript_path = Some(transcript.path().to_string_lossy().into_owned());
+        {
+            let mut store = runtime.store.write().expect("session store lock poisoned");
+            store.hydrate(fixture.list);
+            store.select(selected.clone());
+        }
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let inspector_runtime = Arc::clone(&runtime);
+        let (harness, cx) = cx.add_window_view(move |_window, cx| {
+            let inspector = cx.new(|cx| WorkbenchInspector::new(inspector_runtime, tokio, cx));
+            InspectorHarness { inspector }
+        });
+        let inspector = harness.read_with(cx, |harness, _| harness.inspector.clone());
+        inspector.update(cx, |inspector, cx| {
+            // Exercise the production transcript refresh and Info renderer in
+            // isolation. `set_visible` also starts unrelated Git workers,
+            // which makes this deterministic GPUI test depend on Tokio's
+            // real blocking pool.
+            let context = inspector.selected_context().expect("selected context");
+            inspector.visible = true;
+            inspector.context = Some(context.clone());
+            inspector.refresh_transcript(&context, cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let transcript_state = inspector.read_with(cx, |inspector, _| {
+            format!("{:?}", inspector.transcript_state)
+        });
+        assert!(
+            transcript_state.starts_with("Ready"),
+            "transcript did not load: {transcript_state}"
+        );
+
+        let turn = cx
+            .debug_bounds("INSPECTOR_TRANSCRIPT_TURN_0")
+            .expect("assistant transcript turn");
+        cx.simulate_click(turn.center(), Modifiers::none());
+        let quote = inspector
+            .read_with(cx, |inspector, _| inspector.quote_selection())
+            .expect("selected transcript quote");
+        assert_eq!(quote.content, "The parser drops UTF-8");
+        assert_eq!(
+            quote.source,
+            QuoteSource::Transcript {
+                session_id: selected,
+                turn: "Claude turn near line 1".to_owned(),
+            }
+        );
+
+        inspector.update(cx, |inspector, _| {
+            inspector.refresh_task = None;
+            inspector.review_task = None;
+            inspector.transcript_task = None;
             inspector.poll_task = None;
         });
         cx.run_until_parked();
@@ -4988,6 +5460,16 @@ mod tests {
         assert!(cx.debug_bounds("INSPECTOR_PR_MERGE").is_some());
         assert!(cx.debug_bounds("INSPECTOR_PR_CHECK_0").is_some());
         assert!(cx.debug_bounds("INSPECTOR_PR_COMMENT_0").is_some());
+        let markdown = cx
+            .debug_bounds("INSPECTOR_PR_BODY")
+            .expect("pull request Markdown body");
+        cx.simulate_click(markdown.center(), Modifiers::none());
+        let inspector = harness.read_with(cx, |harness, _| harness.inspector.clone());
+        let quote = inspector
+            .read_with(cx, |inspector, _| inspector.quote_selection())
+            .expect("selected Markdown quote");
+        assert!(matches!(quote.source, QuoteSource::Markdown { .. }));
+        assert!(!quote.content.trim().is_empty());
         let ask = cx.debug_bounds("INSPECTOR_PR_ASK").expect("PR ask action");
         cx.simulate_click(ask.center(), Modifiers::none());
         cx.run_until_parked();

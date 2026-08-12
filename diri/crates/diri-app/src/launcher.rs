@@ -288,9 +288,10 @@ impl LauncherOverlay {
         self.activate_new_session(window, cx);
     }
 
-    /// Open the native composer for one existing local session and append the
-    /// staged paths to that session's own draft. Merely opening this surface
-    /// neither attaches to the PTY nor wakes a hibernated process.
+    /// Open the native composer for one existing session and append staged
+    /// context to that session's identity-keyed local draft. Merely opening
+    /// this surface never writes to the PTY, selects the session, or wakes a
+    /// hibernated process.
     pub(crate) fn open_for_session(
         &mut self,
         session_id: SessionId,
@@ -1715,6 +1716,13 @@ impl LauncherOverlay {
             ui_agent_kind(session.effective_kind())
         });
         let can_submit = self.can_submit();
+        let draft_state = session.as_ref().map_or("Local draft", |session| {
+            if session.hibernation.is_some() {
+                "Local draft · sleeping agent untouched"
+            } else {
+                "Local draft · nothing sent"
+            }
+        });
         let text_height = composer_text_height(self.prompt.line_count());
         let composer_height = text_height + COMPOSER_CONTROLS_HEIGHT;
         let fills = launcher_surface_fills(colors);
@@ -1883,7 +1891,7 @@ impl LauncherOverlay {
                             .flex_none()
                             .text_size(px(10.0))
                             .text_color(colors.tertiary)
-                            .child("Local draft"),
+                            .child(draft_state),
                     ),
             )
             .when_some(self.drop_notice.clone(), |panel, notice| {
@@ -2100,6 +2108,7 @@ fn apply_folder_choice(selected_root: &mut String, chosen: Option<&Path>) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sidebar::{PreviewScenario, SidebarPreviewFixture};
     use crate::store::StoreRuntime;
     use crate::usage::UsageSnapshot;
     use gpui::TestAppContext;
@@ -2268,5 +2277,80 @@ mod tests {
         assert!(delivery.is_sending());
         assert!(delivery.settle(replacement));
         assert!(!delivery.is_sending());
+    }
+
+    #[gpui::test]
+    fn staging_context_uses_the_requested_identity_without_selecting_or_sending(
+        cx: &mut TestAppContext,
+    ) {
+        let runtime = Arc::new(crate::store::StoreRuntime::inert());
+        let mut fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        assert!(fixture.list.sessions.len() >= 2);
+        let active = fixture.list.sessions[0].id.clone();
+        let target = fixture.list.sessions[1].id.clone();
+        fixture.list.sessions[0].kind = AgentKind::CODEX;
+        fixture.list.sessions[1].kind = AgentKind::CLAUDE_CODE;
+        fixture.list.sessions[0].foreground_agent = None;
+        fixture.list.sessions[1].foreground_agent = None;
+        fixture.list.sessions[1].hibernation = Some(diri_proto::HibernationInfo {
+            since: diri_proto::DateMillis(1.0),
+            reason: diri_proto::HibernationReason::Manual,
+            tree_pids: vec![42],
+            tree_start_times: None,
+        });
+        {
+            let mut store = runtime.store.write().expect("session store lock poisoned");
+            store.hydrate(fixture.list);
+            store.select(active.clone());
+        }
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let (usage_tx, _) = tokio::sync::watch::channel(UsageSnapshot::default());
+        let services = Arc::new(AppServices {
+            store: Arc::clone(&runtime),
+            usage_tx,
+            updates: crate::updates::inert(),
+            tokio,
+            dev_build: None,
+        });
+        let (launcher, cx) =
+            cx.add_window_view(move |_window, cx| LauncherOverlay::new(services, true, cx));
+
+        launcher.update_in(cx, |launcher, window, cx| {
+            launcher.open_for_session(target.clone(), "first quoted turn", None, window, cx);
+            launcher.open_for_session(target.clone(), "second quoted turn", None, window, cx);
+        });
+
+        assert_eq!(
+            runtime
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .selected_session_id(),
+            Some(&active),
+            "staging a different target must not switch the active session"
+        );
+        assert!(
+            runtime
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .sessions()
+                .get(&target)
+                .is_some_and(|record| record.hibernation.is_some()),
+            "an app-owned draft cannot wake or rewrite hibernation state"
+        );
+        launcher.read_with(cx, |launcher, _| {
+            assert_eq!(launcher.target, LauncherTarget::Session(target));
+            assert_eq!(
+                launcher.prompt.text(),
+                "first quoted turn\nsecond quoted turn"
+            );
+            assert!(launcher.open);
+        });
     }
 }

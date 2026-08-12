@@ -35,6 +35,8 @@ actions!(
         FocusSidebar,
         ToggleInspector,
         ToggleAuxiliaryTerminal,
+        QuoteSelection,
+        QuoteSelectionToSession,
         ArchiveSelectedSession,
         RenameSelectedSession,
         DelegateSelectedSession,
@@ -96,6 +98,8 @@ pub enum CommandId {
     FocusSidebar,
     ToggleInspector,
     ToggleAuxiliaryTerminal,
+    QuoteSelection,
+    QuoteSelectionToSession,
     ArchiveSelectedSession,
     RenameSelectedSession,
     DelegateSelectedSession,
@@ -321,6 +325,26 @@ pub const COMMANDS: &[CommandSpec] = &[
         Some("cmd-j"),
         Some("⌘J"),
         Some(APP_CONTEXT)
+    ),
+    spec!(
+        QuoteSelection,
+        "quote-selection",
+        Some("cmd-shift-c"),
+        Some("⇧⌘C"),
+        Some(APP_CONTEXT),
+        "Quote Selection",
+        "text.quote",
+        "append cite composer draft context"
+    ),
+    spec!(
+        QuoteSelectionToSession,
+        "quote-selection-to-session",
+        Some("cmd-alt-shift-c"),
+        Some("⌥⇧⌘C"),
+        Some(APP_CONTEXT),
+        "Quote Selection to Session…",
+        "sidebar.left",
+        "append cite composer draft target another agent"
     ),
     spec!(
         ArchiveSelectedSession,
@@ -581,6 +605,10 @@ impl CommandSpec {
             CommandId::ToggleAuxiliaryTerminal => {
                 KeyBinding::new(key, ToggleAuxiliaryTerminal, context)
             }
+            CommandId::QuoteSelection => KeyBinding::new(key, QuoteSelection, context),
+            CommandId::QuoteSelectionToSession => {
+                KeyBinding::new(key, QuoteSelectionToSession, context)
+            }
             CommandId::ArchiveSelectedSession => {
                 KeyBinding::new(key, ArchiveSelectedSession, context)
             }
@@ -694,6 +722,8 @@ impl CommandId {
             Self::FocusSidebar => Box::new(FocusSidebar),
             Self::ToggleInspector => Box::new(ToggleInspector),
             Self::ToggleAuxiliaryTerminal => Box::new(ToggleAuxiliaryTerminal),
+            Self::QuoteSelection => Box::new(QuoteSelection),
+            Self::QuoteSelectionToSession => Box::new(QuoteSelectionToSession),
             Self::ArchiveSelectedSession => Box::new(ArchiveSelectedSession),
             Self::RenameSelectedSession => Box::new(RenameSelectedSession),
             Self::DelegateSelectedSession => Box::new(DelegateSelectedSession),
@@ -774,6 +804,21 @@ mod tests {
         assert_eq!(settings.shortcut_label().as_deref(), Some("⌘,"));
         #[cfg(not(target_os = "macos"))]
         assert_eq!(settings.shortcut_label().as_deref(), Some("Ctrl+,"));
+
+        let quote = command(CommandId::QuoteSelection);
+        assert_eq!(quote.keystroke, Some("cmd-shift-c"));
+        #[cfg(target_os = "macos")]
+        assert_eq!(quote.shortcut_label().as_deref(), Some("⇧⌘C"));
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(quote.shortcut_label().as_deref(), Some("Ctrl+Shift+C"));
+        assert_eq!(
+            quote.palette.map(|metadata| metadata.title),
+            Some("Quote Selection")
+        );
+
+        let picker = command(CommandId::QuoteSelectionToSession);
+        assert_eq!(picker.keystroke, Some("cmd-alt-shift-c"));
+        assert!(picker.palette.is_some());
     }
 
     #[test]

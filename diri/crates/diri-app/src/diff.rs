@@ -10,7 +10,9 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use diri_proto::{SessionDiffBase, SessionReadDiffResult};
+use diri_proto::{SessionDiffBase, SessionId, SessionReadDiffResult};
+
+use crate::quote::{Quote, QuoteSource};
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
@@ -86,6 +88,156 @@ pub struct DiffSnapshot {
     pub deletions: usize,
     pub max_text_columns: usize,
     pub truncated: bool,
+}
+
+/// A review-surface selection. A plain click selects one source line, a shift
+/// click/keyboard extension grows a line range inside that same hunk, and a
+/// hunk-header click selects the whole semantic hunk.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DiffSelection {
+    anchor: Option<usize>,
+    head: Option<usize>,
+    whole_hunk: bool,
+}
+
+impl DiffSelection {
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.anchor.is_none()
+    }
+
+    /// Selects the natural unit at `row`. File/meta rows are not quotable.
+    /// Extension is clamped to the anchor's hunk so a range cannot silently
+    /// combine provenance from different files or hunks.
+    pub fn select(&mut self, snapshot: &DiffSnapshot, row: usize, extend: bool) -> bool {
+        let Some((_, hunk)) = hunk_at(snapshot, row) else {
+            self.clear();
+            return false;
+        };
+        if snapshot
+            .rows
+            .get(row)
+            .is_some_and(|row| row.kind == DiffRowKind::Hunk)
+        {
+            self.anchor = Some(hunk.row_range.start);
+            self.head = Some(hunk.row_range.start);
+            self.whole_hunk = true;
+            return true;
+        }
+
+        if extend
+            && let Some(anchor) = self.anchor
+            && hunk.row_range.contains(&anchor)
+        {
+            self.head = Some(row);
+            self.whole_hunk = false;
+            return true;
+        }
+        self.anchor = Some(row);
+        self.head = Some(row);
+        self.whole_hunk = false;
+        true
+    }
+
+    /// Moves the head through quotable rows. Shift extends; without it the
+    /// destination becomes a new one-line selection.
+    pub fn move_by(&mut self, snapshot: &DiffSnapshot, delta: isize, extend: bool) -> bool {
+        let rows = &snapshot.rows;
+        if rows.is_empty() {
+            return false;
+        }
+        let start = self
+            .head
+            .or(self.anchor)
+            .unwrap_or(if delta < 0 { rows.len() } else { 0 });
+        let mut candidate = start.saturating_add_signed(delta);
+        loop {
+            let Some(row) = rows.get(candidate) else {
+                return false;
+            };
+            if matches!(
+                row.kind,
+                DiffRowKind::Hunk
+                    | DiffRowKind::Context
+                    | DiffRowKind::Addition
+                    | DiffRowKind::Deletion
+            ) {
+                return self.select(snapshot, candidate, extend);
+            }
+            let Some(next) = candidate.checked_add_signed(delta.signum()) else {
+                return false;
+            };
+            candidate = next;
+        }
+    }
+
+    #[must_use]
+    pub fn row_range(&self, snapshot: &DiffSnapshot) -> Option<Range<usize>> {
+        let anchor = self.anchor?;
+        let head = self.head?;
+        let (_, anchor_hunk) = hunk_at(snapshot, anchor)?;
+        if self.whole_hunk {
+            return Some(anchor_hunk.row_range.clone());
+        }
+        let start = anchor.min(head).max(anchor_hunk.row_range.start);
+        let end = anchor
+            .max(head)
+            .saturating_add(1)
+            .min(anchor_hunk.row_range.end);
+        (start < end).then_some(start..end)
+    }
+
+    #[must_use]
+    pub fn contains(&self, snapshot: &DiffSnapshot, row: usize) -> bool {
+        self.row_range(snapshot)
+            .is_some_and(|range| range.contains(&row))
+    }
+
+    #[must_use]
+    pub fn quote(&self, snapshot: &DiffSnapshot, session_id: SessionId) -> Option<Quote> {
+        let range = self.row_range(snapshot)?;
+        let (file, _) = hunk_at(snapshot, range.start)?;
+        let rows = &snapshot.rows[range];
+        let content = rows
+            .iter()
+            .map(|row| match row.kind {
+                DiffRowKind::Addition => format!("+{}", row.text),
+                DiffRowKind::Deletion => format!("-{}", row.text),
+                DiffRowKind::Context => format!(" {}", row.text),
+                _ => row.text.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let line_span = |lines: Vec<u32>| {
+            let start = lines.iter().min().copied()?;
+            let end = lines.iter().max().copied()?;
+            Some((start, end))
+        };
+        let old_lines = line_span(rows.iter().filter_map(|row| row.old_line).collect());
+        let new_lines = line_span(rows.iter().filter_map(|row| row.new_line).collect());
+        Quote::new(
+            QuoteSource::Diff {
+                session_id,
+                path: file.path.clone(),
+                old_lines,
+                new_lines,
+            },
+            content,
+        )
+    }
+}
+
+fn hunk_at(snapshot: &DiffSnapshot, row: usize) -> Option<(&DiffFile, &DiffHunk)> {
+    snapshot.file_diffs.iter().find_map(|file| {
+        file.hunks
+            .iter()
+            .find(|hunk| hunk.row_range.contains(&row))
+            .map(|hunk| (file, hunk))
+    })
 }
 
 #[derive(Debug)]
@@ -716,6 +868,61 @@ mod tests {
     #[test]
     fn parses_single_line_hunk_ranges() {
         assert_eq!(parse_hunk_start("@@ -4 +8 @@"), (Some(4), Some(8)));
+    }
+
+    #[test]
+    fn diff_selection_uses_hunks_and_clamps_extended_line_ranges() {
+        let snapshot = parse_unified_diff(
+            "diff --git a/src/lib.rs b/src/lib.rs\n@@ -10,2 +10,2 @@\n-old\n+new\n@@ -30 +30 @@\n-a\n+b\n",
+        );
+        let mut selection = DiffSelection::default();
+        assert!(selection.select(&snapshot, 2, false));
+        assert!(selection.select(&snapshot, 3, true));
+        assert_eq!(selection.row_range(&snapshot), Some(2..4));
+
+        // Extending into another hunk starts a fresh selection rather than
+        // inventing provenance that spans unrelated hunks.
+        assert!(selection.select(&snapshot, 5, true));
+        assert_eq!(selection.row_range(&snapshot), Some(5..6));
+
+        assert!(selection.select(&snapshot, 1, false));
+        assert_eq!(selection.row_range(&snapshot), Some(1..4));
+    }
+
+    #[test]
+    fn diff_selection_quote_captures_path_lines_and_session() {
+        let snapshot = parse_unified_diff(
+            "diff --git a/src/lib.rs b/src/lib.rs\n@@ -10,2 +10,3 @@\n context\n-old\n+new\n+extra\n",
+        );
+        let mut selection = DiffSelection::default();
+        selection.select(&snapshot, 2, false);
+        selection.select(&snapshot, 5, true);
+        let quote = selection
+            .quote(&snapshot, SessionId("review-session".to_owned()))
+            .unwrap();
+        assert_eq!(quote.content, " context\n-old\n+new\n+extra");
+        assert_eq!(
+            quote.source,
+            QuoteSource::Diff {
+                session_id: SessionId("review-session".to_owned()),
+                path: PathBuf::from("src/lib.rs"),
+                old_lines: Some((10, 11)),
+                new_lines: Some((10, 12)),
+            }
+        );
+    }
+
+    #[test]
+    fn diff_keyboard_selection_moves_and_extends() {
+        let snapshot =
+            parse_unified_diff("diff --git a/a b/a\n@@ -1,2 +1,2 @@\n one\n-two\n+three\n");
+        let mut selection = DiffSelection::default();
+        assert!(selection.move_by(&snapshot, 1, false));
+        assert_eq!(selection.row_range(&snapshot), Some(1..5));
+        assert!(selection.move_by(&snapshot, 1, false));
+        assert_eq!(selection.row_range(&snapshot), Some(2..3));
+        assert!(selection.move_by(&snapshot, 1, true));
+        assert_eq!(selection.row_range(&snapshot), Some(2..4));
     }
 
     #[test]

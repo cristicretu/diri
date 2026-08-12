@@ -360,6 +360,25 @@ impl Sidebar {
         cx.notify();
     }
 
+    /// Reveals the sidebar for a contextual overlay without toggling an
+    /// already-visible panel or depending on the rapid-toggle debounce.
+    pub fn reveal(&mut self, cx: &mut Context<Self>) {
+        if self.ui.visible {
+            return;
+        }
+        self.ui.visible = true;
+        if let Err(error) = self
+            .store
+            .write()
+            .expect("session store lock poisoned")
+            .update_preferences(|prefs| prefs.sidebar_visible = true)
+        {
+            eprintln!("diri: could not remember sidebar visibility: {error}");
+        }
+        cx.emit(SidebarEvent::VisibilityChanged);
+        cx.notify();
+    }
+
     pub fn show_new_agent(&mut self, cx: &mut Context<Self>) {
         self.open_new_agent_popover(None, cx);
     }

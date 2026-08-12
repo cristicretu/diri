@@ -639,6 +639,11 @@ impl TerminalElement {
         mutex_lock(&self.shared.selection).selected_text(&viewport, &buffer)
     }
 
+    #[must_use]
+    pub fn selection_range(&self) -> Option<crate::selection::SelectionRange> {
+        mutex_lock(&self.shared.selection).range()
+    }
+
     pub fn set_find_highlights(&self, spans: Vec<FindSpan>) {
         *mutex_lock(&self.shared.find_spans) = spans;
     }
