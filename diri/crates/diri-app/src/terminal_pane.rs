@@ -1543,22 +1543,29 @@ impl TerminalPane {
         let Some(id) = self.selected_id() else {
             return;
         };
-        let Some((col, row)) = self.grid_cell_at(event.position, window) else {
-            return;
-        };
+        // Resolve opportunistically, but clear gesture state even if the grid
+        // disappeared between press and release (session teardown, a zero-size
+        // re-seed). GPUI delivers `on_mouse_up_out` in capture phase, so an
+        // ordinary release outside the pane still reaches this path and clamps.
+        let cell = self.grid_cell_at(event.position, window);
         let Some(resident) = self.residents.get_mut(&id) else {
             return;
         };
-        let owner = resident
-            .pointer_owner
-            .filter(|(button, _)| *button == event.button)
-            .map(|(_, owner)| owner);
-        resident.pointer_owner = None;
+        let (owner, pending) = finish_pointer_state(
+            &mut resident.pointer_owner,
+            &mut resident.mouse_motion,
+            event.button,
+            cell.is_some(),
+        );
         if owner != Some(PointerOwner::Terminal) {
-            resident.mouse_motion.reset();
             return;
         }
-        if let Some(bytes) = resident.mouse_motion.take_pending() {
+        let Some((col, row)) = cell else {
+            // With no authoritative coordinate, a guessed release would be
+            // worse than dropping this now-cancelled gesture.
+            return;
+        };
+        if let Some(bytes) = pending {
             // A cadence-held drag must precede its release. Letting the timer
             // fire afterward would resurrect a button that is already up.
             resident.attachment.mouse(bytes);
@@ -3210,6 +3217,25 @@ fn terminal_mouse_modifiers(modifiers: &gpui::Modifiers) -> TerminalMouseModifie
     }
 }
 
+fn finish_pointer_state(
+    pointer_owner: &mut Option<(MouseButton, PointerOwner)>,
+    mouse_motion: &mut MouseMotionLimiter,
+    button: MouseButton,
+    cell_available: bool,
+) -> (Option<PointerOwner>, Option<Vec<u8>>) {
+    let owner = pointer_owner
+        .take()
+        .filter(|(owned, _)| *owned == button)
+        .map(|(_, owner)| owner);
+    let pending = if owner == Some(PointerOwner::Terminal) && cell_available {
+        mouse_motion.take_pending()
+    } else {
+        mouse_motion.reset();
+        None
+    };
+    (owner, pending)
+}
+
 fn find_icon_button(
     id: &'static str,
     system_image: &'static str,
@@ -3975,6 +4001,34 @@ mod tests {
             limiter.flush(generation, started + MOUSE_MOTION_CADENCE),
             None,
             "no motion may be emitted after the release"
+        );
+    }
+
+    #[test]
+    fn release_without_a_grid_cell_cancels_the_gesture_and_pending_timer() {
+        let started = Instant::now();
+        let mut limiter = MouseMotionLimiter::default();
+        assert!(matches!(
+            limiter.push(started, (1, 1), b"first".to_vec()),
+            MotionDispatch::SendNow(_)
+        ));
+        let MotionDispatch::Schedule { generation, .. } = limiter.push(
+            started + Duration::from_millis(1),
+            (2, 1),
+            b"pending".to_vec(),
+        ) else {
+            panic!("pending motion");
+        };
+        let mut owner = Some((MouseButton::Left, PointerOwner::Terminal));
+        assert_eq!(
+            finish_pointer_state(&mut owner, &mut limiter, MouseButton::Left, false),
+            (Some(PointerOwner::Terminal), None)
+        );
+        assert_eq!(owner, None);
+        assert_eq!(
+            limiter.flush(generation, started + MOUSE_MOTION_CADENCE),
+            None,
+            "a stale timer cannot send motion after the physical release"
         );
     }
 
