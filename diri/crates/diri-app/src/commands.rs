@@ -37,6 +37,7 @@ actions!(
         ToggleAuxiliaryTerminal,
         ArchiveSelectedSession,
         RenameSelectedSession,
+        DelegateSelectedSession,
         SelectNextAttentionSession,
         CheckForUpdates,
         SelectPreviousSession,
@@ -97,6 +98,7 @@ pub enum CommandId {
     ToggleAuxiliaryTerminal,
     ArchiveSelectedSession,
     RenameSelectedSession,
+    DelegateSelectedSession,
     SelectNextAttentionSession,
     CheckForUpdates,
     SelectPreviousSession,
@@ -333,6 +335,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         Some("cmd-r"),
         Some("⌘R"),
         Some(APP_CONTEXT)
+    ),
+    spec!(
+        DelegateSelectedSession,
+        "delegate-selected-session",
+        Some("cmd-ctrl-d"),
+        Some("⌃⌘D"),
+        Some(APP_CONTEXT),
+        "Delegate Selected Session",
+        "arrowshape.turn.up.right",
+        "handoff delegate context agent session"
     ),
     spec!(
         SelectNextAttentionSession,
@@ -575,6 +587,9 @@ impl CommandSpec {
             CommandId::RenameSelectedSession => {
                 KeyBinding::new(key, RenameSelectedSession, context)
             }
+            CommandId::DelegateSelectedSession => {
+                KeyBinding::new(key, DelegateSelectedSession, context)
+            }
             CommandId::SelectNextAttentionSession => {
                 KeyBinding::new(key, SelectNextAttentionSession, context)
             }
@@ -681,6 +696,7 @@ impl CommandId {
             Self::ToggleAuxiliaryTerminal => Box::new(ToggleAuxiliaryTerminal),
             Self::ArchiveSelectedSession => Box::new(ArchiveSelectedSession),
             Self::RenameSelectedSession => Box::new(RenameSelectedSession),
+            Self::DelegateSelectedSession => Box::new(DelegateSelectedSession),
             Self::SelectNextAttentionSession => Box::new(SelectNextAttentionSession),
             Self::CheckForUpdates => Box::new(CheckForUpdates),
             Self::SelectPreviousSession => Box::new(SelectPreviousSession),

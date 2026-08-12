@@ -224,6 +224,11 @@ impl RootView {
             .detach();
         }
         cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
+            if let SidebarEvent::HandoffProposed(proposal) = event {
+                this.launcher.update(cx, |launcher, cx| {
+                    launcher.open_handoff(proposal.clone(), window, cx);
+                });
+            }
             if let SidebarEvent::ExternalDrop(plan) = event
                 && let Some(action) = &plan.action
             {
