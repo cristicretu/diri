@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 use diri_proto::{AgentReadinessResult, HelloResult, HostEntry};
@@ -15,6 +16,7 @@ const REPORT_LIMIT_BYTES: usize = 12 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlatformMetadata {
+    pub os_name: String,
     pub os_version: String,
     pub architecture: String,
 }
@@ -23,7 +25,8 @@ impl PlatformMetadata {
     #[must_use]
     pub fn current() -> Self {
         Self {
-            os_version: macos_product_version(),
+            os_name: platform_name().to_owned(),
+            os_version: platform_version(),
             architecture: std::env::consts::ARCH.to_owned(),
         }
     }
@@ -66,7 +69,8 @@ impl DiagnosticsReport {
                 bounded_identifier(input.update_channel)
             ),
             format!(
-                "macOS: {} ({})",
+                "{}: {} ({})",
+                bounded_atom(&input.platform.os_name),
                 bounded_atom(&input.platform.os_version),
                 bounded_atom(&input.platform.architecture)
             ),
@@ -190,7 +194,16 @@ fn bounded_identifier(value: &str) -> String {
     value.to_owned()
 }
 
-fn macos_product_version() -> String {
+fn platform_name() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "macOS",
+        "linux" => "Linux",
+        other => other,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn platform_version() -> String {
     Command::new("/usr/bin/sw_vers")
         .arg("-productVersion")
         .output()
@@ -200,6 +213,26 @@ fn macos_product_version() -> String {
         .map(|version| bounded_atom(&version))
         .filter(|version| !version.is_empty())
         .unwrap_or_else(|| "unknown".to_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn platform_version() -> String {
+    std::fs::read_to_string("/etc/os-release")
+        .ok()
+        .and_then(|contents| {
+            contents.lines().find_map(|line| {
+                line.strip_prefix("PRETTY_NAME=")
+                    .map(|value| value.trim_matches('"'))
+                    .filter(|value| !value.is_empty())
+                    .map(bounded_atom)
+            })
+        })
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn platform_version() -> String {
+    "unknown".to_owned()
 }
 
 #[cfg(test)]
@@ -232,6 +265,7 @@ mod tests {
             }),
         }];
         let platform = PlatformMetadata {
+            os_name: "macOS".to_owned(),
             os_version: "15.5".to_owned(),
             architecture: "aarch64".to_owned(),
         };
@@ -277,6 +311,7 @@ mod tests {
     #[test]
     fn unreachable_transport_error_is_never_rendered() {
         let platform = PlatformMetadata {
+            os_name: "macOS".to_owned(),
             os_version: "15.5".to_owned(),
             architecture: "aarch64".to_owned(),
         };

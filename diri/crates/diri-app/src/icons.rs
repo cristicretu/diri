@@ -1,9 +1,8 @@
 //! Compatibility layer for call sites that still use former SF Symbol names.
 //!
-//! The actual glyphs are now diri's embedded, platform-independent SVG icon
+//! The actual glyphs are diri's embedded, platform-independent SVG icon
 //! family. Keeping this small bridge makes the visual-system migration atomic:
-//! every existing control gets the new SVG immediately, while views can move
-//! to semantic `IconName` values independently.
+//! every existing control gets the same semantic SVG on every desktop.
 
 use diri_ui::{IconName, icon_from_system_name};
 use gpui::{AnyElement, Rgba};
@@ -24,8 +23,7 @@ pub fn sf_symbol_weighted(name: &str, size: f32, _weight: SymbolWeight, color: R
     icon_from_system_name(name, size, color)
 }
 
-/// `DIRI_PROBE_SYMBOLS=1` now verifies semantic SVG mappings without touching
-/// AppKit. It remains useful when adding a legacy call site during migration.
+/// Verifies semantic SVG mappings without touching a platform UI toolkit.
 pub fn probe() {
     for name in [
         "gearshape",

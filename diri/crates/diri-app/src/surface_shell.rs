@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
+use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::query_label;
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
 use crate::settings::{HostDraft, SettingsTab, theme};
@@ -26,8 +26,8 @@ use gpui::{
 use tokio::runtime::Runtime;
 
 use crate::commands::{
-    Activate, CloseSurface, MoveDown, MoveUp, OpenSettings, OpenWorktrees, ToggleHistory,
-    UTILITY_CONTEXT,
+    Activate, CloseSurface, CommandId, MoveDown, MoveUp, OpenSettings, OpenWorktrees,
+    ToggleHistory, UTILITY_CONTEXT,
 };
 const SETTINGS_WIDTH: f32 = 600.0;
 const SETTINGS_HEIGHT: f32 = 420.0;
@@ -1645,7 +1645,12 @@ impl UtilitySurfaces {
                     "New sessions",
                     setting_row(
                         "Default agent",
-                        "Used by ⌘T and Quick Open.",
+                        format!(
+                            "Used by {} and Quick Open.",
+                            crate::commands::command(CommandId::NewDefaultSession)
+                                .shortcut_label()
+                                .unwrap_or_default()
+                        ),
                         self.default_agent_dropdown(cx),
                         colors,
                     ),
@@ -1656,20 +1661,23 @@ impl UtilitySurfaces {
                     div()
                         .flex()
                         .flex_col()
-                        .child(toggle_row(
-                            "Start diri at login",
-                            "Open diri automatically after you sign in.",
-                            self.prefs.start_at_login,
-                            "toggle-login",
-                            colors,
-                            cx,
-                            |this, cx| {
-                                this.prefs.start_at_login = !this.prefs.start_at_login;
-                                this.persist_prefs();
-                                cx.notify();
-                            },
-                        ))
-                        .child(setting_divider(colors))
+                        .when(cfg!(target_os = "macos"), |behavior| {
+                            behavior
+                                .child(toggle_row(
+                                    "Start diri at login",
+                                    "Open diri automatically after you sign in.",
+                                    self.prefs.start_at_login,
+                                    "toggle-login",
+                                    colors,
+                                    cx,
+                                    |this, cx| {
+                                        this.prefs.start_at_login = !this.prefs.start_at_login;
+                                        this.persist_prefs();
+                                        cx.notify();
+                                    },
+                                ))
+                                .child(setting_divider(colors))
+                        })
                         .child(toggle_row(
                             "Confirm before closing a session",
                             "Ask before closing a session with a running process.",
@@ -1782,7 +1790,11 @@ impl UtilitySurfaces {
             )
         };
         let mut targets = div().p(px(8.0)).flex().flex_wrap().gap(px(6.0));
-        let mut choices = vec![(None, "This Mac".to_owned(), "desktopcomputer")];
+        let mut choices = vec![(
+            None,
+            crate::platform::local_machine_label().to_owned(),
+            "desktopcomputer",
+        )];
         choices.extend(hosts.iter().map(|entry| {
             (
                 Some(entry.id.clone()),

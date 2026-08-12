@@ -14,6 +14,7 @@ pub mod fonts;
 pub mod fuzzy;
 mod git_review;
 pub mod history;
+mod icons;
 mod inspector;
 mod launcher;
 pub mod markdown;
@@ -22,6 +23,7 @@ mod menu_inbox;
 pub mod navigation;
 pub mod notifications;
 pub mod palette;
+mod platform;
 pub mod query_editor;
 pub mod quick_open;
 mod recovery;
@@ -51,17 +53,21 @@ use std::time::Duration;
 
 use dev_build::DevBuildIdentity;
 use diri_client::DaemonClient;
+#[cfg(target_os = "macos")]
+use gpui::SystemMenuType;
 use gpui::{
-    App, AppContext as _, Bounds, Menu, MenuItem, OsAction, SystemMenuType, TitlebarOptions,
-    Window, WindowBackgroundAppearance, WindowBounds, WindowOptions, point, px, size,
+    App, AppContext as _, Bounds, Menu, MenuItem, OsAction, TitlebarOptions, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowOptions, point, px, size,
 };
 use gpui_platform::application;
 use root::RootView;
 use sidebar::{PreviewScenario, SidebarPreviewFixture};
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 
+#[cfg(target_os = "macos")]
+use crate::commands::HideApp;
 use crate::commands::{
-    CloseSession, CloseWindow, CopySelection, HideApp, OpenLauncher, Paste, Quit, ReopenSession,
+    CloseSession, CloseWindow, CopySelection, OpenLauncher, Paste, Quit, ReopenSession,
 };
 use crate::store::{StoreRuntime, WindowMode, WindowPlacement};
 use crate::updates::UpdateHandle;
@@ -76,10 +82,11 @@ const MIN_WINDOW_HEIGHT: f32 = 560.0;
 const USAGE_REFRESH_DEBOUNCE: Duration = Duration::from_secs(2);
 const USAGE_RECONCILE_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
-/// Standard macOS app behaviors route through the application menu: without
-/// one, cmd-Q / cmd-H / cmd-W and the Edit menu simply do not exist.
+/// Install native application menus without exposing actions that the current
+/// desktop cannot implement.
 fn install_app_menus(cx: &mut App) {
     cx.on_action(|_: &Quit, cx| cx.quit());
+    #[cfg(target_os = "macos")]
     cx.on_action(|_: &HideApp, cx| cx.hide());
     cx.on_action(|_: &CloseWindow, cx| {
         if let Some(window) = cx.active_window() {
@@ -94,6 +101,7 @@ fn install_app_menus(cx: &mut App) {
             let _ = window.update(cx, |_, window, _| window.remove_window());
         }
     });
+    #[cfg(target_os = "macos")]
     cx.set_menus([
         Menu::new("diri").items([
             MenuItem::os_submenu("Services", SystemMenuType::Services),
@@ -103,6 +111,23 @@ fn install_app_menus(cx: &mut App) {
             MenuItem::action("Quit diri", Quit),
         ]),
         Menu::new("File").items([MenuItem::action("New Session", OpenLauncher)]),
+        Menu::new("Edit").items([
+            MenuItem::os_action("Copy", CopySelection, OsAction::Copy),
+            MenuItem::os_action("Paste", Paste, OsAction::Paste),
+        ]),
+        Menu::new("Window").items([
+            MenuItem::action("Close Session", CloseSession),
+            MenuItem::action("Reopen Closed Session", ReopenSession),
+            MenuItem::action("Close Window", CloseWindow),
+        ]),
+    ]);
+    #[cfg(not(target_os = "macos"))]
+    cx.set_menus([
+        Menu::new("File").items([
+            MenuItem::action("New Session", OpenLauncher),
+            MenuItem::separator(),
+            MenuItem::action("Quit diri", Quit),
+        ]),
         Menu::new("Edit").items([
             MenuItem::os_action("Copy", CopySelection, OsAction::Copy),
             MenuItem::os_action("Paste", Paste, OsAction::Paste),
@@ -125,14 +150,14 @@ pub(crate) struct AppServices {
 }
 
 fn main() {
-    #[cfg(target_os = "macos")]
     if std::env::var_os("DIRI_PROBE_SYMBOLS").is_some() {
-        macos::sf_symbols::probe();
+        icons::probe();
         return;
     }
 
+    let smoke_test = std::env::var_os("DIRI_UI_SMOKE_TEST").is_some();
     let preview_value = std::env::var("DIRIJOR_SIDEBAR_PREVIEW").ok();
-    let preview = preview_value.as_deref().is_some_and(|value| value != "0");
+    let preview = smoke_test || preview_value.as_deref().is_some_and(|value| value != "0");
     let scenario_value = std::env::var("DIRIJOR_SIDEBAR_SCENARIO")
         .ok()
         .or_else(|| preview_value.filter(|value| value != "1"));
@@ -348,6 +373,16 @@ fn main() {
         .detach();
         open_main_window(cx, services, preview, scenario);
         cx.activate(true);
+        if smoke_test {
+            cx.spawn(async move |cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(750))
+                    .await;
+                eprintln!("diri: UI smoke window opened successfully");
+                cx.update(|cx| cx.quit());
+            })
+            .detach();
+        }
     });
 }
 
@@ -423,10 +458,11 @@ fn open_main_window(
             app_id: Some(app_id),
             titlebar: Some(TitlebarOptions {
                 title,
-                appears_transparent: true,
+                appears_transparent: cfg!(target_os = "macos"),
                 // GPUI uses top/left insets here: AppKit's native 8 pt origin plus the
                 // spec's +12 x / -6 frame-origin nudge maps to 20 pt left and 14 pt top.
-                traffic_light_position: Some(point(px(20.0), px(14.0))),
+                traffic_light_position: cfg!(target_os = "macos")
+                    .then_some(point(px(20.0), px(14.0))),
             }),
             ..Default::default()
         },

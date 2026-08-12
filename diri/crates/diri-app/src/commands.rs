@@ -4,6 +4,8 @@
 //! presentation live together here. Views execute actions; they do not decode
 //! keystrokes or maintain their own copies of shortcut labels.
 
+use std::borrow::Cow;
+
 use gpui::{Action, App, KeyBinding, Keystroke, actions};
 
 pub const APP_CONTEXT: &str = "Diri";
@@ -504,7 +506,8 @@ pub fn matches_keystroke(id: CommandId, keystroke: &Keystroke) -> bool {
         .keystroke
         .into_iter()
         .chain(command(id).alternate_keystrokes.iter().copied())
-        .filter_map(|binding| Keystroke::parse(binding).ok())
+        .filter_map(|binding| platform_keystroke(id, binding))
+        .filter_map(|binding| Keystroke::parse(&binding).ok())
         .any(|binding| {
             binding.modifiers == keystroke.modifiers
                 && (binding.key == keystroke.key
@@ -521,8 +524,13 @@ impl CommandSpec {
         self.keystroke
             .into_iter()
             .chain(self.alternate_keystrokes.iter().copied())
-            .map(|key| self.key_binding(key))
+            .filter_map(|key| platform_keystroke(self.id, key))
+            .map(|key| self.key_binding(&key))
             .collect()
+    }
+
+    pub fn shortcut_label(&self) -> Option<String> {
+        self.shortcut.map(platform_shortcut_label)
     }
 
     fn key_binding(&self, key: &str) -> KeyBinding {
@@ -586,6 +594,53 @@ impl CommandSpec {
             CommandId::Paste => KeyBinding::new(key, Paste, context),
             CommandId::CopySelection => KeyBinding::new(key, CopySelection, context),
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn platform_keystroke(_id: CommandId, key: &'static str) -> Option<Cow<'static, str>> {
+    Some(Cow::Borrowed(key))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_keystroke(id: CommandId, key: &'static str) -> Option<Cow<'static, str>> {
+    if id == CommandId::HideApp {
+        return None;
+    }
+    let key = key
+        .replace("cmd-ctrl-", "ctrl-shift-")
+        .replace("cmd-", "ctrl-");
+    Some(Cow::Owned(key))
+}
+
+#[cfg(target_os = "macos")]
+fn platform_shortcut_label(label: &str) -> String {
+    label.to_owned()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_shortcut_label(label: &str) -> String {
+    let mut modifiers = vec!["Ctrl"];
+    if label.contains('⌥') {
+        modifiers.push("Alt");
+    }
+    if label.contains('⇧') || label.contains('⌃') {
+        modifiers.push("Shift");
+    }
+    let key = label.replace(['⌘', '⌥', '⇧', '⌃'], "").replace('−', "-");
+    modifiers.push(&key);
+    modifiers.join("+")
+}
+
+pub fn primary_shortcut_label(key: &str) -> String {
+    platform_shortcut_label(&format!("⌘{key}"))
+}
+
+pub fn primary_click_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Command-click"
+    } else {
+        "Ctrl-click"
     }
 }
 
@@ -679,12 +734,16 @@ mod tests {
     #[test]
     fn shortcut_labels_come_from_the_bound_command() {
         let terminal = command(CommandId::NewTerminal);
-        assert_eq!(terminal.keystroke, Some("cmd-alt-t"));
-        assert_eq!(terminal.shortcut, Some("⌥⌘T"));
+        #[cfg(target_os = "macos")]
+        assert_eq!(terminal.shortcut_label().as_deref(), Some("⌥⌘T"));
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(terminal.shortcut_label().as_deref(), Some("Ctrl+Alt+T"));
 
         let settings = command(CommandId::OpenSettings);
-        assert_eq!(settings.keystroke, Some("cmd-,"));
-        assert_eq!(settings.shortcut, Some("⌘,"));
+        #[cfg(target_os = "macos")]
+        assert_eq!(settings.shortcut_label().as_deref(), Some("⌘,"));
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(settings.shortcut_label().as_deref(), Some("Ctrl+,"));
     }
 
     #[test]
@@ -718,17 +777,21 @@ mod tests {
 
     #[test]
     fn modal_passthrough_matching_uses_registry_bindings() {
+        #[cfg(target_os = "macos")]
+        let (launcher, previous, other) = ("cmd-n", "cmd-[", "cmd-t");
+        #[cfg(not(target_os = "macos"))]
+        let (launcher, previous, other) = ("ctrl-n", "ctrl-[", "ctrl-t");
         assert!(matches_keystroke(
             CommandId::OpenLauncher,
-            &Keystroke::parse("cmd-n").unwrap()
+            &Keystroke::parse(launcher).unwrap()
         ));
         assert!(matches_keystroke(
             CommandId::SelectPreviousSession,
-            &Keystroke::parse("cmd-[").unwrap()
+            &Keystroke::parse(previous).unwrap()
         ));
         assert!(!matches_keystroke(
             CommandId::OpenLauncher,
-            &Keystroke::parse("cmd-t").unwrap()
+            &Keystroke::parse(other).unwrap()
         ));
     }
 }

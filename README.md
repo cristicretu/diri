@@ -4,7 +4,7 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![GitHub release](https://img.shields.io/github/v/release/cristicretu/diri)](https://github.com/cristicretu/diri/releases/latest)
 
-Native macOS orchestrator for coding agents. Run Claude Code, Codex, Cursor, Gemini and plain
+Native desktop orchestrator for coding agents on macOS and Linux. Run Claude Code, Codex, Cursor, Gemini and plain
 shells in parallel — across git worktrees or on remote hosts — each with a live status
 (working / needs-you / done) and tmux-like persistence: closing the app never kills a session,
 and a daemon restart brings conversations back.
@@ -14,6 +14,8 @@ and a daemon restart brings conversations back.
 <p align="center"><img src="docs/images/diri-divider-status.png" alt="" width="760"></p>
 
 ## Install
+
+### macOS
 
 ```sh
 brew install --cask cristicretu/diri/diri
@@ -30,6 +32,21 @@ taps. The cask lives in [cristicretu/homebrew-diri](https://github.com/cristicre
 rather than `homebrew-cask`, which requires a notability threshold diri does not meet yet.
 
 macOS 15 or newer.
+
+### Linux beta
+
+Download the x86_64 AppImage or Debian package from
+[Releases](https://github.com/cristicretu/diri/releases/latest). Ubuntu 22.04
+and 24.04 are supported under X11 and Wayland with a Vulkan 1.3-capable GPU.
+
+```sh
+sudo apt install ./diri_<version>_amd64.deb
+# or
+chmod +x diri_<version>_amd64.AppImage && ./diri_<version>_amd64.AppImage
+```
+
+See the [Linux beta guide](diri/LINUX.md) for checksums, upgrade and uninstall
+steps, XDG paths, graphics troubleshooting, and current limitations.
 
 ## 60-second tour
 
@@ -94,7 +111,9 @@ examples, overrides, and validation. This is the easiest way to contribute.
 
 ## Building from source
 
-Needs Rust (pinned in `diri/rust-toolchain.toml`) and the Xcode command-line tools. The first
+Needs Rust (pinned in `diri/rust-toolchain.toml`) plus the platform build dependencies. On macOS
+that means the Xcode command-line tools; Linux dependencies and packaging commands are listed in
+[`diri/LINUX.md`](diri/LINUX.md). The first
 build compiles GPUI from a pinned Zed revision and takes a while.
 
 ```sh
@@ -103,6 +122,7 @@ build compiles GPUI from a pinned Zed revision and takes a while.
 (cd diri && cargo run -p diri-app)         # run the app from source
 
 diri/scripts/package.sh                    # full bundle
+diri/scripts/package-linux.sh              # AppImage + DEB, on x86_64 Linux
 diri/scripts/install-local.sh
 ```
 

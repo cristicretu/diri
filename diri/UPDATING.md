@@ -1,4 +1,9 @@
-# diri's auto-updater
+# diri's macOS auto-updater
+
+Automatic in-app replacement is macOS-only. Linux installs update through a
+new Debian package or AppImage from the same GitHub release; the app says so
+explicitly instead of starting the macOS bundle updater. See
+[`LINUX.md`](LINUX.md).
 
 diri updates itself. It does **not** use Sparkle — that framework is Swift-side
 and the Swift app's appcast carries EdDSA signatures tied to a keypair a Rust
@@ -83,10 +88,12 @@ One-time setup is the Developer ID cert and notary profile described in
 [PACKAGING.md](PACKAGING.md). No Sparkle keys.
 
 First open and merge a normal pull request that updates the `diri-app` version
-and lockfile. Then check out the clean, current `main` branch and run:
+and lockfile. Download the `linux-packages-<commit>` artifact from the
+successful CI run for that exact main commit. Then check out the clean,
+current `main` branch and run:
 
 ```sh
-diri/scripts/release.sh 0.4.1
+DIRI_LINUX_DIST=/path/to/linux-packages diri/scripts/release.sh 0.4.1
 ```
 
 The script refuses to release a version that does not match the manifest, a
@@ -95,7 +102,9 @@ clippy + tests, builds the universal Rust executables, signs them,
 **notarizes and staples the .app first**, then builds and notarizes the DMG
 from that stapled bundle, produces the update zip, rebuilds `appcast.json` from
 the currently published feed, generates `SHA256SUMS` and a reviewed dependency
-license inventory, and creates the GitHub Release at that exact source commit.
+license inventory, verifies the Linux manifest and artifact digests against
+that same source commit, and creates one GitHub Release containing the macOS
+and Linux assets.
 It then updates, commits, **pushes, and reads back** the Homebrew cask;
 the release does not report success until the remote cask checksum matches the
 published DMG.

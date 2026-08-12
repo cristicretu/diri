@@ -32,7 +32,7 @@ use crate::diff::{
     snapshot_from_read_diff,
 };
 use crate::git_review::{GitRepository, GitReviewError, PatchMutation, ReviewStatus};
-use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
+use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::markdown::MarkdownDocument;
 use crate::markdown_view::render_markdown;
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};

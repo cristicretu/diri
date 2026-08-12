@@ -19,11 +19,26 @@ body:
     validations:
       required: true
 
-  - type: input
-    id: macos
+  - type: textarea
+    id: platform
     attributes:
-      label: macOS version and chip
-      placeholder: "15.3, Apple silicon"
+      label: Operating environment
+      description: >
+        On Linux include distro, kernel (`uname -a`), X11 or Wayland, GPU,
+        and desktop environment. On macOS include the version and chip.
+      placeholder: "Ubuntu 22.04; kernel 6.8; Wayland; AMD Radeon; GNOME"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: package
+    attributes:
+      label: Installation format
+      options:
+        - Linux AppImage
+        - Linux Debian package
+        - macOS DMG / Homebrew
+        - Built from source
     validations:
       required: true
 
@@ -58,7 +73,9 @@ body:
     attributes:
       label: Relevant log lines
       description: >
-        From `~/Library/Application Support/Dirijor/dirijord.log`. Please skim
+        On Linux, from `$XDG_STATE_HOME/diri/logs/dirijord.log` (normally
+        `~/.local/state/diri/logs/dirijord.log`); on macOS, from
+        `~/Library/Application Support/Dirijor/logs/dirijord.log`. Please skim
         for paths or prompt text you would rather not post. Raw logs are an
         optional fallback; Copy diagnostics never includes them.
       render: shell

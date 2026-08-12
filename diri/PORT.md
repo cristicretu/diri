@@ -1,9 +1,10 @@
 # Porting the engine to Rust
 
-The goal is a cross-platform diri. The app is already portable — roughly 4% of
-`diri-app` is macOS-specific and it is cfg-gated. What binds diri to macOS is
-the *engine*: the Swift `dirijord` stack in `Sources/`, which owns PTYs,
-sessions, detection and the control socket.
+The Rust runtime replacement is complete and is now the release source of
+truth on macOS and Linux. The x86_64 Linux desktop beta adds XDG paths,
+platform-neutral resources and UI seams, X11/Wayland GPUI backends, AppImage
+and Debian packaging, and native Linux release gates. See [`LINUX.md`](LINUX.md)
+for the supported contract and current limitations.
 
 This is the record of replacing it with `crates/diri-engine`.
 

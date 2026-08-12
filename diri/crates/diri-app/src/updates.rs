@@ -213,42 +213,71 @@ impl UpdateHandle {
 /// Never fails: a build that cannot update itself still gets a handle, parked
 /// in [`UpdatePhase::Unsupported`], so no caller needs an `Option`.
 pub fn spawn(runtime: &Arc<Runtime>, automatic: bool, skipped: Option<String>) -> UpdateHandle {
-    let initial = UpdateState {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (runtime, automatic, skipped);
+        return unsupported(
+            "Use the installed package or download a newer Linux release from GitHub",
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let initial = UpdateState {
+            current_version: CURRENT_VERSION.to_owned(),
+            ..UpdateState::default()
+        };
+        let (state_tx, state_rx) = watch::channel(initial.clone());
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let ready_install = Arc::new(Mutex::new(None));
+        let automatic_flag = Arc::new(AtomicBool::new(automatic));
+
+        let updater: Option<Arc<dyn UpdateBackend>> =
+            match UpdaterConfig::for_running_app(CURRENT_VERSION) {
+                Ok(config) => Some(Arc::new(Updater::new(config))),
+                Err(error) => {
+                    state_tx.send_replace(UpdateState {
+                        phase: UpdatePhase::Unsupported(error.to_string()),
+                        ..initial
+                    });
+                    None
+                }
+            };
+
+        let _guard = runtime.enter();
+        tokio::spawn(service(
+            updater,
+            automatic,
+            skipped,
+            state_tx,
+            command_rx,
+            Arc::clone(&ready_install),
+        ));
+        UpdateHandle {
+            state: state_rx,
+            commands: command_tx,
+            ready_install,
+            automatic: automatic_flag,
+            _inert_state: None,
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn unsupported(reason: impl Into<String>) -> UpdateHandle {
+    let state = UpdateState {
+        phase: UpdatePhase::Unsupported(reason.into()),
         current_version: CURRENT_VERSION.to_owned(),
         ..UpdateState::default()
     };
-    let (state_tx, state_rx) = watch::channel(initial.clone());
-    let (command_tx, command_rx) = mpsc::unbounded_channel();
-    let ready_install = Arc::new(Mutex::new(None));
-    let automatic_flag = Arc::new(AtomicBool::new(automatic));
-
-    let updater: Option<Arc<dyn UpdateBackend>> =
-        match UpdaterConfig::for_running_app(CURRENT_VERSION) {
-            Ok(config) => Some(Arc::new(Updater::new(config))),
-            Err(error) => {
-                state_tx.send_replace(UpdateState {
-                    phase: UpdatePhase::Unsupported(error.to_string()),
-                    ..initial
-                });
-                None
-            }
-        };
-
-    let _guard = runtime.enter();
-    tokio::spawn(service(
-        updater,
-        automatic,
-        skipped,
-        state_tx,
-        command_rx,
-        Arc::clone(&ready_install),
-    ));
+    let (state_tx, state_rx) = watch::channel(state);
+    let (command_tx, _command_rx) = mpsc::unbounded_channel();
     UpdateHandle {
         state: state_rx,
         commands: command_tx,
-        ready_install,
-        automatic: automatic_flag,
-        _inert_state: None,
+        ready_install: Arc::new(Mutex::new(None)),
+        automatic: Arc::new(AtomicBool::new(false)),
+        _inert_state: Some(state_tx),
     }
 }
 

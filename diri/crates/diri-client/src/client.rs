@@ -277,7 +277,7 @@ impl Default for DaemonClient {
 }
 
 impl DaemonClient {
-    /// Uses `~/Library/Application Support/Dirijor/daemon.sock`.
+    /// Uses the platform path provider's default control socket.
     pub fn new() -> Self {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)

@@ -79,7 +79,7 @@ fn initialize(params: &Value) -> Value {
         "capabilities": {"tools":{}},
         "serverInfo": {"name":"dirijor","version":"0.1.0"},
         "instructions": format!(
-            "This session is running INSIDE Dirijor, a macOS orchestrator for coding agents. \
+            "This session is running INSIDE Diri, a desktop orchestrator for coding agents. \
              These tools control it. Use them proactively whenever the user asks to \
              open/start/spawn/close another agent, session, tab, or terminal (Claude Code, \
              Codex, Cursor, Gemini, or a shell), to check what other sessions are doing, to \

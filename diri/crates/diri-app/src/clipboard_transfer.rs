@@ -5,7 +5,7 @@ use std::process::Command;
 
 use tempfile::NamedTempFile;
 
-const SCP: &str = "/usr/bin/scp";
+const SCP: &str = "scp";
 const REMOTE_TEMP_DIRECTORY: &str = "/tmp";
 
 /// A clipboard image staged locally until `scp` has finished reading it.

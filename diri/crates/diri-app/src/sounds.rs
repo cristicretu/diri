@@ -222,13 +222,13 @@ pub fn play<P: Player>(player: &P, event: StatusSound) -> io::Result<()> {
     player.play(&synthesize_wav(event), PLAYBACK_VOLUME)
 }
 
-/// macOS's built-in player, available only when explicitly requested.
-#[cfg(all(target_os = "macos", feature = "audio-playback"))]
+/// Platform playback adapter. Audio is deliberately best-effort: status
+/// changes remain visible in-app when a desktop has no command-line player.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct AfplayPlayer;
+pub struct PlatformPlayer;
 
 #[cfg(all(target_os = "macos", feature = "audio-playback"))]
-impl Player for AfplayPlayer {
+impl Player for PlatformPlayer {
     fn play(&self, wav: &[u8], volume: f32) -> io::Result<()> {
         use std::{
             fs::{self, OpenOptions},
@@ -269,6 +269,69 @@ impl Player for AfplayPlayer {
                 Err(error)
             }
         }
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "audio-playback"))]
+impl Player for PlatformPlayer {
+    fn play(&self, wav: &[u8], _volume: f32) -> io::Result<()> {
+        use std::{
+            fs::{self, OpenOptions},
+            io::Write,
+            process::Command,
+            sync::atomic::{AtomicU64, Ordering},
+            thread,
+        };
+
+        static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+        let sequence = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "diri-status-sound-{}-{sequence}.wav",
+            std::process::id()
+        ));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        file.write_all(wav)?;
+        drop(file);
+
+        let mut last_error = None;
+        for player in ["pw-play", "paplay", "aplay"] {
+            match Command::new(player).arg(&path).spawn() {
+                Ok(mut child) => {
+                    thread::spawn(move || {
+                        let _ = child.wait();
+                        let _ = fs::remove_file(path);
+                    });
+                    return Ok(());
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    last_error = Some(error);
+                }
+                Err(error) => {
+                    let _ = fs::remove_file(path);
+                    return Err(error);
+                }
+            }
+        }
+        let _ = fs::remove_file(path);
+        Err(last_error.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "no Linux audio player is available",
+            )
+        }))
+    }
+}
+
+#[cfg(any(
+    not(feature = "audio-playback"),
+    not(any(target_os = "macos", target_os = "linux"))
+))]
+impl Player for PlatformPlayer {
+    fn play(&self, _wav: &[u8], _volume: f32) -> io::Result<()> {
+        Ok(())
     }
 }
 

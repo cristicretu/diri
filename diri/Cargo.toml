@@ -35,7 +35,7 @@ diri-ui = { path = "crates/diri-ui" }
 diri-usage = { path = "crates/diri-usage" }
 diri-updater = { path = "crates/diri-updater" }
 gpui = { git = "https://github.com/zed-industries/zed.git", rev = "dc2a339d5d043da448a3f7ddc7c0a85c63864aad" }
-gpui_platform = { git = "https://github.com/zed-industries/zed.git", rev = "dc2a339d5d043da448a3f7ddc7c0a85c63864aad", features = ["font-kit"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed.git", rev = "dc2a339d5d043da448a3f7ddc7c0a85c63864aad", features = ["font-kit", "wayland", "x11"] }
 image = { version = "0.25.1", default-features = false }
 nucleo-matcher = "0.3"
 notify = "8.2"

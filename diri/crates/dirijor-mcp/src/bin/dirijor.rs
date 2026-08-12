@@ -84,7 +84,10 @@ fn print_help() {
         "dirijor — Diri automation CLI\n\n\
          Usage:\n  dirijor status [--json]\n  dirijor session <list|get|read|send|wait|spawn|release|archive> ...\n  \
          dirijor worktree <list|create|remove> ...\n  dirijor artifacts <session> [--json]\n  \
-         dirijor events <subscribe|wait> ...\n  dirijor ports [--json]\n  dirijor doctor"
+         dirijor events <subscribe|wait> ...\n  dirijor ports [--json]\n  dirijor doctor\n  \
+         dirijor hook <event>\n  dirijor notify <json>\n  dirijor mcp-tools\n  \
+         dirijor mcp-call --tool <name> < input.json\n\n\
+         Deferred on Linux: companion forwarding (dirijor forward)."
     );
 }
 
@@ -932,10 +935,18 @@ fn doctor() -> Result<(), CliError> {
             Err(error) => println!("✗ Agent catalog unavailable ({})", error.message),
         }
     }
-    let state = socket
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("state.json");
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
+    let state = if std::env::var_os(diri_proto::paths::ENV_SOCKET).is_some() {
+        // An explicit socket normally denotes an isolated test or alternate
+        // instance. Its state is conventionally colocated unless the caller
+        // also selected an app-support root.
+        socket
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("state.json")
+    } else {
+        diri_proto::paths::DirijorPaths::state_file(home)
+    };
     if state.is_file() {
         println!("✓ state file present at {}", state.display());
     } else {

@@ -244,6 +244,7 @@ mod tests {
     /// LaunchServices — so the wait, rename, unpack, and restore paths are the
     /// shipped ones. `pid` is a process that has already exited, which makes
     /// the wait loop fall through immediately.
+    #[cfg(target_os = "macos")]
     fn run_installer(staged: &Path, target: &Path, pid: u32) -> std::process::Output {
         let script =
             installer_script(pid, staged, target, true).replace("/usr/bin/open", "echo relaunched");
@@ -256,6 +257,7 @@ mod tests {
 
     /// A pid that is guaranteed not to be running: spawn something trivial and
     /// reap it.
+    #[cfg(target_os = "macos")]
     fn dead_pid() -> u32 {
         let mut child = Command::new("/usr/bin/true").spawn().expect("spawn");
         let pid = child.id();
@@ -270,6 +272,7 @@ mod tests {
         bundle
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_helper_actually_replaces_the_bundle() {
         let directory = tempfile::tempdir().expect("temp dir");
@@ -293,6 +296,7 @@ mod tests {
         assert!(String::from_utf8_lossy(&output.stdout).contains("relaunched"));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_helper_restores_the_old_bundle_when_the_unpack_fails() {
         let directory = tempfile::tempdir().expect("temp dir");
@@ -342,6 +346,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn unpacking_finds_the_single_app_in_an_archive() {
         let directory = tempfile::tempdir().expect("temp dir");
@@ -365,6 +370,7 @@ mod tests {
         assert!(unpacked.join("Contents/MacOS/diri").exists());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn an_archive_without_a_bundle_is_rejected() {
         let directory = tempfile::tempdir().expect("temp dir");

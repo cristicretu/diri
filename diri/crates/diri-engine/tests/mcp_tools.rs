@@ -105,6 +105,30 @@ fn call(server: &McpServer<RegistryHost>, tool: &str, arguments: Value) -> Resul
 }
 
 #[test]
+fn the_binary_free_shell_manifest_spawns_the_users_login_shell() {
+    let temp = tempfile::tempdir().expect("temp");
+    let logs = temp.path().join("logs");
+    let registry = Arc::new(Mutex::new(Registry::new(
+        engine(),
+        temp.path().join("state.json"),
+    )));
+    let server = McpServer::new(
+        tool_definitions(),
+        RegistryHost::new(Arc::clone(&registry), &logs),
+    );
+
+    let spawned = call(
+        &server,
+        "spawn_agent",
+        json!({"kind": "shell", "cwd": temp.path()}),
+    )
+    .expect("spawn shell");
+    let id = spawned["id"].as_str().expect("session id");
+    assert!(registry.lock().expect("registry").get(id).is_some());
+    call(&server, "release_agent", json!({"session_id": id})).expect("release shell");
+}
+
+#[test]
 fn an_agent_can_list_read_and_release_another_session() {
     let temp = tempfile::tempdir().expect("temp");
     let logs = temp.path().join("logs");

@@ -78,6 +78,65 @@ jobs:
       - name: Test Rust engine natively
         run: cargo test --locked -p diri-engine -- --nocapture
 
+  app-linux:
+    name: Rust workspace (Linux x86_64)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 75
+    defaults:
+      run:
+        working-directory: diri
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.0.0
+      - name: Install GPUI and display-server dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential clang cmake libasound2-dev libfontconfig-dev \
+            libglib2.0-dev libssl-dev libstdc++-12-dev libvulkan1 \
+            libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev \
+            mesa-vulkan-drivers pkg-config weston xvfb
+      - name: Report Linux environment
+        run: |
+          cat /etc/os-release
+          uname -a
+          rustc --version --verbose
+          ldd --version | head -1
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            diri/target
+          key: linux-app-cargo-${{ hashFiles('diri/Cargo.lock') }}
+          restore-keys: linux-app-cargo-
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Test complete Rust workspace natively
+        run: cargo test --locked --workspace -- --nocapture
+      - name: Release build
+        run: cargo build --locked --workspace --release
+      - name: Smoke GUI under X11
+        run: xvfb-run -a env -u WAYLAND_DISPLAY DIRI_UI_SMOKE_TEST=1 target/release/diri
+      - name: Smoke GUI under headless Wayland
+        run: |
+          export XDG_RUNTIME_DIR="${RUNNER_TEMP}/diri-wayland-runtime"
+          mkdir -p "${XDG_RUNTIME_DIR}"
+          chmod 700 "${XDG_RUNTIME_DIR}"
+          weston --backend=headless-backend.so --socket=diri-ci-wayland \
+            --idle-time=0 --log="${RUNNER_TEMP}/weston.log" &
+          weston_pid=$!
+          trap 'kill "${weston_pid}" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 100); do
+            test -S "${XDG_RUNTIME_DIR}/diri-ci-wayland" && break
+            sleep 0.05
+          done
+          test -S "${XDG_RUNTIME_DIR}/diri-ci-wayland"
+          env -u DISPLAY WAYLAND_DISPLAY=diri-ci-wayland \
+            DIRI_UI_SMOKE_TEST=1 target/release/diri
+
   remote-helper-native:
     name: Remote Helper (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
@@ -274,6 +333,115 @@ jobs:
           test -f "${app}/Contents/Resources/bin/remote-helpers/manifest.json"
           test "$(find "${app}/Contents/Resources/bin/remote-helpers/artifacts" -name diri-remote -type f | wc -l | tr -d ' ')" = 3
           codesign --verify --deep --strict "${app}"
+
+  linux-package:
+    name: Linux packages (Ubuntu 22.04)
+    needs: app-linux
+    runs-on: ubuntu-22.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.0.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: sidecar/package-lock.json
+      - name: Install build, package, and smoke dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential clang cmake desktop-file-utils jq libasound2-dev \
+            libfontconfig-dev libglib2.0-dev libssl-dev \
+            libstdc++-12-dev libvulkan1 libwayland-dev libx11-xcb-dev \
+            libxkbcommon-x11-dev mesa-vulkan-drivers pkg-config xvfb
+          cargo install cargo-packager --version 0.11.8 --locked
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            diri/target
+          key: linux-package-cargo-${{ hashFiles('diri/Cargo.lock') }}
+          restore-keys: |
+            linux-package-cargo-
+            linux-app-cargo-
+      - name: Build AppImage and Debian package
+        env:
+          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: diri/scripts/package-linux.sh
+      - name: Verify package layouts and metadata
+        run: |
+          diri/scripts/verify-linux-package.sh diri/dist/linux
+          deb="$(find diri/dist/linux -maxdepth 1 -name '*.deb' -print -quit)"
+          stage="${RUNNER_TEMP}/diri-desktop-entry"
+          dpkg-deb --extract "${deb}" "${stage}"
+          desktop-file-validate "${stage}/usr/share/applications/diri.desktop"
+          sha256sum --check diri/dist/linux/SHA256SUMS
+          jq -e \
+            --arg commit "${{ github.event.pull_request.head.sha || github.sha }}" \
+            '.platform == "linux" and .architecture == "x86_64" and .commit == $commit and (.artifacts | length) == 2' \
+            diri/dist/linux/linux-release.json
+      - name: Exercise Debian upgrade, runtime, and uninstall
+        run: |
+          previous="${RUNNER_TEMP}/diri-previous"
+          DIRI_DIST_DIR="${previous}" DIRI_VERSION=0.5.0 \
+            DIRI_LINUX_FORMATS=deb diri/scripts/package-linux.sh
+          old_deb="$(find "${previous}" -maxdepth 1 -name '*.deb' -print -quit)"
+          new_deb="$(find diri/dist/linux -maxdepth 1 -name '*.deb' -print -quit)"
+          sudo apt-get install --yes "${old_deb}"
+          sudo apt-get install --yes "${new_deb}"
+          test "$(dpkg-query -W -f='${Version}' diri)" = "$(jq -r .version diri/dist/linux/linux-release.json)"
+          xvfb-run -a env -u WAYLAND_DISPLAY DIRI_UI_SMOKE_TEST=1 diri
+          diri/scripts/smoke-installed-linux.sh
+          sudo apt-get purge --yes diri
+          test ! -e /usr/bin/diri
+          test ! -e /usr/bin/dirijor
+      - name: Smoke AppImage launch
+        run: |
+          appimage="$(find diri/dist/linux -maxdepth 1 -name '*.AppImage' -print -quit)"
+          xvfb-run -a env -u WAYLAND_DISPLAY APPIMAGE_EXTRACT_AND_RUN=1 \
+            DIRI_UI_SMOKE_TEST=1 "${appimage}"
+      - name: Upload Linux release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            diri/dist/linux/*.AppImage
+            diri/dist/linux/*.deb
+            diri/dist/linux/SHA256SUMS
+            diri/dist/linux/linux-release.json
+            diri/dist/linux/THIRD-PARTY-LICENSES.json
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-package-ubuntu-24:
+    name: Linux package smoke (Ubuntu 24.04)
+    needs: linux-package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.0.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-packages-${{ github.event.pull_request.head.sha || github.sha }}
+          path: diri/dist/linux
+      - name: Install clean-machine runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes jq libvulkan1 \
+            mesa-vulkan-drivers xvfb
+      - name: Install, launch, recover a session, and uninstall
+        run: |
+          deb="$(find diri/dist/linux -maxdepth 1 -name '*.deb' -print -quit)"
+          appimage="$(find diri/dist/linux -maxdepth 1 -name '*.AppImage' -print -quit)"
+          sudo apt-get install --yes "${deb}"
+          xvfb-run -a env -u WAYLAND_DISPLAY DIRI_UI_SMOKE_TEST=1 diri
+          diri/scripts/smoke-installed-linux.sh
+          xvfb-run -a env -u WAYLAND_DISPLAY APPIMAGE_EXTRACT_AND_RUN=1 \
+            DIRI_UI_SMOKE_TEST=1 "${appimage}"
+          sudo apt-get purge --yes diri
+          test ! -e /usr/bin/diri
 
   browser-sidecar:
     name: Browser sidecar integration

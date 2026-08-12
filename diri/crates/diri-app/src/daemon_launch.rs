@@ -375,13 +375,13 @@ fn spawn_detached(daemon: &Path, boot_log: Option<&Path>) -> io::Result<()> {
     command.spawn().map(|_child| ())
 }
 
-/// `~/Library/Application Support/Dirijor/dirijord-rs.boot.log`, creating the
-/// support directory if needed. Returns `None` when `HOME` is unset.
+/// The platform log directory's early-boot log, created before the Engine can
+/// initialize its own diagnostics. Returns `None` when `HOME` is unset.
 fn boot_log_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    let support = DirijorPaths::app_support(PathBuf::from(home));
-    std::fs::create_dir_all(&support).ok()?;
-    Some(support.join(BOOT_LOG_FILE_NAME))
+    let logs = DirijorPaths::logs_dir(PathBuf::from(home));
+    std::fs::create_dir_all(&logs).ok()?;
+    Some(logs.join(BOOT_LOG_FILE_NAME))
 }
 
 fn is_executable(path: &Path) -> bool {

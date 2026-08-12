@@ -342,11 +342,18 @@ impl RegistryHost {
         let authority = descriptor.authority();
 
         let inherited: Vec<(String, String)> = std::env::vars().collect();
-        let pty = descriptor
-            .spawn_spec(&working_dir, inherited, &[])
-            .ok_or_else(|| {
-                format!("agent {kind:?} declares no binary, so it cannot be spawned by name")
-            })?;
+        let pty = if let Some(pty) = descriptor.spawn_spec(&working_dir, inherited.clone(), &[]) {
+            pty
+        } else if kind == diri_proto::AgentKind::SHELL_ID {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
+            let mut pty = crate::pty::PtySpec::new(vec![shell, "-l".to_owned()], &working_dir);
+            pty.env = inherited;
+            pty
+        } else {
+            return Err(format!(
+                "agent {kind:?} declares no binary, so it cannot be spawned by name"
+            ));
+        };
 
         let id = crate::control::next_session_id();
         let mut record = crate::control::new_record(&id, &kind, &working_dir.to_string_lossy());

@@ -22,6 +22,8 @@ use diri_engine::detect::ManifestEngine;
 use diri_engine::registry::Registry;
 #[cfg(unix)]
 use diri_engine::session::HolderConfig;
+#[cfg(unix)]
+use diri_proto::paths::DirijorPaths;
 
 #[cfg(not(unix))]
 fn main() {
@@ -51,16 +53,38 @@ fn main() {
         unsafe { std::env::set_var("PATH", &path) };
     }
 
-    let app_support = app_support_dir();
-    for dir in ["logs", "holders", "inject", "bin"] {
-        let _ = std::fs::create_dir_all(app_support.join(dir));
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let app_support = DirijorPaths::app_support(&home);
+    let state_dir = DirijorPaths::state_dir(&home);
+    let config_dir = DirijorPaths::config_dir(&home);
+    let runtime_dir = DirijorPaths::runtime_dir(&home);
+    let cache_dir = DirijorPaths::cache_dir(&home);
+    let logs_dir = DirijorPaths::logs_dir(&home);
+    for dir in [
+        app_support.as_path(),
+        state_dir.as_path(),
+        config_dir.as_path(),
+        runtime_dir.as_path(),
+        cache_dir.as_path(),
+        logs_dir.as_path(),
+        app_support.join("holders").as_path(),
+        DirijorPaths::inject_dir(&home).as_path(),
+        DirijorPaths::bin_dir(&home).as_path(),
+        DirijorPaths::manifest_overrides_dir(&home).as_path(),
+    ] {
+        if let Err(error) = ensure_private_dir(dir) {
+            eprintln!("dirijord-rs: cannot create {}: {error}", dir.display());
+            std::process::exit(1);
+        }
     }
 
     // Singleton guard: hold an exclusive lock for our lifetime so a second
     // daemon (a relaunching app whose probe raced) exits instead of stealing
     // the live daemon's socket and orphaning its PTYs. The fd leaks on
     // purpose — it must stay open until process exit.
-    let lock_path = app_support.join("daemon.lock");
+    let lock_path = runtime_dir.join("daemon.lock");
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
@@ -84,7 +108,8 @@ fn main() {
         .and_then(|exe| exe.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let (engine, failed) = load_manifests(&exe_dir, &app_support);
+    let manifest_overrides = DirijorPaths::manifest_overrides_dir(&home);
+    let (engine, failed) = load_manifests(&exe_dir, &manifest_overrides);
     if !failed.is_empty() {
         eprintln!(
             "dirijord-rs: {} manifest file(s) failed to parse: {failed:?}",
@@ -99,13 +124,12 @@ fn main() {
         std::process::exit(1);
     }
 
-    let logs_dir = app_support.join("logs");
     let holder = HolderConfig {
         holders_dir: app_support.join("holders"),
         executable: holder_executable(&exe_dir),
     };
 
-    let mut registry = Registry::new(Arc::clone(&engine), app_support.join("state.json"));
+    let mut registry = Registry::new(Arc::clone(&engine), DirijorPaths::state_file(&home));
     match registry.load() {
         Ok(count) => eprintln!("dirijord-rs: loaded {count} session record(s)"),
         Err(error) => eprintln!("dirijord-rs: state load: {error}"),
@@ -122,11 +146,11 @@ fn main() {
     // A cargo-built dirijord-rs does not sit next to a `dirijor` binary, so
     // inventing `target/debug/dirijor` makes every MCP tools/list fail.
     let cli_path = install_cli_helpers(&exe_dir, &app_support);
-    let mut server = ControlServer::new(Arc::clone(&registry), app_support.join("daemon.sock"))
+    let mut server = ControlServer::new(Arc::clone(&registry), DirijorPaths::socket(&home))
         .with_logs_dir(&logs_dir)
         .with_holder(holder)
         .with_injection(InjectionConfig {
-            inject_dir: app_support.join("inject"),
+            inject_dir: DirijorPaths::inject_dir(&home),
             cli_path,
         });
     if let Some(remote) = remote_manager(&exe_dir, &app_support) {
@@ -198,9 +222,9 @@ fn main() {
 }
 
 /// The user's real login shell from the user database. Authoritative even
-/// under launchd, where the SHELL env var is often /bin/zsh regardless of the
-/// user's configured shell (a fish user's PATH lives in config.fish, which
-/// zsh would never source).
+/// under a desktop service, where the SHELL env var can differ from the user's
+/// configured shell (a fish user's PATH lives in config.fish, which another
+/// shell would never source).
 #[cfg(unix)]
 fn login_shell() -> String {
     // SAFETY: getpwuid returns a pointer to a static per-thread record; it is
@@ -217,7 +241,17 @@ fn login_shell() -> String {
             }
         }
     }
-    std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into())
+    std::env::var("SHELL").unwrap_or_else(|_| default_shell().into())
+}
+
+#[cfg(target_os = "macos")]
+const fn default_shell() -> &'static str {
+    "/bin/zsh"
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn default_shell() -> &'static str {
+    "/bin/sh"
 }
 
 /// Mirrors the Swift daemon's `LoginEnvironment`: `printenv PATH` prints the
@@ -357,12 +391,13 @@ fn anonymous_capture_file() -> std::io::Result<std::fs::File> {
 }
 
 #[cfg(unix)]
-fn app_support_dir() -> PathBuf {
-    if let Ok(root) = std::env::var("DIRIJOR_APP_SUPPORT") {
-        return PathBuf::from(root);
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    Path::new(&home).join("Library/Application Support/Dirijor")
+fn ensure_private_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::create_dir_all(path)?;
+    let mut permissions = std::fs::metadata(path)?.permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(path, permissions)
 }
 
 /// Copy `dirijor`, `dirijor-mcp`, and the CLI's manifest resource bundle into
@@ -521,21 +556,21 @@ fn set_executable(path: &Path) {
 #[cfg(unix)]
 /// Rust-owned base catalog next to the executable, then user overrides, then
 /// the source-tree fallback used by loose development binaries.
-fn load_manifests(exe_dir: &Path, app_support: &Path) -> (ManifestEngine, Vec<String>) {
+fn load_manifests(exe_dir: &Path, overrides: &Path) -> (ManifestEngine, Vec<String>) {
     let mut bases: Vec<PathBuf> = Vec::new();
     if let Ok(configured) = std::env::var("DIRI_MANIFESTS_DIR") {
         bases.push(PathBuf::from(configured));
     }
     bases.push(exe_dir.join("manifests"));
+    bases.push(DirijorPaths::packaged_resources(exe_dir.join("dirijord-rs")).join("manifests"));
     bases.push(diri_engine::detect::bundled_manifest_dir());
     let base = bases.into_iter().find(|dir| dir.is_dir());
-    let overrides = app_support.join("manifests/overrides");
 
     let mut dirs: Vec<&Path> = Vec::new();
     if let Some(base) = &base {
         dirs.push(base);
     }
-    dirs.push(&overrides);
+    dirs.push(overrides);
     ManifestEngine::load_dirs(&dirs).unwrap_or_else(|error| {
         eprintln!("dirijord-rs: manifest load: {error}");
         (ManifestEngine::new(Vec::new()), Vec::new())

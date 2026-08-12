@@ -42,7 +42,7 @@ use crate::commands::{
     CloseFind, CopySelection, FindNext, FindPrevious, OpenFind, Paste, ResetZoom, TERMINAL_CONTEXT,
     ToggleInspector, ToggleSidebar, ZoomIn, ZoomOut,
 };
-use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
+use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::{NavigationOverlay, query_label};
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
 use crate::session_surfaces::switcher_key;
@@ -699,14 +699,7 @@ impl TerminalPane {
             if self.residents.contains_key(&id) {
                 continue;
             }
-            let mut mono = font(crate::fonts::mono_family());
-            mono.fallbacks = Some(gpui::FontFallbacks::from_fonts(vec![
-                ".SF NS Mono".to_owned(),
-                "Menlo".to_owned(),
-                "Apple Symbols".to_owned(),
-                "STIX Two Math".to_owned(),
-                "Apple Color Emoji".to_owned(),
-            ]));
+            let mono = crate::fonts::terminal_font();
             let parked = self
                 .parked_grids
                 .iter()

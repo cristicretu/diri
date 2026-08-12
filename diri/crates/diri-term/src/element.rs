@@ -316,13 +316,7 @@ struct CursorPaint {
 impl TerminalElement {
     #[must_use]
     pub fn new(buffer: SharedGridBuffer) -> Self {
-        let mut terminal_font = font(".SF NS Mono");
-        terminal_font.fallbacks = Some(FontFallbacks::from_fonts(vec![
-            "Menlo".to_owned(),
-            "Apple Symbols".to_owned(),
-            "STIX Two Math".to_owned(),
-            "Apple Color Emoji".to_owned(),
-        ]));
+        let terminal_font = default_terminal_font();
         Self {
             buffer,
             shared: Arc::new(ElementSharedState {
@@ -738,6 +732,41 @@ impl TerminalElement {
             Some(metrics.cell_width),
         ))
     }
+}
+
+#[cfg(target_os = "macos")]
+fn default_terminal_font() -> Font {
+    let mut terminal_font = font(".SF NS Mono");
+    terminal_font.fallbacks = Some(FontFallbacks::from_fonts(
+        [
+            "Menlo",
+            "Apple Symbols",
+            "STIX Two Math",
+            "Apple Color Emoji",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+    ));
+    terminal_font
+}
+
+#[cfg(not(target_os = "macos"))]
+fn default_terminal_font() -> Font {
+    let mut terminal_font = font("monospace");
+    terminal_font.fallbacks = Some(FontFallbacks::from_fonts(
+        [
+            "Noto Sans Mono",
+            "DejaVu Sans Mono",
+            "Noto Sans Symbols 2",
+            "STIX Two Math",
+            "Noto Color Emoji",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+    ));
+    terminal_font
 }
 
 impl IntoElement for TerminalElement {

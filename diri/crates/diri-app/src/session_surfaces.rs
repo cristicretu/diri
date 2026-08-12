@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
-use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
+use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::store::{SessionStore, StoreRuntime};
 use crate::switcher::{
     OverviewArrow, OverviewFilter, OverviewLane, OverviewMode, SwitcherKey, display_title,
@@ -508,7 +508,10 @@ impl SessionSurfaces {
                 div()
                     .text_size(px(11.0))
                     .text_color(colors.tertiary)
-                    .child("⌘ click to select"),
+                    .child(format!(
+                        "{} to select",
+                        crate::commands::primary_click_label()
+                    )),
             )
             .child(mode_selector)
             .child(

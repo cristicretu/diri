@@ -21,16 +21,16 @@ use crate::commands::{
     ToggleCommandPalette, ToggleHistory, ToggleInspector, ToggleOverview, ToggleQuickOpen,
     ToggleSidebar,
 };
+use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::inspector::{InspectorEvent, WorkbenchInspector};
 use crate::launcher::{LauncherEvent, LauncherOverlay};
-use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::NavigationOverlay;
 use crate::notifications::{InAppBanner, NotificationSound};
 use crate::recovery::{RecoveryAction, RecoveryKind, RecoveryNotice};
 use crate::seam::{SeamSlide, toggle_has_settled};
 use crate::session_surfaces::SessionSurfaces;
 use crate::sidebar::{PreviewScenario, Sidebar, SidebarEvent};
-use crate::sounds::{self, AfplayPlayer, SoundGate, StatusSound};
+use crate::sounds::{self, PlatformPlayer, SoundGate, StatusSound};
 use crate::store::SpawnOptions;
 use crate::surface_shell::UtilitySurfaces;
 use crate::terminal_pane::{TerminalPane, TerminalPaneEvent, TerminalViewport};
@@ -344,7 +344,7 @@ impl RootView {
                                     NotificationSound::Frozen => StatusSound::Frozen,
                                 };
                                 if this.sound_gate.should_play(sound, Instant::now()) {
-                                    let _ = sounds::play(&AfplayPlayer, sound);
+                                    let _ = sounds::play(&PlatformPlayer, sound);
                                 }
                             }
                             #[cfg(target_os = "macos")]

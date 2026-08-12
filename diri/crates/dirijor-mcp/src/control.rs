@@ -50,7 +50,7 @@ pub fn default_socket_path() -> PathBuf {
         return PathBuf::from(path);
     }
     let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    home.join("Library/Application Support/Dirijor/daemon.sock")
+    diri_proto::paths::DirijorPaths::socket(home)
 }
 
 #[cfg(unix)]

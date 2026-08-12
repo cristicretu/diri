@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use crate::commands::{NAVIGATION_CONTEXT, ToggleCommandPalette, ToggleQuickOpen};
 use crate::fuzzy::{FuzzyMatcher, FuzzyQuery};
-use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
+use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::palette::{self, PaletteAction, PaletteCommand, Ranked};
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
 use crate::quick_open::{
@@ -1002,7 +1002,10 @@ impl NavigationOverlay {
                         .flex()
                         .gap(px(5.0))
                         .child(chip(format!("⏎ {}", default_name.to_lowercase()), colors))
-                        .child(chip("⌘⏎ term", colors)),
+                        .child(chip(
+                            format!("{} term", crate::commands::primary_shortcut_label("⏎")),
+                            colors,
+                        )),
                 )
             })
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {

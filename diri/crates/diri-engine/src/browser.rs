@@ -337,8 +337,9 @@ fn resolve_node() -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// The sidecar script: env override, then app-bundle Resources, then upward
-/// from the executable (dev checkouts run from target dirs under diri/).
+/// The sidecar script: env override, installed Linux resources, app-bundle
+/// Resources, then upward from the executable (dev checkouts run from target
+/// dirs under diri/).
 fn locate_sidecar() -> Option<PathBuf> {
     if let Ok(configured) = std::env::var("DIRIJOR_SIDECAR") {
         let path = PathBuf::from(configured);
@@ -348,6 +349,11 @@ fn locate_sidecar() -> Option<PathBuf> {
     }
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(exe) = std::env::current_exe().and_then(|exe| exe.canonicalize()) {
+        // /usr/bin/<exe> -> /usr/lib/diri/sidecar/server.js. AppImage keeps the
+        // same layout beneath its mounted AppDir.
+        candidates.push(
+            diri_proto::paths::DirijorPaths::packaged_resources(&exe).join("sidecar/server.js"),
+        );
         // Resources/bin/<exe> → Resources/sidecar/server.js in the bundle.
         let mut dir = exe.parent().map(Path::to_path_buf);
         for _ in 0..7 {

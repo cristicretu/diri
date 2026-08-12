@@ -15,7 +15,7 @@ use gpui::{
 use crate::AppServices;
 use crate::agent_catalog::{AgentOption, quick_agent_options, title_case_id};
 use crate::composer::PromptComposer;
-use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
+use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::CARET;
 use crate::query_editor::{self, ClipboardEdit, Edit};
 use crate::store::SpawnOptions;

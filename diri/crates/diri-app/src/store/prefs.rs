@@ -2,6 +2,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use diri_proto::paths::DirijorPaths;
 use diri_proto::{AgentKind, ProjectId, SessionId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -166,7 +167,7 @@ impl Prefs {
     }
 
     pub fn path_in_home(home: &Path) -> PathBuf {
-        home.join("Library/Application Support/diri/prefs.json")
+        DirijorPaths::prefs_file(home)
     }
 
     pub fn load(path: &Path) -> io::Result<Self> {

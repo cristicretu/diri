@@ -5,13 +5,13 @@
 //! connection to the Engine control protocol, so credentials cannot enter
 //! session state or diagnostic payloads.
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn main() {
-    eprintln!("diri-ssh-askpass is only available on macOS");
+    eprintln!("diri-ssh-askpass is unavailable on this platform");
     std::process::exit(1);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn main() {
     use std::io::Write as _;
 
@@ -31,14 +31,14 @@ fn main() {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PromptKind {
     ConfirmHost,
     Secret,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl PromptKind {
     fn classify(kind: Option<&str>, prompt: &str) -> Self {
         if kind == Some("confirm")
@@ -98,7 +98,82 @@ fn present(kind: PromptKind, prompt: &str) -> Option<String> {
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn present(kind: PromptKind, prompt: &str) -> Option<String> {
+    if program_available("zenity") {
+        present_with_zenity(kind, prompt)
+    } else if program_available("kdialog") {
+        present_with_kdialog(kind, prompt)
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn program_available(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).any(|directory| directory.join(name).is_file()))
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn present_with_zenity(kind: PromptKind, prompt: &str) -> Option<String> {
+    use std::process::Command;
+
+    let mut command = Command::new("zenity");
+    match kind {
+        PromptKind::ConfirmHost => {
+            command.args([
+                "--question",
+                "--title=Verify SSH host",
+                "--ok-label=Allow",
+                "--cancel-label=Cancel",
+                "--text",
+                prompt,
+            ]);
+        }
+        PromptKind::Secret => {
+            command.args(["--password", "--title=SSH authentication", "--text", prompt]);
+        }
+    }
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    response_from_dialog(kind, output.stdout)
+}
+
+#[cfg(target_os = "linux")]
+fn present_with_kdialog(kind: PromptKind, prompt: &str) -> Option<String> {
+    use std::process::Command;
+
+    let output = match kind {
+        PromptKind::ConfirmHost => Command::new("kdialog")
+            .args(["--title", "Verify SSH host", "--yesno", prompt])
+            .output(),
+        PromptKind::Secret => Command::new("kdialog")
+            .args(["--title", "SSH authentication", "--password", prompt])
+            .output(),
+    }
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    response_from_dialog(kind, output.stdout)
+}
+
+#[cfg(target_os = "linux")]
+fn response_from_dialog(kind: PromptKind, output: Vec<u8>) -> Option<String> {
+    match kind {
+        PromptKind::ConfirmHost => Some(String::from("yes")),
+        PromptKind::Secret => String::from_utf8(output)
+            .ok()
+            .map(|secret| secret.trim_end_matches(['\r', '\n']).to_owned())
+            .filter(|secret| !secret.is_empty()),
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
 
@@ -118,6 +193,19 @@ mod tests {
         assert_eq!(
             PromptKind::classify(None, "Enter passphrase for key '/tmp/id_ed25519':"),
             PromptKind::Secret
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn trims_dialog_newlines_without_trimming_the_secret_itself() {
+        assert_eq!(
+            response_from_dialog(PromptKind::Secret, b" pass phrase \n".to_vec()),
+            Some(" pass phrase ".to_owned())
+        );
+        assert_eq!(
+            response_from_dialog(PromptKind::ConfirmHost, Vec::new()),
+            Some("yes".to_owned())
         );
     }
 }

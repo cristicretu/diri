@@ -1,5 +1,50 @@
 # Packaging diri
 
+The macOS and Linux packages are built natively on their oldest supported
+runner. Both consume the same Rust workspace, protocol, daemon, holder, CLI,
+MCP frontend, and agent manifests.
+
+## Linux
+
+Run this on x86_64 Linux after installing the build dependencies in
+[`LINUX.md`](LINUX.md), Node.js 20 or newer, and cargo-packager 0.11.8:
+
+```sh
+cargo install cargo-packager --version 0.11.8 --locked
+scripts/package-linux.sh
+scripts/verify-linux-package.sh dist/linux
+```
+
+The script builds every release binary, installs the locked browser-sidecar
+dependencies, validates the repository's license policy, and passes a declared
+resource manifest to cargo-packager. It emits an AppImage, a Debian package,
+`SHA256SUMS`, `linux-release.json`, and the third-party license inventory under
+`dist/linux`. `linux-release.json` records the version, source commit,
+platform, architecture, format, size, and SHA-256 digest of each artifact.
+
+The AppImage and Debian package have the same internal layout: executables in
+`usr/bin`, manifests and the browser sidecar in `usr/lib/diri`, desktop
+metadata in `usr/share/applications`, and the icon under the hicolor icon
+tree. The Debian package declares the glibc 2.35, fontconfig, GLib, Vulkan,
+Wayland, X11/XCB, and xkbcommon runtime dependencies.
+
+Linux packages are always built on Ubuntu 22.04 to establish the oldest
+supported glibc floor, then installed and smoke-tested on clean Ubuntu 22.04
+and 24.04 CI jobs. The smoke covers X11 launch, package upgrade and uninstall,
+a live shell session, Engine restart/holder adoption, CLI hooks, and MCP. The
+workspace job additionally launches the GUI against headless Wayland. Manual
+native-GPU QA remains a release gate; virtual displays cannot validate real
+drivers, multiple monitors, suspend/resume, or fractional scaling.
+
+`DIRI_DIST_DIR`, `CARGO_TARGET_DIR`, `DIRI_VERSION`, and
+`DIRI_LINUX_FORMATS=appimage,deb` can override the defaults. Linux release
+artifacts must come from the CI run for the exact release commit. Set
+`DIRI_LINUX_DIST` to that downloaded artifact directory when running the
+macOS release script; the release is then created once with both platforms'
+immutable assets.
+
+## macOS
+
 `scripts/package.sh` builds `diri` for Apple silicon and Intel, combines the two slices with `lipo`, asks cargo-packager to assemble `dist/diri.app`, and signs the result. The bundle identifier is `com.dirijor.diri`, the deployment target is macOS 15.0, and the app does not use App Sandbox.
 
 ## One-time setup

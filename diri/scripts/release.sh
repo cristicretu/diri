@@ -11,8 +11,10 @@
 #   SKIP_CASK=1         explicitly publish without updating the Homebrew cask
 #   SKIP_GATES=1        skip cargo test/clippy (for re-running a failed publish)
 #   SKIP_PERF_GATE=1   skip packaged app memory/idle-CPU probe
+#   DIRI_LINUX_DIST     downloaded Linux CI artifact for this source commit
 #
-# This publishes TWO application artifacts per release, both notarized and stapled:
+# This publishes two notarized macOS artifacts plus the CI-built Linux
+# AppImage and Debian package:
 #   diri-<version>-universal.dmg  what people download by hand
 #   diri-<version>-universal.zip  what the in-app updater fetches
 # plus appcast.json, SHA256SUMS, and the reviewed dependency-license inventory.
@@ -144,6 +146,64 @@ if git -C "$ROOT" rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
     fi
 fi
 echo "    source commit : $SOURCE_COMMIT"
+
+if [ -z "${DIRI_LINUX_DIST:-}" ] || [ ! -d "$DIRI_LINUX_DIST" ]; then
+    cat >&2 <<EOF
+error: DIRI_LINUX_DIST must name the downloaded linux-packages CI artifact
+for source commit $SOURCE_COMMIT.
+
+The release is created atomically with macOS and Linux assets. Download the
+Linux package artifact from the successful CI run for this commit, set
+DIRI_LINUX_DIST to that directory, and re-run.
+EOF
+    exit 1
+fi
+
+LINUX_APPIMAGE_SOURCE="$(find "$DIRI_LINUX_DIST" -maxdepth 1 -type f -name '*.AppImage' -print -quit)"
+LINUX_DEB_SOURCE="$(find "$DIRI_LINUX_DIST" -maxdepth 1 -type f -name '*.deb' -print -quit)"
+LINUX_MANIFEST_SOURCE="$DIRI_LINUX_DIST/linux-release.json"
+if [ -z "$LINUX_APPIMAGE_SOURCE" ] || [ -z "$LINUX_DEB_SOURCE" ] || [ ! -f "$LINUX_MANIFEST_SOURCE" ]; then
+    echo "error: Linux CI artifact must contain one AppImage, one DEB, and linux-release.json" >&2
+    exit 1
+fi
+
+python3 - "$LINUX_MANIFEST_SOURCE" "$VERSION" "$SOURCE_COMMIT" \
+    "$LINUX_APPIMAGE_SOURCE" "$LINUX_DEB_SOURCE" <<'PYLINUX'
+import hashlib
+import json
+import pathlib
+import sys
+
+manifest_path, version, commit, *artifact_names = sys.argv[1:]
+manifest = json.loads(pathlib.Path(manifest_path).read_text())
+if manifest.get("version") != version or manifest.get("commit") != commit:
+    raise SystemExit("Linux artifact version/source commit does not match this release")
+if manifest.get("platform") != "linux" or manifest.get("architecture") != "x86_64":
+    raise SystemExit("Linux artifact has the wrong platform or architecture")
+records = {record["file"]: record for record in manifest.get("artifacts", [])}
+for name in artifact_names:
+    path = pathlib.Path(name)
+    record = records.get(path.name)
+    if record is None:
+        raise SystemExit(f"Linux manifest does not declare {path.name}")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if digest != record.get("sha256"):
+        raise SystemExit(f"Linux artifact digest mismatch: {path.name}")
+PYLINUX
+
+LINUX_APPIMAGE="$DIST/$(basename "$LINUX_APPIMAGE_SOURCE")"
+LINUX_DEB="$DIST/$(basename "$LINUX_DEB_SOURCE")"
+LINUX_MANIFEST="$DIST/linux-release.json"
+mkdir -p "$DIST"
+if [ "$LINUX_APPIMAGE_SOURCE" != "$LINUX_APPIMAGE" ]; then
+    cp "$LINUX_APPIMAGE_SOURCE" "$LINUX_APPIMAGE"
+fi
+if [ "$LINUX_DEB_SOURCE" != "$LINUX_DEB" ]; then
+    cp "$LINUX_DEB_SOURCE" "$LINUX_DEB"
+fi
+if [ "$LINUX_MANIFEST_SOURCE" != "$LINUX_MANIFEST" ]; then
+    cp "$LINUX_MANIFEST_SOURCE" "$LINUX_MANIFEST"
+fi
 
 # ----------------------------------------------------------------------------
 # 2. Gates
@@ -277,6 +337,9 @@ echo "==> Writing $CHECKSUMS"
     shasum -a 256 \
         "$(basename "$DMG")" \
         "$(basename "$ZIP")" \
+        "$(basename "$LINUX_APPIMAGE")" \
+        "$(basename "$LINUX_DEB")" \
+        "$(basename "$LINUX_MANIFEST")" \
         "$(basename "$FEED")" \
         "$(basename "$INVENTORY")" > "$(basename "$CHECKSUMS")"
     shasum -a 256 -c "$(basename "$CHECKSUMS")"
@@ -290,13 +353,18 @@ if [ ! -f "$NOTES_FILE" ]; then
     cat > "$NOTES_FILE" <<NOTES
 ## diri $VERSION
 
-Native macOS orchestrator for coding agents.
+Native desktop orchestrator for coding agents on macOS and Linux.
 
-**Install:** download the DMG below, open it, drag diri to Applications.
+**macOS:** download the DMG below, open it, drag diri to Applications.
 Universal (Apple silicon and Intel), signed and notarized, so it opens without
 a Gatekeeper prompt.
 
-diri updates itself from here — \`appcast.json\` is the feed it reads.
+**Linux beta:** download the x86_64 Debian package or AppImage. Ubuntu 22.04
+and 24.04 are supported under X11 and Wayland. Linux updates use a newer
+package/download rather than the in-app macOS updater.
+
+See \`SHA256SUMS\` and \`linux-release.json\` for artifact metadata. The macOS
+app updates itself from the \`appcast.json\` feed attached here.
 NOTES
     echo "==> Wrote default notes to $NOTES_FILE (edit and re-run to customize)"
 fi
@@ -304,7 +372,9 @@ fi
 echo "==> Publishing $TAG to $GH_REPO"
 GH_REPO="$GH_REPO" SOURCE_COMMIT="$SOURCE_COMMIT" \
     "$WORKSPACE/scripts/publish-github-release.sh" \
-    "$VERSION" "$NOTES_FILE" "$DMG" "$ZIP" "$FEED" "$CHECKSUMS" "$INVENTORY"
+    "$VERSION" "$NOTES_FILE" "$DMG" "$ZIP" \
+    "$LINUX_APPIMAGE" "$LINUX_DEB" "$LINUX_MANIFEST" \
+    "$FEED" "$CHECKSUMS" "$INVENTORY"
 
 # ----------------------------------------------------------------------------
 # 6. Bump the Homebrew cask
@@ -329,6 +399,9 @@ cat <<EOF
 ============================================================
   DMG        : $DMG
   Update zip : $ZIP
+  AppImage   : $LINUX_APPIMAGE
+  Debian     : $LINUX_DEB
+  Linux meta : $LINUX_MANIFEST
   DMG sha256 : $DMG_SHA256
   ZIP sha256 : $SHA256
   Checksums   : $CHECKSUMS
@@ -339,5 +412,6 @@ cat <<EOF
 
   Next steps:
     1. Confirm an old build updates itself (diri/UPDATING.md → "Verifying a release")
+    2. Install one Linux artifact on native X11 and Wayland hosts
 ============================================================
 EOF

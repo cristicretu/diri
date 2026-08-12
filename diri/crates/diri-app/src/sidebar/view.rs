@@ -20,8 +20,8 @@ use gpui::{
 };
 use tokio::sync::mpsc;
 
-use crate::commands::OpenSettings;
-use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
+use crate::commands::{CommandId, OpenSettings};
+use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::query_label;
 use crate::query_editor::{self, ClipboardEdit, Edit};
 use crate::seam::toggle_has_settled;
@@ -518,9 +518,10 @@ impl Sidebar {
                     crate::agent_catalog::display_name(&store.preferences().default_agent, catalog)
                 },
             );
-            let location = store
-                .default_spawn_host()
-                .map_or_else(|| "This Mac".to_owned(), |id| store.host_display_name(&id));
+            let location = store.default_spawn_host().map_or_else(
+                || crate::platform::local_machine_label().to_owned(),
+                |id| store.host_display_name(&id),
+            );
             (agent, location)
         };
         div()
@@ -581,7 +582,11 @@ impl Sidebar {
                 div()
                     .text_size(px(Typo::META.size))
                     .text_color(colors.tertiary)
-                    .child("⌘T"),
+                    .child(
+                        crate::commands::command(CommandId::NewDefaultSession)
+                            .shortcut_label()
+                            .unwrap_or_default(),
+                    ),
             )
             .into_any_element()
     }
@@ -651,7 +656,11 @@ impl Sidebar {
                         div()
                             .text_size(px(Typo::META.size))
                             .text_color(colors.tertiary)
-                            .child("⌘T"),
+                            .child(
+                                crate::commands::command(CommandId::NewDefaultSession)
+                                    .shortcut_label()
+                                    .unwrap_or_default(),
+                            ),
                     ),
             )
             .child(
@@ -1237,7 +1246,7 @@ impl Sidebar {
                             .flex_none()
                             .text_size(px(Typo::META.size))
                             .text_color(colors.tertiary)
-                            .child(format!("⌘{index}")),
+                            .child(crate::commands::primary_shortcut_label(&index.to_string())),
                     )
                 },
             )
@@ -1883,9 +1892,10 @@ impl Sidebar {
                     (fallback_target, Some("locating repo…".to_owned()))
                 }
                 Some(crate::store::RepoTarget::NotCloned) => {
-                    let place = selected_host
-                        .as_ref()
-                        .map_or_else(|| "this Mac".to_owned(), |h| h.display_name().to_owned());
+                    let place = selected_host.as_ref().map_or_else(
+                        || crate::platform::local_machine_label_lowercase().to_owned(),
+                        |h| h.display_name().to_owned(),
+                    );
                     let folder = fallback_target
                         .rsplit('/')
                         .next()
@@ -1906,7 +1916,7 @@ impl Sidebar {
         };
         let folder = target.rsplit('/').next().unwrap_or(&target).to_owned();
         let location = selected_host.as_ref().map_or_else(
-            || "This Mac".to_owned(),
+            || crate::platform::local_machine_label().to_owned(),
             |host| host.display_name().to_owned(),
         );
         let mut header = div()
@@ -2019,8 +2029,11 @@ impl Sidebar {
                     .text_color(colors.tertiary)
                     .child("Run shortcuts on"),
             );
-            let mut targets: Vec<(Option<String>, String, &'static str)> =
-                vec![(None, "This Mac".to_owned(), "desktopcomputer")];
+            let mut targets: Vec<(Option<String>, String, &'static str)> = vec![(
+                None,
+                crate::platform::local_machine_label().to_owned(),
+                "desktopcomputer",
+            )];
             for entry in &hosts {
                 targets.push((
                     Some(entry.id.clone()),
@@ -2179,8 +2192,7 @@ impl Sidebar {
             let same_repo_as = same_repo_reference.clone();
             // The picker selection is also the global shortcut destination,
             // so every shortcut stays visible and follows the checkmark.
-            let shortcut = agent_picker_shortcut(&option.kind, &default_kind, option.shortcut);
-            let shortcut = shortcut.to_owned();
+            let shortcut = agent_picker_shortcut(&option.kind, &default_kind, &option.shortcut);
             let agent_kind = ui_agent_kind(&option.kind);
             let spawn_kind = option.kind.clone();
             let available = selected_host.is_some() || option.available;
@@ -3853,7 +3865,7 @@ fn status_state(session: &SessionRecord, migrating: bool) -> StatusState {
 struct AgentPickerOption {
     title: String,
     kind: ProtoAgentKind,
-    shortcut: &'static str,
+    shortcut: String,
     binary: String,
     available: bool,
     setup_url: Option<String>,
@@ -3869,9 +3881,11 @@ fn agent_picker_options(
         .map(|option| AgentPickerOption {
             title: option.display_name,
             shortcut: if option.kind == ProtoAgentKind::CODEX {
-                "⌘⇧N"
+                crate::commands::command(CommandId::NewCodexSession)
+                    .shortcut_label()
+                    .unwrap_or_default()
             } else {
-                ""
+                String::new()
             },
             kind: option.kind,
             binary: option.binary,
@@ -3884,7 +3898,9 @@ fn agent_picker_options(
     options.push(AgentPickerOption {
         title: "Terminal".to_owned(),
         kind: ProtoAgentKind::SHELL,
-        shortcut: "⌥⌘T",
+        shortcut: crate::commands::command(CommandId::NewTerminal)
+            .shortcut_label()
+            .unwrap_or_default(),
         binary: "login shell".to_owned(),
         available: true,
         setup_url: None,
@@ -3896,12 +3912,14 @@ fn agent_picker_options(
 fn agent_picker_shortcut(
     kind: &ProtoAgentKind,
     default_kind: &ProtoAgentKind,
-    fallback: &'static str,
-) -> &'static str {
+    fallback: &str,
+) -> String {
     if kind == default_kind {
-        "⌘T"
+        crate::commands::command(CommandId::NewDefaultSession)
+            .shortcut_label()
+            .unwrap_or_default()
     } else {
-        fallback
+        fallback.to_owned()
     }
 }
 
@@ -4090,21 +4108,34 @@ mod tests {
 
     #[test]
     fn agent_shortcuts_remain_visible_when_the_execution_host_changes() {
+        let default = crate::commands::command(CommandId::NewDefaultSession)
+            .shortcut_label()
+            .unwrap();
+        let codex = crate::commands::command(CommandId::NewCodexSession)
+            .shortcut_label()
+            .unwrap();
+        let terminal = crate::commands::command(CommandId::NewTerminal)
+            .shortcut_label()
+            .unwrap();
         assert_eq!(
             agent_picker_shortcut(
                 &ProtoAgentKind::CLAUDE_CODE,
                 &ProtoAgentKind::CLAUDE_CODE,
                 ""
             ),
-            "⌘T"
+            default
         );
         assert_eq!(
-            agent_picker_shortcut(&ProtoAgentKind::CODEX, &ProtoAgentKind::CLAUDE_CODE, "⌘⇧N"),
-            "⌘⇧N"
+            agent_picker_shortcut(&ProtoAgentKind::CODEX, &ProtoAgentKind::CLAUDE_CODE, &codex),
+            codex
         );
         assert_eq!(
-            agent_picker_shortcut(&ProtoAgentKind::SHELL, &ProtoAgentKind::CLAUDE_CODE, "⌥⌘T"),
-            "⌥⌘T"
+            agent_picker_shortcut(
+                &ProtoAgentKind::SHELL,
+                &ProtoAgentKind::CLAUDE_CODE,
+                &terminal
+            ),
+            terminal
         );
     }
 
