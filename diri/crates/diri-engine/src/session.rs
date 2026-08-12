@@ -2997,9 +2997,16 @@ mod grid_wake_tests {
         thread.join().expect("notifier");
         assert!(changed.generation > observed);
         assert!(!changed.interactive);
+
+        // The waiter may wake after the first notification while the notifier
+        // advances the generation again. Catch up to the latest coalesced
+        // generation before asserting that a quiet source stays asleep.
+        let latest = wake.wait_for_change(changed.generation, Duration::ZERO);
+        assert_eq!(latest.generation, wake.generation());
+        assert!(!latest.interactive);
         assert_eq!(
-            wake.wait_for_change(changed.generation, Duration::from_millis(5)),
-            changed
+            wake.wait_for_change(latest.generation, Duration::from_millis(5)),
+            latest
         );
     }
 

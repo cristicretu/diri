@@ -108,8 +108,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             diri/target
-          key: linux-app-cargo-${{ hashFiles('diri/Cargo.lock') }}
-          restore-keys: linux-app-cargo-
+          key: linux-app-cargo-${{ hashFiles('diri/Cargo.lock') }}-${{ github.event.pull_request.head.sha || github.sha }}
+          restore-keys: |
+            linux-app-cargo-${{ hashFiles('diri/Cargo.lock') }}-
+            linux-app-cargo-
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
@@ -367,9 +369,11 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             diri/target
-          key: linux-package-cargo-${{ hashFiles('diri/Cargo.lock') }}
+          key: linux-package-cargo-${{ hashFiles('diri/Cargo.lock') }}-${{ github.event.pull_request.head.sha || github.sha }}
           restore-keys: |
+            linux-package-cargo-${{ hashFiles('diri/Cargo.lock') }}-
             linux-package-cargo-
+            linux-app-cargo-${{ hashFiles('diri/Cargo.lock') }}-
             linux-app-cargo-
       - name: Build AppImage and Debian package
         env:
