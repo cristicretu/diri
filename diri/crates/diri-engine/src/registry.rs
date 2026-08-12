@@ -826,20 +826,53 @@ impl Registry {
     }
 
     /// Moves an ended resumable record to another checkout of the same
-    /// project. Validation of repository membership and target ownership lives
-    /// in the control method; this is the single durable metadata mutation.
+    /// project and persists the change as one logical operation. Validation of
+    /// repository membership and target ownership lives in the control method.
+    ///
+    /// Persistence can fail after the in-memory edit (for example, when the
+    /// state directory becomes unavailable). Restore every touched field in
+    /// that case so callers never observe a failed request as a hidden move
+    /// that a later flush makes durable.
     pub fn reparent_worktree(
         &mut self,
         id: &str,
         cwd: String,
         branch: Option<String>,
     ) -> std::io::Result<SessionRecord> {
-        let record = self.records.get_mut(id).ok_or_else(|| not_found(id))?;
-        record.cwd.clone_from(&cwd);
-        record.worktree_path = Some(cwd);
-        record.git_branch = branch;
-        record.updated_at = DateMillis::from(std::time::SystemTime::now());
-        Ok(record.clone())
+        let was_dirty = self.dirty;
+        let previous = {
+            let record = self.records.get_mut(id).ok_or_else(|| not_found(id))?;
+            let previous = (
+                record.cwd.clone(),
+                record.worktree_path.clone(),
+                record.git_branch.clone(),
+                record.updated_at,
+            );
+            record.cwd.clone_from(&cwd);
+            record.worktree_path = Some(cwd);
+            record.git_branch = branch;
+            record.updated_at = DateMillis::from(std::time::SystemTime::now());
+            previous
+        };
+
+        if let Err(error) = self.persist() {
+            let record = self
+                .records
+                .get_mut(id)
+                .expect("record cannot disappear during a locked mutation");
+            record.cwd = previous.0;
+            record.worktree_path = previous.1;
+            record.git_branch = previous.2;
+            record.updated_at = previous.3;
+            self.dirty = was_dirty;
+            return Err(error);
+        }
+
+        Ok(self
+            .records
+            .get(id)
+            .expect("record cannot disappear during a locked mutation")
+            .clone())
     }
 
     pub fn mark_seen(&mut self, id: &str) -> std::io::Result<()> {
@@ -1087,6 +1120,38 @@ mod tests {
         let mut reloaded = Registry::new(engine(), &state_file);
         assert_eq!(reloaded.load().expect("load"), 1);
         assert_eq!(reloaded.records()[0].id.0, "s_1");
+    }
+
+    #[test]
+    fn failed_worktree_persistence_rolls_back_every_metadata_field() {
+        let temp = tempfile::tempdir().expect("temp");
+        let blocked_parent = temp.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, b"file").expect("blocking file");
+        let mut registry = Registry::new(engine(), blocked_parent.join("state.json"));
+        let mut original = record("s_move");
+        original.cwd = "/repo/main".into();
+        original.worktree_path = Some("/repo/main".into());
+        original.git_branch = Some("main".into());
+        original.updated_at = DateMillis(42.0);
+        registry.records.insert("s_move".into(), original.clone());
+
+        let error = registry
+            .reparent_worktree("s_move", "/repo/feature".into(), Some("feature".into()))
+            .expect_err("unwritable state path must fail");
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotADirectory
+            ),
+            "unexpected error: {error}"
+        );
+
+        let current = registry.records.get("s_move").expect("record");
+        assert_eq!(current.cwd, original.cwd);
+        assert_eq!(current.worktree_path, original.worktree_path);
+        assert_eq!(current.git_branch, original.git_branch);
+        assert_eq!(current.updated_at, original.updated_at);
+        assert!(!registry.dirty, "failed edit must not be flushed later");
     }
 
     #[test]

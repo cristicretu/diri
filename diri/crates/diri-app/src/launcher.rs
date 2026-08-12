@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use diri_proto::{AgentKind, Project, SessionId};
 use diri_ui::{
@@ -100,6 +101,7 @@ pub(crate) struct LauncherOverlay {
     mode: LauncherMode,
     /// The active destination draft survives a temporary handoff proposal.
     saved_new_prompt: Option<String>,
+    handoff_delivery: HandoffDeliveryState,
     selected_harness: AgentKind,
     selected_root: String,
     selected_host: Option<String>,
@@ -133,6 +135,42 @@ enum LauncherTarget {
 enum LauncherMode {
     NewSession,
     Handoff(HandoffProposal),
+}
+
+/// One acknowledged handoff at a time. Tickets prevent a late completion
+/// from an old proposal from closing or annotating a newer composer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HandoffDeliveryState {
+    next_ticket: u64,
+    pending: Option<u64>,
+}
+
+impl HandoffDeliveryState {
+    fn begin(&mut self) -> Option<u64> {
+        if self.pending.is_some() {
+            return None;
+        }
+        self.next_ticket = self.next_ticket.wrapping_add(1);
+        self.pending = Some(self.next_ticket);
+        self.pending
+    }
+
+    fn settle(&mut self, ticket: u64) -> bool {
+        if self.pending != Some(ticket) {
+            return false;
+        }
+        self.pending = None;
+        true
+    }
+
+    fn invalidate(&mut self) {
+        self.next_ticket = self.next_ticket.wrapping_add(1);
+        self.pending = None;
+    }
+
+    const fn is_sending(self) -> bool {
+        self.pending.is_some()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -181,6 +219,7 @@ impl LauncherOverlay {
             session_drafts: HashMap::new(),
             mode: LauncherMode::NewSession,
             saved_new_prompt: None,
+            handoff_delivery: HandoffDeliveryState::default(),
             selected_harness,
             selected_root,
             selected_host,
@@ -317,6 +356,7 @@ impl LauncherOverlay {
         self.prompt.clear();
         self.prompt.insert_multiline(&proposal.summary);
         self.mode = LauncherMode::Handoff(proposal);
+        self.handoff_delivery.invalidate();
         self.fallback_notice = None;
         self.picker = None;
         self.open = true;
@@ -348,6 +388,7 @@ impl LauncherOverlay {
         if !matches!(self.mode, LauncherMode::Handoff(_)) {
             return;
         }
+        self.handoff_delivery.invalidate();
         self.prompt.clear();
         if let Some(prompt) = self.saved_new_prompt.take()
             && !prompt.is_empty()
@@ -478,6 +519,9 @@ impl LauncherOverlay {
     /// with no explanation, which reads as "broken" rather than "not yet".
     fn blocker(&self) -> Option<String> {
         if let LauncherMode::Handoff(proposal) = &self.mode {
+            if self.handoff_delivery.is_sending() {
+                return Some("Sending handoff…".to_owned());
+            }
             let store = self
                 .services
                 .store
@@ -559,21 +603,43 @@ impl LauncherOverlay {
             return false;
         }
         if let Some(command) = handoff_command(&self.mode, self.prompt.text()) {
-            if self
-                .services
-                .store
-                .notification_action_sender()
-                .send(command)
-                .is_err()
-            {
-                self.fallback_notice = Some(
-                    "The handoff could not be queued. Nothing was sent; try again.".to_owned(),
-                );
-                cx.notify();
+            let Some(ticket) = self.handoff_delivery.begin() else {
                 return false;
-            }
-            self.prompt.clear();
-            self.close(cx);
+            };
+            self.fallback_notice = None;
+            let client = Arc::clone(self.services.store.client());
+            let runtime = Arc::clone(&self.services.tokio);
+            cx.spawn(async move |this, cx| {
+                let task = runtime.spawn(async move {
+                    client.wait_until_connected(Duration::from_secs(5)).await?;
+                    client
+                        .send_text(&command.session_id, command.text, command.submit)
+                        .await
+                });
+                let result = match task.await {
+                    Ok(result) => result.map_err(|error| error.to_string()),
+                    Err(error) => Err(format!("handoff task stopped: {error}")),
+                };
+                let _ = this.update(cx, |this, cx| {
+                    if !this.handoff_delivery.settle(ticket) {
+                        return;
+                    }
+                    match result {
+                        Ok(()) => {
+                            this.prompt.clear();
+                            this.close(cx);
+                        }
+                        Err(error) => {
+                            this.fallback_notice = Some(format!(
+                                "The handoff was not sent: {error}. Review it and try again."
+                            ));
+                            cx.notify();
+                        }
+                    }
+                });
+            })
+            .detach();
+            cx.notify();
             return true;
         }
         let prompt = self.prompt.text().trim().to_owned();
@@ -629,6 +695,13 @@ impl LauncherOverlay {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        // Submission is already explicit at this point. Freeze the editor
+        // until the daemon acknowledges it so post-submit edits cannot be
+        // mistaken for content that was delivered, and Escape cannot claim to
+        // cancel bytes already in flight.
+        if self.handoff_delivery.is_sending() {
+            return true;
+        }
         if self.picker.is_some() && self.handle_picker_key(event, window, cx) {
             return true;
         }
@@ -1371,6 +1444,7 @@ impl LauncherOverlay {
         let LauncherMode::Handoff(proposal) = &self.mode else {
             unreachable!("handoff panel requires a handoff proposal");
         };
+        let sending = self.handoff_delivery.is_sending();
         let can_submit = self.can_submit();
         let blocker = self.blocker();
         let text_height = composer_text_height(self.prompt.line_count());
@@ -1541,13 +1615,22 @@ impl LauncherOverlay {
                                             .flex()
                                             .items_center()
                                             .rounded(px(CONTROL_RADIUS))
-                                            .cursor_pointer()
                                             .text_size(px(11.0))
-                                            .text_color(colors.secondary)
-                                            .hover(move |button| button.bg(Fill::subtle(colors)))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.close(cx);
-                                            }))
+                                            .text_color(if sending {
+                                                colors.tertiary
+                                            } else {
+                                                colors.secondary
+                                            })
+                                            .when(!sending, |button| {
+                                                button
+                                                    .cursor_pointer()
+                                                    .hover(move |button| {
+                                                        button.bg(Fill::subtle(colors))
+                                                    })
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.close(cx);
+                                                    }))
+                                            })
                                             .child("Cancel"),
                                     )
                                     .child(
@@ -1590,7 +1673,11 @@ impl LauncherOverlay {
                                                     colors.tertiary
                                                 },
                                             ))
-                                            .child("Send handoff"),
+                                            .child(if sending {
+                                                "Sending…"
+                                            } else {
+                                                "Send handoff"
+                                            }),
                                     ),
                             ),
                     ),
@@ -2162,5 +2249,24 @@ mod tests {
                 submit: true,
             })
         );
+    }
+
+    #[test]
+    fn handoff_delivery_accepts_one_send_and_ignores_stale_completions() {
+        let mut delivery = HandoffDeliveryState::default();
+        let first = delivery.begin().expect("first send");
+        assert!(delivery.is_sending());
+        assert_eq!(delivery.begin(), None, "double submit must be refused");
+
+        delivery.invalidate();
+        let replacement = delivery.begin().expect("replacement proposal send");
+        assert_ne!(first, replacement);
+        assert!(
+            !delivery.settle(first),
+            "an old RPC must not close a replacement composer"
+        );
+        assert!(delivery.is_sending());
+        assert!(delivery.settle(replacement));
+        assert!(!delivery.is_sending());
     }
 }
