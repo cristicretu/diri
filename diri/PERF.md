@@ -69,7 +69,10 @@ terminal interface rather than hidden behind another wrapper:
   terminals remain current without invalidating the window.
 - The daemon publishes the leading edge immediately, lets two interactive
   response publications bypass coalescing, and caps only continuous output at
-  8 ms (120 Hz). GPUI's display link is the sole client-side repaint pacer.
+  8 ms (120 Hz). A destructive erase may wait up to 16 ms for its redraw bytes,
+  but the wait ends as soon as they arrive and never applies to typed echo or
+  additive scrolling. GPUI's display link is the sole client-side repaint
+  pacer.
 - Held sessions negotiate an additive persistent binary input/resize stream.
   Old live Holders reject the optional negotiation and continue over the exact
   legacy JSON/base64 request path. On Apple platforms the dedicated input lane

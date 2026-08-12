@@ -106,16 +106,23 @@ const LIVENESS_INTERVAL: Duration = Duration::from_secs(2);
 /// flickering. A terminal emulator never shows that state because its reader
 /// drains everything queued before it renders. Draining alone is not enough
 /// here: the daemon is usually parked in `poll` and wakes on the *first* write
-/// of a repaint, with the rest microseconds behind. This is the quiet window
-/// that lets the rest arrive. It is only ever waited out by a screen that
-/// just lost content, so typed echo is not slowed by it.
-const OUTPUT_SETTLE: Duration = Duration::from_millis(3);
+/// of a repaint, with the rest usually microseconds behind but occasionally a
+/// scheduler quantum behind on a loaded machine. This is the quiet window that
+/// lets the rest arrive. It is only ever waited out by a screen that just lost
+/// content, so typed echo and additive scrolling are not slowed by it. The
+/// wait returns as soon as bytes arrive; 16 ms is only its worst-case ceiling.
+const OUTPUT_SETTLE: Duration = Duration::from_millis(16);
 
 /// Ceiling on how long one batch may hold back a repaint. Output that never
 /// goes quiet (a build log) would otherwise wait on `OUTPUT_SETTLE` forever.
-/// Well under the 16ms grid flush interval, so continuous streaming publishes
-/// at exactly the same rate it did before.
+/// One 120 Hz display interval, so continuous streaming cannot be held longer
+/// than the renderer's own frame cadence.
 const OUTPUT_BATCH_CEILING: Duration = Duration::from_millis(8);
+
+/// A destructive repaint gets one 60 Hz interval to recover from an erase.
+/// This is deliberately separate from [`OUTPUT_BATCH_CEILING`], so a build log
+/// that continuously adds content still publishes at up to 120 Hz.
+const OUTPUT_REPAINT_CEILING: Duration = Duration::from_millis(16);
 
 /// Byte ceiling on one batch, matching `alacritty_terminal`'s
 /// `MAX_LOCKED_READ`. A child that writes faster than it can be parsed must
@@ -2360,7 +2367,9 @@ fn feed_output_batch(
     buffer: &mut [u8],
     first: usize,
 ) -> bool {
-    let deadline = Instant::now() + OUTPUT_BATCH_CEILING;
+    let started_at = Instant::now();
+    let batch_deadline = started_at + OUTPUT_BATCH_CEILING;
+    let repaint_deadline = started_at + OUTPUT_REPAINT_CEILING;
     let mut count = first;
     let mut total = 0usize;
     let mut filled_before = None;
@@ -2379,6 +2388,11 @@ fn feed_output_batch(
         };
         total += count;
 
+        let deadline = if mid_repaint {
+            repaint_deadline
+        } else {
+            batch_deadline
+        };
         let remaining = deadline.saturating_duration_since(Instant::now());
         if total >= OUTPUT_BATCH_BYTES || remaining.is_zero() {
             return false;

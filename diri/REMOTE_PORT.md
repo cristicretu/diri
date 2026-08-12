@@ -423,10 +423,13 @@ and sequence. Scrollback is bounded to 4 MiB and served on demand through
 The PTY reader must never block on a client. The Holder uses bounded queues. It
 coalesces background output for no more than 8 ms, while up to two grid
 publications after interactive input bypass that wait (one trailing publication
-may already be in flight before the actual response). When no client is
-attached, it continues parsing terminal state but does not construct or
-serialize diffs. If an attached client falls behind, stale updates are discarded
-and the connection is reseeded from a complete snapshot after reconnect.
+may already be in flight before the actual response). If a destructive repaint
+temporarily removes screen content, the Holder instead gives its redraw bytes up
+to 16 ms to arrive, returning immediately when they do. That longer ceiling is
+isolated from typed echo and additive scrolling. When no client is attached, it
+continues parsing terminal state but does not construct or serialize diffs. If
+an attached client falls behind, stale updates are discarded and the connection
+is reseeded from a complete snapshot after reconnect.
 
 One owner/event loop handles PTY drain, terminal parsing, diff construction, and
 attach writes. The hot path does not put an `Arc<Mutex<Terminal>>` across tasks.
