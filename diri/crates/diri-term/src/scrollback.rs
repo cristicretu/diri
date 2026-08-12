@@ -14,6 +14,7 @@ use std::pin::Pin;
 use diri_proto::grid::{GridCell, GridCodecError, GridRowCodec};
 use diri_proto::methods::ReadScrollbackCellsResult;
 use diri_proto::model::SessionId;
+use diri_proto::terminal::MouseModes;
 
 use crate::buffer::GridBuffer;
 
@@ -461,7 +462,7 @@ impl ScrollbackViewport {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TerminalModes {
     pub alt_screen: bool,
-    pub mouse_reporting: bool,
+    pub mouse: MouseModes,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -504,7 +505,7 @@ impl ScrollRouter {
             WheelDelta::PrecisePoints(delta) => self.precise_steps(delta, event.line_height),
             WheelDelta::Lines(delta) => classic_steps(delta, event.visible_rows),
         }?;
-        if !modes.alt_screen && !modes.mouse_reporting {
+        if !modes.alt_screen && !modes.mouse.is_reporting() {
             return Some(WheelRoute::Local {
                 lines: i64::from(steps),
             });
@@ -941,7 +942,10 @@ mod tests {
             router.route(
                 TerminalModes {
                     alt_screen: false,
-                    mouse_reporting: true,
+                    mouse: MouseModes::new(
+                        diri_proto::terminal::MouseTrackingMode::ButtonEvents,
+                        diri_proto::terminal::MouseEncoding::Legacy,
+                    ),
                 },
                 event(-12.0),
             ),

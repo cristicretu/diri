@@ -168,6 +168,22 @@ fn an_attach_is_seeded_then_streams_diffs_and_answers_input() {
                 .is_some_and(|update| grid_text(&update).contains("warm-up-pump"))
     });
 
+    // Mouse reports use their own frame kind so the Engine takes the raw
+    // interactive path instead of treating escape bytes as prompt text. The
+    // payload remains ordered with keyboard input and reaches the same PTY.
+    data.write_all(
+        &FrameCodec::encode(&Frame::mouse(b"mouse-over-attach\n".to_vec())).expect("encode"),
+    )
+    .expect("send mouse payload");
+    frames.until("the raw mouse payload echo", |frame| {
+        frame.frame_type == FrameType::Grid
+            && frame
+                .grid_payload()
+                .ok()
+                .flatten()
+                .is_some_and(|update| grid_text(&update).contains("mouse-over-attach"))
+    });
+
     // Typing through the established data channel: cat echoes, and each echo
     // comes back as a grid DIFF (not a full snapshot). Use the median so a
     // single scheduler hiccup cannot fail the test, while a fixed 16 ms frame

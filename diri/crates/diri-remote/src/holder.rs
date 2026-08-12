@@ -783,7 +783,7 @@ impl Holder {
         }
         match message {
             RemoteMessage::Terminal(frame) => match frame.frame_type {
-                FrameType::Input => self.write_input(&frame.payload),
+                FrameType::Input | FrameType::Mouse => self.write_input(&frame.payload),
                 FrameType::Resize => {
                     let Some((cols, rows)) = frame.resize_payload() else {
                         return Err(io::Error::new(
@@ -1021,7 +1021,7 @@ impl Holder {
                 sequence: self.state.snapshot_sequence,
                 alt_screen: self.screen.is_alt_screen(),
                 bracketed_paste: self.screen.bracketed_paste(),
-                mouse_reporting: self.screen.mouse_reporting(),
+                mouse: self.screen.mouse_modes(),
                 grid,
             }))?;
         } else {
@@ -1029,7 +1029,7 @@ impl Holder {
                 sequence: self.state.snapshot_sequence,
                 alt_screen: self.screen.is_alt_screen(),
                 bracketed_paste: self.screen.bracketed_paste(),
-                mouse_reporting: self.screen.mouse_reporting(),
+                mouse: self.screen.mouse_modes(),
                 grid,
             }))?;
         }
@@ -1068,7 +1068,7 @@ impl Holder {
             sequence: self.state.snapshot_sequence,
             alt_screen: self.screen.is_alt_screen(),
             bracketed_paste: self.screen.bracketed_paste(),
-            mouse_reporting: self.screen.mouse_reporting(),
+            mouse: self.screen.mouse_modes(),
             grid: self.screen.full_snapshot(),
         }))
     }

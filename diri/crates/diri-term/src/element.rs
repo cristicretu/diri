@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuar
 use std::time::{Duration, Instant};
 
 use diri_proto::grid::{GridCell, GridUpdate};
+use diri_proto::terminal::MouseModes;
 use gpui::{
     App, Bounds, ContentMask, Element, ElementId, FocusHandle, Font, FontFallbacks, FontId,
     GlobalElementId, InputHandler, InspectorElementId, IntoElement, LayoutId, PaintQuad, Pixels,
@@ -375,6 +376,13 @@ impl TerminalElement {
         read_lock(&self.buffer).rows
     }
 
+    /// Columns in the mirrored screen, used to clamp pointer reports to the
+    /// authoritative grid while a resize is in flight.
+    #[must_use]
+    pub fn grid_cols(&self) -> u16 {
+        read_lock(&self.buffer).cols
+    }
+
     #[must_use]
     pub fn theme(mut self, theme: TermTheme) -> Self {
         self.theme = theme;
@@ -474,21 +482,18 @@ impl TerminalElement {
         mutex_lock(&self.shared.viewport).scroll_to_absolute(absolute_row, anchor, visible_rows)
     }
 
-    pub fn set_modes(&self, alt_screen: bool, mouse_reporting: bool) -> bool {
+    pub fn set_modes(&self, alt_screen: bool, mouse: MouseModes) -> bool {
         let mut modes = mutex_lock(&self.shared.modes);
         let entered_alt = alt_screen && !modes.alt_screen;
-        *modes = TerminalModes {
-            alt_screen,
-            mouse_reporting,
-        };
+        *modes = TerminalModes { alt_screen, mouse };
         drop(modes);
         entered_alt && mutex_lock(&self.shared.viewport).enter_alt_screen()
     }
 
     /// True while the foreground program consumes mouse events, in which case
     /// pointer gestures belong to it rather than local selection.
-    pub fn mouse_reporting(&self) -> bool {
-        mutex_lock(&self.shared.modes).mouse_reporting
+    pub fn mouse_modes(&self) -> MouseModes {
+        mutex_lock(&self.shared.modes).mouse
     }
 
     /// Resolves a wheel event and applies local scrollback movement. Daemon

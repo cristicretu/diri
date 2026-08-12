@@ -1,10 +1,10 @@
 //! Versioned wire protocol between the local Engine and a remote PTY Holder.
 //!
-//! Terminal frame kinds 1 through 10 keep their existing payloads and are not
-//! wrapped in another frame. Remote-only control kinds start at 32. Small,
-//! infrequent control payloads use JSON; a full terminal snapshot keeps the
-//! existing binary grid encoding so reconnect does not serialize every cell
-//! as JSON.
+//! Terminal frame kinds 1 through 10 retain their wire meanings; kind 11 adds
+//! raw mouse input. They are not wrapped in another frame. Remote-only control
+//! kinds start at 32. Small, infrequent control payloads use JSON; a full
+//! terminal snapshot keeps the existing binary grid encoding so reconnect
+//! does not serialize every cell as JSON.
 
 use std::error::Error;
 use std::fmt;
@@ -15,9 +15,11 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::frames::{Frame, FrameType, MAX_FRAME_BYTES};
 use crate::grid::{GridCodecError, GridUpdate};
+use crate::terminal::MouseModes;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 3;
+pub const PROTOCOL_MINOR: u16 = 4;
+pub const MOUSE_INPUT_PROTOCOL_MINOR: u16 = 4;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_ARGUMENTS: usize = 512;
 pub const MAX_ENVIRONMENT_VARIABLES: usize = 4096;
@@ -264,7 +266,7 @@ pub struct FullSnapshot {
     pub sequence: u64,
     pub alt_screen: bool,
     pub bracketed_paste: bool,
-    pub mouse_reporting: bool,
+    pub mouse: MouseModes,
     pub grid: GridUpdate,
 }
 
@@ -273,7 +275,7 @@ pub struct GridDelta {
     pub sequence: u64,
     pub alt_screen: bool,
     pub bracketed_paste: bool,
-    pub mouse_reporting: bool,
+    pub mouse: MouseModes,
     pub grid: GridUpdate,
 }
 
@@ -864,7 +866,11 @@ impl RemoteCodec {
                 output.extend_from_slice(&value.sequence.to_be_bytes());
                 let modes = u8::from(value.alt_screen)
                     | (u8::from(value.bracketed_paste) << 1)
-                    | (u8::from(value.mouse_reporting) << 2);
+                    // Keep bit 2 as the historical any-reporting flag so an
+                    // older peer remains compatible with this additive mode
+                    // byte extension.
+                    | (u8::from(value.mouse.is_reporting()) << 2)
+                    | (value.mouse.detail_bits() << 3);
                 output.push(modes);
                 if !value.grid.is_full_snapshot {
                     return rollback(
@@ -884,7 +890,8 @@ impl RemoteCodec {
                 output.extend_from_slice(&value.sequence.to_be_bytes());
                 let modes = u8::from(value.alt_screen)
                     | (u8::from(value.bracketed_paste) << 1)
-                    | (u8::from(value.mouse_reporting) << 2);
+                    | (u8::from(value.mouse.is_reporting()) << 2)
+                    | (value.mouse.detail_bits() << 3);
                 output.push(modes);
                 if value.grid.is_full_snapshot {
                     return rollback(
@@ -1038,7 +1045,7 @@ fn decode_json<T: DeserializeOwned>(kind: u8, payload: &[u8]) -> Result<T, Remot
 }
 
 fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodecError> {
-    if kind <= FrameType::Modes as u8 {
+    if kind <= FrameType::Mouse as u8 {
         return Ok(RemoteMessage::Terminal(Frame::new(
             FrameType::try_from(kind).map_err(|_| RemoteCodecError::UnknownMessageType(kind))?,
             payload.to_vec(),
@@ -1075,7 +1082,7 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
                 sequence,
                 alt_screen: modes & 1 != 0,
                 bracketed_paste: modes & 2 != 0,
-                mouse_reporting: modes & 4 != 0,
+                mouse: MouseModes::from_detail_bits(modes >> 3, modes & 4 != 0),
                 grid,
             }))
         }
@@ -1099,7 +1106,7 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
                 sequence,
                 alt_screen: modes & 1 != 0,
                 bracketed_paste: modes & 2 != 0,
-                mouse_reporting: modes & 4 != 0,
+                mouse: MouseModes::from_detail_bits(modes >> 3, modes & 4 != 0),
                 grid,
             }))
         }
@@ -1127,7 +1134,7 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
 }
 
 fn validate_kind(kind: u8) -> Result<(), RemoteCodecError> {
-    if (1..=FrameType::Modes as u8).contains(&kind)
+    if (1..=FrameType::Mouse as u8).contains(&kind)
         || (KIND_HELLO..=KIND_SCROLLBACK_RESPONSE).contains(&kind)
     {
         Ok(())
@@ -1260,7 +1267,10 @@ mod tests {
             sequence: 42,
             alt_screen: true,
             bracketed_paste: true,
-            mouse_reporting: false,
+            mouse: MouseModes::new(
+                crate::terminal::MouseTrackingMode::ButtonMotion,
+                crate::terminal::MouseEncoding::Sgr,
+            ),
             grid: GridUpdate {
                 cols: 2,
                 rows: 1,
@@ -1275,12 +1285,18 @@ mod tests {
 
     #[test]
     fn terminal_frames_keep_their_existing_wire_kind() {
-        let message = RemoteMessage::Terminal(Frame::input(b"abc".to_vec()));
-        let encoded = RemoteCodec::encode(&message).expect("encode");
-        assert_eq!(encoded[0], FrameType::Input as u8);
+        for frame in [
+            Frame::input(b"abc".to_vec()),
+            Frame::mouse(b"mouse".to_vec()),
+        ] {
+            let expected_kind = frame.frame_type as u8;
+            let message = RemoteMessage::Terminal(frame);
+            let encoded = RemoteCodec::encode(&message).expect("encode");
+            assert_eq!(encoded[0], expected_kind);
 
-        let decoded = RemoteCodec::new().feed(&encoded).expect("decode");
-        assert_eq!(decoded, vec![message]);
+            let decoded = RemoteCodec::new().feed(&encoded).expect("decode");
+            assert_eq!(decoded, vec![message]);
+        }
     }
 
     #[test]
@@ -1303,9 +1319,30 @@ mod tests {
         let message = RemoteMessage::FullSnapshot(snapshot());
         let encoded = RemoteCodec::encode(&message).expect("encode");
         assert_eq!(encoded[0], KIND_FULL_SNAPSHOT);
+        assert_ne!(encoded[13] & 0b100, 0, "historical any-mouse bit");
         assert_eq!(
             RemoteCodec::new().feed(&encoded).expect("decode"),
             vec![message]
+        );
+    }
+
+    #[test]
+    fn full_snapshot_decodes_the_historical_mouse_boolean() {
+        let message = RemoteMessage::FullSnapshot(snapshot());
+        let mut encoded = RemoteCodec::encode(&message).expect("encode");
+        // Header (5), sequence (8), then the historical flags byte. Strip
+        // every detailed bit and leave alt/bracketed/any-mouse enabled.
+        encoded[13] = 0b111;
+        let decoded = RemoteCodec::new().feed(&encoded).expect("decode");
+        let RemoteMessage::FullSnapshot(decoded) = &decoded[0] else {
+            panic!("snapshot");
+        };
+        assert_eq!(
+            decoded.mouse,
+            MouseModes::new(
+                crate::terminal::MouseTrackingMode::ButtonEvents,
+                crate::terminal::MouseEncoding::Sgr,
+            )
         );
     }
 
@@ -1318,7 +1355,10 @@ mod tests {
             sequence: 43,
             alt_screen: true,
             bracketed_paste: true,
-            mouse_reporting: false,
+            mouse: MouseModes::new(
+                crate::terminal::MouseTrackingMode::ButtonMotion,
+                crate::terminal::MouseEncoding::Sgr,
+            ),
             grid,
         });
         let encoded = RemoteCodec::encode(&message).expect("encode");

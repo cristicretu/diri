@@ -164,6 +164,14 @@ impl RemoteSessionClient {
     }
 
     pub fn write(&self, bytes: &[u8]) -> io::Result<()> {
+        self.write_terminal(bytes, false)
+    }
+
+    pub fn write_mouse(&self, bytes: &[u8]) -> io::Result<()> {
+        self.write_terminal(bytes, true)
+    }
+
+    fn write_terminal(&self, bytes: &[u8], mouse: bool) -> io::Result<()> {
         if bytes.is_empty() {
             return Ok(());
         }
@@ -171,10 +179,8 @@ impl RemoteSessionClient {
         if writer.controller_epoch.is_none() || writer.input.is_none() {
             return queue_input(&mut writer, bytes);
         }
-        if let Err(error) = write_message(
-            &mut writer,
-            &RemoteMessage::Terminal(Frame::input(bytes.to_vec())),
-        ) {
+        let frame = terminal_input_frame(self.helper.protocol, bytes, mouse);
+        if let Err(error) = write_message(&mut writer, &RemoteMessage::Terminal(frame)) {
             queue_input(&mut writer, bytes)?;
             terminate_current(&mut writer);
             writer.controller_epoch = None;
@@ -374,6 +380,18 @@ fn write_message(writer: &mut WriterState, message: &RemoteMessage) -> io::Resul
     input.flush()
 }
 
+fn terminal_input_frame(protocol: ProtocolVersion, bytes: &[u8], mouse: bool) -> Frame {
+    if mouse && protocol.minor >= diri_proto::remote_pty::MOUSE_INPUT_PROTOCOL_MINOR {
+        Frame::mouse(bytes.to_vec())
+    } else {
+        // Protocol 1.3 Holders predate the distinct frame but accept the exact
+        // same bytes as ordinary raw input. Live sessions retain their
+        // creation Build ID, so this compatibility path matters across an
+        // Engine upgrade.
+        Frame::input(bytes.to_vec())
+    }
+}
+
 fn queue_input(writer: &mut WriterState, bytes: &[u8]) -> io::Result<()> {
     if writer.queued_input.len().saturating_add(bytes.len()) > MAX_QUEUED_INPUT {
         return Err(io::Error::new(
@@ -416,5 +434,29 @@ impl Drop for RemoteSessionClient {
             terminate_current(writer);
         }
         self.persist_observed_output_offset();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use diri_proto::frames::FrameType;
+
+    use super::*;
+
+    #[test]
+    fn mouse_input_falls_back_for_live_protocol_1_3_holders() {
+        let old = ProtocolVersion { major: 1, minor: 3 };
+        assert_eq!(
+            terminal_input_frame(old, b"mouse", true).frame_type,
+            FrameType::Input
+        );
+        assert_eq!(
+            terminal_input_frame(ProtocolVersion::CURRENT, b"mouse", true).frame_type,
+            FrameType::Mouse
+        );
+        assert_eq!(
+            terminal_input_frame(ProtocolVersion::CURRENT, b"key", false).frame_type,
+            FrameType::Input
+        );
     }
 }

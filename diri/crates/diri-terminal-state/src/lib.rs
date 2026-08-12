@@ -22,6 +22,10 @@ use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
 use diri_proto::grid::{ChangedRow, GridCell, GridRowCodec, GridUpdate, TermColor, TermStyle};
+use diri_proto::terminal::{
+    MouseEncoding, MouseModes, MouseTrackingMode, TerminalMouseEvent, TerminalMouseModifiers,
+    encode_mouse_event,
+};
 
 /// Receiver-side authority for a remote terminal stream. A mirror accepts a
 /// full snapshot as a new baseline and then only contiguous sequenced diffs;
@@ -38,7 +42,7 @@ pub struct GridMirror {
     sequence: Option<u64>,
     alt_screen: bool,
     bracketed_paste: bool,
-    mouse_reporting: bool,
+    mouse: MouseModes,
 }
 
 impl GridMirror {
@@ -53,7 +57,7 @@ impl GridMirror {
         grid: &GridUpdate,
         alt_screen: bool,
         bracketed_paste: bool,
-        mouse_reporting: bool,
+        mouse: MouseModes,
     ) -> Result<(), MirrorError> {
         if !grid.is_full_snapshot {
             return Err(MirrorError::SnapshotRequired);
@@ -64,7 +68,7 @@ impl GridMirror {
         self.sequence = Some(sequence);
         self.alt_screen = alt_screen;
         self.bracketed_paste = bracketed_paste;
-        self.mouse_reporting = mouse_reporting;
+        self.mouse = mouse;
         Ok(())
     }
 
@@ -74,7 +78,7 @@ impl GridMirror {
         grid: &GridUpdate,
         alt_screen: bool,
         bracketed_paste: bool,
-        mouse_reporting: bool,
+        mouse: MouseModes,
     ) -> Result<(), MirrorError> {
         let Some(previous) = self.sequence else {
             return Err(MirrorError::SnapshotRequired);
@@ -97,7 +101,7 @@ impl GridMirror {
         self.sequence = Some(sequence);
         self.alt_screen = alt_screen;
         self.bracketed_paste = bracketed_paste;
-        self.mouse_reporting = mouse_reporting;
+        self.mouse = mouse;
         Ok(())
     }
 
@@ -130,8 +134,8 @@ impl GridMirror {
     }
 
     #[must_use]
-    pub const fn modes(&self) -> (bool, bool, bool) {
-        (self.alt_screen, self.bracketed_paste, self.mouse_reporting)
+    pub const fn modes(&self) -> (bool, bool, MouseModes) {
+        (self.alt_screen, self.bracketed_paste, self.mouse)
     }
 
     #[must_use]
@@ -488,9 +492,29 @@ impl HeadlessScreen {
         (self.geometry.cols, self.geometry.rows)
     }
 
-    /// Whether the child asked for mouse reporting (any flavor).
+    /// The independent tracking and encoding modes requested by the child.
+    pub fn mouse_modes(&self) -> MouseModes {
+        let mode = self.term.mode();
+        let tracking = if mode.contains(TermMode::MOUSE_MOTION) {
+            MouseTrackingMode::AnyMotion
+        } else if mode.contains(TermMode::MOUSE_DRAG) {
+            MouseTrackingMode::ButtonMotion
+        } else if mode.contains(TermMode::MOUSE_REPORT_CLICK) {
+            MouseTrackingMode::ButtonEvents
+        } else {
+            MouseTrackingMode::Off
+        };
+        let encoding = if mode.contains(TermMode::SGR_MOUSE) {
+            MouseEncoding::Sgr
+        } else {
+            MouseEncoding::Legacy
+        };
+        MouseModes::new(tracking, encoding)
+    }
+
+    /// Whether any tracking mode is active.
     pub fn mouse_reporting(&self) -> bool {
-        self.term.mode().intersects(TermMode::MOUSE_MODE)
+        self.mouse_modes().is_reporting()
     }
 
     /// Cursor (col, row, visible) without touching cell data.
@@ -621,7 +645,7 @@ impl HeadlessScreen {
         update: &GridUpdate,
         alt_screen: bool,
         bracketed_paste: bool,
-        mouse_reporting: bool,
+        mouse: MouseModes,
     ) -> bool {
         let cols = self.geometry.cols;
         let rows = self.geometry.rows;
@@ -693,8 +717,11 @@ impl HeadlessScreen {
         if bracketed_paste {
             bytes.extend_from_slice(b"\x1b[?2004h");
         }
-        if mouse_reporting {
-            bytes.extend_from_slice(b"\x1b[?1000h\x1b[?1006h");
+        if let Some(mode) = mouse.tracking.dec_private_mode() {
+            bytes.extend_from_slice(format!("\x1b[?{mode}h").as_bytes());
+        }
+        if matches!(mouse.encoding, MouseEncoding::Sgr) {
+            bytes.extend_from_slice(b"\x1b[?1006h");
         }
         bytes.extend_from_slice(if update.cursor_visible {
             b"\x1b[?25h"
@@ -726,19 +753,23 @@ impl HeadlessScreen {
         }
         let x = col.min(self.geometry.cols.saturating_sub(1));
         let y = row.min(self.geometry.rows.saturating_sub(1));
-        let button = if up { 64 } else { 65 }; // X11 wheel buttons 4/5, wheel-flagged
         let mut out = Vec::new();
         for _ in 0..lines {
-            if self.term.mode().contains(TermMode::SGR_MOUSE) {
-                out.extend_from_slice(format!("\x1b[<{button};{};{}M", x + 1, y + 1).as_bytes());
+            let event = if up {
+                TerminalMouseEvent::WheelUp
             } else {
-                // Legacy X10 encoding: 32 + button, 32 + 1-based coordinate.
-                out.push(0x1b);
-                out.extend_from_slice(b"[M");
-                out.push(32 + button as u8);
-                out.push((32 + x + 1).min(255) as u8);
-                out.push((32 + y + 1).min(255) as u8);
-            }
+                TerminalMouseEvent::WheelDown
+            };
+            let Some(report) = encode_mouse_event(
+                self.mouse_modes(),
+                event,
+                TerminalMouseModifiers::default(),
+                x as u16,
+                y as u16,
+            ) else {
+                break;
+            };
+            out.extend_from_slice(&report);
         }
         out
     }
@@ -1267,7 +1298,13 @@ mod tests {
 
         let mut restored = HeadlessScreen::new(40, 10);
         assert!(
-            restored.restore(&[], &snapshot, false, true, true),
+            restored.restore(
+                &[],
+                &snapshot,
+                false,
+                true,
+                MouseModes::new(MouseTrackingMode::ButtonEvents, MouseEncoding::Sgr),
+            ),
             "restorable"
         );
         assert_eq!(restored.lines(), original.lines());
@@ -1287,7 +1324,7 @@ mod tests {
 
         let mut smaller = HeadlessScreen::new(39, 10);
         assert!(
-            !smaller.restore(&[], &snapshot, false, false, false),
+            !smaller.restore(&[], &snapshot, false, false, MouseModes::OFF),
             "a checkpoint from another geometry is a cache miss"
         );
     }
@@ -1305,7 +1342,7 @@ mod tests {
 
         let mut restored = HeadlessScreen::new(12, 2);
         assert!(
-            restored.restore(&history, &snapshot, false, false, false),
+            restored.restore(&history, &snapshot, false, false, MouseModes::OFF),
             "restorable"
         );
         assert_eq!(restored.scrollback(), original.scrollback());
@@ -1333,11 +1370,11 @@ mod tests {
         let snapshot = screen.full_snapshot();
         let mut mirror = GridMirror::new();
         mirror
-            .apply_snapshot(9, &snapshot, false, true, false)
+            .apply_snapshot(9, &snapshot, false, true, MouseModes::OFF)
             .expect("snapshot");
         assert_eq!(mirror.sequence(), Some(9));
         assert_eq!(mirror.size(), (8, 2));
-        assert_eq!(mirror.modes(), (false, true, false));
+        assert_eq!(mirror.modes(), (false, true, MouseModes::OFF));
 
         let mut delta_source = HeadlessScreen::new(8, 2);
         delta_source.feed(b"one");
@@ -1345,15 +1382,56 @@ mod tests {
         delta_source.feed(b" two");
         let delta = delta_source.grid_update(false);
         mirror
-            .apply_delta(10, &delta, true, false, true)
+            .apply_delta(
+                10,
+                &delta,
+                true,
+                false,
+                MouseModes::new(MouseTrackingMode::AnyMotion, MouseEncoding::Sgr),
+            )
             .expect("contiguous delta");
-        assert_eq!(mirror.modes(), (true, false, true));
+        assert_eq!(
+            mirror.modes(),
+            (
+                true,
+                false,
+                MouseModes::new(MouseTrackingMode::AnyMotion, MouseEncoding::Sgr)
+            )
+        );
         assert!(matches!(
-            mirror.apply_delta(12, &delta, false, false, false),
+            mirror.apply_delta(12, &delta, false, false, MouseModes::OFF),
             Err(MirrorError::SequenceGap {
                 expected: 11,
                 actual: 12
             })
         ));
+    }
+
+    #[test]
+    fn parser_preserves_each_tracking_mode_and_encoding_independently() {
+        let mut screen = HeadlessScreen::new(300, 24);
+        assert_eq!(screen.mouse_modes(), MouseModes::OFF);
+
+        screen.feed(b"\x1b[?1000h");
+        assert_eq!(
+            screen.mouse_modes(),
+            MouseModes::new(MouseTrackingMode::ButtonEvents, MouseEncoding::Legacy)
+        );
+        screen.feed(b"\x1b[?1002h\x1b[?1006h");
+        assert_eq!(
+            screen.mouse_modes(),
+            MouseModes::new(MouseTrackingMode::ButtonMotion, MouseEncoding::Sgr)
+        );
+        screen.feed(b"\x1b[?1003h\x1b[?1006l");
+        assert_eq!(
+            screen.mouse_modes(),
+            MouseModes::new(MouseTrackingMode::AnyMotion, MouseEncoding::Legacy)
+        );
+        screen.feed(b"\x1b[?1003l\x1b[?1006h");
+        assert_eq!(
+            screen.mouse_modes(),
+            MouseModes::new(MouseTrackingMode::Off, MouseEncoding::Sgr),
+            "1006 is independent of tracking"
+        );
     }
 }

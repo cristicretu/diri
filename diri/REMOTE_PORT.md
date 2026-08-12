@@ -417,8 +417,11 @@ PTY bytes -> shared terminal parser -> Grid + Cursor + Modes
 
 On attach, the Holder sends a `FullSnapshot`, followed by sequenced incremental
 updates. A snapshot contains only the visible grid, cursor, modes, dimensions,
-and sequence. Scrollback is bounded to 4 MiB and served on demand through
-`Scroll`. Raw output is bounded to 32 MiB.
+and sequence. Mouse state preserves the selected tracking regime (off, DECSET
+1000, 1002, or 1003) independently from legacy/SGR coordinate encoding. The
+wire mode byte retains its historical any-mouse bit and uses previously unused
+bits for those details. Scrollback is bounded to 4 MiB and served on demand
+through `Scroll`. Raw output is bounded to 32 MiB.
 
 The PTY reader must never block on a client. The Holder uses bounded queues. It
 coalesces background output for no more than 8 ms, while up to two grid
@@ -474,7 +477,9 @@ are a future enhancement and are not part of the completed baseline.
 `diri-proto::remote_pty` is the versioned protocol authority. Protocol 1.3
 declares terminal, session management, environment capture, directory listing,
 batched executable discovery, persistence probing, and atomic activation as
-required capabilities.
+required capabilities. Protocol 1.4 additively preserves granular mouse
+tracking/encoding bits and the raw mouse-input frame while retaining the old
+any-mouse compatibility bit.
 
 The protocol includes:
 
@@ -488,6 +493,7 @@ Grid
 Scroll
 Modes
 Input
+Mouse
 Resize
 Ping
 Pong

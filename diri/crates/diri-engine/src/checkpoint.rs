@@ -1,5 +1,6 @@
-//! Durable screen checkpoints: `<id>.screen.plist`, byte-compatible with
-//! `Sources/DirijorDaemonKit/ScreenCheckpoint.swift`.
+//! Durable screen checkpoints: `<id>.screen.plist`. Version 2 remains
+//! load-compatible with the historical Swift checkpoint; version 3 preserves
+//! granular mouse state.
 //!
 //! A checkpoint pairs an RLE-encoded full grid with the exact raw-log offset
 //! it represents, so a restarted daemon can seed the emulator from a few
@@ -8,19 +9,21 @@
 //!
 //! Checkpoints are an acceleration cache, never authoritative state: a
 //! malformed, stale, or future-version file is ignored and the bounded
-//! raw-log replay runs instead. The on-disk format is a property list
-//! (Swift writes binary; either flavor is read) with the exact keys the
-//! Swift daemon uses, so a Rust daemon adopting a Swift-spawned fleet
-//! restores from Swift's checkpoints, and a rollback reads ours.
+//! raw-log replay runs instead. The on-disk format is a property list (either
+//! binary or XML is read). Version 2's historical keys still load during an
+//! upgrade; a rollback safely treats version 3 as a cache miss and rebuilds
+//! from the authoritative raw log.
 
 use std::path::Path;
 
 use diri_proto::grid::{GridCell, GridRowCodec, GridUpdate};
+use diri_proto::terminal::{MouseEncoding, MouseModes, MouseTrackingMode};
 
 // Version 1 persisted only the visible grid. Restoring it silently collapsed
 // every adopted session to at most one line of history, so it is deliberately
 // treated as a cache miss and rebuilt from the authoritative raw log.
-const CURRENT_VERSION: u64 = 2;
+const PREVIOUS_VERSION: u64 = 2;
+const CURRENT_VERSION: u64 = 3;
 
 /// A decoded checkpoint, grid already validated.
 pub struct ScreenCheckpoint {
@@ -34,7 +37,7 @@ pub struct ScreenCheckpoint {
     pub marker_buffer: Vec<u8>,
     pub alt_screen: bool,
     pub bracketed_paste: bool,
-    pub mouse_reporting: bool,
+    pub mouse: MouseModes,
 }
 
 impl ScreenCheckpoint {
@@ -49,7 +52,8 @@ impl ScreenCheckpoint {
     pub fn load(path: &Path) -> Option<Self> {
         let value = plist::Value::from_file(path).ok()?;
         let dict = value.as_dictionary()?;
-        if dict.get("version")?.as_unsigned_integer()? != CURRENT_VERSION {
+        let version = dict.get("version")?.as_unsigned_integer()?;
+        if !matches!(version, PREVIOUS_VERSION | CURRENT_VERSION) {
             return None;
         }
         let grid = GridUpdate::decode(as_data(dict.get("gridPayload")?)?).ok()?;
@@ -68,6 +72,18 @@ impl ScreenCheckpoint {
         {
             return None;
         }
+        let mouse = if version == PREVIOUS_VERSION {
+            MouseModes::from_detail_bits(0, dict.get("mouseReporting")?.as_boolean()?)
+        } else {
+            MouseModes::new(
+                MouseTrackingMode::from_wire(
+                    u8::try_from(dict.get("mouseTrackingMode")?.as_unsigned_integer()?).ok()?,
+                )?,
+                MouseEncoding::from_wire(
+                    u8::try_from(dict.get("mouseEncoding")?.as_unsigned_integer()?).ok()?,
+                )?,
+            )
+        };
         Some(Self {
             log_offset: dict.get("logOffset")?.as_unsigned_integer()?,
             history,
@@ -75,12 +91,11 @@ impl ScreenCheckpoint {
             marker_buffer: as_data(dict.get("markerBuffer")?)?.to_vec(),
             alt_screen: dict.get("altScreen")?.as_boolean()?,
             bracketed_paste: dict.get("bracketedPaste")?.as_boolean()?,
-            mouse_reporting: dict.get("mouseReporting")?.as_boolean()?,
+            mouse,
         })
     }
 
-    /// Writes atomically (temp file + rename) as a binary plist, the format
-    /// Swift's `PropertyListEncoder` emits.
+    /// Writes atomically (temp file + rename) as a binary plist.
     pub fn write_atomically(&self, path: &Path) -> std::io::Result<()> {
         let mut dict = plist::Dictionary::new();
         dict.insert(
@@ -120,7 +135,15 @@ impl ScreenCheckpoint {
         );
         dict.insert(
             "mouseReporting".into(),
-            plist::Value::Boolean(self.mouse_reporting),
+            plist::Value::Boolean(self.mouse.is_reporting()),
+        );
+        dict.insert(
+            "mouseTrackingMode".into(),
+            plist::Value::Integer(u64::from(self.mouse.tracking as u8).into()),
+        );
+        dict.insert(
+            "mouseEncoding".into(),
+            plist::Value::Integer(u64::from(self.mouse.encoding as u8).into()),
         );
 
         let temp = path.with_extension("plist.tmp");
@@ -160,7 +183,7 @@ mod tests {
             marker_buffer: vec![0x1b, b']'],
             alt_screen: true,
             bracketed_paste: false,
-            mouse_reporting: true,
+            mouse: MouseModes::new(MouseTrackingMode::AnyMotion, MouseEncoding::Sgr),
         }
     }
 
@@ -177,11 +200,11 @@ mod tests {
         assert_eq!(loaded.marker_buffer, vec![0x1b, b']']);
         assert!(loaded.alt_screen);
         assert!(!loaded.bracketed_paste);
-        assert!(loaded.mouse_reporting);
+        assert_eq!(loaded.mouse, sample().mouse);
     }
 
     #[test]
-    fn the_on_disk_format_is_a_binary_plist_with_swifts_keys() {
+    fn the_on_disk_format_is_a_binary_plist_with_versioned_keys() {
         let dir = tempfile::tempdir().expect("temp");
         let path = dir.path().join("s_x.screen.plist");
         sample().write_atomically(&path).expect("write");
@@ -205,6 +228,8 @@ mod tests {
             "altScreen",
             "bracketedPaste",
             "mouseReporting",
+            "mouseTrackingMode",
+            "mouseEncoding",
         ] {
             assert!(keys.contains_key(key), "missing Swift key {key}");
         }
@@ -278,6 +303,34 @@ mod tests {
         assert_eq!(loaded.history, sample().history);
         assert_eq!(loaded.grid, sample().grid);
         assert!(loaded.bracketed_paste);
+        assert_eq!(loaded.mouse, MouseModes::OFF);
+    }
+
+    #[test]
+    fn version_two_enabled_mouse_state_loads_with_its_historical_semantics() {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("s_v2.screen.plist");
+        sample().write_atomically(&path).expect("write");
+        let mut dict = plist::Value::from_file(&path)
+            .expect("read")
+            .into_dictionary()
+            .expect("dictionary");
+        dict.insert(
+            "version".into(),
+            plist::Value::Integer(PREVIOUS_VERSION.into()),
+        );
+        dict.remove("mouseTrackingMode");
+        dict.remove("mouseEncoding");
+        plist::Value::Dictionary(dict)
+            .to_file_binary(&path)
+            .expect("rewrite v2");
+
+        let loaded = ScreenCheckpoint::load(&path).expect("load v2");
+        assert_eq!(
+            loaded.mouse,
+            MouseModes::new(MouseTrackingMode::ButtonEvents, MouseEncoding::Sgr),
+            "v2 restore used to synthesize DECSET 1000 and DECSET 1006"
+        );
     }
 
     #[test]
@@ -300,7 +353,10 @@ mod tests {
             .expect("read back")
             .into_dictionary()
             .expect("dict");
-        dict.insert("version".into(), plist::Value::Integer(3.into()));
+        dict.insert(
+            "version".into(),
+            plist::Value::Integer((CURRENT_VERSION + 1).into()),
+        );
         plist::Value::Dictionary(dict)
             .to_file_binary(&path)
             .expect("rewrite");

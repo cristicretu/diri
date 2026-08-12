@@ -130,7 +130,7 @@ impl AttachHub {
         let Ok(mut guard) = registry.lock() else {
             return false;
         };
-        if matches!(frame.frame_type, FrameType::Input) {
+        if matches!(frame.frame_type, FrameType::Input | FrameType::Mouse) {
             // Input to a frozen session wakes it; write_input's queue covers
             // the race where the governor froze it mid-keystroke.
             let _ = guard.wake_session(session_id);
@@ -141,6 +141,9 @@ impl AttachHub {
         match frame.frame_type {
             FrameType::Input => {
                 let _ = session.write_input(&frame.payload);
+            }
+            FrameType::Mouse => {
+                let _ = session.write_mouse(&frame.payload);
             }
             FrameType::Resize => {
                 if let Some((cols, rows)) = frame.resize_payload() {

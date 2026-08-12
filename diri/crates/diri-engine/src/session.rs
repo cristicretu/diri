@@ -29,6 +29,7 @@ use diri_proto::remote_pty::{
     FullSnapshot, GridDelta, LaunchRequest, ProcessExit, RemoteCodec, RemoteMessage,
     RemoteProcessState,
 };
+use diri_proto::terminal::MouseModes;
 use diri_proto::{NeedsInputDetail, SessionStatus};
 use diri_terminal_state::GridMirror;
 
@@ -300,7 +301,7 @@ pub struct GridSignature {
     pub size: (usize, usize),
     pub cursor: (u16, u16, bool),
     pub alt_screen: bool,
-    pub mouse_reporting: bool,
+    pub mouse: MouseModes,
 }
 
 /// Event source for the attachment writer. PTY readers advance it only after
@@ -406,7 +407,7 @@ fn grid_wake_event(state: &GridWakeState, observed: u64) -> GridWakeEvent {
 
 pub(crate) struct AttachmentSeed {
     pub grid: diri_proto::grid::GridUpdate,
-    pub modes: (bool, bool),
+    pub modes: (bool, MouseModes),
     pub signature: GridSignature,
     pub wake: GridWake,
     pub wake_generation: u64,
@@ -1125,16 +1126,16 @@ impl Session {
                     let grid = remote.mirror.full_update()?;
                     let (cols, rows) = remote.mirror.size();
                     let (cursor_col, cursor_row, cursor_visible) = remote.mirror.cursor();
-                    let (alt_screen, _, mouse_reporting) = remote.mirror.modes();
+                    let (alt_screen, _, mouse) = remote.mirror.modes();
                     Some((
                         grid,
-                        (alt_screen, mouse_reporting),
+                        (alt_screen, mouse),
                         GridSignature {
                             content_seq: remote.revision,
                             size: (usize::from(cols), usize::from(rows)),
                             cursor: (cursor_col, cursor_row, cursor_visible),
                             alt_screen,
-                            mouse_reporting,
+                            mouse,
                         },
                     ))
                 })
@@ -1143,13 +1144,13 @@ impl Session {
                 let screen = self.shared.screen.lock().expect("screen");
                 (
                     screen.full_snapshot(),
-                    (screen.is_alt_screen(), screen.mouse_reporting()),
+                    (screen.is_alt_screen(), screen.mouse_modes()),
                     GridSignature {
                         content_seq: screen.content_seq(),
                         size: screen.size(),
                         cursor: screen.cursor(),
                         alt_screen: screen.is_alt_screen(),
-                        mouse_reporting: screen.mouse_reporting(),
+                        mouse: screen.mouse_modes(),
                     },
                 )
             });
@@ -1181,13 +1182,13 @@ impl Session {
         {
             let (cols, rows) = remote.mirror.size();
             let (cursor_col, cursor_row, cursor_visible) = remote.mirror.cursor();
-            let (alt_screen, _, mouse_reporting) = remote.mirror.modes();
+            let (alt_screen, _, mouse) = remote.mirror.modes();
             let current = GridSignature {
                 content_seq: remote.revision,
                 size: (usize::from(cols), usize::from(rows)),
                 cursor: (cursor_col, cursor_row, cursor_visible),
                 alt_screen,
-                mouse_reporting,
+                mouse,
             };
             if current == *signature {
                 return None;
@@ -1204,7 +1205,7 @@ impl Session {
             size: screen.size(),
             cursor: screen.cursor(),
             alt_screen: screen.is_alt_screen(),
-            mouse_reporting: screen.mouse_reporting(),
+            mouse: screen.mouse_modes(),
         };
         if current == *signature {
             return None;
@@ -1233,8 +1234,8 @@ impl Session {
         self.shared.screen.lock().expect("screen").bracketed_paste()
     }
 
-    /// Current (alt_screen, mouse_reporting).
-    pub fn modes(&self) -> (bool, bool) {
+    /// Current alternate-screen and granular mouse modes.
+    pub fn modes(&self) -> (bool, MouseModes) {
         if let Some(remote) = self
             .shared
             .remote_grid
@@ -1243,11 +1244,11 @@ impl Session {
             .as_ref()
             && remote.mirror.sequence().is_some()
         {
-            let (alt_screen, _, mouse_reporting) = remote.mirror.modes();
-            return (alt_screen, mouse_reporting);
+            let (alt_screen, _, mouse) = remote.mirror.modes();
+            return (alt_screen, mouse);
         }
         let screen = self.shared.screen.lock().expect("screen");
-        (screen.is_alt_screen(), screen.mouse_reporting())
+        (screen.is_alt_screen(), screen.mouse_modes())
     }
 
     /// A wheel event from an attached client: forwarded to the child when it
@@ -1331,6 +1332,10 @@ impl Session {
     }
 
     fn write_raw(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.write_raw_kind(bytes, false)
+    }
+
+    fn write_raw_kind(&self, bytes: &[u8], mouse: bool) -> std::io::Result<()> {
         // Before the deferred exec there is no PTY: queue for the launch
         // flush, exactly like the Swift daemon's `queuedLaunchInput`.
         if let Some(deferred) = &self.deferred
@@ -1354,8 +1359,20 @@ impl Session {
                 writer.flush()
             }
             Transport::Held(client) => client.write(bytes).map_err(holder_io_error),
+            Transport::Remote(client) if mouse => client.write_mouse(bytes),
             Transport::Remote(client) => client.write(bytes),
         }
+    }
+
+    /// Sends a pre-encoded terminal mouse report without presenting it to the
+    /// prompt/status reducers as typed text.
+    pub fn write_mouse(&self, bytes: &[u8]) -> std::io::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.shared.note_hot();
+        self.shared.grid_wake.prioritize_interactive_changes();
+        self.write_raw_kind(bytes, true)
     }
 
     /// Sends text the way a user would.
@@ -2121,7 +2138,7 @@ fn apply_remote_snapshot(
                 &snapshot.grid,
                 snapshot.alt_screen,
                 snapshot.bracketed_paste,
-                snapshot.mouse_reporting,
+                snapshot.mouse,
             )
             .map_err(std::io::Error::other)?;
         remote.revision = remote.revision.saturating_add(1);
@@ -2141,7 +2158,7 @@ fn apply_remote_snapshot(
             &snapshot.grid,
             snapshot.alt_screen,
             snapshot.bracketed_paste,
-            snapshot.mouse_reporting,
+            snapshot.mouse,
         ) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -2174,7 +2191,7 @@ fn apply_remote_delta(shared: &Shared, delta: GridDelta) -> std::io::Result<()> 
                 &delta.grid,
                 delta.alt_screen,
                 delta.bracketed_paste,
-                delta.mouse_reporting,
+                delta.mouse,
             )
             .map_err(std::io::Error::other)?;
         remote.revision = remote.revision.saturating_add(1);
@@ -2498,7 +2515,7 @@ fn pump_held(
                     &checkpoint.grid,
                     checkpoint.alt_screen,
                     checkpoint.bracketed_paste,
-                    checkpoint.mouse_reporting,
+                    checkpoint.mouse,
                 )
             });
         match restored {
@@ -2775,7 +2792,7 @@ struct CheckpointKey {
     marker_bytes: usize,
     alt_screen: bool,
     bracketed_paste: bool,
-    mouse_reporting: bool,
+    mouse: MouseModes,
 }
 
 /// Writes the current screen as a durable checkpoint, skipping the write when
@@ -2787,14 +2804,14 @@ fn persist_checkpoint(
     marker_buffer: &[u8],
     last_key: &mut Option<CheckpointKey>,
 ) {
-    let (history, grid, alt_screen, bracketed_paste, mouse_reporting, content_seq) = {
+    let (history, grid, alt_screen, bracketed_paste, mouse, content_seq) = {
         let screen = shared.screen.lock().expect("screen");
         (
             screen.history_snapshot(),
             screen.full_snapshot(),
             screen.is_alt_screen(),
             screen.bracketed_paste(),
-            screen.mouse_reporting(),
+            screen.mouse_modes(),
             screen.content_seq(),
         )
     };
@@ -2804,7 +2821,7 @@ fn persist_checkpoint(
         marker_bytes: marker_buffer.len(),
         alt_screen,
         bracketed_paste,
-        mouse_reporting,
+        mouse,
     };
     if *last_key == Some(key) {
         return;
@@ -2816,7 +2833,7 @@ fn persist_checkpoint(
         marker_buffer: marker_buffer.to_vec(),
         alt_screen,
         bracketed_paste,
-        mouse_reporting,
+        mouse,
     };
     // A failed write must not stop the session; the checkpoint is a cache.
     if checkpoint.write_atomically(path).is_ok() {

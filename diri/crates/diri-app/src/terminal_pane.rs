@@ -9,6 +9,9 @@ use std::time::{Duration, Instant};
 
 use diri_client::attachment::{SessionAttachment, TerminalChunk};
 use diri_proto::grid::GridUpdate;
+use diri_proto::terminal::{
+    MouseModes, TerminalMouseButton, TerminalMouseEvent, TerminalMouseModifiers, encode_mouse_event,
+};
 use diri_proto::{
     AgentKind as ProtoAgentKind, ArtifactKind, ExitReason, PrCheck, PullRequestStatus,
     Resumability, RiskHint, SessionArtifact, SessionId, SessionRecord, SessionStatus,
@@ -65,6 +68,10 @@ const PANE_EVENT_QUEUE_CAPACITY: usize = 256;
 /// the client can never see, resizing slower makes the drag look like it snaps
 /// at the end instead of reflowing under the cursor.
 const RESIZE_CADENCE: Duration = Duration::from_millis(8);
+/// Cell motion is redundant above display cadence. This bounds DECSET 1003
+/// writes while still allowing one report per rendered frame on high-refresh
+/// displays; repeated moves within one cell are suppressed altogether.
+const MOUSE_MOTION_CADENCE: Duration = Duration::from_millis(8);
 /// Two resizes further apart than this belong to different gestures. A drag
 /// steps faster than this and must keep reflowing live; anything slower is a
 /// discrete change -- a panel toggle, a window snap, a font-size change --
@@ -345,8 +352,43 @@ enum AttachmentState {
     Reconnecting,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PointerOwner {
+    LocalSelection,
+    LocalReference,
+    Terminal,
+    Ignored,
+}
+
+#[derive(Default)]
+struct MouseMotionLimiter {
+    last_sent_at: Option<Instant>,
+    last_cell: Option<(u16, u16)>,
+}
+
+impl MouseMotionLimiter {
+    fn reset(&mut self) {
+        self.last_sent_at = None;
+        self.last_cell = None;
+    }
+
+    fn should_send(&mut self, now: Instant, cell: (u16, u16)) -> bool {
+        if self.last_cell == Some(cell)
+            || self
+                .last_sent_at
+                .is_some_and(|sent| now.duration_since(sent) < MOUSE_MOTION_CADENCE)
+        {
+            return false;
+        }
+        self.last_sent_at = Some(now);
+        self.last_cell = Some(cell);
+        true
+    }
+}
+
 enum AttachmentCommand {
     Input(Vec<u8>),
+    Mouse(Vec<u8>),
     Resize(u16, u16),
     Scroll {
         direction: u8,
@@ -372,6 +414,14 @@ impl AttachmentControl {
 
     fn resize(&self, cols: u16, rows: u16) {
         let _ = self.tx.send(AttachmentCommand::Resize(cols, rows));
+    }
+
+    fn mouse(&self, bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        let _ = self.pane_tx.send(PaneEvent::InteractiveInput);
+        let _ = self.tx.send(AttachmentCommand::Mouse(bytes));
     }
 
     fn scroll(&self, direction: u8, lines: u16, col: u16, row: u16) {
@@ -501,6 +551,8 @@ struct ResidentTerminal {
     /// selection, and readline keys as the other query fields.
     find_query: QueryEditor,
     last_size: (u16, u16),
+    pointer_owner: Option<(MouseButton, PointerOwner)>,
+    mouse_motion: MouseMotionLimiter,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -812,6 +864,8 @@ impl TerminalPane {
                     find: None,
                     find_query: QueryEditor::default(),
                     last_size: (0, 0),
+                    pointer_owner: None,
+                    mouse_motion: MouseMotionLimiter::default(),
                 },
             );
         }
@@ -981,13 +1035,10 @@ impl TerminalPane {
             }
             PaneEvent::Chunk(
                 id,
-                TerminalChunk::Modes {
-                    alt_screen,
-                    mouse_reporting,
-                },
+                TerminalChunk::Modes { alt_screen, mouse },
             ) => {
                 if let Some(resident) = self.residents.get_mut(&id) {
-                    resident.element.set_modes(alt_screen, mouse_reporting);
+                    resident.element.set_modes(alt_screen, mouse);
                 }
                 if self.selected_id().as_ref() == Some(&id) {
                     cx.notify();
@@ -1329,7 +1380,179 @@ impl TerminalPane {
         let row = ((f32::from(position.y) - grid_y) / f32::from(metrics.line_height))
             .floor()
             .max(0.0) as usize;
-        Some((col, row))
+        let resident = self.selected_id().and_then(|id| self.residents.get(&id))?;
+        clamp_grid_cell(
+            col,
+            row,
+            resident.element.grid_cols(),
+            resident.element.grid_rows(),
+        )
+        .map(|(col, row)| (usize::from(col), usize::from(row)))
+    }
+
+    fn handle_pointer_down(
+        &mut self,
+        event: &gpui::MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.selected_id() else {
+            return;
+        };
+        let Some((col, row)) = self.grid_cell_at(event.position, window) else {
+            return;
+        };
+        let owner = {
+            let Some(resident) = self.residents.get(&id) else {
+                return;
+            };
+            pointer_owner(
+                resident.element.mouse_modes(),
+                event.button,
+                &event.modifiers,
+            )
+        };
+        let Some(resident) = self.residents.get_mut(&id) else {
+            return;
+        };
+        resident.pointer_owner = Some((event.button, owner));
+        resident.mouse_motion.reset();
+
+        match owner {
+            PointerOwner::LocalSelection => {
+                match event.click_count {
+                    1 => resident.element.begin_selection(col, row),
+                    _ => resident.element.select_word(col, row),
+                }
+                cx.notify();
+            }
+            PointerOwner::LocalReference => {
+                let reference = resident.element.reference_at(col, row);
+                match reference {
+                    Some(TerminalReference::Url(url)) => cx.open_url(&url),
+                    Some(TerminalReference::File(reference)) => {
+                        let Some(session) = self.selected_session() else {
+                            return;
+                        };
+                        cx.emit(TerminalPaneEvent::OpenFileReference {
+                            reference,
+                            cwd: session.cwd.clone(),
+                            session_id: session.id.clone(),
+                        });
+                    }
+                    None => {}
+                }
+            }
+            PointerOwner::Terminal => {
+                let Some(button) = terminal_mouse_button(event.button) else {
+                    return;
+                };
+                if let Some(bytes) = encode_mouse_event(
+                    resident.element.mouse_modes(),
+                    TerminalMouseEvent::Press(button),
+                    terminal_mouse_modifiers(&event.modifiers),
+                    col as u16,
+                    row as u16,
+                ) {
+                    resident.attachment.mouse(bytes);
+                }
+                cx.stop_propagation();
+            }
+            PointerOwner::Ignored => {}
+        }
+    }
+
+    fn handle_pointer_up(
+        &mut self,
+        event: &gpui::MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.selected_id() else {
+            return;
+        };
+        let Some((col, row)) = self.grid_cell_at(event.position, window) else {
+            return;
+        };
+        let Some(resident) = self.residents.get_mut(&id) else {
+            return;
+        };
+        let owner = resident
+            .pointer_owner
+            .filter(|(button, _)| *button == event.button)
+            .map(|(_, owner)| owner);
+        resident.pointer_owner = None;
+        if owner != Some(PointerOwner::Terminal) {
+            return;
+        }
+        let Some(button) = terminal_mouse_button(event.button) else {
+            return;
+        };
+        if let Some(bytes) = encode_mouse_event(
+            resident.element.mouse_modes(),
+            TerminalMouseEvent::Release(button),
+            terminal_mouse_modifiers(&event.modifiers),
+            col as u16,
+            row as u16,
+        ) {
+            resident.attachment.mouse(bytes);
+        }
+        cx.stop_propagation();
+    }
+
+    fn handle_pointer_move(
+        &mut self,
+        event: &gpui::MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.selected_id() else {
+            return;
+        };
+        let Some((col, row)) = self.grid_cell_at(event.position, window) else {
+            return;
+        };
+        let Some(resident) = self.residents.get_mut(&id) else {
+            return;
+        };
+        let owner = event.pressed_button.and_then(|button| {
+            resident
+                .pointer_owner
+                .filter(|(owned, _)| *owned == button)
+                .map(|(_, owner)| owner)
+        });
+        if owner == Some(PointerOwner::LocalSelection) {
+            resident.element.drag_selection(col, row);
+            cx.notify();
+            return;
+        }
+        if event.pressed_button.is_some() && owner != Some(PointerOwner::Terminal) {
+            return;
+        }
+        let button = match event.pressed_button {
+            Some(button) => terminal_mouse_button(button).map(Some),
+            None => Some(None),
+        };
+        let Some(button) = button else {
+            return;
+        };
+        let Some(bytes) = encode_mouse_event(
+            resident.element.mouse_modes(),
+            TerminalMouseEvent::Motion(button),
+            terminal_mouse_modifiers(&event.modifiers),
+            col as u16,
+            row as u16,
+        ) else {
+            return;
+        };
+        if !resident
+            .mouse_motion
+            .should_send(Instant::now(), (col as u16, row as u16))
+        {
+            return;
+        }
+        resident.attachment.mouse(bytes);
+        cx.stop_propagation();
     }
 
     /// The height the mirrored grid needs when the daemon's screen is taller
@@ -2111,67 +2334,20 @@ impl TerminalPane {
                             .expect("session store lock poisoned")
                             .select(id_for_focus.clone());
                     }
-                    let Some(id) = this.selected_id() else {
-                        return;
-                    };
-                    let Some((col, row)) = this.grid_cell_at(event.position, window) else {
-                        return;
-                    };
-                    let Some(resident) = this.residents.get(&id) else {
-                        return;
-                    };
-                    if event.modifiers.platform {
-                        match resident.element.reference_at(col, row) {
-                            Some(TerminalReference::Url(url)) => cx.open_url(&url),
-                            Some(TerminalReference::File(reference)) => {
-                                let Some(session) = this.selected_session() else {
-                                    return;
-                                };
-                                cx.emit(TerminalPaneEvent::OpenFileReference {
-                                    reference,
-                                    cwd: session.cwd.clone(),
-                                    session_id: session.id.clone(),
-                                });
-                            }
-                            None => {}
-                        }
-                        return;
-                    }
-                    // Mouse-reporting programs (Claude Code, vim) would
-                    // normally own the pointer, but clicks are not forwarded
-                    // to the PTY yet -- suppressing local selection here
-                    // bought nothing and made text un-copyable. Revisit when
-                    // click forwarding lands (then: plain drag to the app,
-                    // option-drag for local selection, per terminal
-                    // convention).
-                    match event.click_count {
-                        1 => resident.element.begin_selection(col, row),
-                        _ => resident.element.select_word(col, row),
-                    }
-                    // notify, never window.refresh(): refresh() flags the
-                    // whole frame as caching-disabled, repainting every cached
-                    // view at pointer-event rate.
-                    cx.notify();
+                    this.handle_pointer_down(event, window, cx);
                 }),
             )
-            .on_mouse_move(
-                cx.listener(|this, event: &gpui::MouseMoveEvent, window, cx| {
-                    if event.pressed_button != Some(MouseButton::Left) {
-                        return;
-                    }
-                    let Some(id) = this.selected_id() else {
-                        return;
-                    };
-                    let Some((col, row)) = this.grid_cell_at(event.position, window) else {
-                        return;
-                    };
-                    let Some(resident) = this.residents.get(&id) else {
-                        return;
-                    };
-                    resident.element.drag_selection(col, row);
-                    cx.notify();
-                }),
-            )
+            .on_mouse_down(MouseButton::Middle, cx.listener(Self::handle_pointer_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::handle_pointer_down))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_pointer_up))
+            .on_mouse_up(MouseButton::Middle, cx.listener(Self::handle_pointer_up))
+            .on_mouse_up(MouseButton::Right, cx.listener(Self::handle_pointer_up))
+            // A release outside the pane still belongs to the child that saw
+            // the press. `grid_cell_at` clamps it to the nearest grid cell.
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::handle_pointer_up))
+            .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::handle_pointer_up))
+            .on_mouse_up_out(MouseButton::Right, cx.listener(Self::handle_pointer_up))
+            .on_mouse_move(cx.listener(Self::handle_pointer_move))
             .on_scroll_wheel(cx.listener(Self::handle_scroll))
             .child(match overflow {
                 // Settled: the mirrored screen fits, so the grid fills the pane
@@ -2860,6 +3036,65 @@ impl Render for TerminalPane {
     }
 }
 
+fn clamp_grid_cell(col: usize, row: usize, cols: u16, rows: u16) -> Option<(u16, u16)> {
+    if cols == 0 || rows == 0 {
+        return None;
+    }
+    Some((
+        u16::try_from(col).unwrap_or(u16::MAX).min(cols - 1),
+        u16::try_from(row).unwrap_or(u16::MAX).min(rows - 1),
+    ))
+}
+
+fn pointer_owner(
+    mouse: MouseModes,
+    button: MouseButton,
+    modifiers: &gpui::Modifiers,
+) -> PointerOwner {
+    // `platform` is Command on the supported macOS desktop. Preserve local
+    // reference resolution for that entire gesture, including its release.
+    if modifiers.platform {
+        return if button == MouseButton::Left {
+            PointerOwner::LocalReference
+        } else {
+            PointerOwner::Ignored
+        };
+    }
+    // Option must claim the press, not merely the first move; otherwise the
+    // child would receive an unmatched press before a local selection began.
+    if modifiers.alt {
+        return if button == MouseButton::Left {
+            PointerOwner::LocalSelection
+        } else {
+            PointerOwner::Ignored
+        };
+    }
+    if mouse.is_reporting() && terminal_mouse_button(button).is_some() {
+        PointerOwner::Terminal
+    } else if button == MouseButton::Left {
+        PointerOwner::LocalSelection
+    } else {
+        PointerOwner::Ignored
+    }
+}
+
+fn terminal_mouse_button(button: MouseButton) -> Option<TerminalMouseButton> {
+    match button {
+        MouseButton::Left => Some(TerminalMouseButton::Left),
+        MouseButton::Middle => Some(TerminalMouseButton::Middle),
+        MouseButton::Right => Some(TerminalMouseButton::Right),
+        MouseButton::Navigate(_) => None,
+    }
+}
+
+fn terminal_mouse_modifiers(modifiers: &gpui::Modifiers) -> TerminalMouseModifiers {
+    TerminalMouseModifiers {
+        shift: modifiers.shift,
+        alt: modifiers.alt,
+        control: modifiers.control,
+    }
+}
+
 fn find_icon_button(
     id: &'static str,
     system_image: &'static str,
@@ -3069,6 +3304,9 @@ fn spawn_attachment(
                             Some(AttachmentCommand::Input(bytes)) => {
                                 let _ = writer.send_input(bytes);
                             }
+                            Some(AttachmentCommand::Mouse(bytes)) => {
+                                let _ = writer.send_mouse(bytes);
+                            }
                             Some(AttachmentCommand::Resize(cols, rows)) => {
                                 last_resize = Some((cols, rows));
                                 let _ = writer.resize(cols, rows);
@@ -3109,7 +3347,9 @@ async fn wait_for_retry(
             command = commands.recv() => match command {
                 Some(AttachmentCommand::Resize(cols, rows)) => *last_resize = Some((cols, rows)),
                 Some(AttachmentCommand::Close) | None => return true,
-                Some(AttachmentCommand::Input(_)) | Some(AttachmentCommand::Scroll { .. }) => {}
+                Some(AttachmentCommand::Input(_))
+                | Some(AttachmentCommand::Mouse(_))
+                | Some(AttachmentCommand::Scroll { .. }) => {}
             }
         }
     }
@@ -3461,6 +3701,112 @@ mod tests {
             sent.push(at);
         }
         sent
+    }
+
+    #[test]
+    fn pointer_ownership_preserves_local_escape_hatches_and_reporting_off() {
+        let plain = Modifiers::default();
+        let option = Modifiers {
+            alt: true,
+            ..Modifiers::default()
+        };
+        let command = Modifiers {
+            platform: true,
+            ..Modifiers::default()
+        };
+        let reporting = MouseModes::new(
+            diri_proto::terminal::MouseTrackingMode::AnyMotion,
+            diri_proto::terminal::MouseEncoding::Sgr,
+        );
+
+        assert_eq!(
+            pointer_owner(MouseModes::OFF, MouseButton::Left, &plain),
+            PointerOwner::LocalSelection
+        );
+        assert_eq!(
+            pointer_owner(MouseModes::OFF, MouseButton::Right, &plain),
+            PointerOwner::Ignored,
+            "reporting-off right-click behavior stays unchanged"
+        );
+        assert_eq!(
+            pointer_owner(reporting, MouseButton::Left, &plain),
+            PointerOwner::Terminal
+        );
+        assert_eq!(
+            pointer_owner(reporting, MouseButton::Left, &option),
+            PointerOwner::LocalSelection,
+            "Option claims the whole drag before a press can reach the PTY"
+        );
+        assert_eq!(
+            pointer_owner(reporting, MouseButton::Left, &command),
+            PointerOwner::LocalReference,
+            "Command-click remains local"
+        );
+        assert_eq!(
+            pointer_owner(reporting, MouseButton::Right, &command),
+            PointerOwner::Ignored,
+            "no Command-modified button is forwarded"
+        );
+    }
+
+    #[test]
+    fn option_drag_still_produces_copyable_terminal_text() {
+        let element = TerminalElement::with_buffer(GridBuffer::default());
+        let mut cells: Vec<_> = "copy me"
+            .chars()
+            .map(|character| diri_proto::grid::GridCell {
+                scalar: u32::from(character),
+                ..diri_proto::grid::GridCell::BLANK
+            })
+            .collect();
+        cells.push(diri_proto::grid::GridCell::BLANK);
+        element.apply_damage(GridUpdate {
+            cols: 8,
+            rows: 1,
+            cursor_col: 0,
+            cursor_row: 0,
+            cursor_visible: true,
+            is_full_snapshot: true,
+            changed_rows: vec![diri_proto::grid::ChangedRow::new(0, cells)],
+        });
+        let option = Modifiers {
+            alt: true,
+            ..Modifiers::default()
+        };
+        let reporting = MouseModes::new(
+            diri_proto::terminal::MouseTrackingMode::ButtonMotion,
+            diri_proto::terminal::MouseEncoding::Sgr,
+        );
+        assert_eq!(
+            pointer_owner(reporting, MouseButton::Left, &option),
+            PointerOwner::LocalSelection
+        );
+        element.begin_selection(0, 0);
+        element.drag_selection(7, 0);
+        assert_eq!(element.selected_text(), "copy me");
+    }
+
+    #[test]
+    fn pointer_coordinates_clamp_to_every_grid_edge() {
+        assert_eq!(clamp_grid_cell(5, 7, 80, 24), Some((5, 7)));
+        assert_eq!(clamp_grid_cell(usize::MAX, 100, 80, 24), Some((79, 23)));
+        assert_eq!(clamp_grid_cell(0, 0, 0, 24), None);
+        assert_eq!(clamp_grid_cell(0, 0, 80, 0), None);
+    }
+
+    #[test]
+    fn unrestricted_motion_is_rate_limited_and_cell_deduplicated() {
+        let started = Instant::now();
+        let mut limiter = MouseMotionLimiter::default();
+        assert!(
+            limiter.should_send(started, (1, 1)),
+            "first motion is immediate"
+        );
+        assert!(!limiter.should_send(started + Duration::from_millis(1), (2, 1)));
+        assert!(!limiter.should_send(started + MOUSE_MOTION_CADENCE, (1, 1)));
+        assert!(limiter.should_send(started + MOUSE_MOTION_CADENCE, (2, 1)));
+        limiter.reset();
+        assert!(limiter.should_send(started + Duration::from_secs(1), (2, 1)));
     }
 
     #[test]

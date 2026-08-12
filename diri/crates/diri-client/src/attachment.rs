@@ -15,6 +15,7 @@ use diri_proto::frames::{Frame, FrameCodec, FrameType};
 use diri_proto::grid::GridUpdate;
 use diri_proto::methods::{AttachRequest, ClientRole};
 use diri_proto::model::SessionId;
+use diri_proto::terminal::MouseModes;
 use futures_core::Stream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -32,10 +33,7 @@ const CHUNK_QUEUE_CAPACITY: usize = 256;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalChunk {
     Grid(GridUpdate),
-    Modes {
-        alt_screen: bool,
-        mouse_reporting: bool,
-    },
+    Modes { alt_screen: bool, mouse: MouseModes },
     Pong,
 }
 
@@ -135,6 +133,10 @@ impl SessionAttachmentHandle {
         self.send(Frame::input(bytes))
     }
 
+    pub fn send_mouse(&self, bytes: impl Into<Vec<u8>>) -> Result<(), AttachmentClosed> {
+        self.send(Frame::mouse(bytes))
+    }
+
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), AttachmentClosed> {
         self.send(Frame::resize(cols, rows))
     }
@@ -201,6 +203,11 @@ impl SessionAttachment {
     /// Queues raw keystroke bytes for the session PTY.
     pub fn send_input(&self, bytes: impl Into<Vec<u8>>) -> Result<(), AttachmentClosed> {
         self.handle().send_input(bytes)
+    }
+
+    /// Queues a pre-encoded mouse report on the raw interactive path.
+    pub fn send_mouse(&self, bytes: impl Into<Vec<u8>>) -> Result<(), AttachmentClosed> {
+        self.handle().send_mouse(bytes)
     }
 
     /// Queues a PTY resize. Debouncing and first-resize semantics belong to the caller.
@@ -314,12 +321,9 @@ async fn process_incoming(
                 .map_err(|_| ())?;
         }
         FrameType::Modes => {
-            let (alt_screen, mouse_reporting) = frame.modes_payload().ok_or(())?;
+            let (alt_screen, mouse) = frame.modes_payload().ok_or(())?;
             chunks
-                .send(TerminalChunk::Modes {
-                    alt_screen,
-                    mouse_reporting,
-                })
+                .send(TerminalChunk::Modes { alt_screen, mouse })
                 .await
                 .map_err(|_| ())?;
         }
@@ -328,7 +332,7 @@ async fn process_incoming(
         // These byte-replay frames belong to the retired VT-parsing client.
         FrameType::Output | FrameType::ReplayBegin | FrameType::ReplayEnd => {}
         // The daemon does not send client-to-daemon frame types.
-        FrameType::Input | FrameType::Resize | FrameType::Scroll => {}
+        FrameType::Input | FrameType::Resize | FrameType::Scroll | FrameType::Mouse => {}
     }
     Ok(())
 }
