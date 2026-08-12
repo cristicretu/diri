@@ -7,6 +7,7 @@ mod commands;
 mod composer;
 #[cfg(unix)]
 mod daemon_launch;
+mod delegation;
 mod dev_build;
 mod diagnostics;
 pub mod diff;

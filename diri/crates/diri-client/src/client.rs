@@ -487,6 +487,13 @@ impl DaemonClient {
             .await
     }
 
+    pub async fn reparent_worktree(
+        &self,
+        params: SessionReparentWorktreeParams,
+    ) -> Result<SessionReparentWorktreeResult, ClientError> {
+        self.typed(Method::SESSION_REPARENT_WORKTREE, &params).await
+    }
+
     /// `host.sync_prefs`: rsync over ssh — bounded, but slower than a local
     /// round trip.
     pub async fn sync_prefs(&self, host: &str) -> Result<HostSyncPrefsResult, ClientError> {

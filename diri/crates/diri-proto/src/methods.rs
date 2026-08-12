@@ -36,6 +36,7 @@ impl Method {
     pub const SESSION_UNARCHIVE: &'static str = "session.unarchive";
     pub const SESSION_REOPEN_LAST: &'static str = "session.reopen_last";
     pub const SESSION_MIGRATE: &'static str = "session.migrate";
+    pub const SESSION_REPARENT_WORKTREE: &'static str = "session.reparent_worktree";
     pub const HOST_SYNC_PREFS: &'static str = "host.sync_prefs";
     pub const HOST_LOCATE_REPO: &'static str = "host.locate_repo";
     pub const HOST_INITIALIZE: &'static str = "host.initialize";
@@ -401,6 +402,16 @@ pub type SessionHibernateResult = EmptyResult;
 pub type SessionWakeResult = EmptyResult;
 pub type SessionArchiveResult = EmptyResult;
 pub type SessionUnarchiveResult = EmptyResult;
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionReparentWorktreeParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    pub project_root: String,
+    pub worktree_path: String,
+}
+
+pub type SessionReparentWorktreeResult = SessionRecord;
 pub type SessionReadScreenResult = ReadScreenResult;
 pub type SessionReadScrollbackResult = ReadScrollbackResult;
 pub type SessionReadScrollbackCellsResult = ReadScrollbackCellsResult;

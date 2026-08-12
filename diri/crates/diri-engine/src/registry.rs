@@ -825,6 +825,23 @@ impl Registry {
         Ok(())
     }
 
+    /// Moves an ended resumable record to another checkout of the same
+    /// project. Validation of repository membership and target ownership lives
+    /// in the control method; this is the single durable metadata mutation.
+    pub fn reparent_worktree(
+        &mut self,
+        id: &str,
+        cwd: String,
+        branch: Option<String>,
+    ) -> std::io::Result<SessionRecord> {
+        let record = self.records.get_mut(id).ok_or_else(|| not_found(id))?;
+        record.cwd.clone_from(&cwd);
+        record.worktree_path = Some(cwd);
+        record.git_branch = branch;
+        record.updated_at = DateMillis::from(std::time::SystemTime::now());
+        Ok(record.clone())
+    }
+
     pub fn mark_seen(&mut self, id: &str) -> std::io::Result<()> {
         let record = self.records.get_mut(id).ok_or_else(|| not_found(id))?;
         record.last_seen_at = Some(DateMillis::from(std::time::SystemTime::now()));
@@ -1017,6 +1034,7 @@ mod tests {
             git_branch: None,
             title: "test".into(),
             title_source: TitleSource::Placeholder,
+            originating_prompt: None,
             agent_session_id: None,
             transcript_path: None,
             status: SessionStatus::Starting,

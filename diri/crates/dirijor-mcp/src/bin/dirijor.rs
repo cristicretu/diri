@@ -1190,6 +1190,7 @@ mod tests {
             git_branch: None,
             title: title.into(),
             title_source: TitleSource::Placeholder,
+            originating_prompt: None,
             agent_session_id: None,
             transcript_path: None,
             status: SessionStatus::Idle,

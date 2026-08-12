@@ -122,6 +122,9 @@ pub enum StoreEffect {
         id: SessionId,
         target_host: Option<String>,
     },
+    /// Confirmation of a worktree proposal. The Engine revalidates the
+    /// repository, lifecycle, and target ownership before persisting it.
+    ReparentWorktree(diri_proto::SessionReparentWorktreeParams),
     /// `host.sync_prefs` — push agent preferences to a remote host.
     SyncPrefs {
         host: String,
@@ -2041,6 +2044,10 @@ impl SessionStore {
         }));
     }
 
+    pub fn reparent_worktree(&self, params: diri_proto::SessionReparentWorktreeParams) {
+        self.emit(StoreEffect::ReparentWorktree(params));
+    }
+
     /// Fallback cwd for spawning LOCALLY while a REMOTE session is active:
     /// its remote cwd is useless as a local path, so prefer the first project
     /// root that exists on this machine, then home.
@@ -2794,6 +2801,16 @@ async fn run_effects(
                 }
                 outcome
             }
+            StoreEffect::ReparentWorktree(params) => match client.reparent_worktree(params).await {
+                Ok(record) => {
+                    store
+                        .write()
+                        .expect("session store lock poisoned")
+                        .upsert_session(record);
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            },
             StoreEffect::SyncPrefs { host, host_name } => {
                 let result = client.sync_prefs(&host).await;
                 store
@@ -2982,6 +2999,7 @@ fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
         StoreEffect::Spawn(_) => ("Create session failed", None),
         StoreEffect::SpawnAuxiliary(_) => ("Open terminal failed", None),
         StoreEffect::Migrate { .. } => ("Move session failed", None),
+        StoreEffect::ReparentWorktree(_) => ("Move session to worktree failed", None),
         StoreEffect::SyncPrefs { host, host_name } => (
             "Sync preferences failed",
             Some(RetryAction::SyncPrefs {

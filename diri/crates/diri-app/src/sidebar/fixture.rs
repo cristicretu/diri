@@ -489,6 +489,7 @@ fn session(
         git_branch: branch.map(str::to_owned),
         title: title.into(),
         title_source: TitleSource::AgentProvided,
+        originating_prompt: None,
         agent_session_id: None,
         transcript_path: None,
         status,

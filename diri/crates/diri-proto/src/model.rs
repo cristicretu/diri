@@ -707,6 +707,11 @@ pub struct SessionRecord {
     pub git_branch: Option<String>,
     pub title: String,
     pub title_source: TitleSource,
+    /// The first prompt used to create this session. It is retained so a
+    /// sibling proposal can reproduce the user's request without scraping a
+    /// live terminal; older records fall back to their transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub originating_prompt: Option<String>,
     #[serde(rename = "agentSessionID", skip_serializing_if = "Option::is_none")]
     pub agent_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -1,6 +1,7 @@
 use diri_proto::{ProjectId, SessionId};
 use gpui::{Pixels, Point};
 
+use crate::delegation::SiblingProposal;
 use crate::query_editor::QueryEditor;
 
 pub const DEFAULT_SIDEBAR_WIDTH: f32 = 248.0;
@@ -65,6 +66,12 @@ pub struct SidebarUiState {
     pub hover_card: Option<(SessionId, f32)>,
     pub drag: Option<DragItem>,
     pub drag_target: Option<String>,
+    /// Keyboard source for the two-step mark-then-delegate equivalent.
+    pub delegation_mark: Option<SessionId>,
+    /// Empty-space drops stop here until the user confirms the sibling spawn.
+    pub pending_sibling: Option<SiblingProposal>,
+    /// Inline explanation for a rejected drop or keyboard target.
+    pub delegation_notice: Option<String>,
     /// A live drag has staged a reorder in memory that still needs one prefs
     /// write when the gesture ends.
     pub order_dirty: bool,
@@ -91,6 +98,9 @@ impl SidebarUiState {
             hover_card: None,
             drag: None,
             drag_target: None,
+            delegation_mark: None,
+            pending_sibling: None,
+            delegation_notice: None,
             order_dirty: false,
             resize_origin: None,
             preview_account: false,
@@ -188,6 +198,14 @@ impl SidebarUiState {
         self.rename_draft.clear();
         (!title.is_empty()).then_some((id, title))
     }
+
+    pub fn cancel_delegation(&mut self) {
+        self.drag = None;
+        self.drag_target = None;
+        self.delegation_mark = None;
+        self.pending_sibling = None;
+        self.delegation_notice = None;
+    }
 }
 
 pub fn move_before<T: Clone + PartialEq>(order: &mut Vec<T>, moved: &T, target: &T) {
@@ -282,5 +300,35 @@ mod tests {
         state.set_focus_cursor(rows[2].clone(), &[rows[0].clone(), rows[2].clone()]);
         state.reconcile_focus_cursor(&[rows[0].clone()], None);
         assert_eq!(state.focus_cursor, Some(rows[0].clone()));
+    }
+
+    #[test]
+    fn cancellation_discards_all_unconfirmed_delegation_state() {
+        let mut state = SidebarUiState::new(DEFAULT_SIDEBAR_WIDTH);
+        state.delegation_mark = Some(SessionId::new("marked"));
+        state.drag = Some(DragItem::Session {
+            id: SessionId::new("source"),
+            project: ProjectId::new("project"),
+            parent: None,
+            archived: false,
+        });
+        state.pending_sibling = Some(SiblingProposal {
+            source_id: SessionId::new("source"),
+            source_title: "Source".to_owned(),
+            kind: diri_proto::AgentKind::CODEX,
+            project_id: ProjectId::new("project"),
+            cwd: "/repo".to_owned(),
+            prompt: "Keep going".to_owned(),
+            parent: None,
+            host: None,
+        });
+        state.delegation_notice = Some("proposal".to_owned());
+
+        state.cancel_delegation();
+
+        assert!(state.drag.is_none());
+        assert!(state.pending_sibling.is_none());
+        assert!(state.delegation_notice.is_none());
+        assert!(state.delegation_mark.is_none());
     }
 }

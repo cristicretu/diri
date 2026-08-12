@@ -1065,6 +1065,7 @@ mod tests {
             git_branch: None,
             title: "Refactor".into(),
             title_source: TitleSource::AgentProvided,
+            originating_prompt: None,
             agent_session_id: Some("uuid".into()),
             transcript_path: None,
             status: diri_proto::SessionStatus::Idle,

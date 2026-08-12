@@ -48,6 +48,7 @@ fn record(id: &str, host: Option<&str>, agent_session_id: Option<&str>) -> Sessi
         git_branch: None,
         title: "a remote conversation".into(),
         title_source: TitleSource::FirstPrompt,
+        originating_prompt: None,
         agent_session_id: agent_session_id.map(ToString::to_string),
         transcript_path: None,
         // What the old transport left behind: a record that still claims to be

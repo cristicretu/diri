@@ -17,6 +17,7 @@ use gpui::{
 use crate::AppServices;
 use crate::agent_catalog::{AgentOption, quick_agent_options, title_case_id};
 use crate::composer::PromptComposer;
+use crate::delegation::HandoffProposal;
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::CARET;
 use crate::notifications::SendTextCommand;
@@ -96,6 +97,9 @@ pub(crate) struct LauncherOverlay {
     target: LauncherTarget,
     new_session_draft: String,
     session_drafts: HashMap<SessionId, String>,
+    mode: LauncherMode,
+    /// The active destination draft survives a temporary handoff proposal.
+    saved_new_prompt: Option<String>,
     selected_harness: AgentKind,
     selected_root: String,
     selected_host: Option<String>,
@@ -125,6 +129,12 @@ enum LauncherTarget {
     Session(SessionId),
 }
 
+#[derive(Clone, Debug)]
+enum LauncherMode {
+    NewSession,
+    Handoff(HandoffProposal),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProjectCommit {
     Recent(usize),
@@ -144,7 +154,10 @@ impl LauncherOverlay {
                     Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         if this
                             .update(cx, |this, cx| {
-                                if this.open && matches!(this.target, LauncherTarget::NewSession) {
+                                if this.open
+                                    && matches!(this.target, LauncherTarget::NewSession)
+                                    && matches!(this.mode, LauncherMode::NewSession)
+                                {
                                     this.reconcile_harness();
                                 }
                                 cx.notify();
@@ -166,6 +179,8 @@ impl LauncherOverlay {
             target: LauncherTarget::NewSession,
             new_session_draft: String::new(),
             session_drafts: HashMap::new(),
+            mode: LauncherMode::NewSession,
+            saved_new_prompt: None,
             selected_harness,
             selected_root,
             selected_host,
@@ -184,6 +199,7 @@ impl LauncherOverlay {
     }
 
     pub(crate) fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.restore_new_prompt();
         self.switch_target(LauncherTarget::NewSession);
         self.drop_notice = None;
         // A half-written prompt survives Escape. This used to clear on every
@@ -224,6 +240,7 @@ impl LauncherOverlay {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.restore_new_prompt();
         self.switch_target(LauncherTarget::NewSession);
         self.selected_root = root;
         self.selected_host = None;
@@ -243,6 +260,7 @@ impl LauncherOverlay {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.restore_new_prompt();
         self.switch_target(LauncherTarget::Session(session_id.clone()));
         self.prompt.append_context(insertion);
         self.drop_notice = notice;
@@ -285,6 +303,26 @@ impl LauncherOverlay {
         self.picker = None;
     }
 
+    /// Opens an identity-targeted review surface. Merely opening it cannot
+    /// write to either session; the only send path is the labelled confirmation
+    /// control rendered by `render_handoff_panel`.
+    pub(crate) fn open_handoff(
+        &mut self,
+        proposal: HandoffProposal,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.restore_new_prompt();
+        self.saved_new_prompt = Some(self.prompt.text().to_owned());
+        self.prompt.clear();
+        self.prompt.insert_multiline(&proposal.summary);
+        self.mode = LauncherMode::Handoff(proposal);
+        self.picker = None;
+        self.open = true;
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
     pub(crate) fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus, cx);
     }
@@ -295,6 +333,7 @@ impl LauncherOverlay {
         }
         self.open = false;
         self.picker = None;
+        self.restore_new_prompt();
         cx.emit(LauncherEvent::Closed);
         cx.notify();
     }
@@ -302,6 +341,19 @@ impl LauncherOverlay {
     /// Close from outside the launcher (sidebar session click, menu bar, etc.).
     pub(crate) fn dismiss(&mut self, cx: &mut Context<Self>) {
         self.close(cx);
+    }
+
+    fn restore_new_prompt(&mut self) {
+        if !matches!(self.mode, LauncherMode::Handoff(_)) {
+            return;
+        }
+        self.prompt.clear();
+        if let Some(prompt) = self.saved_new_prompt.take()
+            && !prompt.is_empty()
+        {
+            self.prompt.insert_multiline(&prompt);
+        }
+        self.mode = LauncherMode::NewSession;
     }
 
     fn harness_choices(&self) -> Vec<AgentOption> {
@@ -424,6 +476,22 @@ impl LauncherOverlay {
     /// `None` means it can. The submit button used to just sit there dimmed
     /// with no explanation, which reads as "broken" rather than "not yet".
     fn blocker(&self) -> Option<String> {
+        if let LauncherMode::Handoff(proposal) = &self.mode {
+            let store = self
+                .services
+                .store
+                .store
+                .read()
+                .expect("session store lock poisoned");
+            let Some(target) = store.sessions().get(&proposal.target_id) else {
+                return Some("The target session is no longer available".to_owned());
+            };
+            if target.is_archived() || matches!(target.status, diri_proto::SessionStatus::Exited(_))
+            {
+                return Some("The target session has ended".to_owned());
+            }
+            return None;
+        }
         if let LauncherTarget::Session(id) = &self.target {
             let store = self
                 .services
@@ -486,6 +554,12 @@ impl LauncherOverlay {
     }
 
     fn submit(&mut self, cx: &mut Context<Self>) -> bool {
+        // Handoff sending is a separate, confirmation-gated path. Until that
+        // path handles this mode, never fall through to the new-session spawn
+        // action merely because the shared composer received Enter.
+        if matches!(self.mode, LauncherMode::Handoff(_)) {
+            return false;
+        }
         if !self.can_submit() {
             return false;
         }
