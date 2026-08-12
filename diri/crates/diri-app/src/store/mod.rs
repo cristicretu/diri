@@ -55,6 +55,11 @@ pub(crate) fn is_auxiliary_terminal(session: &SessionRecord) -> bool {
 // 20fps direct path.
 const UI_PUBLISH_INTERVAL: Duration = Duration::from_millis(50);
 
+// A stalled remote scan may be overlapped by exactly one forced rescan. Beyond
+// that, repeated Refresh clicks would queue daemon-side scans that each hold a
+// thread behind the same per-target single-flight lock.
+const MAX_AGENT_CATALOG_SCANS: u32 = 2;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StoreEventChange {
     None,
@@ -324,7 +329,10 @@ pub struct SessionStore {
     /// Empty until the first successful connect, and empty forever against a
     /// daemon too old to send descriptors — every reader must have a fallback.
     agents: HashMap<String, AgentReadinessResult>,
-    agent_catalog_loading: HashSet<String>,
+    /// Scans outstanding per target, counted rather than flagged: a forced
+    /// rescan is allowed to overlap a scan that has not answered, and the
+    /// spinner has to stay up until the last of them replies.
+    agent_catalog_scans: HashMap<String, u32>,
     agent_catalog_errors: HashMap<String, String>,
     /// Attention states serving out their settle window, newest arming wins.
     /// Drained by the settle task in `StoreHandle`, which is what turns one of
@@ -388,7 +396,7 @@ impl SessionStore {
                 prefs_path,
                 hosts: Vec::new(),
                 agents: HashMap::new(),
-                agent_catalog_loading: HashSet::new(),
+                agent_catalog_scans: HashMap::new(),
                 agent_catalog_errors: HashMap::new(),
                 attention_settle: HashMap::new(),
                 attention_wake: Arc::new(Notify::new()),
@@ -411,7 +419,6 @@ impl SessionStore {
     pub fn set_agent_catalog(&mut self, agents: AgentReadinessResult) {
         let local = agents.host.is_none();
         let key = agent_target_key(agents.host.as_deref());
-        self.agent_catalog_loading.remove(&key);
         self.agent_catalog_errors.remove(&key);
         self.agents.insert(key, agents);
         // Preserve Main's repair policy for the local preference. A remote
@@ -446,22 +453,46 @@ impl SessionStore {
         if !force && self.agent_catalog_errors.contains_key(&key) {
             return;
         }
-        if self.agent_catalog_loading.insert(key) {
-            self.emit(StoreEffect::RefreshAgents { host, force });
+        // An outstanding scan absorbs passive requests, but never the explicit
+        // rescan: a remote scan can outlive its usefulness (an unreachable
+        // host, a Helper install that outlasts the round trip), and Refresh is
+        // the only control the user has. Suppressing it there left the target
+        // spinning until the app was relaunched. One rescue attempt may
+        // overlap a stalled scan; further clicks wait for those two to answer.
+        let outstanding = self.agent_catalog_scans.get(&key).copied().unwrap_or(0);
+        if outstanding >= if force { MAX_AGENT_CATALOG_SCANS } else { 1 } {
+            return;
         }
+        self.agent_catalog_scans.insert(key, outstanding + 1);
+        self.emit(StoreEffect::RefreshAgents { host, force });
     }
 
     pub fn configure_agent(&mut self, params: diri_proto::AgentConfigureParams) {
         // Configuration is a user mutation, not a cache refresh: it must reach
         // the engine even while a scan for the same target is in flight, or a
         // toggle flipped during a slow remote scan silently reverts.
-        self.agent_catalog_loading
-            .insert(agent_target_key(params.host.as_deref()));
+        let key = agent_target_key(params.host.as_deref());
+        let outstanding = self.agent_catalog_scans.get(&key).copied().unwrap_or(0);
+        self.agent_catalog_scans.insert(key, outstanding + 1);
         self.emit(StoreEffect::ConfigureAgent(params));
     }
 
+    /// Retires one outstanding scan. The catalog stops reading as loading only
+    /// once every request for the target has answered, so an early reply from
+    /// a rescue rescan does not hide the one still running.
+    fn finish_agent_catalog_request(&mut self, key: &str) {
+        let Some(outstanding) = self.agent_catalog_scans.get_mut(key) else {
+            return;
+        };
+        *outstanding -= 1;
+        if *outstanding == 0 {
+            self.agent_catalog_scans.remove(key);
+        }
+    }
+
     pub fn agent_catalog_is_loading(&self, host: Option<&str>) -> bool {
-        self.agent_catalog_loading.contains(&agent_target_key(host))
+        self.agent_catalog_scans
+            .contains_key(&agent_target_key(host))
     }
 
     pub fn agent_catalog_error(&self, host: Option<&str>) -> Option<&str> {
@@ -2714,11 +2745,11 @@ async fn run_effects(
                         .await;
                     let mut locked = store.write().expect("session store lock poisoned");
                     let key = agent_target_key(host.as_deref());
-                    // Clear the requested key, not the one the response names:
+                    // Retire the requested key, not the one the response names:
                     // a daemon too old for per-host params echoes no host, and
                     // keying off the response would leave this target loading
                     // (and every further request suppressed) forever.
-                    locked.agent_catalog_loading.remove(&key);
+                    locked.finish_agent_catalog_request(&key);
                     match result {
                         Ok(catalog) => {
                             locked.agent_catalog_errors.remove(&key);
@@ -2742,7 +2773,7 @@ async fn run_effects(
                     let mut locked = store.write().expect("session store lock poisoned");
                     let key = agent_target_key(host.as_deref());
                     // Requested key, not response key — see RefreshAgents.
-                    locked.agent_catalog_loading.remove(&key);
+                    locked.finish_agent_catalog_request(&key);
                     match result {
                         Ok(catalog) => {
                             locked.agent_catalog_errors.remove(&key);

@@ -1339,8 +1339,8 @@ fn a_failed_scan_is_retried_only_by_an_explicit_rescan() {
         effects.try_recv(),
         Ok(StoreEffect::RefreshAgents { .. })
     ));
-    // The effect loop reports the failure: loading cleared, error recorded.
-    store.agent_catalog_loading.remove("forge");
+    // The effect loop reports the failure: the scan retires, error recorded.
+    store.finish_agent_catalog_request("forge");
     store
         .agent_catalog_errors
         .insert("forge".into(), "ssh: connect timed out".into());
@@ -1354,6 +1354,57 @@ fn a_failed_scan_is_retried_only_by_an_explicit_rescan() {
         effects.try_recv(),
         Ok(StoreEffect::RefreshAgents { force: true, .. })
     ));
+}
+
+#[test]
+fn refresh_reaches_the_engine_while_a_stalled_scan_is_still_outstanding() {
+    let (mut store, mut effects) = SessionStore::headless(Prefs::default());
+    store.request_agent_catalog(Some("forge".into()), false);
+    assert!(matches!(
+        effects.try_recv(),
+        Ok(StoreEffect::RefreshAgents { force: false, .. })
+    ));
+    // Nothing has answered. A passive re-ask on every paint must not pile up
+    // scans, but Refresh is the user's only escape from a wedged remote scan
+    // and has to reach the daemon.
+    store.request_agent_catalog(Some("forge".into()), false);
+    assert!(effects.try_recv().is_err());
+    store.request_agent_catalog(Some("forge".into()), true);
+    assert!(matches!(
+        effects.try_recv(),
+        Ok(StoreEffect::RefreshAgents { force: true, .. })
+    ));
+    // One rescue attempt is the cap: further clicks would queue daemon-side
+    // scans behind the same per-target lock.
+    store.request_agent_catalog(Some("forge".into()), true);
+    assert!(effects.try_recv().is_err());
+
+    // The rescue answers first. The target keeps reading as loading until the
+    // stalled scan retires too, and only then does a passive request resume.
+    store.finish_agent_catalog_request("forge");
+    assert!(store.agent_catalog_is_loading(Some("forge")));
+    store.finish_agent_catalog_request("forge");
+    assert!(!store.agent_catalog_is_loading(Some("forge")));
+    store.request_agent_catalog(Some("forge".into()), false);
+    assert!(matches!(
+        effects.try_recv(),
+        Ok(StoreEffect::RefreshAgents { .. })
+    ));
+}
+
+#[test]
+fn an_installed_catalog_leaves_an_outstanding_scan_running() {
+    let (mut store, _effects) = SessionStore::headless(Prefs::default());
+    store.request_agent_catalog(Some("forge".into()), false);
+    store.request_agent_catalog(Some("forge".into()), true);
+    // A catalog arriving out of band (the reply to the rescue, a connect-time
+    // install) is not a reply to every request: retiring the target here would
+    // drop the spinner while a scan is still on the wire.
+    store.set_agent_catalog(AgentReadinessResult {
+        host: Some("forge".into()),
+        ..AgentReadinessResult::default()
+    });
+    assert!(store.agent_catalog_is_loading(Some("forge")));
 }
 
 #[test]

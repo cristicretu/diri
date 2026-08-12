@@ -24,6 +24,14 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(8);
 const EVENT_CHANNEL_CAPACITY: usize = 4096;
+// A local catalog scan is filesystem metadata over the manifest list; nothing
+// in it blocks. A remote one crosses ssh and may bootstrap the Helper before it
+// can answer, which the Engine bounds far more generously than a user will wait
+// staring at a spinner. Timing out does not waste the scan: the Engine finishes
+// it and caches the result, so the retry this failure re-enables is usually
+// instant.
+const AGENT_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
+const REMOTE_AGENT_CATALOG_TIMEOUT: Duration = Duration::from_secs(240);
 
 /// Errors surfaced by daemon requests and the reconnecting transport.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -657,18 +665,30 @@ impl DaemonClient {
         self.empty(Method::GOVERNOR_CONFIGURE, &params).await
     }
 
+    /// `agent.readiness`: PATH metadata locally, but a remote target crosses
+    /// ssh and may install the Helper first, so the two carry very different
+    /// bounds. Both are explicit: the settings page shows a spinner for the
+    /// whole call, and an unbounded one has no way back to the user.
     pub async fn agent_readiness(
         &self,
         params: diri_proto::AgentReadinessParams,
     ) -> Result<AgentReadinessResult, ClientError> {
-        self.typed(Method::AGENT_READINESS, &params).await
+        let timeout = agent_catalog_timeout(params.host.is_some());
+        self.core
+            .request_typed(Method::AGENT_READINESS, Some(&params), Some(timeout))
+            .await
     }
 
+    /// `agent.configure`: writes the preference, then answers with the same
+    /// catalog `agent.readiness` builds — and can therefore scan.
     pub async fn configure_agent(
         &self,
         params: diri_proto::AgentConfigureParams,
     ) -> Result<diri_proto::AgentConfigureResult, ClientError> {
-        self.typed(Method::AGENT_CONFIGURE, &params).await
+        let timeout = agent_catalog_timeout(params.host.is_some());
+        self.core
+            .request_typed(Method::AGENT_CONFIGURE, Some(&params), Some(timeout))
+            .await
     }
 
     pub async fn hibernate(&self, session_id: &SessionId) -> Result<(), ClientError> {
@@ -819,6 +839,14 @@ impl Drop for DaemonClient {
 impl ConnectionState {
     fn is_connected(&self) -> bool {
         matches!(self, Self::Connected(_))
+    }
+}
+
+const fn agent_catalog_timeout(remote: bool) -> Duration {
+    if remote {
+        REMOTE_AGENT_CATALOG_TIMEOUT
+    } else {
+        AGENT_CATALOG_TIMEOUT
     }
 }
 
