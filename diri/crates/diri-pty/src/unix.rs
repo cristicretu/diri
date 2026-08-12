@@ -34,12 +34,27 @@ impl Pty {
             ));
         }
 
+        #[cfg(target_os = "linux")]
+        let winsize = libc::winsize {
+            ws_row: spec.rows,
+            ws_col: spec.cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // Apple's libc declares `openpty` with a mutable winsize pointer even
+        // though the structure is an input. Keep that ABI detail at this seam;
+        // Linux correctly accepts a shared pointer and clippy enforces it.
+        #[cfg(not(target_os = "linux"))]
         let mut winsize = libc::winsize {
             ws_row: spec.rows,
             ws_col: spec.cols,
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
+        #[cfg(target_os = "linux")]
+        let winsize_ptr = &winsize;
+        #[cfg(not(target_os = "linux"))]
+        let winsize_ptr = &mut winsize;
         let mut master: RawFd = -1;
         let mut slave: RawFd = -1;
         // SAFETY: both output pointers refer to initialized local storage and
@@ -51,7 +66,7 @@ impl Pty {
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut winsize,
+                winsize_ptr,
             )
         };
         if result != 0 {
