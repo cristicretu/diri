@@ -51,8 +51,10 @@ to include the viewport's scrolling phase.
 | Local input-to-grid median, including scroll | 75 µs | 64 µs | 15% faster |
 
 The Metal sample recorded one invalidation per frame and zero 120 Hz frame-
-budget overruns. The renderer benchmark also rejects an average CPU frame cost
-at or above 8 ms. The terminal-state benchmark has absolute budgets for typing,
+budget overruns. The renderer benchmark rejects a steady-state average CPU
+frame cost at or above 8 ms; Criterion's tiny cold-start calibration batches
+are excluded until at least 32 frames have been observed. The terminal-state
+benchmark has absolute budgets for typing,
 scrolling, and cursor traffic, while the Holder and attach tests enforce their
 release latency ceilings.
 
