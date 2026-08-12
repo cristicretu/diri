@@ -1843,8 +1843,8 @@ impl UtilitySurfaces {
         }
         if !unsupported {
             rows = rows.child(setting_divider(colors)).child(toggle_row(
-                "Check automatically",
-                "Look for new releases in the background.",
+                "Update automatically",
+                "Download verified GitHub releases and install when diri quits.",
                 self.prefs.automatic_updates,
                 "toggle-automatic-updates",
                 colors,

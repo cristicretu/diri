@@ -38,6 +38,7 @@ diri-usage.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 image.workspace = true
+libc = "0.2"
 nucleo-matcher.workspace = true
 notify.workspace = true
 serde.workspace = true

@@ -5,15 +5,17 @@
 //! UI never calls the updater directly — it sends [`UpdateCommand`]s, so a
 //! click cannot block a frame and two clicks cannot start two downloads.
 //!
-//! Update *checks* are automatic; downloading and installing are not. A
-//! background check only lights the pill in the sidebar footer, matching the
-//! "gentle reminders" behavior the Swift app gets from Sparkle: nothing steals
-//! focus or restarts the app mid-session without being asked.
+//! Automatic updates check, download, and verify in the background. Installing
+//! waits for the user to quit or request a restart, so an update never steals
+//! focus or interrupts a live session.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use diri_updater::{Release, StagedUpdate, UpdateError, Updater, UpdaterConfig};
+use diri_updater::{
+    Release, Result as UpdateResult, StagedUpdate, UpdateError, Updater, UpdaterConfig,
+};
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, watch};
 
@@ -23,6 +25,48 @@ const FIRST_CHECK_DELAY: Duration = Duration::from_secs(20);
 const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Small seam around the blocking updater so the service policy can be tested
+/// without a network request or a signed app bundle.
+trait UpdateBackend: Send + Sync {
+    fn clean_cache(&self);
+    fn check(&self, skipped: Option<&str>) -> UpdateResult<Option<Release>>;
+    fn download_and_stage(
+        &self,
+        release: &Release,
+        on_progress: &mut dyn FnMut(f32),
+    ) -> UpdateResult<StagedUpdate>;
+    fn install(&self, staged: &StagedUpdate, relaunch: bool) -> UpdateResult<()>;
+}
+
+impl UpdateBackend for Updater {
+    fn clean_cache(&self) {
+        Updater::clean_cache(self);
+    }
+
+    fn check(&self, skipped: Option<&str>) -> UpdateResult<Option<Release>> {
+        Updater::check(self, skipped)
+    }
+
+    fn download_and_stage(
+        &self,
+        release: &Release,
+        on_progress: &mut dyn FnMut(f32),
+    ) -> UpdateResult<StagedUpdate> {
+        let archive = Updater::download(self, release, on_progress)?;
+        Updater::stage(self, release, &archive)
+    }
+
+    fn install(&self, staged: &StagedUpdate, relaunch: bool) -> UpdateResult<()> {
+        Updater::install(self, staged, relaunch)
+    }
+}
+
+#[derive(Clone)]
+struct ReadyInstall {
+    updater: Arc<dyn UpdateBackend>,
+    staged: StagedUpdate,
+}
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum UpdatePhase {
@@ -50,8 +94,8 @@ pub struct UpdateState {
     pub phase: UpdatePhase,
     pub current_version: String,
     pub last_checked_unix: Option<u64>,
-    /// True when the user asked for the running check, which is the only case
-    /// where "You're up to date" is worth showing.
+    /// True when this work should surface transient progress or failure. A
+    /// background check stays quiet until it finds a release to download.
     pub user_initiated: bool,
 }
 
@@ -118,6 +162,8 @@ pub enum UpdateCommand {
 pub struct UpdateHandle {
     state: watch::Receiver<UpdateState>,
     commands: mpsc::UnboundedSender<UpdateCommand>,
+    ready_install: Arc<Mutex<Option<ReadyInstall>>>,
+    automatic: Arc<AtomicBool>,
     // Preview mode keeps the watch open without spawning the updater service.
     _inert_state: Option<watch::Sender<UpdateState>>,
 }
@@ -132,6 +178,9 @@ impl UpdateHandle {
     }
 
     pub fn send(&self, command: UpdateCommand) {
+        if let UpdateCommand::SetAutomatic(enabled) = &command {
+            self.automatic.store(*enabled, Ordering::SeqCst);
+        }
         // A closed channel means the service task is gone; the UI has nothing
         // useful to do about that, and the state stream stops updating anyway.
         let _ = self.commands.send(command);
@@ -139,6 +188,23 @@ impl UpdateHandle {
 
     pub fn check(&self, user_initiated: bool) {
         self.send(UpdateCommand::Check { user_initiated });
+    }
+
+    /// Launches the non-reopening swap helper when an automatic update is
+    /// staged. This path is synchronous and bounded so quitting never waits
+    /// behind an in-progress network download on the service task.
+    pub fn install_on_quit(&self) {
+        if !self.automatic.load(Ordering::SeqCst) {
+            return;
+        }
+        let ready = self.ready_install.lock().expect("ready update").take();
+        let Some(ready) = ready else {
+            return;
+        };
+        if let Err(error) = ready.updater.install(&ready.staged, false) {
+            eprintln!("diri updater: {error}");
+            *self.ready_install.lock().expect("ready update") = Some(ready);
+        }
     }
 }
 
@@ -153,23 +219,35 @@ pub fn spawn(runtime: &Arc<Runtime>, automatic: bool, skipped: Option<String>) -
     };
     let (state_tx, state_rx) = watch::channel(initial.clone());
     let (command_tx, command_rx) = mpsc::unbounded_channel();
+    let ready_install = Arc::new(Mutex::new(None));
+    let automatic_flag = Arc::new(AtomicBool::new(automatic));
 
-    let updater = match UpdaterConfig::for_running_app(CURRENT_VERSION) {
-        Ok(config) => Some(Arc::new(Updater::new(config))),
-        Err(error) => {
-            state_tx.send_replace(UpdateState {
-                phase: UpdatePhase::Unsupported(error.to_string()),
-                ..initial
-            });
-            None
-        }
-    };
+    let updater: Option<Arc<dyn UpdateBackend>> =
+        match UpdaterConfig::for_running_app(CURRENT_VERSION) {
+            Ok(config) => Some(Arc::new(Updater::new(config))),
+            Err(error) => {
+                state_tx.send_replace(UpdateState {
+                    phase: UpdatePhase::Unsupported(error.to_string()),
+                    ..initial
+                });
+                None
+            }
+        };
 
     let _guard = runtime.enter();
-    tokio::spawn(service(updater, automatic, skipped, state_tx, command_rx));
+    tokio::spawn(service(
+        updater,
+        automatic,
+        skipped,
+        state_tx,
+        command_rx,
+        Arc::clone(&ready_install),
+    ));
     UpdateHandle {
         state: state_rx,
         commands: command_tx,
+        ready_install,
+        automatic: automatic_flag,
         _inert_state: None,
     }
 }
@@ -186,12 +264,14 @@ pub fn inert() -> UpdateHandle {
     UpdateHandle {
         state: state_rx,
         commands: command_tx,
+        ready_install: Arc::new(Mutex::new(None)),
+        automatic: Arc::new(AtomicBool::new(false)),
         _inert_state: Some(state_tx),
     }
 }
 
 struct Service {
-    updater: Arc<Updater>,
+    updater: Arc<dyn UpdateBackend>,
     state: watch::Sender<UpdateState>,
     automatic: bool,
     /// Set once a check finds something, cleared when it is superseded.
@@ -199,14 +279,16 @@ struct Service {
     staged: Option<StagedUpdate>,
     skipped: Option<String>,
     busy: bool,
+    ready_install: Arc<Mutex<Option<ReadyInstall>>>,
 }
 
 async fn service(
-    updater: Option<Arc<Updater>>,
+    updater: Option<Arc<dyn UpdateBackend>>,
     automatic: bool,
     skipped: Option<String>,
     state: watch::Sender<UpdateState>,
     mut commands: mpsc::UnboundedReceiver<UpdateCommand>,
+    ready_install: Arc<Mutex<Option<ReadyInstall>>>,
 ) {
     let Some(updater) = updater else {
         // Nothing to drive, but keep draining commands so a click in Settings
@@ -228,6 +310,7 @@ async fn service(
         // Persisted in Prefs, so a skip outlives the session that made it.
         skipped: skipped.filter(|version| !version.is_empty()),
         busy: false,
+        ready_install,
     };
 
     let mut ticker = tokio::time::interval_at(
@@ -255,13 +338,14 @@ impl Service {
     async fn handle(&mut self, command: UpdateCommand) {
         match command {
             UpdateCommand::Check { user_initiated } => self.check(user_initiated).await,
-            UpdateCommand::Download => self.download().await,
-            UpdateCommand::Install => self.install(),
+            UpdateCommand::Download => self.download(true).await,
+            UpdateCommand::Install => self.install(true),
             UpdateCommand::Skip => {
                 if let Some(release) = self.pending.take() {
                     self.skipped = Some(release.version);
                 }
                 self.staged = None;
+                self.ready_install.lock().expect("ready update").take();
                 self.publish(UpdatePhase::Idle, false);
             }
             UpdateCommand::Dismiss => {
@@ -275,7 +359,12 @@ impl Service {
                 };
                 self.publish(phase, false);
             }
-            UpdateCommand::SetAutomatic(enabled) => self.automatic = enabled,
+            UpdateCommand::SetAutomatic(enabled) => {
+                self.automatic = enabled;
+                if enabled && self.pending.is_some() && self.staged.is_none() {
+                    self.download(true).await;
+                }
+            }
         }
     }
 
@@ -303,6 +392,11 @@ impl Service {
             Ok(Ok(Some(release))) => {
                 self.pending = Some(release.clone());
                 self.publish(UpdatePhase::Available(release), user_initiated);
+                if self.automatic {
+                    // Once a release is found, progress and failures are worth
+                    // surfacing even though the check itself was background.
+                    self.download(true).await;
+                }
             }
             Ok(Ok(None)) => {
                 self.pending = None;
@@ -316,7 +410,7 @@ impl Service {
         }
     }
 
-    async fn download(&mut self) {
+    async fn download(&mut self, user_initiated: bool) {
         let Some(release) = self.pending.clone() else {
             return;
         };
@@ -329,7 +423,7 @@ impl Service {
                 release: release.clone(),
                 progress: 0.0,
             },
-            true,
+            user_initiated,
         );
 
         // Progress arrives on the blocking thread; funnel it through a channel
@@ -338,10 +432,10 @@ impl Service {
         let updater = Arc::clone(&self.updater);
         let downloading = release.clone();
         let worker = tokio::task::spawn_blocking(move || {
-            let archive = updater.download(&downloading, |fraction| {
+            let mut on_progress = |fraction| {
                 let _ = progress_tx.send(fraction);
-            })?;
-            updater.stage(&downloading, &archive)
+            };
+            updater.download_and_stage(&downloading, &mut on_progress)
         });
         tokio::pin!(worker);
 
@@ -350,7 +444,7 @@ impl Service {
                 Some(fraction) = progress_rx.recv() => {
                     self.publish(
                         UpdatePhase::Downloading { release: release.clone(), progress: fraction },
-                        true,
+                        user_initiated,
                     );
                 }
                 result = &mut worker => break result,
@@ -360,26 +454,39 @@ impl Service {
 
         match staged {
             Ok(Ok(staged)) => {
+                *self.ready_install.lock().expect("ready update") = Some(ReadyInstall {
+                    updater: Arc::clone(&self.updater),
+                    staged: staged.clone(),
+                });
                 self.staged = Some(staged);
-                self.publish(UpdatePhase::Ready(release), true);
+                self.publish(UpdatePhase::Ready(release), user_initiated);
             }
-            Ok(Err(error)) => self.fail(&error, true),
+            Ok(Err(error)) => self.fail(&error, user_initiated),
             Err(_) => self.publish(
                 UpdatePhase::Failed("The download stopped unexpectedly".to_owned()),
-                true,
+                user_initiated,
             ),
         }
     }
 
-    fn install(&mut self) {
-        let Some(staged) = &self.staged else {
+    fn install(&mut self, relaunch: bool) {
+        let ready = self.ready_install.lock().expect("ready update").take();
+        let Some(ready) = ready else {
             return;
         };
-        match self.updater.install(staged) {
+        match ready.updater.install(&ready.staged, relaunch) {
             // RootView watches for Installing and quits; the helper is already
             // waiting for this process to go away.
-            Ok(()) => self.publish(UpdatePhase::Installing, true),
-            Err(error) => self.fail(&error, true),
+            Ok(()) => {
+                // Taking the staged update makes the app-quit hook idempotent
+                // after an explicit "Restart to update" click.
+                self.staged = None;
+                self.publish(UpdatePhase::Installing, true);
+            }
+            Err(error) => {
+                *self.ready_install.lock().expect("ready update") = Some(ready);
+                self.fail(&error, true);
+            }
         }
     }
 
@@ -413,6 +520,41 @@ impl Service {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicUsize;
+
+    struct FakeUpdater {
+        offered: Release,
+        downloads: AtomicUsize,
+        installs: Mutex<Vec<bool>>,
+    }
+
+    impl UpdateBackend for FakeUpdater {
+        fn clean_cache(&self) {}
+
+        fn check(&self, _skipped: Option<&str>) -> UpdateResult<Option<Release>> {
+            Ok(Some(self.offered.clone()))
+        }
+
+        fn download_and_stage(
+            &self,
+            release: &Release,
+            on_progress: &mut dyn FnMut(f32),
+        ) -> UpdateResult<StagedUpdate> {
+            self.downloads.fetch_add(1, Ordering::SeqCst);
+            on_progress(1.0);
+            Ok(StagedUpdate {
+                release: release.clone(),
+                app: PathBuf::from("/tmp/fake-staged/diri.app"),
+                directory: PathBuf::from("/tmp/fake-staged"),
+            })
+        }
+
+        fn install(&self, _staged: &StagedUpdate, relaunch: bool) -> UpdateResult<()> {
+            self.installs.lock().expect("installs").push(relaunch);
+            Ok(())
+        }
+    }
 
     fn release(version: &str) -> Release {
         Release {
@@ -478,6 +620,191 @@ mod tests {
             state(UpdatePhase::Ready(release("0.5.0")), true).summary(),
             "Restart to update to 0.5.0"
         );
+    }
+
+    #[test]
+    fn an_automatic_check_downloads_and_stages_the_release() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async {
+            let updater = Arc::new(FakeUpdater {
+                offered: release("0.5.0"),
+                downloads: AtomicUsize::new(0),
+                installs: Mutex::new(Vec::new()),
+            });
+            let backend: Arc<dyn UpdateBackend> = updater.clone();
+            let (state_tx, mut state_rx) = watch::channel(UpdateState::default());
+            let (command_tx, command_rx) = mpsc::unbounded_channel();
+            let ready_install = Arc::new(Mutex::new(None));
+            let task = tokio::spawn(service(
+                Some(backend),
+                true,
+                None,
+                state_tx,
+                command_rx,
+                ready_install,
+            ));
+
+            command_tx
+                .send(UpdateCommand::Check {
+                    user_initiated: false,
+                })
+                .expect("send background check");
+            let ready = tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if matches!(state_rx.borrow().phase, UpdatePhase::Ready(_)) {
+                        return;
+                    }
+                    state_rx.changed().await.expect("service remains alive");
+                }
+            })
+            .await;
+
+            drop(command_tx);
+            task.abort();
+            assert!(
+                ready.is_ok(),
+                "automatic updates must be staged in the background"
+            );
+            assert_eq!(updater.downloads.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn disabling_automatic_updates_keeps_download_manual() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async {
+            let updater = Arc::new(FakeUpdater {
+                offered: release("0.5.0"),
+                downloads: AtomicUsize::new(0),
+                installs: Mutex::new(Vec::new()),
+            });
+            let backend: Arc<dyn UpdateBackend> = updater.clone();
+            let (state_tx, mut state_rx) = watch::channel(UpdateState::default());
+            let (command_tx, command_rx) = mpsc::unbounded_channel();
+            let task = tokio::spawn(service(
+                Some(backend),
+                false,
+                None,
+                state_tx,
+                command_rx,
+                Arc::new(Mutex::new(None)),
+            ));
+
+            command_tx
+                .send(UpdateCommand::Check {
+                    user_initiated: true,
+                })
+                .expect("send manual check");
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if matches!(state_rx.borrow().phase, UpdatePhase::Available(_)) {
+                        return;
+                    }
+                    state_rx.changed().await.expect("service remains alive");
+                }
+            })
+            .await
+            .expect("manual release offer");
+
+            drop(command_tx);
+            task.abort();
+            assert_eq!(updater.downloads.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn disabling_automatic_updates_does_not_install_a_staged_release_on_quit() {
+        let updater = Arc::new(FakeUpdater {
+            offered: release("0.5.0"),
+            downloads: AtomicUsize::new(0),
+            installs: Mutex::new(Vec::new()),
+        });
+        let backend: Arc<dyn UpdateBackend> = updater.clone();
+        let ready_install = Arc::new(Mutex::new(Some(ReadyInstall {
+            updater: backend,
+            staged: StagedUpdate {
+                release: release("0.5.0"),
+                app: PathBuf::from("/tmp/fake-staged/diri.app"),
+                directory: PathBuf::from("/tmp/fake-staged"),
+            },
+        })));
+        let (_state_tx, state) = watch::channel(UpdateState::default());
+        let (commands, _command_rx) = mpsc::unbounded_channel();
+        let handle = UpdateHandle {
+            state,
+            commands,
+            ready_install: Arc::clone(&ready_install),
+            automatic: Arc::new(AtomicBool::new(false)),
+            _inert_state: None,
+        };
+
+        handle.install_on_quit();
+        assert!(updater.installs.lock().expect("installs").is_empty());
+        assert!(
+            ready_install.lock().expect("ready update").is_some(),
+            "the verified release stays available for a manual restart"
+        );
+    }
+
+    #[test]
+    fn a_staged_automatic_update_is_installed_without_relaunch_on_normal_quit() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async {
+            let updater = Arc::new(FakeUpdater {
+                offered: release("0.5.0"),
+                downloads: AtomicUsize::new(0),
+                installs: Mutex::new(Vec::new()),
+            });
+            let backend: Arc<dyn UpdateBackend> = updater.clone();
+            let (state_tx, state_rx) = watch::channel(UpdateState::default());
+            let (command_tx, command_rx) = mpsc::unbounded_channel();
+            let ready_install = Arc::new(Mutex::new(None));
+            let handle = UpdateHandle {
+                state: state_rx,
+                commands: command_tx,
+                ready_install: Arc::clone(&ready_install),
+                automatic: Arc::new(AtomicBool::new(true)),
+                _inert_state: None,
+            };
+            let task = tokio::spawn(service(
+                Some(backend),
+                true,
+                None,
+                state_tx,
+                command_rx,
+                ready_install,
+            ));
+
+            handle.check(false);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                let mut states = handle.subscribe();
+                loop {
+                    if matches!(states.borrow().phase, UpdatePhase::Ready(_)) {
+                        return;
+                    }
+                    states.changed().await.expect("service remains alive");
+                }
+            })
+            .await
+            .expect("automatic update reaches ready");
+
+            handle.install_on_quit();
+            task.abort();
+            assert_eq!(
+                *updater.installs.lock().expect("installs"),
+                vec![false],
+                "a normal quit must swap the staged app without reopening it"
+            );
+        });
     }
 
     #[test]

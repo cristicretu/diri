@@ -1378,6 +1378,7 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "image",
+ "libc",
  "notify",
  "nucleo-matcher",
  "objc2 0.6.4",

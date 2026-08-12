@@ -324,10 +324,12 @@ fn main() {
         bind_terminal_keys(cx);
         install_app_menus(cx);
         let quit_store = Arc::clone(&services.store);
+        let quit_updates = services.updates.clone();
         let release_owned_daemon =
             !preview && std::env::var_os(diri_proto::paths::ENV_SOCKET).is_none();
         cx.on_app_quit(move |_| {
             let quit_store = Arc::clone(&quit_store);
+            let quit_updates = quit_updates.clone();
             async move {
                 if let Err(error) = quit_store
                     .store
@@ -337,6 +339,10 @@ fn main() {
                 {
                     eprintln!("diri: could not flush preferences while quitting: {error}");
                 }
+                // Automatic updates are already downloaded and verified. Start
+                // the detached swap helper now; it waits for this process to
+                // exit and deliberately does not reopen an app the user quit.
+                quit_updates.install_on_quit();
                 if release_owned_daemon
                     && let Err(error) = quit_store.client().shutdown_daemon_if_idle().await
                 {

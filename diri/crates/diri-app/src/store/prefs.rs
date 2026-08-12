@@ -82,8 +82,8 @@ pub struct Prefs {
     pub start_at_login: bool,
     pub confirm_before_closing_session: bool,
     pub status_sounds: bool,
-    /// Check the releases feed in the background. Downloading and installing
-    /// always stay manual — see `crate::updates`.
+    /// Check, download, and verify releases in the background. A staged update
+    /// installs on quit or when the user requests a restart.
     pub automatic_updates: bool,
     /// A release the user chose not to install. Persisted so "Skip" outlives
     /// the session that clicked it; empty means nothing is skipped.

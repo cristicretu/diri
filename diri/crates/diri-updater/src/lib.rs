@@ -178,9 +178,14 @@ impl Updater {
 
     /// Starts the swap helper. The caller must quit the app immediately after
     /// this returns.
-    pub fn install(&self, staged: &StagedUpdate) -> Result<()> {
+    pub fn install(&self, staged: &StagedUpdate, relaunch: bool) -> Result<()> {
         bundle::ensure_writable(&self.config.bundle)?;
-        install::launch_installer(&staged.app, &self.config.bundle, &staged.directory)
+        install::launch_installer(
+            &staged.app,
+            &self.config.bundle,
+            &staged.directory,
+            relaunch,
+        )
     }
 
     /// Removes staging directories left behind by earlier updates. Cheap, and
@@ -335,6 +340,22 @@ mod tests {
             .expect("the download passes signature, Gatekeeper, and version checks");
         assert_eq!(staged.app.file_name().expect("a bundle"), "diri.app");
         assert_eq!(staged.release.version, release.version);
+        for executable in ["dirijord-rs", "diri-holder"] {
+            let path = staged.app.join("Contents/Resources/bin").join(executable);
+            let metadata = std::fs::metadata(&path).unwrap_or_else(|error| {
+                panic!("published bundle is missing {}: {error}", path.display())
+            });
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_ne!(
+                    metadata.permissions().mode() & 0o111,
+                    0,
+                    "published helper is not executable: {}",
+                    path.display()
+                );
+            }
+        }
     }
 
     #[test]
