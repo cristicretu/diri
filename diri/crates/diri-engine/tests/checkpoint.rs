@@ -210,30 +210,38 @@ fn adoption_seeds_from_the_checkpoint_not_the_raw_tail() {
     let holder = holder_config(&root);
     let state_file = root.join("state.json");
 
-    // Life #1: a held cat says something, then the daemon "crashes".
+    // Life #1: a held child writes one complete line, then stays alive while
+    // the daemon "crashes". Avoid `cat` here: PTY echo and cat's own write
+    // are two separate log appends, so observing the first is not quiescence.
     {
         let mut registry = Registry::new(engine(), &state_file);
         registry
             .spawn(
-                shell_spec("s_ad", "cat", &logs, Some(holder.clone())),
+                shell_spec(
+                    "s_ad",
+                    "printf 'hello-from-the-log\\n'; exec sleep 30",
+                    &logs,
+                    Some(holder.clone()),
+                ),
                 record("s_ad"),
             )
             .expect("spawn");
-        registry
-            .get("s_ad")
-            .expect("session")
-            .write_input(b"hello-from-the-log\n")
-            .expect("write");
-        wait_until("the echo to land", Duration::from_secs(5), || {
-            log_tail(&logs, "s_ad") > 0
+        wait_until("the complete line to paint", Duration::from_secs(5), || {
+            registry
+                .get("s_ad")
+                .expect("session")
+                .screen_lines()
+                .join("\n")
+                .contains("hello-from-the-log")
         });
         registry.persist().expect("persist");
     }
 
     // Between lives: plant a checkpoint at the exact tail whose content the
     // log has never seen.
+    let planted_offset = log_tail(&logs, "s_ad");
     ScreenCheckpoint {
-        log_offset: log_tail(&logs, "s_ad"),
+        log_offset: planted_offset,
         history: Vec::new(),
         grid: synthetic_grid("PAINTED-FROM-CHECKPOINT"),
         marker_buffer: Vec::new(),
@@ -261,9 +269,14 @@ fn adoption_seeds_from_the_checkpoint_not_the_raw_tail() {
         .expect("adopted")
         .screen_lines()
         .join("\n");
+    let final_tail = log_tail(&logs, "s_ad");
+    assert_eq!(
+        final_tail, planted_offset,
+        "the read-side fixture must stay quiet after planting its checkpoint"
+    );
     assert!(
         !screen.contains("hello-from-the-log"),
-        "replay from the checkpoint offset must not re-feed old bytes: {screen:?}"
+        "replay from checkpoint offset {planted_offset} at final tail {final_tail} must not re-feed old bytes: {screen:?}"
     );
 
     registry
