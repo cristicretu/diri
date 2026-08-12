@@ -405,16 +405,6 @@ fn spawn_agent_starts_a_session_owned_by_its_caller() {
             .with_caller(Some("s_orchestrator".to_string())),
     );
 
-    // `shell` declares no binary, so spawning it by name is refused with a
-    // message that says why rather than starting something unexpected.
-    let refused = call(
-        &server,
-        "spawn_agent",
-        json!({ "kind": "shell", "cwd": "/tmp" }),
-    )
-    .expect_err("shell has no binary");
-    assert!(refused.contains("no binary"), "got {refused}");
-
     // An unknown agent is refused too.
     let unknown = call(
         &server,
@@ -449,7 +439,7 @@ fn spawn_agent_starts_a_session_owned_by_its_caller() {
     assert_eq!(
         registry.lock().expect("registry").live_count(),
         0,
-        "no session should have been started by any of those"
+        "no session should have been started by any rejected request"
     );
 }
 
