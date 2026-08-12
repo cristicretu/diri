@@ -10,7 +10,8 @@ use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use diri_proto::{AgentKind, DateMillis, HistoryEntry, SessionSpawnParams};
+use diri_client::{ClientError, DaemonClient};
+use diri_proto::{AgentKind, DateMillis, HistoryEntry};
 use serde_json::Value;
 
 const MAX_ENTRIES: usize = 500;
@@ -18,6 +19,7 @@ const CLAUDE_HEAD_CAP: usize = 8 << 20;
 const CLAUDE_TAIL_BYTES: usize = 16 << 10;
 const CODEX_FIRST_LINE_CAP: usize = 512 << 10;
 const CODEX_FIRST_PROMPT_CAP: usize = 8 << 20;
+const RESUME_PROMPT: &str = "This historical conversation has just been resumed. Briefly state the recovered state, inspect the current workspace, and continue the unfinished task without replaying completed work.";
 
 #[derive(Clone, Debug)]
 pub struct HistoryRoots {
@@ -60,45 +62,31 @@ pub fn scan(roots: &HistoryRoots, tracked: &HashSet<String>) -> Vec<HistoryEntry
     entries
 }
 
-/// Build the daemon request used to resume a durable conversation without
-/// requiring `session.resume_from_history`. A generic spawn launches the
-/// agent's native resume command, then the daemon injects a short continuation
-/// prompt once the resumed TUI is ready. No transcript contents are copied.
-pub fn resume_spawn(entry: &HistoryEntry) -> Option<SessionSpawnParams> {
+/// Resume a durable conversation through the first-class Engine path. The
+/// typed request preserves the Agent kind, conversation id, and transcript
+/// path on the new record so another machine or Engine restart can resume it
+/// again instead of degrading it into a one-shot generic shell command.
+pub async fn resume(
+    client: &DaemonClient,
+    entry: &HistoryEntry,
+) -> Result<diri_proto::SessionId, ClientError> {
     if !entry.cwd_exists || !Path::new(&entry.cwd).is_dir() {
-        return None;
+        return Err(ClientError::Control(diri_proto::ControlError::bad_request(
+            "the conversation folder is no longer available",
+        )));
     }
-    if !entry
-        .id
-        .chars()
-        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
-    {
-        return None;
+    if !matches!(
+        entry.kind.id(),
+        AgentKind::CLAUDE_CODE_ID | AgentKind::CODEX_ID
+    ) {
+        return Err(ClientError::Control(diri_proto::ControlError::bad_request(
+            "the conversation's agent cannot resume",
+        )));
     }
-    // Only the two agents whose transcripts the history scanner can read; the
-    // resume command line is theirs, not the manifest's, because a history
-    // entry is a conversation on disk rather than a live session record.
-    let command = match entry.kind.id() {
-        AgentKind::CLAUDE_CODE_ID => format!("claude --resume {}", entry.id),
-        AgentKind::CODEX_ID => format!("codex resume {}", entry.id),
-        _ => return None,
-    };
-    Some(SessionSpawnParams {
-        kind: AgentKind::generic(command),
-        cwd: entry.cwd.clone(),
-        new_worktree: None,
-        worktree_branch: None,
-        title: entry.title.clone(),
-        initial_prompt: Some(
-            "This historical conversation has just been resumed. Briefly state the recovered state, inspect the current workspace, and continue the unfinished task without replaying completed work."
-                .to_owned(),
-        ),
-        parent: None,
-        initial_cols: None,
-        initial_rows: None,
-        host: None,
-        same_repo_as: None,
-    })
+    client
+        .resume_from_history_with_prompt(entry.clone(), Some(RESUME_PROMPT.to_owned()))
+        .await
+        .map(|record| record.id)
 }
 
 pub fn matches_query(entry: &HistoryEntry, query: &str) -> bool {
@@ -381,9 +369,13 @@ fn folder_name(path: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Write as _;
+    use std::os::unix::net::UnixListener;
+    use std::sync::mpsc;
     use std::time::Duration;
 
     use diri_client::DaemonClient;
+    use diri_proto::{ControlMessage, HelloResult, Method, RUST_ENGINE_KIND, WIRE_VERSION};
     use tempfile::TempDir;
 
     use super::*;
@@ -447,29 +439,93 @@ mod tests {
         );
     }
 
-    #[test]
-    fn excludes_tracked_entries_and_builds_resume_spawn() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn history_resume_uses_the_first_class_resume_rpc() {
         let temp = TempDir::new().unwrap();
-        let cwd = temp.path().to_string_lossy().into_owned();
+        let socket = temp.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (request_tx, request_rx) = mpsc::sync_channel(1);
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                let ControlMessage::Request { id, method, params } =
+                    serde_json::from_str(&line).unwrap()
+                else {
+                    continue;
+                };
+                let terminal = method != Method::HELLO;
+                let response = if terminal {
+                    request_tx.send((method, params)).unwrap();
+                    ControlMessage::Response {
+                        id,
+                        result: Err(diri_proto::ControlError::bad_request("test complete")),
+                    }
+                } else {
+                    ControlMessage::Response {
+                        id,
+                        result: Ok(serde_json::to_value(HelloResult {
+                            proto: WIRE_VERSION,
+                            build: "test-engine".to_owned(),
+                            pid: std::process::id() as i32,
+                            engine_kind: Some(RUST_ENGINE_KIND.to_owned()),
+                            executable_hash: None,
+                        })
+                        .unwrap()),
+                    }
+                };
+                let mut bytes = serde_json::to_vec(&response).unwrap();
+                bytes.push(b'\n');
+                writer.write_all(&bytes).unwrap();
+                writer.flush().unwrap();
+                if terminal {
+                    break;
+                }
+            }
+        });
+
+        let client = DaemonClient::with_socket_path(socket);
+        client.connect();
+        client
+            .wait_until_connected(Duration::from_secs(2))
+            .await
+            .unwrap();
         let entry = HistoryEntry {
             id: "conversation-id".to_owned(),
             kind: AgentKind::CLAUDE_CODE,
-            cwd: cwd.clone(),
+            cwd: temp.path().to_string_lossy().into_owned(),
             title: Some("A title".to_owned()),
-            transcript_path: "/read/only/transcript.jsonl".to_owned(),
+            transcript_path: temp
+                .path()
+                .join("conversation-id.jsonl")
+                .to_string_lossy()
+                .into_owned(),
             last_active_at: DateMillis(10.0),
             created_at: None,
             cwd_exists: true,
         };
-        let spawn = resume_spawn(&entry).unwrap();
-        assert_eq!(spawn.cwd, cwd);
+
+        assert!(resume(&client, &entry).await.is_err());
+        let (method, params) = request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(method, Method::SESSION_RESUME_FROM_HISTORY);
+        let params = params.unwrap();
+        assert_eq!(params["entry"]["id"], entry.id);
         assert_eq!(
-            spawn.kind,
-            AgentKind::generic("claude --resume conversation-id")
+            params["entry"]["kind"],
+            serde_json::json!({ "claudeCode": {} })
         );
-        let prompt = spawn.initial_prompt.as_deref().unwrap();
-        assert!(prompt.contains("historical conversation has just been resumed"));
-        assert_eq!(spawn.title.as_deref(), Some("A title"));
+        assert_eq!(params["entry"]["transcriptPath"], entry.transcript_path);
+        assert!(params["initialPrompt"].as_str().is_some_and(|prompt| {
+            prompt.contains("historical conversation has just been resumed")
+        }));
+
+        client.shutdown().await;
+        server.join().unwrap();
     }
 
     #[test]
@@ -519,20 +575,12 @@ mod tests {
                         .is_none_or(|requested| &entry.id == requested)
             })
             .expect("no untracked historical Claude conversation with a live cwd");
-        let params = resume_spawn(&entry).expect("history entry was not resumable");
-        let prompt = params.initial_prompt.as_deref().unwrap();
-        assert!(prompt.contains("historical conversation has just been resumed"));
-        assert_eq!(
-            params.kind,
-            AgentKind::generic(format!("claude --resume {}", entry.id))
-        );
         let session_id = if let Ok(existing) = std::env::var("DIRI_EXISTING_SESSION_ID") {
             diri_proto::SessionId::new(existing)
         } else {
-            client
-                .spawn(params)
+            resume(&client, &entry)
                 .await
-                .expect("session.spawn rejected the resume prompt")
+                .expect("session.resume_from_history rejected the conversation")
         };
 
         let mut screen = String::new();

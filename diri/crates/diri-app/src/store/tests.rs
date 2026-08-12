@@ -1,9 +1,11 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use diri_proto::{
-    AgentKind, AttentionLevel, DateMillis, ExitInfo, ExitReason, Project, ProjectId, Resumability,
-    SessionId, SessionListResult, SessionRecord, SessionStatus, TitleSource,
+    AgentDescriptor, AgentKind, AgentReadinessItem, AgentReadinessResult, AttentionLevel,
+    DateMillis, ExitInfo, ExitReason, Project, ProjectId, Resumability, SessionId,
+    SessionListResult, SessionRecord, SessionStatus, TitleSource,
 };
 use tempfile::tempdir;
 use tokio::sync::mpsc;
@@ -11,9 +13,9 @@ use tokio::sync::mpsc;
 use crate::notifications::NotificationSound;
 
 use super::{
-    ClickModifiers, DefaultAgent, EventEnvelope, InspectorTab, Prefs, SessionStore,
-    SidebarProjection, StoreEffect, StoreEventChange, TerminalResidency, WindowMode,
-    WindowPlacement, event_publication_policy,
+    ClickModifiers, EventEnvelope, InspectorTab, Prefs, SessionStore, SidebarProjection,
+    StoreEffect, StoreEventChange, TerminalResidency, WindowMode, WindowPlacement,
+    event_publication_policy,
 };
 use crate::switcher::{OverviewFilter, OverviewLane, SwitcherKey};
 
@@ -38,6 +40,7 @@ fn session(value: &str, project: &str, created: f64) -> SessionRecord {
         agent_session_id: None,
         transcript_path: None,
         status: SessionStatus::Idle,
+        status_evidence: None,
         needs_input: None,
         resumability: Resumability::Live,
         parent: None,
@@ -64,6 +67,7 @@ fn project(value: &str, name: &str) -> Project {
         root: format!("/work/{value}"),
         name: name.to_owned(),
         pinned_order: None,
+        host: None,
     }
 }
 
@@ -759,7 +763,7 @@ fn attention_rollup_and_needs_input_sort_use_proto_derivation() {
 }
 
 #[test]
-fn hidden_needs_input_update_emits_chime_and_notification_effect() {
+fn hidden_needs_input_update_chimes_and_posts_once_its_window_expires() {
     let (mut store, mut effects) = hydrated(
         vec![session("visible", "p", 2.0)],
         vec![project("p", "P")],
@@ -771,15 +775,117 @@ fn hidden_needs_input_update_emits_chime_and_notification_effect() {
     hidden.status = SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Permission);
     store.upsert_session(hidden);
 
-    let transition = drain(&mut effects)
-        .into_iter()
-        .find_map(|effect| match effect {
-            StoreEffect::StatusTransition(transition) => Some(transition),
-            _ => None,
-        })
-        .expect("needs-input update should emit a status transition");
+    // Nothing is announced on the transition itself, and nothing is due yet.
+    assert!(
+        drain(&mut effects)
+            .into_iter()
+            .all(|effect| !matches!(effect, StoreEffect::StatusTransition(_)))
+    );
+    assert!(store.drain_settled_attention(Instant::now()).is_empty());
+
+    let transitions = store.drain_settled_attention(
+        store
+            .next_attention_deadline()
+            .expect("needs-input update should arm a settle window"),
+    );
+    let transition = transitions
+        .first()
+        .expect("a session still blocked at its deadline is announced");
     assert_eq!(transition.sound, Some(NotificationSound::NeedsInput));
     assert!(transition.notification.is_some());
+    assert!(store.next_attention_deadline().is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_settle_task_sleeps_on_the_window_and_then_publishes() {
+    let (store, _effects) = SessionStore::headless(Prefs::default());
+    let store = Arc::new(std::sync::RwLock::new(store));
+    let (status_tx, mut status_rx) = tokio::sync::broadcast::channel(8);
+    let task = tokio::spawn(super::run_attention_settle(
+        Arc::clone(&store),
+        status_tx.clone(),
+    ));
+
+    // The session the user is looking at, so the blocked one is not the
+    // selected row and earns a banner as well as a chime.
+    store
+        .write()
+        .expect("session store lock poisoned")
+        .upsert_session(session("visible", "p", 2.0));
+    let mut blocked = session("blocked", "p", 1.0);
+    blocked.status = SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Permission);
+    store
+        .write()
+        .expect("session store lock poisoned")
+        .upsert_session(blocked);
+
+    // Nothing is published until the window is served — the task is asleep on
+    // the deadline it was woken to install.
+    assert!(status_rx.try_recv().is_err());
+
+    let transition = tokio::time::timeout(Duration::from_secs(30), status_rx.recv())
+        .await
+        .expect("the settle task must publish once the window expires")
+        .expect("status channel stays open");
+    assert_eq!(transition.sound, Some(NotificationSound::NeedsInput));
+    assert!(transition.notification.is_some());
+
+    task.abort();
+}
+
+#[test]
+fn a_session_that_unblocks_inside_its_window_is_never_announced() {
+    let (mut store, mut effects) = hydrated(
+        vec![session("visible", "p", 2.0)],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    drain(&mut effects);
+
+    let mut blocked = session("hidden", "p", 1.0);
+    blocked.status = SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Permission);
+    store.upsert_session(blocked.clone());
+    assert!(store.next_attention_deadline().is_some());
+
+    // Answered before the window expired: the pending state goes with it, so
+    // the settle task is not even kept awake for it.
+    blocked.status = SessionStatus::Working;
+    blocked.needs_input = None;
+    store.upsert_session(blocked);
+
+    assert!(store.next_attention_deadline().is_none());
+    assert!(
+        store
+            .drain_settled_attention(Instant::now() + Duration::from_secs(60))
+            .is_empty()
+    );
+}
+
+#[test]
+fn selecting_a_session_inside_its_window_leaves_the_chime_but_drops_the_banner() {
+    let (mut store, mut effects) = hydrated(
+        vec![session("visible", "p", 2.0)],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    drain(&mut effects);
+
+    let mut blocked = session("hidden", "p", 1.0);
+    blocked.status = SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Permission);
+    store.upsert_session(blocked);
+    store.select(id("hidden"));
+
+    let transitions = store.drain_settled_attention(
+        store
+            .next_attention_deadline()
+            .expect("needs-input update should arm a settle window"),
+    );
+    let transition = transitions.first().expect("the chime still fires");
+    assert_eq!(transition.sound, Some(NotificationSound::NeedsInput));
+    assert!(
+        transition.notification.is_none(),
+        "the session the user is looking at needs no system banner"
+    );
 }
 
 #[test]
@@ -1125,7 +1231,7 @@ fn prefs_round_trip_and_zoom_clamp() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("nested/prefs.json");
     let prefs = Prefs {
-        default_agent: DefaultAgent::Gemini,
+        default_agent: AgentKind::GEMINI,
         default_spawn_host: Some("forge".to_owned()),
         terminal_font_size: 19.5,
         window_placement: Some(WindowPlacement {
@@ -1156,6 +1262,124 @@ fn prefs_round_trip_and_zoom_clamp() {
     assert_eq!(store.prefs.terminal_font_size, 10.0);
     store.reset_terminal_zoom().unwrap();
     assert_eq!(Prefs::load(&path).unwrap().terminal_font_size, 13.0);
+}
+
+#[test]
+fn default_agent_preferences_migrate_legacy_values_and_persist_manifest_ids() {
+    for (saved, expected) in [
+        ("claudeCode", AgentKind::CLAUDE_CODE),
+        ("codex", AgentKind::CODEX),
+        ("cursor", AgentKind::CURSOR),
+        ("gemini", AgentKind::GEMINI),
+    ] {
+        let prefs: Prefs = serde_json::from_value(serde_json::json!({
+            "defaultAgent": saved
+        }))
+        .expect("legacy prefs decode");
+        assert_eq!(prefs.default_agent, expected);
+    }
+
+    let prefs = Prefs {
+        default_agent: AgentKind::new("amp"),
+        ..Prefs::default()
+    };
+    let encoded = serde_json::to_value(&prefs).expect("prefs encode");
+    assert_eq!(encoded["defaultAgent"], "amp");
+    let decoded: Prefs = serde_json::from_value(encoded).expect("manifest id decodes");
+    assert_eq!(decoded.default_agent, AgentKind::new("amp"));
+}
+
+#[test]
+fn unknown_saved_default_repairs_to_available_first_class_then_shell() {
+    let prefs = Prefs {
+        default_agent: AgentKind::new("removed-agent"),
+        ..Prefs::default()
+    };
+    let (mut store, _) = SessionStore::headless(prefs);
+    store.set_agent_catalog(AgentReadinessResult {
+        agents: vec![AgentReadinessItem {
+            kind: AgentKind::CODEX,
+            binary: "codex".into(),
+            path: Some("/bin/codex".into()),
+            descriptor: Some(AgentDescriptor {
+                id: AgentKind::CODEX_ID.into(),
+                display_name: "Codex".into(),
+                first_class: true,
+                ..AgentDescriptor::default()
+            }),
+            ..AgentReadinessItem::default()
+        }],
+        ..AgentReadinessResult::default()
+    });
+    assert_eq!(store.preferences().default_agent, AgentKind::CODEX);
+
+    store
+        .update_preferences(|prefs| prefs.default_agent = AgentKind::new("removed-again"))
+        .expect("headless prefs update");
+    store.set_agent_catalog(AgentReadinessResult {
+        agents: vec![AgentReadinessItem {
+            kind: AgentKind::new("amp"),
+            binary: "amp".into(),
+            path: Some("/bin/amp".into()),
+            descriptor: Some(AgentDescriptor {
+                id: "amp".into(),
+                display_name: "Amp".into(),
+                first_class: false,
+                ..AgentDescriptor::default()
+            }),
+            ..AgentReadinessItem::default()
+        }],
+        ..AgentReadinessResult::default()
+    });
+    assert_eq!(store.preferences().default_agent, AgentKind::SHELL);
+}
+
+#[test]
+fn a_configure_issued_during_an_inflight_scan_still_reaches_the_engine() {
+    let (mut store, mut effects) = SessionStore::headless(Prefs::default());
+    store.request_agent_catalog(Some("forge".into()), false);
+    assert!(matches!(
+        effects.try_recv(),
+        Ok(StoreEffect::RefreshAgents { .. })
+    ));
+    // The scan has not answered yet. A settings toggle flipped in that window
+    // is a user mutation, not a cache refresh — dropping it would silently
+    // revert the control on the next catalog paint.
+    store.configure_agent(diri_proto::AgentConfigureParams {
+        host: Some("forge".into()),
+        kind: AgentKind::CLAUDE_CODE,
+        executable_path: None,
+        show_in_quick_create: false,
+    });
+    assert!(matches!(
+        effects.try_recv(),
+        Ok(StoreEffect::ConfigureAgent(_))
+    ));
+}
+
+#[test]
+fn a_failed_scan_is_retried_only_by_an_explicit_rescan() {
+    let (mut store, mut effects) = SessionStore::headless(Prefs::default());
+    store.request_agent_catalog(Some("forge".into()), false);
+    assert!(matches!(
+        effects.try_recv(),
+        Ok(StoreEffect::RefreshAgents { .. })
+    ));
+    // The effect loop reports the failure: loading cleared, error recorded.
+    store.agent_catalog_loading.remove("forge");
+    store
+        .agent_catalog_errors
+        .insert("forge".into(), "ssh: connect timed out".into());
+    // Render paths ask again on every paint of a surface whose catalog is
+    // absent; after a failure that must not become a scan loop against an
+    // unreachable host.
+    store.request_agent_catalog(Some("forge".into()), false);
+    assert!(effects.try_recv().is_err());
+    store.request_agent_catalog(Some("forge".into()), true);
+    assert!(matches!(
+        effects.try_recv(),
+        Ok(StoreEffect::RefreshAgents { force: true, .. })
+    ));
 }
 
 #[test]
@@ -1681,4 +1905,72 @@ fn inert_runtime_has_no_background_tasks_or_live_sessions() {
             .is_empty()
     );
     assert!(runtime.snapshots().borrow().sessions.is_empty());
+}
+
+#[test]
+fn action_retry_policy_only_replays_idempotent_operations() {
+    let rename = StoreEffect::Rename {
+        id: id("one"),
+        title: "New title".to_owned(),
+    };
+    let sync = StoreEffect::SyncPrefs {
+        host: "forge".to_owned(),
+        host_name: "Forge".to_owned(),
+    };
+    assert!(super::action_context(&rename).unwrap().retry.is_some());
+    assert!(super::action_context(&sync).unwrap().retry.is_some());
+
+    for unsafe_effect in [
+        StoreEffect::Remove(id("one")),
+        StoreEffect::Archive(id("one")),
+        StoreEffect::Unarchive(id("one")),
+        StoreEffect::Migrate {
+            id: id("one"),
+            target_host: Some("forge".to_owned()),
+        },
+        StoreEffect::ReopenLast,
+    ] {
+        assert!(
+            super::action_context(&unsafe_effect)
+                .expect("user action has failure context")
+                .retry
+                .is_none(),
+            "unsafe operation unexpectedly became replayable: {unsafe_effect:?}"
+        );
+    }
+}
+
+/// The menu bar refreshes on every publish while its panel is open, so this
+/// projection has to be cached the way the sidebar's is — rebuilding the tree
+/// and cloning `Prefs` per publish measured ~28µs against ~8ns cached at 80
+/// sessions. Pointer equality is the only way to see the cache from a test.
+#[test]
+fn the_menu_bar_projection_is_cached_per_revision() {
+    let (mut store, _) = hydrated(
+        vec![session("one", "p", 1.0), session("two", "p", 2.0)],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    // Collapse after hydration: hydrating selects a session, and selecting
+    // unfolds whatever hides it (`selecting_a_folded_session_reveals_it`).
+    store
+        .toggle_project_collapsed(pid("p"))
+        .expect("collapse the project");
+
+    let first = store.menu_bar_projection();
+    assert!(
+        Arc::ptr_eq(&first, &store.menu_bar_projection()),
+        "a second call at the same revision must reuse the built tree"
+    );
+
+    // The menu bar keeps its own collapse state, so it ignores the sidebar's
+    // folds; that difference is why it cannot just share `sidebar_projection`.
+    assert_eq!(rows(&first, 0), vec![id("one"), id("two")]);
+    assert!(store.sidebar_projection().projects[0].sessions.is_empty());
+
+    store.rename(id("one"), "renamed");
+    assert!(
+        !Arc::ptr_eq(&first, &store.menu_bar_projection()),
+        "a mutation must invalidate the cache, not serve a stale tree"
+    );
 }

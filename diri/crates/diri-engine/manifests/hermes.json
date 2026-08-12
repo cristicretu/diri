@@ -14,6 +14,11 @@
       "hermes-agent"
     ],
     "firstClass": true,
+    "setup": {
+      "url": "https://github.com/NousResearch/hermes-agent/blob/main/website/docs/getting-started/quickstart.md",
+      "installHint": "Install Hermes with the official Nous Research installer.",
+      "signInHint": "Run hermes setup --portal or hermes model to configure a provider."
+    },
     "statusAuthority": "screen",
     "binary": "hermes",
     "resume": {

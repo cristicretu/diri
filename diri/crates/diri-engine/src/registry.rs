@@ -792,16 +792,27 @@ impl Registry {
         let id = session_project_id(root, host).0;
         if let Some(existing) = self
             .projects
-            .iter()
+            .iter_mut()
             .find(|project| project.get("id").and_then(|value| value.as_str()) == Some(&id))
         {
+            // Records persisted before projects carried their host learn it
+            // here; without it a remote project with no live sessions cannot
+            // tell the app which machine owns its root.
+            if let Some(host) = host
+                && existing.get("host").is_none()
+            {
+                existing["host"] = serde_json::Value::String(host.to_owned());
+            }
             return existing.clone();
         }
         let name = Path::new(root)
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| root.to_string());
-        let project = serde_json::json!({ "id": id, "root": root, "name": name });
+        let mut project = serde_json::json!({ "id": id, "root": root, "name": name });
+        if let Some(host) = host {
+            project["host"] = serde_json::Value::String(host.to_owned());
+        }
         self.projects.push(project.clone());
         project
     }
@@ -926,6 +937,14 @@ fn repair_persisted_agent_title(record: &mut SessionRecord) -> bool {
 
 fn fold_session_status(record: &mut SessionRecord, view: &SessionView) {
     record.status.clone_from(&view.status);
+    // Keep evidence only when it explains this exact canonical state. This is
+    // both a mixed-version guard and protection against observing the reducer
+    // and shared record on opposite sides of an in-flight transition.
+    record.status_evidence = view
+        .status_evidence
+        .as_ref()
+        .filter(|evidence| evidence.status == view.status)
+        .cloned();
     record.needs_input.clone_from(&view.needs_input);
 }
 
@@ -1001,6 +1020,7 @@ mod tests {
             agent_session_id: None,
             transcript_path: None,
             status: SessionStatus::Starting,
+            status_evidence: None,
             needs_input: None,
             resumability: Resumability::NotResumable,
             parent: None,
@@ -1069,6 +1089,29 @@ mod tests {
         let records = registry.records();
         assert_ne!(records[0].project_id, records[1].project_id);
         assert_eq!(registry.projects_raw().len(), 2);
+    }
+
+    /// The project record — not its sessions — is what tells the app which
+    /// machine owns a root: after the last session of a remote project is
+    /// closed, launch surfaces must still spawn on that host, not locally
+    /// with the remote path as cwd. Pre-host records learn theirs on ensure.
+    #[test]
+    fn projects_record_their_owning_host_and_legacy_records_learn_it() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+
+        let local = registry.ensure_session_project("/workspace/app", None);
+        assert_eq!(local.get("host"), None);
+        let remote = registry.ensure_session_project("/srv/app", Some("forge"));
+        assert_eq!(remote["host"], "forge");
+
+        // A record persisted before projects carried hosts: same id, no host.
+        let id = session_project_id("/srv/legacy", Some("forge")).0;
+        registry
+            .projects
+            .push(serde_json::json!({ "id": id, "root": "/srv/legacy", "name": "legacy" }));
+        let repaired = registry.ensure_session_project("/srv/legacy", Some("forge"));
+        assert_eq!(repaired["host"], "forge");
     }
 
     /// Older records stored `projectID` as the raw directory path instead of a
@@ -1409,6 +1452,7 @@ mod tests {
         let view = SessionView {
             id: "claude".to_owned(),
             status: SessionStatus::Working,
+            status_evidence: None,
             needs_input: None,
             title: Some("Repair remote attach".to_owned()),
             title_source: Some(TitleSource::AgentProvided),

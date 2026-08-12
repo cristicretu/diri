@@ -191,26 +191,49 @@ mod tests {
             bytes.starts_with(b"bplist00"),
             "PropertyListEncoder parity means binary plist"
         );
-        // Apple's own parser must accept what we write — that is the
-        // rollback direction (a Swift daemon adopting Rust-written state).
-        let lint = std::process::Command::new("plutil")
-            .arg("-lint")
-            .arg(&path)
-            .output()
-            .expect("plutil");
-        assert!(
-            lint.status.success(),
-            "plutil rejected our plist: {}",
-            String::from_utf8_lossy(&lint.stdout)
-        );
+        let keys = plist::Value::from_file(&path)
+            .expect("read binary plist")
+            .into_dictionary()
+            .expect("dictionary");
+        for key in [
+            "version",
+            "logOffset",
+            "gridPayload",
+            "historyRowCount",
+            "historyPayload",
+            "markerBuffer",
+            "altScreen",
+            "bracketedPaste",
+            "mouseReporting",
+        ] {
+            assert!(keys.contains_key(key), "missing Swift key {key}");
+        }
+
+        // Apple's own parser is the strongest rollback check, but `plutil`
+        // is a macOS tool. Keep that assertion on Apple runners while the
+        // platform-independent header/key assertions still run on Linux.
+        #[cfg(target_os = "macos")]
+        {
+            let lint = std::process::Command::new("plutil")
+                .arg("-lint")
+                .arg(&path)
+                .output()
+                .expect("plutil");
+            assert!(
+                lint.status.success(),
+                "plutil rejected our plist: {}",
+                String::from_utf8_lossy(&lint.stdout)
+            );
+        }
     }
 
     #[test]
     fn a_swift_shaped_plist_written_by_apples_tools_loads() {
         // The forward direction of the mixed-fleet upgrade: a checkpoint
-        // whose bytes come out of Apple's plist implementation (the same one
-        // PropertyListEncoder uses) must load here. Build it as XML with the
-        // Swift key set, convert with plutil to binary1, then load.
+        // with the same keys and value types PropertyListEncoder uses must
+        // load here. On macOS, additionally convert it with Apple's plist
+        // implementation before loading; Linux has no `plutil`, so it reads
+        // the equivalent standard XML representation directly.
         let dir = tempfile::tempdir().expect("temp");
         let path = dir.path().join("s_swift.screen.plist");
         let payload = sample().grid.encode().expect("encode");
@@ -236,16 +259,19 @@ mod tests {
 </plist>"#
         );
         std::fs::write(&path, xml).expect("write xml");
-        let convert = std::process::Command::new("plutil")
-            .args(["-convert", "binary1"])
-            .arg(&path)
-            .output()
-            .expect("plutil");
-        assert!(convert.status.success());
-        assert!(
-            std::fs::read(&path).expect("read").starts_with(b"bplist00"),
-            "converted to binary"
-        );
+        #[cfg(target_os = "macos")]
+        {
+            let convert = std::process::Command::new("plutil")
+                .args(["-convert", "binary1"])
+                .arg(&path)
+                .output()
+                .expect("plutil");
+            assert!(convert.status.success());
+            assert!(
+                std::fs::read(&path).expect("read").starts_with(b"bplist00"),
+                "converted to binary"
+            );
+        }
 
         let loaded = ScreenCheckpoint::load(&path).expect("load Swift-shaped plist");
         assert_eq!(loaded.log_offset, 777);

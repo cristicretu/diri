@@ -109,7 +109,10 @@ pub(super) fn build_projection(
             .get(&project_id)
             .cloned()
             .unwrap_or_else(|| synthetic_project(&project_id, &group));
-        let host = group.first().and_then(|session| session.host.clone());
+        let host = project
+            .host
+            .clone()
+            .or_else(|| group.first().and_then(|session| session.host.clone()));
         // A project is as old as its oldest session. That is the arrival order
         // a first-time user perceives, and it keeps a project from jumping
         // around as its sessions come and go.
@@ -352,5 +355,6 @@ fn synthetic_project(id: &ProjectId, sessions: &[Arc<SessionRecord>]) -> Project
         root,
         name,
         pinned_order: None,
+        host: sessions.first().and_then(|session| session.host.clone()),
     }
 }

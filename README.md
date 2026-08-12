@@ -1,4 +1,4 @@
-# diri
+<h1><img src="docs/images/diri-wordmark.png" alt="diri" width="300"></h1>
 
 [![CI](https://github.com/cristicretu/diri/actions/workflows/ci.yml/badge.svg)](https://github.com/cristicretu/diri/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
@@ -63,35 +63,33 @@ Two processes, one wire protocol:
 - **`diri`** — the desktop app: Rust + [GPUI](https://github.com/zed-industries/zed). Owns the
   window, sidebar, terminal renderer, command palette, and usage accounting. Lives in
   [`diri/`](diri/).
-- **`dirijord`** — a headless Swift daemon, launched by the app and outliving it. Owns PTYs and
+- **`dirijord-rs`** — the headless Rust engine, launched by the app and outliving it. Owns PTYs and
   child agent processes, an offset-addressed output log per session (for detach and replay), a
   headless terminal emulator for status detection, the session registry and persistence,
   worktrees, and the control socket.
 
-`dirijor` is a small CLI: the MCP shim injected into agents, the hook and notify forwarders, and
-`status`/`doctor`. `dirijord-holder` owns the PTY master so sessions survive a daemon restart.
-
-> **A Rust port of the engine is in progress** in `diri/crates/diri-engine`, so that diri can run
-> on Linux and Windows. It is not shipped — the released app runs the Swift daemon above. See
-> [`diri/PORT.md`](diri/PORT.md) for what is done and what is left.
+`dirijor` is the automation CLI for hooks, notifications, status, and diagnostics;
+`dirijor-mcp` is the MCP stdio server injected into agents. `diri-holder` owns each PTY master so
+sessions survive an engine restart. Every shipped executable is built from the Rust workspace in
+[`diri/`](diri/).
 
 ## Adding an agent
 
 Agent support is data, not code. Each agent is one JSON file in
-`Sources/DirijorCore/Resources/manifests/` describing how to spawn it, how to resume, which keys
+`diri/crates/diri-engine/manifests/` describing how to spawn it, how to resume, which keys
 approve or deny a prompt, and the screen rules that decide whether it is working, waiting, or
-done. Copy the closest existing manifest and adjust it — no Swift or Rust required. This is the
-easiest way to contribute.
+done. Copy the closest existing manifest and adjust it — no code changes required. The
+[manifest-authoring guide](docs/AGENT-MANIFESTS.md) explains the schema, safe capture workflow,
+examples, overrides, and validation. This is the easiest way to contribute.
 
 ## Building from source
 
-Needs both toolchains: Rust (pinned in `diri/rust-toolchain.toml`) and Swift 6 with the Xcode
-command-line tools. The first Rust build compiles GPUI from a pinned Zed revision and takes a
-while.
+Needs Rust (pinned in `diri/rust-toolchain.toml`) and the Xcode command-line tools. The first
+build compiles GPUI from a pinned Zed revision and takes a while.
 
 ```sh
-swift build && swift test                  # engine
-(cd diri && cargo build)                   # app
+(cd diri && cargo build)                   # app, engine, holder, CLI, MCP
+(cd diri && cargo test --workspace)
 (cd diri && cargo run -p diri-app)         # run the app from source
 
 diri/scripts/package.sh                    # full bundle

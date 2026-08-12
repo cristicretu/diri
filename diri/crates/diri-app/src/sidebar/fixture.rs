@@ -407,6 +407,7 @@ fn project(id: &str, root: &str, name: &str) -> Project {
         root: root.into(),
         name: name.into(),
         pinned_order: None,
+        host: None,
     }
 }
 
@@ -491,6 +492,7 @@ fn session(
         agent_session_id: None,
         transcript_path: None,
         status,
+        status_evidence: None,
         needs_input: None,
         resumability,
         parent: None,

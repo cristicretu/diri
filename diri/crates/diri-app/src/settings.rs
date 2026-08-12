@@ -1,4 +1,4 @@
-//! State shared by the four settings tabs.
+//! State shared by the settings tabs.
 //!
 //! General, Terminal, and Resources mutate diri's preferences. Remote manages
 //! the shared execution-host catalog used by the SSH Remote Holder transport.
@@ -6,23 +6,31 @@
 use diri_proto::{HostEntry, HostNodeConfig};
 use diri_term::theme::TermTheme;
 
-use crate::store::{DefaultAgent, Prefs};
+use crate::store::Prefs;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SettingsTab {
     #[default]
     General,
+    Agents,
     Terminal,
     Resources,
     Remote,
 }
 
 impl SettingsTab {
-    pub const ALL: [Self; 4] = [Self::General, Self::Terminal, Self::Resources, Self::Remote];
+    pub const ALL: [Self; 5] = [
+        Self::General,
+        Self::Agents,
+        Self::Terminal,
+        Self::Resources,
+        Self::Remote,
+    ];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::General => "General",
+            Self::Agents => "Agents",
             Self::Terminal => "Terminal",
             Self::Resources => "Resources",
             Self::Remote => "Remote",
@@ -32,6 +40,7 @@ impl SettingsTab {
     pub const fn subtitle(self) -> &'static str {
         match self {
             Self::General => "Startup, sessions, and updates",
+            Self::Agents => "Installed CLIs and quick create",
             Self::Terminal => "Appearance and text size",
             Self::Resources => "Idle sessions and memory",
             Self::Remote => "SSH execution hosts",
@@ -41,6 +50,7 @@ impl SettingsTab {
     pub const fn icon(self) -> &'static str {
         match self {
             Self::General => "gearshape",
+            Self::Agents => "sparkles",
             Self::Terminal => "terminal",
             Self::Resources => "server.rack",
             Self::Remote => "network",
@@ -169,15 +179,6 @@ fn unique_host_id<'a>(name: &str, existing: impl Iterator<Item = &'a str>) -> St
     unreachable!()
 }
 
-pub fn default_agent_label(agent: DefaultAgent) -> &'static str {
-    match agent {
-        DefaultAgent::ClaudeCode => "Claude Code",
-        DefaultAgent::Codex => "Codex",
-        DefaultAgent::Cursor => "Cursor",
-        DefaultAgent::Gemini => "Gemini",
-    }
-}
-
 pub fn theme(id: &str) -> TermTheme {
     crate::app_theme::terminal_theme(id)
 }
@@ -223,7 +224,6 @@ mod tests {
         assert_eq!(cycle_hibernate_minutes(60), 0);
         assert_eq!(cycle_memory_limit(2), 4);
         assert_eq!(cycle_memory_limit(8), 2);
-        assert_eq!(DefaultAgent::ALL.len(), 4);
         assert!(
             SettingsTab::ALL
                 .into_iter()

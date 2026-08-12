@@ -17,7 +17,7 @@ Build and launch an unmistakable development copy of diri.
 
 Options:
   --release       Build with Cargo's release profile.
-  --settings TAB  Open Settings on general, terminal, resources, or remote.
+  --settings TAB  Open Settings on general, terminal, resources, remote, or diagnostics.
   -h, --help      Show this help.
 
 Arguments after -- are passed to cargo build. Options that change Cargo's
@@ -64,7 +64,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "${settings_preview}" in
-    ""|general|terminal|resources|remote) ;;
+    ""|general|terminal|resources|remote|diagnostics) ;;
     *)
         echo "error: unknown Settings tab: ${settings_preview}" >&2
         exit 2
@@ -98,15 +98,24 @@ mkdir -p "${target_dir}"
 
 cd "${workspace_dir}"
 echo "==> Building ${display_name} (${profile})"
+# diri-app does not pull dirijord-rs into target/<profile>/; build both so a
+# clean checkout launches against this tree's Engine instead of a missing or
+# stale binary (installed app / leftover debug build).
 if (( ${#cargo_args[@]} > 0 )); then
-    cargo build --package diri-app --bin diri "${cargo_args[@]}"
+    cargo build --package diri-app --bin diri --package diri-engine --bin dirijord-rs "${cargo_args[@]}"
 else
-    cargo build --package diri-app --bin diri
+    cargo build --package diri-app --bin diri --package diri-engine --bin dirijord-rs
 fi
 
 binary="${target_dir}/${profile}/diri"
 if [[ ! -x "${binary}" ]]; then
     echo "error: cargo did not produce ${binary}" >&2
+    exit 1
+fi
+
+engine_bin="${target_dir}/${profile}/dirijord-rs"
+if [[ ! -x "${engine_bin}" ]]; then
+    echo "error: cargo did not produce ${engine_bin}" >&2
     exit 1
 fi
 
@@ -156,14 +165,20 @@ if [[ -n "${settings_preview}" ]]; then
     launch_environment+=("DIRI_SETTINGS_PREVIEW=${settings_preview}")
 fi
 
-# A dev wrapper intentionally does not carry a second daemon. If no daemon is
-# live, point its launch-only fallback at the installed release bundle; both
-# clients still use the same socket and Application Support directory.
+# The Rust app fail-closes unless Hello reports engineKind=diri-rust-engine.
+# Prefer a local cargo build of dirijord-rs, then the packaged Rust Engine in
+# an installed bundle. Never point at the retired legacy daemon — the client
+# rejects it and the UI comes up unable to spawn or list sessions.
 if [[ -z "${DIRIJORD_PATH:-}" ]]; then
-    for installed_app in "${HOME}/Applications/diri.app" "/Applications/diri.app"; do
-        installed_daemon="${installed_app}/Contents/Resources/bin/dirijord"
-        if [[ -x "${installed_daemon}" ]]; then
-            launch_environment+=("DIRIJORD_PATH=${installed_daemon}")
+    for candidate in \
+        "${target_dir}/${profile}/dirijord-rs" \
+        "${target_dir}/debug/dirijord-rs" \
+        "${target_dir}/release/dirijord-rs" \
+        "${HOME}/Applications/diri.app/Contents/Resources/bin/dirijord-rs" \
+        "/Applications/diri.app/Contents/Resources/bin/dirijord-rs"
+    do
+        if [[ -x "${candidate}" ]]; then
+            launch_environment+=("DIRIJORD_PATH=${candidate}")
             break
         fi
     done
@@ -171,6 +186,14 @@ fi
 
 echo "==> Launching ${display_name} (${build_label})"
 echo "    ${app_path}"
+if [[ -n "${DIRIJORD_PATH:-}" ]]; then
+    echo "    engine: ${DIRIJORD_PATH}"
+fi
+for item in "${launch_environment[@]}"; do
+    if [[ "${item}" == DIRIJORD_PATH=* ]]; then
+        echo "    engine: ${item#DIRIJORD_PATH=}"
+    fi
+done
 exec env \
     -u DIRIJOR_SOCKET \
     -u DIRIJOR_SESSION_ID \

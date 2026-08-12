@@ -14,6 +14,11 @@
       "aider-chat"
     ],
     "firstClass": true,
+    "setup": {
+      "url": "https://aider.chat/docs/install.html",
+      "installHint": "Install Aider with its official installer or pipx.",
+      "signInHint": "Configure an API key for your chosen model provider."
+    },
     "statusAuthority": "screen",
     "binary": "aider",
     "returnToLoginShell": true,

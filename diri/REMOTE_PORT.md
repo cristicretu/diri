@@ -321,6 +321,29 @@ belongs to exactly one top-level Project. The same path on two SSH hosts is two
 different Projects, and project-level Agent creation inherits that Project's
 host and directory.
 
+## Agent executable discovery
+
+Agent availability and executable overrides are target-specific: local and
+each configured SSH host have independent catalog state. The Engine owns the
+catalog and preferences; the Helper only reports filesystem facts from the
+remote account.
+
+Protocol 1.3 adds the required `executable-discovery` capability. One bounded
+`executables` request carries every bundled manifest binary and any configured
+override. The Helper captures the login environment exactly once, resolves all
+queries directly from that PATH without spawning `which` per Agent, validates
+manual paths as executable regular files, and returns both the detected and
+configured resolution. An Agent launch reuses that same captured environment
+and cwd, so discovery does not add a second login-shell startup.
+
+The Engine caches each target catalog for five minutes and single-flights
+concurrent scans per target. Menus render only cached facts and never execute
+filesystem or SSH work. Missing Agents stay in Settings for discovery and
+manual binding but do not appear in quick-create menus. A valid manual path has
+precedence over PATH; an invalid override is reported while a valid PATH result
+remains usable. Executable preferences and quick-create visibility are stored
+in an owner-only, additive Engine configuration file.
+
 ## Holder and process lifecycle
 
 The Holder owns the PTY master, the Agent child/process group, terminal state,
@@ -358,10 +381,11 @@ restart/adoption preserves still-running sessions.
 every Linux host. PAM or `systemd-logind` policy may kill all processes from a
 login session.
 
-Each host is therefore probed rather than assumed. Diri launches a temporary
-Holder, closes the first SSH channel, reconnects through an independent channel,
-checks the process identity, and cleans up the test session. The result is one
-of:
+Each host is therefore probed rather than assumed. Diri closes any finite-lived
+bootstrap ControlMaster, launches a temporary Holder over a non-multiplexed SSH
+connection, waits for that underlying connection to close, reconnects over a
+second non-multiplexed connection, checks the process identity, and cleans up
+the test session. The result is one of:
 
 ```text
 native-detach
@@ -427,9 +451,10 @@ are a future enhancement and are not part of the completed baseline.
 
 ## Wire protocol
 
-`diri-proto::remote_pty` is the versioned protocol authority. Protocol 1.2
+`diri-proto::remote_pty` is the versioned protocol authority. Protocol 1.3
 declares terminal, session management, environment capture, directory listing,
-persistence probing, and atomic activation as required capabilities.
+batched executable discovery, persistence probing, and atomic activation as
+required capabilities.
 
 The protocol includes:
 
@@ -575,10 +600,14 @@ OpenSSH detach/reconnect soak. These are mandatory release gates and do not use
 Rosetta or a developer's real SSH host.
 
 The acceptance suite validates release-mode UDS performance, a 23 MiB slow-
-attach recovery case, and transient user-supervisor behavior. The real SSH soak
-verifies bootstrap, login-shell handling, persistence probing, Bridge
-disconnection, same-PID/same-incarnation reconnection, snapshot restoration,
-continued input, and cleanup.
+attach recovery case, transient user-supervisor behavior, and an actual Holder
+PTY's `isatty`, canonical editing, resize, and `SIGWINCH` behavior. The real SSH
+soak verifies bootstrap, login-shell handling, persistence probing, Bridge
+disconnection, explicit ControlMaster teardown, same-PID/same-incarnation
+reconnection, snapshot restoration, continued input, and cleanup. A separate
+PAM/logind endpoint with logout process cleanup enabled verifies that such a
+host is classified as non-persistent rather than receiving a false detach
+guarantee.
 
 An optional manual soak uses:
 
@@ -611,6 +640,8 @@ The completed refactor includes all of the following:
 - account/cwd environment capture and structured `argv`/`cwd`/environment
   execution;
 - bounded remote directory selection and host-aware project identity;
+- target-aware local/remote Agent discovery, manual executable binding, and
+  shared availability-filtered quick-create surfaces;
 - location-aware working-tree inspection with non-Git compatibility;
 - explicit persistence probing with no privilege escalation;
 - native artifacts and release gates for Linux x86_64, Linux aarch64, and

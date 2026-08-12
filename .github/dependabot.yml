@@ -10,16 +10,6 @@ updates:
         patterns: ["*"]
     open-pull-requests-limit: 5
 
-  - package-ecosystem: swift
-    directory: /
-    schedule:
-      interval: weekly
-      day: monday
-    groups:
-      swift-dependencies:
-        patterns: ["*"]
-    open-pull-requests-limit: 5
-
   - package-ecosystem: npm
     directory: /sidecar
     schedule:

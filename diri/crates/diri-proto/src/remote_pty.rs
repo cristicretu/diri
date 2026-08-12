@@ -17,7 +17,7 @@ use crate::frames::{Frame, FrameType, MAX_FRAME_BYTES};
 use crate::grid::{GridCodecError, GridUpdate};
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 2;
+pub const PROTOCOL_MINOR: u16 = 3;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_ARGUMENTS: usize = 512;
 pub const MAX_ENVIRONMENT_VARIABLES: usize = 4096;
@@ -29,6 +29,7 @@ pub const MAX_TERMINAL_CELLS: usize = 1_000_000;
 pub const MAX_DIRECTORY_ENTRIES: usize = 512;
 pub const MAX_DIRECTORY_SCANNED_ENTRIES: usize = 16_384;
 pub const MAX_DIRECTORY_RESPONSE_BYTES: usize = 512 * 1024;
+pub const MAX_EXECUTABLE_QUERIES: usize = 128;
 
 const HEADER_BYTES: usize = 5;
 const FULL_SNAPSHOT_FIXED_BYTES: usize = 9;
@@ -81,6 +82,9 @@ pub enum RemoteCapability {
     EnvironmentCapture,
     /// Helper CLI can return one bounded directory level.
     DirectoryList,
+    /// Helper can resolve a bounded batch of executable names against the
+    /// account login PATH and validate user-selected executable paths.
+    ExecutableDiscovery,
     /// Helper CLI can execute the detach/supervisor persistence probe.
     PersistenceProbe,
     /// Uploaded Helper can activate itself without replacing different bytes.
@@ -110,6 +114,7 @@ impl RemoteCapability {
             Self::SessionManagement => "session-management",
             Self::EnvironmentCapture => "environment-capture",
             Self::DirectoryList => "directory-list",
+            Self::ExecutableDiscovery => "executable-discovery",
             Self::PersistenceProbe => "persistence-probe",
             Self::AtomicActivation => "atomic-activation",
             Self::AgentEvents => "agent-events",
@@ -146,6 +151,7 @@ pub const PHASE_ONE_HELPER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::SessionManagement,
     RemoteCapability::EnvironmentCapture,
     RemoteCapability::DirectoryList,
+    RemoteCapability::ExecutableDiscovery,
     RemoteCapability::PersistenceProbe,
     RemoteCapability::AtomicActivation,
 ];
@@ -356,6 +362,8 @@ pub struct EnvironmentCaptureResult {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct DirectoryListRequest {
     pub path: String,
+    #[serde(default)]
+    pub mode: DirectoryListMode,
 }
 
 impl DirectoryListRequest {
@@ -380,10 +388,28 @@ impl DirectoryListRequest {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DirectoryListMode {
+    #[default]
+    Directories,
+    Executables,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DirectoryEntryKind {
+    #[default]
+    Directory,
+    Executable,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct DirectoryEntry {
     pub name: String,
     pub path: String,
+    #[serde(default)]
+    pub kind: DirectoryEntryKind,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -394,6 +420,101 @@ pub struct DirectoryListResult {
     pub parent: Option<String>,
     pub entries: Vec<DirectoryEntry>,
     pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutableQuery {
+    pub id: String,
+    pub binary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ExecutableDiscoveryRequest {
+    pub queries: Vec<ExecutableQuery>,
+    /// When present, capture the same login environment and resolved working
+    /// directory that will be used to launch the selected Agent. Catalog
+    /// scans omit this and pay for no separate cwd lookup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default = "default_environment_timeout_millis")]
+    pub timeout_millis: u64,
+}
+
+const fn default_environment_timeout_millis() -> u64 {
+    10_000
+}
+
+impl ExecutableDiscoveryRequest {
+    pub fn validate(&self) -> Result<(), RemoteCodecError> {
+        if self.queries.is_empty() || self.queries.len() > MAX_EXECUTABLE_QUERIES {
+            return Err(RemoteCodecError::InvalidLaunch(format!(
+                "executable discovery requires 1..={MAX_EXECUTABLE_QUERIES} queries"
+            )));
+        }
+        if !(100..=10_000).contains(&self.timeout_millis) {
+            return Err(RemoteCodecError::InvalidLaunch(
+                "executable discovery timeout must be between 100 and 10000 ms".into(),
+            ));
+        }
+        EnvironmentCaptureRequest {
+            cwd: self.cwd.clone(),
+            timeout_millis: self.timeout_millis,
+        }
+        .validate()?;
+        let mut total_bytes = self.cwd.as_ref().map_or(0, String::len);
+        for query in &self.queries {
+            validate_identifier("agent id", &query.id)?;
+            if query.binary.is_empty()
+                || query.binary.len() > 512
+                || query.binary.as_bytes().contains(&0)
+            {
+                return Err(RemoteCodecError::InvalidLaunch(
+                    "agent binary must be non-empty, NUL-free, and at most 512 bytes".into(),
+                ));
+            }
+            if let Some(path) = &query.configured_path
+                && (path.is_empty() || path.len() > 4_096 || path.as_bytes().contains(&0))
+            {
+                return Err(RemoteCodecError::InvalidLaunch(
+                    "configured executable path must be NUL-free and at most 4096 bytes".into(),
+                ));
+            }
+            total_bytes = total_bytes
+                .saturating_add(query.id.len())
+                .saturating_add(query.binary.len())
+                .saturating_add(query.configured_path.as_ref().map_or(0, String::len));
+        }
+        if total_bytes > MAX_LAUNCH_BYTES {
+            return Err(RemoteCodecError::InvalidLaunch(format!(
+                "executable discovery payload exceeds {MAX_LAUNCH_BYTES} bytes"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutableDiscoveryItem {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detected_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutableDiscoveryResult {
+    /// The single login environment used to resolve every query. Spawn paths
+    /// reuse it directly, avoiding a second remote shell startup.
+    pub environment: EnvironmentCaptureResult,
+    pub items: Vec<ExecutableDiscoveryItem>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1090,22 +1211,48 @@ mod tests {
     fn directory_requests_accept_only_normalized_absolute_or_home_paths() {
         for valid in ["/", "/srv/app", "~", "~/code"] {
             assert!(
-                DirectoryListRequest { path: valid.into() }
-                    .validate()
-                    .is_ok(),
+                DirectoryListRequest {
+                    path: valid.into(),
+                    mode: DirectoryListMode::Directories,
+                }
+                .validate()
+                .is_ok(),
                 "{valid}"
             );
         }
         for invalid in ["relative", "/srv/../etc", "/srv/./app", "~/../etc"] {
             assert!(
                 DirectoryListRequest {
-                    path: invalid.into()
+                    path: invalid.into(),
+                    mode: DirectoryListMode::Directories,
                 }
                 .validate()
                 .is_err(),
                 "{invalid}"
             );
         }
+    }
+
+    #[test]
+    fn executable_discovery_is_bounded_and_validates_its_launch_context() {
+        let request = ExecutableDiscoveryRequest {
+            queries: vec![ExecutableQuery {
+                id: "codex".into(),
+                binary: "codex".into(),
+                configured_path: Some("~/.local/bin/codex".into()),
+            }],
+            cwd: Some("~/code".into()),
+            timeout_millis: 1_000,
+        };
+        assert!(request.validate().is_ok());
+
+        let mut empty = request.clone();
+        empty.queries.clear();
+        assert!(empty.validate().is_err());
+
+        let mut traversal = request;
+        traversal.cwd = Some("~/../secrets".into());
+        assert!(traversal.validate().is_err());
     }
 
     fn snapshot() -> FullSnapshot {

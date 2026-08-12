@@ -15,6 +15,11 @@
       "factory-droid"
     ],
     "firstClass": true,
+    "setup": {
+      "url": "https://docs.factory.ai/cli/getting-started/quickstart",
+      "installHint": "Install Droid with Factory's installer or a supported package manager.",
+      "signInHint": "Run droid, then use /login if prompted."
+    },
     "statusAuthority": "screen",
     "binary": "droid",
     "resume": {

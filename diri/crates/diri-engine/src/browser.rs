@@ -372,6 +372,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn browser_integration_runs_across_engines() {
+        if std::env::var("DIRIJOR_RUN_BROWSER_TESTS").as_deref() != Ok("1") {
+            return;
+        }
+        assert!(
+            BrowserPool::is_available(),
+            "node, the sidecar, and installed Playwright browsers are required"
+        );
+        let temp = tempfile::tempdir().expect("temp browser fixture");
+        let page = temp.path().join("page.html");
+        std::fs::write(
+            &page,
+            r#"<!doctype html><meta charset=utf8>
+               <input id=name>
+               <button id=go onclick="out.textContent='Hi '+document.querySelector('#name').value">Go</button>
+               <div id=out></div>"#,
+        )
+        .expect("write browser fixture");
+
+        let pool = BrowserPool::new(temp.path());
+        let result = pool
+            .run(json!({
+                "url": format!("file://{}", page.display()),
+                "engines": ["chromium", "webkit", "firefox"],
+                "steps": [
+                    {"fill": ["#name", "Diri"]},
+                    {"click": "#go"},
+                    {"assert": {"selector": "#out", "text": "Hi Diri"}}
+                ]
+            }))
+            .expect("run browser flow");
+        pool.shutdown();
+        assert_eq!(result["pass"], true, "{result}");
+    }
+
+    #[test]
     fn shutdown_wakes_pending_requests_and_is_idempotent() {
         let pool = BrowserPool::new(Path::new("/tmp/diri-browser-test"));
         let (sender, receiver) = mpsc::channel();

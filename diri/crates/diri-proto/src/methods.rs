@@ -50,6 +50,7 @@ impl Method {
     pub const CLIENT_SET_ACTIVE: &'static str = "client.set_active";
     pub const GOVERNOR_CONFIGURE: &'static str = "governor.configure";
     pub const AGENT_READINESS: &'static str = "agent.readiness";
+    pub const AGENT_CONFIGURE: &'static str = "agent.configure";
     pub const EVENTS_SUBSCRIBE: &'static str = "events.subscribe";
     pub const EVENTS_WAIT: &'static str = "events.wait";
     pub const HOOK_REPORT: &'static str = "hook.report";
@@ -158,6 +159,20 @@ pub struct AgentKeystroke {
     pub submit: bool,
 }
 
+/// Optional, display-only guidance for installing and authenticating an
+/// Agent. Clients must never execute either hint; the URL is opened only after
+/// an explicit user action and is validated by the client as HTTP(S).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSetup {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_in_hint: Option<String>,
+}
+
 /// The daemon-side manifest descriptor for one agent, as much of it as the
 /// client needs. Deliberately partial and tolerant: the daemon owns the full
 /// schema (spawn args, env hygiene, injection), and unknown fields are ignored
@@ -169,6 +184,8 @@ pub struct AgentDescriptor {
     pub display_name: String,
     #[serde(default)]
     pub short_label: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
     #[serde(default)]
     pub glyph: String,
     #[serde(default)]
@@ -181,20 +198,81 @@ pub struct AgentDescriptor {
     pub approve: Option<AgentKeystroke>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny: Option<AgentKeystroke>,
+    /// Additive setup guidance. Older clients ignore this field and older
+    /// daemons omit it, so user manifest overrides remain forwards/backwards
+    /// compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<AgentSetup>,
+    /// Preserve Engine-owned manifest fields that this client-facing view does
+    /// not interpret (for example injection and resume metadata). The catalog
+    /// remains additive while Settings consumes only the typed subset above.
+    #[serde(default, flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct AgentReadinessItem {
+    /// This field predates open manifest-backed Agent kinds and was shipped as
+    /// a plain manifest id. Keep that compact wire shape for old clients even
+    /// though session records use AgentKind's keyed-enum encoding.
+    #[serde(
+        serialize_with = "serialize_agent_kind_id",
+        deserialize_with = "deserialize_agent_kind_id"
+    )]
     pub kind: AgentKind,
     pub binary: String,
+    /// Effective executable used for spawn: a valid manual path first, then
+    /// the account PATH result. Kept under the original field name for older
+    /// clients that only understand installed/not-installed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detected_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_source: Option<AgentPathSource>,
+    #[serde(default = "default_true")]
+    pub show_in_quick_create: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     /// The agent's manifest descriptor. This is how the AGENT CATALOG reaches
     /// the client: `agent.readiness` doubles as "what agents exist and what can
     /// they do". Absent when talking to a daemon that predates it — the client
     /// then falls back to its built-in knowledge of the original four.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub descriptor: Option<AgentDescriptor>,
+}
+
+fn serialize_agent_kind_id<S>(kind: &AgentKind, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(kind.id())
+}
+
+fn deserialize_agent_kind_id<'de, D>(deserializer: D) -> Result<AgentKind, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if let Some(id) = value.as_str() {
+        return Ok(AgentKind::new(id));
+    }
+    serde_json::from_value(value).map_err(D::Error::custom)
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentPathSource {
+    SystemPath,
+    Manual,
 }
 
 impl AgentReadinessItem {
@@ -204,7 +282,13 @@ impl AgentReadinessItem {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentReadinessResult {
+    /// `HostEntry.id`; absent means this Mac.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scanned_at: Option<DateMillis>,
     pub agents: Vec<AgentReadinessItem>,
 }
 
@@ -218,6 +302,32 @@ impl AgentReadinessResult {
             .and_then(|item| item.descriptor.as_ref())
     }
 }
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentReadinessParams {
+    /// `HostEntry.id`; absent means this Mac.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub force_refresh: bool,
+}
+
+/// Replaces one target/agent row atomically. `executablePath = null` means
+/// "use PATH again"; quick-create may only be enabled when the resulting
+/// executable resolves.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentConfigureParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub kind: AgentKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_path: Option<String>,
+    pub show_in_quick_create: bool,
+}
+
+pub type AgentConfigureResult = AgentReadinessResult;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -336,8 +446,11 @@ pub struct SessionHistoryResult {
 pub type SessionHistoryParams = EmptyParams;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ResumeFromHistoryParams {
     pub entry: HistoryEntry,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_prompt: Option<String>,
 }
 
 pub type ResumeFromHistoryResult = SessionRecord;
@@ -467,7 +580,9 @@ pub type SessionReopenLastResult = SessionRecord;
 
 /// `session.migrate`: one-click handoff of a live Claude session between local
 /// and a remote host, preserving conversation context (`claude --resume`) and
-/// code state (WIP commit + push + hard-sync of the target checkout).
+/// code state — committed work by push + hard-sync of the target checkout,
+/// uncommitted work re-applied to the target tree as uncommitted state, so a
+/// session round-trips losslessly and origin only ever sees real commits.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionMigrateParams {
@@ -558,6 +673,8 @@ pub struct HostListDirectoriesParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
     pub path: String,
+    #[serde(default)]
+    pub mode: crate::remote_pty::DirectoryListMode,
 }
 
 pub type HostListDirectoriesResult = crate::remote_pty::DirectoryListResult;
@@ -718,7 +835,6 @@ pub struct HookReportParams {
 pub type HookReportResult = EmptyResult;
 pub type GovernorConfigureParams = GovernorSettingsParams;
 pub type GovernorConfigureResult = EmptyResult;
-pub type AgentReadinessParams = EmptyParams;
 pub type ClientSetActiveResult = EmptyResult;
 pub type DaemonPrepareShutdownParams = EmptyParams;
 pub type DaemonPrepareShutdownResult = EmptyResult;

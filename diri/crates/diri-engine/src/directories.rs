@@ -3,11 +3,13 @@
 use std::collections::BinaryHeap;
 use std::fs;
 use std::io;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use diri_proto::remote_pty::{
-    DirectoryEntry, DirectoryListRequest, DirectoryListResult, MAX_DIRECTORY_ENTRIES,
-    MAX_DIRECTORY_RESPONSE_BYTES, MAX_DIRECTORY_SCANNED_ENTRIES,
+    DirectoryEntry, DirectoryEntryKind, DirectoryListMode, DirectoryListRequest,
+    DirectoryListResult, MAX_DIRECTORY_ENTRIES, MAX_DIRECTORY_RESPONSE_BYTES,
+    MAX_DIRECTORY_SCANNED_ENTRIES,
 };
 
 pub fn list(request: &DirectoryListRequest) -> io::Result<DirectoryListResult> {
@@ -22,7 +24,8 @@ pub fn list(request: &DirectoryListRequest) -> io::Result<DirectoryListResult> {
         ));
     }
 
-    let mut entries = BinaryHeap::<(String, String)>::with_capacity(MAX_DIRECTORY_ENTRIES + 1);
+    let mut entries =
+        BinaryHeap::<(String, String, bool)>::with_capacity(MAX_DIRECTORY_ENTRIES + 1);
     let mut truncated = false;
     for (scanned, entry) in fs::read_dir(&canonical)?.enumerate() {
         if scanned == MAX_DIRECTORY_SCANNED_ENTRIES {
@@ -33,7 +36,12 @@ pub fn list(request: &DirectoryListRequest) -> io::Result<DirectoryListResult> {
         let file_type = entry.file_type()?;
         let is_directory = file_type.is_dir()
             || (file_type.is_symlink() && entry.metadata().is_ok_and(|metadata| metadata.is_dir()));
-        if !is_directory {
+        let is_executable = request.mode == DirectoryListMode::Executables
+            && !is_directory
+            && entry.metadata().is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            });
+        if !is_directory && !is_executable {
             continue;
         }
         let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
@@ -41,15 +49,15 @@ pub fn list(request: &DirectoryListRequest) -> io::Result<DirectoryListResult> {
         };
         let path = canonical.join(&name).to_string_lossy().into_owned();
         if entries.len() < MAX_DIRECTORY_ENTRIES {
-            entries.push((name, path));
+            entries.push((name, path, is_executable));
         } else {
             truncated = true;
             if entries
                 .peek()
-                .is_some_and(|(largest, _)| name.as_str() < largest.as_str())
+                .is_some_and(|(largest, _, _)| name.as_str() < largest.as_str())
             {
                 entries.pop();
-                entries.push((name, path));
+                entries.push((name, path, is_executable));
             }
         }
     }
@@ -69,8 +77,16 @@ pub fn list(request: &DirectoryListRequest) -> io::Result<DirectoryListResult> {
     .len();
     let mut response_bytes = fixed_bytes;
     let mut bounded = Vec::with_capacity(entries.len());
-    for (name, path) in entries.into_sorted_vec() {
-        let entry = DirectoryEntry { name, path };
+    for (name, path, is_executable) in entries.into_sorted_vec() {
+        let entry = DirectoryEntry {
+            name,
+            path,
+            kind: if is_executable {
+                DirectoryEntryKind::Executable
+            } else {
+                DirectoryEntryKind::Directory
+            },
+        };
         let entry_bytes = serde_json::to_vec(&entry)
             .map_err(io::Error::other)?
             .len()
@@ -118,6 +134,7 @@ mod tests {
         fs::write(temp.path().join("file"), b"x").expect("file");
         let result = list(&DirectoryListRequest {
             path: temp.path().to_string_lossy().into_owned(),
+            mode: DirectoryListMode::Directories,
         })
         .expect("list");
         assert_eq!(

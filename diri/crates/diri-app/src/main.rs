@@ -1,11 +1,14 @@
+mod agent_catalog;
 mod app_theme;
 mod clipboard_transfer;
 mod code_intelligence;
 mod code_viewer;
+mod commands;
 mod composer;
 #[cfg(unix)]
 mod daemon_launch;
 mod dev_build;
+mod diagnostics;
 pub mod diff;
 pub mod fonts;
 pub mod fuzzy;
@@ -21,6 +24,7 @@ pub mod notifications;
 pub mod palette;
 pub mod query_editor;
 pub mod quick_open;
+mod recovery;
 pub mod review_prompt;
 pub mod root;
 pub mod seam;
@@ -28,6 +32,7 @@ mod session_surfaces;
 pub mod settings;
 pub mod sidebar;
 pub mod sounds;
+mod status_debug;
 mod surface_shell;
 pub mod switcher;
 pub mod terminal_pane;
@@ -47,16 +52,17 @@ use std::time::Duration;
 use dev_build::DevBuildIdentity;
 use diri_client::DaemonClient;
 use gpui::{
-    App, AppContext as _, Bounds, KeyBinding, Menu, MenuItem, OsAction, SystemMenuType,
-    TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds, WindowOptions, actions,
-    point, px, size,
+    App, AppContext as _, Bounds, Menu, MenuItem, OsAction, SystemMenuType, TitlebarOptions,
+    Window, WindowBackgroundAppearance, WindowBounds, WindowOptions, point, px, size,
 };
 use gpui_platform::application;
 use root::RootView;
 use sidebar::{PreviewScenario, SidebarPreviewFixture};
-use terminal_pane::bind_terminal_keys;
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 
+use crate::commands::{
+    CloseSession, CloseWindow, CopySelection, HideApp, OpenLauncher, Paste, Quit, ReopenSession,
+};
 use crate::store::{StoreRuntime, WindowMode, WindowPlacement};
 use crate::updates::UpdateHandle;
 use crate::usage::{
@@ -69,8 +75,6 @@ const MIN_WINDOW_WIDTH: f32 = 900.0;
 const MIN_WINDOW_HEIGHT: f32 = 560.0;
 const USAGE_REFRESH_DEBOUNCE: Duration = Duration::from_secs(2);
 const USAGE_RECONCILE_INTERVAL: Duration = Duration::from_secs(30 * 60);
-
-actions!(diri_app, [Quit, HideApp, CloseWindow]);
 
 /// Standard macOS app behaviors route through the application menu: without
 /// one, cmd-Q / cmd-H / cmd-W and the Edit menu simply do not exist.
@@ -85,18 +89,11 @@ fn install_app_menus(cx: &mut App) {
     // Cmd+W routes through CloseSession: RootView closes the selected
     // session and only propagates here — closing the window — when no
     // session is selected.
-    cx.on_action(|_: &root::CloseSession, cx| {
+    cx.on_action(|_: &CloseSession, cx| {
         if let Some(window) = cx.active_window() {
             let _ = window.update(cx, |_, window, _| window.remove_window());
         }
     });
-    cx.bind_keys([
-        KeyBinding::new("cmd-n", root::OpenLauncher, None),
-        KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("cmd-h", HideApp, None),
-        KeyBinding::new("cmd-w", root::CloseSession, None),
-        KeyBinding::new("cmd-shift-t", root::ReopenSession, None),
-    ]);
     cx.set_menus([
         Menu::new("diri").items([
             MenuItem::os_submenu("Services", SystemMenuType::Services),
@@ -105,14 +102,14 @@ fn install_app_menus(cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("Quit diri", Quit),
         ]),
-        Menu::new("File").items([MenuItem::action("New Session", root::OpenLauncher)]),
+        Menu::new("File").items([MenuItem::action("New Session", OpenLauncher)]),
         Menu::new("Edit").items([
-            MenuItem::os_action("Copy", terminal_pane::CopySelection, OsAction::Copy),
-            MenuItem::os_action("Paste", terminal_pane::Paste, OsAction::Paste),
+            MenuItem::os_action("Copy", CopySelection, OsAction::Copy),
+            MenuItem::os_action("Paste", Paste, OsAction::Paste),
         ]),
         Menu::new("Window").items([
-            MenuItem::action("Close Session", root::CloseSession),
-            MenuItem::action("Reopen Closed Session", root::ReopenSession),
+            MenuItem::action("Close Session", CloseSession),
+            MenuItem::action("Reopen Closed Session", ReopenSession),
             MenuItem::action("Close Window", CloseWindow),
         ]),
     ]);
@@ -318,13 +315,15 @@ fn main() {
         load_system_fonts(cx);
         #[cfg(target_os = "macos")]
         diri_ui::set_mark_rasterizer(macos::brand_raster::raster_mark);
-        bind_terminal_keys(cx);
+        commands::bind_default_keys(cx);
         install_app_menus(cx);
         let quit_store = Arc::clone(&services.store);
+        let quit_updates = services.updates.clone();
         let release_owned_daemon =
             !preview && std::env::var_os(diri_proto::paths::ENV_SOCKET).is_none();
         cx.on_app_quit(move |_| {
             let quit_store = Arc::clone(&quit_store);
+            let quit_updates = quit_updates.clone();
             async move {
                 if let Err(error) = quit_store
                     .store
@@ -334,6 +333,10 @@ fn main() {
                 {
                     eprintln!("diri: could not flush preferences while quitting: {error}");
                 }
+                // Automatic updates are already downloaded and verified. Start
+                // the detached swap helper now; it waits for this process to
+                // exit and deliberately does not reopen an app the user quit.
+                quit_updates.install_on_quit();
                 if release_owned_daemon
                     && let Err(error) = quit_store.client().shutdown_daemon_if_idle().await
                 {

@@ -221,9 +221,17 @@ impl ScrollbackViewport {
 
     /// Re-pins the anchor to whatever content the window now shows. Returning
     /// to live drops the anchor so the view follows the bottom again.
+    ///
+    /// An anchor is an absolute row, so it only exists once geometry is known.
+    /// Before the first fetch answers, `live_start_row` is still zero and any
+    /// anchor derived from it names a row that does not exist: the first wheel
+    /// event of a session recorded a negative anchor, and the arriving geometry
+    /// re-derived the offset from it and threw the reader to the top of
+    /// history. While geometry is unknown the offset is the state, and it
+    /// carries over unchanged.
     fn sync_anchor(&mut self) {
-        self.anchor =
-            (self.view_offset > 0).then(|| self.live_start_row.saturating_sub(self.view_offset));
+        self.anchor = (self.geometry_known && self.view_offset > 0)
+            .then(|| self.live_start_row.saturating_sub(self.view_offset));
     }
 
     pub fn scroll_by(&mut self, lines: i64, visible_rows: usize) -> bool {
@@ -657,6 +665,45 @@ mod tests {
             viewport.view_offset(),
             546,
             "scrolling clamps at the oldest retained row"
+        );
+    }
+
+    #[test]
+    fn the_first_scroll_of_a_session_stays_where_the_wheel_put_it() {
+        // The very first wheel event happens before any fetch has told the
+        // viewport where the live edge is, so `live_start_row` is still 0. The
+        // anchor derived from it was a negative absolute row, and the moment
+        // real geometry landed the offset was recomputed against it and threw
+        // the reader to the oldest retained row.
+        let mut viewport = ScrollbackViewport::default();
+        assert!(!viewport.geometry_known());
+        viewport.scroll_by(5, 40);
+        assert_eq!(viewport.view_offset(), 5);
+
+        let request = viewport.begin_fetch(40).expect("first scroll wants rows");
+        let start = request.first_row.max(0);
+        let rows: Vec<_> = (start..start + request.max_rows)
+            .map(|_| row("history", 8))
+            .collect();
+        viewport
+            .complete_fetch(
+                ReadScrollbackCellsResult {
+                    payload: GridRowCodec::encode_rows(&rows).unwrap(),
+                    first_row: start,
+                    row_count: i64::try_from(rows.len()).unwrap(),
+                    total_rows: 1_040,
+                    live_start_row: 1_000,
+                    cols: 8,
+                    content_seq: 1,
+                },
+                40,
+            )
+            .unwrap();
+
+        assert_eq!(
+            viewport.view_offset(),
+            5,
+            "learning the live edge must not move the window"
         );
     }
 

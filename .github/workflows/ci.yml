@@ -9,55 +9,8 @@ permissions:
   contents: read
 
 jobs:
-  engine:
-    name: Swift engine (daemon + CLI)
-    runs-on: macos-15
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.0.0
-      - name: Validate shell scripts
-        run: bash -n scripts/*.sh diri/scripts/*.sh
-      - name: Verify reviewed regressions stay fixed
-        run: diri/scripts/verify-remote-refactor.sh
-      - name: Test release publishing guards
-        run: |
-          bash diri/scripts/test-publish-github-release.sh
-          bash diri/scripts/test-publish-homebrew-cask.sh
-      - name: Install and audit browser sidecar
-        working-directory: sidecar
-        run: |
-          npm ci
-          npm audit --omit=dev
-      # --no-parallel is load-bearing on CI. Run in parallel, every test starts
-      # at once, and the suite then stalls indefinitely on a 3-core runner: the
-      # PTY and holder tests block inside async contexts, and with that few
-      # cores the cooperative pool has no thread left to make progress on.
-      # A developer Mac has enough cores to hide it. Serial costs ~30s.
-      #
-      # SwiftPM also block-buffers when stdout is a pipe, so a test process that
-      # dies takes most of its console output with it — hence the xunit file.
-      # `script` gives the run a pty, which makes SwiftPM line-buffer. Piped, it
-      # block-buffers, and a test process that dies takes the tail of its output
-      # with it — so the log's last line is wherever the buffer happened to
-      # flush, not where the run actually stopped. That cost real debugging
-      # time. The xunit file is no help either: it is only written at the end.
-      - name: Test
-        env:
-          # Runner spawns and socket binds are far slower than on a dev Mac; the
-          # 5s liveness waits time out there. See waitUntil in the test helpers.
-          DIRIJOR_TEST_TIMEOUT_SCALE: "6"
-        run: |
-          set -o pipefail
-          script -q /dev/null swift test --no-parallel | tee "${RUNNER_TEMP}/test.log"
-          grep -q "Test run with .* passed" "${RUNNER_TEMP}/test.log"
-      - name: Where it stopped
-        if: failure()
-        run: tail -40 "${RUNNER_TEMP}/test.log" || true
-      - name: Release build
-        run: swift build -c release
-
   app:
-    name: Rust app (diri)
+    name: Rust workspace
     runs-on: macos-15
     timeout-minutes: 60
     defaults:
@@ -75,6 +28,12 @@ jobs:
             diri/target
           key: ${{ runner.os }}-cargo-${{ hashFiles('diri/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
+      - name: Validate shell and release scripts
+        run: |
+          bash -n ../scripts/*.sh scripts/*.sh
+          bash scripts/verify-remote-refactor.sh
+          bash scripts/test-publish-github-release.sh
+          bash scripts/test-publish-homebrew-cask.sh
       - name: Check dependency license policy
         run: python3 ../scripts/check-licenses.py
       - name: Format
@@ -87,6 +46,37 @@ jobs:
         run: scripts/remote-acceptance.sh
       - name: Release build
         run: cargo build --workspace --release
+
+  engine-linux:
+    name: Rust engine (Linux x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: diri
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.0.0
+      - name: Report Linux environment
+        run: |
+          cat /etc/os-release
+          uname -a
+          rustc --version --verbose
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            diri/target
+          key: linux-engine-cargo-${{ hashFiles('diri/Cargo.lock') }}
+          restore-keys: linux-engine-cargo-
+      # This is deliberately native rather than a cross-build: the PTY suite
+      # exercises openpty/ioctl/SIGWINCH/process groups and Linux's EIO-at-EOF
+      # behavior against real child processes.
+      - name: Test shared PTY crate natively
+        run: cargo test --locked -p diri-pty -- --nocapture
+      - name: Test Rust engine natively
+        run: cargo test --locked -p diri-engine -- --nocapture
 
   remote-helper-native:
     name: Remote Helper (${{ matrix.target }})
@@ -188,6 +178,51 @@ jobs:
           DIRI_REMOTE_SSH_TARGET: diri-ci-soak
           DIRI_REMOTE_SOAK_SECONDS: "5"
         run: scripts/remote-ssh-soak.sh
+      - name: Start PAM/logind logout-policy endpoint
+        run: |
+          sudo useradd --create-home --shell /bin/bash diri-pam
+          sudo usermod -p '*' diri-pam
+          sudo install -d -m 700 -o diri-pam -g diri-pam /home/diri-pam/.ssh
+          sudo install -m 600 -o diri-pam -g diri-pam \
+            "${RUNNER_TEMP}/diri_ci_key.pub" /home/diri-pam/.ssh/authorized_keys
+          sudo mkdir -p /etc/systemd/logind.conf.d
+          printf '%s\n' \
+            '[Login]' \
+            'KillUserProcesses=yes' \
+            'UserStopDelaySec=0' \
+            | sudo tee /etc/systemd/logind.conf.d/99-diri-ci.conf >/dev/null
+          sudo systemctl restart systemd-logind
+          printf '%s\n' \
+            'Host diri-ci-pam' \
+            '  HostName 127.0.0.1' \
+            '  Port 2223' \
+            '  User diri-pam' \
+            "  IdentityFile ${RUNNER_TEMP}/diri_ci_key" \
+            '  IdentitiesOnly yes' \
+            '  StrictHostKeyChecking accept-new' \
+            "  UserKnownHostsFile ${RUNNER_TEMP}/known_hosts" \
+            >> "${HOME}/.ssh/config"
+          sudo /usr/sbin/sshd -D -e -p 2223 \
+            -o PasswordAuthentication=no \
+            -o KbdInteractiveAuthentication=no \
+            -o UsePAM=yes \
+            -o AllowUsers=diri-pam \
+            -o PidFile="${RUNNER_TEMP}/sshd/pam-sshd.pid" \
+            >"${RUNNER_TEMP}/sshd/pam-sshd.log" 2>&1 &
+          for attempt in $(seq 1 50); do
+            if ssh -o BatchMode=yes diri-ci-pam true; then
+              exit 0
+            fi
+            sleep 0.1
+          done
+          cat "${RUNNER_TEMP}/sshd/pam-sshd.log"
+          exit 1
+      - name: Verify PAM/logind logout is not misclassified
+        env:
+          DIRI_REMOTE_SSH_TARGET: diri-ci-pam
+        run: >-
+          cargo test --locked --release --package diri-remote --test real_ssh_soak
+          real_ssh_pam_logout_is_classified_non_persistent -- --ignored --exact --nocapture
 
   bundle:
     name: Package diri.app (unsigned)
@@ -226,11 +261,14 @@ jobs:
           app="${RUNNER_TEMP}/diri-dist/diri.app"
           plutil -lint "${app}/Contents/Info.plist"
           test -x "${app}/Contents/Resources/bin/dirijor"
+          test -x "${app}/Contents/Resources/bin/dirijor-mcp"
           test -x "${app}/Contents/Resources/bin/dirijord-rs"
           test -x "${app}/Contents/Resources/bin/diri-holder"
           test -x "${app}/Contents/Resources/bin/diri-ssh-askpass"
           test -f "${app}/Contents/Resources/bin/manifests/codex.json"
           lipo "${app}/Contents/Resources/bin/dirijord-rs" -verify_arch arm64 x86_64
+          lipo "${app}/Contents/Resources/bin/dirijor" -verify_arch arm64 x86_64
+          lipo "${app}/Contents/Resources/bin/dirijor-mcp" -verify_arch arm64 x86_64
           lipo "${app}/Contents/Resources/bin/diri-holder" -verify_arch arm64 x86_64
           lipo "${app}/Contents/Resources/bin/diri-ssh-askpass" -verify_arch arm64 x86_64
           test -f "${app}/Contents/Resources/bin/remote-helpers/manifest.json"
@@ -247,8 +285,10 @@ jobs:
         working-directory: sidecar
         run: |
           npm ci
+          npm audit --omit=dev
           npx playwright install chromium webkit firefox
       - name: Run browser integration tests
+        working-directory: diri
         env:
           DIRIJOR_RUN_BROWSER_TESTS: "1"
-        run: swift test --filter BrowserPoolTests
+        run: cargo test --package diri-engine browser_integration_runs_across_engines -- --nocapture

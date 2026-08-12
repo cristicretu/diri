@@ -43,6 +43,8 @@ pub struct ControlServer {
     governor: std::sync::Arc<Mutex<crate::governor::GovernorConfig>>,
     browser: std::sync::OnceLock<crate::browser::BrowserPool>,
     active_connections: Arc<AtomicUsize>,
+    agent_catalog: Arc<Mutex<crate::agent_catalog::AgentCatalogStore>>,
+    agent_scans: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 /// Where injection files live and which CLI they point at. Present, spawns
@@ -66,6 +68,15 @@ impl ControlServer {
         let remote_bindings = socket_path.parent().and_then(|parent| {
             crate::remote::binding::RemoteBindingStore::new(parent.join("remote-bindings")).ok()
         });
+        let agent_config_path = socket_path
+            .parent()
+            .map(|parent| parent.join("agents.json"))
+            .unwrap_or_else(|| PathBuf::from("agents.json"));
+        let agent_catalog = crate::agent_catalog::AgentCatalogStore::new(&agent_config_path)
+            .unwrap_or_else(|error| {
+                eprintln!("diri-engine: Agent configuration unavailable: {error}");
+                crate::agent_catalog::AgentCatalogStore::empty(agent_config_path)
+            });
         Self {
             registry,
             socket_path,
@@ -80,6 +91,8 @@ impl ControlServer {
             governor: std::sync::Arc::new(Mutex::new(crate::governor::GovernorConfig::default())),
             browser: std::sync::OnceLock::new(),
             active_connections: Arc::new(AtomicUsize::new(0)),
+            agent_catalog: Arc::new(Mutex::new(agent_catalog)),
+            agent_scans: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -345,7 +358,7 @@ impl ControlServer {
     /// pushes event frames onto the same socket while this loop keeps
     /// answering requests — one connection carries both, as the Swift daemon's
     /// does.
-    pub fn serve(&self, stream: UnixStream) -> std::io::Result<()> {
+    pub fn serve(self: &Arc<Self>, stream: UnixStream) -> std::io::Result<()> {
         let _connection = ActiveConnectionGuard::new(Arc::clone(&self.active_connections));
         let mut reader = BufReader::new(stream.try_clone()?);
         let writer = Arc::new(Mutex::new(stream));
@@ -411,7 +424,7 @@ impl ControlServer {
     }
 
     fn handle_line(
-        &self,
+        self: &Arc<Self>,
         line: &[u8],
         writer: &Arc<Mutex<UnixStream>>,
         subscription: &mut Option<SubscriptionHandle>,
@@ -438,6 +451,43 @@ impl ControlServer {
                     id,
                     result: self.events_subscribe(params, writer, subscription),
                 })
+            }
+            ControlMessage::Request { id, method, params }
+                if (method == Method::AGENT_READINESS || method == Method::AGENT_CONFIGURE)
+                    && params
+                        .as_ref()
+                        .and_then(|value| value.get("host"))
+                        .and_then(Value::as_str)
+                        .is_some() =>
+            {
+                // A remote catalog scan can hold an SSH connection for
+                // minutes, and the app multiplexes every RPC over this one
+                // connection; answering inline would stall spawns, kills, and
+                // list refreshes behind an unreachable host. The scan runs on
+                // its own thread and writes its response when done — clients
+                // match responses by id, and per-target single-flight inside
+                // `agent_catalog` keeps concurrent scans deduplicated. Local
+                // scans stay inline: they are PATH lookups, not connections.
+                let server = Arc::clone(self);
+                let writer = Arc::clone(writer);
+                let spawned = std::thread::Builder::new()
+                    .name("dirijord-agent-scan".into())
+                    .spawn(move || {
+                        let response = ControlMessage::Response {
+                            id,
+                            result: server.dispatch(&method, params),
+                        };
+                        let _ = write_message(&writer, &response);
+                    });
+                match spawned {
+                    Ok(_) => None,
+                    Err(error) => Some(ControlMessage::Response {
+                        id,
+                        result: Err(ControlError::internal(format!(
+                            "could not start the catalog scan: {error}"
+                        ))),
+                    }),
+                }
             }
             ControlMessage::Request { id, method, params } => Some(ControlMessage::Response {
                 id,
@@ -593,7 +643,8 @@ impl ControlServer {
             Method::SESSION_RESUME => self.session_resume(params),
             Method::SESSION_RESUME_FROM_HISTORY => self.session_resume_from_history(params),
             Method::SESSION_REOPEN_LAST => self.session_reopen_last(),
-            Method::AGENT_READINESS => self.agent_readiness(),
+            Method::AGENT_READINESS => self.agent_readiness(params),
+            Method::AGENT_CONFIGURE => self.agent_configure(params),
             Method::PROJECT_ADD => self.project_add(params),
             Method::SESSION_READ_DIFF => self.session_read_diff(params),
             Method::SESSION_HIBERNATE => self.session_hibernate(params),
@@ -698,7 +749,10 @@ impl ControlServer {
         let manifest = engine
             .manifest(&kind)
             .ok_or_else(|| ControlError::not_found(format!("no manifest for agent {kind:?}")))?;
-        let descriptor = manifest.agent.clone().unwrap_or_default();
+        let mut descriptor = manifest.agent.clone().unwrap_or_default();
+        if let Some(binary) = descriptor.binary.as_deref() {
+            descriptor.binary = Some(self.resolve_local_agent_executable(&kind, binary)?);
+        }
         let authority = descriptor.authority();
 
         let id = next_session_id();
@@ -716,10 +770,14 @@ impl ControlServer {
                 uuid
             });
             if let Some(injection) = &self.injection {
-                launch_args.extend(crate::inject::injection_args(
+                launch_args.extend(crate::inject::injection_args_with_cursor(
                     &descriptor.injection,
                     &injection.inject_dir,
                     &injection.cli_path,
+                    Some(crate::inject::CursorInject {
+                        session_id: &id,
+                        socket_path: &self.socket_path,
+                    }),
                 ));
             }
         }
@@ -742,6 +800,7 @@ impl ControlServer {
         };
 
         let mut record = new_record(&id, &kind, &cwd);
+        record.kind = p.kind.clone();
         // A linked worktree is an execution cwd inside the project selected
         // by the user; it does not become a new first-level sidebar project.
         record.project_id = crate::registry::session_project_id(&p.cwd, None);
@@ -870,24 +929,8 @@ impl ControlServer {
         } else {
             p.cwd.clone()
         };
-        let captured = manager
-            .capture_environment(
-                &helper,
-                &diri_proto::remote_pty::EnvironmentCaptureRequest {
-                    cwd: Some(requested_cwd),
-                    timeout_millis: 10_000,
-                },
-            )
-            .map_err(io_control_error)?;
-        let cwd = PathBuf::from(&captured.cwd);
-        if !cwd.is_absolute() {
-            return Err(ControlError::internal(
-                "remote Helper returned a non-absolute cwd",
-            ));
-        }
-
         let kind = p.kind.id().to_string();
-        let (descriptor, engine) = {
+        let (mut descriptor, engine) = {
             let registry = self.registry.lock().map_err(poisoned)?;
             let engine = registry.engine();
             let manifest = engine.manifest(&kind).ok_or_else(|| {
@@ -896,6 +939,33 @@ impl ControlServer {
             (manifest.agent.clone().unwrap_or_default(), engine)
         };
         drop(engine);
+        let captured = if let Some(binary) = descriptor.binary.as_deref() {
+            let (executable, captured) = self.discover_remote_agent_for_launch(
+                manager.as_ref(),
+                &host,
+                &kind,
+                binary,
+                requested_cwd,
+            )?;
+            descriptor.binary = Some(executable);
+            captured
+        } else {
+            manager
+                .capture_environment(
+                    &helper,
+                    &diri_proto::remote_pty::EnvironmentCaptureRequest {
+                        cwd: Some(requested_cwd),
+                        timeout_millis: 10_000,
+                    },
+                )
+                .map_err(io_control_error)?
+        };
+        let cwd = PathBuf::from(&captured.cwd);
+        if !cwd.is_absolute() {
+            return Err(ControlError::internal(
+                "remote Helper returned a non-absolute cwd",
+            ));
+        }
         let authority = descriptor.authority();
         let inherited = captured
             .environment
@@ -971,6 +1041,7 @@ impl ControlServer {
         };
 
         let mut record = new_record(&id, &kind, &captured.cwd);
+        record.kind = p.kind.clone();
         record.host = Some(host.id.clone());
         record.project_id = crate::registry::session_project_id(&captured.cwd, Some(&host.id));
         record.remote_persistence = Some(persistence);
@@ -1287,6 +1358,7 @@ impl ControlServer {
             let target_id = target_host.as_ref().map(|host| host.id.clone());
             let branch = prepared.branch.clone();
             let cwd = prepared.target_repo_root.clone();
+            let worktree = prepared.target_is_worktree.then(|| cwd.clone());
             let transcript = shuttle.local_target_path.clone();
             let local = target_host.is_none();
             registry.ensure_session_project(&cwd, target_id.as_deref());
@@ -1295,7 +1367,7 @@ impl ControlServer {
                 record.cwd = cwd;
                 record.project_id =
                     crate::registry::session_project_id(&record.cwd, record.host.as_deref());
-                record.worktree_path = None;
+                record.worktree_path = worktree;
                 record.git_branch = Some(branch);
                 record.transcript_path = if local { transcript } else { None };
                 record.status = diri_proto::SessionStatus::Exited(diri_proto::ExitInfo {
@@ -1366,6 +1438,10 @@ impl ControlServer {
                 },
             )
             .map_err(io_control_error)?;
+        self.agent_catalog
+            .lock()
+            .map_err(poisoned)?
+            .invalidate(Some(&host.id));
         encode(&diri_proto::HostInitializeResult {
             helper_build_id: helper.build_id,
             protocol: helper.protocol,
@@ -1380,7 +1456,10 @@ impl ControlServer {
     /// uses the verified Helper over `ssh -T`; the app never executes SSH.
     fn host_list_directories(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::HostListDirectoriesParams = decode(params)?;
-        let request = diri_proto::remote_pty::DirectoryListRequest { path: p.path };
+        let request = diri_proto::remote_pty::DirectoryListRequest {
+            path: p.path,
+            mode: p.mode,
+        };
         let result = if let Some(host_id) = p.host {
             let manager = self
                 .remote
@@ -1762,22 +1841,7 @@ impl ControlServer {
         let persistence = manager
             .probe_persistence(&host, &helper)
             .map_err(io_control_error)?;
-        let captured = manager
-            .capture_environment(
-                &helper,
-                &diri_proto::remote_pty::EnvironmentCaptureRequest {
-                    cwd: Some(record.cwd.clone()),
-                    timeout_millis: 10_000,
-                },
-            )
-            .map_err(io_control_error)?;
-        let cwd = PathBuf::from(&captured.cwd);
-        if !cwd.is_absolute() {
-            return Err(ControlError::internal(
-                "remote Helper returned a non-absolute cwd",
-            ));
-        }
-        let (descriptor, authority) = {
+        let (mut descriptor, authority) = {
             let registry = self.registry.lock().map_err(poisoned)?;
             let engine = registry.engine();
             let manifest = engine.manifest(record.kind.id()).ok_or_else(|| {
@@ -1787,6 +1851,33 @@ impl ControlServer {
             let authority = descriptor.authority();
             (descriptor, authority)
         };
+        let captured = if let Some(binary) = descriptor.binary.as_deref() {
+            let (executable, captured) = self.discover_remote_agent_for_launch(
+                manager.as_ref(),
+                &host,
+                record.kind.id(),
+                binary,
+                record.cwd.clone(),
+            )?;
+            descriptor.binary = Some(executable);
+            captured
+        } else {
+            manager
+                .capture_environment(
+                    &helper,
+                    &diri_proto::remote_pty::EnvironmentCaptureRequest {
+                        cwd: Some(record.cwd.clone()),
+                        timeout_millis: 10_000,
+                    },
+                )
+                .map_err(io_control_error)?
+        };
+        let cwd = PathBuf::from(&captured.cwd);
+        if !cwd.is_absolute() {
+            return Err(ControlError::internal(
+                "remote Helper returned a non-absolute cwd",
+            ));
+        }
         let mut launch_args = descriptor.spawn_args.clone();
         launch_args.extend(
             descriptor
@@ -1854,6 +1945,7 @@ impl ControlServer {
         let mut registry = self.registry.lock().map_err(poisoned)?;
         let id = next_session_id();
         let kind = p.entry.kind.id().to_string();
+        let prompt = p.initial_prompt.filter(|prompt| !prompt.is_empty());
         let mut record = new_record(&id, &kind, &p.entry.cwd);
         record.agent_session_id = Some(p.entry.id.clone());
         record.transcript_path = Some(p.entry.transcript_path.clone());
@@ -1873,6 +1965,19 @@ impl ControlServer {
             .into_iter()
             .find(|record| record.id.0 == id)
             .ok_or_else(|| ControlError::internal("the resumed session vanished"))?;
+        drop(registry);
+        if kind == diri_proto::AgentKind::CLAUDE_CODE_ID || prompt.is_some() {
+            let registry = Arc::clone(&self.registry);
+            let session_id = id.clone();
+            std::thread::spawn(move || {
+                prepare_agent_input(
+                    &registry,
+                    &session_id,
+                    kind == diri_proto::AgentKind::CLAUDE_CODE_ID,
+                    prompt.as_deref(),
+                );
+            });
+        }
         serde_json::to_value(&record).map_err(|error| ControlError::internal(error.to_string()))
     }
 
@@ -1891,11 +1996,13 @@ impl ControlServer {
         let manifest = engine
             .manifest(kind)
             .ok_or_else(|| ControlError::not_found(format!("no manifest for agent {kind}")))?;
-        let descriptor = manifest.agent.clone().unwrap_or_default();
+        let mut descriptor = manifest.agent.clone().unwrap_or_default();
         descriptor
             .binary
             .as_ref()
             .ok_or_else(|| ControlError::bad_request(format!("agent {kind} declares no binary")))?;
+        let binary = descriptor.binary.clone().expect("checked above");
+        descriptor.binary = Some(self.resolve_local_agent_executable(kind, &binary)?);
         let tail = descriptor.resume_args(agent_session_id).ok_or_else(|| {
             ControlError::bad_request(format!("agent {kind} does not support resume"))
         })?;
@@ -1906,15 +2013,21 @@ impl ControlServer {
             // Only the appendable flag mechanisms replay on resume, exactly
             // as in Swift: Codex's global `-c` overrides must precede the
             // resume SUBCOMMAND and are deliberately not replayed.
-            let claude_only = crate::agent::InjectionSpec {
+            let replay = crate::agent::InjectionSpec {
                 claude_hooks: descriptor.injection.claude_hooks,
                 claude_mcp: descriptor.injection.claude_mcp,
+                cursor_mcp: descriptor.injection.cursor_mcp,
+                cursor_hooks: descriptor.injection.cursor_hooks,
                 ..Default::default()
             };
-            launch_args.extend(crate::inject::injection_args(
-                &claude_only,
+            launch_args.extend(crate::inject::injection_args_with_cursor(
+                &replay,
                 &injection.inject_dir,
                 &injection.cli_path,
+                Some(crate::inject::CursorInject {
+                    session_id: id,
+                    socket_path: &self.socket_path,
+                }),
             ));
         }
 
@@ -1958,30 +2071,303 @@ impl ControlServer {
         serde_json::to_value(&record).map_err(|error| ControlError::internal(error.to_string()))
     }
 
-    /// Which agent binaries actually resolve, plus each manifest's descriptor
-    /// — this doubles as the agent catalog the client's picker renders.
-    fn agent_readiness(&self) -> Result<JsonValue, ControlError> {
-        let registry = self.registry.lock().map_err(poisoned)?;
-        let engine = registry.engine();
-        let mut agents = Vec::new();
-        for id in engine.ids() {
-            let Some(manifest) = engine.manifest(id) else {
-                continue;
-            };
-            let Some(descriptor) = &manifest.agent else {
-                continue;
-            };
-            let Some(binary) = &descriptor.binary else {
-                continue;
-            };
-            agents.push(json!({
-                "kind": id,
-                "binary": binary,
-                "path": resolve_on_path(binary),
-                "descriptor": engine.raw_agent(id),
-            }));
+    /// Manifest catalog plus executable facts for one execution target. The
+    /// scan is batched and target-keyed; a menu render never invokes this RPC.
+    fn agent_readiness(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::AgentReadinessParams = decode(params).unwrap_or_default();
+        encode(&self.agent_catalog(&p, false)?)
+    }
+
+    fn resolve_local_agent_executable(
+        &self,
+        kind: &str,
+        binary: &str,
+    ) -> Result<String, ControlError> {
+        let preference = self
+            .agent_catalog
+            .lock()
+            .map_err(poisoned)?
+            .preference(None, kind);
+        // Only an explicit user-configured path overrides the manifest. With
+        // no override the binary deliberately stays bare: `spawn_spec` either
+        // hands it to a fresh interactive login shell (which resolves the
+        // nvm/mise/Homebrew PATH the daemon never inherited) or absolutizes
+        // it against the spawn environment. Judging availability by the
+        // daemon's own PATH here would reject agents the login shell can
+        // launch, and pin versions to whatever the daemon saw at startup.
+        let Some(configured) = preference.executable_path.as_deref() else {
+            return Ok(binary.to_owned());
+        };
+        let resolution = crate::agent_catalog::resolve_local(binary, Some(configured));
+        resolution
+            .configured_path
+            .ok_or_else(|| agent_unavailable(kind, None, resolution.configured_error.as_deref()))
+    }
+
+    fn discover_remote_agent_for_launch(
+        &self,
+        manager: &crate::remote::manager::RemoteManager,
+        host: &diri_proto::HostEntry,
+        kind: &str,
+        binary: &str,
+        cwd: String,
+    ) -> Result<(String, diri_proto::remote_pty::EnvironmentCaptureResult), ControlError> {
+        let preference = self
+            .agent_catalog
+            .lock()
+            .map_err(poisoned)?
+            .preference(Some(&host.id), kind);
+        let result = manager
+            .discover_executables(
+                host,
+                &diri_proto::remote_pty::ExecutableDiscoveryRequest {
+                    queries: vec![diri_proto::remote_pty::ExecutableQuery {
+                        id: kind.to_owned(),
+                        binary: binary.to_owned(),
+                        configured_path: preference.executable_path,
+                    }],
+                    cwd: Some(cwd),
+                    timeout_millis: 10_000,
+                },
+            )
+            .map_err(io_control_error)?;
+        let resolution = result.items.into_iter().next().ok_or_else(|| {
+            ControlError::internal("remote Helper omitted the executable discovery result")
+        })?;
+        let host_name = host.display_name();
+        let executable = resolution
+            .configured_path
+            .or(resolution.detected_path)
+            .ok_or_else(|| {
+                agent_unavailable(
+                    kind,
+                    Some(host_name),
+                    resolution.configured_error.as_deref(),
+                )
+            })?;
+        Ok((executable, result.environment))
+    }
+
+    fn agent_configure(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::AgentConfigureParams = decode(params)?;
+        let kind = p.kind.id().to_owned();
+        {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            let engine = registry.engine();
+            let manifest = engine.manifest(&kind).ok_or_else(|| {
+                ControlError::not_found(format!("no manifest for agent {kind:?}"))
+            })?;
+            if manifest
+                .agent
+                .as_ref()
+                .and_then(|agent| agent.binary.as_ref())
+                .is_none()
+            {
+                return Err(ControlError::bad_request(
+                    "terminal and generic manifests cannot be configured as Agents",
+                ));
+            }
         }
-        Ok(json!({ "agents": agents }))
+        if let Some(host) = p.host.as_deref() {
+            self.resolve_host(host)?;
+        }
+        let preference = crate::agent_catalog::AgentPreference {
+            executable_path: p.executable_path,
+            show_in_quick_create: Some(p.show_in_quick_create),
+        };
+        self.agent_catalog
+            .lock()
+            .map_err(poisoned)?
+            .configure(p.host.as_deref(), &kind, preference)
+            .map_err(io_control_error)?;
+        let result = self.agent_catalog(
+            &diri_proto::AgentReadinessParams {
+                host: p.host,
+                force_refresh: true,
+            },
+            true,
+        )?;
+        encode(&result)
+    }
+
+    fn agent_catalog(
+        &self,
+        params: &diri_proto::AgentReadinessParams,
+        _validate_configured: bool,
+    ) -> Result<diri_proto::AgentReadinessResult, ControlError> {
+        if let Some(host) = params.host.as_deref() {
+            self.resolve_host(host)?;
+        }
+        if !params.force_refresh
+            && let Some(cached) = self
+                .agent_catalog
+                .lock()
+                .map_err(poisoned)?
+                .cached(params.host.as_deref())
+        {
+            return Ok(cached);
+        }
+        let force_baseline = if params.force_refresh {
+            self.agent_catalog
+                .lock()
+                .map_err(poisoned)?
+                .cached(params.host.as_deref())
+        } else {
+            None
+        };
+
+        // Single-flight each target. A slow remote never blocks local or a
+        // different host, while concurrent menus/settings share one scan.
+        let target_key = params.host.as_deref().unwrap_or("local").to_owned();
+        let scan_lock = self
+            .agent_scans
+            .lock()
+            .map_err(poisoned)?
+            .entry(target_key)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _scan = scan_lock.lock().map_err(poisoned)?;
+        if params.force_refresh {
+            let current = self
+                .agent_catalog
+                .lock()
+                .map_err(poisoned)?
+                .cached(params.host.as_deref());
+            if current != force_baseline
+                && let Some(current) = current
+            {
+                return Ok(current);
+            }
+        }
+        if !params.force_refresh
+            && let Some(cached) = self
+                .agent_catalog
+                .lock()
+                .map_err(poisoned)?
+                .cached(params.host.as_deref())
+        {
+            return Ok(cached);
+        }
+
+        let manifests = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            let engine = registry.engine();
+            let mut manifests = engine
+                .ids()
+                .into_iter()
+                .filter_map(|id| {
+                    let descriptor = engine.manifest(id)?.agent.as_ref()?;
+                    let binary = descriptor.binary.clone()?;
+                    Some((id.to_owned(), binary, engine.raw_agent(id).cloned()))
+                })
+                .collect::<Vec<_>>();
+            manifests.sort_by(|left, right| left.0.cmp(&right.0));
+            manifests
+        };
+        let preferences = {
+            let catalog = self.agent_catalog.lock().map_err(poisoned)?;
+            manifests
+                .iter()
+                .map(|(id, _, _)| catalog.preference(params.host.as_deref(), id))
+                .collect::<Vec<_>>()
+        };
+
+        let resolutions = if let Some(host_id) = params.host.as_deref() {
+            let manager = self
+                .remote
+                .as_ref()
+                .ok_or_else(crate::remote::transport_unavailable)?;
+            let host = self.resolve_host(host_id)?;
+            let result = manager
+                .discover_executables(
+                    &host,
+                    &diri_proto::remote_pty::ExecutableDiscoveryRequest {
+                        queries: manifests
+                            .iter()
+                            .zip(&preferences)
+                            .map(|((id, binary, _), preference)| {
+                                diri_proto::remote_pty::ExecutableQuery {
+                                    id: id.clone(),
+                                    binary: binary.clone(),
+                                    configured_path: preference.executable_path.clone(),
+                                }
+                            })
+                            .collect(),
+                        cwd: None,
+                        timeout_millis: 10_000,
+                    },
+                )
+                .map_err(io_control_error)?;
+            let by_id = result
+                .items
+                .into_iter()
+                .map(|item| (item.id.clone(), item))
+                .collect::<std::collections::HashMap<_, _>>();
+            manifests
+                .iter()
+                .map(|(id, _, _)| {
+                    let item = by_id.get(id);
+                    crate::agent_catalog::ExecutableResolution {
+                        detected_path: item.and_then(|item| item.detected_path.clone()),
+                        configured_path: item.and_then(|item| item.configured_path.clone()),
+                        configured_error: item.and_then(|item| item.configured_error.clone()),
+                    }
+                })
+                .collect::<Vec<_>>()
+        } else {
+            manifests
+                .iter()
+                .zip(&preferences)
+                .map(|((_, binary, _), preference)| {
+                    crate::agent_catalog::resolve_local(
+                        binary,
+                        preference.executable_path.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut agents = Vec::with_capacity(manifests.len());
+        for (((id, binary, raw_descriptor), preference), resolution) in
+            manifests.into_iter().zip(preferences).zip(resolutions)
+        {
+            let path = resolution
+                .configured_path
+                .clone()
+                .or_else(|| resolution.detected_path.clone());
+            let show = preference.show_in_quick_create.unwrap_or(path.is_some()) && path.is_some();
+            let path_source = if resolution.configured_path.is_some() {
+                Some(diri_proto::AgentPathSource::Manual)
+            } else if resolution.detected_path.is_some() {
+                Some(diri_proto::AgentPathSource::SystemPath)
+            } else {
+                None
+            };
+            let descriptor = raw_descriptor.and_then(|value| {
+                serde_json::from_value::<diri_proto::AgentDescriptor>(value).ok()
+            });
+            agents.push(diri_proto::AgentReadinessItem {
+                kind: diri_proto::AgentKind::new(id),
+                binary,
+                path,
+                detected_path: resolution.detected_path,
+                configured_path: preference.executable_path,
+                path_source,
+                show_in_quick_create: show,
+                error: resolution.configured_error,
+                descriptor,
+            });
+        }
+        let result = diri_proto::AgentReadinessResult {
+            host: params.host.clone(),
+            scanned_at: Some(diri_proto::DateMillis::from(std::time::SystemTime::now())),
+            agents,
+        };
+        self.agent_catalog
+            .lock()
+            .map_err(poisoned)?
+            .cache(params.host.as_deref(), result.clone());
+        Ok(result)
     }
 
     fn project_add(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
@@ -2098,7 +2484,7 @@ impl ControlServer {
                         .is_ok_and(|registry| registry.live_count() == 0);
                     if still_idle {
                         if let Some(remote) = remote {
-                            remote.close_control_masters();
+                            let _ = remote.close_control_masters();
                         }
                         if let Some(holder) = holder {
                             let paths = crate::holder::HolderManagerPaths::new(&holder.holders_dir);
@@ -2280,6 +2666,7 @@ pub(crate) fn new_record(id: &str, kind: &str, cwd: &str) -> diri_proto::Session
         agent_session_id: None,
         transcript_path: None,
         status: diri_proto::SessionStatus::Starting,
+        status_evidence: None,
         needs_input: None,
         resumability: Resumability::Live,
         parent: None,
@@ -2373,33 +2760,6 @@ fn encode<T: serde::Serialize>(value: &T) -> Result<JsonValue, ControlError> {
     serde_json::to_value(value).map_err(|error| ControlError::internal(error.to_string()))
 }
 
-/// Resolves a binary on the daemon's PATH, as the readiness check needs.
-fn resolve_on_path(binary: &str) -> Option<String> {
-    if binary.contains('/') {
-        return Path::new(binary).exists().then(|| binary.to_string());
-    }
-    let path = std::env::var("PATH").ok()?;
-    for dir in path.split(':') {
-        let candidate = Path::new(dir).join(binary);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if std::fs::metadata(&candidate)
-                .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-                .unwrap_or(false)
-            {
-                return Some(candidate.to_string_lossy().into_owned());
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            if candidate.is_file() {
-                return Some(candidate.to_string_lossy().into_owned());
-            }
-        }
-    }
-    None
-}
 fn migrate_control_error(error: crate::migrate::MigrateError) -> ControlError {
     match error {
         crate::migrate::MigrateError::BadRequest(message) => ControlError::bad_request(message),
@@ -2412,6 +2772,17 @@ fn io_control_error(error: std::io::Error) -> ControlError {
         std::io::ErrorKind::NotFound => ControlError::not_found(error.to_string()),
         _ => ControlError::internal(error.to_string()),
     }
+}
+
+fn agent_unavailable(kind: &str, host: Option<&str>, detail: Option<&str>) -> ControlError {
+    let target = host.map_or_else(|| "this Mac".to_owned(), ToOwned::to_owned);
+    let suffix = detail.map_or_else(String::new, |detail| format!(": {detail}"));
+    ControlError::new(
+        "agent_unavailable",
+        format!(
+            "{kind} is not available on {target}; detect it or bind an executable in Settings > Agents{suffix}"
+        ),
+    )
 }
 
 fn history_entry_to_wire(entry: crate::history::HistoryEntry) -> diri_proto::HistoryEntry {
@@ -2849,9 +3220,12 @@ mod tests {
         Arc::new(engine)
     }
 
-    fn server(temp: &Path) -> ControlServer {
+    fn server(temp: &Path) -> Arc<ControlServer> {
         let registry = Registry::new(engine(), temp.join("state.json"));
-        ControlServer::new(Arc::new(Mutex::new(registry)), temp.join("daemon.sock"))
+        Arc::new(ControlServer::new(
+            Arc::new(Mutex::new(registry)),
+            temp.join("daemon.sock"),
+        ))
     }
 
     fn test_record(id: &str) -> diri_proto::SessionRecord {
@@ -2868,6 +3242,7 @@ mod tests {
             agent_session_id: None,
             transcript_path: None,
             status: SessionStatus::Idle,
+            status_evidence: None,
             needs_input: None,
             resumability: Resumability::NotResumable,
             parent: None,
@@ -2891,12 +3266,16 @@ mod tests {
     /// Round-trips one request through the dispatcher the way a client would.
     /// Dispatches one line the way `serve` would, with a throwaway socket
     /// standing in for the connection's write half.
-    fn handle(server: &ControlServer, line: &[u8]) -> Option<ControlMessage> {
+    fn handle(server: &Arc<ControlServer>, line: &[u8]) -> Option<ControlMessage> {
         let (writer, _peer) = UnixStream::pair().expect("socketpair");
         server.handle_line(line, &Arc::new(Mutex::new(writer)), &mut None)
     }
 
-    fn call(server: &ControlServer, method: &str, params: Option<JsonValue>) -> ControlMessage {
+    fn call(
+        server: &Arc<ControlServer>,
+        method: &str,
+        params: Option<JsonValue>,
+    ) -> ControlMessage {
         let request = ControlMessage::Request {
             id: 1,
             method: method.into(),
@@ -2991,10 +3370,17 @@ mod tests {
             codex_descriptor.injection.codex_notify || codex_descriptor.injection.codex_mcp,
             "codex opts into at least one shim"
         );
+
+        let cursor = engine.manifest("cursor").expect("cursor manifest");
+        let cursor_descriptor = cursor.agent.clone().expect("agent");
+        assert!(cursor_descriptor.injection.cursor_mcp);
+        assert!(cursor_descriptor.injection.cursor_hooks);
     }
 
     #[test]
     fn resuming_an_agent_directly_executes_the_agent() {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let temp = tempfile::tempdir().expect("temp");
         let registry = Registry::new(engine(), temp.path().join("state.json"));
         let server = ControlServer::new(
@@ -3004,6 +3390,23 @@ mod tests {
             ))),
             temp.path().join("daemon.sock"),
         );
+        let executable = temp.path().join("claude");
+        std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").expect("fake claude executable");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+            .expect("make fake claude executable");
+        server
+            .agent_catalog
+            .lock()
+            .expect("agent catalog lock")
+            .configure(
+                None,
+                "claude-code",
+                crate::agent_catalog::AgentPreference {
+                    executable_path: Some(executable.to_string_lossy().into_owned()),
+                    show_in_quick_create: Some(true),
+                },
+            )
+            .expect("bind fake claude executable");
 
         let spec = server
             .resume_spec(&registry, "s_resume", "claude-code", "/tmp", Some("uuid-1"))
@@ -3013,8 +3416,127 @@ mod tests {
         // have to reach the agent itself.
         let command = spec.pty.argv.last().expect("argv");
         assert!(
-            command.contains("'claude'") && command.contains("'--resume' 'uuid-1'"),
+            command.contains(&format!("{}'", executable.display()))
+                && command.contains("'--resume' 'uuid-1'"),
             "resume flags must reach the agent: {command:?}"
+        );
+    }
+
+    /// Without a manual path the manifest's binary stays bare: the interactive
+    /// login shell (or `spawn_spec`'s PATH absolutization) resolves it at
+    /// launch against nvm/mise/Homebrew PATHs the daemon never inherited.
+    /// Pre-judging availability by the daemon's own PATH would hard-fail
+    /// spawns the login shell can serve, and pin versions to daemon startup.
+    #[test]
+    fn local_spawns_keep_the_bare_binary_unless_a_path_is_configured() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().expect("temp");
+        let server = server(temp.path());
+        assert_eq!(
+            server
+                .resolve_local_agent_executable("claude-code", "not-on-the-daemon-path")
+                .expect("a bare binary is not pre-judged by the daemon's PATH"),
+            "not-on-the-daemon-path"
+        );
+
+        let configured = temp.path().join("claude");
+        std::fs::write(&configured, b"#!/bin/sh\nexit 0\n").expect("fake claude executable");
+        std::fs::set_permissions(&configured, std::fs::Permissions::from_mode(0o700))
+            .expect("make fake claude executable");
+        server
+            .agent_catalog
+            .lock()
+            .expect("agent catalog lock")
+            .configure(
+                None,
+                "claude-code",
+                crate::agent_catalog::AgentPreference {
+                    executable_path: Some(configured.to_string_lossy().into_owned()),
+                    show_in_quick_create: Some(true),
+                },
+            )
+            .expect("bind fake claude executable");
+        assert_eq!(
+            server
+                .resolve_local_agent_executable("claude-code", "claude")
+                .expect("configured path wins"),
+            configured.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn history_resume_keeps_the_identity_needed_for_another_resume() {
+        let temp = tempfile::tempdir().expect("temp");
+        let manifests = temp.path().join("manifests");
+        std::fs::create_dir_all(&manifests).expect("manifests dir");
+        std::fs::write(
+            manifests.join("probe.json"),
+            json!({
+                "schemaVersion": 2,
+                "id": "probe",
+                "version": "test",
+                "statusModel": "full",
+                "agent": {
+                    "binary": "/bin/sh",
+                    "resume": { "style": "flag", "token": "-c" },
+                },
+                "rules": [],
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+        let (probe, _) = ManifestEngine::load_dir(&manifests).expect("load");
+        let registry = Arc::new(Mutex::new(Registry::new(
+            Arc::new(probe),
+            temp.path().join("state.json"),
+        )));
+        let server = Arc::new(
+            ControlServer::new(Arc::clone(&registry), temp.path().join("daemon.sock"))
+                .with_logs_dir(temp.path().join("logs")),
+        );
+        let transcript = temp.path().join("conversation.jsonl");
+        std::fs::write(&transcript, "{}\n").expect("transcript");
+        let kind = diri_proto::AgentKind::new("probe");
+
+        let result = ok_of(call(
+            &server,
+            diri_proto::Method::SESSION_RESUME_FROM_HISTORY,
+            Some(json!({
+                "entry": {
+                    "id": "read line",
+                    "kind": serde_json::to_value(&kind).expect("kind"),
+                    "cwd": temp.path(),
+                    "title": "Recovered conversation",
+                    "transcriptPath": transcript,
+                    "lastActiveAt": 10.0,
+                    "cwdExists": true,
+                }
+            })),
+        ));
+
+        assert_eq!(result["kind"], serde_json::to_value(&kind).expect("kind"));
+        assert_eq!(result["agentSessionID"], "read line");
+        assert_eq!(
+            result["transcriptPath"],
+            transcript.to_string_lossy().as_ref()
+        );
+        assert_eq!(result["resumability"], "live");
+
+        let id = result["id"].as_str().expect("session id").to_owned();
+        registry
+            .lock()
+            .expect("registry")
+            .terminate(&id, Duration::from_millis(100))
+            .expect("terminate resumed probe");
+        assert_eq!(
+            registry
+                .lock()
+                .expect("registry")
+                .record(&id)
+                .expect("record")
+                .resumability,
+            diri_proto::Resumability::Resumable,
+            "the recovered record must remain resumable after its live process is gone"
         );
     }
 
@@ -3095,7 +3617,10 @@ mod tests {
             "the premise: a dead agent's session stays in the registry"
         );
 
-        let server = ControlServer::new(Arc::clone(&registry), temp.path().join("daemon.sock"));
+        let server = Arc::new(ControlServer::new(
+            Arc::clone(&registry),
+            temp.path().join("daemon.sock"),
+        ));
         let result = ok_of(call(
             &server,
             "session.resume",
@@ -3167,7 +3692,10 @@ mod tests {
             .lock()
             .expect("registry")
             .insert_record(test_record("s_rec"));
-        let server = ControlServer::new(registry, temp.path().join("daemon.sock"));
+        let server = Arc::new(ControlServer::new(
+            registry,
+            temp.path().join("daemon.sock"),
+        ));
 
         let params = json!({ "sessionID": "s_rec", "title": "renamed by hand" });
         ok_of(call(&server, "session.rename", Some(params)));
@@ -3222,7 +3750,10 @@ mod tests {
             .lock()
             .expect("registry")
             .insert_record(test_record("s_hook"));
-        let server = ControlServer::new(registry, temp.path().join("daemon.sock"));
+        let server = Arc::new(ControlServer::new(
+            registry,
+            temp.path().join("daemon.sock"),
+        ));
 
         ok_of(call(
             &server,
@@ -3286,6 +3817,11 @@ mod tests {
             .expect("claude in the catalog");
         assert_eq!(claude["binary"], "claude");
         assert!(
+            claude["descriptor"]["setup"]["url"]
+                .as_str()
+                .is_some_and(|url| url.starts_with("https://"))
+        );
+        assert!(
             claude["descriptor"]["injection"]["claudeHooks"]
                 .as_bool()
                 .unwrap_or(false),
@@ -3304,7 +3840,10 @@ mod tests {
             .lock()
             .expect("registry")
             .insert_record(test_record("s_gone"));
-        let server = ControlServer::new(registry, temp.path().join("daemon.sock"));
+        let server = Arc::new(ControlServer::new(
+            registry,
+            temp.path().join("daemon.sock"),
+        ));
 
         ok_of(call(
             &server,
@@ -3354,7 +3893,10 @@ mod tests {
         let mut record = test_record("s_diff");
         record.cwd = repo.to_string_lossy().into_owned();
         registry.lock().expect("registry").insert_record(record);
-        let server = ControlServer::new(registry, temp.path().join("daemon.sock"));
+        let server = Arc::new(ControlServer::new(
+            registry,
+            temp.path().join("daemon.sock"),
+        ));
 
         let result = ok_of(call(
             &server,

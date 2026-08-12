@@ -117,7 +117,11 @@ fn main() {
     );
     let registry = Arc::new(Mutex::new(registry));
 
-    let cli_path = exe_dir.join("dirijor");
+    // Stable CLI path under App Support (same contract as Swift dirijord):
+    // hooks, Codex notify, and dirijor-mcp all reference this absolute path.
+    // A cargo-built dirijord-rs does not sit next to a `dirijor` binary, so
+    // inventing `target/debug/dirijor` makes every MCP tools/list fail.
+    let cli_path = install_cli_helpers(&exe_dir, &app_support);
     let mut server = ControlServer::new(Arc::clone(&registry), app_support.join("daemon.sock"))
         .with_logs_dir(&logs_dir)
         .with_holder(holder)
@@ -221,17 +225,83 @@ fn login_shell() -> String {
 /// space-separated list, so `echo $PATH` produces garbage there — and `-i -l`
 /// sources both interactive and login files, which is where agent PATHs are
 /// actually configured.
+///
+/// Hard ceiling: wait for the shell to exit, then read stdout. On timeout,
+/// SIGKILL the process group (not SIGTERM — rc files can trap that) and fall
+/// back. Never block on an unbounded pipe read while the writer may still live.
 #[cfg(unix)]
 fn login_path(shell: &str) -> Option<String> {
+    login_path_with_timeout(shell, std::time::Duration::from_secs(5))
+}
+
+#[cfg(unix)]
+fn login_path_with_timeout(shell: &str, capture_timeout: std::time::Duration) -> Option<String> {
+    capture_login_path(shell, &["-i", "-l", "-c", "printenv PATH"], capture_timeout)
+}
+
+#[cfg(unix)]
+fn capture_login_path(
+    shell: &str,
+    arguments: &[&str],
+    capture_timeout: std::time::Duration,
+) -> Option<String> {
+    use std::io::{Read, Seek};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
     let fallback = || {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
         format!("{home}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
     };
-    let output = std::process::Command::new(shell)
-        .args(["-i", "-l", "-c", "printenv PATH"])
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // A background process from an rc file can inherit stdout after its shell
+    // exits. Capturing into an unlinked regular file means reading stops at the
+    // current length instead of waiting for that descendant to close a pipe.
+    let mut capture = anonymous_capture_file().ok()?;
+    let child_stdout = capture.try_clone().ok()?;
+    let mut child = unsafe {
+        Command::new(shell)
+            .args(arguments)
+            .stdout(Stdio::from(child_stdout))
+            .stderr(Stdio::null())
+            .pre_exec(|| {
+                // Own process group so trapped shells / hung children die with us.
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            })
+            .spawn()
+    }
+    .ok()?;
+
+    let started = Instant::now();
+    let timed_out = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break false,
+            Ok(None) if started.elapsed() < capture_timeout => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) | Err(_) => break true,
+        }
+    };
+
+    if timed_out {
+        let pid = child.id() as i32;
+        // SAFETY: pid is this child's id; negative targets its process group.
+        unsafe {
+            let _ = libc::kill(-pid, libc::SIGKILL);
+            let _ = libc::kill(pid, libc::SIGKILL);
+        }
+        let _ = child.wait();
+        return Some(fallback());
+    }
+
+    capture.rewind().ok()?;
+    let mut bytes = Vec::new();
+    let _ = capture.take(1 << 20).read_to_end(&mut bytes);
+    let stdout = String::from_utf8_lossy(&bytes);
     // Interactive shells may print a greeting; take the last line that looks
     // like a PATH.
     let path = stdout
@@ -253,12 +323,199 @@ fn login_path(shell: &str) -> Option<String> {
 }
 
 #[cfg(unix)]
+fn anonymous_capture_file() -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    for _ in 0..8 {
+        let mut nonce = [0_u8; 8];
+        getrandom::fill(&mut nonce).map_err(|error| std::io::Error::other(error.to_string()))?;
+        let suffix = nonce
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let path =
+            std::env::temp_dir().join(format!("dirijor-path-{}-{suffix}", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(file) => {
+                std::fs::remove_file(path)?;
+                return Ok(file);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique PATH capture file",
+    ))
+}
+
+#[cfg(unix)]
 fn app_support_dir() -> PathBuf {
     if let Ok(root) = std::env::var("DIRIJOR_APP_SUPPORT") {
         return PathBuf::from(root);
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     Path::new(&home).join("Library/Application Support/Dirijor")
+}
+
+/// Copy `dirijor`, `dirijor-mcp`, and the CLI's manifest resource bundle into
+/// App Support `bin/`, then return the stable `dirijor` path used for injection.
+#[cfg(unix)]
+fn install_cli_helpers(exe_dir: &Path, app_support: &Path) -> PathBuf {
+    let bin_dir = app_support.join("bin");
+    let _ = std::fs::create_dir_all(&bin_dir);
+    for name in ["dirijor", "dirijor-mcp"] {
+        let dest = bin_dir.join(name);
+        let Some(source) = cli_helper_sources(exe_dir, name)
+            .into_iter()
+            .find(|path| is_executable(path))
+        else {
+            continue;
+        };
+        if source.canonicalize().ok() == dest.canonicalize().ok() {
+            continue;
+        }
+        match install_cli_helper(&source, &dest) {
+            Ok(()) => eprintln!(
+                "dirijord-rs: installed helper: {} -> {}",
+                source.display(),
+                dest.display()
+            ),
+            Err(error) => eprintln!(
+                "dirijord-rs: helper install failed for {name}: {error} (source {})",
+                source.display()
+            ),
+        }
+    }
+    install_cli_resource_bundle(exe_dir, &bin_dir);
+    let stable = bin_dir.join("dirijor");
+    if is_executable(&stable) {
+        stable
+    } else if is_executable(&exe_dir.join("dirijor")) {
+        exe_dir.join("dirijor")
+    } else {
+        // Last resort: PATH lookup at spawn time. Still better than a path
+        // that is known not to exist beside this Engine binary.
+        PathBuf::from("dirijor")
+    }
+}
+
+#[cfg(unix)]
+fn install_cli_helper(source: &Path, dest: &Path) -> std::io::Result<()> {
+    let file_name = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid helper name")
+        })?;
+    let staging = dest.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&staging);
+    std::fs::copy(source, &staging)?;
+    set_executable(&staging);
+    if let Err(error) = std::fs::rename(&staging, dest) {
+        let _ = std::fs::remove_file(&staging);
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn install_cli_resource_bundle(exe_dir: &Path, bin_dir: &Path) {
+    const NAME: &str = "dirijor_DirijorCore.bundle";
+    let Some(source) = cli_helper_sources(exe_dir, NAME)
+        .into_iter()
+        .find(|path| path.is_dir())
+    else {
+        return;
+    };
+    let dest = bin_dir.join(NAME);
+    if source.canonicalize().ok() == dest.canonicalize().ok() {
+        return;
+    }
+    let staging = bin_dir.join(format!(".{NAME}.{}.tmp", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging);
+    if let Err(error) = copy_dir(&source, &staging) {
+        let _ = std::fs::remove_dir_all(&staging);
+        eprintln!(
+            "dirijord-rs: helper resource install failed: {error} (source {})",
+            source.display()
+        );
+        return;
+    }
+    let _ = std::fs::remove_dir_all(&dest);
+    if let Err(error) = std::fs::rename(&staging, &dest) {
+        let _ = std::fs::remove_dir_all(&staging);
+        eprintln!("dirijord-rs: helper resource activation failed: {error}");
+    }
+}
+
+#[cfg(unix)]
+fn copy_dir(source: &Path, dest: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let target = dest.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else if file_type.is_file() {
+            std::fs::copy(entry.path(), target)?;
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "resource bundle contains a symlink or special file",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn cli_helper_sources(exe_dir: &Path, name: &str) -> Vec<PathBuf> {
+    let mut sources = vec![exe_dir.join(name)];
+    // cargo: <repo>/diri/target/{debug,release} → <repo>/.build/debug/<name>
+    if let Some(repo) = exe_dir
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+    {
+        sources.push(repo.join(".build/debug").join(name));
+        sources.push(repo.join(".build/arm64-apple-macosx/debug").join(name));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        sources.push(
+            Path::new(&home)
+                .join("Applications/diri.app/Contents/Resources/bin")
+                .join(name),
+        );
+    }
+    sources.push(PathBuf::from("/Applications/diri.app/Contents/Resources/bin").join(name));
+    sources
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn set_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mut perms = meta.permissions();
+        perms.set_mode(perms.mode() | 0o755);
+        let _ = std::fs::set_permissions(path, perms);
+    }
 }
 
 #[cfg(unix)]
@@ -368,6 +625,78 @@ fn resolve_remote_catalog_source(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_path_capture_does_not_wait_for_a_child_that_inherited_stdout() {
+        use std::time::{Duration, Instant};
+
+        let started = Instant::now();
+        let path = capture_login_path(
+            "/bin/sh",
+            &["-c", "/bin/sleep 5 & printf '/fixture:/usr/bin\\n'"],
+            Duration::from_secs(2),
+        );
+
+        assert_eq!(path.as_deref(), Some("/fixture:/usr/bin"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn login_path_capture_kills_a_shell_that_exceeds_the_deadline() {
+        use std::time::{Duration, Instant};
+
+        let started = Instant::now();
+        let path = capture_login_path(
+            "/bin/sh",
+            &["-c", "/bin/sleep 5; printf '/too-late:/usr/bin\\n'"],
+            Duration::from_millis(500),
+        );
+
+        assert_ne!(path.as_deref(), Some("/too-late:/usr/bin"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn cli_helper_replacement_keeps_the_running_inode_intact() {
+        use std::io::Read;
+
+        let temporary = tempfile::tempdir().expect("temp");
+        let source = temporary.path().join("source");
+        let dest = temporary.path().join("dirijor-mcp");
+        std::fs::write(&source, b"new").expect("source");
+        std::fs::write(&dest, b"old").expect("dest");
+        let mut running = std::fs::File::open(&dest).expect("running helper");
+
+        install_cli_helper(&source, &dest).expect("install");
+
+        let mut old = String::new();
+        running.read_to_string(&mut old).expect("old inode");
+        assert_eq!(old, "old");
+        assert_eq!(std::fs::read_to_string(&dest).expect("new path"), "new");
+    }
+
+    #[test]
+    fn cli_resource_bundle_is_installed_without_stale_files() {
+        let temporary = tempfile::tempdir().expect("temp");
+        let source = temporary.path().join("source");
+        let bin = temporary.path().join("bin");
+        let manifests = source.join("dirijor_DirijorCore.bundle/manifests");
+        std::fs::create_dir_all(&manifests).expect("source bundle");
+        std::fs::write(manifests.join("cursor.json"), b"cursor").expect("cursor manifest");
+
+        install_cli_resource_bundle(&source, &bin);
+        let installed = bin.join("dirijor_DirijorCore.bundle/manifests");
+        assert_eq!(
+            std::fs::read(installed.join("cursor.json")).expect("installed cursor manifest"),
+            b"cursor"
+        );
+
+        std::fs::remove_file(manifests.join("cursor.json")).expect("remove old manifest");
+        std::fs::write(manifests.join("codex.json"), b"codex").expect("codex manifest");
+        install_cli_resource_bundle(&source, &bin);
+        assert!(!installed.join("cursor.json").exists());
+        assert!(installed.join("codex.json").exists());
+    }
 
     #[test]
     fn loose_build_prefers_current_sibling_over_a_stale_catalog() {
