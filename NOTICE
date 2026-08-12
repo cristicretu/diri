@@ -6,7 +6,7 @@ GPUI (https://github.com/zed-industries/zed)
 The GPUI crates used by Diri are pinned to a specific Zed revision. Crates
 marked Apache-2.0 by upstream remain under that license. Zed describes its
 repository as primarily GPL-3.0-or-later with Apache-2.0 components where
-marked; the dependency inventory is checked by `scripts/check-licenses.sh`.
+marked; the dependency inventory is checked by `scripts/check-licenses.py`.
 
 Diri replaces GPUI's disabled, no-op `ztracing` profiling surface with a small
 independent Apache-2.0 compatibility implementation in `diri/vendor/` so the
@@ -23,19 +23,19 @@ A copy of the license is available at http://www.apache.org/licenses/LICENSE-2.0
 The screen-detection predicates in the following files are ADAPTED from
 herdr's TOML screen manifests (`src/detect/manifests/*.toml`):
 
-    Sources/DirijorCore/Resources/manifests/amp.json
-    Sources/DirijorCore/Resources/manifests/antigravity.json
-    Sources/DirijorCore/Resources/manifests/copilot.json
-    Sources/DirijorCore/Resources/manifests/devin.json
-    Sources/DirijorCore/Resources/manifests/droid.json
-    Sources/DirijorCore/Resources/manifests/grok.json
-    Sources/DirijorCore/Resources/manifests/hermes.json
-    Sources/DirijorCore/Resources/manifests/kilo.json
-    Sources/DirijorCore/Resources/manifests/kimi.json
-    Sources/DirijorCore/Resources/manifests/kiro.json
-    Sources/DirijorCore/Resources/manifests/opencode.json
-    Sources/DirijorCore/Resources/manifests/pi.json
-    Sources/DirijorCore/Resources/manifests/qoder.json
+    diri/crates/diri-engine/manifests/amp.json
+    diri/crates/diri-engine/manifests/antigravity.json
+    diri/crates/diri-engine/manifests/copilot.json
+    diri/crates/diri-engine/manifests/devin.json
+    diri/crates/diri-engine/manifests/droid.json
+    diri/crates/diri-engine/manifests/grok.json
+    diri/crates/diri-engine/manifests/hermes.json
+    diri/crates/diri-engine/manifests/kilo.json
+    diri/crates/diri-engine/manifests/kimi.json
+    diri/crates/diri-engine/manifests/kiro.json
+    diri/crates/diri-engine/manifests/opencode.json
+    diri/crates/diri-engine/manifests/pi.json
+    diri/crates/diri-engine/manifests/qoder.json
 
 Changes made: the rules were translated from herdr's TOML rule schema into
 Dirijor's JSON predicate schema, re-prioritised for Dirijor's evaluator (which

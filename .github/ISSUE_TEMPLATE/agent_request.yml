@@ -6,7 +6,7 @@ body:
     attributes:
       value: >
         Agent support is a single JSON file in
-        `Sources/DirijorCore/Resources/manifests/` — no Swift or Rust. If you
+        `diri/crates/diri-engine/manifests/` — no Rust required. If you
         want to write it yourself, copy the closest existing manifest; the
         fields are documented in CONTRIBUTING.md. Otherwise this issue is
         enough for someone else to pick up.

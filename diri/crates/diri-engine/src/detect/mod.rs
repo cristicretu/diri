@@ -407,4 +407,58 @@ mod tests {
         let snapshot = ScreenSnapshot::from_lines(["anything"]);
         assert!(engine.evaluate(&snapshot, "no-such-agent").is_none());
     }
+
+    #[test]
+    fn first_class_agents_ship_verified_official_setup_links() {
+        let engine = engine();
+        let mut first_class_count = 0;
+        for id in engine.ids() {
+            let descriptor: diri_proto::AgentDescriptor =
+                serde_json::from_value(engine.raw_agent(id).expect("bundled descriptor").clone())
+                    .expect("client descriptor");
+            if !descriptor.first_class {
+                continue;
+            }
+            first_class_count += 1;
+            let setup = descriptor.setup.expect("first-class setup metadata");
+            let url = setup
+                .url
+                .as_deref()
+                .filter(|url| url.starts_with("https://") || url.starts_with("http://"))
+                .unwrap_or_else(|| panic!("{id} needs a verified HTTP(S) setup URL"));
+            let authority = url
+                .split_once("://")
+                .expect("checked scheme")
+                .1
+                .split(['/', '?', '#'])
+                .next()
+                .unwrap_or_default();
+            assert!(!authority.is_empty(), "{id} setup URL has no host");
+            assert!(
+                setup
+                    .install_hint
+                    .as_deref()
+                    .is_some_and(|hint| !hint.trim().is_empty()),
+                "{id} needs an install hint"
+            );
+            assert!(
+                setup
+                    .sign_in_hint
+                    .as_deref()
+                    .is_some_and(|hint| !hint.trim().is_empty()),
+                "{id} needs a sign-in hint"
+            );
+            if id == "amp" {
+                assert_eq!(
+                    setup.sign_in_hint.as_deref(),
+                    Some("Sign in at ampcode.com, then run amp."),
+                    "Amp guidance must stay within its official manual"
+                );
+            }
+        }
+        assert!(
+            first_class_count >= 17,
+            "the bundled first-class roster unexpectedly shrank"
+        );
+    }
 }

@@ -158,6 +158,20 @@ pub struct AgentKeystroke {
     pub submit: bool,
 }
 
+/// Optional, display-only guidance for installing and authenticating an
+/// Agent. Clients must never execute either hint; the URL is opened only after
+/// an explicit user action and is validated by the client as HTTP(S).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSetup {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_in_hint: Option<String>,
+}
+
 /// The daemon-side manifest descriptor for one agent, as much of it as the
 /// client needs. Deliberately partial and tolerant: the daemon owns the full
 /// schema (spawn args, env hygiene, injection), and unknown fields are ignored
@@ -169,6 +183,8 @@ pub struct AgentDescriptor {
     pub display_name: String,
     #[serde(default)]
     pub short_label: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
     #[serde(default)]
     pub glyph: String,
     #[serde(default)]
@@ -181,6 +197,11 @@ pub struct AgentDescriptor {
     pub approve: Option<AgentKeystroke>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny: Option<AgentKeystroke>,
+    /// Additive setup guidance. Older clients ignore this field and older
+    /// daemons omit it, so user manifest overrides remain forwards/backwards
+    /// compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<AgentSetup>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -467,7 +488,9 @@ pub type SessionReopenLastResult = SessionRecord;
 
 /// `session.migrate`: one-click handoff of a live Claude session between local
 /// and a remote host, preserving conversation context (`claude --resume`) and
-/// code state (WIP commit + push + hard-sync of the target checkout).
+/// code state — committed work by push + hard-sync of the target checkout,
+/// uncommitted work re-applied to the target tree as uncommitted state, so a
+/// session round-trips losslessly and origin only ever sees real commits.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionMigrateParams {

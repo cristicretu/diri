@@ -19,20 +19,6 @@
   ],
   "manually_reviewed_non_rust": [
     {
-      "name": "SwiftTerm",
-      "ecosystem": "SwiftPM",
-      "version": "1.15.0",
-      "license": "MIT",
-      "source": "https://github.com/migueldeicaza/SwiftTerm"
-    },
-    {
-      "name": "swift-argument-parser",
-      "ecosystem": "SwiftPM",
-      "version": "1.8.2",
-      "license": "Apache-2.0",
-      "source": "https://github.com/apple/swift-argument-parser"
-    },
-    {
       "name": "playwright",
       "ecosystem": "npm",
       "version": "1.62.1",

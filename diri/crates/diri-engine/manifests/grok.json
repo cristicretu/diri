@@ -15,6 +15,11 @@
       "grok-build"
     ],
     "firstClass": true,
+    "setup": {
+      "url": "https://docs.x.ai/build/overview",
+      "installHint": "Install Grok with xAI's official installer.",
+      "signInHint": "Run grok login, or set XAI_API_KEY."
+    },
     "statusAuthority": "screen",
     "binary": "grok",
     "resume": {

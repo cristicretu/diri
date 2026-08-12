@@ -500,6 +500,7 @@ mod tests {
             agent_session_id: None,
             transcript_path: None,
             status,
+            status_evidence: None,
             needs_input: Some(NeedsInputDetail {
                 kind: NeedsInputKind::Permission,
                 source: NeedsInputSource::ScreenScrape,
@@ -574,6 +575,7 @@ mod tests {
             id: "amp".to_owned(),
             display_name: "Amp".to_owned(),
             short_label: "amp".to_owned(),
+            aliases: vec!["ampcode".to_owned()],
             glyph: "\u{23fb}".to_owned(),
             first_class: true,
             approve: Some(AgentKeystroke {
@@ -584,6 +586,7 @@ mod tests {
                 text: "n".to_owned(),
                 submit: true,
             }),
+            setup: None,
         };
         let current = session(
             amp.clone(),

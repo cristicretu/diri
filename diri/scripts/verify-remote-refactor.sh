@@ -36,7 +36,7 @@ else
     fail "Agent catalog carries only ${count} manifests (expected at least 20)"
 fi
 
-# Swift declares returnToLoginShell on 16 Agents. Dropping it means an Agent
+# The canonical catalog declares returnToLoginShell on 16 Agents. Dropping it means an Agent
 # that exits or self-updates ends the session instead of landing at a prompt.
 login_shell="$(grep -l returnToLoginShell "${manifests}"/*.json | wc -l | tr -d ' ')"
 if [[ "${login_shell}" -eq 16 ]]; then

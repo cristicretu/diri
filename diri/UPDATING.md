@@ -91,12 +91,11 @@ diri/scripts/release.sh 0.4.1
 
 The script refuses to release a version that does not match the manifest, a
 dirty checkout, or a commit other than the current `origin/main`. It runs
-clippy + tests, builds universal binaries, bundles and signs the Rust Engine
-and Holder, **notarizes and staples the .app first**, then builds and notarizes
-the DMG from that stapled bundle, produces the update zip, rebuilds
-`appcast.json` from the currently published feed, generates `SHA256SUMS` and a
-reviewed dependency license inventory, and creates the GitHub Release at that
-exact source commit.
+clippy + tests, builds the universal Rust executables, signs them,
+**notarizes and staples the .app first**, then builds and notarizes the DMG
+from that stapled bundle, produces the update zip, rebuilds `appcast.json` from
+the currently published feed, generates `SHA256SUMS` and a reviewed dependency
+license inventory, and creates the GitHub Release at that exact source commit.
 It then updates, commits, **pushes, and reads back** the Homebrew cask;
 the release does not report success until the remote cask checksum matches the
 published DMG.
@@ -118,15 +117,15 @@ Release notes come from `dist/notes-<version>.md`. The script writes a default
 one if it is missing, so writing that file first — and re-running — is how you
 customize them.
 
-### The bundled daemon advances with the app
+### The bundled Engine updates safely with the app
 
 `diri.app` carries `dirijord-rs` + `diri-holder` in `Contents/Resources/bin`,
-and the update zip carries those exact binaries. On every app launch,
-`daemon_launch` hashes the bundled Engine and compares it with the executable
-hash reported by the live Engine. A mismatch uses the persisting
-`daemon.shutdown` RPC, starts the newly bundled Engine, and lets it adopt the
-existing holder-owned sessions. The PTYs and Agents never belong to the daemon
-process, so replacing the daemon does not replace or kill them.
+and the update zip carries those exact binaries. On every launch, the app
+verifies the running Engine's identity and compares its executable hash with
+the bundled Engine. A mismatch asks the old process to persist and shut down,
+waits for it to exit, then launches the new binary. Holder processes retain
+their PTYs across that handoff, so updating the Engine does not terminate live
+agent sessions.
 
 This is content-based rather than version-string-based: rebuilding the same app
 version with different Engine bytes still refreshes the Engine, while an exact
