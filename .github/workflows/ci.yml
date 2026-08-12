@@ -444,6 +444,7 @@ jobs:
         run: |
           deb="$(find "${PWD}/diri/dist/linux" -maxdepth 1 -name '*.deb' -print -quit)"
           appimage="$(find "${PWD}/diri/dist/linux" -maxdepth 1 -name '*.AppImage' -print -quit)"
+          chmod +x "${appimage}"
           sudo apt-get install --yes "${deb}"
           xvfb-run -a env -u WAYLAND_DISPLAY DIRI_UI_SMOKE_TEST=1 diri
           diri/scripts/smoke-installed-linux.sh
