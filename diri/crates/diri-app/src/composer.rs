@@ -138,6 +138,27 @@ impl PromptComposer {
         self.reveal_caret = true;
     }
 
+    /// Append staged context without replacing a draft the user already
+    /// wrote. A new block starts on its own line unless the draft already
+    /// ends in whitespace, keeping quoted paths visually separate while
+    /// preserving every byte of the existing text.
+    pub fn append_context(&mut self, context: &str) {
+        if context.is_empty() {
+            return;
+        }
+        if !self.editor.is_empty()
+            && !self
+                .editor
+                .text()
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace)
+        {
+            self.insert_multiline("\n");
+        }
+        self.insert_multiline(context);
+    }
+
     pub fn editor_mut(&mut self) -> &mut QueryEditor {
         self.reveal_caret = true;
         self.goal_column = None;
@@ -428,5 +449,30 @@ mod tests {
         assert_eq!(intersect(&(2..9), &(0..5)), Some(2..5));
         assert_eq!(intersect(&(2..9), &(5..12)), Some(5..9));
         assert_eq!(intersect(&(2..9), &(12..14)), None);
+    }
+
+    #[test]
+    fn staged_context_appends_without_replacing_the_existing_draft() {
+        let mut composer = PromptComposer::default();
+        composer.insert_multiline("Review the parser first");
+        composer.append_context("'/tmp/a file.rs' '/tmp/tests'");
+        assert_eq!(
+            composer.text(),
+            "Review the parser first\n'/tmp/a file.rs' '/tmp/tests'"
+        );
+
+        composer.append_context("'/tmp/more.rs'");
+        assert_eq!(
+            composer.text(),
+            "Review the parser first\n'/tmp/a file.rs' '/tmp/tests'\n'/tmp/more.rs'"
+        );
+    }
+
+    #[test]
+    fn staged_context_uses_existing_trailing_whitespace() {
+        let mut composer = PromptComposer::default();
+        composer.insert_multiline("Look here: ");
+        composer.append_context("'/tmp/example.rs'");
+        assert_eq!(composer.text(), "Look here: '/tmp/example.rs'");
     }
 }

@@ -21,6 +21,7 @@ use crate::commands::{
     ToggleCommandPalette, ToggleHistory, ToggleInspector, ToggleOverview, ToggleQuickOpen,
     ToggleSidebar,
 };
+use crate::external_drop::ExternalDropAction;
 use crate::inspector::{InspectorEvent, WorkbenchInspector};
 use crate::launcher::{LauncherEvent, LauncherOverlay};
 use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
@@ -223,6 +224,39 @@ impl RootView {
             .detach();
         }
         cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
+            if let SidebarEvent::ExternalDrop(plan) = event
+                && let Some(action) = &plan.action
+            {
+                let notice = plan.feedback();
+                match action {
+                    ExternalDropAction::OpenLauncher { root } => {
+                        this.launcher.update(cx, |launcher, cx| {
+                            launcher.open_at_directory(root.clone(), notice, window, cx);
+                        });
+                    }
+                    ExternalDropAction::OpenSessionComposer {
+                        session_id,
+                        insertion,
+                    } => {
+                        this.launcher.update(cx, |launcher, cx| {
+                            launcher.open_for_session(
+                                session_id.clone(),
+                                insertion,
+                                notice,
+                                window,
+                                cx,
+                            );
+                        });
+                    }
+                }
+                // Like Command-N, a drop swaps the main-pane branch. Focus
+                // once more after GPUI mounts the composer so the insertion
+                // caret is ready without a click.
+                let launcher = this.launcher.clone();
+                cx.defer_in(window, move |_, window, cx| {
+                    launcher.update(cx, |launcher, cx| launcher.focus(window, cx));
+                });
+            }
             if matches!(event, SidebarEvent::SessionActivated) {
                 if this.launcher.read(cx).is_open() {
                     this.launcher

@@ -6,4 +6,5 @@ mod view;
 
 pub use fixture::{PreviewScenario, SidebarPreviewFixture};
 pub use state::{DragItem, Popover, SidebarUiState, move_before, move_to_end};
-pub use view::{Sidebar, SidebarEvent};
+pub use view::Sidebar;
+pub(crate) use view::SidebarEvent;

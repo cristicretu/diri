@@ -9,18 +9,19 @@ use diri_proto::{
 };
 use diri_ui::{
     AgentKind, AgentLogo, AlertChip, AttentionDot, AttentionLevel, Fill, FloatingSurface,
-    HairlineDivider, HoverMarquee, Ink, LoadingIndicator, Metrics, Radius, RowFill, SemanticColors,
-    Space, StateChip, StatusGlyph, StatusState, Typo,
+    HairlineDivider, HoverMarquee, Ink, LoadingIndicator, Metrics, Palette, Radius, RowFill,
+    SemanticColors, Space, StateChip, StatusGlyph, StatusState, Typo,
 };
 use gpui::{
-    Anchor, AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, FontWeight, Hsla, IntoElement, MouseButton, Pixels, Point, Render, Rgba,
-    ScrollHandle, SharedString, Task, Window, anchored, deferred, div, linear_color_stop,
+    Anchor, AnyElement, App, AppContext as _, Context, Entity, EventEmitter, ExternalPaths,
+    FocusHandle, Focusable, FontWeight, Hsla, IntoElement, MouseButton, Pixels, Point, Render,
+    Rgba, ScrollHandle, SharedString, Task, Window, anchored, deferred, div, linear_color_stop,
     linear_gradient, point, prelude::*, px,
 };
 use tokio::sync::mpsc;
 
 use crate::commands::OpenSettings;
+use crate::external_drop::{ExternalDropPlan, ExternalDropTarget, plan_external_drop};
 use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::query_label;
 use crate::query_editor::{self, ClipboardEdit, Edit};
@@ -39,7 +40,7 @@ use super::{
 const PREVIEW_USAGE: f64 = 4.82;
 
 #[derive(Clone, Debug)]
-pub enum SidebarEvent {
+pub(crate) enum SidebarEvent {
     VisibilityChanged,
     WidthChanged,
     /// The Agents page of Settings, for one target host. Plain Settings goes
@@ -59,6 +60,10 @@ pub enum SidebarEvent {
     /// keeps showing a stale frame until some unrelated update wakes it, which
     /// reads as "the ✕ did nothing".
     ConfirmationChanged,
+    /// Finder input has been fully validated and reduced to a UI-only staged
+    /// action. RootView owns both composer destinations, so the sidebar never
+    /// sends daemon input or spawns a session itself.
+    ExternalDrop(ExternalDropPlan),
 }
 
 #[derive(Clone)]
@@ -111,6 +116,10 @@ pub struct Sidebar {
     /// one-level directory browser. The listing payload itself lives in the
     /// Store so the daemon adapter can complete it asynchronously.
     directory_picker_open: bool,
+    /// Inline, contextual feedback for rejected or partially accepted Finder
+    /// drops. It remains until dismissed or replaced by the next drop so an
+    /// error can never disappear between mouse-up and the next frame.
+    external_drop_feedback: Option<String>,
 }
 
 impl EventEmitter<SidebarEvent> for Sidebar {}
@@ -185,6 +194,7 @@ impl Sidebar {
             last_toggle: None,
             preview,
             directory_picker_open: false,
+            external_drop_feedback: None,
         };
         sidebar.ui.preview_account = preview;
         // Preview-only hook so headless screenshots can verify popover layout.
@@ -625,14 +635,125 @@ impl Sidebar {
             .into_any_element()
     }
 
+    fn external_drop(
+        &mut self,
+        paths: &ExternalPaths,
+        target: ExternalDropTarget,
+        cx: &mut Context<Self>,
+    ) {
+        let plan = plan_external_drop(paths.paths(), target);
+        self.external_drop_feedback = plan.feedback();
+        if plan.action.is_some() {
+            cx.emit(SidebarEvent::ExternalDrop(plan));
+        }
+        cx.notify();
+    }
+
+    fn can_accept_external_drop(paths: &ExternalPaths, target: ExternalDropTarget) -> bool {
+        plan_external_drop(paths.paths(), target).accepts_drop()
+    }
+
+    fn external_drop_feedback(
+        &self,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let message = self.external_drop_feedback.clone()?;
+        Some(
+            div()
+                .id("external-drop-feedback")
+                .mx(px(Space::INSET))
+                .mb(px(6.0))
+                .p(px(8.0))
+                .flex()
+                .items_start()
+                .gap(px(7.0))
+                .rounded(px(Radius::ROW))
+                .bg(Ink::ATTENTION.alpha(0.08))
+                .border_1()
+                .border_color(Ink::ATTENTION.alpha(0.22))
+                .child(sf_symbol(
+                    "exclamationmark.circle.fill",
+                    11.0,
+                    Ink::ATTENTION,
+                ))
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .flex_1()
+                        .text_size(px(Typo::META.size))
+                        .line_height(px(15.0))
+                        .text_color(colors.secondary)
+                        .child(message),
+                )
+                .child(
+                    div()
+                        .id("dismiss-external-drop-feedback")
+                        .size(px(18.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(Radius::CHIP))
+                        .cursor_pointer()
+                        .hover(move |button| button.bg(colors.primary.alpha(0.07)))
+                        .child(sf_symbol("xmark", 8.0, colors.tertiary))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.external_drop_feedback = None;
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn empty_space_drop_target(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("sidebar-empty-space-drop-target")
+            .flex_1()
+            .min_h(px(52.0))
+            .rounded(px(Radius::ROW))
+            .drag_over::<ExternalPaths>(move |element, paths, _, _| {
+                if Self::can_accept_external_drop(paths, ExternalDropTarget::EmptySpace) {
+                    element
+                        .bg(Ink::FRESH.alpha(0.07))
+                        .border_1()
+                        .border_color(Ink::FRESH.alpha(0.32))
+                } else {
+                    element
+                }
+            })
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                cx.stop_propagation();
+                this.external_drop(paths, ExternalDropTarget::EmptySpace, cx);
+            }))
+            .into_any_element()
+    }
+
     fn empty_state(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
         div()
+            .id("sidebar-empty-state")
             .flex_1()
             .flex()
             .flex_col()
             .items_center()
             .justify_center()
             .gap(px(12.0))
+            .rounded(px(Radius::PANEL))
+            .drag_over::<ExternalPaths>(move |element, paths, _, _| {
+                if Self::can_accept_external_drop(paths, ExternalDropTarget::EmptySpace) {
+                    element
+                        .bg(Ink::FRESH.alpha(0.07))
+                        .border_1()
+                        .border_color(Ink::FRESH.alpha(0.32))
+                } else {
+                    element
+                }
+            })
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                cx.stop_propagation();
+                this.external_drop(paths, ExternalDropTarget::EmptySpace, cx);
+            }))
             .child(AgentLogo::new(AgentKind::ClaudeCode, 44.0, colors).badged(false))
             .child(
                 div()
@@ -695,6 +816,7 @@ impl Sidebar {
         let project_for_click = group.project.clone();
         let project_root = group.project.root.clone();
         let project_host = group.host.clone();
+        let project_is_remote = project_host.is_some();
         let project_host_label = group.host.as_deref().map(|host| {
             self.store
                 .read()
@@ -783,6 +905,31 @@ impl Sidebar {
                 .on_drop(cx.listener(|this, _: &DraggedSidebarItem, _, cx| {
                     this.finish_drag();
                     cx.notify();
+                }))
+                .drag_over::<ExternalPaths>(move |element, paths, _, _| {
+                    if Self::can_accept_external_drop(
+                        paths,
+                        ExternalDropTarget::Project {
+                            remote: project_is_remote,
+                        },
+                    ) {
+                        element
+                            .bg(Ink::FRESH.alpha(0.10))
+                            .border_1()
+                            .border_color(Ink::FRESH.alpha(0.38))
+                    } else {
+                        element
+                    }
+                })
+                .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                    cx.stop_propagation();
+                    this.external_drop(
+                        paths,
+                        ExternalDropTarget::Project {
+                            remote: project_is_remote,
+                        },
+                        cx,
+                    );
                 }))
                 .child(project_badge(colors))
                 .child(
@@ -929,6 +1076,7 @@ impl Sidebar {
         let hovered = self.ui.hovered_session.as_ref() == Some(&id);
         let archived = session.is_archived();
         let hibernated = session.hibernation.is_some();
+        let session_is_remote = session.host.is_some();
         let ended = matches!(session.status, diri_proto::SessionStatus::Exited(_)) && !archived;
         let host_label = session.host.as_ref().map(|host| {
             self.store
@@ -974,6 +1122,40 @@ impl Sidebar {
                 .gap(px(8.0))
                 .rounded(px(Radius::ROW))
                 .bg(RowFill::Selected.color(colors))
+                .drag_over::<ExternalPaths>({
+                    let id = id.clone();
+                    move |element, paths, _, _| {
+                        if Self::can_accept_external_drop(
+                            paths,
+                            ExternalDropTarget::Session {
+                                id: id.clone(),
+                                remote: session_is_remote,
+                            },
+                        ) {
+                            element
+                                .bg(Palette::GEMINI_BLUE.alpha(0.12))
+                                .border_1()
+                                .border_color(Palette::GEMINI_BLUE.alpha(0.42))
+                        } else {
+                            element
+                        }
+                    }
+                })
+                .on_drop(cx.listener({
+                    let id = id.clone();
+                    move |this, paths: &ExternalPaths, _, cx| {
+                        cx.stop_propagation();
+                        this.commit_rename();
+                        this.external_drop(
+                            paths,
+                            ExternalDropTarget::Session {
+                                id: id.clone(),
+                                remote: session_is_remote,
+                            },
+                            cx,
+                        );
+                    }
+                }))
                 .children(indent_rails(row, colors))
                 // The fold control is inert mid-rename, but its column stays so
                 // the text does not slide sideways the moment editing starts.
@@ -1137,6 +1319,39 @@ impl Sidebar {
                     }
                     this.finish_drag();
                     cx.notify();
+                }
+            }))
+            .drag_over::<ExternalPaths>({
+                let id = id.clone();
+                move |element, paths, _, _| {
+                    if Self::can_accept_external_drop(
+                        paths,
+                        ExternalDropTarget::Session {
+                            id: id.clone(),
+                            remote: session_is_remote,
+                        },
+                    ) {
+                        element
+                            .bg(Palette::GEMINI_BLUE.alpha(0.12))
+                            .border_1()
+                            .border_color(Palette::GEMINI_BLUE.alpha(0.42))
+                    } else {
+                        element
+                    }
+                }
+            })
+            .on_drop(cx.listener({
+                let id = id.clone();
+                move |this, paths: &ExternalPaths, _, cx| {
+                    cx.stop_propagation();
+                    this.external_drop(
+                        paths,
+                        ExternalDropTarget::Session {
+                            id: id.clone(),
+                            remote: session_is_remote,
+                        },
+                        cx,
+                    );
                 }
             }))
             .children(indent_rails(row, colors))
@@ -3499,6 +3714,7 @@ impl Render for Sidebar {
         for group in &projection.projects {
             list = list.child(self.project_section(group, colors, window, cx));
         }
+        list = list.child(self.empty_space_drop_target(cx));
 
         let mut root = div()
             .id("sidebar")
@@ -3527,6 +3743,9 @@ impl Render for Sidebar {
                     .child(list)
                     .children(self.scroll_fades(colors)),
             );
+        }
+        if let Some(feedback) = self.external_drop_feedback(colors, cx) {
+            root = root.child(feedback);
         }
         root = root.child(self.account_footer(colors, cx));
         if let Some(popover) = self.popover(colors, window, cx) {

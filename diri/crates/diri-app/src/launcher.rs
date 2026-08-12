@@ -1,11 +1,13 @@
 //! Compact new-session destination opened in the main pane by Command-N.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use diri_proto::{AgentKind, Project};
+use diri_proto::{AgentKind, Project, SessionId};
 use diri_ui::{
-    AgentKind as UiAgentKind, AgentLogo, Fill, FloatingSurface, Palette, Radius, SemanticColors,
+    AgentKind as UiAgentKind, AgentLogo, Fill, FloatingSurface, Ink, Palette, Radius,
+    SemanticColors,
 };
 use gpui::{
     AnyElement, App, Context, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle,
@@ -17,6 +19,7 @@ use crate::agent_catalog::{AgentOption, quick_agent_options, title_case_id};
 use crate::composer::PromptComposer;
 use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::CARET;
+use crate::notifications::SendTextCommand;
 use crate::query_editor::{self, ClipboardEdit, Edit};
 use crate::store::SpawnOptions;
 
@@ -73,10 +76,17 @@ pub(crate) struct LauncherOverlay {
     services: Arc<AppServices>,
     focus: FocusHandle,
     prompt: PromptComposer,
+    target: LauncherTarget,
+    new_session_draft: String,
+    session_drafts: HashMap<SessionId, String>,
     selected_harness: AgentKind,
     selected_root: String,
     selected_host: Option<String>,
     fallback_notice: Option<String>,
+    /// Finder drops may partially succeed. Keep their ignored-path detail
+    /// inline with the staged draft until the user sends or replaces it; a
+    /// toast would separate the reason from its action.
+    drop_notice: Option<String>,
     /// Which picker, if any, is open — and where its keyboard highlight sits,
     /// so both are reachable without the mouse.
     picker: Option<Picker>,
@@ -90,6 +100,12 @@ pub(crate) struct LauncherOverlay {
 enum Picker {
     Harness,
     Project,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LauncherTarget {
+    NewSession,
+    Session(SessionId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,7 +127,7 @@ impl LauncherOverlay {
                     Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         if this
                             .update(cx, |this, cx| {
-                                if this.open {
+                                if this.open && matches!(this.target, LauncherTarget::NewSession) {
                                     this.reconcile_harness();
                                 }
                                 cx.notify();
@@ -130,10 +146,14 @@ impl LauncherOverlay {
             services,
             focus,
             prompt: PromptComposer::default(),
+            target: LauncherTarget::NewSession,
+            new_session_draft: String::new(),
+            session_drafts: HashMap::new(),
             selected_harness,
             selected_root,
             selected_host,
             fallback_notice: None,
+            drop_notice: None,
             picker: None,
             highlight: 0,
             open: false,
@@ -147,6 +167,8 @@ impl LauncherOverlay {
     }
 
     pub(crate) fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.switch_target(LauncherTarget::NewSession);
+        self.drop_notice = None;
         // A half-written prompt survives Escape. This used to clear on every
         // open, so closing the launcher by reflex — or bouncing off it to
         // check something — threw the prompt away with no way back. It is
@@ -158,6 +180,48 @@ impl LauncherOverlay {
             self.selected_host = host;
             self.fallback_notice = None;
         }
+        self.activate_new_session(window, cx);
+    }
+
+    /// Open Command-N at a validated local directory. The Finder gesture only
+    /// prepares the form: the existing draft remains, focus lands in its
+    /// prompt, and no spawn occurs before explicit submission.
+    pub(crate) fn open_at_directory(
+        &mut self,
+        root: String,
+        notice: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.switch_target(LauncherTarget::NewSession);
+        self.selected_root = root;
+        self.selected_host = None;
+        self.fallback_notice = None;
+        self.drop_notice = notice;
+        self.activate_new_session(window, cx);
+    }
+
+    /// Open the native composer for one existing local session and append the
+    /// staged paths to that session's own draft. Merely opening this surface
+    /// neither attaches to the PTY nor wakes a hibernated process.
+    pub(crate) fn open_for_session(
+        &mut self,
+        session_id: SessionId,
+        insertion: &str,
+        notice: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.switch_target(LauncherTarget::Session(session_id.clone()));
+        self.prompt.append_context(insertion);
+        self.drop_notice = notice;
+        self.picker = None;
+        self.open = true;
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    fn activate_new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.services
             .store
             .store
@@ -169,6 +233,25 @@ impl LauncherOverlay {
         self.open = true;
         window.focus(&self.focus, cx);
         cx.notify();
+    }
+
+    fn switch_target(&mut self, target: LauncherTarget) {
+        if self.target == target {
+            return;
+        }
+        let saved = transition_draft(
+            &self.target,
+            &target,
+            self.prompt.text(),
+            &mut self.new_session_draft,
+            &mut self.session_drafts,
+        );
+        self.prompt.clear();
+        if !saved.is_empty() {
+            self.prompt.insert_multiline(&saved);
+        }
+        self.target = target;
+        self.picker = None;
     }
 
     pub(crate) fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -306,6 +389,21 @@ impl LauncherOverlay {
     /// `None` means it can. The submit button used to just sit there dimmed
     /// with no explanation, which reads as "broken" rather than "not yet".
     fn blocker(&self) -> Option<String> {
+        if let LauncherTarget::Session(id) = &self.target {
+            let store = self
+                .services
+                .store
+                .store
+                .read()
+                .expect("session store lock poisoned");
+            let Some(session) = store.sessions().get(id) else {
+                return Some("This session is no longer available".to_owned());
+            };
+            return session
+                .host
+                .is_some()
+                .then(|| "Local paths cannot be used on a remote session".to_owned());
+        }
         if self.selected_root.is_empty() {
             return Some("Choose a project to start in".to_owned());
         }
@@ -343,21 +441,48 @@ impl LauncherOverlay {
             return false;
         }
         let prompt = self.prompt.text().trim().to_owned();
-        self.services
-            .store
-            .store
-            .write()
-            .expect("session store lock poisoned")
-            .spawn_kind(
-                self.selected_harness.clone(),
-                SpawnOptions {
-                    cwd: Some(self.selected_root.clone()),
-                    initial_prompt: Some(prompt),
-                    host: self.selected_host.clone(),
-                    ..SpawnOptions::default()
-                },
-            );
+        match &self.target {
+            LauncherTarget::NewSession => {
+                self.services
+                    .store
+                    .store
+                    .write()
+                    .expect("session store lock poisoned")
+                    .spawn_kind(
+                        self.selected_harness.clone(),
+                        SpawnOptions {
+                            cwd: Some(self.selected_root.clone()),
+                            initial_prompt: Some(prompt),
+                            host: self.selected_host.clone(),
+                            ..SpawnOptions::default()
+                        },
+                    );
+                self.new_session_draft.clear();
+            }
+            LauncherTarget::Session(id) => {
+                // Selection can attach or resume terminal state, so it belongs
+                // to explicit confirmation—not the Finder release that merely
+                // opened this draft.
+                self.services
+                    .store
+                    .store
+                    .write()
+                    .expect("session store lock poisoned")
+                    .select(id.clone());
+                let _ = self
+                    .services
+                    .store
+                    .notification_action_sender()
+                    .send(SendTextCommand {
+                        session_id: id.clone(),
+                        text: prompt,
+                        submit: true,
+                    });
+                self.session_drafts.remove(id);
+            }
+        }
         self.prompt.clear();
+        self.drop_notice = None;
         self.close(cx);
         true
     }
@@ -386,7 +511,7 @@ impl LauncherOverlay {
             // Cycling the agent from the keyboard: the picker was mouse-only,
             // which is a strange thing to require of a surface you reached
             // with ⌘N and are about to leave with ↵.
-            "tab" => {
+            "tab" if matches!(self.target, LauncherTarget::NewSession) => {
                 self.cycle_harness(if shift { -1 } else { 1 });
                 cx.notify();
                 true
@@ -757,6 +882,9 @@ impl LauncherOverlay {
         focused: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if matches!(self.target, LauncherTarget::Session(_)) {
+            return self.render_session_panel(colors, focused, cx);
+        }
         let can_submit = self.can_submit();
         let harness_open = self.picker == Some(Picker::Harness);
         let project_open = self.picker == Some(Picker::Project);
@@ -1069,9 +1197,282 @@ impl LauncherOverlay {
                         .left(px(COMPOSER_INSET))
                         .child(self.render_project_picker(colors, cx)),
                 )
+            })
+            .when_some(self.drop_notice.clone(), |panel, notice| {
+                panel.child(
+                    div()
+                        .id("launcher-drop-notice")
+                        .mt(px(9.0))
+                        .mx(px(COMPOSER_INSET))
+                        .px(px(9.0))
+                        .py(px(7.0))
+                        .flex()
+                        .items_start()
+                        .gap(px(7.0))
+                        .rounded(px(Radius::ROW))
+                        .bg(Ink::ATTENTION.alpha(0.08))
+                        .border_1()
+                        .border_color(Ink::ATTENTION.alpha(0.20))
+                        .child(sf_symbol(
+                            "exclamationmark.circle.fill",
+                            11.0,
+                            Ink::ATTENTION,
+                        ))
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(px(10.0))
+                                .line_height(px(14.0))
+                                .text_color(colors.secondary)
+                                .child(notice),
+                        ),
+                )
             });
 
         panel.into_any_element()
+    }
+
+    fn render_session_panel(
+        &self,
+        colors: SemanticColors,
+        focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let session = match &self.target {
+            LauncherTarget::Session(id) => self
+                .services
+                .store
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .sessions()
+                .get(id)
+                .cloned(),
+            LauncherTarget::NewSession => None,
+        };
+        let title = session.as_ref().map_or_else(
+            || "Unavailable session".to_owned(),
+            |session| session.title.clone(),
+        );
+        let cwd = session.as_ref().map_or_else(
+            || "Session no longer available".to_owned(),
+            |session| session.cwd.clone(),
+        );
+        let logo = session.as_ref().map_or(UiAgentKind::Generic, |session| {
+            ui_agent_kind(session.effective_kind())
+        });
+        let can_submit = self.can_submit();
+        let text_height = composer_text_height(self.prompt.line_count());
+        let composer_height = text_height + COMPOSER_CONTROLS_HEIGHT;
+        let composer_fill = if colors.appearance == diri_ui::Appearance::Dark {
+            rgba(0x26282dff)
+        } else {
+            rgba(0xf2f1efff)
+        };
+        let shelf_fill = if colors.appearance == diri_ui::Appearance::Dark {
+            rgba(0x1d1f23ff)
+        } else {
+            rgba(0xe8e7e4ff)
+        };
+        let prompt = if self.prompt.is_empty() {
+            div()
+                .h(px(COMPOSER_LINE_HEIGHT))
+                .flex()
+                .items_center()
+                .when(focused, |line| {
+                    line.child(div().text_color(colors.primary.alpha(0.92)).child(CARET))
+                })
+                .child(
+                    div()
+                        .text_color(colors.tertiary)
+                        .child("Add context or instructions…"),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .id("session-composer-prompt-lines")
+                .size_full()
+                .flex()
+                .flex_col()
+                .overflow_y_scroll()
+                .track_scroll(self.prompt.scroll_handle())
+                .children(self.prompt.render_lines(
+                    px(COMPOSER_LINE_HEIGHT),
+                    focused.then_some(CARET),
+                    HighlightStyle {
+                        background_color: Some(Palette::GEMINI_BLUE.alpha(0.30).into()),
+                        ..HighlightStyle::default()
+                    },
+                ))
+                .into_any_element()
+        };
+
+        div()
+            .relative()
+            .w(px(PANEL_WIDTH))
+            .child(
+                div()
+                    .h(px(TITLE_HEIGHT))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(8.0))
+                    .child(sf_symbol("paperclip", 16.0, Palette::GEMINI_BLUE))
+                    .child(
+                        div()
+                            .max_w(px(PANEL_WIDTH - 52.0))
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_size(px(20.0))
+                            .font_weight(FontWeight::NORMAL)
+                            .text_color(colors.primary.alpha(0.94))
+                            .child(format!("Add context to {title}")),
+                    ),
+            )
+            .child(
+                div()
+                    .relative()
+                    .mt(px(TITLE_GAP))
+                    .mx(px(COMPOSER_INSET))
+                    .h(px(composer_height))
+                    .rounded(px(Radius::PANEL))
+                    .bg(composer_fill)
+                    .border_1()
+                    .border_color(if focused {
+                        Palette::GEMINI_BLUE.alpha(0.46)
+                    } else {
+                        colors.primary.alpha(0.09)
+                    })
+                    .cursor_text()
+                    .on_mouse_down(MouseButton::Left, {
+                        let focus = self.focus.clone();
+                        move |_, window, cx| window.focus(&focus, cx)
+                    })
+                    .child(
+                        div()
+                            .h(px(text_height))
+                            .px(px(COMPOSER_PADDING))
+                            .pt(px(COMPOSER_PAD_TOP))
+                            .pb(px(COMPOSER_PAD_BOTTOM))
+                            .text_size(px(COMPOSER_FONT_SIZE))
+                            .line_height(px(COMPOSER_LINE_HEIGHT))
+                            .text_color(colors.primary)
+                            .child(prompt),
+                    )
+                    .child(
+                        div()
+                            .h(px(COMPOSER_CONTROLS_HEIGHT))
+                            .px(px(10.0))
+                            .pb(px(8.0))
+                            .flex()
+                            .items_end()
+                            .justify_between()
+                            .child(div().text_size(px(10.0)).text_color(colors.tertiary).child(
+                                self.blocker().unwrap_or_else(|| {
+                                    "Review first — dropping sent nothing".to_owned()
+                                }),
+                            ))
+                            .child(
+                                div()
+                                    .id("session-composer-submit")
+                                    .size(px(CONTROL_SIZE))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(CONTROL_RADIUS))
+                                    .bg(if can_submit {
+                                        colors.primary
+                                    } else {
+                                        Fill::subtle(colors)
+                                    })
+                                    .when(can_submit, |button| {
+                                        button
+                                            .cursor_pointer()
+                                            .hover(move |button| button.opacity(0.86))
+                                            .active(move |button| button.opacity(0.72))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.submit(cx);
+                                            }))
+                                    })
+                                    .child(sf_symbol_weighted(
+                                        "arrow.up",
+                                        10.0,
+                                        SymbolWeight::Bold,
+                                        if can_submit {
+                                            colors.background
+                                        } else {
+                                            colors.tertiary
+                                        },
+                                    )),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .relative()
+                    .mx(px(16.0))
+                    .h(px(SHELF_HEIGHT))
+                    .px(px(12.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .rounded_bl(px(Radius::PANEL))
+                    .rounded_br(px(Radius::PANEL))
+                    .bg(shelf_fill)
+                    .border_1()
+                    .border_color(colors.primary.alpha(0.055))
+                    .child(AgentLogo::new(logo, 17.0, colors).badged(false))
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .flex_1()
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_size(px(11.0))
+                            .text_color(colors.secondary)
+                            .child(cwd),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(10.0))
+                            .text_color(colors.tertiary)
+                            .child("Local draft"),
+                    ),
+            )
+            .when_some(self.drop_notice.clone(), |panel, notice| {
+                panel.child(
+                    div()
+                        .id("session-composer-drop-notice")
+                        .mt(px(9.0))
+                        .mx(px(COMPOSER_INSET))
+                        .px(px(9.0))
+                        .py(px(7.0))
+                        .flex()
+                        .items_start()
+                        .gap(px(7.0))
+                        .rounded(px(Radius::ROW))
+                        .bg(Ink::ATTENTION.alpha(0.08))
+                        .border_1()
+                        .border_color(Ink::ATTENTION.alpha(0.20))
+                        .child(sf_symbol(
+                            "exclamationmark.circle.fill",
+                            11.0,
+                            Ink::ATTENTION,
+                        ))
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(px(10.0))
+                                .line_height(px(14.0))
+                                .text_color(colors.secondary)
+                                .child(notice),
+                        ),
+                )
+            })
+            .into_any_element()
     }
 
     /// Wrapper for a picker popover. It swallows its own mouse-down so the
@@ -1181,6 +1582,28 @@ fn initial_target(services: &AppServices) -> (AgentKind, String, Option<String>)
     )
 }
 
+fn transition_draft(
+    current: &LauncherTarget,
+    next: &LauncherTarget,
+    current_text: &str,
+    new_session_draft: &mut String,
+    session_drafts: &mut HashMap<SessionId, String>,
+) -> String {
+    match current {
+        LauncherTarget::NewSession => current_text.clone_into(new_session_draft),
+        LauncherTarget::Session(id) if current_text.is_empty() => {
+            session_drafts.remove(id);
+        }
+        LauncherTarget::Session(id) => {
+            session_drafts.insert(id.clone(), current_text.to_owned());
+        }
+    }
+    match next {
+        LauncherTarget::NewSession => new_session_draft.clone(),
+        LauncherTarget::Session(id) => session_drafts.get(id).cloned().unwrap_or_default(),
+    }
+}
+
 fn ui_agent_kind(kind: &AgentKind) -> UiAgentKind {
     match kind.id() {
         AgentKind::CLAUDE_CODE_ID => UiAgentKind::ClaudeCode,
@@ -1249,5 +1672,55 @@ mod tests {
         ));
         assert_eq!(selected, "/work/chosen");
         assert_eq!(prompt.text(), "keep this\nunfinished prompt");
+    }
+
+    #[test]
+    fn each_session_and_the_new_session_launcher_keep_an_independent_draft() {
+        let new = LauncherTarget::NewSession;
+        let first = LauncherTarget::Session(SessionId("first".into()));
+        let second = LauncherTarget::Session(SessionId("second".into()));
+        let mut new_draft = String::new();
+        let mut sessions = HashMap::new();
+
+        assert_eq!(
+            transition_draft(
+                &new,
+                &first,
+                "unfinished new session",
+                &mut new_draft,
+                &mut sessions,
+            ),
+            ""
+        );
+        assert_eq!(
+            transition_draft(
+                &first,
+                &second,
+                "review this\n'/tmp/one.rs'",
+                &mut new_draft,
+                &mut sessions,
+            ),
+            ""
+        );
+        assert_eq!(
+            transition_draft(
+                &second,
+                &first,
+                "compare '/tmp/two.rs'",
+                &mut new_draft,
+                &mut sessions,
+            ),
+            "review this\n'/tmp/one.rs'"
+        );
+        assert_eq!(
+            transition_draft(
+                &first,
+                &new,
+                "review this\n'/tmp/one.rs'",
+                &mut new_draft,
+                &mut sessions,
+            ),
+            "unfinished new session"
+        );
     }
 }
