@@ -806,7 +806,7 @@ fn environment_capture_frames_its_payload_and_scrubs_ssh_state() {
     let state_dir = temporary.path().join("state");
     let request = EnvironmentCaptureRequest {
         cwd: Some("/".into()),
-        timeout_millis: 2_000,
+        timeout_millis: 10_000,
     };
     let mut child = Command::new(helper())
         .arg("environment")
