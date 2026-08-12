@@ -2,6 +2,8 @@
 
 - [Getting started](GETTING_STARTED.md) — installation, first session, worktrees,
   remote hosts, diagnostics, and local data.
+- [Keyboard shortcuts](KEYBOARD_SHORTCUTS.md) — every binding, grouped by task,
+  plus how Diri resolves an ambiguous keystroke.
 - [Security model](SECURITY-MODEL.md) — trust boundaries and safe-use guidance.
 - [Remote nodes](../diri/NODE.md) — run sessions over SSH and tmux.
 - [Packaging](../diri/PACKAGING.md) — build, signing, and notarization.
