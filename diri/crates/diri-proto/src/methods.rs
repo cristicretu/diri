@@ -174,6 +174,24 @@ pub struct AgentSetup {
     pub sign_in_hint: Option<String>,
 }
 
+/// How a running agent accepts visual context. This is deliberately a
+/// manifest capability: terminal shortcuts differ between agents and can
+/// change independently of Diri.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ImageInputStrategy {
+    /// Add private, validated file paths to the submitted prompt.
+    PromptPath,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageInputSpec {
+    pub strategy: ImageInputStrategy,
+    #[serde(default)]
+    pub supports_image_only: bool,
+}
+
 /// The daemon-side manifest descriptor for one agent, as much of it as the
 /// client needs. Deliberately partial and tolerant: the daemon owns the full
 /// schema (spawn args, env hygiene, injection), and unknown fields are ignored
@@ -204,6 +222,10 @@ pub struct AgentDescriptor {
     /// compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup: Option<AgentSetup>,
+    /// Optional visual-input contract. Absence is intentionally conservative:
+    /// callers may reference a path, but must also require explanatory text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_input: Option<ImageInputSpec>,
     /// Preserve Engine-owned manifest fields that this client-facing view does
     /// not interpret (for example injection and resume metadata). The catalog
     /// remains additive while Settings consumes only the typed subset above.

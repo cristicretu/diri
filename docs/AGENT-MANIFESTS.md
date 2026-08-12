@@ -30,6 +30,10 @@ fields. Remove the comments in a real manifest.
     "statusAuthority": "screen",
     "binary": "example",
     "returnToLoginShell": true,
+    "imageInput": {
+      "strategy": "promptPath",
+      "supportsImageOnly": true
+    },
     "approve": { "text": "y", "submit": true },
     "deny": { "text": "n", "submit": true }
   },
@@ -109,6 +113,7 @@ Do not use an ignored key for behavior.
 | `binary` | Yes for a launchable agent | `argv[0]`, such as `maki`; omit only for pseudo-agents such as `shell` and `generic`. |
 | `spawnArgs` | No | Fixed argv words inserted on every launch. Each item is one word; never concatenate a shell command. |
 | `returnToLoginShell` | No | After a local agent exits, return to an interactive login shell instead of ending the PTY. Most terminal agents set this to `true`. |
+| `imageInput` | No | Declares verified visual-context delivery. `strategy: promptPath` references Diri-owned staged paths in the submitted prompt. Set `supportsImageOnly` only when the running agent accepts a turn with images and no text. Without this declaration Diri uses the conservative path fallback and requires text. |
 | `approve`, `deny` | No | Canned prompt answers: `text` is typed literally and `submit` controls whether Return follows. `deny` defaults to Escape; omit `approve` when no universal safe answer exists. |
 
 `env` is a map of values Diri deliberately forces into the child. Use it only

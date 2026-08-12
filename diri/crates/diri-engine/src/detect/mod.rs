@@ -337,6 +337,26 @@ mod tests {
     }
 
     #[test]
+    fn image_input_survives_the_raw_manifest_to_client_catalog_boundary() {
+        let engine = engine();
+        for id in ["claude-code", "codex"] {
+            let raw = engine
+                .raw_agent(id)
+                .unwrap_or_else(|| panic!("{id} carries no agent object"));
+            let descriptor: diri_proto::AgentDescriptor = serde_json::from_value(raw.clone())
+                .unwrap_or_else(|error| panic!("{id} is not a client descriptor: {error}"));
+            let image_input = descriptor
+                .image_input
+                .unwrap_or_else(|| panic!("{id} lost imageInput during catalog conversion"));
+            assert_eq!(
+                image_input.strategy,
+                diri_proto::ImageInputStrategy::PromptPath
+            );
+            assert!(image_input.supports_image_only);
+        }
+    }
+
+    #[test]
     fn cline_and_maki_carry_official_setup_guidance() {
         let engine = engine();
         for (id, expected_url) in [

@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 
 use diri_proto::SessionId;
 
+use crate::image_attachments::{ImageRejection, inspect_path, is_supported_image_path};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExternalPathKind {
     File,
@@ -41,6 +43,7 @@ pub(crate) enum ExternalPathRejection {
     RequiresDirectory,
     AdditionalPath,
     RemoteTarget,
+    Image(ImageRejection),
 }
 
 impl ExternalPathRejection {
@@ -54,6 +57,7 @@ impl ExternalPathRejection {
             Self::RequiresDirectory => "is not a directory",
             Self::AdditionalPath => "only the first directory starts the session",
             Self::RemoteTarget => "is local, but the target runs on another host",
+            Self::Image(reason) => reason.explanation(),
         }
     }
 }
@@ -79,6 +83,7 @@ pub(crate) enum ExternalDropAction {
     OpenSessionComposer {
         session_id: SessionId,
         insertion: String,
+        image_paths: Vec<PathBuf>,
     },
 }
 
@@ -187,9 +192,19 @@ fn plan_staged_drop(
     match target {
         ExternalDropTarget::Session { id, remote: false } => {
             let mut accepted = Vec::new();
+            let mut image_paths = Vec::new();
             let mut rejected = Vec::new();
             for result in staged {
                 match result {
+                    Ok(path) if is_supported_image_path(&path.path) => {
+                        match inspect_path(&path.path) {
+                            Ok(()) => image_paths.push(path.path),
+                            Err(reason) => rejected.push(RejectedExternalPath {
+                                path: path.path,
+                                reason: ExternalPathRejection::Image(reason),
+                            }),
+                        }
+                    }
                     Ok(path) => accepted.push(path),
                     Err(error) => rejected.push(error),
                 }
@@ -200,10 +215,11 @@ fn plan_staged_drop(
                 .collect::<Vec<_>>()
                 .join(" ");
             ExternalDropPlan {
-                action: (!insertion.is_empty()).then_some(
+                action: (!insertion.is_empty() || !image_paths.is_empty()).then_some(
                     ExternalDropAction::OpenSessionComposer {
                         session_id: id,
                         insertion,
+                        image_paths,
                     },
                 ),
                 rejected,
@@ -488,9 +504,60 @@ mod tests {
             Some(ExternalDropAction::OpenSessionComposer {
                 session_id: SessionId("session-1".into()),
                 insertion: "'/tmp/a folder' '/tmp/$HOME; rm -rf nope'".into(),
+                image_paths: Vec::new(),
             })
         );
         assert!(plan.rejected.is_empty());
+    }
+
+    #[test]
+    fn session_target_routes_raster_images_as_pending_attachments_not_prompt_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first image.png");
+        let second = directory.path().join("second.webp");
+        fs::write(&first, b"\x89PNG\r\n\x1a\nimage").unwrap();
+        fs::write(&second, b"RIFF\x04\0\0\0WEBPimage").unwrap();
+
+        let plan = plan_external_drop(
+            &[first.clone(), second.clone()],
+            ExternalDropTarget::Session {
+                id: SessionId("session-1".into()),
+                remote: false,
+            },
+        );
+        assert_eq!(
+            plan.action,
+            Some(ExternalDropAction::OpenSessionComposer {
+                session_id: SessionId("session-1".into()),
+                insertion: String::new(),
+                image_paths: vec![first, second],
+            })
+        );
+        assert!(plan.rejected.is_empty());
+    }
+
+    #[test]
+    fn invalid_raster_payload_gets_visible_image_specific_feedback() {
+        let directory = tempfile::tempdir().unwrap();
+        let fake = directory.path().join("not-really.png");
+        fs::write(&fake, b"plain text").unwrap();
+        let plan = plan_external_drop(
+            &[fake],
+            ExternalDropTarget::Session {
+                id: SessionId("session-1".into()),
+                remote: false,
+            },
+        );
+        assert!(plan.action.is_none());
+        assert!(matches!(
+            plan.rejected[0].reason,
+            ExternalPathRejection::Image(ImageRejection::InvalidContents)
+        ));
+        assert!(
+            plan.feedback()
+                .unwrap()
+                .contains("does not contain the image data")
+        );
     }
 
     #[test]

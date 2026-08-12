@@ -1,6 +1,5 @@
 mod agent_catalog;
 mod app_theme;
-mod clipboard_transfer;
 mod code_intelligence;
 mod code_viewer;
 mod commands;
@@ -17,6 +16,7 @@ pub mod fuzzy;
 mod git_review;
 pub mod history;
 mod icons;
+mod image_attachments;
 mod inspector;
 mod launcher;
 pub mod markdown;

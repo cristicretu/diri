@@ -232,13 +232,34 @@ impl RootView {
             });
         }
         if let Some(terminal) = &terminal {
-            cx.subscribe(terminal, |this, _, event, cx| {
-                let TerminalPaneEvent::OpenFileReference { reference, cwd, .. } = event;
-                let inspector = this.inspector.clone();
-                this.reveal_inspector(cx);
-                if let Some(inspector) = inspector {
-                    inspector.update(cx, |inspector, cx| {
-                        inspector.open_file_reference(cwd.clone(), reference.clone(), cx);
+            cx.subscribe_in(terminal, window, |this, _, event, window, cx| match event {
+                TerminalPaneEvent::OpenFileReference { reference, cwd, .. } => {
+                    let inspector = this.inspector.clone();
+                    this.reveal_inspector(cx);
+                    if let Some(inspector) = inspector {
+                        inspector.update(cx, |inspector, cx| {
+                            inspector.open_file_reference(cwd.clone(), reference.clone(), cx);
+                        });
+                    }
+                }
+                TerminalPaneEvent::StageImagePaths { session_id, paths } => {
+                    this.launcher.update(cx, |launcher, cx| {
+                        launcher.open_for_session(session_id.clone(), "", paths, None, window, cx);
+                    });
+                }
+                TerminalPaneEvent::StageClipboardImage {
+                    session_id,
+                    bytes,
+                    extension,
+                } => {
+                    this.launcher.update(cx, |launcher, cx| {
+                        launcher.open_clipboard_image(
+                            session_id.clone(),
+                            bytes,
+                            extension,
+                            window,
+                            cx,
+                        );
                     });
                 }
             })
@@ -263,11 +284,13 @@ impl RootView {
                     ExternalDropAction::OpenSessionComposer {
                         session_id,
                         insertion,
+                        image_paths,
                     } => {
                         this.launcher.update(cx, |launcher, cx| {
                             launcher.open_local_paths_for_session(
                                 session_id.clone(),
                                 insertion,
+                                image_paths,
                                 notice,
                                 window,
                                 cx,

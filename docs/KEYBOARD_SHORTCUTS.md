@@ -133,7 +133,7 @@ Ask and commit composers both take ↵ to submit and Esc to cancel.
 | ⌘G | Command-G | Next match |
 | ⇧⌘G | Shift-Command-G | Previous match |
 | ⌘C | Command-C | Copy the selection |
-| ⌘V | Command-V | Paste, including images |
+| ⌘V | Command-V | Paste text, or stage an image in the session composer |
 | ⌘= or ⌘+ | Command-plus | Zoom in |
 | ⌘- | Command-minus | Zoom out |
 | ⌘0 | Command-zero | Reset zoom |
@@ -141,6 +141,12 @@ Ask and commit composers both take ↵ to submit and Esc to cancel.
 With the find bar open, ↵ jumps to the next match, ⇧↵ to the previous one, and
 Esc closes it. Typing edits the query through the [shared text keymap](#text-fields);
 ⌘V stays the paste action rather than a find-bar edit, so it never inserts twice.
+
+Finder image drops on either the terminal or its sidebar row use that same staged
+attachment draft. A drop or image paste never submits a turn; review the filename
+chips, add optional instructions when the agent supports image-only input, then
+press ↵. PNG, JPEG, GIF, and WebP are accepted up to 20 MB each. Esc keeps the
+per-session draft, while each chip and **Clear images** provide explicit cleanup.
 
 Apart from ⌃⇥ and the active-surface shortcuts above, keys without ⌘ go to the
 running program, modifiers and all. Keys with ⌘ do not reach the program — ⌫ is the
