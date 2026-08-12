@@ -20,12 +20,13 @@ use objc2_app_kit::{
     NSImageView, NSLineBreakMode, NSPanel, NSPopUpMenuWindowLevel, NSRunningApplication,
     NSScrollView, NSStatusBar, NSStatusBarButton, NSStatusItem, NSTextAlignment, NSTextField,
     NSTrackingArea, NSTrackingAreaOptions, NSVariableStatusItemLength, NSView,
-    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
-    NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
-    NSWorkspaceDidActivateApplicationNotification,
+    NSViewBoundsDidChangeNotification, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
+    NSVisualEffectState, NSVisualEffectView, NSWindowAnimationBehavior, NSWindowCollectionBehavior,
+    NSWindowStyleMask, NSWorkspace, NSWorkspaceDidActivateApplicationNotification,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
+    MainThreadMarker, NSNotification, NSNotificationCenter, NSObject, NSObjectProtocol, NSPoint,
+    NSRect, NSSize, NSString,
 };
 
 use diri_proto::{AgentKind, AttentionLevel, ProjectId, SessionId};
@@ -102,6 +103,8 @@ pub struct NativeMenuBar {
     scroll: Retained<NSScrollView>,
     body: Retained<NSView>,
     target: Retained<MenuBarTarget>,
+    /// Re-syncs row hover while the list scrolls; see [`MenuBarHoverRow::sync_hover_to_pointer`].
+    scroll_observer: Option<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
     last_fingerprint: Option<u64>,
     /// Last level pushed to the status item; see [`NativeMenuBar::set_attention`].
     last_attention: Option<AttentionLevel>,
@@ -112,6 +115,10 @@ impl Drop for NativeMenuBar {
         // The dismiss monitors are process-global and retain this target; clear
         // them so a rebuilt menu bar cannot stack observers on the same status item.
         self.target.remove_monitors();
+        if let Some(observer) = self.scroll_observer.take() {
+            // SAFETY: observer came from addObserverForName on this same center.
+            unsafe { NSNotificationCenter::defaultCenter().removeObserver(observer.as_ref()) };
+        }
     }
 }
 
@@ -184,6 +191,31 @@ impl NativeMenuBar {
                 | NSAutoresizingMaskOptions::ViewHeightSizable,
         );
         surface.addSubview(&scroll);
+
+        // `updateTrackingAreas` is supposed to run as the visible rect moves,
+        // but hover correctness should not rest on that: watch the clip view
+        // directly so every scroll re-derives hover from the pointer.
+        let clip = scroll.contentView();
+        clip.setPostsBoundsChangedNotifications(true);
+        let scroll_observer = {
+            let body = body.clone();
+            let handler = RcBlock::new(move |_notification: NonNull<NSNotification>| {
+                for child in body.subviews().iter() {
+                    if let Some(row) = child.downcast_ref::<MenuBarHoverRow>() {
+                        row.sync_hover_to_pointer();
+                    }
+                }
+            });
+            // SAFETY: retained below and removed in `Drop for NativeMenuBar`.
+            unsafe {
+                NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
+                    Some(NSViewBoundsDidChangeNotification),
+                    Some(&clip),
+                    None,
+                    &handler,
+                )
+            }
+        };
 
         let footer_divider = separator(
             rect(ROW_INSET, FOOTER_HEIGHT, POPUP_WIDTH - ROW_INSET * 2.0, 1.0),
@@ -337,6 +369,7 @@ impl NativeMenuBar {
             scroll,
             body,
             target,
+            scroll_observer: Some(scroll_observer),
             last_fingerprint: None,
             last_attention: None,
         };
@@ -385,6 +418,10 @@ impl NativeMenuBar {
         if self.last_fingerprint == Some(fingerprint) {
             return;
         }
+        // `refresh` clears the fingerprint whenever the panel goes away, so a
+        // missing one means this is the first paint since it opened — the only
+        // time the list should jump back to the first project.
+        let opening = self.last_fingerprint.is_none();
         self.last_fingerprint = Some(fingerprint);
 
         let content_height = content_height_for(model);
@@ -442,7 +479,7 @@ impl NativeMenuBar {
             28.0,
         ));
 
-        self.rebuild_body(model, content_height, selected_session_id, mtm);
+        self.rebuild_body(model, content_height, selected_session_id, opening, mtm);
     }
 
     /// Retint the template status-item / header mark. Same Ink map as row
@@ -453,7 +490,13 @@ impl NativeMenuBar {
         }
         self.last_attention = Some(attention);
 
-        let tint = match attention {
+        // Absolute sRGB only, and nil for anything that is not a real signal.
+        // A dynamic color like `labelColor` resolves against the app's
+        // appearance rather than the menu bar's, so tinting with it paints the
+        // mark black on a dark bar — which is what made the working state
+        // disappear. Leaving the tint nil lets AppKit render the template the
+        // way it renders every other status item.
+        let signal_tint = match attention {
             AttentionLevel::NeedsInput => Some(rgba_ns(
                 Ink::ATTENTION.r,
                 Ink::ATTENTION.g,
@@ -463,12 +506,20 @@ impl NativeMenuBar {
             AttentionLevel::DoneUnseen => {
                 Some(rgba_ns(Ink::FRESH.r, Ink::FRESH.g, Ink::FRESH.b, 1.0))
             }
-            AttentionLevel::Working => Some(NSColor::labelColor().colorWithAlphaComponent(0.82)),
-            AttentionLevel::IdleSeen | AttentionLevel::None | AttentionLevel::Unknown => None,
+            AttentionLevel::Working
+            | AttentionLevel::IdleSeen
+            | AttentionLevel::None
+            | AttentionLevel::Unknown => None,
         };
-        self.button.setContentTintColor(tint.as_deref());
-        self.header_icon
-            .setContentTintColor(Some(tint.as_deref().unwrap_or(&*NSColor::labelColor())));
+        self.button.setContentTintColor(signal_tint.as_deref());
+
+        // The header mark sits inside the panel, where `labelColor` resolves
+        // against the right appearance, so it can keep the quieter idle tones.
+        let header_tint = signal_tint.unwrap_or_else(|| match attention {
+            AttentionLevel::Working => NSColor::labelColor().colorWithAlphaComponent(0.82),
+            _ => NSColor::labelColor(),
+        });
+        self.header_icon.setContentTintColor(Some(&header_tint));
     }
 
     fn rebuild_body(
@@ -476,8 +527,13 @@ impl NativeMenuBar {
         model: &InboxModel,
         content_height: f64,
         selected_session_id: Option<&SessionId>,
+        opening: bool,
         mtm: MainThreadMarker,
     ) {
+        // Every state change rebuilds the body, and selecting a row is a state
+        // change — so restoring the offset is what keeps a click from throwing
+        // the user back to the top of the list.
+        let anchor = (!opening).then(|| self.scroll_offset_from_top());
         for child in self.body.subviews().iter() {
             child.removeFromSuperview();
         }
@@ -489,7 +545,7 @@ impl NativeMenuBar {
             self.target.set_project_ids(Vec::new());
             self.add_empty_state(content_height, mtm);
             self.scroll.setDocumentView(Some(&self.body));
-            self.scroll_body_to_top();
+            self.restore_scroll(anchor);
             return;
         }
 
@@ -541,17 +597,31 @@ impl NativeMenuBar {
             }
         }
         self.scroll.setDocumentView(Some(&self.body));
-        self.scroll_body_to_top();
+        self.restore_scroll(anchor);
     }
 
-    fn scroll_body_to_top(&self) {
-        // Non-flipped document: y=0 is the bottom. Pin the clip to the top of
-        // the body so opening the menu always starts at the first project.
+    /// Distance from the top of the list, which is the thing worth preserving:
+    /// the document is non-flipped, so a raw `y` would hold position relative to
+    /// the *bottom* and drift every time a row is added or removed above.
+    fn scroll_offset_from_top(&self) -> f64 {
         let clip = self.scroll.contentView();
-        let doc_height = self.body.frame().size.height;
-        let clip_height = clip.bounds().size.height;
-        let top_y = (doc_height - clip_height).max(0.0);
-        clip.scrollToPoint(NSPoint::new(0.0, top_y));
+        offset_from_top(
+            self.body.frame().size.height,
+            clip.bounds().size.height,
+            clip.bounds().origin.y,
+        )
+    }
+
+    /// `None` pins to the top (the panel just opened); otherwise re-apply the
+    /// captured distance, clamped to whatever the rebuilt list can now show.
+    fn restore_scroll(&self, from_top: Option<f64>) {
+        let clip = self.scroll.contentView();
+        let y = clip_y_for_offset(
+            self.body.frame().size.height,
+            clip.bounds().size.height,
+            from_top,
+        );
+        clip.scrollToPoint(NSPoint::new(0.0, y));
         self.scroll.reflectScrolledClipView(&clip);
     }
 
@@ -1148,6 +1218,21 @@ fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
 }
 
+/// Clip origin, in the non-flipped document space the panel scrolls, that is
+/// `from_top` points below the first row. `None` means pin to the top.
+fn clip_y_for_offset(doc_height: f64, clip_height: f64, from_top: Option<f64>) -> f64 {
+    let top_y = (doc_height - clip_height).max(0.0);
+    match from_top {
+        Some(offset) => (top_y - offset.min(top_y)).max(0.0),
+        None => top_y,
+    }
+}
+
+/// Inverse of [`clip_y_for_offset`]: how far below the first row the viewport sits.
+fn offset_from_top(doc_height: f64, clip_height: f64, clip_y: f64) -> f64 {
+    ((doc_height - clip_height).max(0.0) - clip_y).max(0.0)
+}
+
 fn point_in_rect(point: NSPoint, frame: NSRect) -> bool {
     point.x >= frame.origin.x
         && point.x < frame.origin.x + frame.size.width
@@ -1506,6 +1591,12 @@ define_class!(
                 )
             };
             self.addTrackingArea(&area);
+            // Scrolling slides rows under a stationary cursor. AppKit
+            // synthesizes mouseEntered: for each row that passes beneath it but
+            // does not reliably pair those with mouseExited:, so hover state
+            // accumulates and every scrolled-past row stays filled. Re-derive it
+            // from where the pointer actually is instead of trusting the events.
+            self.sync_hover_to_pointer();
         }
 
         #[unsafe(method(acceptsFirstMouse:))]
@@ -1572,6 +1663,23 @@ impl MenuBarHoverRow {
         });
         // SAFETY: designated NSView initializer.
         unsafe { msg_send![super(this), initWithFrame: frame] }
+    }
+
+    /// True when the pointer is over the part of this row the clip view is
+    /// actually showing. `visibleRect` is what makes a row scrolled off the top
+    /// or bottom of the panel stop counting as hovered.
+    fn pointer_is_inside(&self) -> bool {
+        let Some(window) = self.window() else {
+            return false;
+        };
+        let on_screen = NSRect::new(NSEvent::mouseLocation(), NSSize::new(0.0, 0.0));
+        let in_window = window.convertRectFromScreen(on_screen).origin;
+        let point = self.convertPoint_fromView(in_window, None);
+        point_in_rect(point, self.visibleRect())
+    }
+
+    fn sync_hover_to_pointer(&self) {
+        self.set_hovered(self.pointer_is_inside());
     }
 
     fn set_hovered(&self, hovered: bool) {
@@ -2008,6 +2116,36 @@ impl MenuBarTarget {
 mod tests {
     use super::*;
     use diri_ui::{Metrics, Space};
+
+    /// Selecting a row rebuilds the body, so without an anchor every click threw
+    /// the list back to the first project.
+    #[test]
+    fn rebuilding_the_list_keeps_the_viewport_where_the_user_left_it() {
+        let (doc, clip) = (400.0, 360.0);
+        let resting = clip_y_for_offset(doc, clip, None);
+        assert_eq!(
+            resting, 40.0,
+            "no anchor pins to the top of a scrollable list"
+        );
+
+        // Scrolled 25pt down, then rebuilt with the same content.
+        let scrolled = 15.0;
+        let offset = offset_from_top(doc, clip, scrolled);
+        assert_eq!(offset, 25.0);
+        assert_eq!(clip_y_for_offset(doc, clip, Some(offset)), scrolled);
+    }
+
+    #[test]
+    fn a_shrinking_list_clamps_instead_of_scrolling_past_its_own_end() {
+        // Parked 100pt down, then all but one row goes away.
+        let offset = offset_from_top(600.0, 360.0, 140.0);
+        assert_eq!(offset, 100.0);
+        assert_eq!(clip_y_for_offset(380.0, 360.0, Some(offset)), 0.0);
+
+        // Content shorter than the viewport has nowhere to scroll at all.
+        assert_eq!(clip_y_for_offset(120.0, 360.0, Some(offset)), 0.0);
+        assert_eq!(offset_from_top(120.0, 360.0, 0.0), 0.0);
+    }
 
     /// The panel hand-places what the sidebar lays out with flexbox, so the
     /// columns silently drift the moment a sidebar token changes.
