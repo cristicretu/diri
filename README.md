@@ -1,4 +1,4 @@
-# diri
+<h1><img src="docs/images/diri-wordmark.png" alt="diri" width="300"></h1>
 
 [![CI](https://github.com/cristicretu/diri/actions/workflows/ci.yml/badge.svg)](https://github.com/cristicretu/diri/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
