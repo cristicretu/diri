@@ -231,7 +231,21 @@ fn login_shell() -> String {
 /// back. Never block on an unbounded pipe read while the writer may still live.
 #[cfg(unix)]
 fn login_path(shell: &str) -> Option<String> {
-    use std::io::Read;
+    login_path_with_timeout(shell, std::time::Duration::from_secs(5))
+}
+
+#[cfg(unix)]
+fn login_path_with_timeout(shell: &str, capture_timeout: std::time::Duration) -> Option<String> {
+    capture_login_path(shell, &["-i", "-l", "-c", "printenv PATH"], capture_timeout)
+}
+
+#[cfg(unix)]
+fn capture_login_path(
+    shell: &str,
+    arguments: &[&str],
+    capture_timeout: std::time::Duration,
+) -> Option<String> {
+    use std::io::{Read, Seek};
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
@@ -241,10 +255,15 @@ fn login_path(shell: &str) -> Option<String> {
         format!("{home}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
     };
 
+    // A background process from an rc file can inherit stdout after its shell
+    // exits. Capturing into an unlinked regular file means reading stops at the
+    // current length instead of waiting for that descendant to close a pipe.
+    let mut capture = anonymous_capture_file().ok()?;
+    let child_stdout = capture.try_clone().ok()?;
     let mut child = unsafe {
         Command::new(shell)
-            .args(["-i", "-l", "-c", "printenv PATH"])
-            .stdout(Stdio::piped())
+            .args(arguments)
+            .stdout(Stdio::from(child_stdout))
             .stderr(Stdio::null())
             .pre_exec(|| {
                 // Own process group so trapped shells / hung children die with us.
@@ -257,12 +276,11 @@ fn login_path(shell: &str) -> Option<String> {
     }
     .ok()?;
 
-    const CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
     let started = Instant::now();
     let timed_out = loop {
         match child.try_wait() {
             Ok(Some(_)) => break false,
-            Ok(None) if started.elapsed() < CAPTURE_TIMEOUT => {
+            Ok(None) if started.elapsed() < capture_timeout => {
                 std::thread::sleep(Duration::from_millis(50));
             }
             Ok(None) | Err(_) => break true,
@@ -280,9 +298,9 @@ fn login_path(shell: &str) -> Option<String> {
         return Some(fallback());
     }
 
-    let mut stdout = child.stdout.take()?;
+    capture.rewind().ok()?;
     let mut bytes = Vec::new();
-    let _ = stdout.read_to_end(&mut bytes);
+    let _ = capture.take(1 << 20).read_to_end(&mut bytes);
     let stdout = String::from_utf8_lossy(&bytes);
     // Interactive shells may print a greeting; take the last line that looks
     // like a PATH.
@@ -302,6 +320,40 @@ fn login_path(shell: &str) -> Option<String> {
     } else {
         format!("{path}:{}", fallback())
     })
+}
+
+#[cfg(unix)]
+fn anonymous_capture_file() -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    for _ in 0..8 {
+        let mut nonce = [0_u8; 8];
+        getrandom::fill(&mut nonce).map_err(|error| std::io::Error::other(error.to_string()))?;
+        let suffix = nonce
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let path =
+            std::env::temp_dir().join(format!("dirijor-path-{}-{suffix}", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(file) => {
+                std::fs::remove_file(path)?;
+                return Ok(file);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique PATH capture file",
+    ))
 }
 
 #[cfg(unix)]
@@ -573,6 +625,36 @@ fn resolve_remote_catalog_source(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_path_capture_does_not_wait_for_a_child_that_inherited_stdout() {
+        use std::time::{Duration, Instant};
+
+        let started = Instant::now();
+        let path = capture_login_path(
+            "/bin/sh",
+            &["-c", "/bin/sleep 2 & printf '/fixture:/usr/bin\\n'"],
+            Duration::from_millis(200),
+        );
+
+        assert_eq!(path.as_deref(), Some("/fixture:/usr/bin"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn login_path_capture_kills_a_shell_that_exceeds_the_deadline() {
+        use std::time::{Duration, Instant};
+
+        let started = Instant::now();
+        let path = capture_login_path(
+            "/bin/sh",
+            &["-c", "/bin/sleep 2; printf '/too-late:/usr/bin\\n'"],
+            Duration::from_millis(200),
+        );
+
+        assert_ne!(path.as_deref(), Some("/too-late:/usr/bin"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 
     #[test]
     fn cli_helper_replacement_keeps_the_running_inode_intact() {
