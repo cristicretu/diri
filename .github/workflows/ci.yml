@@ -377,7 +377,7 @@ jobs:
           stage="${RUNNER_TEMP}/diri-desktop-entry"
           dpkg-deb --extract "${deb}" "${stage}"
           desktop-file-validate "${stage}/usr/share/applications/diri.desktop"
-          sha256sum --check diri/dist/linux/SHA256SUMS
+          (cd diri/dist/linux && sha256sum --check SHA256SUMS)
           jq -e \
             --arg commit "${{ github.event.pull_request.head.sha || github.sha }}" \
             '.platform == "linux" and .architecture == "x86_64" and .commit == $commit and (.artifacts | length) == 2' \

@@ -19,6 +19,7 @@ mod inspector;
 mod launcher;
 pub mod markdown;
 mod markdown_view;
+#[cfg(any(target_os = "macos", test))]
 mod menu_inbox;
 pub mod navigation;
 pub mod notifications;
