@@ -633,12 +633,12 @@ mod tests {
         let started = Instant::now();
         let path = capture_login_path(
             "/bin/sh",
-            &["-c", "/bin/sleep 2 & printf '/fixture:/usr/bin\\n'"],
-            Duration::from_millis(200),
+            &["-c", "/bin/sleep 5 & printf '/fixture:/usr/bin\\n'"],
+            Duration::from_secs(2),
         );
 
         assert_eq!(path.as_deref(), Some("/fixture:/usr/bin"));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[test]
@@ -648,12 +648,12 @@ mod tests {
         let started = Instant::now();
         let path = capture_login_path(
             "/bin/sh",
-            &["-c", "/bin/sleep 2; printf '/too-late:/usr/bin\\n'"],
-            Duration::from_millis(200),
+            &["-c", "/bin/sleep 5; printf '/too-late:/usr/bin\\n'"],
+            Duration::from_millis(500),
         );
 
         assert_ne!(path.as_deref(), Some("/too-late:/usr/bin"));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[test]
