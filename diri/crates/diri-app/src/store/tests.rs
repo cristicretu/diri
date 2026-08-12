@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use diri_proto::{
     AgentDescriptor, AgentKind, AgentReadinessItem, AgentReadinessResult, AttentionLevel,
@@ -735,7 +736,7 @@ fn attention_rollup_and_needs_input_sort_use_proto_derivation() {
 }
 
 #[test]
-fn hidden_needs_input_update_emits_chime_and_notification_effect() {
+fn hidden_needs_input_update_chimes_and_posts_once_its_window_expires() {
     let (mut store, mut effects) = hydrated(
         vec![session("visible", "p", 2.0)],
         vec![project("p", "P")],
@@ -747,15 +748,117 @@ fn hidden_needs_input_update_emits_chime_and_notification_effect() {
     hidden.status = SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Permission);
     store.upsert_session(hidden);
 
-    let transition = drain(&mut effects)
-        .into_iter()
-        .find_map(|effect| match effect {
-            StoreEffect::StatusTransition(transition) => Some(transition),
-            _ => None,
-        })
-        .expect("needs-input update should emit a status transition");
+    // Nothing is announced on the transition itself, and nothing is due yet.
+    assert!(
+        drain(&mut effects)
+            .into_iter()
+            .all(|effect| !matches!(effect, StoreEffect::StatusTransition(_)))
+    );
+    assert!(store.drain_settled_attention(Instant::now()).is_empty());
+
+    let transitions = store.drain_settled_attention(
+        store
+            .next_attention_deadline()
+            .expect("needs-input update should arm a settle window"),
+    );
+    let transition = transitions
+        .first()
+        .expect("a session still blocked at its deadline is announced");
     assert_eq!(transition.sound, Some(NotificationSound::NeedsInput));
     assert!(transition.notification.is_some());
+    assert!(store.next_attention_deadline().is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_settle_task_sleeps_on_the_window_and_then_publishes() {
+    let (store, _effects) = SessionStore::headless(Prefs::default());
+    let store = Arc::new(std::sync::RwLock::new(store));
+    let (status_tx, mut status_rx) = tokio::sync::broadcast::channel(8);
+    let task = tokio::spawn(super::run_attention_settle(
+        Arc::clone(&store),
+        status_tx.clone(),
+    ));
+
+    // The session the user is looking at, so the blocked one is not the
+    // selected row and earns a banner as well as a chime.
+    store
+        .write()
+        .expect("session store lock poisoned")
+        .upsert_session(session("visible", "p", 2.0));
+    let mut blocked = session("blocked", "p", 1.0);
+    blocked.status = SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Permission);
+    store
+        .write()
+        .expect("session store lock poisoned")
+        .upsert_session(blocked);
+
+    // Nothing is published until the window is served — the task is asleep on
+    // the deadline it was woken to install.
+    assert!(status_rx.try_recv().is_err());
+
+    let transition = tokio::time::timeout(Duration::from_secs(30), status_rx.recv())
+        .await
+        .expect("the settle task must publish once the window expires")
+        .expect("status channel stays open");
+    assert_eq!(transition.sound, Some(NotificationSound::NeedsInput));
+    assert!(transition.notification.is_some());
+
+    task.abort();
+}
+
+#[test]
+fn a_session_that_unblocks_inside_its_window_is_never_announced() {
+    let (mut store, mut effects) = hydrated(
+        vec![session("visible", "p", 2.0)],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    drain(&mut effects);
+
+    let mut blocked = session("hidden", "p", 1.0);
+    blocked.status = SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Permission);
+    store.upsert_session(blocked.clone());
+    assert!(store.next_attention_deadline().is_some());
+
+    // Answered before the window expired: the pending state goes with it, so
+    // the settle task is not even kept awake for it.
+    blocked.status = SessionStatus::Working;
+    blocked.needs_input = None;
+    store.upsert_session(blocked);
+
+    assert!(store.next_attention_deadline().is_none());
+    assert!(
+        store
+            .drain_settled_attention(Instant::now() + Duration::from_secs(60))
+            .is_empty()
+    );
+}
+
+#[test]
+fn selecting_a_session_inside_its_window_leaves_the_chime_but_drops_the_banner() {
+    let (mut store, mut effects) = hydrated(
+        vec![session("visible", "p", 2.0)],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    drain(&mut effects);
+
+    let mut blocked = session("hidden", "p", 1.0);
+    blocked.status = SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Permission);
+    store.upsert_session(blocked);
+    store.select(id("hidden"));
+
+    let transitions = store.drain_settled_attention(
+        store
+            .next_attention_deadline()
+            .expect("needs-input update should arm a settle window"),
+    );
+    let transition = transitions.first().expect("the chime still fires");
+    assert_eq!(transition.sound, Some(NotificationSound::NeedsInput));
+    assert!(
+        transition.notification.is_none(),
+        "the session the user is looking at needs no system banner"
+    );
 }
 
 #[test]

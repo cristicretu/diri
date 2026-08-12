@@ -53,6 +53,9 @@ url.workspace = true
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 gpui_platform = { workspace = true, features = ["test-support"] }
+# Pauses the clock so the notification settle window is exercised without
+# spending its wall-clock duration in the test suite.
+tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "=0.6.2"

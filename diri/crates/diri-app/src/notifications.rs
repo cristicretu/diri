@@ -2,6 +2,8 @@
 //!
 //! The behavior and per-agent answers carry over from the retired Swift client.
 
+use std::time::{Duration, Instant};
+
 use diri_proto::remote_pty::PersistenceCapability;
 use diri_proto::{
     AgentDescriptor, AgentKind, AttentionLevel, HibernationReason, NeedsInputKind, SessionId,
@@ -269,23 +271,17 @@ pub fn command_for_action(action_id: &str, data: &ActionData) -> Option<SendText
     })
 }
 
-/// Produce sound/banner work for a single authoritative session update.
+/// Produce the sound/banner work that a session update earns immediately.
 ///
-/// Chimes are emitted even for the focused session. Banners are suppressed only
-/// when that same session is selected and the app is active.
-///
-/// `descriptor` is the manifest descriptor for `current.effective_kind()`, when
-/// the daemon shipped one. It carries the agent's display name and its
-/// approve/deny keystrokes, so banner copy and quick actions stay
-/// manifest-driven instead of needing a client release per agent.
+/// These are one-shot facts — the host cannot keep processes alive, the
+/// governor froze a session — so there is nothing to wait out. Attention
+/// itself is a *state*, and states flap; it goes through the settle window
+/// instead (see [`attention_signal`]).
 #[must_use]
-pub fn transitions_for_update(
+pub fn immediate_transitions_for_update(
     previous: Option<&SessionRecord>,
     current: &SessionRecord,
-    selected_session_id: Option<&SessionId>,
-    app_is_active: bool,
     status_sounds_enabled: bool,
-    descriptor: Option<&AgentDescriptor>,
 ) -> Vec<StatusTransition> {
     let mut transitions = Vec::with_capacity(2);
 
@@ -321,27 +317,115 @@ pub fn transitions_for_update(
         });
     }
 
+    transitions
+}
+
+/// How long an attention state has to hold before it is worth interrupting for.
+///
+/// Attention is scraped off a moving terminal: an agent touches idle for a beat
+/// between tool calls, a permission prompt is answered by a hook before anyone
+/// could have read it, a session is done for one tick and back to work on the
+/// next. Announcing the transition itself turns every one of those into a chime
+/// and a Notification Center entry. Arming a deadline and re-reading the
+/// session when it expires means only states that actually survived get
+/// announced — and a state that resolves inside the window costs nothing.
+pub const ATTENTION_SETTLE: Duration = Duration::from_millis(1000);
+
+/// A noteworthy attention state waiting out [`ATTENTION_SETTLE`].
+///
+/// Only the level is held. The banner is built from the live record when the
+/// deadline expires, so a session that swapped one blocker for another during
+/// the window is described by the blocker it actually has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingAttention {
+    pub level: AttentionLevel,
+    pub deadline: Instant,
+}
+
+impl PendingAttention {
+    #[must_use]
+    pub fn armed_at(level: AttentionLevel, now: Instant) -> Self {
+        Self {
+            level,
+            // Saturating: a deadline that cannot be represented is one we would
+            // rather fire late than never.
+            deadline: now.checked_add(ATTENTION_SETTLE).unwrap_or(now),
+        }
+    }
+}
+
+/// The attention state this update entered, if any — the trigger that arms a
+/// settle window.
+///
+/// Entering the state is what counts. A session already blocked that swaps
+/// blockers is still the same interruption and does not re-arm.
+#[must_use]
+pub fn attention_signal(
+    previous: Option<&SessionRecord>,
+    current: &SessionRecord,
+) -> Option<AttentionLevel> {
     let previous_attention = previous.map(SessionRecord::attention);
     let current_attention = current.attention();
-    let became_blocked = previous_attention != Some(AttentionLevel::NeedsInput)
-        && current_attention == AttentionLevel::NeedsInput;
-    let became_done = previous_attention != Some(AttentionLevel::DoneUnseen)
-        && current_attention == AttentionLevel::DoneUnseen;
-    if became_blocked || became_done {
-        let is_focused = selected_session_id == Some(&current.id) && app_is_active;
-        transitions.push(StatusTransition {
-            sound: status_sounds_enabled.then_some(if became_blocked {
-                NotificationSound::NeedsInput
-            } else {
-                NotificationSound::Done
-            }),
-            notification: (!is_focused)
-                .then(|| attention_request(current, status_sounds_enabled, descriptor)),
-            in_app_banner: None,
-        });
+    let entered =
+        |level: AttentionLevel| previous_attention != Some(level) && current_attention == level;
+    if entered(AttentionLevel::NeedsInput) {
+        Some(AttentionLevel::NeedsInput)
+    } else if entered(AttentionLevel::DoneUnseen) {
+        Some(AttentionLevel::DoneUnseen)
+    } else {
+        None
     }
+}
 
-    transitions
+/// Whether a pending settle window still describes the session.
+///
+/// This is the whole point of the delay: the record is re-read at the deadline,
+/// and a session that moved on — went back to work, got archived, had its
+/// prompt answered — is never announced at all.
+#[must_use]
+pub fn attention_still_holds(current: &SessionRecord, pending: AttentionLevel) -> bool {
+    !current.is_archived() && current.attention() == pending
+}
+
+/// Sound/banner work for an attention state that outlived its settle window.
+///
+/// Returns `None` when the session no longer holds the state that armed it.
+///
+/// Chimes are emitted even for the focused session. Banners are suppressed only
+/// when that same session is selected and the app is active — both judged
+/// against where the user is *now*, so selecting the session during the window
+/// is enough to stop the banner.
+///
+/// `descriptor` is the manifest descriptor for `current.effective_kind()`, when
+/// the daemon shipped one. It carries the agent's display name and its
+/// approve/deny keystrokes, so banner copy and quick actions stay
+/// manifest-driven instead of needing a client release per agent.
+#[must_use]
+pub fn settled_attention_transition(
+    current: &SessionRecord,
+    pending: AttentionLevel,
+    selected_session_id: Option<&SessionId>,
+    app_is_active: bool,
+    status_sounds_enabled: bool,
+    descriptor: Option<&AgentDescriptor>,
+) -> Option<StatusTransition> {
+    let sound = match pending {
+        AttentionLevel::NeedsInput => NotificationSound::NeedsInput,
+        AttentionLevel::DoneUnseen => NotificationSound::Done,
+        // No other level is worth interrupting for, so none is ever armed and
+        // none has banner copy to build.
+        _ => return None,
+    };
+    if !attention_still_holds(current, pending) {
+        return None;
+    }
+    let is_focused = selected_session_id == Some(&current.id) && app_is_active;
+    Some(StatusTransition {
+        sound: status_sounds_enabled.then_some(sound),
+        notification: (!is_focused)
+            .then(|| attention_request(current, status_sounds_enabled, descriptor)),
+        in_app_banner: None,
+    })
 }
 
 fn attention_request(
@@ -470,7 +554,7 @@ mod tests {
         current.host = Some("forge".to_owned());
         current.remote_persistence = Some(PersistenceCapability::NonPersistent);
 
-        let first = transitions_for_update(None, &current, None, true, false, None);
+        let first = immediate_transitions_for_update(None, &current, false);
         let banner = first
             .iter()
             .find_map(|transition| transition.in_app_banner.as_ref())
@@ -478,9 +562,7 @@ mod tests {
         assert!(banner.title.contains("cannot survive"));
         assert!(banner.body.contains("forge"));
 
-        assert!(
-            transitions_for_update(Some(&current), &current, None, true, false, None).is_empty()
-        );
+        assert!(immediate_transitions_for_update(Some(&current), &current, false).is_empty());
     }
     use diri_proto::{
         AgentKeystroke, DateMillis, NeedsInputDetail, NeedsInputSource, ProjectId, Resumability,
@@ -530,6 +612,26 @@ mod tests {
         }
     }
 
+    /// What the settle task does at the deadline for a session that is still in
+    /// the state that armed it.
+    fn settled(
+        current: &SessionRecord,
+        selected_session_id: Option<&SessionId>,
+        app_is_active: bool,
+        status_sounds_enabled: bool,
+        descriptor: Option<&AgentDescriptor>,
+    ) -> StatusTransition {
+        settled_attention_transition(
+            current,
+            current.attention(),
+            selected_session_id,
+            app_is_active,
+            status_sounds_enabled,
+            descriptor,
+        )
+        .expect("a session still in its armed state is announced")
+    }
+
     #[test]
     fn approve_and_deny_map_to_each_agents_exact_keystrokes() {
         for (kind, text, submit) in [
@@ -539,7 +641,7 @@ mod tests {
             (AgentKind::GEMINI, "", true),
         ] {
             let current = session(kind, SessionStatus::NeedsInput(NeedsInputKind::Permission));
-            let transition = &transitions_for_update(None, &current, None, true, true, None)[0];
+            let transition = settled(&current, None, true, true, None);
             let data = transition
                 .notification
                 .as_ref()
@@ -592,8 +694,7 @@ mod tests {
             amp.clone(),
             SessionStatus::NeedsInput(NeedsInputKind::Permission),
         );
-        let transition =
-            &transitions_for_update(None, &current, None, true, true, Some(&descriptor))[0];
+        let transition = settled(&current, None, true, true, Some(&descriptor));
         let notification = transition.notification.as_ref().unwrap();
         assert_eq!(notification.title, "Amp needs you");
         let data = notification.action_data.as_ref().unwrap();
@@ -621,15 +722,14 @@ mod tests {
             approve: None,
             ..descriptor.clone()
         };
-        let transition =
-            &transitions_for_update(None, &current, None, true, true, Some(&unverified))[0];
+        let transition = settled(&current, None, true, true, Some(&unverified));
         let notification = transition.notification.as_ref().unwrap();
         assert_eq!(notification.title, "Amp needs you");
         assert!(notification.action_data.is_none());
 
         // Without a descriptor (daemon too old to send one) an unknown agent
         // falls back to the generic name and no quick actions.
-        let transition = &transitions_for_update(None, &current, None, true, true, None)[0];
+        let transition = settled(&current, None, true, true, None);
         assert_eq!(
             transition.notification.as_ref().unwrap().title,
             "Agent needs you"
@@ -642,23 +742,122 @@ mod tests {
             AgentKind::CODEX,
             SessionStatus::NeedsInput(NeedsInputKind::Permission),
         );
-        let hidden = transitions_for_update(
-            None,
-            &current,
-            Some(&SessionId::new("other")),
-            true,
-            true,
-            None,
+        let hidden = settled(&current, Some(&SessionId::new("other")), true, true, None);
+        assert_eq!(hidden.sound, Some(NotificationSound::NeedsInput));
+        assert!(hidden.notification.is_some());
+
+        let focused = settled(&current, Some(&current.id), true, true, None);
+        assert_eq!(focused.sound, Some(NotificationSound::NeedsInput));
+        assert!(focused.notification.is_none());
+
+        let inactive = settled(&current, Some(&current.id), false, true, None);
+        assert!(inactive.notification.is_some());
+    }
+
+    #[test]
+    fn entering_an_attention_state_arms_it_and_holding_it_does_not_rearm() {
+        let working = session(AgentKind::CODEX, SessionStatus::Working);
+        let blocked = session(
+            AgentKind::CODEX,
+            SessionStatus::NeedsInput(NeedsInputKind::Permission),
         );
-        assert_eq!(hidden[0].sound, Some(NotificationSound::NeedsInput));
-        assert!(hidden[0].notification.is_some());
+        assert_eq!(
+            attention_signal(Some(&working), &blocked),
+            Some(AttentionLevel::NeedsInput)
+        );
+        // Still blocked on the next tick — same interruption, no second window.
+        assert_eq!(attention_signal(Some(&blocked), &blocked), None);
+        assert_eq!(attention_signal(Some(&blocked), &working), None);
 
-        let focused = transitions_for_update(None, &current, Some(&current.id), true, true, None);
-        assert_eq!(focused[0].sound, Some(NotificationSound::NeedsInput));
-        assert!(focused[0].notification.is_none());
+        let mut done = session(AgentKind::CODEX, SessionStatus::Idle);
+        done.needs_input = None;
+        done.last_turn_completed_at = Some(DateMillis(50.0));
+        done.last_seen_at = Some(DateMillis(40.0));
+        assert_eq!(done.attention(), AttentionLevel::DoneUnseen);
+        assert_eq!(
+            attention_signal(Some(&working), &done),
+            Some(AttentionLevel::DoneUnseen)
+        );
+    }
 
-        let inactive = transitions_for_update(None, &current, Some(&current.id), false, true, None);
-        assert!(inactive[0].notification.is_some());
+    #[test]
+    fn a_state_that_does_not_outlive_its_window_is_never_announced() {
+        // The blip this whole delay exists for: idle for a beat between tool
+        // calls, back to working before anyone could have read a banner.
+        let working = session(AgentKind::CODEX, SessionStatus::Working);
+        assert!(
+            settled_attention_transition(
+                &working,
+                AttentionLevel::DoneUnseen,
+                None,
+                true,
+                true,
+                None
+            )
+            .is_none()
+        );
+
+        // A prompt answered inside the window — by a hook, or by the user in
+        // the terminal — leaves nothing to interrupt for either.
+        let mut answered = session(
+            AgentKind::CODEX,
+            SessionStatus::NeedsInput(NeedsInputKind::Permission),
+        );
+        answered.status = SessionStatus::Working;
+        answered.needs_input = None;
+        assert!(
+            settled_attention_transition(
+                &answered,
+                AttentionLevel::NeedsInput,
+                None,
+                true,
+                true,
+                None
+            )
+            .is_none()
+        );
+
+        // Archiving a session is the user saying they are done with it.
+        let mut archived = session(
+            AgentKind::CODEX,
+            SessionStatus::NeedsInput(NeedsInputKind::Permission),
+        );
+        archived.archived_at = Some(DateMillis(3.0));
+        assert!(
+            settled_attention_transition(
+                &archived,
+                AttentionLevel::NeedsInput,
+                None,
+                true,
+                true,
+                None
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn the_window_describes_the_blocker_the_session_ended_up_with() {
+        // Armed on one prompt, expired on another: the banner has to name the
+        // question actually on screen, and carry its identity so Notification
+        // Center treats it as a new blocker rather than a duplicate.
+        let armed = session(
+            AgentKind::CODEX,
+            SessionStatus::NeedsInput(NeedsInputKind::Permission),
+        );
+        let mut replaced = armed.clone();
+        replaced.needs_input.as_mut().unwrap().summary = "Delete the branch?".to_owned();
+
+        let transition = settled(&replaced, None, true, true, None);
+        let notification = transition.notification.as_ref().unwrap();
+        assert_eq!(notification.body, "Delete the branch?");
+        assert_ne!(
+            notification.identifier,
+            settled(&armed, None, true, true, None)
+                .notification
+                .unwrap()
+                .identifier
+        );
     }
 
     #[test]
@@ -668,7 +867,7 @@ mod tests {
             SessionStatus::NeedsInput(NeedsInputKind::Question),
         );
         question.needs_input.as_mut().unwrap().kind = NeedsInputKind::Question;
-        let transition = &transitions_for_update(None, &question, None, true, true, None)[0];
+        let transition = settled(&question, None, true, true, None);
         assert!(
             transition
                 .notification
@@ -682,7 +881,7 @@ mod tests {
             AgentKind::SHELL,
             SessionStatus::NeedsInput(NeedsInputKind::Permission),
         );
-        let transition = &transitions_for_update(None, &shell, None, true, true, None)[0];
+        let transition = settled(&shell, None, true, true, None);
         assert!(
             transition
                 .notification
@@ -758,7 +957,7 @@ mod tests {
             AgentKind::CODEX,
             SessionStatus::NeedsInput(NeedsInputKind::Permission),
         );
-        let transition = &transitions_for_update(None, &current, None, true, false, None)[0];
+        let transition = settled(&current, None, true, false, None);
         assert_eq!(transition.sound, None);
         assert!(transition.notification.as_ref().unwrap().use_system_sound);
     }

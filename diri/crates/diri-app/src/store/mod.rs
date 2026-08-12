@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use diri_client::{ClientError, ConnectionState, DaemonClient, EventEnvelope};
 use diri_proto::paths::DirijorPaths;
@@ -18,12 +18,13 @@ use diri_proto::{
     ExitReason, GovernorConfigureParams, HelloResult, HostEntry, HostsConfig, Project, ProjectId,
     Resumability, SessionId, SessionListResult, SessionRecord, SessionSpawnParams, SessionStatus,
 };
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::notifications::{
-    SendTextCommand, StatusTransition, migration_transition, prefs_sync_transition,
-    reach_failure_transition, transitions_for_update,
+    PendingAttention, SendTextCommand, StatusTransition, attention_signal,
+    immediate_transitions_for_update, migration_transition, prefs_sync_transition,
+    reach_failure_transition, settled_attention_transition,
 };
 use crate::switcher::{
     OverviewArrow, OverviewFilter, OverviewMode, OverviewOutcome, SessionOverviewState,
@@ -314,6 +315,13 @@ pub struct SessionStore {
     /// Empty until the first successful connect, and empty forever against a
     /// daemon too old to send descriptors — every reader must have a fallback.
     agents: AgentReadinessResult,
+    /// Attention states serving out their settle window, newest arming wins.
+    /// Drained by the settle task in `StoreHandle`, which is what turns one of
+    /// these into a chime and a banner — see `drain_settled_attention`.
+    attention_settle: HashMap<SessionId, PendingAttention>,
+    /// Wakes the settle task when a window is armed early enough to beat the
+    /// one it is currently sleeping on.
+    attention_wake: Arc<Notify>,
     effects: mpsc::UnboundedSender<StoreEffect>,
 }
 
@@ -369,6 +377,8 @@ impl SessionStore {
                 prefs_path,
                 hosts: Vec::new(),
                 agents: AgentReadinessResult::default(),
+                attention_settle: HashMap::new(),
+                attention_wake: Arc::new(Notify::new()),
                 effects,
             },
             receiver,
@@ -1112,14 +1122,13 @@ impl SessionStore {
         let previous = self.sessions.get(&session.id).cloned();
         let is_new = previous.is_none();
         let id = session.id.clone();
-        let transitions = transitions_for_update(
+        let transitions = immediate_transitions_for_update(
             previous.as_deref(),
             &session,
-            self.selected_session_id.as_ref(),
-            self.app_is_active,
             self.prefs.status_sounds,
-            self.agents.descriptor(session.effective_kind()),
         );
+        let attention = attention_signal(previous.as_deref(), &session);
+        let arriving_attention = session.attention();
         let arriving_archived = session.is_archived();
         // Closing the tab also drops the Engine record and deletes the
         // session's output log, so it may only happen where nothing is lost.
@@ -1141,6 +1150,7 @@ impl SessionStore {
                 .as_deref()
                 .is_none_or(|record| !matches!(record.status, SessionStatus::Exited(_)));
         self.sessions.insert(id.clone(), Arc::new(session));
+        self.settle_attention(&id, attention, arriving_attention, arriving_archived);
         // Spawn selects the id before the authoritative record arrives, and
         // only focus_session grants terminal residency -- without this, a
         // session created from the UI stays "Preparing terminal" forever.
@@ -1181,11 +1191,88 @@ impl SessionStore {
         self.reconcile_navigation();
     }
 
+    /// Arms, replaces, or abandons a session's settle window after an update.
+    ///
+    /// A fresh signal always re-arms: the newest reason to interrupt is the one
+    /// worth waiting on. Without a signal, a window whose state the session no
+    /// longer holds is dropped here rather than at the deadline, so a blip that
+    /// resolves immediately never even keeps the settle task awake.
+    fn settle_attention(
+        &mut self,
+        id: &SessionId,
+        signal: Option<AttentionLevel>,
+        attention: AttentionLevel,
+        archived: bool,
+    ) {
+        if let Some(level) = signal {
+            self.attention_settle.insert(
+                id.clone(),
+                PendingAttention::armed_at(level, Instant::now()),
+            );
+            self.attention_wake.notify_one();
+        } else if self
+            .attention_settle
+            .get(id)
+            .is_some_and(|pending| archived || pending.level != attention)
+        {
+            self.attention_settle.remove(id);
+        }
+    }
+
+    /// The earliest settle window still to run, for the task that sleeps on it.
+    #[must_use]
+    pub fn next_attention_deadline(&self) -> Option<Instant> {
+        self.attention_settle
+            .values()
+            .map(|pending| pending.deadline)
+            .min()
+    }
+
+    /// Handle to the signal raised whenever a settle window is armed.
+    #[must_use]
+    pub fn attention_wake(&self) -> Arc<Notify> {
+        Arc::clone(&self.attention_wake)
+    }
+
+    /// Turns every expired settle window into the chime and banner it earned,
+    /// judged against the session as it is now — not as it was when the window
+    /// was armed. States that did not survive produce nothing.
+    #[must_use]
+    pub fn drain_settled_attention(&mut self, now: Instant) -> Vec<StatusTransition> {
+        let due: Vec<SessionId> = self
+            .attention_settle
+            .iter()
+            .filter(|(_, pending)| pending.deadline <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut transitions = Vec::with_capacity(due.len());
+        for id in due {
+            let Some(pending) = self.attention_settle.remove(&id) else {
+                continue;
+            };
+            let Some(session) = self.sessions.get(&id) else {
+                continue;
+            };
+            if let Some(transition) = settled_attention_transition(
+                session,
+                pending.level,
+                self.selected_session_id.as_ref(),
+                self.app_is_active,
+                self.prefs.status_sounds,
+                self.agents.descriptor(session.effective_kind()),
+            ) {
+                transitions.push(transition);
+            }
+        }
+        transitions
+    }
+
     pub fn remove_session_record(&mut self, id: &SessionId) {
         if self.selected_session_id.as_ref() == Some(id) {
             self.focus_neighbor(&HashSet::from([id.clone()]));
         }
         self.sessions.remove(id);
+        self.attention_settle.remove(id);
         self.closing.remove(id);
         self.sidebar_selection.remove(id);
         self.mru_order.retain(|candidate| candidate != id);
@@ -2258,6 +2345,11 @@ impl StoreRuntime {
             status_tx.clone(),
         )));
 
+        tasks.push(tokio::spawn(run_attention_settle(
+            Arc::clone(&store),
+            status_tx.clone(),
+        )));
+
         let action_client = Arc::clone(&client);
         let action_status = status_tx.clone();
         tasks.push(tokio::spawn(async move {
@@ -2326,6 +2418,47 @@ impl Drop for StoreRuntime {
             for task in tasks.drain(..) {
                 task.abort();
             }
+        }
+    }
+}
+
+/// Announces attention states that outlived their settle window.
+///
+/// Every chime and banner for a blocked or finished session comes from here,
+/// one window after the transition and only if the session still holds the
+/// state — see `SessionStore::drain_settled_attention`. The loop sleeps on the
+/// nearest deadline and is woken early whenever a closer one is armed, so a
+/// quiet fleet costs no timer at all.
+async fn run_attention_settle(
+    store: Arc<RwLock<SessionStore>>,
+    status_tx: broadcast::Sender<StatusTransition>,
+) {
+    let wake = store
+        .read()
+        .expect("session store lock poisoned")
+        .attention_wake();
+    loop {
+        let deadline = store
+            .read()
+            .expect("session store lock poisoned")
+            .next_attention_deadline();
+        match deadline {
+            Some(deadline) => {
+                tokio::select! {
+                    () = tokio::time::sleep_until(deadline.into()) => {}
+                    // A window closer than the one being slept on, or one that
+                    // replaced it: recompute rather than oversleep.
+                    () = wake.notified() => continue,
+                }
+            }
+            None => wake.notified().await,
+        }
+        let transitions = store
+            .write()
+            .expect("session store lock poisoned")
+            .drain_settled_attention(Instant::now());
+        for transition in transitions {
+            let _ = status_tx.send(transition);
         }
     }
 }
