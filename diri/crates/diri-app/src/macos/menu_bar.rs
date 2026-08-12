@@ -12,23 +12,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use block2::RcBlock;
 use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
-use objc2::{AnyThread, DefinedClass, MainThreadOnly, define_class, msg_send, sel};
+use objc2::runtime::{AnyObject, ProtocolObject};
+use objc2::{AnyThread, DefinedClass, MainThreadOnly, Message, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationOptions, NSAutoresizingMaskOptions, NSBackingStoreType,
     NSBox, NSBoxType, NSButton, NSCellImagePosition, NSColor, NSEvent, NSEventMask,
     NSEventModifierFlags, NSFocusRingType, NSFont, NSFontAttributeName, NSFontWeightMedium,
     NSFontWeightRegular, NSFontWeightSemibold, NSForegroundColorAttributeName, NSImage,
     NSImageAlignment, NSImageScaling, NSImageSymbolConfiguration, NSImageView, NSLineBreakMode,
-    NSPanel, NSPopUpMenuWindowLevel, NSRunningApplication, NSScrollView, NSStatusBar,
-    NSStatusBarButton, NSStatusItem, NSTextAlignment, NSTextField, NSTrackingArea,
-    NSTrackingAreaOptions, NSVariableStatusItemLength, NSView, NSVisualEffectBlendingMode,
-    NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindowAnimationBehavior,
-    NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSMutableParagraphStyle, NSPanel, NSParagraphStyle, NSParagraphStyleAttributeName,
+    NSPopUpMenuWindowLevel, NSRunningApplication, NSScrollView, NSStatusBar, NSStatusBarButton,
+    NSStatusItem, NSTextAlignment, NSTextField, NSTrackingArea, NSTrackingAreaOptions,
+    NSVariableStatusItemLength, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
+    NSVisualEffectState, NSVisualEffectView, NSWindowAnimationBehavior, NSWindowCollectionBehavior,
+    NSWindowStyleMask, NSWorkspace, NSWorkspaceDidActivateApplicationNotification,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSMutableAttributedString, NSObject, NSObjectProtocol, NSPoint, NSRange,
-    NSRect, NSSize, NSString, NSTimer,
+    MainThreadMarker, NSMutableAttributedString, NSNotification, NSObject, NSObjectProtocol,
+    NSPoint, NSRange, NSRect, NSSize, NSString, NSTimer,
 };
 use tokio::sync::mpsc;
 
@@ -76,8 +77,7 @@ const DIRI_LOGO_WIDTH: f64 = DIRI_LOGO_HEIGHT * (59.5 / 42.5);
 /// Optical width of the "diri" wordmark at 13pt Semibold.
 const DIRI_TITLE_WIDTH: f64 = 28.0;
 /// Symmetric pad around logo + title (same inset on both sides).
-const BRAND_HIT_WIDTH: f64 =
-    ROW_PAD + DIRI_LOGO_WIDTH + ROW_GAP + DIRI_TITLE_WIDTH + ROW_PAD;
+const BRAND_HIT_WIDTH: f64 = ROW_PAD + DIRI_LOGO_WIDTH + ROW_GAP + DIRI_TITLE_WIDTH + ROW_PAD;
 const FOLDER_BADGE: f64 = 18.0;
 /// `diri_ui::IconSize::COMPACT`: every sidebar glyph authored at 8-11pt
 /// actually renders in a 14pt box.
@@ -117,6 +117,18 @@ pub struct NativeMenuBar {
     body: Retained<NSView>,
     target: Retained<MenuBarTarget>,
     last_fingerprint: Option<u64>,
+    /// Last (level, badge) pushed to the status item; see [`NativeMenuBar::set_attention`].
+    last_attention: Option<(AttentionLevel, usize)>,
+}
+
+impl Drop for NativeMenuBar {
+    fn drop(&mut self) {
+        // The dismiss monitors are process-global and the shimmer timer retains
+        // the target, so neither goes away on its own. Left installed they would
+        // keep firing into a menu bar that no longer exists.
+        self.target.remove_monitors();
+        self.target.stop_shimmer();
+    }
 }
 
 impl NativeMenuBar {
@@ -214,15 +226,28 @@ impl NativeMenuBar {
             rect(ROW_INSET, 0.0, BRAND_HIT_WIDTH, 28.0),
             target.clone(),
         );
+        // One rasterization, shared by the status item and the panel header.
+        // Both are the same fixed vector at the same fixed size, and only their
+        // tint ever changes.
+        let logo = brand_raster::template_diri_logo_ns_image(DIRI_LOGO_HEIGHT as f32);
+        if let Some(image) = &logo {
+            // Status-item templates must stay untinted so AppKit paints them for
+            // the menu bar (white on dark, black on light). Forcing labelColor
+            // resolves against the app window and reads as black on a dark bar.
+            button.setImage(Some(image));
+        }
         let header_icon = {
-            let view = if let Some(image) =
-                brand_raster::template_diri_logo_ns_image(DIRI_LOGO_HEIGHT as f32)
-            {
-                NSImageView::imageViewWithImage(&image, mtm)
+            let view = if let Some(image) = &logo {
+                NSImageView::imageViewWithImage(image, mtm)
             } else {
                 NSImageView::initWithFrame(
                     NSImageView::alloc(mtm),
-                    rect(ROW_PAD, (28.0 - DIRI_LOGO_HEIGHT) / 2.0, DIRI_LOGO_WIDTH, DIRI_LOGO_HEIGHT),
+                    rect(
+                        ROW_PAD,
+                        (28.0 - DIRI_LOGO_HEIGHT) / 2.0,
+                        DIRI_LOGO_WIDTH,
+                        DIRI_LOGO_HEIGHT,
+                    ),
                 )
             };
             view.setFrame(rect(
@@ -340,22 +365,39 @@ impl NativeMenuBar {
             body,
             target,
             last_fingerprint: None,
+            last_attention: None,
         };
         menu_bar.set_attention(AttentionLevel::None, 0);
         Some(menu_bar)
     }
 
     pub fn refresh(&mut self) {
+        // The panel is closed for almost every publish, and a closed panel only
+        // needs the status-item glyph. Building the inbox — which rebuilds the
+        // sidebar tree — before checking that would put the most expensive work
+        // in the app on the hottest path.
+        if !self.panel.isVisible() {
+            let (attention, needs_you) = self
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .attention_rollup();
+            self.set_attention(attention, needs_you);
+            self.last_fingerprint = None;
+            self.target.stop_shimmer();
+            return;
+        }
+
         let collapsed = self.target.collapsed_projects();
-        let (model, selected, attention) = {
-            let store = self.store.write().expect("session store lock poisoned");
+        let (model, selected, attention, needs_you) = {
+            let mut store = self.store.write().expect("session store lock poisoned");
             let projection = store.menu_bar_projection();
             let model = build_inbox(&projection, &collapsed);
             let selected = store.selected_session_id().cloned();
-            let attention = store.global_attention();
-            (model, selected, attention)
+            let (attention, needs_you) = store.attention_rollup();
+            (model, selected, attention, needs_you)
         };
-        self.apply_model(&model, selected.as_ref(), attention);
+        self.apply_model(&model, selected.as_ref(), attention, needs_you);
     }
 
     fn apply_model(
@@ -363,17 +405,12 @@ impl NativeMenuBar {
         model: &InboxModel,
         selected_session_id: Option<&SessionId>,
         attention: AttentionLevel,
+        needs_you: usize,
     ) {
-        self.set_attention(attention, model.needs_you);
+        self.set_attention(attention, needs_you);
         let Some(mtm) = MainThreadMarker::new() else {
             return;
         };
-
-        if !self.panel.isVisible() {
-            self.last_fingerprint = None;
-            self.target.stop_shimmer();
-            return;
-        }
 
         let fingerprint = panel_fingerprint(model, selected_session_id);
         if self.last_fingerprint == Some(fingerprint) {
@@ -385,14 +422,14 @@ impl NativeMenuBar {
         let body_height = content_height.min(MAX_BODY_HEIGHT);
         let height = HEADER_HEIGHT + body_height + FOOTER_HEIGHT;
 
-        let old_top_left = self.panel.isVisible().then(|| {
+        // Resizing grows the panel downward from its origin; pin the top-left so
+        // the panel stays hung off the status item as rows come and go.
+        let old_top_left = {
             let frame = self.panel.frame();
             NSPoint::new(frame.origin.x, frame.origin.y + frame.size.height)
-        });
+        };
         self.panel.setContentSize(NSSize::new(POPUP_WIDTH, height));
-        if let Some(top_left) = old_top_left {
-            self.panel.setFrameTopLeftPoint(top_left);
-        }
+        self.panel.setFrameTopLeftPoint(old_top_left);
         self.surface.setFrame(rect(0.0, 0.0, POPUP_WIDTH, height));
 
         let header_y = FOOTER_HEIGHT + body_height;
@@ -438,13 +475,16 @@ impl NativeMenuBar {
         self.rebuild_body(model, content_height, selected_session_id, mtm);
     }
 
+    /// Only tint and badge change here. The logo itself is rasterized once in
+    /// `new()` — it is a fixed vector at a fixed size, and re-stroking it into a
+    /// fresh bitmap on every publish was pure waste. This is now the only work a
+    /// closed panel does per publish, so unchanged state exits immediately.
     fn set_attention(&mut self, attention: AttentionLevel, needs_you: usize) {
-        // Status-item templates must stay untinted so AppKit paints them for the
-        // menu bar (white on dark, black on light). Forcing labelColor resolves
-        // against the app window and reads as black on a dark menu bar.
-        if let Some(image) = brand_raster::template_diri_logo_ns_image(DIRI_LOGO_HEIGHT as f32) {
-            self.button.setImage(Some(&image));
+        if self.last_attention == Some((attention, needs_you)) {
+            return;
         }
+        self.last_attention = Some((attention, needs_you));
+
         if needs_you > 0 {
             self.button
                 .setTitle(&NSString::from_str(&needs_you.to_string()));
@@ -454,8 +494,7 @@ impl NativeMenuBar {
                 .setContentTintColor(Some(&NSColor::systemOrangeColor()));
         } else {
             self.button.setTitle(&NSString::new());
-            self.button
-                .setImagePosition(NSCellImagePosition::ImageOnly);
+            self.button.setImagePosition(NSCellImagePosition::ImageOnly);
             let attention_tint = match attention {
                 AttentionLevel::NeedsInput => Some(NSColor::systemOrangeColor()),
                 AttentionLevel::DoneUnseen => Some(NSColor::systemGreenColor()),
@@ -464,8 +503,7 @@ impl NativeMenuBar {
                 | AttentionLevel::None
                 | AttentionLevel::Unknown => None,
             };
-            self.button
-                .setContentTintColor(attention_tint.as_deref());
+            self.button.setContentTintColor(attention_tint.as_deref());
         }
 
         let header_tint = match attention {
@@ -476,9 +514,6 @@ impl NativeMenuBar {
                 NSColor::labelColor()
             }
         };
-        if let Some(image) = brand_raster::template_diri_logo_ns_image(DIRI_LOGO_HEIGHT as f32) {
-            self.header_icon.setImage(Some(&image));
-        }
         self.header_icon.setContentTintColor(Some(&header_tint));
     }
 
@@ -532,16 +567,13 @@ impl NativeMenuBar {
         for row in &model.rows {
             match row {
                 InboxRow::Project {
-                    name,
-                    count,
-                    collapsed,
-                    ..
+                    name, collapsed, ..
                 } => {
                     if project_tag > 0 {
                         y -= 6.0;
                     }
                     y -= PROJECT_HEIGHT;
-                    self.add_project_header(name, *count, *collapsed, project_tag, y, mtm);
+                    self.add_project_header(name, *collapsed, project_tag, y, mtm);
                     project_tag += 1;
                 }
                 InboxRow::Session(session) => {
@@ -583,7 +615,6 @@ impl NativeMenuBar {
     fn add_project_header(
         &self,
         name: &str,
-        _count: usize,
         collapsed: bool,
         tag: isize,
         y: f64,
@@ -966,13 +997,11 @@ fn panel_fingerprint(model: &InboxModel, selected: Option<&SessionId>) -> u64 {
             InboxRow::Project {
                 id,
                 name,
-                count,
                 collapsed,
             } => {
                 0u8.hash(&mut hasher);
                 id.hash(&mut hasher);
                 name.hash(&mut hasher);
-                count.hash(&mut hasher);
                 collapsed.hash(&mut hasher);
             }
             InboxRow::Session(session) => {
@@ -988,9 +1017,6 @@ fn panel_fingerprint(model: &InboxModel, selected: Option<&SessionId>) -> u64 {
             }
         }
     }
-    model.needs_you.hash(&mut hasher);
-    model.finished.hash(&mut hasher);
-    model.working.hash(&mut hasher);
     selected.map(|id| id.0.as_str()).hash(&mut hasher);
     hasher.finish()
 }
@@ -1033,7 +1059,7 @@ fn agent_mark_view(
     color: &NSColor,
     x: f64,
     mtm: MainThreadMarker,
-) -> Retained<NSImageView> {
+) -> Retained<NSView> {
     let y = (ROW_HEIGHT - GLYPH_SIZE) / 2.0;
     if let Some(kind) = agent_mark_kind(agent_id)
         && let Some(image) = brand_raster::template_ns_image(kind, GLYPH_SIZE as f32)
@@ -1042,9 +1068,11 @@ fn agent_mark_view(
         view.setFrame(rect(x, y, GLYPH_SIZE, GLYPH_SIZE));
         view.setImageAlignment(NSImageAlignment::AlignCenter);
         view.setContentTintColor(Some(color));
-        return view;
+        return Retained::into_super(Retained::into_super(view));
     }
-    // Shell / unknown: caret bar matching StatusGlyph::shell_caret.
+    // Shell / unknown: caret bar matching StatusGlyph::shell_caret. A plain
+    // NSView hosts it — an NSImageView here is an NSControl sitting in the glyph
+    // column with no image and no action.
     let caret = NSBox::initWithFrame(
         NSBox::alloc(mtm),
         rect(
@@ -1058,8 +1086,7 @@ fn agent_mark_view(
     caret.setBorderWidth(0.0);
     caret.setCornerRadius(1.0);
     caret.setFillColor(color);
-    let host =
-        NSImageView::initWithFrame(NSImageView::alloc(mtm), rect(x, y, GLYPH_SIZE, GLYPH_SIZE));
+    let host = NSView::initWithFrame(NSView::alloc(mtm), rect(x, y, GLYPH_SIZE, GLYPH_SIZE));
     host.addSubview(&caret);
     host
 }
@@ -1212,8 +1239,43 @@ fn style_plain_button(button: &NSButton, prominent: bool) {
     button.setFocusRingType(NSFocusRingType::None);
 }
 
+/// Quantization of the shimmer's alpha curve. The band is a soft gradient, so
+/// a couple dozen steps are visually indistinguishable from per-glyph exactness
+/// and let the colors be allocated once instead of per character per frame.
+const SHIMMER_STEPS: usize = 24;
+const SHIMMER_BASE_ALPHA: f64 = 0.50;
+const SHIMMER_PEAK_ALPHA: f64 = 0.96;
+/// Half-width of the travelling highlight, as a fraction of the title.
+const SHIMMER_BAND: f64 = 0.30;
+
+fn shimmer_ramp() -> Vec<Retained<NSColor>> {
+    let label_color = NSColor::labelColor();
+    (0..SHIMMER_STEPS)
+        .map(|step| {
+            let falloff = step as f64 / (SHIMMER_STEPS - 1) as f64;
+            let alpha = SHIMMER_BASE_ALPHA + (SHIMMER_PEAK_ALPHA - SHIMMER_BASE_ALPHA) * falloff;
+            label_color.colorWithAlphaComponent(alpha)
+        })
+        .collect()
+}
+
+/// A cell rendering an attributed string takes its wrapping from the string, not
+/// from the control, so the label's `ByTruncatingTail` is lost unless the style
+/// travels with it. Without this a long working title clips mid-glyph instead of
+/// ellipsizing, then snaps back the moment the agent goes idle.
+fn shimmer_paragraph_style() -> Retained<NSParagraphStyle> {
+    let style = NSMutableParagraphStyle::new();
+    style.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+    Retained::into_super(style)
+}
+
 /// Soft highlight band that travels left→right across a working-session title.
-fn paint_title_shimmer(label: &NSTextField, phase: f64) {
+fn paint_title_shimmer(
+    label: &NSTextField,
+    phase: f64,
+    ramp: &[Retained<NSColor>],
+    paragraph: &NSParagraphStyle,
+) {
     let text = label.stringValue();
     let len = text.length();
     if len == 0 {
@@ -1227,12 +1289,13 @@ fn paint_title_shimmer(label: &NSTextField, phase: f64) {
             attributed.addAttribute_value_range(NSFontAttributeName, &font, full);
         }
     }
+    // SAFETY: NSParagraphStyle is a valid value for NSParagraphStyleAttributeName.
+    unsafe {
+        attributed.addAttribute_value_range(NSParagraphStyleAttributeName, paragraph, full);
+    }
 
-    let base = 0.50;
-    let peak = 0.96;
-    let band = 0.30;
     // Travel fully off both ends so the highlight enters and exits cleanly.
-    let center = phase * (1.0 + 2.0 * band) - band;
+    let center = phase * (1.0 + 2.0 * SHIMMER_BAND) - SHIMMER_BAND;
     for i in 0..len {
         let t = if len == 1 {
             0.5
@@ -1240,14 +1303,13 @@ fn paint_title_shimmer(label: &NSTextField, phase: f64) {
             i as f64 / (len - 1) as f64
         };
         let dist = (t - center).abs();
-        let falloff = (1.0 - (dist / band).min(1.0)).powf(1.55);
-        let alpha = base + (peak - base) * falloff;
-        let color = NSColor::labelColor().colorWithAlphaComponent(alpha);
+        let falloff = (1.0 - (dist / SHIMMER_BAND).min(1.0)).powf(1.55);
+        let step = ((falloff * (SHIMMER_STEPS - 1) as f64).round() as usize).min(SHIMMER_STEPS - 1);
         // SAFETY: NSColor is a valid attribute value for NSForegroundColorAttributeName.
         unsafe {
             attributed.addAttribute_value_range(
                 NSForegroundColorAttributeName,
-                &color,
+                &ramp[step],
                 NSRange::new(i, 1),
             );
         }
@@ -1273,10 +1335,11 @@ fn point_in_rect(point: NSPoint, frame: NSRect) -> bool {
         && point.y < frame.origin.y + frame.size.height
 }
 
-fn spawn_shortcut_from_event(event: &NSEvent) -> Option<SpawnShortcut> {
+/// Keys the panel claims while it is open. ⇧⌘T is deliberately absent: the app
+/// binds it to `ReopenSession`, so it falls through untouched.
+fn menu_shortcut_from_event(event: &NSEvent) -> Option<MenuShortcut> {
     let modifiers = event.modifierFlags();
-    let command = modifiers.contains(NSEventModifierFlags::Command);
-    if !command {
+    if !modifiers.contains(NSEventModifierFlags::Command) {
         return None;
     }
     let shift = modifiers.contains(NSEventModifierFlags::Shift);
@@ -1286,18 +1349,21 @@ fn spawn_shortcut_from_event(event: &NSEvent) -> Option<SpawnShortcut> {
         .map(|chars| chars.to_string().to_ascii_lowercase())
         .unwrap_or_default();
     match key.as_str() {
-        "t" if option => Some(SpawnShortcut::Shell),
-        "t" if !shift => Some(SpawnShortcut::Default),
-        "n" if shift => Some(SpawnShortcut::Codex),
+        "t" if option => Some(MenuShortcut::SpawnShell),
+        "t" if !shift => Some(MenuShortcut::SpawnDefault),
+        "n" if shift => Some(MenuShortcut::SpawnCodex),
+        // Matches the app's own `cmd-n` → OpenLauncher binding.
+        "n" => Some(MenuShortcut::NewAgent),
         _ => None,
     }
 }
 
 #[derive(Clone, Copy)]
-enum SpawnShortcut {
-    Default,
-    Shell,
-    Codex,
+enum MenuShortcut {
+    NewAgent,
+    SpawnDefault,
+    SpawnShell,
+    SpawnCodex,
 }
 
 struct MenuBarHoverChromeIvars {
@@ -1760,11 +1826,17 @@ struct MenuBarTargetIvars {
     collapsed_projects: RefCell<HashSet<String>>,
     shimmer_labels: RefCell<Vec<Retained<NSTextField>>>,
     shimmer_timer: RefCell<Option<Retained<NSTimer>>>,
+    /// Allocated once; see [`shimmer_ramp`].
+    shimmer_ramp: Vec<Retained<NSColor>>,
+    shimmer_paragraph: Retained<NSParagraphStyle>,
     /// Outside clicks in other apps.
     global_dismiss_monitor: RefCell<Option<Retained<AnyObject>>>,
     /// Outside clicks in diri's own windows (global monitors never see these).
     local_dismiss_monitor: RefCell<Option<Retained<AnyObject>>>,
     key_monitor: RefCell<Option<Retained<AnyObject>>>,
+    /// Another app coming forward (⌘Tab, Dock, Spotlight). Mouse monitors never
+    /// see those, so without this the panel floats over whatever you switched to.
+    workspace_observer: RefCell<Option<Retained<ProtocolObject<dyn NSObjectProtocol>>>>,
 }
 
 define_class!(
@@ -1813,36 +1885,9 @@ define_class!(
             self.show_main_window();
         }
 
-        #[unsafe(method(selectSession:))]
-        fn select_session(&self, sender: Option<&AnyObject>) {
-            if let Some(tag) = sender
-                .and_then(|sender| sender.downcast_ref::<NSButton>())
-                .map(|button| button.tag())
-            {
-                self.select_session_tag(tag);
-            }
-        }
-
-        #[unsafe(method(closeSession:))]
-        fn close_session(&self, sender: Option<&AnyObject>) {
-            if let Some(tag) = sender
-                .and_then(|sender| sender.downcast_ref::<NSButton>())
-                .map(|button| button.tag())
-            {
-                self.close_session_tag(tag);
-            }
-        }
-
-        #[unsafe(method(toggleProject:))]
-        fn toggle_project(&self, sender: Option<&AnyObject>) {
-            if let Some(tag) = sender
-                .and_then(|sender| sender.downcast_ref::<NSButton>())
-                .map(|button| button.tag())
-            {
-                self.toggle_project_tag(tag);
-            }
-        }
-
+        // Row select / close / project collapse have no selector: rows are
+        // custom views that call `*_tag` directly on mouseUp. Only the two
+        // permission buttons below are still real NSControls.
         #[unsafe(method(approveSession:))]
         fn approve_session(&self, sender: Option<&AnyObject>) {
             self.send_permission_action(sender, APPROVE_ACTION_ID);
@@ -1865,8 +1910,9 @@ define_class!(
             }
             // Linear left→right sweep (not an opacity pulse).
             let phase = (wall_clock_seconds() / SHIMMER_PERIOD_SECS).fract();
+            let ivars = self.ivars();
             for label in labels.iter() {
-                paint_title_shimmer(label, phase);
+                paint_title_shimmer(label, phase, &ivars.shimmer_ramp, &ivars.shimmer_paragraph);
             }
         }
 
@@ -1895,9 +1941,12 @@ impl MenuBarTarget {
             collapsed_projects: RefCell::new(HashSet::new()),
             shimmer_labels: RefCell::new(Vec::new()),
             shimmer_timer: RefCell::new(None),
+            shimmer_ramp: shimmer_ramp(),
+            shimmer_paragraph: shimmer_paragraph_style(),
             global_dismiss_monitor: RefCell::new(None),
             local_dismiss_monitor: RefCell::new(None),
             key_monitor: RefCell::new(None),
+            workspace_observer: RefCell::new(None),
         });
         // SAFETY: NSObject's init is its designated initializer.
         unsafe { msg_send![super(this), init] }
@@ -2036,8 +2085,12 @@ impl MenuBarTarget {
     fn install_monitors(&self) {
         self.remove_monitors();
 
-        // MenuBarTarget outlives the panel for the process; monitors are cleared on hide.
-        let this = self as *const Self;
+        // Blocks hold a strong reference rather than a raw pointer: a global
+        // monitor is process-wide and outlives whatever installed it, so a bare
+        // `*const Self` would dangle if `NativeMenuBar` were ever dropped with
+        // the panel open. The cycle it creates (target → block → target) is cut
+        // by `remove_monitors`, which runs on hide and on drop.
+        let this = self.retain();
         let panel = self.ivars().panel.clone();
         let button = self.ivars().button.clone();
         let should_dismiss = move || {
@@ -2057,12 +2110,11 @@ impl MenuBarTarget {
 
         let global_dismiss = RcBlock::new({
             let should_dismiss = should_dismiss.clone();
+            let this = this.clone();
             move |_event: NonNull<NSEvent>| {
-                if !should_dismiss() {
-                    return;
+                if should_dismiss() {
+                    this.hide_panel();
                 }
-                // SAFETY: target lives as long as NativeMenuBar.
-                unsafe { (*this).hide_panel() };
             }
         });
         let global_dismiss_monitor = NSEvent::addGlobalMonitorForEventsMatchingMask_handler(
@@ -2073,12 +2125,14 @@ impl MenuBarTarget {
         // Global monitors never see clicks delivered to this process. Without a
         // local twin, the panel stays open when the user clicks back into diri.
         let local_dismiss_monitor = unsafe {
-            let local_dismiss = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
-                if should_dismiss() {
-                    // SAFETY: target lives as long as NativeMenuBar.
-                    (*this).hide_panel();
+            let local_dismiss = RcBlock::new({
+                let this = this.clone();
+                move |event: NonNull<NSEvent>| -> *mut NSEvent {
+                    if should_dismiss() {
+                        this.hide_panel();
+                    }
+                    event.as_ptr()
                 }
-                event.as_ptr()
             });
             NSEvent::addLocalMonitorForEventsMatchingMask_handler(
                 NSEventMask::LeftMouseDown | NSEventMask::RightMouseDown,
@@ -2090,38 +2144,77 @@ impl MenuBarTarget {
         let panel_for_keys = self.ivars().panel.clone();
         // SAFETY: local monitor may swallow handled key events by returning null.
         let key_monitor = unsafe {
-            let key_handler = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
-                if !panel_for_keys.isVisible() {
-                    return event.as_ptr();
-                }
-                let event_ref = event.as_ref();
-                let chars = event_ref
-                    .charactersIgnoringModifiers()
-                    .map(|value| value.to_string())
-                    .unwrap_or_default();
-                if chars == "\u{1b}" {
-                    // SAFETY: target lives as long as NativeMenuBar.
-                    (*this).hide_panel();
-                    return std::ptr::null_mut();
-                }
-                if let Some(shortcut) = spawn_shortcut_from_event(event_ref) {
-                    let mut store = store.write().expect("session store lock poisoned");
+            let key_handler = RcBlock::new({
+                let this = this.clone();
+                move |event: NonNull<NSEvent>| -> *mut NSEvent {
+                    if !panel_for_keys.isVisible() {
+                        return event.as_ptr();
+                    }
+                    let event_ref = event.as_ref();
+                    let chars = event_ref
+                        .charactersIgnoringModifiers()
+                        .map(|value| value.to_string())
+                        .unwrap_or_default();
+                    if chars == "\u{1b}" {
+                        this.hide_panel();
+                        return std::ptr::null_mut();
+                    }
+                    let Some(shortcut) = menu_shortcut_from_event(event_ref) else {
+                        return event.as_ptr();
+                    };
                     match shortcut {
-                        SpawnShortcut::Default => store.spawn_default(SpawnOptions::default()),
-                        SpawnShortcut::Shell => store.spawn_shell(SpawnOptions::default()),
-                        SpawnShortcut::Codex => {
-                            store.spawn_kind(AgentKind::CODEX, SpawnOptions::default());
+                        // The panel owns key status while it is open, so gpui's
+                        // own ⌘N binding never fires; route it to the same place
+                        // the header's New Agent button goes.
+                        MenuShortcut::NewAgent => {
+                            store
+                                .write()
+                                .expect("session store lock poisoned")
+                                .request_open_launcher();
+                            this.show_main_window();
+                        }
+                        MenuShortcut::SpawnDefault
+                        | MenuShortcut::SpawnShell
+                        | MenuShortcut::SpawnCodex => {
+                            let mut store = store.write().expect("session store lock poisoned");
+                            match shortcut {
+                                MenuShortcut::SpawnDefault => {
+                                    store.spawn_default(SpawnOptions::default());
+                                }
+                                MenuShortcut::SpawnShell => {
+                                    store.spawn_shell(SpawnOptions::default());
+                                }
+                                _ => store.spawn_kind(AgentKind::CODEX, SpawnOptions::default()),
+                            }
+                            store.request_snapshot_publish();
                         }
                     }
-                    store.request_snapshot_publish();
-                    return std::ptr::null_mut();
+                    std::ptr::null_mut()
                 }
-                event.as_ptr()
             });
             NSEvent::addLocalMonitorForEventsMatchingMask_handler(
                 NSEventMask::KeyDown,
                 &key_handler,
             )
+        };
+
+        // ⌘Tab, Spotlight, or a Dock click brings another app forward without
+        // ever producing a click the mouse monitors can see.
+        let workspace_observer = {
+            let this = this.clone();
+            let handler = RcBlock::new(move |_notification: NonNull<NSNotification>| {
+                this.hide_panel();
+            });
+            let center = NSWorkspace::sharedWorkspace().notificationCenter();
+            // SAFETY: the observer is retained here and removed in `remove_monitors`.
+            unsafe {
+                center.addObserverForName_object_queue_usingBlock(
+                    Some(NSWorkspaceDidActivateApplicationNotification),
+                    None,
+                    None,
+                    &handler,
+                )
+            }
         };
 
         self.ivars()
@@ -2131,6 +2224,9 @@ impl MenuBarTarget {
             .local_dismiss_monitor
             .replace(local_dismiss_monitor);
         self.ivars().key_monitor.replace(key_monitor);
+        self.ivars()
+            .workspace_observer
+            .replace(Some(workspace_observer));
     }
 
     fn remove_monitors(&self) {
@@ -2145,6 +2241,15 @@ impl MenuBarTarget {
         if let Some(monitor) = self.ivars().key_monitor.take() {
             // SAFETY: monitor came from addLocalMonitorForEventsMatchingMask.
             unsafe { NSEvent::removeMonitor(&monitor) };
+        }
+        if let Some(observer) = self.ivars().workspace_observer.take() {
+            // SAFETY: observer came from addObserverForName on this same center,
+            // and nothing else holds it once it is taken out of the ivar.
+            unsafe {
+                NSWorkspace::sharedWorkspace()
+                    .notificationCenter()
+                    .removeObserver(observer.as_ref());
+            }
         }
     }
 

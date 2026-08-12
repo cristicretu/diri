@@ -498,7 +498,17 @@ impl RootView {
                     Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         if this
                             .update_in(cx, |this, window, cx| {
-                                let (open_launcher, open_settings) = {
+                                // This loop runs on every store change; probe under
+                                // a read lock so only the rare menu-bar request
+                                // pays for exclusive access.
+                                let pending = this
+                                    .services
+                                    .store
+                                    .store
+                                    .read()
+                                    .expect("session store lock poisoned")
+                                    .has_pending_ui_request();
+                                let (open_launcher, open_settings) = if pending {
                                     let mut store = this
                                         .services
                                         .store
@@ -509,6 +519,8 @@ impl RootView {
                                         store.take_open_launcher_request(),
                                         store.take_open_settings_request(),
                                     )
+                                } else {
+                                    (false, false)
                                 };
                                 if open_launcher {
                                     this.open_launcher(&OpenLauncher, window, cx);

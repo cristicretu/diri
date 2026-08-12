@@ -89,6 +89,7 @@ objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
     "NSView",
     "NSVisualEffectView",
     "NSWindow",
+    "NSWorkspace",
     "block2",
     "objc2-core-foundation",
 ] }
@@ -99,11 +100,14 @@ objc2-foundation = { version = "=0.3.2", default-features = false, features = [
     "NSDictionary",
     "NSError",
     "NSGeometry",
+    "NSNotification",
     "NSObject",
+    "NSOperation",
     "NSRange",
     "NSSet",
     "NSString",
     "NSTimer",
+    "block2",
 ] }
 objc2-user-notifications = { version = "=0.3.2", default-features = false, features = [
     "UNNotification",

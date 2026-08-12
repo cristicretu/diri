@@ -288,15 +288,6 @@ pub fn permission_action_data(
         })
 }
 
-/// Human-facing agent name for menu-bar and banner copy.
-#[must_use]
-pub fn agent_display_name<'a>(
-    kind: &AgentKind,
-    descriptor: Option<&'a AgentDescriptor>,
-) -> &'a str {
-    display_name(kind, descriptor)
-}
-
 /// Produce sound/banner work for a single authoritative session update.
 ///
 /// Chimes are emitted even for the focused session. Banners are suppressed only

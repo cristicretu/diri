@@ -298,21 +298,17 @@ pub fn template_settings_ns_image(point_size: f32) -> Option<Retained<NSImage>> 
     let map =
         |x: f32, y: f32| NSPoint::new(f64::from(origin + x * scale), f64::from(origin + y * scale));
 
-    // icons/settings.svg — stroke 1.75, round caps, two knobs on parallel rails.
+    // Geometry is a hand-transcription of icons/settings.svg; `settings_svg_matches_the_inlined_geometry`
+    // fails the build if the asset and these numbers ever drift apart.
     let strokes = NSBezierPath::bezierPath();
-    strokes.setLineWidth(f64::from(1.75 * scale));
+    strokes.setLineWidth(f64::from(SETTINGS_STROKE * scale));
     strokes.setLineCapStyle(NSLineCapStyle::Round);
-    for (from, to) in [
-        ((4.0, 7.0), (11.0, 7.0)),
-        ((15.0, 7.0), (20.0, 7.0)),
-        ((4.0, 17.0), (7.0, 17.0)),
-        ((11.0, 17.0), (20.0, 17.0)),
-    ] {
+    for (from, to) in SETTINGS_RAILS {
         strokes.moveToPoint(map(from.0, from.1));
         strokes.lineToPoint(map(to.0, to.1));
     }
-    for (cx, cy) in [(13.0_f32, 7.0_f32), (9.0, 17.0)] {
-        let r = 2.0 * scale;
+    for (cx, cy) in SETTINGS_KNOBS {
+        let r = SETTINGS_KNOB_R * scale;
         let center = map(cx, cy);
         strokes.appendBezierPathWithOvalInRect(NSRect::new(
             NSPoint::new(center.x - f64::from(r), center.y - f64::from(r)),
@@ -366,9 +362,6 @@ pub fn template_settings_ns_image(point_size: f32) -> Option<Retained<NSImage>> 
 /// Template-tinted for the menu-bar status item and panel header.
 #[must_use]
 pub fn template_diri_logo_ns_image(height: f32) -> Option<Retained<NSImage>> {
-    // Ensure the canonical SVG stays in the tree even though geometry is inlined.
-    let _canonical = DIRI_LOGO_SVG;
-
     let _mtm = MainThreadMarker::new()?;
     let height = height.max(1.0);
     let width = height * (DIRI_LOGO_VB_W / DIRI_LOGO_VB_H);
@@ -383,17 +376,22 @@ pub fn template_diri_logo_ns_image(height: f32) -> Option<Retained<NSImage>> {
         )
     };
 
+    // Geometry is a hand-transcription of brand/diri.svg; `diri_svg_matches_the_inlined_geometry`
+    // fails the build if the asset and these numbers ever drift apart.
     let strokes = NSBezierPath::bezierPath();
     strokes.setLineWidth(f64::from(DIRI_LOGO_STROKE * scale));
     strokes.setLineCapStyle(NSLineCapStyle::Round);
     strokes.setLineJoinStyle(NSLineJoinStyle::Round);
-    // polyline: 4.25 4.25 → 25.25 21.25 → 4.25 38.25
-    strokes.moveToPoint(map(4.25, 4.25));
-    strokes.lineToPoint(map(25.25, 21.25));
-    strokes.lineToPoint(map(4.25, 38.25));
-    // baseline: 29.25 38.25 → 55.25 38.25
-    strokes.moveToPoint(map(29.25, 38.25));
-    strokes.lineToPoint(map(55.25, 38.25));
+    let mut chevron = DIRI_LOGO_CHEVRON.iter();
+    if let Some(&(x, y)) = chevron.next() {
+        strokes.moveToPoint(map(x, y));
+    }
+    for &(x, y) in chevron {
+        strokes.lineToPoint(map(x, y));
+    }
+    let ((from_x, from_y), (to_x, to_y)) = DIRI_LOGO_BASELINE;
+    strokes.moveToPoint(map(from_x, from_y));
+    strokes.lineToPoint(map(to_x, to_y));
 
     let bitmap = unsafe {
         NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bitmapFormat_bytesPerRow_bitsPerPixel(
@@ -446,4 +444,144 @@ fn channel(value: f32) -> u8 {
 const DIRI_LOGO_VB_W: f32 = 59.5;
 const DIRI_LOGO_VB_H: f32 = 42.5;
 const DIRI_LOGO_STROKE: f32 = 8.5;
-const DIRI_LOGO_SVG: &[u8] = include_bytes!("../../../diri-ui/assets/brand/diri.svg");
+const DIRI_LOGO_CHEVRON: [(f32, f32); 3] = [(4.25, 4.25), (25.25, 21.25), (4.25, 38.25)];
+const DIRI_LOGO_BASELINE: ((f32, f32), (f32, f32)) = ((29.25, 38.25), (55.25, 38.25));
+const DIRI_LOGO_SVG: &str = include_str!("../../../diri-ui/assets/brand/diri.svg");
+
+const SETTINGS_STROKE: f32 = 1.75;
+const SETTINGS_KNOB_R: f32 = 2.0;
+const SETTINGS_RAILS: [((f32, f32), (f32, f32)); 4] = [
+    ((4.0, 7.0), (11.0, 7.0)),
+    ((15.0, 7.0), (20.0, 7.0)),
+    ((4.0, 17.0), (7.0, 17.0)),
+    ((11.0, 17.0), (20.0, 17.0)),
+];
+const SETTINGS_KNOBS: [(f32, f32); 2] = [(13.0, 7.0), (9.0, 17.0)];
+const SETTINGS_SVG: &str = include_str!("../../../diri-ui/assets/icons/settings.svg");
+
+/// Keeps both assets wired into every build rather than only test builds:
+/// deleting or emptying either SVG fails compilation here, instead of quietly
+/// leaving the menubar drawing art the design system no longer ships.
+const _: () = {
+    assert!(!DIRI_LOGO_SVG.is_empty());
+    assert!(!SETTINGS_SVG.is_empty());
+};
+
+/// AppKit draws these marks from numbers inlined above rather than from the SVG
+/// assets, because `NSBezierPath` has no path parser and the shapes are four
+/// lines and two circles. That is only safe while the two stay in sync, so the
+/// tests below re-derive the geometry straight out of the asset text.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pulls every number out of an SVG attribute, e.g. `points="4.25 4.25 …"`.
+    fn numbers_in(svg: &str, attribute: &str) -> Vec<f32> {
+        let needle = format!("{attribute}=\"");
+        let start = svg
+            .find(&needle)
+            .unwrap_or_else(|| panic!("{attribute} missing from svg"))
+            + needle.len();
+        let end = start
+            + svg[start..]
+                .find('"')
+                .unwrap_or_else(|| panic!("unterminated {attribute}"));
+        svg[start..end]
+            .split([' ', ',', '\n'])
+            .filter(|token| !token.is_empty())
+            .map(|token| {
+                token
+                    .parse()
+                    .unwrap_or_else(|_| panic!("{attribute} holds a non-number: {token}"))
+            })
+            .collect()
+    }
+
+    fn attribute(svg: &str, name: &str) -> String {
+        let needle = format!("{name}=\"");
+        let start = svg
+            .find(&needle)
+            .unwrap_or_else(|| panic!("{name} missing from svg"))
+            + needle.len();
+        let end = start + svg[start..].find('"').expect("unterminated attribute");
+        svg[start..end].to_owned()
+    }
+
+    #[test]
+    fn diri_svg_matches_the_inlined_geometry() {
+        assert_eq!(
+            numbers_in(DIRI_LOGO_SVG, "viewBox"),
+            [0.0, 0.0, DIRI_LOGO_VB_W, DIRI_LOGO_VB_H]
+        );
+        assert_eq!(
+            attribute(DIRI_LOGO_SVG, "stroke-width")
+                .parse::<f32>()
+                .expect("numeric stroke-width"),
+            DIRI_LOGO_STROKE
+        );
+
+        let chevron: Vec<(f32, f32)> = numbers_in(DIRI_LOGO_SVG, "points")
+            .chunks_exact(2)
+            .map(|pair| (pair[0], pair[1]))
+            .collect();
+        assert_eq!(chevron, DIRI_LOGO_CHEVRON);
+
+        let baseline = (
+            (
+                attribute(DIRI_LOGO_SVG, "x1").parse().expect("x1"),
+                attribute(DIRI_LOGO_SVG, "y1").parse().expect("y1"),
+            ),
+            (
+                attribute(DIRI_LOGO_SVG, "x2").parse().expect("x2"),
+                attribute(DIRI_LOGO_SVG, "y2").parse().expect("y2"),
+            ),
+        );
+        assert_eq!(baseline, DIRI_LOGO_BASELINE);
+    }
+
+    #[test]
+    fn settings_svg_matches_the_inlined_geometry() {
+        assert_eq!(numbers_in(SETTINGS_SVG, "viewBox"), [0.0, 0.0, 24.0, 24.0]);
+        assert_eq!(
+            attribute(SETTINGS_SVG, "stroke-width")
+                .parse::<f32>()
+                .expect("numeric stroke-width"),
+            SETTINGS_STROKE
+        );
+
+        // `M4 7h7M15 7h5…` — each run is an absolute move plus a horizontal delta.
+        let rails: Vec<((f32, f32), (f32, f32))> = attribute(SETTINGS_SVG, "d")
+            .split('M')
+            .filter(|run| !run.is_empty())
+            .map(|run| {
+                let (origin, delta) = run.split_once('h').expect("horizontal rail");
+                let (x, y) = origin.trim().split_once(' ').expect("move takes x and y");
+                let x: f32 = x.parse().expect("rail x");
+                let y: f32 = y.parse().expect("rail y");
+                let delta: f32 = delta.trim().parse().expect("rail length");
+                ((x, y), (x + delta, y))
+            })
+            .collect();
+        assert_eq!(rails, SETTINGS_RAILS);
+
+        let knobs: Vec<(f32, f32)> = SETTINGS_SVG
+            .match_indices("<circle")
+            .map(|(at, _)| {
+                let circle = &SETTINGS_SVG[at..];
+                (
+                    attribute(circle, "cx").parse().expect("cx"),
+                    attribute(circle, "cy").parse().expect("cy"),
+                )
+            })
+            .collect();
+        assert_eq!(knobs, SETTINGS_KNOBS);
+        for (at, _) in SETTINGS_SVG.match_indices("<circle") {
+            assert_eq!(
+                attribute(&SETTINGS_SVG[at..], "r")
+                    .parse::<f32>()
+                    .expect("numeric radius"),
+                SETTINGS_KNOB_R
+            );
+        }
+    }
+}

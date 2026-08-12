@@ -37,7 +37,6 @@ pub enum InboxRow {
     Project {
         id: String,
         name: String,
-        count: usize,
         collapsed: bool,
     },
     Session(InboxSessionRow),
@@ -46,45 +45,20 @@ pub enum InboxRow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InboxModel {
     pub rows: Vec<InboxRow>,
-    pub needs_you: usize,
-    pub finished: usize,
-    pub working: usize,
-    pub total_sessions: usize,
 }
 
 pub fn build_inbox(
     projection: &SidebarProjection,
     collapsed_projects: &std::collections::HashSet<String>,
 ) -> InboxModel {
-    let mut needs_you = 0usize;
-    let mut finished = 0usize;
-    let mut working = 0usize;
-    let mut total_sessions = 0usize;
     let mut rows = Vec::new();
-
     for group in &projection.projects {
         if group.active.is_empty() {
             continue;
         }
-        for session in &group.active {
-            match session.attention() {
-                AttentionLevel::NeedsInput => needs_you += 1,
-                AttentionLevel::DoneUnseen => finished += 1,
-                AttentionLevel::Working => working += 1,
-                _ => {}
-            }
-        }
-        total_sessions += group.active.len();
         rows.extend(project_rows(group, collapsed_projects));
     }
-
-    InboxModel {
-        rows,
-        needs_you,
-        finished,
-        working,
-        total_sessions,
-    }
+    InboxModel { rows }
 }
 
 fn project_rows(
@@ -95,7 +69,6 @@ fn project_rows(
     let mut rows = vec![InboxRow::Project {
         id: group.project.id.0.clone(),
         name: group.project.name.clone(),
-        count: group.active.len(),
         collapsed,
     }];
     if collapsed {
@@ -242,34 +215,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_visible_sessions_still_lists_the_project_header() {
-        let child = session(
-            "a",
-            "robite",
-            "Cursor Agent",
-            AgentKind::CURSOR,
-            SessionStatus::Idle,
-        );
+    fn projects_with_no_active_sessions_are_dropped_entirely() {
         let projection = SidebarProjection {
-            projects: vec![group(
-                "robite-landing",
-                "robite",
-                Vec::new(),
-                vec![Arc::clone(&child)],
-            )],
+            projects: vec![group("robite-landing", "robite", Vec::new(), Vec::new())],
             ordered_sessions: Vec::new(),
             display_order: Vec::new(),
         };
         let model = build_inbox(&projection, &std::collections::HashSet::new());
-        assert_eq!(model.rows.len(), 1);
-        assert!(matches!(
-            &model.rows[0],
-            InboxRow::Project {
-                collapsed: false,
-                count: 1,
-                ..
-            }
-        ));
+        assert!(model.rows.is_empty());
     }
 
     #[test]
@@ -298,7 +251,6 @@ mod tests {
             &model.rows[0],
             InboxRow::Project {
                 collapsed: true,
-                count: 1,
                 ..
             }
         ));
