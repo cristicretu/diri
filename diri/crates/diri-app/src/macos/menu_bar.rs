@@ -25,8 +25,7 @@ use objc2_app_kit::{
     NSWorkspaceDidActivateApplicationNotification,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
-    NSString,
+    MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
 };
 
 use diri_proto::{AgentKind, ProjectId, SessionId};
@@ -475,9 +474,7 @@ impl NativeMenuBar {
         for row in &model.rows {
             match row {
                 InboxRow::Project {
-                    name,
-                    collapsed,
-                    ..
+                    name, collapsed, ..
                 } => {
                     if project_tag > 0 {
                         y -= 6.0;
@@ -1974,8 +1971,6 @@ impl MenuBarTarget {
             }
         }
     }
-
-
 
     fn show_main_window(&self) {
         self.hide_panel();
