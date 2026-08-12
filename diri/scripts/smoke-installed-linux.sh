@@ -53,8 +53,11 @@ start_daemon() {
     DIRIJOR_APP_SUPPORT="${smoke_root}/support" \
         dirijord-rs >>"${smoke_root}/daemon.log" 2>&1 &
     daemon_pid=$!
+    # A stopped daemon can leave its socket inode behind briefly. Require a
+    # successful control round-trip before treating the replacement as ready.
     for _ in $(seq 1 100); do
-        if [[ -S "${smoke_root}/support/daemon.sock" ]]; then
+        if DIRIJOR_APP_SUPPORT="${smoke_root}/support" \
+            dirijor status --json >/dev/null 2>&1; then
             return
         fi
         if ! kill -0 "${daemon_pid}" 2>/dev/null; then
