@@ -6,7 +6,9 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use diri_proto::{ExitReason, NeedsInputKind, RiskHint, SessionStatus};
+use diri_proto::{
+    ExitReason, NeedsInputKind, RiskHint, SessionStatus, StatusEvidenceSource, StatusFallbackReason,
+};
 
 use super::*;
 use crate::detect::{ManifestState, ScreenObservation};
@@ -24,6 +26,95 @@ fn observation(state: ManifestState, seq: u64) -> ScreenObservation {
         prompt_excerpt: None,
         options: None,
     }
+}
+
+#[test]
+fn evidence_covers_every_authority_without_terminal_content() {
+    let mut hooks =
+        StatusReducer::new(Authority::HooksPrimary, t0()).with_manifest("claude-code", Some("4"));
+    let now = settled(&mut hooks, t0());
+    let hook_outcome = hooks.reduce(hook(ClaudeHook::UserPromptSubmit), now);
+    let hook_evidence = hook_outcome.status_evidence.expect("hook evidence");
+    assert_eq!(hook_evidence.source, StatusEvidenceSource::Hook);
+    assert_eq!(hook_evidence.status, SessionStatus::Working);
+    assert_eq!(hook_evidence.manifest_id.as_deref(), Some("claude-code"));
+    assert_eq!(hook_evidence.manifest_version.as_deref(), Some("4"));
+    assert_eq!(hook_evidence.matched_rule_id, None);
+
+    let mut screen =
+        StatusReducer::new(Authority::ScreenPrimary, t0()).with_manifest("codex", Some("8"));
+    let now = settled(&mut screen, t0());
+    let screen_outcome = screen.reduce(
+        StatusSignal::Screen(ScreenObservation {
+            matched_rule_id: "codex-working-spinner".into(),
+            ..observation(ManifestState::Working, 1)
+        }),
+        now,
+    );
+    let screen_evidence = screen_outcome.status_evidence.expect("screen evidence");
+    assert_eq!(screen_evidence.source, StatusEvidenceSource::ScreenRule);
+    assert_eq!(
+        screen_evidence.matched_rule_id.as_deref(),
+        Some("codex-working-spinner")
+    );
+
+    let mut process =
+        StatusReducer::new(Authority::ProcessOnly, t0()).with_manifest("shell", Some("1"));
+    let process_outcome = process.reduce(StatusSignal::PtyOutputActivity, t0());
+    let process_evidence = process_outcome.status_evidence.expect("process evidence");
+    assert_eq!(
+        process_evidence.source,
+        StatusEvidenceSource::ProcessLiveness
+    );
+    assert_eq!(
+        process_evidence.fallback_reason,
+        Some(StatusFallbackReason::ProcessOnly)
+    );
+
+    let serialized = serde_json::to_string(&[hook_evidence, screen_evidence, process_evidence])
+        .expect("serialize evidence");
+    for forbidden in ["prompt", "terminal", "/Users/", "SECRET="] {
+        assert!(!serialized.contains(forbidden));
+    }
+}
+
+#[test]
+fn stale_working_status_gets_staleness_evidence() {
+    let mut reducer =
+        StatusReducer::new(Authority::HooksPrimary, t0()).with_manifest("claude-code", Some("4"));
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(hook(ClaudeHook::UserPromptSubmit), now);
+    let outcome = reducer.reduce(StatusSignal::Tick, now + Duration::from_secs(61));
+    assert_eq!(outcome.status_change, Some(SessionStatus::Unknown));
+    let evidence = outcome.status_evidence.expect("staleness evidence");
+    assert_eq!(evidence.source, StatusEvidenceSource::Staleness);
+    assert_eq!(
+        evidence.fallback_reason,
+        Some(StatusFallbackReason::StaleSignals)
+    );
+    assert_eq!(evidence.status, SessionStatus::Unknown);
+}
+
+#[test]
+fn anti_flicker_is_visible_in_evidence_before_idle_commits() {
+    let mut reducer =
+        StatusReducer::new(Authority::ScreenPrimary, t0()).with_manifest("codex", Some("8"));
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::Working, 1)),
+        now,
+    );
+    let pending = reducer.reduce(
+        StatusSignal::Screen(ScreenObservation {
+            matched_rule_id: "codex-idle".into(),
+            ..observation(ManifestState::Idle, 2)
+        }),
+        now + Duration::from_millis(100),
+    );
+    let evidence = pending.status_evidence.expect("anti-flicker evidence");
+    assert_eq!(evidence.status, SessionStatus::Working);
+    assert!(evidence.anti_flicker_active);
+    assert_eq!(evidence.matched_rule_id.as_deref(), Some("codex-idle"));
 }
 
 fn blocker(seq: u64, excerpt: &str) -> ScreenObservation {
@@ -374,6 +465,11 @@ fn codex_turn_complete_then_a_tick_settles_to_idle() {
     let outcome = reducer.reduce(StatusSignal::Tick, now);
     assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
     assert!(outcome.turn_completed);
+    let evidence = outcome
+        .status_evidence
+        .expect("the delayed decision keeps its notify authority");
+    assert_eq!(evidence.status, SessionStatus::Idle);
+    assert_eq!(evidence.source, StatusEvidenceSource::Notify);
 }
 
 #[test]

@@ -7,7 +7,6 @@ their own terms.
 - `GPL-3.0-or-later.txt` is included for Zed packages conservatively treated
   as GPL-3.0-or-later because their crate manifests do not carry independent
   license metadata.
-- `SwiftTerm-MIT.txt` is SwiftTerm's MIT license notice.
 - Apache-2.0 dependencies are covered by the repository's Apache-2.0 text.
 
 `license-policy.json` records the reviewed exceptions and

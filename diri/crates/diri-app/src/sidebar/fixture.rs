@@ -491,6 +491,7 @@ fn session(
         agent_session_id: None,
         transcript_path: None,
         status,
+        status_evidence: None,
         needs_input: None,
         resumability,
         parent: None,

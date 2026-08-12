@@ -1,12 +1,12 @@
 # Authoring agent manifests
 
 An agent manifest is the data contract for launching a coding agent and reading
-its terminal state. A basic screen-driven integration needs no Swift or Rust:
+its terminal state. A basic screen-driven integration needs no Rust code:
 declare the executable, then add small rules for working, idle, and needs-input
 screens.
 
-Use [Maki](../Sources/DirijorCore/Resources/manifests/maki.json) as a compact
-screen-driven example. [Claude Code](../Sources/DirijorCore/Resources/manifests/claude-code.json)
+Use [Maki](../diri/crates/diri-engine/manifests/maki.json) as a compact
+screen-driven example. [Claude Code](../diri/crates/diri-engine/manifests/claude-code.json)
 shows the advanced hooks-driven shape.
 
 ## Minimal screen-driven manifest
@@ -98,7 +98,7 @@ Do not use an ignored key for behavior.
 
 | Field | Required? | Meaning |
 | --- | --- | --- |
-| `id` | Rust built-ins | Repeat the top-level id in the Rust-owned catalog. Including it in both copies is harmless and reduces drift. |
+| `id` | Built-ins | Repeat the top-level id in the `agent` descriptor so the catalog identity is available to clients. |
 | `displayName` | Yes | Clear product name shown in the UI and diagnostics. |
 | `shortLabel` | No | Compact lower-case label; defaults to the id. |
 | `glyph` | No | One-character mark for places without an icon; defaults to `▸`. |
@@ -143,9 +143,9 @@ hint or open its URL without an explicit user action.
 
 Declare resume only when the CLI documents it and Diri can obtain the required
 id. A flag that accepts an id is not useful if the CLI never reports that id.
-The Rust engine's current built-in representation uses `flag` without an id for
-bare latest-session tokens; follow the closest Rust manifest and verify the
-actual argv in tests when the two catalog copies need different style values.
+The engine's current built-in representation uses `flag` without an id for bare
+latest-session tokens; follow the closest manifest and verify the actual argv in
+tests rather than guessing.
 
 ### Injection mechanisms
 
@@ -208,11 +208,10 @@ Prefer several literal UI markers over a broad regex. Anchor prompt and status
 rows, and make blocker rules distinguish a pending form from the answered form
 that may remain in scrollback.
 
-### Shared regex subset
+### Regex support
 
-Every pattern must compile in both Swift's ICU-based `NSRegularExpression` and
-Rust's `regex` crate. Rust deliberately rejects lookaround and backreferences,
-so do not use `(?=...)`, `(?!...)`, `(?<=...)`, `(?<!...)`, `\1`, or named
+Patterns use Rust's `regex` crate, which deliberately rejects lookaround and
+backreferences. Do not use `(?=...)`, `(?!...)`, `(?<=...)`, `(?<!...)`, `\1`, or named
 backreferences. Remember that a backslash is escaped once for JSON: regex
 `\s` is written as `"\\s"`. Prefer literal Unicode glyphs over engine-specific
 escape syntax.
@@ -255,18 +254,10 @@ Never publish a full terminal transcript just to demonstrate one status row.
 
 ## Bundled manifests and user overrides
 
-One logical built-in manifest is currently owned in two catalogs:
-
-- Swift compatibility engine:
-  [`Sources/DirijorCore/Resources/manifests/`](../Sources/DirijorCore/Resources/manifests/)
-- Authoritative Rust engine:
-  [`diri/crates/diri-engine/manifests/`](../diri/crates/diri-engine/manifests/)
-
-Add the same id to both and keep detection rules equivalent. The Rust copy must
-carry `agent.id`; including it in both is recommended. Descriptor details may
-differ only where the current engines encode the same launch semantics
-differently, such as a bare latest-session resume token. Treat the nearest
-working manifest as the compatibility reference rather than guessing.
+Built-in manifests live in the canonical catalog at
+[`diri/crates/diri-engine/manifests/`](../diri/crates/diri-engine/manifests/).
+Add one JSON file whose filename, top-level `id`, and `agent.id` agree. Treat the
+nearest working manifest as the compatibility reference rather than guessing.
 
 At startup, bundled files are loaded in filename order. User files under
 `~/Library/Application Support/Dirijor/manifests/overrides/` load afterward and
@@ -285,17 +276,13 @@ Add golden fixtures for every state the new rules claim to recognize. These
 focused commands keep the edit loop short:
 
 ```sh
-swift test --filter BundledManifestIntegrityTests
-swift test --filter GoldenScreenTests
 (cd diri && cargo test -p diri-engine detect::tests)
 ```
 
-Before opening a pull request, run both required engine checks. They decode
-every bundled manifest; the Rust test also proves every regex is in the shared
-subset:
+Before opening a pull request, run the complete engine package. It decodes every
+bundled manifest and proves every regex is supported:
 
 ```sh
-swift test
 (cd diri && cargo test -p diri-engine)
 ```
 

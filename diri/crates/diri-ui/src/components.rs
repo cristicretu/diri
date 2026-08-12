@@ -192,9 +192,9 @@ impl FloatingSurface {
 }
 
 impl RenderOnce for FloatingSurface {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let colors = self.colors;
-        div()
+        let surface = div()
             .relative()
             .rounded(px(Radius::PANEL))
             // Floating chrome keeps the sidebar hue but uses a denser material
@@ -218,12 +218,45 @@ impl RenderOnce for FloatingSurface {
                     inset: true,
                 },
             ])
-            .child(self.child)
-            .with_animation(
-                "floating-surface-entry",
-                Animation::new(Duration::from_millis(160)).with_easing(ease_out_quint()),
-                |surface, delta| surface.opacity(0.76 + 0.24 * delta),
-            )
+            .child(self.child);
+        if floating_surface_motion(cx.reduce_motion()) == FloatingSurfaceMotion::Immediate {
+            surface.into_any_element()
+        } else {
+            surface
+                .with_animation(
+                    // Animation state belongs to this mounted element. The stable
+                    // key prevents ordinary parent repaints from restarting it;
+                    // closing unmounts the element and drops that state, so a
+                    // rapid close/open creates a fresh, fully hit-testable surface
+                    // rather than resuming stale partial opacity.
+                    "floating-surface-entry",
+                    Animation::new(Duration::from_millis(160)).with_easing(ease_out_quint()),
+                    |surface, delta| surface.opacity(floating_surface_opacity(false, delta)),
+                )
+                .into_any_element()
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FloatingSurfaceMotion {
+    Immediate,
+    EntryFade,
+}
+
+fn floating_surface_motion(reduce_motion: bool) -> FloatingSurfaceMotion {
+    if reduce_motion {
+        FloatingSurfaceMotion::Immediate
+    } else {
+        FloatingSurfaceMotion::EntryFade
+    }
+}
+
+fn floating_surface_opacity(reduce_motion: bool, progress: f32) -> f32 {
+    if reduce_motion {
+        1.0
+    } else {
+        0.76 + 0.24 * progress.clamp(0.0, 1.0)
     }
 }
 
@@ -278,5 +311,24 @@ mod tests {
         assert_eq!(marquee_progress(0.10, 0.20, 0.80), 0.0);
         assert!((marquee_progress(0.50, 0.20, 0.80) - 0.5).abs() < f32::EPSILON);
         assert_eq!(marquee_progress(0.90, 0.20, 0.80), 1.0);
+    }
+
+    #[test]
+    fn floating_surface_motion_policy_is_immediate_when_reduced() {
+        assert_eq!(
+            floating_surface_motion(true),
+            FloatingSurfaceMotion::Immediate
+        );
+        assert_eq!(
+            floating_surface_motion(false),
+            FloatingSurfaceMotion::EntryFade
+        );
+        // Immediate policy cannot inherit a stale mid-animation opacity from
+        // an open/close/open sequence. Normal motion keeps the old endpoints.
+        for stale_progress in [-1.0, 0.0, 0.4, 1.0, 2.0] {
+            assert_eq!(floating_surface_opacity(true, stale_progress), 1.0);
+        }
+        assert_eq!(floating_surface_opacity(false, 0.0), 0.76);
+        assert_eq!(floating_surface_opacity(false, 1.0), 1.0);
     }
 }

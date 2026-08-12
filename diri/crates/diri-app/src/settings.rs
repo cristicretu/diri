@@ -3,10 +3,10 @@
 //! General, Terminal, and Resources mutate diri's preferences. Remote manages
 //! the shared execution-host catalog used by the SSH Remote Holder transport.
 
-use diri_proto::{HostEntry, HostNodeConfig};
+use diri_proto::{AgentKind, AgentReadinessResult, HostEntry, HostNodeConfig};
 use diri_term::theme::TermTheme;
 
-use crate::store::{DefaultAgent, Prefs};
+use crate::store::Prefs;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SettingsTab {
@@ -169,13 +169,8 @@ fn unique_host_id<'a>(name: &str, existing: impl Iterator<Item = &'a str>) -> St
     unreachable!()
 }
 
-pub fn default_agent_label(agent: DefaultAgent) -> &'static str {
-    match agent {
-        DefaultAgent::ClaudeCode => "Claude Code",
-        DefaultAgent::Codex => "Codex",
-        DefaultAgent::Cursor => "Cursor",
-        DefaultAgent::Gemini => "Gemini",
-    }
+pub fn default_agent_label(agent: &AgentKind, catalog: &AgentReadinessResult) -> String {
+    crate::agent_catalog::display_name(agent, catalog)
 }
 
 pub fn theme(id: &str) -> TermTheme {
@@ -223,7 +218,6 @@ mod tests {
         assert_eq!(cycle_hibernate_minutes(60), 0);
         assert_eq!(cycle_memory_limit(2), 4);
         assert_eq!(cycle_memory_limit(8), 2);
-        assert_eq!(DefaultAgent::ALL.len(), 4);
         assert!(
             SettingsTab::ALL
                 .into_iter()

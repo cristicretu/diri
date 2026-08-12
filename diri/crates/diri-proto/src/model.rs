@@ -191,7 +191,11 @@ impl<'de> Deserialize<'de> for AgentKind {
     where
         D: Deserializer<'de>,
     {
-        let (case, payload) = decode_keyed_enum(deserializer)?;
+        let value = Value::deserialize(deserializer)?;
+        if let Some(id) = value.as_str() {
+            return Ok(Self::new(id));
+        }
+        let (case, payload) = decode_keyed_enum_value(value).map_err(de::Error::custom)?;
         #[derive(Default, Deserialize)]
         struct Payload {
             id: Option<String>,
@@ -317,6 +321,57 @@ string_enum! {
         CodexNotify => "codexNotify",
         ScreenScrape => "screenScrape",
     }
+}
+
+string_enum! {
+    /// The bounded, structured signal that justified a session status.
+    ///
+    /// This deliberately describes only the class of signal. Raw hook
+    /// payloads, terminal captures, prompts, paths, and environment values do
+    /// not belong in status evidence.
+    pub enum StatusEvidenceSource {
+        Hook => "hook",
+        Notify => "notify",
+        ScreenRule => "screenRule",
+        ProcessLiveness => "processLiveness",
+        Staleness => "staleness",
+    }
+}
+
+string_enum! {
+    /// Fixed fallback explanations for decisions without a manifest rule.
+    pub enum StatusFallbackReason {
+        StartupGrace => "startupGrace",
+        ProcessOnly => "processOnly",
+        StaleSignals => "staleSignals",
+        ProcessExited => "processExited",
+    }
+}
+
+/// Privacy-safe evidence for one canonical status decision.
+///
+/// `status` intentionally duplicates the record's status. Clients must ignore
+/// evidence whose status does not match the enclosing record, preventing an
+/// out-of-order or mixed-version update from explaining a newer contradictory
+/// state with stale evidence.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusEvidence {
+    pub status: SessionStatus,
+    pub source: StatusEvidenceSource,
+    pub signal_at: DateMillis,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_rule_id: Option<String>,
+    #[serde(default)]
+    pub startup_grace_active: bool,
+    #[serde(default)]
+    pub anti_flicker_active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<StatusFallbackReason>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -657,6 +712,10 @@ pub struct SessionRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transcript_path: Option<String>,
     pub status: SessionStatus,
+    /// Additive decision metadata. Absent for records written by older Engine
+    /// builds; clients keep the normal status summary primary either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_evidence: Option<StatusEvidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub needs_input: Option<NeedsInputDetail>,
     pub resumability: Resumability,
@@ -750,13 +809,15 @@ where
     D: Deserializer<'de>,
 {
     let value = Value::deserialize(deserializer)?;
+    decode_keyed_enum_value(value).map_err(de::Error::custom)
+}
+
+fn decode_keyed_enum_value(value: Value) -> Result<(String, Value), &'static str> {
     let object = value
         .as_object()
-        .ok_or_else(|| de::Error::custom("Swift enum must be a keyed JSON object"))?;
+        .ok_or("Swift enum must be a keyed JSON object")?;
     if object.len() != 1 {
-        return Err(de::Error::custom(
-            "Swift enum object must contain exactly one case",
-        ));
+        return Err("Swift enum object must contain exactly one case");
     }
     let (case, payload) = object.iter().next().expect("length checked above");
     Ok((case.clone(), payload.clone()))

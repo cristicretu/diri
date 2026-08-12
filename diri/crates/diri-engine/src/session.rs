@@ -102,6 +102,7 @@ const LIVENESS_INTERVAL: Duration = Duration::from_secs(2);
 pub struct SessionView {
     pub id: String,
     pub status: SessionStatus,
+    pub status_evidence: Option<diri_proto::StatusEvidence>,
     pub needs_input: Option<NeedsInputDetail>,
     pub title: Option<String>,
     pub title_source: Option<diri_proto::TitleSource>,
@@ -634,7 +635,7 @@ impl Session {
             0,
         ));
         let log = OutputLog::writer(&spec.logs_dir, &spec.id)?;
-        let shared = new_shared(&spec, log);
+        let shared = new_shared(&spec, log, &engine);
         *shared.remote_grid.lock().expect("remote grid") = Some(RemoteGridState {
             mirror: GridMirror::new(),
             revision: 0,
@@ -692,7 +693,7 @@ impl Session {
             remote.output_offset,
         ));
         let log = OutputLog::writer(&spec.logs_dir, &spec.id)?;
-        let shared = new_shared(&spec, log);
+        let shared = new_shared(&spec, log, &engine);
         shared
             .remote_output_offset
             .store(remote.output_offset, Ordering::SeqCst);
@@ -731,7 +732,7 @@ impl Session {
     fn spawn_direct(spec: SessionSpec, engine: Arc<ManifestEngine>) -> std::io::Result<Self> {
         let pty = Pty::spawn(&spec.pty)?;
         let log = OutputLog::writer(&spec.logs_dir, &spec.id)?;
-        let shared = new_shared(&spec, log);
+        let shared = new_shared(&spec, log, &engine);
         shared.child_pid.store(pty.pid() as i32, Ordering::SeqCst);
 
         let reader = pty.reader()?;
@@ -807,7 +808,7 @@ impl Session {
         let paths = HolderPaths::new(&holder.holders_dir, &spec.id);
         let client = HolderClient::new(paths.socket());
         let log = OutputLog::reader(&spec.logs_dir, &spec.id)?;
-        let shared = new_shared(&spec, log);
+        let shared = new_shared(&spec, log, &engine);
         let deferred = Arc::new(DeferredLaunch::new());
 
         let pump = {
@@ -948,7 +949,7 @@ impl Session {
         engine: Arc<ManifestEngine>,
     ) -> std::io::Result<Self> {
         let log = OutputLog::reader(&spec.logs_dir, &spec.id)?;
-        let shared = new_shared(&spec, log);
+        let shared = new_shared(&spec, log, &engine);
         if let Ok(stat) = client.stat() {
             shared.child_pid.store(stat.child_pid, Ordering::SeqCst);
         }
@@ -998,6 +999,13 @@ impl Session {
         SessionView {
             id: self.shared.id.clone(),
             status: self.shared.status.lock().expect("status").clone(),
+            status_evidence: self
+                .shared
+                .reducer
+                .lock()
+                .expect("reducer")
+                .evidence()
+                .cloned(),
             needs_input: self.shared.needs_input.lock().expect("needs input").clone(),
             title,
             title_source,
@@ -1593,7 +1601,10 @@ impl Drop for Session {
     }
 }
 
-fn new_shared(spec: &SessionSpec, log: OutputLog) -> Arc<Shared> {
+fn new_shared(spec: &SessionSpec, log: OutputLog, engine: &ManifestEngine) -> Arc<Shared> {
+    let manifest_version = engine
+        .manifest(&spec.manifest_id)
+        .map(|manifest| manifest.version.clone());
     Arc::new(Shared {
         id: spec.id.clone(),
         status: Mutex::new(SessionStatus::Starting),
@@ -1606,7 +1617,10 @@ fn new_shared(spec: &SessionSpec, log: OutputLog) -> Arc<Shared> {
             spec.pty.cols as usize,
             spec.pty.rows as usize,
         )),
-        reducer: Mutex::new(StatusReducer::new(spec.authority, SystemTime::now())),
+        reducer: Mutex::new(
+            StatusReducer::new(spec.authority, SystemTime::now())
+                .with_manifest(spec.manifest_id.clone(), manifest_version),
+        ),
         exit: Mutex::new(None),
         exited: AtomicBool::new(false),
         stop: AtomicBool::new(false),
@@ -1681,6 +1695,9 @@ fn apply(shared: &Shared, outcome: &ReducerOutcome) {
             changed = true;
         }
     }
+    // The reducer already suppresses evidence with unchanged structured
+    // meaning, so an emitted value always warrants a record/UI refresh.
+    changed |= outcome.status_evidence.is_some();
     // Leaving a needs-input state clears the pending detail, so the UI does not
     // keep showing a prompt that has been answered.
     if matches!(

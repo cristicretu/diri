@@ -51,6 +51,13 @@ pub struct InjectionSpec {
     pub codex_notify: bool,
     #[serde(default, rename = "codexMCP")]
     pub codex_mcp: bool,
+    /// Cursor has no `--mcp-config`. Launch a session-local `--plugin-dir`
+    /// whose `mcp.json` advertises the `dirijor` stdio server.
+    #[serde(default, rename = "cursorMCP")]
+    pub cursor_mcp: bool,
+    /// Same plugin ships hooks: Cursor `stop` → `dirijor hook Stop`.
+    #[serde(default, rename = "cursorHooks")]
+    pub cursor_hooks: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -60,6 +67,19 @@ pub struct ApproveSpec {
     pub text: Option<String>,
     #[serde(default)]
     pub submit: bool,
+}
+
+/// Display-only setup metadata. It is parsed here so user overrides can carry
+/// it, but the Engine never executes the hint or opens the URL.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupSpec {
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub install_hint: Option<String>,
+    #[serde(default)]
+    pub sign_in_hint: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -105,6 +125,8 @@ pub struct AgentDescriptor {
     pub env_scrub_prefixes: Vec<String>,
     #[serde(default)]
     pub approve: Option<ApproveSpec>,
+    #[serde(default)]
+    pub setup: Option<SetupSpec>,
 }
 
 impl AgentDescriptor {

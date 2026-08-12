@@ -9,7 +9,7 @@ use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::query_label;
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
 use crate::settings::{HostDraft, SettingsTab, default_agent_label, theme};
-use crate::store::{DefaultAgent, Prefs, SessionStore, StoreRuntime};
+use crate::store::{Prefs, SessionStore, StoreRuntime};
 use crate::updates::{UpdateCommand, UpdateHandle, UpdatePhase};
 use crate::worktrees::WorktreesSheet;
 use diri_proto::{AgentKind as ProtoAgentKind, HistoryEntry, HostEntry, HostsConfig};
@@ -55,6 +55,7 @@ enum Surface {
     History,
     Worktrees,
     Settings,
+    Diagnostics,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -272,6 +273,7 @@ pub struct UtilitySurfaces {
     runtime: Arc<Runtime>,
     updates: UpdateHandle,
     activity: String,
+    diagnostics_report: Option<String>,
     _update_changes: Task<()>,
     _store_changes: Task<()>,
 }
@@ -305,6 +307,14 @@ impl UtilitySurfaces {
             Some("remote") => SettingsTab::Remote,
             _ => SettingsTab::General,
         };
+        let diagnostics_preview = settings_preview.as_deref() == Some("diagnostics");
+        let diagnostics_report = diagnostics_preview.then(|| {
+            let store = store_runtime
+                .store
+                .read()
+                .expect("session store lock poisoned");
+            build_diagnostics_report(&store)
+        });
         // The Settings pane renders update state it does not own, so it has to
         // be woken when that state moves.
         let update_changes = {
@@ -336,7 +346,9 @@ impl UtilitySurfaces {
         };
         Self {
             focus,
-            surface: if settings_preview.is_some() {
+            surface: if diagnostics_preview {
+                Surface::Diagnostics
+            } else if settings_preview.is_some() {
                 Surface::Settings
             } else {
                 Surface::None
@@ -361,6 +373,7 @@ impl UtilitySurfaces {
             runtime,
             updates,
             activity: "Connected client · shared daemon remains untouched".to_owned(),
+            diagnostics_report,
             _update_changes: update_changes,
             _store_changes: store_changes,
         }
@@ -916,6 +929,16 @@ impl UtilitySurfaces {
         self.surface = Surface::Settings;
         self.settings_menu = None;
         self.host_editor = None;
+        cx.notify();
+    }
+
+    fn open_diagnostics(&mut self, cx: &mut Context<Self>) {
+        let store = self.store.read().expect("session store lock poisoned");
+        let report = build_diagnostics_report(&store);
+        drop(store);
+        self.diagnostics_report = Some(report);
+        self.surface = Surface::Diagnostics;
+        self.settings_menu = None;
         cx.notify();
     }
 
@@ -1581,6 +1604,22 @@ impl UtilitySurfaces {
                 ))
                 .child(self.update_settings(cx))
                 .child(setting_section(
+                    "Support",
+                    setting_row(
+                        "Copy diagnostics",
+                        "Preview a privacy-safe report before copying it.",
+                        surface_button(
+                            "Preview…",
+                            "preview-diagnostics",
+                            colors,
+                            cx,
+                            |this, cx| this.open_diagnostics(cx),
+                        ),
+                        colors,
+                    ),
+                    colors,
+                ))
+                .child(setting_section(
                     "Quick Open",
                     div()
                         .p(px(12.0))
@@ -1632,10 +1671,16 @@ impl UtilitySurfaces {
 
     fn default_agent_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = self.settings_colors();
-        let selected = self.prefs.default_agent;
+        let (selected, catalog) = {
+            let store = self.store.read().expect("session store lock poisoned");
+            (
+                store.preferences().default_agent.clone(),
+                store.agent_catalog().clone(),
+            )
+        };
         let open = self.settings_menu == Some(SettingsMenu::DefaultAgent);
         let trigger = settings_select_button(
-            default_agent_label(selected),
+            default_agent_label(&selected, &catalog),
             "default-agent-dropdown",
             open,
             SettingsMenu::DefaultAgent,
@@ -1646,34 +1691,78 @@ impl UtilitySurfaces {
         let mut control = div().relative().min_w(px(154.0)).child(trigger);
         if open {
             let mut options = div().p(px(4.0)).flex().flex_col();
-            for (index, agent) in DefaultAgent::ALL.into_iter().enumerate() {
-                let is_selected = agent == selected;
+            for (index, option) in crate::agent_catalog::default_agent_options(&catalog)
+                .into_iter()
+                .enumerate()
+            {
+                let is_selected = option.kind == selected;
+                let enabled = option.available;
+                let agent = option.kind.clone();
+                let setup_url = option.setup_url.clone();
+                let unavailable = option.unavailable_detail();
                 options = options.child(
                     div()
                         .id(SharedString::from(format!("default-agent-option-{index}")))
-                        .h(px(Metrics::ROW_HEIGHT))
+                        .min_h(px(Metrics::ROW_HEIGHT))
                         .px(px(8.0))
+                        .py(px(5.0))
                         .flex()
                         .items_center()
                         .gap(px(8.0))
                         .rounded(px(Radius::ROW))
                         .bg(Fill::selected(colors, is_selected))
-                        .cursor_pointer()
-                        .hover(move |style| style.bg(colors.primary.alpha(0.08)))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.prefs.default_agent = agent;
-                            this.settings_menu = None;
-                            this.persist_prefs();
-                            cx.notify();
-                        }))
-                        .child(AgentLogo::new(ui_default_agent(agent), 16.0, colors).badged(false))
+                        .when(enabled, |row| {
+                            row.cursor_pointer()
+                                .hover(move |style| style.bg(colors.primary.alpha(0.08)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.prefs.default_agent = agent.clone();
+                                    this.settings_menu = None;
+                                    this.persist_prefs();
+                                    cx.notify();
+                                }))
+                        })
+                        .child(AgentLogo::new(ui_agent(&option.kind), 16.0, colors).badged(false))
                         .child(
                             div()
+                                .min_w_0()
                                 .flex_1()
+                                .flex()
+                                .flex_col()
                                 .text_size(px(Typo::ROW.size))
-                                .text_color(colors.primary)
-                                .child(default_agent_label(agent)),
+                                .text_color(if enabled {
+                                    colors.primary
+                                } else {
+                                    colors.secondary
+                                })
+                                .child(option.display_name)
+                                .when_some(unavailable, |label, unavailable| {
+                                    label.child(
+                                        div()
+                                            .whitespace_nowrap()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .text_size(px(Typo::META.size))
+                                            .text_color(colors.tertiary)
+                                            .child(unavailable),
+                                    )
+                                }),
                         )
+                        .when_some(setup_url, |row, url| {
+                            row.child(
+                                div()
+                                    .id(format!("default-agent-setup-{index}"))
+                                    .px(px(6.0))
+                                    .py(px(3.0))
+                                    .rounded(px(Radius::CHIP))
+                                    .cursor_pointer()
+                                    .text_size(px(Typo::META.size))
+                                    .text_color(colors.secondary)
+                                    .bg(Fill::subtle(colors))
+                                    .hover(move |button| button.bg(colors.primary.alpha(0.10)))
+                                    .on_click(move |_, _, cx| cx.open_url(&url))
+                                    .child("Setup…"),
+                            )
+                        })
                         .when(is_selected, |row| {
                             row.child(sf_symbol_weighted(
                                 "checkmark",
@@ -2850,6 +2939,165 @@ impl UtilitySurfaces {
         }
         control.into_any_element()
     }
+
+    fn render_diagnostics(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        let report = self.diagnostics_report.clone().unwrap_or_else(|| {
+            "Diagnostics are not available yet. Close this preview and try again.".to_owned()
+        });
+        FloatingSurface::new(
+            colors,
+            div()
+                .id("diagnostics-preview")
+                .debug_selector(|| "diagnostics-preview".into())
+                .w(px(620.0))
+                .h(px(500.0))
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .h(px(54.0))
+                        .px(px(16.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.0))
+                        .child(sf_symbol("stethoscope", 15.0, colors.secondary))
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .flex_1()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .child(
+                                    div()
+                                        .text_size(px(Typo::TITLE.size))
+                                        .font_weight(Typo::TITLE.weight)
+                                        .child("Copy Diagnostics"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(Typo::META.size))
+                                        .text_color(colors.tertiary)
+                                        .child("This is the exact text that will be copied."),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("close-diagnostics")
+                                .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(Radius::BADGE))
+                                .cursor_pointer()
+                                .hover(move |style| style.bg(Fill::subtle(colors)))
+                                .child(sf_symbol_weighted(
+                                    "xmark",
+                                    13.5,
+                                    SymbolWeight::Bold,
+                                    colors.secondary,
+                                ))
+                                .on_click(cx.listener(|this, _, _, cx| this.close_surface(cx))),
+                        ),
+                )
+                .child(HairlineDivider::horizontal(colors))
+                .child(
+                    div()
+                        .id("diagnostics-report-scroll")
+                        .min_h(px(0.0))
+                        .flex_1()
+                        .overflow_y_scroll()
+                        .p(px(16.0))
+                        .child(
+                            div()
+                                .w_full()
+                                .p(px(14.0))
+                                .rounded(px(Radius::CARD))
+                                .bg(colors.primary.alpha(0.035))
+                                .border_1()
+                                .border_color(colors.primary.alpha(0.065))
+                                .font_family(crate::fonts::mono_family())
+                                .text_size(px(11.0))
+                                .line_height(px(17.0))
+                                .text_color(colors.secondary)
+                                .whitespace_normal()
+                                .child(wrappable_setting_copy(report.clone().into())),
+                        ),
+                )
+                .child(HairlineDivider::horizontal(colors))
+                .child(
+                    div()
+                        .px(px(16.0))
+                        .h(px(62.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .max_w(px(390.0))
+                                .text_size(px(Typo::META.size))
+                                .text_color(colors.tertiary)
+                                .child("Diagnostics exclude terminal content and paths by design. Review them before posting anyway."),
+                        )
+                        .child(
+                            div()
+                                .id("copy-diagnostics")
+                                .h(px(32.0))
+                                .px(px(12.0))
+                                .flex()
+                                .items_center()
+                                .gap(px(7.0))
+                                .rounded(px(Radius::ROW))
+                                .cursor_pointer()
+                                .bg(colors.primary.alpha(0.10))
+                                .hover(move |button| button.bg(colors.primary.alpha(0.14)))
+                                .text_size(px(Typo::ROW_EMPHASIZED.size))
+                                .font_weight(Typo::ROW_EMPHASIZED.weight)
+                                .child(sf_symbol("doc.on.doc", 12.0, colors.secondary))
+                                .child("Copy report")
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        report.clone(),
+                                    ));
+                                })),
+                        ),
+                ),
+        )
+    }
+}
+
+fn build_diagnostics_report(store: &SessionStore) -> String {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/nonexistent"));
+    let platform = crate::diagnostics::PlatformMetadata::current();
+    let active_host_ids = store
+        .sessions()
+        .values()
+        .filter_map(|session| session.host.clone())
+        .collect::<HashSet<_>>();
+    crate::diagnostics::DiagnosticsReport::generate(crate::diagnostics::DiagnosticsInput {
+        app_version: crate::updates::CURRENT_VERSION,
+        app_build: option_env!("DIRI_BUILD_ID").unwrap_or(env!("CARGO_PKG_VERSION")),
+        update_channel: if cfg!(debug_assertions) {
+            "development"
+        } else {
+            "stable"
+        },
+        platform: &platform,
+        daemon_state: store.daemon_state(),
+        daemon_identity: store.daemon_identity(),
+        agents: store.agent_catalog(),
+        hosts: store.hosts(),
+        active_host_ids: &active_host_ids,
+        storage_reachable: crate::diagnostics::storage_reachable(&home),
+    })
+    .as_str()
+    .to_owned()
 }
 
 impl Focusable for UtilitySurfaces {
@@ -2865,6 +3113,7 @@ impl Render for UtilitySurfaces {
             Surface::History => Some(self.render_history(cx).into_any_element()),
             Surface::Worktrees => Some(self.render_worktrees(cx).into_any_element()),
             Surface::Settings => Some(self.render_settings(cx).into_any_element()),
+            Surface::Diagnostics => Some(self.render_diagnostics(cx).into_any_element()),
         };
         let root = div()
             .id("utility-surfaces")
@@ -3480,15 +3729,6 @@ fn ui_agent(kind: &ProtoAgentKind) -> diri_ui::AgentKind {
     }
 }
 
-fn ui_default_agent(agent: DefaultAgent) -> diri_ui::AgentKind {
-    match agent {
-        DefaultAgent::ClaudeCode => diri_ui::AgentKind::ClaudeCode,
-        DefaultAgent::Codex => diri_ui::AgentKind::Codex,
-        DefaultAgent::Cursor => diri_ui::AgentKind::Cursor,
-        DefaultAgent::Gemini => diri_ui::AgentKind::Gemini,
-    }
-}
-
 fn folder_name(path: &str) -> &str {
     Path::new(path)
         .file_name()
@@ -3577,8 +3817,12 @@ fn relative_time(milliseconds: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[cfg(target_os = "macos")]
+    use gpui::HeadlessAppContext;
     use gpui::{
         Entity, Modifiers, MouseDownEvent, ScrollDelta, ScrollWheelEvent, StyleRefinement,
         TestAppContext, point, size,
@@ -3600,6 +3844,62 @@ mod tests {
                     .cached(StyleRefinement::default().absolute().inset_0()),
             )
         }
+    }
+
+    /// Regenerates the issue/PR screenshot without Screen Recording access or
+    /// live user state. It is ignored because its only output is an artifact;
+    /// the ordinary layout assertions below remain part of every test run.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes the deterministic diagnostics screenshot artifact"]
+    fn render_diagnostics_preview_screenshot() {
+        let output = std::env::var_os("DIRI_VISUAL_OUTPUT")
+            .map(PathBuf::from)
+            .expect("set DIRI_VISUAL_OUTPUT to the target PNG path");
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| crate::fonts::init(cx));
+
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let updates = crate::updates::inert();
+        let window = cx
+            .open_window(size(px(1100.0), px(700.0)), move |window, cx| {
+                let surfaces = cx.new(|cx| {
+                    let mut surfaces =
+                        UtilitySurfaces::new(runtime, tokio, updates, window, cx);
+                    surfaces.surface = Surface::Diagnostics;
+                    surfaces.diagnostics_report = Some(
+                        "# Diri diagnostics\nReview this report before posting it publicly.\n\nApp: 0.5.0 (build preview, channel development)\nmacOS: 15.5 (aarch64)\nDaemon: connecting automatically\nSession/state storage: reachable\n\nAgents:\n- codex: installed\n- claude-code: unavailable\n\nRemote hosts:\n- none configured\n\nExcluded by design: terminal content, prompts, logs, environment variables, paths, SSH destinations, tokens, and account identifiers."
+                            .to_owned(),
+                    );
+                    surfaces
+                });
+                cx.new(|_| CachedOverlayHarness { surfaces })
+            })
+            .expect("open headless diagnostics window");
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, _| window.refresh())
+            .expect("refresh diagnostics window");
+        cx.run_until_parked();
+        let screenshot = cx
+            .capture_screenshot(window.into())
+            .expect("capture diagnostics screenshot");
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent).expect("create screenshot directory");
+        }
+        screenshot
+            .save(output)
+            .expect("save diagnostics screenshot");
     }
 
     struct SettingsModalHarness {

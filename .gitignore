@@ -1,10 +1,7 @@
-.build/
-.build-*/
 .DS_Store
 xcuserdata/
 dist/
 sidecar/node_modules/
-.swiftpm/
 .skill-build/
 
 # Rust build output

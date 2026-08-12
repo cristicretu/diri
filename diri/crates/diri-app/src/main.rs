@@ -1,3 +1,4 @@
+mod agent_catalog;
 mod app_theme;
 mod clipboard_transfer;
 mod code_intelligence;
@@ -6,6 +7,7 @@ mod composer;
 #[cfg(unix)]
 mod daemon_launch;
 mod dev_build;
+mod diagnostics;
 pub mod diff;
 pub mod fonts;
 pub mod fuzzy;
@@ -20,6 +22,7 @@ pub mod notifications;
 pub mod palette;
 pub mod query_editor;
 pub mod quick_open;
+mod recovery;
 pub mod review_prompt;
 pub mod root;
 pub mod seam;
@@ -27,6 +30,7 @@ mod session_surfaces;
 pub mod settings;
 pub mod sidebar;
 pub mod sounds;
+mod status_debug;
 mod surface_shell;
 pub mod switcher;
 pub mod terminal_pane;

@@ -19,28 +19,19 @@ case "${1:-}" in
         ;;
 esac
 
-for tool in bash cargo python3 swift; do
+for tool in bash cargo python3; do
     if ! command -v "${tool}" >/dev/null 2>&1; then
         echo "error: ${tool} is required; see CONTRIBUTING.md" >&2
         exit 1
     fi
 done
 
-# Keep compiler caches inside the checkout. This works in sandboxed development
-# environments and avoids depending on writable global Swift/Clang cache paths.
-export CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-${root}/.build/clang-module-cache}"
-export SWIFTPM_MODULECACHE_OVERRIDE="${SWIFTPM_MODULECACHE_OVERRIDE:-${CLANG_MODULE_CACHE_PATH}}"
-mkdir -p "${CLANG_MODULE_CACHE_PATH}"
-
 echo "==> Shell and release publishing guards"
 bash -n "${root}"/scripts/*.sh "${root}"/diri/scripts/*.sh
 bash "${root}/diri/scripts/test-publish-github-release.sh"
 bash "${root}/diri/scripts/test-publish-homebrew-cask.sh"
 
-echo "==> Swift engine"
-swift test --package-path "${root}" --no-parallel
-
-echo "==> Rust app"
+echo "==> Rust workspace"
 (
     cd "${root}/diri"
     cargo fmt --all -- --check
@@ -63,7 +54,11 @@ if [[ "${run_browser}" == "1" ]]; then
         npm audit --omit=dev
         npx playwright install chromium webkit firefox
     )
-    DIRIJOR_RUN_BROWSER_TESTS=1 swift test --package-path "${root}" --filter BrowserPoolTests
+    (
+        cd "${root}/diri"
+        DIRIJOR_RUN_BROWSER_TESTS=1 cargo test --package diri-engine \
+            browser_integration_runs_across_engines -- --nocapture
+    )
 fi
 
 echo "All contributor checks passed."

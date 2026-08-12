@@ -716,10 +716,14 @@ impl ControlServer {
                 uuid
             });
             if let Some(injection) = &self.injection {
-                launch_args.extend(crate::inject::injection_args(
+                launch_args.extend(crate::inject::injection_args_with_cursor(
                     &descriptor.injection,
                     &injection.inject_dir,
                     &injection.cli_path,
+                    Some(crate::inject::CursorInject {
+                        session_id: &id,
+                        socket_path: &self.socket_path,
+                    }),
                 ));
             }
         }
@@ -742,6 +746,7 @@ impl ControlServer {
         };
 
         let mut record = new_record(&id, &kind, &cwd);
+        record.kind = p.kind.clone();
         // A linked worktree is an execution cwd inside the project selected
         // by the user; it does not become a new first-level sidebar project.
         record.project_id = crate::registry::session_project_id(&p.cwd, None);
@@ -971,6 +976,7 @@ impl ControlServer {
         };
 
         let mut record = new_record(&id, &kind, &captured.cwd);
+        record.kind = p.kind.clone();
         record.host = Some(host.id.clone());
         record.project_id = crate::registry::session_project_id(&captured.cwd, Some(&host.id));
         record.remote_persistence = Some(persistence);
@@ -1287,6 +1293,7 @@ impl ControlServer {
             let target_id = target_host.as_ref().map(|host| host.id.clone());
             let branch = prepared.branch.clone();
             let cwd = prepared.target_repo_root.clone();
+            let worktree = prepared.target_is_worktree.then(|| cwd.clone());
             let transcript = shuttle.local_target_path.clone();
             let local = target_host.is_none();
             registry.ensure_session_project(&cwd, target_id.as_deref());
@@ -1295,7 +1302,7 @@ impl ControlServer {
                 record.cwd = cwd;
                 record.project_id =
                     crate::registry::session_project_id(&record.cwd, record.host.as_deref());
-                record.worktree_path = None;
+                record.worktree_path = worktree;
                 record.git_branch = Some(branch);
                 record.transcript_path = if local { transcript } else { None };
                 record.status = diri_proto::SessionStatus::Exited(diri_proto::ExitInfo {
@@ -1906,15 +1913,21 @@ impl ControlServer {
             // Only the appendable flag mechanisms replay on resume, exactly
             // as in Swift: Codex's global `-c` overrides must precede the
             // resume SUBCOMMAND and are deliberately not replayed.
-            let claude_only = crate::agent::InjectionSpec {
+            let replay = crate::agent::InjectionSpec {
                 claude_hooks: descriptor.injection.claude_hooks,
                 claude_mcp: descriptor.injection.claude_mcp,
+                cursor_mcp: descriptor.injection.cursor_mcp,
+                cursor_hooks: descriptor.injection.cursor_hooks,
                 ..Default::default()
             };
-            launch_args.extend(crate::inject::injection_args(
-                &claude_only,
+            launch_args.extend(crate::inject::injection_args_with_cursor(
+                &replay,
                 &injection.inject_dir,
                 &injection.cli_path,
+                Some(crate::inject::CursorInject {
+                    session_id: id,
+                    socket_path: &self.socket_path,
+                }),
             ));
         }
 
@@ -2280,6 +2293,7 @@ pub(crate) fn new_record(id: &str, kind: &str, cwd: &str) -> diri_proto::Session
         agent_session_id: None,
         transcript_path: None,
         status: diri_proto::SessionStatus::Starting,
+        status_evidence: None,
         needs_input: None,
         resumability: Resumability::Live,
         parent: None,
@@ -2868,6 +2882,7 @@ mod tests {
             agent_session_id: None,
             transcript_path: None,
             status: SessionStatus::Idle,
+            status_evidence: None,
             needs_input: None,
             resumability: Resumability::NotResumable,
             parent: None,
@@ -2991,6 +3006,11 @@ mod tests {
             codex_descriptor.injection.codex_notify || codex_descriptor.injection.codex_mcp,
             "codex opts into at least one shim"
         );
+
+        let cursor = engine.manifest("cursor").expect("cursor manifest");
+        let cursor_descriptor = cursor.agent.clone().expect("agent");
+        assert!(cursor_descriptor.injection.cursor_mcp);
+        assert!(cursor_descriptor.injection.cursor_hooks);
     }
 
     #[test]

@@ -14,6 +14,11 @@
       "devin-cli"
     ],
     "firstClass": true,
+    "setup": {
+      "url": "https://docs.devin.ai/cli",
+      "installHint": "Install Devin CLI with Cognition's installer or Homebrew.",
+      "signInHint": "Run devin auth login."
+    },
     "statusAuthority": "screen",
     "binary": "devin",
     "resume": {

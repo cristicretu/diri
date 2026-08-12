@@ -486,7 +486,10 @@ impl NavigationOverlay {
         match self.overlay {
             Some(Overlay::CommandPalette) => {
                 let selection = if let Some(action) = self.ranked_actions.get(self.highlight) {
-                    Some(CommandSelection::Action(action.item.command.clone()))
+                    action
+                        .item
+                        .enabled
+                        .then(|| CommandSelection::Action(action.item.command.clone()))
                 } else {
                     self.ranked_sessions
                         .get(self.highlight.saturating_sub(self.ranked_actions.len()))
@@ -560,9 +563,14 @@ impl NavigationOverlay {
                             options.cwd = Some(store.local_fallback_directory());
                         }
                     }
-                    store.spawn_kind(agent.kind(), options);
+                    store.spawn_kind(agent, options);
                 }
                 self.close_overlay(cx);
+            }
+            PaletteCommand::UnavailableAgent { setup_url } => {
+                if let Some(url) = setup_url {
+                    cx.open_url(&url);
+                }
             }
             PaletteCommand::MigrateSelected { target_host } => {
                 {
@@ -640,7 +648,8 @@ impl NavigationOverlay {
             let selected = store.selected_session().cloned();
             let default_host = store.default_spawn_host();
             let actions = palette::actions_for_default_host(
-                store.preferences().default_agent,
+                store.preferences().default_agent.clone(),
+                store.agent_catalog(),
                 &projects,
                 &hosts,
                 selected.as_ref(),
@@ -794,12 +803,19 @@ impl NavigationOverlay {
     ) -> AnyElement {
         let action = ranked.item;
         let command = action.command.clone();
+        let enabled = action.enabled;
+        let trailing = action
+            .detail
+            .clone()
+            .map(SharedString::from)
+            .or_else(|| action.shortcut.map(SharedString::from));
         palette_row(
             highlighted_label(action.title, &ranked.title_matches),
             sf_symbol(action.system_image, 12.5, colors.secondary),
-            action.shortcut.map(SharedString::from),
+            trailing,
             index == self.highlight,
             index,
+            enabled,
             colors,
         )
         .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
@@ -808,9 +824,11 @@ impl NavigationOverlay {
                 cx.notify();
             }
         }))
-        .on_click(cx.listener(move |this, _, _, cx| {
-            this.run_command_selection(CommandSelection::Action(command.clone()), cx);
-        }))
+        .when(enabled, |row| {
+            row.on_click(cx.listener(move |this, _, _, cx| {
+                this.run_command_selection(CommandSelection::Action(command.clone()), cx);
+            }))
+        })
         .into_any_element()
     }
 
@@ -836,6 +854,7 @@ impl NavigationOverlay {
             Some(SharedString::from(chip)),
             index == self.highlight,
             index,
+            true,
             colors,
         )
         .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
@@ -945,14 +964,13 @@ impl NavigationOverlay {
         } else {
             colors.secondary
         };
-        let default_name = self
-            .store
-            .read()
-            .expect("session store lock poisoned")
-            .preferences()
-            .default_agent
-            .display_name()
-            .to_owned();
+        let default_name = {
+            let store = self.store.read().expect("session store lock poisoned");
+            crate::agent_catalog::display_name(
+                &store.preferences().default_agent,
+                store.agent_catalog(),
+            )
+        };
         let row = div()
             .id(format!("quick-row-{index}"))
             .flex()
@@ -1165,6 +1183,7 @@ fn palette_row(
     trailing: Option<SharedString>,
     highlighted: bool,
     index: usize,
+    enabled: bool,
     colors: SemanticColors,
 ) -> gpui::Stateful<gpui::Div> {
     div()
@@ -1184,7 +1203,8 @@ fn palette_row(
         } else {
             colors.primary.alpha(0.0)
         })
-        .cursor_pointer()
+        .opacity(if enabled { 1.0 } else { 0.48 })
+        .when(enabled, |row| row.cursor_pointer())
         .text_size(px(13.0))
         .child(
             div()

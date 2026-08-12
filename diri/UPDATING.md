@@ -87,7 +87,7 @@ diri/scripts/release.sh 0.4.1
 
 The script refuses to release a version that does not match the manifest, a
 dirty checkout, or a commit other than the current `origin/main`. It runs
-clippy + tests, builds a universal binary, bundles the Swift daemon, signs it,
+clippy + tests, builds the universal Rust executables, signs them,
 **notarizes and staples the .app first**, then builds and notarizes the DMG
 from that stapled bundle, produces the update zip, rebuilds `appcast.json` from
 the currently published feed, generates `SHA256SUMS` and a reviewed dependency
@@ -113,15 +113,14 @@ Release notes come from `dist/notes-<version>.md`. The script writes a default
 one if it is missing, so writing that file first — and re-running — is how you
 customize them.
 
-### The bundled daemon does not update with the app
+### The bundled Engine updates safely with the app
 
-`diri.app` carries `dirijord` + `dirijord-holder` in `Contents/Resources/bin`,
-and the update zip carries them too — but `daemon_launch` is launch-only by
-design (PLAN.md §3.1: never restart a live daemon, to avoid ping-pong with a
-still-installed `Dirijor.app`). After a self-update the *old* daemon keeps
-running from the replaced bundle, so a release that changes `dirijord` does not
-take effect until that daemon is restarted by other means. The app half updates
-immediately; the daemon half waits.
+`diri.app` carries `dirijord-rs` + `diri-holder` in `Contents/Resources/bin`,
+and the update zip carries them too. At launch, the app verifies the running
+Engine's identity and executable hash. When the bundled Engine changed, it asks
+the old process to persist and shut down, then launches the new binary. Holder
+processes retain their PTYs across that handoff, so updating the Engine does not
+terminate live agent sessions.
 
 The canonical release tag is `v<version>`. `gh release create` creates that tag
 at the verified `origin/main` commit; do not create a second `diri-v<version>`
