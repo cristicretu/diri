@@ -1,4 +1,6 @@
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -13,7 +15,7 @@ use diri_ui::{
     RowFill, SemanticColors, Space, StateChip, StatusGlyph, StatusState, Typo,
 };
 use gpui::{
-    Anchor, Animation, AnimationExt, AnyElement, App, AppContext as _, Context, Entity,
+    Anchor, Animation, AnimationExt, AnyElement, App, AppContext as _, Bounds, Context, Entity,
     EventEmitter, ExternalPaths, FocusHandle, Focusable, FontWeight, Hsla, IntoElement,
     MouseButton, Pixels, Point, Render, Rgba, ScrollHandle, SharedString, Task, Window, anchored,
     deferred, div, linear_color_stop, linear_gradient, point, prelude::*, px,
@@ -33,11 +35,27 @@ use crate::updates::{UpdateCommand, UpdatePhase, UpdateState};
 use crate::usage::{UsageFormat, UsageSnapshot};
 
 use super::{
-    DragItem, Popover, PreviewScenario, SidebarPreviewFixture, SidebarUiState, move_before,
-    move_to_end,
+    CursorMove, DragItem, Popover, PreviewScenario, SidebarPreviewFixture, SidebarUiState,
+    move_before, move_to_end,
 };
 
 const PREVIEW_USAGE: f64 = 4.82;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FocusRow {
+    id: SessionId,
+    parent: Option<SessionId>,
+    has_children: bool,
+    collapsed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HorizontalFocusAction {
+    Collapse(SessionId),
+    Expand(SessionId),
+    MoveTo(SessionId),
+    Unchanged,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) enum SidebarEvent {
@@ -52,6 +70,9 @@ pub(crate) enum SidebarEvent {
     /// A plain click (or shortcut) selected a session: hand keyboard focus
     /// to its terminal surface so the user can type immediately.
     SessionActivated,
+    /// Escape left keyboard-navigation mode without changing the active
+    /// session. Root owns the terminal entity, so it completes the handoff.
+    FocusTerminal,
     /// The user acted on the update pill. The sidebar holds no updater of its
     /// own; RootView owns the handle and forwards these.
     Update(UpdateCommand),
@@ -100,12 +121,15 @@ pub struct Sidebar {
     /// Session list scroll position, read back each frame to size the top and
     /// bottom fades.
     list_scroll: ScrollHandle,
+    /// Window-space row bounds from the latest prepaint. Keyboard navigation
+    /// uses these to reveal only rows that actually crossed the viewport edge.
+    row_bounds: Rc<RefCell<HashMap<SessionId, Bounds<Pixels>>>>,
     directory_scroll: ScrollHandle,
     glyphs: HashMap<SessionId, Entity<StatusGlyph>>,
     /// Rebuilt once per projection render. Looking up ⌘1…⌘9 inside every row
     /// previously re-locked the store and scanned the full session list N times.
     shortcut_ranks: HashMap<SessionId, usize>,
-    rename_focus: FocusHandle,
+    focus_handle: FocusHandle,
     hover_generation: u64,
     usage: Option<UsageSnapshot>,
     update: UpdateState,
@@ -126,7 +150,7 @@ impl EventEmitter<SidebarEvent> for Sidebar {}
 
 impl Focusable for Sidebar {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.rename_focus.clone()
+        self.focus_handle.clone()
     }
 }
 
@@ -184,10 +208,11 @@ impl Sidebar {
             _store_changes: store_changes,
             ui,
             list_scroll: ScrollHandle::new(),
+            row_bounds: Rc::new(RefCell::new(HashMap::new())),
             directory_scroll: ScrollHandle::new(),
             glyphs: HashMap::new(),
             shortcut_ranks: HashMap::new(),
-            rename_focus: cx.focus_handle(),
+            focus_handle: cx.focus_handle(),
             hover_generation: 0,
             usage: None,
             update: UpdateState::default(),
@@ -314,6 +339,11 @@ impl Sidebar {
             eprintln!("diri: could not remember sidebar visibility: {error}");
         }
         cx.emit(SidebarEvent::VisibilityChanged);
+        if !visible {
+            // A hidden focus owner cannot receive Escape or hand keys onward.
+            // Return to the terminal for every collapse entry point.
+            cx.emit(SidebarEvent::FocusTerminal);
+        }
         cx.notify();
     }
 
@@ -424,9 +454,10 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) {
         self.commit_rename();
+        self.ui.focus_cursor = Some(session.id.clone());
         self.ui
             .begin_rename(session.id.clone(), session.title.clone());
-        self.rename_focus.focus(window, cx);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -439,45 +470,207 @@ impl Sidebar {
         }
     }
 
+    pub fn is_focused(&self, window: &Window) -> bool {
+        self.focus_handle.is_focused(window)
+    }
+
+    /// Enters keyboard-navigation mode from any other surface. An active row
+    /// is the initial landmark, while an existing identity cursor survives
+    /// subsequent trips to the terminal.
+    pub fn focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.ui.visible {
+            self.ui.visible = true;
+            self.last_toggle = Some(Instant::now());
+            if let Err(error) = self
+                .store
+                .write()
+                .expect("session store lock poisoned")
+                .update_preferences(|prefs| prefs.sidebar_visible = true)
+            {
+                eprintln!("diri: could not remember sidebar visibility: {error}");
+            }
+            cx.emit(SidebarEvent::VisibilityChanged);
+        }
+        self.ui.popover = None;
+        let (mut rows, selected) = self.focus_rows_snapshot();
+        if rows.is_empty()
+            && let Some(selected) = selected.as_ref()
+        {
+            self.store
+                .write()
+                .expect("session store lock poisoned")
+                .reveal_in_sidebar(selected);
+            rows = self.focus_rows_snapshot().0;
+        }
+        let visible = focus_row_ids(&rows);
+        self.ui.reconcile_focus_cursor(&visible, selected.as_ref());
+        self.focus_handle.focus(window, cx);
+        self.scroll_focus_cursor_into_view(window);
+        cx.notify();
+    }
+
+    fn focus_rows_snapshot(&self) -> (Vec<FocusRow>, Option<SessionId>) {
+        let mut store = self.store.write().expect("session store lock poisoned");
+        let expanded_archives = store.preferences().sidebar_expanded_archives.clone();
+        let selected = store.selected_session_id().cloned();
+        let projection = store.sidebar_projection();
+        (focus_rows(&projection, &expanded_archives), selected)
+    }
+
+    fn move_focus_cursor(
+        &mut self,
+        movement: CursorMove,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let (rows, selected) = self.focus_rows_snapshot();
+        let visible = focus_row_ids(&rows);
+        self.ui.reconcile_focus_cursor(&visible, selected.as_ref());
+        self.ui.move_focus_cursor(movement, &visible);
+        self.scroll_focus_cursor_into_view(window);
+        cx.notify();
+        true
+    }
+
+    fn move_focus_horizontally(
+        &mut self,
+        right: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let (rows, selected) = self.focus_rows_snapshot();
+        let visible = focus_row_ids(&rows);
+        self.ui.reconcile_focus_cursor(&visible, selected.as_ref());
+        let action = horizontal_focus_action(&rows, self.ui.focus_cursor.as_ref(), right);
+        match action {
+            HorizontalFocusAction::Collapse(id) | HorizontalFocusAction::Expand(id) => {
+                let _ = self
+                    .store
+                    .write()
+                    .expect("session store lock poisoned")
+                    .toggle_session_collapsed(id);
+            }
+            HorizontalFocusAction::MoveTo(id) => {
+                self.ui.set_focus_cursor(id, &visible);
+            }
+            HorizontalFocusAction::Unchanged => {}
+        }
+        let (next_rows, _) = self.focus_rows_snapshot();
+        self.ui
+            .reconcile_focus_cursor(&focus_row_ids(&next_rows), None);
+        self.scroll_focus_cursor_into_view(window);
+        cx.notify();
+        true
+    }
+
+    fn activate_focus_cursor(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(id) = self.ui.focus_cursor.clone() else {
+            return true;
+        };
+        let exists = {
+            let mut store = self.store.write().expect("session store lock poisoned");
+            let exists = store.sessions().contains_key(&id);
+            if exists {
+                store.select(id);
+            }
+            exists
+        };
+        if exists {
+            cx.emit(SidebarEvent::SessionActivated);
+            cx.notify();
+        }
+        true
+    }
+
+    fn scroll_focus_cursor_into_view(&self, window: &mut Window) {
+        let Some(id) = self.ui.focus_cursor.clone() else {
+            return;
+        };
+        let scroll = self.list_scroll.clone();
+        let row_bounds = Rc::clone(&self.row_bounds);
+        // Keyboard movement changes the focused styling in the upcoming
+        // frame. A row newly exposed by Right may not have bounds until that
+        // frame has painted, so retry once on the following frame.
+        window.on_next_frame(move |window, _cx| {
+            if !reveal_tracked_row(&scroll, &row_bounds, &id, window) {
+                window.on_next_frame(move |window, _cx| {
+                    reveal_tracked_row(&scroll, &row_bounds, &id, window);
+                });
+            }
+        });
+    }
+
     fn on_key_down(
         &mut self,
         event: &gpui::KeyDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.ui.renaming.is_none() {
-            if self.ui.popover.is_some() && event.keystroke.key.as_str() == "escape" {
-                self.ui.popover = None;
-                cx.notify();
-            }
-            return;
-        }
-        match event.keystroke.key.as_str() {
-            "enter" => self.commit_rename(),
-            "escape" => self.ui.cancel_rename(),
-            _ => {
-                let Some(edit) = query_editor::edit_for(&event.keystroke) else {
-                    return;
-                };
-                match edit {
-                    Edit::Local(local) => {
-                        self.ui.rename_draft.apply(local);
-                    }
-                    Edit::Clipboard(ClipboardEdit::Copy) => {
-                        query_editor::copy_selection(&self.ui.rename_draft, cx);
-                    }
-                    Edit::Clipboard(ClipboardEdit::Cut) => {
-                        query_editor::cut_selection(&mut self.ui.rename_draft, cx);
-                    }
-                    Edit::Clipboard(ClipboardEdit::Paste) => {
-                        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                            self.ui.rename_draft.insert(&text);
+        if self.ui.renaming.is_some() {
+            // Rename remains a modal editor for every editing keystroke. A
+            // non-editing application shortcut may continue through GPUI's
+            // action dispatch, matching the existing command behavior.
+            match event.keystroke.key.as_str() {
+                "enter" => self.commit_rename(),
+                "escape" => self.ui.cancel_rename(),
+                _ => {
+                    let Some(edit) = query_editor::edit_for(&event.keystroke) else {
+                        return;
+                    };
+                    match edit {
+                        Edit::Local(local) => {
+                            self.ui.rename_draft.apply(local);
+                        }
+                        Edit::Clipboard(ClipboardEdit::Copy) => {
+                            query_editor::copy_selection(&self.ui.rename_draft, cx);
+                        }
+                        Edit::Clipboard(ClipboardEdit::Cut) => {
+                            query_editor::cut_selection(&mut self.ui.rename_draft, cx);
+                        }
+                        Edit::Clipboard(ClipboardEdit::Paste) => {
+                            if let Some(text) =
+                                cx.read_from_clipboard().and_then(|item| item.text())
+                            {
+                                self.ui.rename_draft.insert(&text);
+                            }
                         }
                     }
                 }
             }
+            cx.stop_propagation();
+            cx.notify();
+            return;
         }
-        cx.notify();
+
+        let key = event.keystroke.key.as_str();
+        if key == "escape" {
+            cx.stop_propagation();
+            if self.ui.popover.take().is_none() {
+                cx.emit(SidebarEvent::FocusTerminal);
+            }
+            cx.notify();
+            return;
+        }
+        let modifiers = event.keystroke.modifiers;
+        if modifiers.platform || modifiers.control || modifiers.alt {
+            return;
+        }
+        let handled = match key {
+            "up" => self.move_focus_cursor(CursorMove::Up, window, cx),
+            "down" => self.move_focus_cursor(CursorMove::Down, window, cx),
+            "home" => self.move_focus_cursor(CursorMove::Home, window, cx),
+            "end" => self.move_focus_cursor(CursorMove::End, window, cx),
+            "left" => self.move_focus_horizontally(false, window, cx),
+            "right" => self.move_focus_horizontally(true, window, cx),
+            "enter" => self.activate_focus_cursor(cx),
+            // Deliberately consumed but unbound. Hold-to-peek owns Space in
+            // the follow-up issue, and activation must remain Enter-only.
+            "space" => true,
+            _ => false,
+        };
+        if handled {
+            cx.stop_propagation();
+        }
     }
 
     fn schedule_hover_card(
@@ -878,7 +1071,7 @@ impl Sidebar {
                             cx.stop_propagation();
                             this.commit_rename();
                             this.ui.hover_card = None;
-                            this.rename_focus.focus(window, cx);
+                            this.focus_handle.focus(window, cx);
                             this.ui.popover = Some(Popover::ProjectActions {
                                 id: id.clone(),
                                 position: Some(event.position),
@@ -1055,12 +1248,28 @@ impl Sidebar {
         // row list here means "collapsed" without asking a second source.
         for row in &group.sessions {
             let shortcut = self.shortcut_for(row.id());
-            section = section.child(self.session_row(row, shortcut, colors, window, cx));
+            let id = row.id().clone();
+            let rendered = self.session_row(row, shortcut, colors, window, cx);
+            section = section.child(self.track_row_bounds(id, rendered));
         }
         if !collapsed && !group.archived.is_empty() {
             section = section.child(self.archived_bucket(group, colors, window, cx));
         }
         section.into_any_element()
+    }
+
+    fn track_row_bounds(&self, id: SessionId, row: AnyElement) -> AnyElement {
+        let bounds = Rc::clone(&self.row_bounds);
+        div()
+            .w_full()
+            .flex_none()
+            .on_children_prepainted(move |children, _, _| {
+                if let Some(row) = children.first().copied() {
+                    bounds.borrow_mut().insert(id.clone(), row);
+                }
+            })
+            .child(row)
+            .into_any_element()
     }
 
     fn session_row(
@@ -1083,6 +1292,9 @@ impl Sidebar {
             )
         };
         let hovered = self.ui.hovered_session.as_ref() == Some(&id);
+        let focused = self.focus_handle.is_focused(window)
+            && self.ui.renaming.is_none()
+            && self.ui.focus_cursor.as_ref() == Some(&id);
         let archived = session.is_archived();
         let hibernated = session.hibernation.is_some();
         let session_is_remote = session.host.is_some();
@@ -1219,6 +1431,12 @@ impl Sidebar {
             .gap(px(8.0))
             .rounded(px(Radius::ROW))
             .bg(fill.color(colors))
+            .border_1()
+            .border_color(if focused {
+                Ink::FRESH.alpha(0.82)
+            } else {
+                colors.primary.alpha(0.0)
+            })
             .opacity(if archived {
                 0.58
             } else if hibernated {
@@ -1235,6 +1453,7 @@ impl Sidebar {
             .on_click(
                 cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                     this.commit_rename();
+                    this.ui.focus_cursor = Some(row_session.id.clone());
                     if event.click_count() == 2 {
                         this.begin_rename(&row_session, window, cx);
                         return;
@@ -1269,7 +1488,8 @@ impl Sidebar {
                     cx.stop_propagation();
                     this.commit_rename();
                     this.ui.hover_card = None;
-                    this.rename_focus.focus(window, cx);
+                    this.ui.focus_cursor = Some(rename_session.id.clone());
+                    this.focus_handle.focus(window, cx);
                     this.ui.popover = Some(Popover::SessionActions {
                         id: rename_session.id.clone(),
                         position: event.position,
@@ -1655,7 +1875,9 @@ impl Sidebar {
             );
         if expanded {
             for session in &group.archived {
-                bucket = bucket.child(self.archived_row(session, colors, window, cx));
+                let id = session.id.clone();
+                let rendered = self.archived_row(session, colors, window, cx);
+                bucket = bucket.child(self.track_row_bounds(id, rendered));
             }
         }
         bucket.into_any_element()
@@ -1665,11 +1887,14 @@ impl Sidebar {
         &mut self,
         session: &SessionRecord,
         colors: SemanticColors,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = session.id.clone();
         let hovered = self.ui.hovered_session.as_ref() == Some(&id);
+        let focused = self.focus_handle.is_focused(window)
+            && self.ui.renaming.is_none()
+            && self.ui.focus_cursor.as_ref() == Some(&id);
         let selected = self
             .store
             .read()
@@ -1689,13 +1914,19 @@ impl Sidebar {
             .items_center()
             .gap(px(8.0))
             .rounded(px(Radius::ROW))
-            .opacity(0.58)
+            .opacity(if focused { 0.82 } else { 0.58 })
             .bg(if selected {
                 RowFill::Selected.color(colors)
             } else if hovered {
                 RowFill::Hover.color(colors)
             } else {
                 RowFill::Clear.color(colors)
+            })
+            .border_1()
+            .border_color(if focused {
+                Ink::FRESH.alpha(0.82)
+            } else {
+                colors.primary.alpha(0.0)
             })
             .cursor_pointer()
             .on_hover(cx.listener({
@@ -1707,6 +1938,7 @@ impl Sidebar {
             }))
             .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
                 let modifiers = event.modifiers();
+                this.ui.focus_cursor = Some(row_session.id.clone());
                 this.store
                     .write()
                     .expect("session store lock poisoned")
@@ -3716,13 +3948,130 @@ impl Sidebar {
     }
 }
 
+fn focus_rows(
+    projection: &crate::store::SidebarProjection,
+    expanded_archives: &[ProjectId],
+) -> Vec<FocusRow> {
+    let mut result = Vec::new();
+    for group in &projection.projects {
+        let mut ancestors: Vec<SessionId> = Vec::new();
+        for row in &group.sessions {
+            let depth = usize::from(row.depth);
+            ancestors.truncate(depth);
+            let parent = depth
+                .checked_sub(1)
+                .and_then(|index| ancestors.get(index))
+                .cloned();
+            result.push(FocusRow {
+                id: row.id().clone(),
+                parent,
+                has_children: row.has_children,
+                collapsed: row.collapsed,
+            });
+            ancestors.push(row.id().clone());
+        }
+        if expanded_archives.contains(&group.project.id) {
+            result.extend(group.archived.iter().map(|session| FocusRow {
+                id: session.id.clone(),
+                parent: None,
+                has_children: false,
+                collapsed: false,
+            }));
+        }
+    }
+    result
+}
+
+fn focus_row_ids(rows: &[FocusRow]) -> Vec<SessionId> {
+    rows.iter().map(|row| row.id.clone()).collect()
+}
+
+fn horizontal_focus_action(
+    rows: &[FocusRow],
+    cursor: Option<&SessionId>,
+    right: bool,
+) -> HorizontalFocusAction {
+    let Some(row) = cursor.and_then(|cursor| rows.iter().find(|row| &row.id == cursor)) else {
+        return HorizontalFocusAction::Unchanged;
+    };
+    if right {
+        if row.has_children && row.collapsed {
+            HorizontalFocusAction::Expand(row.id.clone())
+        } else if row.has_children {
+            rows.iter()
+                .find(|candidate| candidate.parent.as_ref() == Some(&row.id))
+                .map(|child| HorizontalFocusAction::MoveTo(child.id.clone()))
+                .unwrap_or(HorizontalFocusAction::Unchanged)
+        } else {
+            HorizontalFocusAction::Unchanged
+        }
+    } else if row.has_children && !row.collapsed {
+        HorizontalFocusAction::Collapse(row.id.clone())
+    } else {
+        row.parent
+            .clone()
+            .map(HorizontalFocusAction::MoveTo)
+            .unwrap_or(HorizontalFocusAction::Unchanged)
+    }
+}
+
+fn offset_to_reveal(
+    current: f32,
+    viewport_top: f32,
+    viewport_bottom: f32,
+    row_top: f32,
+    row_bottom: f32,
+) -> f32 {
+    if row_top < viewport_top {
+        current + viewport_top - row_top
+    } else if row_bottom > viewport_bottom {
+        current - (row_bottom - viewport_bottom)
+    } else {
+        current
+    }
+}
+
+fn reveal_tracked_row(
+    scroll: &ScrollHandle,
+    row_bounds: &RefCell<HashMap<SessionId, Bounds<Pixels>>>,
+    id: &SessionId,
+    window: &mut Window,
+) -> bool {
+    let Some(row) = row_bounds.borrow().get(id).copied() else {
+        return false;
+    };
+    let viewport = scroll.bounds();
+    let offset = scroll.offset();
+    let next_y = offset_to_reveal(
+        f32::from(offset.y),
+        f32::from(viewport.top()),
+        f32::from(viewport.bottom()),
+        f32::from(row.top()),
+        f32::from(row.bottom()),
+    );
+    if (next_y - f32::from(offset.y)).abs() > f32::EPSILON {
+        scroll.set_offset(point(offset.x, px(next_y)));
+        window.refresh();
+    }
+    true
+}
+
 impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.colors();
-        let projection = {
+        let (projection, expanded_archives, selected) = {
             let mut store = self.store.write().expect("session store lock poisoned");
-            store.sidebar_projection()
+            let expanded = store.preferences().sidebar_expanded_archives.clone();
+            let selected = store.selected_session_id().cloned();
+            (store.sidebar_projection(), expanded, selected)
         };
+        let focus_rows = focus_rows(&projection, &expanded_archives);
+        let visible = focus_row_ids(&focus_rows);
+        self.ui.reconcile_focus_cursor(&visible, selected.as_ref());
+        let visible_set: HashSet<_> = visible.iter().collect();
+        self.row_bounds
+            .borrow_mut()
+            .retain(|id, _| visible_set.contains(id));
         self.shortcut_ranks.clear();
         let session_count = projection.ordered_sessions.len();
         for (index, session) in projection.ordered_sessions.iter().enumerate() {
@@ -3763,7 +4112,7 @@ impl Render for Sidebar {
             .flex_col()
             .text_color(colors.primary)
             .bg(Self::surface_fill(colors))
-            .track_focus(&self.rename_focus)
+            .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
             .child(self.top_bar(colors, cx))
             .child(self.new_agent_row(colors, cx));
@@ -4347,6 +4696,57 @@ mod tests {
     }
 
     #[test]
+    fn horizontal_focus_navigation_expands_collapses_and_walks_to_parent() {
+        let parent = SessionId::new("parent");
+        let child = SessionId::new("child");
+        let expanded = vec![
+            FocusRow {
+                id: parent.clone(),
+                parent: None,
+                has_children: true,
+                collapsed: false,
+            },
+            FocusRow {
+                id: child.clone(),
+                parent: Some(parent.clone()),
+                has_children: false,
+                collapsed: false,
+            },
+        ];
+
+        assert_eq!(
+            horizontal_focus_action(&expanded, Some(&parent), false),
+            HorizontalFocusAction::Collapse(parent.clone())
+        );
+        assert_eq!(
+            horizontal_focus_action(&expanded, Some(&parent), true),
+            HorizontalFocusAction::MoveTo(child.clone())
+        );
+        assert_eq!(
+            horizontal_focus_action(&expanded, Some(&child), false),
+            HorizontalFocusAction::MoveTo(parent.clone())
+        );
+
+        let collapsed = [FocusRow {
+            id: parent.clone(),
+            parent: None,
+            has_children: true,
+            collapsed: true,
+        }];
+        assert_eq!(
+            horizontal_focus_action(&collapsed, Some(&parent), true),
+            HorizontalFocusAction::Expand(parent)
+        );
+    }
+
+    #[test]
+    fn scrolling_reveals_only_rows_outside_the_viewport() {
+        assert_eq!(offset_to_reveal(-40.0, 100.0, 300.0, 150.0, 178.0), -40.0);
+        assert_eq!(offset_to_reveal(-40.0, 100.0, 300.0, 80.0, 108.0), -20.0);
+        assert_eq!(offset_to_reveal(-40.0, 100.0, 300.0, 292.0, 320.0), -60.0);
+    }
+
+    #[test]
     fn agent_shortcuts_remain_visible_when_the_execution_host_changes() {
         assert_eq!(
             agent_picker_shortcut(
@@ -4516,6 +4916,82 @@ mod tests {
             sidebar.read_with(cx, |sidebar, _| sidebar.ui.popover.clone()),
             None
         );
+    }
+
+    #[gpui::test]
+    fn rename_mode_swallows_navigation_and_keeps_editing(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        let focused = sidebar.read_with(cx, |sidebar, _| {
+            sidebar
+                .ui
+                .focus_cursor
+                .clone()
+                .expect("render seeds the cursor")
+        });
+        sidebar.update_in(cx, |sidebar, window, cx| {
+            sidebar.ui.begin_rename(focused.clone(), "Before");
+            sidebar.focus_handle.focus(window, cx);
+            cx.notify();
+        });
+
+        cx.simulate_keystrokes("down x");
+
+        sidebar.read_with(cx, |sidebar, _| {
+            assert_eq!(sidebar.ui.focus_cursor, Some(focused));
+            assert!(sidebar.ui.renaming.is_some());
+            assert_eq!(sidebar.ui.rename_draft.text(), "x");
+        });
+    }
+
+    #[gpui::test]
+    fn keyboard_cursor_moves_without_activating_until_enter(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        sidebar.update_in(cx, |sidebar, window, cx| sidebar.focus(window, cx));
+        let active_before = sidebar.read_with(cx, |sidebar, _| {
+            sidebar
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .selected_session_id()
+                .cloned()
+        });
+
+        cx.simulate_keystrokes("down space");
+
+        let cursor = sidebar.read_with(cx, |sidebar, _| {
+            assert_eq!(
+                sidebar
+                    .store
+                    .read()
+                    .expect("session store lock poisoned")
+                    .selected_session_id()
+                    .cloned(),
+                active_before
+            );
+            sidebar.ui.focus_cursor.clone().expect("cursor after Down")
+        });
+        assert_ne!(Some(cursor.clone()), active_before);
+
+        cx.simulate_keystrokes("enter");
+
+        sidebar.read_with(cx, |sidebar, _| {
+            assert_eq!(
+                sidebar
+                    .store
+                    .read()
+                    .expect("session store lock poisoned")
+                    .selected_session_id(),
+                Some(&cursor)
+            );
+        });
     }
 
     #[gpui::test]

@@ -113,6 +113,14 @@ impl SessionSurfaces {
         store.toggle_overview();
         cx.notify();
     }
+
+    pub(crate) fn dismiss(&mut self, cx: &mut Context<Self>) {
+        let mut store = self.store.write().expect("session store lock poisoned");
+        store.cancel_switcher();
+        store.dismiss_overview();
+        drop(store);
+        cx.notify();
+    }
 }
 
 impl Render for SessionSurfaces {

@@ -7,6 +7,14 @@ pub const DEFAULT_SIDEBAR_WIDTH: f32 = 248.0;
 pub const MIN_SIDEBAR_WIDTH: f32 = 200.0;
 pub const MAX_SIDEBAR_WIDTH: f32 = 400.0;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorMove {
+    Up,
+    Down,
+    Home,
+    End,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DragItem {
     Project(ProjectId),
@@ -62,6 +70,11 @@ pub struct SidebarUiState {
     pub order_dirty: bool,
     pub resize_origin: Option<(f32, f32)>,
     pub preview_account: bool,
+    /// Keyboard focus follows a session identity, not a visual index. The
+    /// previous order is retained solely to choose the next row (or the
+    /// previous row at the end) if that session disappears.
+    pub focus_cursor: Option<SessionId>,
+    focus_order: Vec<SessionId>,
 }
 
 impl SidebarUiState {
@@ -81,7 +94,65 @@ impl SidebarUiState {
             order_dirty: false,
             resize_origin: None,
             preview_account: false,
+            focus_cursor: None,
+            focus_order: Vec::new(),
         }
+    }
+
+    /// Reconciles the identity cursor with the rows the sidebar is actually
+    /// painting. Reorders leave the identity untouched. A removed or newly
+    /// hidden row gives its position to the row that followed it, falling back
+    /// to the previous row when it was last.
+    pub fn reconcile_focus_cursor(&mut self, visible: &[SessionId], preferred: Option<&SessionId>) {
+        let next = match self.focus_cursor.as_ref() {
+            Some(cursor) if visible.contains(cursor) => Some(cursor.clone()),
+            Some(cursor) => {
+                let previous_index = self
+                    .focus_order
+                    .iter()
+                    .position(|candidate| candidate == cursor)
+                    .unwrap_or(0);
+                visible
+                    .get(previous_index.min(visible.len().saturating_sub(1)))
+                    .cloned()
+            }
+            None => preferred
+                .filter(|candidate| visible.contains(candidate))
+                .cloned()
+                .or_else(|| visible.first().cloned()),
+        };
+        self.focus_cursor = next;
+        self.focus_order = visible.to_vec();
+    }
+
+    pub fn set_focus_cursor(&mut self, id: SessionId, visible: &[SessionId]) {
+        if visible.contains(&id) {
+            self.focus_cursor = Some(id);
+            self.focus_order = visible.to_vec();
+        }
+    }
+
+    pub fn move_focus_cursor(&mut self, movement: CursorMove, visible: &[SessionId]) -> bool {
+        if visible.is_empty() {
+            self.focus_cursor = None;
+            self.focus_order.clear();
+            return false;
+        }
+        let current = self
+            .focus_cursor
+            .as_ref()
+            .and_then(|cursor| visible.iter().position(|candidate| candidate == cursor));
+        let index = match movement {
+            CursorMove::Home => 0,
+            CursorMove::End => visible.len() - 1,
+            CursorMove::Up => current.map_or(visible.len() - 1, |index| index.saturating_sub(1)),
+            CursorMove::Down => current.map_or(0, |index| (index + 1).min(visible.len() - 1)),
+        };
+        let next = visible[index].clone();
+        let changed = self.focus_cursor.as_ref() != Some(&next);
+        self.focus_cursor = Some(next);
+        self.focus_order = visible.to_vec();
+        changed
     }
 
     pub fn set_width(&mut self, width: f32) {
@@ -170,5 +241,46 @@ mod tests {
         let mut state = SidebarUiState::new(DEFAULT_SIDEBAR_WIDTH);
         state.begin_rename(SessionId::new("one"), "  ");
         assert!(state.take_rename().is_none());
+    }
+
+    #[test]
+    fn focus_cursor_moves_and_clamps_across_visible_rows() {
+        let rows = ["one", "two", "three"].map(SessionId::new);
+        let mut state = SidebarUiState::new(DEFAULT_SIDEBAR_WIDTH);
+        state.reconcile_focus_cursor(&rows, Some(&rows[1]));
+
+        assert_eq!(state.focus_cursor, Some(rows[1].clone()));
+        assert!(state.move_focus_cursor(CursorMove::Up, &rows));
+        assert_eq!(state.focus_cursor, Some(rows[0].clone()));
+        assert!(!state.move_focus_cursor(CursorMove::Up, &rows));
+        assert!(state.move_focus_cursor(CursorMove::End, &rows));
+        assert_eq!(state.focus_cursor, Some(rows[2].clone()));
+        assert!(state.move_focus_cursor(CursorMove::Home, &rows));
+        assert_eq!(state.focus_cursor, Some(rows[0].clone()));
+    }
+
+    #[test]
+    fn focus_cursor_tracks_identity_across_reorders() {
+        let rows = ["one", "two", "three"].map(SessionId::new);
+        let mut state = SidebarUiState::new(DEFAULT_SIDEBAR_WIDTH);
+        state.reconcile_focus_cursor(&rows, Some(&rows[1]));
+
+        state.reconcile_focus_cursor(&[rows[2].clone(), rows[1].clone(), rows[0].clone()], None);
+
+        assert_eq!(state.focus_cursor, Some(rows[1].clone()));
+    }
+
+    #[test]
+    fn removed_focus_cursor_lands_on_a_sensible_neighbour() {
+        let rows = ["one", "two", "three"].map(SessionId::new);
+        let mut state = SidebarUiState::new(DEFAULT_SIDEBAR_WIDTH);
+        state.reconcile_focus_cursor(&rows, Some(&rows[1]));
+
+        state.reconcile_focus_cursor(&[rows[0].clone(), rows[2].clone()], None);
+        assert_eq!(state.focus_cursor, Some(rows[2].clone()));
+
+        state.set_focus_cursor(rows[2].clone(), &[rows[0].clone(), rows[2].clone()]);
+        state.reconcile_focus_cursor(&[rows[0].clone()], None);
+        assert_eq!(state.focus_cursor, Some(rows[0].clone()));
     }
 }

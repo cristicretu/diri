@@ -288,6 +288,12 @@ impl NavigationOverlay {
         cx.notify();
     }
 
+    pub(crate) fn dismiss(&mut self, cx: &mut Context<Self>) {
+        if self.overlay.is_some() {
+            self.close_overlay(cx);
+        }
+    }
+
     /// Back to the first row, scrolled back to the top of the list.
     fn reset_selection(&mut self) {
         self.highlight = 0;

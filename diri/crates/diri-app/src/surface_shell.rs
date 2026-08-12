@@ -995,6 +995,12 @@ impl UtilitySurfaces {
         cx.notify();
     }
 
+    pub(crate) fn dismiss(&mut self, cx: &mut Context<Self>) {
+        if self.surface != Surface::None {
+            self.close_surface(cx);
+        }
+    }
+
     pub(crate) fn is_open(&self) -> bool {
         self.surface != Surface::None
     }

@@ -2254,6 +2254,18 @@ impl SessionStore {
         changed
     }
 
+    /// Makes a session addressable by an external sidebar-focus request
+    /// without selecting or activating it. Normal selection calls `reveal`
+    /// through `focus_session`; this narrower entry point is for the keyboard
+    /// cursor when every project is currently folded away.
+    pub(crate) fn reveal_in_sidebar(&mut self, id: &SessionId) -> bool {
+        let changed = self.reveal(id);
+        if changed && let Err(error) = self.persist_preferences() {
+            eprintln!("diri: could not remember revealed sidebar row: {error}");
+        }
+        changed
+    }
+
     fn sidebar_visible_order(&mut self) -> Vec<SessionId> {
         let expanded: HashSet<_> = self
             .prefs

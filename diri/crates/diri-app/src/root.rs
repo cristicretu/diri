@@ -13,13 +13,13 @@ use gpui::{
 use crate::AppServices;
 use crate::commands::{
     self, APP_CONTEXT, ArchiveSelectedSession, CheckForUpdates, CloseSession, CommandId,
-    MoveSelectedSessionDown, MoveSelectedSessionUp, NewCodexSession, NewDefaultSession,
-    NewTerminal, OpenLauncher, OpenSettings, OpenWorktrees, RenameSelectedSession, ReopenSession,
-    SESSION_NAVIGATION_CONTEXT, SelectLastSession, SelectNextAttentionSession, SelectNextSession,
-    SelectPreviousSession, SelectSession1, SelectSession2, SelectSession3, SelectSession4,
-    SelectSession5, SelectSession6, SelectSession7, SelectSession8, ToggleAuxiliaryTerminal,
-    ToggleCommandPalette, ToggleHistory, ToggleInspector, ToggleOverview, ToggleQuickOpen,
-    ToggleSidebar,
+    FocusSidebar, MoveSelectedSessionDown, MoveSelectedSessionUp, NewCodexSession,
+    NewDefaultSession, NewTerminal, OpenLauncher, OpenSettings, OpenWorktrees,
+    RenameSelectedSession, ReopenSession, SESSION_NAVIGATION_CONTEXT, SelectLastSession,
+    SelectNextAttentionSession, SelectNextSession, SelectPreviousSession, SelectSession1,
+    SelectSession2, SelectSession3, SelectSession4, SelectSession5, SelectSession6, SelectSession7,
+    SelectSession8, ToggleAuxiliaryTerminal, ToggleCommandPalette, ToggleHistory, ToggleInspector,
+    ToggleOverview, ToggleQuickOpen, ToggleSidebar,
 };
 use crate::external_drop::ExternalDropAction;
 use crate::inspector::{InspectorEvent, WorkbenchInspector};
@@ -265,6 +265,14 @@ impl RootView {
                 if let Some(terminal) = &this.terminal {
                     terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
                     this.sync_auxiliary_terminal(window, cx);
+                }
+            }
+            if matches!(event, SidebarEvent::FocusTerminal) {
+                if let Some(terminal) = &this.terminal {
+                    terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+                    this.sync_auxiliary_terminal(window, cx);
+                } else {
+                    window.focus(&this.focus, cx);
                 }
             }
             if let SidebarEvent::Update(command) = event {
@@ -633,12 +641,22 @@ impl RootView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        // The sidebar is a real keyboard surface. Let its bubble handler own
+        // navigation and rename input instead of mirroring the same keystroke
+        // into the live terminal during root capture.
+        if self.sidebar.read(cx).is_focused(_window) {
+            return;
+        }
         if self.launcher.read(cx).is_open() {
             let reopen = commands::matches_keystroke(CommandId::OpenLauncher, &event.keystroke);
-            self.launcher.update(cx, |launcher, cx| {
-                launcher.handle_key_down(event, _window, cx);
-            });
-            if !reopen {
+            let focus_sidebar =
+                commands::matches_keystroke(CommandId::FocusSidebar, &event.keystroke);
+            if !focus_sidebar {
+                self.launcher.update(cx, |launcher, cx| {
+                    launcher.handle_key_down(event, _window, cx);
+                });
+            }
+            if !reopen && !focus_sidebar {
                 cx.stop_propagation();
             }
             return;
@@ -651,6 +669,7 @@ impl RootView {
                 CommandId::OpenSettings,
                 CommandId::ToggleCommandPalette,
                 CommandId::ToggleQuickOpen,
+                CommandId::FocusSidebar,
             ]
             .into_iter()
             .any(|command| commands::matches_keystroke(command, &event.keystroke));
@@ -726,6 +745,23 @@ impl RootView {
             }
             CommandId::ToggleSidebar => {
                 self.sidebar.update(cx, |sidebar, cx| sidebar.toggle(cx));
+            }
+            CommandId::FocusSidebar => {
+                if self.launcher.read(cx).is_open() {
+                    self.launcher
+                        .update(cx, |launcher, cx| launcher.dismiss(cx));
+                }
+                if let Some(navigation) = &self.navigation {
+                    navigation.update(cx, |navigation, cx| navigation.dismiss(cx));
+                }
+                if let Some(surfaces) = &self.utility_surfaces {
+                    surfaces.update(cx, |surfaces, cx| surfaces.dismiss(cx));
+                }
+                if let Some(surfaces) = &self.session_surfaces {
+                    surfaces.update(cx, |surfaces, cx| surfaces.dismiss(cx));
+                }
+                self.sidebar
+                    .update(cx, |sidebar, cx| sidebar.focus(window, cx));
             }
             CommandId::ToggleInspector => self.toggle_inspector(cx),
             CommandId::ToggleAuxiliaryTerminal => {
@@ -2079,6 +2115,9 @@ impl Render for RootView {
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| {
                 this.run_command(CommandId::ToggleSidebar, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusSidebar, window, cx| {
+                this.run_command(CommandId::FocusSidebar, window, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleInspector, window, cx| {
                 this.run_command(CommandId::ToggleInspector, window, cx);
