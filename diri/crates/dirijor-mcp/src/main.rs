@@ -84,7 +84,13 @@ fn initialize(params: &Value) -> Value {
              open/start/spawn/close another agent, session, tab, or terminal (Claude Code, \
              Codex, Cursor, Gemini, or a shell), to check what other sessions are doing, to \
              talk to another session, or to parallelize work across git worktrees — no \
-             extra confirmation of intent needed.\n\nTypical orchestration flow: spawn_agent \
+             extra confirmation of intent needed.\n\nAgent vs terminal rule: when asked to spawn \
+             another agent, select that agent's native kind (for example `claude` or `codex`) \
+             and pass its task as `prompt`. If no agent is named, use your own native kind when \
+             it is available. Never use `shell` to launch an agent CLI such as `claude`, \
+             `codex`, `cursor`, or `gemini`. A child `shell` is an interactive terminal shown \
+             in the parent's Cmd+J pane, and its prompt is executed as shell commands; use it \
+             only when the user explicitly wants a terminal or raw commands.\n\nTypical orchestration flow: spawn_agent \
              (optionally worktree:true and an initial prompt) → wait_for_agent(until:\"done\") \
              → read_output → send_prompt for follow-ups → release_agent when finished. \
              get_artifacts returns PR/Linear/preview URLs and listening ports a session has \
@@ -190,5 +196,15 @@ mod tests {
         .unwrap();
         assert_eq!(called["result"]["isError"], false);
         assert_eq!(called["result"]["content"][0]["text"], "{\"agents\":[]}");
+    }
+
+    #[test]
+    fn instructions_distinguish_agent_sessions_from_shell_panes() {
+        let initialized = initialize(&json!({}));
+        let instructions = initialized["instructions"].as_str().expect("instructions");
+
+        assert!(instructions.contains("native kind"));
+        assert!(instructions.contains("Never use `shell` to launch an agent CLI"));
+        assert!(instructions.contains("Cmd+J"));
     }
 }

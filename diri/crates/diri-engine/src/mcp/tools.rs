@@ -43,13 +43,18 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
     vec![
         tool(
             "spawn_agent",
-            "Open a NEW session (tab) in diri running an agent or a shell. USE THIS whenever the \
-             user asks to open, start, spawn or launch another agent, session, or terminal. \
+            "Open a NEW standalone agent session, or an interactive shell in the current \
+             session's Cmd+J pane. USE THIS whenever the user asks to open, start, spawn or \
+             launch another agent, session, or terminal. For an agent, choose its native kind \
+             and pass the task as `prompt`; if no agent is named, reuse your own native kind \
+             when it is offered. Never use `shell` to launch an agent CLI such as \
+             `claude`, `codex`, `cursor`, or `gemini`; a shell prompt is executed as commands. \
+             Use `shell` only when the user explicitly wants a terminal or raw commands. \
              Optionally create a fresh git worktree for it and give it an initial prompt.",
             json!({
                 "type": "object",
                 "properties": {
-                    "kind": { "type": "string", "enum": kind_enum, "description": "Which agent to run." },
+                    "kind": { "type": "string", "enum": kind_enum, "description": "The native agent kind to launch. Use shell only for a terminal or raw commands, never as an agent wrapper." },
                     "cwd": { "type": "string", "description": "Working directory (a repo path when worktree is true)." },
                     "worktree": { "type": "boolean", "description": "Create a fresh git worktree off cwd and run there (local spawns only)." },
                     "prompt": { "type": "string", "description": "Initial prompt to send once the agent is ready." },
@@ -243,6 +248,33 @@ mod tests {
             .filter_map(Value::as_str)
             .collect();
         assert_eq!(enumerated, vec!["opencode", "shell"]);
+    }
+
+    #[test]
+    fn spawning_guidance_reserves_shell_for_terminal_commands() {
+        let tools = tool_definitions();
+        let spawn = tools
+            .iter()
+            .find(|tool| tool.name == "spawn_agent")
+            .expect("spawn_agent");
+        let kind = spawn.input_schema["properties"]["kind"]["description"]
+            .as_str()
+            .expect("kind description");
+
+        assert!(spawn.description.contains("standalone agent session"));
+        assert!(spawn.description.contains("reuse your own native kind"));
+        assert!(
+            spawn
+                .description
+                .contains("Never use `shell` to launch an agent CLI")
+        );
+        assert!(
+            spawn
+                .description
+                .contains("shell prompt is executed as commands")
+        );
+        assert!(kind.contains("native agent kind"));
+        assert!(kind.contains("never as an agent wrapper"));
     }
 
     #[test]
