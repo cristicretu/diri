@@ -835,10 +835,18 @@ impl SessionStore {
     }
 
     pub fn update_preferences(&mut self, update: impl FnOnce(&mut Prefs)) -> io::Result<()> {
-        update(&mut self.prefs);
-        self.prefs.normalize();
+        // Preference edits are a tiny transaction: the UI must never observe
+        // a mutation which failed to reach disk and will disappear on restart.
+        // This matters especially for recipe management, where an optimistic
+        // “Saved” row would otherwise be a lie.
+        let mut next = self.prefs.clone();
+        update(&mut next);
+        next.normalize();
+        if let Some(path) = self.prefs_path.as_deref() {
+            next.save(path)?;
+        }
+        self.prefs = next;
         self.invalidate_projection();
-        self.persist_preferences()?;
         if matches!(self.daemon_state, DaemonState::Connected) {
             self.emit(StoreEffect::ConfigureGovernor(self.governor_settings()));
         }

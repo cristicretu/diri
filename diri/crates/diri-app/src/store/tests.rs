@@ -1324,6 +1324,30 @@ fn unknown_saved_default_repairs_to_available_first_class_then_shell() {
 }
 
 #[test]
+fn failed_preference_write_does_not_publish_an_ephemeral_mutation() {
+    let tmp = tempfile::tempdir().expect("temporary directory");
+    let blocked_parent = tmp.path().join("not-a-directory");
+    let path = blocked_parent.join("preferences.json");
+    let (mut store, _) = SessionStore::load(path).expect("missing preference file loads defaults");
+    std::fs::write(&blocked_parent, b"file").expect("create blocking file");
+    let before = store.preferences().clone();
+
+    let error = store
+        .update_preferences(|prefs| prefs.status_sounds = !prefs.status_sounds)
+        .expect_err("write through a file parent must fail");
+
+    assert!(matches!(
+        error.kind(),
+        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotADirectory
+    ));
+    assert_eq!(
+        store.preferences(),
+        &before,
+        "failed persistence must leave the visible settings unchanged"
+    );
+}
+
+#[test]
 fn a_configure_issued_during_an_inflight_scan_still_reaches_the_engine() {
     let (mut store, mut effects) = SessionStore::headless(Prefs::default());
     store.request_agent_catalog(Some("forge".into()), false);

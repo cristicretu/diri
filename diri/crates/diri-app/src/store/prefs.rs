@@ -6,6 +6,8 @@ use diri_proto::paths::DirijorPaths;
 use diri_proto::{AgentKind, ProjectId, SessionId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::launch_recipe::{LaunchRecipeBook, deserialize_recipe_book};
+
 const DEFAULT_THEME: &str = "dirijor-dark";
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -117,6 +119,9 @@ pub struct Prefs {
     /// Sessions whose spawned children are folded away.
     pub sidebar_collapsed_sessions: Vec<SessionId>,
     pub sidebar_expanded_archives: Vec<ProjectId>,
+    /// Versioned, locally owned one-action Agent workflows.
+    #[serde(default, deserialize_with = "deserialize_recipe_book")]
+    pub launch_recipes: LaunchRecipeBook,
     /// Session that should regain focus after the daemon's initial hydrate.
     pub last_selected_session: Option<SessionId>,
 }
@@ -150,6 +155,7 @@ impl Default for Prefs {
             sidebar_collapsed_projects: Vec::new(),
             sidebar_collapsed_sessions: Vec::new(),
             sidebar_expanded_archives: Vec::new(),
+            launch_recipes: LaunchRecipeBook::default(),
             last_selected_session: None,
         }
     }
@@ -242,5 +248,60 @@ impl Prefs {
         if self.terminal_theme.is_empty() {
             self.terminal_theme = DEFAULT_THEME.to_owned();
         }
+        self.launch_recipes.normalize();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::launch_recipe::{LaunchRecipe, RecipeProject};
+
+    #[test]
+    fn older_preferences_migrate_to_an_empty_recipe_book() {
+        let mut value = serde_json::to_value(Prefs::default()).expect("serialize prefs");
+        value
+            .as_object_mut()
+            .expect("prefs object")
+            .remove("launchRecipes");
+        let prefs: Prefs = serde_json::from_value(value).expect("old preferences remain readable");
+        assert!(prefs.launch_recipes.items().is_empty());
+    }
+
+    #[test]
+    fn malformed_recipe_data_does_not_discard_other_preferences() {
+        let mut value = serde_json::to_value(Prefs {
+            status_sounds: false,
+            ..Prefs::default()
+        })
+        .expect("serialize prefs");
+        value["launchRecipes"] = serde_json::json!({"version": 1, "items": "broken"});
+        let prefs: Prefs =
+            serde_json::from_value(value).expect("malformed recipe field is isolated");
+        assert!(!prefs.status_sounds);
+        assert!(prefs.launch_recipes.items().is_empty());
+    }
+
+    #[test]
+    fn recipe_book_round_trips_through_preferences() {
+        let mut prefs = Prefs::default();
+        prefs
+            .launch_recipes
+            .add(LaunchRecipe::draft(
+                "Review",
+                AgentKind::CODEX,
+                RecipeProject::Path {
+                    path: "/tmp".into(),
+                },
+                None,
+                "Review this branch",
+            ))
+            .expect("add recipe");
+        let json = serde_json::to_vec(&prefs).expect("serialize prefs");
+        let restored: Prefs = serde_json::from_slice(&json).expect("deserialize prefs");
+        assert_eq!(
+            restored.launch_recipes.items(),
+            prefs.launch_recipes.items()
+        );
     }
 }

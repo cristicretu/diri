@@ -18,6 +18,7 @@ mod git_review;
 pub mod history;
 mod icons;
 mod inspector;
+mod launch_recipe;
 mod launcher;
 pub mod markdown;
 mod markdown_view;
