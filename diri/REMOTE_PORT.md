@@ -432,9 +432,11 @@ mean `false`; for a live protocol 1.4 Holder the state is `None`, never an
 invented terminal default. In that mixed-version case the Engine reconstructs
 DECCKM from the same ordered retained output it already feeds through its local
 emulator, then publishes the resolved state to desktop attachments. Cold
-adoption hydrates that emulator from the complete locally retained OutputLog
-prefix before resuming at the persisted remote tail, so a quiet 1.4 Holder
-cannot turn an absent bit into a false terminal default.
+adoption hydrates that emulator from locally retained OutputLog bytes before
+resuming at the persisted remote tail. If rotation removed the authoritative
+prefix and no retained transition resolves DECCKM, the state remains unknown:
+the Engine emits no desktop Modes seed, the app stays Attaching, and input is
+gated until an authoritative Holder report or later transition arrives.
 
 The PTY reader must never block on a client. The Holder uses bounded queues. It
 coalesces background output for no more than 8 ms, while up to two grid
@@ -468,6 +470,12 @@ dedicated input thread uses interactive QoS so persistence does not trade a
 faster socket acknowledgement for slower end-to-grid delivery. The local
 daemon's held-output follower is raised only while the session is recently
 attached or receiving input, then returns to default QoS.
+
+Current local Holders also report their parser-owned DECCKM value in `stat`.
+The field is optional for live older Holders. If both that field and the
+pre-rotation output prefix are unavailable, adoption keeps DECCKM unknown,
+does not write a v4 checkpoint with a guessed value, and uses the same
+Modes-before-input readiness gate as remote compatibility.
 
 ## Controller lease
 

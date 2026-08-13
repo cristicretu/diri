@@ -90,13 +90,15 @@ impl AttachHub {
             if write_frame(&writer, &grid_frame).is_err() {
                 return;
             }
-            let modes = Frame::modes_with_bracketed_paste(
-                seed.modes.alt_screen,
-                seed.modes.bracketed_paste,
-                seed.modes.mouse,
-            )
-            .with_application_cursor_keys(seed.modes.application_cursor_keys);
-            let _ = write_frame(&writer, &modes);
+            if let Some(application_cursor_keys) = seed.modes.application_cursor_keys {
+                let modes = Frame::modes_with_bracketed_paste(
+                    seed.modes.alt_screen,
+                    seed.modes.bracketed_paste,
+                    seed.modes.mouse,
+                )
+                .with_application_cursor_keys(application_cursor_keys);
+                let _ = write_frame(&writer, &modes);
+            }
             seed
         };
 
@@ -287,6 +289,7 @@ impl AttachHub {
                 // only broadcasts changes.
                 if let Some(previous) = last_modes
                     && previous != modes
+                    && let Some(application_cursor_keys) = modes.application_cursor_keys
                 {
                     frames.push(
                         Frame::modes_with_bracketed_paste(
@@ -294,7 +297,7 @@ impl AttachHub {
                             modes.bracketed_paste,
                             modes.mouse,
                         )
-                        .with_application_cursor_keys(modes.application_cursor_keys),
+                        .with_application_cursor_keys(application_cursor_keys),
                     );
                 }
                 last_modes = Some(modes);

@@ -1,6 +1,8 @@
 //! Durable screen checkpoints: `<id>.screen.plist`. Versions before 4 are
 //! deliberately cache misses because they cannot say whether DECCKM was on;
-//! the retained raw log is authoritative and reconstructs that state exactly.
+//! retained output reconstructs it only when the Holder incarnation prefix is
+//! still present. Otherwise the mode stays unknown until the current Holder or
+//! a later terminal transition supplies authority.
 //!
 //! A checkpoint pairs an RLE-encoded full grid with the exact raw-log offset
 //! it represents, so a restarted daemon can seed the emulator from a few
@@ -20,7 +22,7 @@ use diri_proto::terminal::{MouseEncoding, MouseModes, MouseTrackingMode};
 
 // Version 1 persisted only the visible grid. Restoring it silently collapsed
 // every adopted session to at most one line of history, so it is deliberately
-// treated as a cache miss and rebuilt from the authoritative raw log.
+// treated as a cache miss and rebuilt from retained output where possible.
 const APPLICATION_CURSOR_VERSION: u64 = 4;
 const CURRENT_VERSION: u64 = APPLICATION_CURSOR_VERSION;
 
@@ -56,7 +58,7 @@ impl ScreenCheckpoint {
         // A v2/v3 snapshot can reproduce cells, paste, and mouse state, but
         // silently inventing DECCKM=false would send the wrong arrow bytes to
         // a still-live TUI. Treat it as the acceleration-cache miss it is and
-        // replay the authoritative retained log. Versions >=4 are additive:
+        // replay retained output without inventing a mode. Versions >=4 are additive:
         // required-field decoding below still fails closed on an incompatible
         // future shape while preserving the v4 cursor bit in a future v5.
         if version < APPLICATION_CURSOR_VERSION {

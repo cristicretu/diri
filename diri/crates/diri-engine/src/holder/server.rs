@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use base64::Engine as _;
+use diri_terminal_state::ApplicationCursorModeTracker;
 
 use crate::log::{DEFAULT_RING_CAPACITY, OutputLog};
 use crate::pty::{Pty, PtySpec};
@@ -45,6 +46,7 @@ struct Shared {
     /// the holder's whole life; closing happens when `run` returns.
     pty: Mutex<Pty>,
     log: Mutex<OutputLog>,
+    application_cursor_keys: Mutex<ApplicationCursorModeTracker>,
     /// Log tail at the moment this holder started: the boundary between prior
     /// incarnations' bytes and bytes attributable to THIS child.
     epoch_offset: u64,
@@ -120,6 +122,7 @@ impl HolderServer {
             child_pid,
             pty: Mutex::new(pty),
             log: Mutex::new(log),
+            application_cursor_keys: Mutex::new(ApplicationCursorModeTracker::known(false)),
             epoch_offset,
             finished: AtomicBool::new(false),
             listen_fd: AtomicI32::new(listen_fd),
@@ -221,6 +224,11 @@ fn pump_pty(shared: &Shared, reader: &mut crate::pty::PtyStream) {
                     // the exit watcher joins this thread before writing the
                     // marker, so nothing can land beyond it — but a byte
                     // consumed from the kernel and then dropped would be lost.
+                    shared
+                        .application_cursor_keys
+                        .lock()
+                        .expect("application cursor mode")
+                        .feed(&buffer[..count]);
                     let _ = shared.log.lock().expect("log").append(&buffer[..count]);
                     if shared.finished.load(Ordering::SeqCst) {
                         return;
@@ -281,6 +289,11 @@ fn watch_exit(shared: &Shared, pump: std::thread::JoinHandle<()>) {
             match drain.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(count) => {
+                    shared
+                        .application_cursor_keys
+                        .lock()
+                        .expect("application cursor mode")
+                        .feed(&buffer[..count]);
                     let _ = shared.log.lock().expect("log").append(&buffer[..count]);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -511,6 +524,11 @@ fn current_stat(shared: &Shared) -> HolderStat {
         cols: size.map(|(cols, _)| cols),
         rows: size.map(|(_, rows)| rows),
         epoch_offset: Some(shared.epoch_offset),
+        application_cursor_keys: shared
+            .application_cursor_keys
+            .lock()
+            .expect("application cursor mode")
+            .value(),
     }
 }
 

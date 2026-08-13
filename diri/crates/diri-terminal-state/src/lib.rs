@@ -21,11 +21,77 @@ use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
+use alacritty_terminal::vte::ansi::{Handler, PrivateMode};
 use diri_proto::grid::{ChangedRow, GridCell, GridRowCodec, GridUpdate, TermColor, TermStyle};
 use diri_proto::terminal::{
     MouseEncoding, MouseModes, MouseTrackingMode, TerminalMouseEvent, TerminalMouseModifiers,
     encode_mouse_event,
 };
+
+/// Provenance-aware DECCKM state for streams that may begin after terminal
+/// output has already been discarded. `None` means no retained byte has yet
+/// established the sticky mode; it must never be collapsed to the emulator's
+/// construction default.
+#[derive(Default)]
+pub struct ApplicationCursorModeTracker {
+    processor: Processor,
+    state: ApplicationCursorModeState,
+}
+
+#[derive(Default)]
+struct ApplicationCursorModeState {
+    value: Option<bool>,
+}
+
+impl Handler for ApplicationCursorModeState {
+    fn set_private_mode(&mut self, mode: PrivateMode) {
+        if mode.raw() == 1 {
+            self.value = Some(true);
+        }
+    }
+
+    fn unset_private_mode(&mut self, mode: PrivateMode) {
+        if mode.raw() == 1 {
+            self.value = Some(false);
+        }
+    }
+
+    fn reset_state(&mut self) {
+        self.value = Some(false);
+    }
+}
+
+impl ApplicationCursorModeTracker {
+    #[must_use]
+    pub fn known(value: bool) -> Self {
+        Self {
+            processor: Processor::new(),
+            state: ApplicationCursorModeState { value: Some(value) },
+        }
+    }
+
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self::default()
+    }
+
+    pub fn feed(&mut self, bytes: &[u8]) {
+        self.processor.advance(&mut self.state, bytes);
+    }
+
+    pub fn set_known(&mut self, value: bool) {
+        self.state.value = Some(value);
+    }
+
+    pub fn set_unknown(&mut self) {
+        self.state.value = None;
+    }
+
+    #[must_use]
+    pub const fn value(&self) -> Option<bool> {
+        self.state.value
+    }
+}
 
 /// Receiver-side authority for a remote terminal stream. A mirror accepts a
 /// full snapshot as a new baseline and then only contiguous sequenced diffs;
@@ -1485,5 +1551,21 @@ mod tests {
             MouseModes::new(MouseTrackingMode::Off, MouseEncoding::Sgr),
             "1006 is independent of tracking"
         );
+    }
+
+    #[test]
+    fn application_cursor_tracker_preserves_unknown_until_authoritative_output() {
+        let mut tracker = ApplicationCursorModeTracker::unknown();
+        tracker.feed(b"ordinary output\x1b[?2004h");
+        assert_eq!(tracker.value(), None);
+
+        tracker.feed(b"\x1b[?1;");
+        assert_eq!(tracker.value(), None, "split CSI is not guessed early");
+        tracker.feed(b"1000h");
+        assert_eq!(tracker.value(), Some(true));
+
+        tracker.set_unknown();
+        tracker.feed(b"\x1bc");
+        assert_eq!(tracker.value(), Some(false), "RIS is authoritative reset");
     }
 }

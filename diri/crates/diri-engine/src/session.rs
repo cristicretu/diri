@@ -31,7 +31,7 @@ use diri_proto::remote_pty::{
 };
 use diri_proto::terminal::MouseModes;
 use diri_proto::{NeedsInputDetail, SessionStatus};
-use diri_terminal_state::GridMirror;
+use diri_terminal_state::{ApplicationCursorModeTracker, GridMirror};
 
 use crate::detect::ManifestEngine;
 use crate::holder::{
@@ -61,8 +61,8 @@ const HOT_WINDOW_SECS: u64 = 30;
 
 /// Normal raw-log tail budget for display reconstruction and for deciding
 /// whether a current checkpoint is cheap enough to resume. A legacy or
-/// unusable checkpoint deliberately bypasses it once to recover sticky modes
-/// from the bounded retained prefix.
+/// unusable checkpoint deliberately bypasses it once to inspect every retained
+/// byte; sticky modes remain unknown if rotation removed their provenance.
 const REPLAY_BUDGET: usize = 256 << 10;
 const MAX_REPLAY_BUDGET: usize = 32 << 20;
 
@@ -212,6 +212,10 @@ struct Shared {
     prompt_input: Mutex<PromptInputState>,
     log: Mutex<OutputLog>,
     screen: Mutex<HeadlessScreen>,
+    /// DECCKM plus whether its value has authoritative provenance. The
+    /// emulator itself always has a boolean construction default, which is
+    /// not evidence when retained output begins after a rotation gap.
+    application_cursor_keys: Mutex<ApplicationCursorModeTracker>,
     reducer: Mutex<StatusReducer>,
     /// How the child ended, once known (from `wait` or the exit marker).
     exit: Mutex<Option<Exit>>,
@@ -302,7 +306,7 @@ pub struct GridSignature {
     pub size: (usize, usize),
     pub cursor: (u16, u16, bool),
     pub alt_screen: bool,
-    pub application_cursor_keys: bool,
+    pub application_cursor_keys: Option<bool>,
     pub mouse: MouseModes,
 }
 
@@ -421,7 +425,7 @@ pub(crate) struct AttachmentSeed {
 pub(crate) struct AttachmentModes {
     pub alt_screen: bool,
     pub bracketed_paste: bool,
-    pub application_cursor_keys: bool,
+    pub application_cursor_keys: Option<bool>,
     pub mouse: MouseModes,
 }
 
@@ -750,7 +754,8 @@ impl Session {
         // persisted tail offset plus a quiet remote process produces an empty
         // replay and the first `None` snapshot is resolved against a freshly
         // constructed (and falsely definitive) terminal default.
-        let retained_output_tail = hydrate_screen_from_retained_output(&shared);
+        let retained_output_tail =
+            hydrate_screen_from_retained_output(&shared, 0, Some(remote.output_offset));
         let client = Arc::new(RemoteSessionClient::new(
             remote.manager,
             remote.helper,
@@ -858,7 +863,7 @@ impl Session {
         let client = HolderClient::new(paths.socket());
         let floor = wait_for_holder(&client, &spec.logs_dir, &spec.id, pre_spawn_tail)
             .map_err(holder_io_error)?;
-        Self::attach(spec, client, floor, engine)
+        Self::attach(spec, client, floor, Some(false), engine)
     }
 
     /// Spawns through a holder, but not yet: the exec waits for the first
@@ -998,7 +1003,7 @@ impl Session {
             spec.pty.cols = cols;
             spec.pty.rows = rows;
         }
-        let session = Self::attach(spec, client, floor, engine)?;
+        let session = Self::attach(spec, client, floor, stat.application_cursor_keys, engine)?;
         if let Some((status, needs_input)) = initial_status {
             *session.shared.status.lock().expect("status") = status;
             *session.shared.needs_input.lock().expect("needs input") = needs_input;
@@ -1012,10 +1017,30 @@ impl Session {
         spec: SessionSpec,
         client: HolderClient,
         exit_marker_floor: u64,
+        holder_application_cursor_keys: Option<bool>,
         engine: Arc<ManifestEngine>,
     ) -> std::io::Result<Self> {
         let log = OutputLog::reader(&spec.logs_dir, &spec.id)?;
         let shared = new_shared(&spec, log, &engine);
+        match holder_application_cursor_keys {
+            Some(value) => {
+                shared
+                    .application_cursor_keys
+                    .lock()
+                    .expect("application cursor mode")
+                    .set_known(value);
+                shared.screen.lock().expect("screen").feed(if value {
+                    b"\x1b[?1h"
+                } else {
+                    b"\x1b[?1l"
+                });
+            }
+            None => shared
+                .application_cursor_keys
+                .lock()
+                .expect("application cursor mode")
+                .set_unknown(),
+        }
         if let Ok(stat) = client.stat() {
             shared.child_pid.store(stat.child_pid, Ordering::SeqCst);
         }
@@ -1138,14 +1163,19 @@ impl Session {
         let wake = self.shared.grid_wake.clone();
         loop {
             let wake_generation = wake.generation();
+            let application_cursor_keys = self
+                .shared
+                .application_cursor_keys
+                .lock()
+                .expect("application cursor mode")
+                .value();
             let sampled = {
                 let remote = self.shared.remote_grid.lock().expect("remote grid");
                 remote.as_ref().and_then(|remote| {
                     let grid = remote.mirror.full_update()?;
                     let (cols, rows) = remote.mirror.size();
                     let (cursor_col, cursor_row, cursor_visible) = remote.mirror.cursor();
-                    let (alt_screen, bracketed_paste, application_cursor_keys, mouse) =
-                        remote.mirror.modes();
+                    let (alt_screen, bracketed_paste, _, mouse) = remote.mirror.modes();
                     Some((
                         grid,
                         AttachmentModes {
@@ -1172,7 +1202,7 @@ impl Session {
                     AttachmentModes {
                         alt_screen: screen.is_alt_screen(),
                         bracketed_paste: screen.bracketed_paste(),
-                        application_cursor_keys: screen.application_cursor_keys(),
+                        application_cursor_keys,
                         mouse: screen.mouse_modes(),
                     },
                     GridSignature {
@@ -1180,7 +1210,7 @@ impl Session {
                         size: screen.size(),
                         cursor: screen.cursor(),
                         alt_screen: screen.is_alt_screen(),
-                        application_cursor_keys: screen.application_cursor_keys(),
+                        application_cursor_keys,
                         mouse: screen.mouse_modes(),
                     },
                 )
@@ -1203,6 +1233,12 @@ impl Session {
         &self,
         signature: &mut GridSignature,
     ) -> Option<diri_proto::grid::GridUpdate> {
+        let application_cursor_keys = self
+            .shared
+            .application_cursor_keys
+            .lock()
+            .expect("application cursor mode")
+            .value();
         if let Some(remote) = self
             .shared
             .remote_grid
@@ -1213,7 +1249,7 @@ impl Session {
         {
             let (cols, rows) = remote.mirror.size();
             let (cursor_col, cursor_row, cursor_visible) = remote.mirror.cursor();
-            let (alt_screen, _, application_cursor_keys, mouse) = remote.mirror.modes();
+            let (alt_screen, _, _, mouse) = remote.mirror.modes();
             let current = GridSignature {
                 content_seq: remote.revision,
                 size: (usize::from(cols), usize::from(rows)),
@@ -1237,7 +1273,7 @@ impl Session {
             size: screen.size(),
             cursor: screen.cursor(),
             alt_screen: screen.is_alt_screen(),
-            application_cursor_keys: screen.application_cursor_keys(),
+            application_cursor_keys,
             mouse: screen.mouse_modes(),
         };
         if current == *signature {
@@ -1269,6 +1305,12 @@ impl Session {
 
     /// Current attachment-visible terminal modes.
     pub(crate) fn modes(&self) -> AttachmentModes {
+        let application_cursor_keys = self
+            .shared
+            .application_cursor_keys
+            .lock()
+            .expect("application cursor mode")
+            .value();
         if let Some(remote) = self
             .shared
             .remote_grid
@@ -1277,8 +1319,7 @@ impl Session {
             .as_ref()
             && remote.mirror.sequence().is_some()
         {
-            let (alt_screen, bracketed_paste, application_cursor_keys, mouse) =
-                remote.mirror.modes();
+            let (alt_screen, bracketed_paste, _, mouse) = remote.mirror.modes();
             return AttachmentModes {
                 alt_screen,
                 bracketed_paste,
@@ -1290,7 +1331,7 @@ impl Session {
         AttachmentModes {
             alt_screen: screen.is_alt_screen(),
             bracketed_paste: screen.bracketed_paste(),
-            application_cursor_keys: screen.application_cursor_keys(),
+            application_cursor_keys,
             mouse: screen.mouse_modes(),
         }
     }
@@ -1731,6 +1772,7 @@ fn new_shared(spec: &SessionSpec, log: OutputLog, engine: &ManifestEngine) -> Ar
             spec.pty.cols as usize,
             spec.pty.rows as usize,
         )),
+        application_cursor_keys: Mutex::new(ApplicationCursorModeTracker::known(false)),
         reducer: Mutex::new(
             StatusReducer::new(spec.authority, SystemTime::now())
                 .with_manifest(spec.manifest_id.clone(), manifest_version),
@@ -1751,32 +1793,78 @@ fn new_shared(spec: &SessionSpec, log: OutputLog, engine: &ManifestEngine) -> Ar
     })
 }
 
-/// Replays the complete locally retained remote-output prefix into a fresh
-/// emulator and returns the first offset the remote Holder still owes us.
+/// Replays the locally retained remote-output suffix into a fresh emulator
+/// and returns the first offset the remote Holder still owes us.
 ///
 /// This deliberately ignores the normal 256 KiB presentation replay budget.
 /// Terminal modes such as DECCKM are sticky, and protocol-1.4 Holders cannot
 /// put their current value in a snapshot. The bounded OutputLog spill is the
-/// only authoritative cold-adoption source available to a new Engine.
-fn hydrate_screen_from_retained_output(shared: &Shared) -> u64 {
+/// When rotation removed its prefix, the mode tracker remains unknown rather
+/// than treating the emulator's construction default as history.
+fn hydrate_screen_from_retained_output(
+    shared: &Shared,
+    authoritative_floor: u64,
+    expected_tail: Option<u64>,
+) -> u64 {
     let mut log = shared.log.lock().expect("log");
     let mut screen = shared.screen.lock().expect("screen");
-    hydrate_screen_from_log(&mut log, &mut screen)
+    let mut application_cursor_keys = shared
+        .application_cursor_keys
+        .lock()
+        .expect("application cursor mode");
+    hydrate_screen_from_log(
+        &mut log,
+        &mut screen,
+        &mut application_cursor_keys,
+        authoritative_floor,
+        expected_tail,
+    )
 }
 
-fn hydrate_screen_from_log(log: &mut OutputLog, screen: &mut HeadlessScreen) -> u64 {
+fn hydrate_screen_from_log(
+    log: &mut OutputLog,
+    screen: &mut HeadlessScreen,
+    application_cursor_keys: &mut ApplicationCursorModeTracker,
+    authoritative_floor: u64,
+    expected_tail: Option<u64>,
+) -> u64 {
     log.refresh_from_disk();
     let tail = log.tail_offset();
     let mut offset = log.oldest_available_offset();
+    application_cursor_keys.set_unknown();
+    seed_default_application_cursor_from_complete_prefix(
+        application_cursor_keys,
+        offset,
+        authoritative_floor,
+        expected_tail.is_none_or(|expected| expected == tail),
+    );
     while offset < tail {
         let (start, bytes) = log.read(offset, LOG_READ_BUDGET);
         if bytes.is_empty() {
             break;
         }
+        application_cursor_keys.feed(&bytes);
         screen.feed(&bytes);
         offset = start.saturating_add(bytes.len() as u64);
     }
     offset.min(tail)
+}
+
+/// Establishes the terminal construction default only when the retained range
+/// includes the start of the current Holder incarnation and reaches the tail
+/// the caller means to reconstruct. Existing Holder/checkpoint authority wins.
+fn seed_default_application_cursor_from_complete_prefix(
+    application_cursor_keys: &mut ApplicationCursorModeTracker,
+    oldest_available: u64,
+    authoritative_floor: u64,
+    tail_is_complete: bool,
+) {
+    if application_cursor_keys.value().is_none()
+        && oldest_available <= authoritative_floor
+        && tail_is_complete
+    {
+        application_cursor_keys.set_known(false);
+    }
 }
 
 /// Waits for a freshly launched holder and returns the exit-marker floor:
@@ -2181,6 +2269,15 @@ fn apply_remote_output(
     }
     shared.remote_output_offset.store(end, Ordering::SeqCst);
     let _ = shared.log.lock().expect("log").append(bytes);
+    let application_cursor_mode_changed = {
+        let mut application_cursor_keys = shared
+            .application_cursor_keys
+            .lock()
+            .expect("application cursor mode");
+        let before = application_cursor_keys.value();
+        application_cursor_keys.feed(bytes);
+        application_cursor_keys.value() != before
+    };
     let observation = {
         let mut screen = shared.screen.lock().expect("screen");
         screen.feed(bytes);
@@ -2197,6 +2294,13 @@ fn apply_remote_output(
         drop(reducer);
         apply(shared, &outcome);
     }
+    // A 1.4 Holder has no DECCKM snapshot bit, and a mode-only escape may
+    // produce no GridDelta. Wake attachments when raw output resolves or
+    // toggles the compatibility tracker so their Modes-before-input gate can
+    // advance independently of visible grid damage.
+    if application_cursor_mode_changed {
+        shared.grid_wake.notify();
+    }
 }
 
 fn apply_remote_snapshot(
@@ -2211,14 +2315,28 @@ fn apply_remote_snapshot(
     // Engine feeds that retained stream through its own emulator, so it is a
     // trustworthy compatibility source for live old Holders and cold replay.
     let emulated_application_cursor_keys = shared
-        .screen
+        .application_cursor_keys
         .lock()
-        .expect("screen")
-        .application_cursor_keys();
+        .expect("application cursor mode")
+        .value();
     let application_cursor_keys = resolve_remote_application_cursor_keys(
         snapshot.application_cursor_keys,
         emulated_application_cursor_keys,
     );
+    if let Some(value) = application_cursor_keys {
+        shared
+            .application_cursor_keys
+            .lock()
+            .expect("application cursor mode")
+            .set_known(value);
+    }
+    let restored_application_cursor_keys = application_cursor_keys.unwrap_or_else(|| {
+        shared
+            .screen
+            .lock()
+            .expect("screen")
+            .application_cursor_keys()
+    });
     {
         let mut remote = shared.remote_grid.lock().expect("remote grid");
         let remote = remote
@@ -2231,7 +2349,7 @@ fn apply_remote_snapshot(
                 &snapshot.grid,
                 snapshot.alt_screen,
                 snapshot.bracketed_paste,
-                application_cursor_keys,
+                restored_application_cursor_keys,
                 snapshot.mouse,
             )
             .map_err(std::io::Error::other)?;
@@ -2252,7 +2370,7 @@ fn apply_remote_snapshot(
             &snapshot.grid,
             snapshot.alt_screen,
             snapshot.bracketed_paste,
-            application_cursor_keys,
+            restored_application_cursor_keys,
             snapshot.mouse,
         ) {
             return Err(std::io::Error::new(
@@ -2275,14 +2393,28 @@ fn apply_remote_snapshot(
 
 fn apply_remote_delta(shared: &Shared, delta: GridDelta) -> std::io::Result<()> {
     let emulated_application_cursor_keys = shared
-        .screen
+        .application_cursor_keys
         .lock()
-        .expect("screen")
-        .application_cursor_keys();
+        .expect("application cursor mode")
+        .value();
     let application_cursor_keys = resolve_remote_application_cursor_keys(
         delta.application_cursor_keys,
         emulated_application_cursor_keys,
     );
+    if let Some(value) = application_cursor_keys {
+        shared
+            .application_cursor_keys
+            .lock()
+            .expect("application cursor mode")
+            .set_known(value);
+    }
+    let mirrored_application_cursor_keys = application_cursor_keys.unwrap_or_else(|| {
+        shared
+            .screen
+            .lock()
+            .expect("screen")
+            .application_cursor_keys()
+    });
     {
         let mut remote = shared.remote_grid.lock().expect("remote grid");
         let remote = remote
@@ -2295,7 +2427,7 @@ fn apply_remote_delta(shared: &Shared, delta: GridDelta) -> std::io::Result<()> 
                 &delta.grid,
                 delta.alt_screen,
                 delta.bracketed_paste,
-                application_cursor_keys,
+                mirrored_application_cursor_keys,
                 delta.mouse,
             )
             .map_err(std::io::Error::other)?;
@@ -2312,9 +2444,9 @@ fn apply_remote_delta(shared: &Shared, delta: GridDelta) -> std::io::Result<()> 
 
 fn resolve_remote_application_cursor_keys(
     advertised: Option<bool>,
-    emulated_from_retained_output: bool,
-) -> bool {
-    advertised.unwrap_or(emulated_from_retained_output)
+    emulated_from_retained_output: Option<bool>,
+) -> Option<bool> {
+    advertised.or(emulated_from_retained_output)
 }
 
 fn record_remote_exit(shared: &Shared, exit: ProcessExit) {
@@ -2509,6 +2641,11 @@ fn feed_output_batch(
             // still running and its status still matters.
             let _ = log.append(&buffer[..count]);
         }
+        shared
+            .application_cursor_keys
+            .lock()
+            .expect("application cursor mode")
+            .feed(&buffer[..count]);
         let mid_repaint = {
             let mut screen = shared.screen.lock().expect("screen");
             let before = *filled_before.get_or_insert_with(|| screen.filled_cells());
@@ -2611,6 +2748,7 @@ fn pump_held(
         let checkpoint_path = crate::checkpoint::ScreenCheckpoint::path_for_log(log.path());
         let watcher = log_watch::LogWatcher::new(log.path());
         let tail = log.tail_offset();
+        let oldest_available = log.oldest_available_offset();
         // A fresh-enough checkpoint seeds the emulator from a few KiB and
         // replay resumes at its offset. "Fresh enough" preserves the hard
         // startup-work bound: the remaining tail must fit the same budget a
@@ -2632,25 +2770,43 @@ fn pump_held(
                 )
             });
         match restored {
-            Some(checkpoint) => (
-                checkpoint_path,
-                checkpoint.log_offset,
-                watcher,
-                checkpoint.marker_buffer,
-            ),
+            Some(checkpoint) => {
+                shared
+                    .application_cursor_keys
+                    .lock()
+                    .expect("application cursor mode")
+                    .set_known(checkpoint.application_cursor_keys);
+                (
+                    checkpoint_path,
+                    checkpoint.log_offset,
+                    watcher,
+                    checkpoint.marker_buffer,
+                )
+            }
             // A checkpoint miss is a correctness migration, not the normal
-            // repaint fast path. Replay every retained byte in this Holder
-            // incarnation so sticky modes that precede the 256 KiB
-            // display-tail budget are reconstructed.
-            // The spill file is independently bounded; once this pass catches
-            // up it writes a current v4 checkpoint and future adoption is the
-            // cheap path again.
-            None => (
-                checkpoint_path,
-                log.oldest_available_offset().max(exit_marker_floor),
-                watcher,
-                Vec::new(),
-            ),
+            // repaint fast path. Inspect every retained byte in this Holder
+            // incarnation so sticky modes before the 256 KiB display-tail
+            // budget are reconstructed when their provenance is still
+            // available. A rotated prefix deliberately leaves DECCKM unknown,
+            // which also suppresses checkpoint persistence below.
+            None => {
+                let mut application_cursor_keys = shared
+                    .application_cursor_keys
+                    .lock()
+                    .expect("application cursor mode");
+                seed_default_application_cursor_from_complete_prefix(
+                    &mut application_cursor_keys,
+                    oldest_available,
+                    exit_marker_floor,
+                    true,
+                );
+                (
+                    checkpoint_path,
+                    oldest_available.max(exit_marker_floor),
+                    watcher,
+                    Vec::new(),
+                )
+            }
         }
     };
     // Adoption can restore a checkpoint concurrently with a freshly attached
@@ -2792,6 +2948,11 @@ fn pump_held(
 
         if !output.is_empty() {
             checkpoint_dirty_at = Some(Instant::now());
+            shared
+                .application_cursor_keys
+                .lock()
+                .expect("application cursor mode")
+                .feed(&output);
             let observation = {
                 let mut screen = shared.screen.lock().expect("screen");
                 screen.feed(&output);
@@ -2925,6 +3086,16 @@ fn persist_checkpoint(
     marker_buffer: &[u8],
     last_key: &mut Option<CheckpointKey>,
 ) {
+    let Some(application_cursor_keys) = shared
+        .application_cursor_keys
+        .lock()
+        .expect("application cursor mode")
+        .value()
+    else {
+        // A checkpoint turns absence into a durable boolean. Never write one
+        // until retained output or Holder state has established DECCKM.
+        return;
+    };
     let (history, grid, alt_screen, bracketed_paste, application_cursor_keys, mouse, content_seq) = {
         let screen = shared.screen.lock().expect("screen");
         (
@@ -2932,7 +3103,7 @@ fn persist_checkpoint(
             screen.full_snapshot(),
             screen.is_alt_screen(),
             screen.bracketed_paste(),
-            screen.application_cursor_keys(),
+            application_cursor_keys,
             screen.mouse_modes(),
             screen.content_seq(),
         )
@@ -3172,25 +3343,39 @@ mod prompt_title_tests {
 #[cfg(test)]
 mod remote_mode_tests {
     use super::{
-        HeadlessScreen, OutputLog, REPLAY_BUDGET, hydrate_screen_from_log,
-        resolve_remote_application_cursor_keys,
+        ApplicationCursorModeTracker, HeadlessScreen, LOG_READ_BUDGET, OutputLog,
+        hydrate_screen_from_log, resolve_remote_application_cursor_keys,
+        seed_default_application_cursor_from_complete_prefix,
     };
 
     #[test]
     fn old_holder_unknown_mode_uses_retained_output_truth() {
-        assert!(resolve_remote_application_cursor_keys(None, true));
-        assert!(!resolve_remote_application_cursor_keys(None, false));
-        assert!(resolve_remote_application_cursor_keys(Some(true), false));
-        assert!(!resolve_remote_application_cursor_keys(Some(false), true));
+        assert_eq!(
+            resolve_remote_application_cursor_keys(None, Some(true)),
+            Some(true)
+        );
+        assert_eq!(
+            resolve_remote_application_cursor_keys(None, Some(false)),
+            Some(false)
+        );
+        assert_eq!(resolve_remote_application_cursor_keys(None, None), None);
+        assert_eq!(
+            resolve_remote_application_cursor_keys(Some(true), Some(false)),
+            Some(true)
+        );
+        assert_eq!(
+            resolve_remote_application_cursor_keys(Some(false), Some(true)),
+            Some(false)
+        );
     }
 
     #[test]
-    fn old_holder_cold_adoption_hydrates_truth_before_a_quiet_tail_resume() {
+    fn old_holder_cold_adoption_keeps_rotated_quiet_tail_unknown() {
         let root = tempfile::tempdir().expect("temp");
         let persisted_tail = {
             let mut log = OutputLog::writer(root.path(), "remote").expect("writer");
             log.append(b"\x1b[?1h").expect("mode transition");
-            log.append(&vec![b'x'; REPLAY_BUDGET + (64 << 10)])
+            log.append(&vec![b'x'; (8 << 20) + (64 << 10)])
                 .expect("output after the transition");
             log.flush().expect("flush");
             log.tail_offset()
@@ -3201,15 +3386,56 @@ mod remote_mode_tests {
         // whose absent bit decodes as None and supplies no corrective output.
         let mut retained = OutputLog::writer(root.path(), "remote").expect("cold reader");
         let mut screen = HeadlessScreen::new(80, 24);
-        assert!(!screen.application_cursor_keys());
+        let mut mode = ApplicationCursorModeTracker::unknown();
         assert_eq!(
-            hydrate_screen_from_log(&mut retained, &mut screen),
+            hydrate_screen_from_log(
+                &mut retained,
+                &mut screen,
+                &mut mode,
+                0,
+                Some(persisted_tail)
+            ),
             persisted_tail
         );
-        assert!(resolve_remote_application_cursor_keys(
+        assert!(retained.oldest_available_offset() > 0, "fixture rotated");
+        assert_eq!(
+            resolve_remote_application_cursor_keys(None, mode.value()),
             None,
-            screen.application_cursor_keys()
-        ));
+            "a 1.4 snapshot plus a rotated suffix stays unknown"
+        );
+    }
+
+    #[test]
+    fn rotated_local_legacy_history_never_invents_false() {
+        let root = tempfile::tempdir().expect("temp");
+        let mut writer =
+            OutputLog::open(root.path(), "local", 4 << 20, 8 << 20, false).expect("writer");
+        writer.append(b"\x1b[?1h").expect("old transition");
+        writer
+            .append(&vec![b'x'; (8 << 20) + (64 << 10)])
+            .expect("rotate past transition");
+        writer.flush().expect("flush");
+        let tail = writer.tail_offset();
+        drop(writer);
+
+        let mut retained = OutputLog::reader(root.path(), "local").expect("reader");
+        let mut mode = ApplicationCursorModeTracker::unknown();
+        retained.refresh_from_disk();
+        let oldest = retained.oldest_available_offset();
+        assert!(oldest > 0, "fixture rotated");
+        seed_default_application_cursor_from_complete_prefix(&mut mode, oldest, 0, true);
+        let mut offset = oldest;
+        while offset < tail {
+            let (start, bytes) = retained.read(offset, LOG_READ_BUDGET);
+            assert!(!bytes.is_empty(), "retained suffix remains readable");
+            mode.feed(&bytes);
+            offset = start.saturating_add(bytes.len() as u64);
+        }
+        assert_eq!(
+            offset, tail,
+            "the local migration inspects the whole retained suffix"
+        );
+        assert_eq!(mode.value(), None);
     }
 }
 
