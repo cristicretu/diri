@@ -9,6 +9,7 @@
 mod brand;
 mod components;
 mod icon;
+pub mod motion;
 mod status;
 mod svg;
 mod tokens;

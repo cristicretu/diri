@@ -9,14 +9,14 @@ use diri_proto::{
 };
 use diri_ui::{
     AgentKind, AgentLogo, AlertChip, AttentionDot, AttentionLevel, Fill, FloatingSurface,
-    HairlineDivider, HoverMarquee, Ink, LoadingIndicator, Metrics, Palette, Radius, RowFill,
-    SemanticColors, Space, StateChip, StatusGlyph, StatusState, Typo,
+    HairlineDivider, HoverMarquee, Ink, LoadingIndicator, Metrics, Motion, Palette, Radius,
+    RowFill, SemanticColors, Space, StateChip, StatusGlyph, StatusState, Typo,
 };
 use gpui::{
-    Anchor, AnyElement, App, AppContext as _, Context, Entity, EventEmitter, ExternalPaths,
-    FocusHandle, Focusable, FontWeight, Hsla, IntoElement, MouseButton, Pixels, Point, Render,
-    Rgba, ScrollHandle, SharedString, Task, Window, anchored, deferred, div, linear_color_stop,
-    linear_gradient, point, prelude::*, px,
+    Anchor, Animation, AnimationExt, AnyElement, App, AppContext as _, Context, Entity,
+    EventEmitter, ExternalPaths, FocusHandle, Focusable, FontWeight, Hsla, IntoElement,
+    MouseButton, Pixels, Point, Render, Rgba, ScrollHandle, SharedString, Task, Window, anchored,
+    deferred, div, linear_color_stop, linear_gradient, point, prelude::*, px,
 };
 use tokio::sync::mpsc;
 
@@ -1110,6 +1110,7 @@ impl Sidebar {
         } else {
             RowFill::Clear
         };
+        let fill_color = fill.color(colors);
 
         if self.ui.renaming.as_ref() == Some(&id) {
             return div()
@@ -1199,7 +1200,7 @@ impl Sidebar {
         let drag_payload = DraggedSidebarItem(drag_item);
         let drag_label: SharedString = title.clone().into();
         let entity = cx.entity();
-        div()
+        let row = div()
             .id(format!("session:{}", id.0))
             .pl(px(Space::ROW_H))
             .pr(px(Space::ROW_H))
@@ -1455,8 +1456,34 @@ impl Sidebar {
                             .child(format!("⌘{index}")),
                     )
                 },
-            )
-            .into_any_element()
+            );
+
+        // A selection fill arrives on ROW_SELECT instead of switching between
+        // two frames. Hover deliberately does not animate: hover should feel
+        // like the cursor is touching the row, and a highlight that ramps in
+        // reads as lag rather than as polish.
+        //
+        // Cost drives the same split. A running animation asks for a window
+        // frame per tick, and a window frame repaints everything in it --
+        // live terminal grids included. Hover changes on every row a pointer
+        // crosses, so animating it would schedule repaints for the length of
+        // a sweep down the sidebar; selection changes once per click. An
+        // unselected row therefore carries no animation state at all, rather
+        // than animating an invisible zero-alpha fill.
+        if !selected && !multi {
+            return row.into_any_element();
+        }
+        row.with_animation(
+            SharedString::from(format!("row-fill:{}:{fill:?}", id.0)),
+            Animation::new(Motion::ROW_SELECT_TIME).with_easing(|delta| Motion::SNAP.settle(delta)),
+            move |row, delta| {
+                row.bg(Rgba {
+                    a: fill_color.a * delta,
+                    ..fill_color
+                })
+            },
+        )
+        .into_any_element()
     }
 
     /// The fold control for a row that spawned children, drawn in the same
