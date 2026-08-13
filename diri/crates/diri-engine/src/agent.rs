@@ -93,6 +93,11 @@ pub struct AgentDescriptor {
     pub aliases: Vec<String>,
     #[serde(default)]
     pub first_class: bool,
+    /// Product default order in Agent catalogs and quick-create surfaces.
+    /// User-defined ordering can override this later without changing the
+    /// manifest; unspecified Agents follow the ordered entries by id.
+    #[serde(default)]
+    pub catalog_order: Option<u16>,
     #[serde(default)]
     pub status_authority: Option<StatusAuthority>,
     /// The executable to run. Absent for `shell` and `generic`, whose command

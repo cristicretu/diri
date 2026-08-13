@@ -34,30 +34,19 @@ impl AgentOption {
     }
 }
 
-/// Complete supported-Agent rows in deterministic product order.
+/// Complete supported-Agent rows in the order supplied by Settings readiness.
 ///
 /// Availability must only come from Engine readiness facts. In particular,
 /// an empty or not-yet-populated response must never be expanded into
 /// optimistic "installed" entries: high-frequency launch surfaces derive
 /// from this collection and must fail closed when detection has no facts.
 pub(crate) fn agent_options(catalog: &AgentReadinessResult) -> Vec<AgentOption> {
-    let mut options: Vec<_> = catalog
+    catalog
         .agents
         .iter()
         .filter(|item| !item.kind.is_terminal())
         .map(option_from_readiness)
-        .collect();
-    options.sort_by(|left, right| {
-        option_order(left)
-            .cmp(&option_order(right))
-            .then_with(|| {
-                left.display_name
-                    .to_lowercase()
-                    .cmp(&right.display_name.to_lowercase())
-            })
-            .then_with(|| left.kind.id().cmp(right.kind.id()))
-    });
-    options
+        .collect()
 }
 
 /// Settings is the complete supported catalog, grouped by readiness rather
@@ -194,7 +183,7 @@ pub(crate) fn display_name(kind: &AgentKind, catalog: &AgentReadinessResult) -> 
         .into_iter()
         .find(|option| option.kind == *kind)
         .map(|option| option.display_name)
-        .unwrap_or_else(|| builtin_name(kind).unwrap_or_else(|| title_case_id(kind.id())))
+        .unwrap_or_else(|| title_case_id(kind.id()))
 }
 
 pub(crate) fn system_image(kind: &AgentKind) -> &'static str {
@@ -248,7 +237,6 @@ fn option_from_readiness(item: &AgentReadinessItem) -> AgentOption {
         .map(|descriptor| descriptor.display_name.trim())
         .filter(|name| !name.is_empty())
         .map(str::to_owned)
-        .or_else(|| builtin_name(&item.kind))
         .unwrap_or_else(|| title_case_id(item.kind.id()));
     let install_hint = setup
         .and_then(|setup| setup.install_hint.as_deref())
@@ -262,8 +250,7 @@ fn option_from_readiness(item: &AgentReadinessItem) -> AgentOption {
         binary: item.binary.clone(),
         available: item.available(),
         show_in_quick_create: item.show_in_quick_create,
-        first_class: descriptor.is_some_and(|descriptor| descriptor.first_class)
-            || is_legacy_first_class(&item.kind),
+        first_class: descriptor.is_some_and(|descriptor| descriptor.first_class),
         setup_url: setup
             .and_then(|setup| setup.url.as_deref())
             .and_then(normal_web_url),
@@ -287,40 +274,6 @@ fn terminal_option() -> AgentOption {
         setup_url: None,
         install_hint: "Uses your login shell.".to_owned(),
         sign_in_hint: None,
-    }
-}
-
-fn option_order(option: &AgentOption) -> (u8, usize) {
-    let pinned = [
-        AgentKind::CLAUDE_CODE_ID,
-        AgentKind::CODEX_ID,
-        AgentKind::CURSOR_ID,
-        AgentKind::GEMINI_ID,
-    ];
-    pinned
-        .iter()
-        .position(|id| *id == option.kind.id())
-        .map_or((1, usize::MAX), |index| (0, index))
-}
-
-fn is_legacy_first_class(kind: &AgentKind) -> bool {
-    matches!(
-        kind.id(),
-        AgentKind::CLAUDE_CODE_ID
-            | AgentKind::CODEX_ID
-            | AgentKind::CURSOR_ID
-            | AgentKind::GEMINI_ID
-    )
-}
-
-fn builtin_name(kind: &AgentKind) -> Option<String> {
-    match kind.id() {
-        AgentKind::CLAUDE_CODE_ID => Some("Claude Code".to_owned()),
-        AgentKind::CODEX_ID => Some("Codex".to_owned()),
-        AgentKind::CURSOR_ID => Some("Cursor".to_owned()),
-        AgentKind::GEMINI_ID => Some("Gemini".to_owned()),
-        AgentKind::SHELL_ID => Some("Terminal".to_owned()),
-        _ => None,
     }
 }
 
@@ -454,6 +407,38 @@ mod tests {
                 AgentKind::new("zebra-missing"),
                 AgentKind::new("alpha-missing"),
             ]
+        );
+    }
+
+    #[test]
+    fn quick_create_choices_come_only_from_settings_and_keep_catalog_order() {
+        let mut zeta = item("zeta-future-agent", true, false);
+        zeta.show_in_quick_create = true;
+        let mut builtin = item("claude-code", true, false);
+        builtin.show_in_quick_create = true;
+        let mut hidden = item("alpha-hidden-agent", true, false);
+        hidden.show_in_quick_create = false;
+        let mut beta = item("beta-future-agent", true, false);
+        beta.show_in_quick_create = true;
+        let catalog = AgentReadinessResult {
+            agents: vec![zeta, builtin, hidden, beta],
+            ..AgentReadinessResult::default()
+        };
+
+        let options = quick_agent_options(Some(&catalog));
+        assert_eq!(
+            options
+                .iter()
+                .map(|option| option.kind.id())
+                .collect::<Vec<_>>(),
+            ["zeta-future-agent", "claude-code", "beta-future-agent"]
+        );
+        assert!(
+            options
+                .iter()
+                .find(|option| option.kind.id() == "claude-code")
+                .is_some_and(|option| !option.first_class),
+            "the client must not override manifest metadata by Agent id"
         );
     }
 

@@ -2263,17 +2263,23 @@ impl ControlServer {
                 .filter_map(|id| {
                     let descriptor = engine.manifest(id)?.agent.as_ref()?;
                     let binary = descriptor.binary.clone()?;
-                    Some((id.to_owned(), binary, engine.raw_agent(id).cloned()))
+                    Some((
+                        id.to_owned(),
+                        binary,
+                        descriptor.catalog_order.unwrap_or(u16::MAX),
+                        engine.raw_agent(id).cloned(),
+                    ))
                 })
                 .collect::<Vec<_>>();
-            manifests.sort_by(|left, right| left.0.cmp(&right.0));
+            manifests
+                .sort_by(|left, right| left.2.cmp(&right.2).then_with(|| left.0.cmp(&right.0)));
             manifests
         };
         let preferences = {
             let catalog = self.agent_catalog.lock().map_err(poisoned)?;
             manifests
                 .iter()
-                .map(|(id, _, _)| catalog.preference(params.host.as_deref(), id))
+                .map(|(id, _, _, _)| catalog.preference(params.host.as_deref(), id))
                 .collect::<Vec<_>>()
         };
 
@@ -2290,7 +2296,7 @@ impl ControlServer {
                         queries: manifests
                             .iter()
                             .zip(&preferences)
-                            .map(|((id, binary, _), preference)| {
+                            .map(|((id, binary, _, _), preference)| {
                                 diri_proto::remote_pty::ExecutableQuery {
                                     id: id.clone(),
                                     binary: binary.clone(),
@@ -2310,7 +2316,7 @@ impl ControlServer {
                 .collect::<std::collections::HashMap<_, _>>();
             manifests
                 .iter()
-                .map(|(id, _, _)| {
+                .map(|(id, _, _, _)| {
                     let item = by_id.get(id);
                     crate::agent_catalog::ExecutableResolution {
                         detected_path: item.and_then(|item| item.detected_path.clone()),
@@ -2323,7 +2329,7 @@ impl ControlServer {
             manifests
                 .iter()
                 .zip(&preferences)
-                .map(|((_, binary, _), preference)| {
+                .map(|((_, binary, _, _), preference)| {
                     crate::agent_catalog::resolve_local(
                         binary,
                         preference.executable_path.as_deref(),
@@ -2333,7 +2339,7 @@ impl ControlServer {
         };
 
         let mut agents = Vec::with_capacity(manifests.len());
-        for (((id, binary, raw_descriptor), preference), resolution) in
+        for (((id, binary, _, raw_descriptor), preference), resolution) in
             manifests.into_iter().zip(preferences).zip(resolutions)
         {
             let path = resolution
@@ -3824,6 +3830,15 @@ mod tests {
         assert!(
             agents.len() >= 20,
             "readiness must expose the complete supported CLI catalog"
+        );
+        assert_eq!(
+            agents
+                .iter()
+                .take(3)
+                .filter_map(|agent| agent["kind"].as_str())
+                .collect::<Vec<_>>(),
+            ["claude-code", "codex", "antigravity"],
+            "the manifest-owned default catalog order must place Antigravity after Claude Code and Codex"
         );
         let claude = agents
             .iter()

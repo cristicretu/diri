@@ -14,6 +14,7 @@
       "cc"
     ],
     "firstClass": true,
+    "catalogOrder": 10,
     "setup": {
       "url": "https://docs.anthropic.com/en/docs/claude-code/getting-started",
       "installHint": "Follow Anthropic's Claude Code installation guide.",

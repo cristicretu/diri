@@ -238,8 +238,8 @@ pub struct AgentReadinessItem {
     pub error: Option<String>,
     /// The agent's manifest descriptor. This is how the AGENT CATALOG reaches
     /// the client: `agent.readiness` doubles as "what agents exist and what can
-    /// they do". Absent when talking to a daemon that predates it — the client
-    /// then falls back to its built-in knowledge of the original four.
+    /// they do". Absent descriptors are rendered from the manifest id; clients
+    /// must not invent additional supported or installed Agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub descriptor: Option<AgentDescriptor>,
 }
