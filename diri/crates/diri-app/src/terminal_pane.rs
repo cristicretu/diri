@@ -496,14 +496,18 @@ impl AttachmentControl {
 }
 
 enum PaneEvent {
-    AttachmentState(SessionId, AttachmentState),
-    Chunk(SessionId, TerminalChunk),
-    GridBatch(SessionId, Vec<GridUpdate>),
+    AttachmentState(SessionId, AttachmentGeneration, AttachmentState),
+    Chunk(SessionId, AttachmentGeneration, TerminalChunk),
+    GridBatch(SessionId, AttachmentGeneration, Vec<GridUpdate>),
     FindSnapshot(SessionId, SearchRequest, FindSnapshot),
     ScrollbackCells(SessionId, diri_proto::ReadScrollbackCellsResult, usize),
     ScrollbackFailed(SessionId),
     ClipboardUploadFinished(SessionId, Result<String, String>),
 }
+
+/// Identifies one attachment task, not the durable session it reads. A session
+/// receives a new generation whenever residency replaces its attachment.
+type AttachmentGeneration = u64;
 
 /// Bounded, grid-aware handoff from transport tasks to the GPUI thread.
 /// Terminal grids are state, not a log: one coalesced final update per session
@@ -522,9 +526,10 @@ struct PaneEventReceiver {
 #[derive(Default)]
 struct PaneMailboxState {
     events: VecDeque<PaneEvent>,
-    /// At most a new baseline plus its final trailing diff. The two-frame
-    /// boundary is observable by resize reflow holds and must not be erased.
-    grids: HashMap<SessionId, Vec<GridUpdate>>,
+    /// At most one attachment generation's new baseline plus its final trailing
+    /// diff. The two-frame boundary is observable by resize reflow holds and
+    /// must not be erased.
+    grids: HashMap<SessionId, (AttachmentGeneration, Vec<GridUpdate>)>,
     grid_order: VecDeque<SessionId>,
 }
 
@@ -550,23 +555,32 @@ impl PaneEventSender {
         }
         let mut state = self.state.lock().expect("pane event mailbox");
         match event {
-            PaneEvent::Chunk(id, TerminalChunk::Grid(update)) => {
-                if let Some(batch) = state.grids.get_mut(&id) {
-                    let starts_new_baseline = update.is_full_snapshot
-                        || batch.last().is_some_and(|last| {
-                            last.cols != update.cols || last.rows != update.rows
-                        });
-                    if starts_new_baseline {
+            PaneEvent::Chunk(id, generation, TerminalChunk::Grid(update)) => {
+                if let Some((queued_generation, batch)) = state.grids.get_mut(&id) {
+                    if generation < *queued_generation {
+                        return Ok(());
+                    }
+                    if generation > *queued_generation {
+                        *queued_generation = generation;
                         batch.clear();
                         batch.push(update);
-                    } else if batch.len() == 1 && batch[0].is_full_snapshot {
-                        batch.push(update);
-                    } else if let Some(pending) = batch.last_mut() {
-                        pending.coalesce(update);
+                    } else {
+                        let starts_new_baseline = update.is_full_snapshot
+                            || batch.last().is_some_and(|last| {
+                                last.cols != update.cols || last.rows != update.rows
+                            });
+                        if starts_new_baseline {
+                            batch.clear();
+                            batch.push(update);
+                        } else if batch.len() == 1 && batch[0].is_full_snapshot {
+                            batch.push(update);
+                        } else if let Some(pending) = batch.last_mut() {
+                            pending.coalesce(update);
+                        }
                     }
                 } else {
                     state.grid_order.push_back(id.clone());
-                    state.grids.insert(id, vec![update]);
+                    state.grids.insert(id, (generation, vec![update]));
                 }
             }
             event => {
@@ -591,8 +605,8 @@ impl PaneEventReceiver {
         let mut state = self.state.lock().expect("pane event mailbox");
         batch.extend(state.events.drain(..));
         while let Some(id) = state.grid_order.pop_front() {
-            if let Some(updates) = state.grids.remove(&id) {
-                batch.push(PaneEvent::GridBatch(id, updates));
+            if let Some((generation, updates)) = state.grids.remove(&id) {
+                batch.push(PaneEvent::GridBatch(id, generation, updates));
             }
         }
         true
@@ -602,6 +616,9 @@ impl PaneEventReceiver {
 struct ResidentTerminal {
     element: TerminalElement,
     attachment: AttachmentControl,
+    /// Rejects events that finished crossing to GPUI after this resident's
+    /// predecessor was detached.
+    attachment_generation: AttachmentGeneration,
     attachment_state: AttachmentState,
     find: Option<TerminalFindModel>,
     /// The editable text behind `find`'s query, so ⌘F gets the same caret,
@@ -675,6 +692,9 @@ pub struct TerminalPane {
     /// switching read as instant with a residency of one.
     parked_grids: Vec<(SessionId, SharedGridBuffer)>,
     pane_tx: PaneEventSender,
+    /// Monotonic within this pane; enough to distinguish replacement tasks
+    /// because every attachment event returns through this pane's mailbox.
+    next_attachment_generation: AttachmentGeneration,
     focus: FocusHandle,
     glyphs: HashMap<SessionId, Entity<StatusGlyph>>,
     open_checks_for: Option<String>,
@@ -808,6 +828,7 @@ impl TerminalPane {
             residents: HashMap::new(),
             parked_grids: Vec::new(),
             pane_tx,
+            next_attachment_generation: 1,
             focus,
             glyphs: HashMap::new(),
             open_checks_for: None,
@@ -883,6 +904,8 @@ impl TerminalPane {
                 continue;
             }
             let mono = crate::fonts::terminal_font();
+            let generation = self.next_attachment_generation;
+            self.next_attachment_generation = self.next_attachment_generation.wrapping_add(1);
             let parked = self
                 .parked_grids
                 .iter()
@@ -892,6 +915,7 @@ impl TerminalPane {
                 &self.tokio,
                 socket.clone(),
                 id.clone(),
+                generation,
                 self.pane_tx.clone(),
             );
             let ime_attachment = attachment.clone();
@@ -910,6 +934,7 @@ impl TerminalPane {
                 ResidentTerminal {
                     element,
                     attachment,
+                    attachment_generation: generation,
                     attachment_state: AttachmentState::Attaching,
                     find: None,
                     find_query: QueryEditor::default(),
@@ -1057,7 +1082,10 @@ impl TerminalPane {
 
     fn handle_pane_event(&mut self, event: PaneEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
-            PaneEvent::AttachmentState(id, state) => {
+            PaneEvent::AttachmentState(id, generation, state) => {
+                if !self.attachment_is_current(&id, generation) {
+                    return;
+                }
                 if let Some(resident) = self.residents.get_mut(&id) {
                     if resident.attachment_state != state {
                         resident.pointer_owner = None;
@@ -1069,7 +1097,10 @@ impl TerminalPane {
                     cx.notify();
                 }
             }
-            PaneEvent::Chunk(id, TerminalChunk::Grid(update)) => {
+            PaneEvent::Chunk(id, generation, TerminalChunk::Grid(update)) => {
+                if !self.attachment_is_current(&id, generation) {
+                    return;
+                }
                 if let Some(hold) = self.reflow_holds.get_mut(&id) {
                     if hold.park(update) {
                         self.release_reflow_hold(&id, window, cx);
@@ -1078,7 +1109,10 @@ impl TerminalPane {
                 }
                 self.apply_grid_updates(id, [update], window, cx);
             }
-            PaneEvent::GridBatch(id, updates) => {
+            PaneEvent::GridBatch(id, generation, updates) => {
+                if !self.attachment_is_current(&id, generation) {
+                    return;
+                }
                 if self.reflow_holds.contains_key(&id) {
                     for update in updates {
                         let release = self
@@ -1093,7 +1127,10 @@ impl TerminalPane {
                 }
                 self.apply_grid_updates(id, updates, window, cx);
             }
-            PaneEvent::Chunk(id, TerminalChunk::Modes { alt_screen, mouse }) => {
+            PaneEvent::Chunk(id, generation, TerminalChunk::Modes { alt_screen, mouse }) => {
+                if !self.attachment_is_current(&id, generation) {
+                    return;
+                }
                 if let Some(resident) = self.residents.get_mut(&id) {
                     if resident.element.mouse_modes() != mouse {
                         resident.pointer_owner = None;
@@ -1105,7 +1142,7 @@ impl TerminalPane {
                     cx.notify();
                 }
             }
-            PaneEvent::Chunk(_, TerminalChunk::Pong) => {}
+            PaneEvent::Chunk(_, _, TerminalChunk::Pong) => {}
             PaneEvent::FindSnapshot(id, request, snapshot) => {
                 let visible = self.selected_id().as_ref() == Some(&id);
                 if let Some(resident) = self.residents.get_mut(&id)
@@ -1148,6 +1185,12 @@ impl TerminalPane {
                 Err(error) => eprintln!("diri: clipboard image upload failed: {error}"),
             },
         }
+    }
+
+    fn attachment_is_current(&self, id: &SessionId, generation: AttachmentGeneration) -> bool {
+        self.residents
+            .get(id)
+            .is_some_and(|resident| resident.attachment_generation == generation)
     }
 
     /// Applies grid frames to a resident and repaints if what landed is worth a
@@ -3386,6 +3429,7 @@ fn spawn_attachment(
     runtime: &Handle,
     socket: std::path::PathBuf,
     id: SessionId,
+    generation: AttachmentGeneration,
     pane_tx: PaneEventSender,
 ) -> AttachmentControl {
     let (command_tx, mut commands) = mpsc::unbounded_channel();
@@ -3397,6 +3441,7 @@ fn spawn_attachment(
         loop {
             let _ = pane_tx.send(PaneEvent::AttachmentState(
                 id.clone(),
+                generation,
                 AttachmentState::Attaching,
             ));
             let mut attachment = match SessionAttachment::connect(&socket, id.clone()).await {
@@ -3404,6 +3449,7 @@ fn spawn_attachment(
                 Err(_) => {
                     let _ = pane_tx.send(PaneEvent::AttachmentState(
                         id.clone(),
+                        generation,
                         AttachmentState::Reconnecting,
                     ));
                     if wait_for_retry(&mut commands, &mut last_resize).await {
@@ -3418,6 +3464,7 @@ fn spawn_attachment(
             }
             let _ = pane_tx.send(PaneEvent::AttachmentState(
                 id.clone(),
+                generation,
                 AttachmentState::Live,
             ));
 
@@ -3425,7 +3472,10 @@ fn spawn_attachment(
                 tokio::select! {
                     chunk = attachment.chunks.recv() => {
                         let Some(chunk) = chunk else { break false };
-                        if pane_tx.send(PaneEvent::Chunk(id.clone(), chunk)).is_err() {
+                        if pane_tx
+                            .send(PaneEvent::Chunk(id.clone(), generation, chunk))
+                            .is_err()
+                        {
                             break true;
                         }
                     }
@@ -3455,6 +3505,7 @@ fn spawn_attachment(
             }
             let _ = pane_tx.send(PaneEvent::AttachmentState(
                 id.clone(),
+                generation,
                 AttachmentState::Reconnecting,
             ));
             if wait_for_retry(&mut commands, &mut last_resize).await {
@@ -3747,6 +3798,7 @@ mod tests {
     async fn pane_mailbox_retains_one_exact_final_grid_per_session() {
         let (sender, mut receiver) = pane_event_channel();
         let id = SessionId::new("mailbox");
+        let generation = 7;
         let mut first_cells = vec![GridCell::BLANK; 2];
         first_cells[0].scalar = u32::from('a');
         let first = GridUpdate {
@@ -3772,22 +3824,33 @@ mod tests {
 
         assert!(
             sender
-                .send(PaneEvent::Chunk(id.clone(), TerminalChunk::Grid(first)))
+                .send(PaneEvent::Chunk(
+                    id.clone(),
+                    generation,
+                    TerminalChunk::Grid(first),
+                ))
                 .is_ok()
         );
         assert!(
             sender
-                .send(PaneEvent::Chunk(id.clone(), TerminalChunk::Grid(second)))
+                .send(PaneEvent::Chunk(
+                    id.clone(),
+                    generation,
+                    TerminalChunk::Grid(second),
+                ))
                 .is_ok()
         );
 
         let mut batch = Vec::new();
         assert!(receiver.recv_batch(&mut batch).await);
         assert_eq!(batch.len(), 1);
-        let PaneEvent::GridBatch(batch_id, updates) = batch.pop().expect("grid batch") else {
+        let PaneEvent::GridBatch(batch_id, batch_generation, updates) =
+            batch.pop().expect("grid batch")
+        else {
             panic!("mailbox did not return a grid batch");
         };
         assert_eq!(batch_id, id);
+        assert_eq!(batch_generation, generation);
         assert_eq!(updates.len(), 2, "the post-snapshot boundary is retained");
         let mut applied = Vec::new();
         for update in &updates {
@@ -3796,6 +3859,36 @@ mod tests {
         assert_eq!(applied, final_cells);
         assert_eq!(updates.last().expect("final update").cursor_col, 0);
         assert!(!updates.last().expect("final update").cursor_visible);
+    }
+
+    #[tokio::test]
+    async fn pane_mailbox_replaces_a_stale_attachment_grid_with_the_new_generation() {
+        let (sender, mut receiver) = pane_event_channel();
+        let id = SessionId::new("reselected");
+
+        for (generation, character) in [(3, 'o'), (4, 'n'), (3, 's')] {
+            assert!(
+                sender
+                    .send(PaneEvent::Chunk(
+                        id.clone(),
+                        generation,
+                        TerminalChunk::Grid(filled_grid(character)),
+                    ))
+                    .is_ok()
+            );
+        }
+
+        let mut batch = Vec::new();
+        assert!(receiver.recv_batch(&mut batch).await);
+        assert_eq!(batch.len(), 1);
+        let PaneEvent::GridBatch(batch_id, generation, updates) = batch.pop().expect("grid batch")
+        else {
+            panic!("mailbox did not return a grid batch");
+        };
+        assert_eq!(batch_id, id);
+        assert_eq!(generation, 4);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].changed_rows[0].cells[0].scalar, u32::from('n'));
     }
 
     /// Replays a drag as the render loop sees it -- a geometry change every
@@ -4086,6 +4179,24 @@ mod tests {
         }
     }
 
+    fn filled_grid(character: char) -> GridUpdate {
+        const COLS: u16 = 8;
+        const ROWS: u16 = 4;
+        let mut cell = GridCell::BLANK;
+        cell.scalar = u32::from(character);
+        GridUpdate {
+            cols: COLS,
+            rows: ROWS,
+            cursor_col: 0,
+            cursor_row: ROWS - 1,
+            cursor_visible: true,
+            is_full_snapshot: true,
+            changed_rows: (0..ROWS)
+                .map(|row| ChangedRow::new(row, vec![cell; usize::from(COLS)]))
+                .collect(),
+        }
+    }
+
     fn reflow_hold() -> ReflowHold {
         ReflowHold {
             parked: Vec::new(),
@@ -4364,6 +4475,99 @@ mod tests {
         pane.update_in(cx, |pane, window, cx| {
             pane.reconcile_store_change(window, cx);
             assert!(pane.is_focused(window));
+        });
+    }
+
+    #[gpui::test]
+    fn stale_detached_attachment_cannot_overwrite_a_reselected_session(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let mut reselected = fixture_session();
+        reselected.id = SessionId::new("reselected");
+        let mut other = fixture_session();
+        other.id = SessionId::new("other");
+        {
+            let mut store = runtime.store.write().expect("session store lock poisoned");
+            store.upsert_session(reselected.clone());
+            store.upsert_session(other.clone());
+            store.select(reselected.id.clone());
+        }
+
+        let runtime_for_view = Arc::clone(&runtime);
+        let (pane, cx) = cx.add_window_view(move |window, cx| {
+            TerminalPane::new(runtime_for_view, tokio, window, cx)
+        });
+        let old_generation = pane.read_with(cx, |pane, _| {
+            pane.residents
+                .get(&reselected.id)
+                .expect("initial resident")
+                .attachment_generation
+        });
+        let stale = PaneEvent::Chunk(
+            reselected.id.clone(),
+            old_generation,
+            TerminalChunk::Grid(filled_grid('s')),
+        );
+
+        // Replace A's resident attachment, exactly as an A -> B -> A switch
+        // does with the default residency of one.
+        {
+            runtime
+                .store
+                .write()
+                .expect("session store lock poisoned")
+                .select(other.id.clone());
+        }
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+        });
+        {
+            runtime
+                .store
+                .write()
+                .expect("session store lock poisoned")
+                .select(reselected.id.clone());
+        }
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            let new_generation = pane
+                .residents
+                .get(&reselected.id)
+                .expect("reselected resident")
+                .attachment_generation;
+            assert_ne!(new_generation, old_generation);
+            pane.handle_pane_event(
+                PaneEvent::Chunk(
+                    reselected.id.clone(),
+                    new_generation,
+                    TerminalChunk::Grid(filled_grid('n')),
+                ),
+                window,
+                cx,
+            );
+        });
+
+        // The old attachment can finish a read after its control was dropped.
+        // That event was already queued before the replacement existed and
+        // must not repaint the new resident's buffer.
+        pane.update_in(cx, |pane, window, cx| {
+            pane.handle_pane_event(stale, window, cx);
+            let resident = pane
+                .residents
+                .get(&reselected.id)
+                .expect("reselected resident");
+            let buffer = resident.element.buffer();
+            let buffer = buffer.read().expect("grid buffer lock poisoned");
+            assert_eq!(
+                buffer.cells[0].scalar,
+                u32::from('n'),
+                "a detached attachment repainted the newly selected terminal"
+            );
         });
     }
 
