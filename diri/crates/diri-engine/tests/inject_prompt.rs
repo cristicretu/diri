@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use diri_engine::control::ControlServer;
 use diri_engine::detect::ManifestEngine;
 use diri_engine::registry::Registry;
-use diri_proto::ControlMessage;
+use diri_proto::{ControlError, ControlMessage};
 use serde_json::json;
 
 fn engine() -> Arc<ManifestEngine> {
@@ -42,6 +42,15 @@ impl Control {
     }
 
     fn request(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+        self.try_request(method, params)
+            .unwrap_or_else(|error| panic!("{method} failed: {error}"))
+    }
+
+    fn try_request(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, ControlError> {
         let id = self.next_id;
         self.next_id += 1;
         let mut bytes = serde_json::to_vec(&ControlMessage::Request {
@@ -55,9 +64,7 @@ impl Control {
         let mut line = String::new();
         self.reader.read_line(&mut line).expect("read reply");
         match serde_json::from_str::<ControlMessage>(&line).expect("decode") {
-            ControlMessage::Response {
-                result: Ok(result), ..
-            } => result,
+            ControlMessage::Response { result, .. } => result,
             other => panic!("{method} failed: {other:?}"),
         }
     }
@@ -106,6 +113,56 @@ fn screen(control: &mut Control, id: &str) -> String {
 
 fn occurrences(haystack: &str, needle: &str) -> usize {
     haystack.matches(needle).count()
+}
+
+/// A successful spawn with an initial prompt is an acknowledgement that the
+/// prompt reached the child, not merely that prompt delivery was scheduled.
+#[test]
+fn spawn_does_not_return_before_prompt_is_delivered() {
+    let temp = tempfile::tempdir().expect("temp");
+    let server = start_server(temp.path());
+    let mut control = Control::connect(&server);
+
+    let prompt = "acknowledge this prompt";
+    let id = spawn(
+        &mut control,
+        r#"sleep 1.2; stty -echo; printf '\033[?2004h> '; exec cat"#,
+        "/bin/sh",
+        prompt,
+    );
+
+    let text = screen(&mut control, &id);
+    assert!(
+        text.contains(prompt),
+        "session.spawn returned success before delivering its prompt: {text:?}"
+    );
+
+    control.request("session.kill", json!({ "sessionID": id }));
+}
+
+#[test]
+fn spawn_reports_when_the_child_exits_before_accepting_its_prompt() {
+    let temp = tempfile::tempdir().expect("temp");
+    let server = start_server(temp.path());
+    let mut control = Control::connect(&server);
+
+    let error = control
+        .try_request(
+            "session.spawn",
+            json!({
+                "kind": { "shell": {} },
+                "cwd": "/tmp",
+                "argv": ["/bin/sh", "-c", "exit 0"],
+                "initialPrompt": "this cannot be delivered",
+            }),
+        )
+        .expect_err("spawn must not acknowledge an undelivered prompt");
+
+    assert_eq!(error.code, "initial_prompt_delivery_failed");
+    assert!(
+        error.message.contains("session s_") && error.message.contains("was not delivered"),
+        "the error must identify the created session and the delivery failure: {error}"
+    );
 }
 
 /// A TUI that paints nothing for over a second, then brings its composer up

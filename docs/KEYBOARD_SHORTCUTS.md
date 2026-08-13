@@ -12,7 +12,7 @@ you are typing in a terminal.
 
 | Shortcut | Keys | Action |
 | --- | --- | --- |
-| ⌘N | Command-N | Open the launcher: pick a project and agent, then type the first prompt |
+| ⌘N | Command-N | Show or hide the launcher: pick a project and agent, then type the first prompt |
 | ⌘T | Command-T | Start a session with the default agent immediately, no launcher |
 | ⌥⌘T | Option-Command-T | Start a plain shell session |
 | ⇧⌘N | Shift-Command-N | Start a Codex session |

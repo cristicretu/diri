@@ -1045,6 +1045,20 @@ impl RootView {
         });
     }
 
+    fn toggle_launcher(&mut self, _: &OpenLauncher, window: &mut Window, cx: &mut Context<Self>) {
+        let opens = self
+            .launcher
+            .update(cx, |launcher, cx| launcher.toggle(window, cx));
+        cx.notify();
+        if !opens {
+            return;
+        }
+        let launcher = self.launcher.clone();
+        cx.defer_in(window, move |_, window, cx| {
+            launcher.update(cx, |launcher, cx| launcher.focus(window, cx));
+        });
+    }
+
     fn on_key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(surfaces) = &self.session_surfaces {
             surfaces.update(cx, |surfaces, cx| {
@@ -2049,7 +2063,7 @@ impl Render for RootView {
             .capture_key_up(cx.listener(Self::on_key_up))
             .on_action(cx.listener(Self::close_selected_session))
             .on_action(cx.listener(Self::reopen_last_session))
-            .on_action(cx.listener(Self::open_launcher))
+            .on_action(cx.listener(Self::toggle_launcher))
             .on_action(cx.listener(|this, _: &NewDefaultSession, window, cx| {
                 this.run_command(CommandId::NewDefaultSession, window, cx);
             }))
