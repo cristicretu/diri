@@ -12,8 +12,8 @@ use diri_ui::{
 };
 use gpui::{
     AnyElement, App, Context, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle,
-    KeyDownEvent, MouseButton, PathPromptOptions, Render, Role, Task, Window, div, prelude::*, px,
-    rgba,
+    KeyDownEvent, MouseButton, PathPromptOptions, Render, Role, ScrollHandle, Task, Window, div,
+    prelude::*, px, rgba,
 };
 
 use crate::AppServices;
@@ -36,6 +36,11 @@ const CONTROL_SIZE: f32 = 32.0;
 const CONTROL_RADIUS: f32 = 9.0;
 const SHELF_HEIGHT: f32 = 40.0;
 const PICKER_HEIGHT: f32 = 200.0;
+const RECIPE_PICKER_MIN_HEIGHT: f32 = 156.0;
+const RECIPE_PICKER_MAX_HEIGHT: f32 = 320.0;
+const RECIPE_PICKER_GAP: f32 = 8.0;
+const PANEL_EDGE_INSET: f32 = 12.0;
+const RECIPE_ROW_GROUP: &str = "recipe-row";
 
 /// Composer metrics. The text area is sized from the wrapped line count
 /// rather than pinned at one height: a one-line prompt should not sit in a
@@ -55,6 +60,29 @@ const COMPOSER_CONTROLS_HEIGHT: f32 = 44.0;
 /// The width text actually wraps at, derived from the panel so the two cannot
 /// drift apart: the panel, less the composer's margin, padding and border.
 const COMPOSER_TEXT_WIDTH: f32 = PANEL_WIDTH - 2.0 * COMPOSER_INSET - 2.0 * COMPOSER_PADDING - 2.0;
+
+fn recipe_picker_height(viewport_height: f32, composer_height: f32) -> f32 {
+    let base_height = TITLE_HEIGHT + TITLE_GAP + composer_height + SHELF_HEIGHT;
+    (viewport_height - base_height - RECIPE_PICKER_GAP - 2.0 * PANEL_EDGE_INSET)
+        .clamp(RECIPE_PICKER_MIN_HEIGHT, RECIPE_PICKER_MAX_HEIGHT)
+}
+
+fn recipe_surface_height(recipe_count: usize, editor_open: bool, budget: f32) -> f32 {
+    if editor_open {
+        budget.min(206.0)
+    } else {
+        let desired = ((recipe_count as f32 * 54.0) + 54.0).max(128.0);
+        if desired <= budget {
+            desired
+        } else {
+            // Rows are 54pt. Quantizing the crowded viewport keeps both edges
+            // intentional instead of exposing a chopped half-row after
+            // keyboard navigation scrolls to the end.
+            let visible_rows = ((budget - 12.0) / 54.0).floor().max(2.0);
+            12.0 + visible_rows * 54.0
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct LauncherSurfaceFills {
@@ -132,6 +160,7 @@ pub(crate) struct LauncherOverlay {
     /// so both are reachable without the mouse.
     picker: Option<Picker>,
     highlight: usize,
+    recipe_scroll: ScrollHandle,
     open: bool,
     preview: bool,
     _store_changes: Task<()>,
@@ -331,6 +360,7 @@ impl LauncherOverlay {
             drop_notice: None,
             picker: None,
             highlight: 0,
+            recipe_scroll: ScrollHandle::new(),
             open: false,
             preview,
             _store_changes: store_changes,
@@ -632,6 +662,84 @@ impl LauncherOverlay {
             .to_vec()
     }
 
+    /// Opening the library warms every distinct valid destination in one pass.
+    /// A remote recipe should not need a sacrificial first click merely to
+    /// discover whether its Agent is installed.
+    fn warm_recipe_catalogs(&self) {
+        let targets = self
+            .recipes()
+            .into_iter()
+            .map(|recipe| recipe.host)
+            .collect::<HashSet<_>>();
+        let mut store = self
+            .services
+            .store
+            .store
+            .write()
+            .expect("session store lock poisoned");
+        let targets = targets
+            .into_iter()
+            .filter(|target| {
+                target.is_none()
+                    || target
+                        .as_deref()
+                        .is_some_and(|host| store.host(host).is_some())
+            })
+            .filter(|target| store.agent_catalog(target.as_deref()).is_none())
+            .collect::<Vec<_>>();
+        for target in targets {
+            store.request_agent_catalog(target, false);
+        }
+    }
+
+    fn host_label(&self, host: Option<&str>) -> String {
+        match host {
+            None => "This Mac".to_owned(),
+            Some(host) => self
+                .services
+                .store
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .host_display_name(host),
+        }
+    }
+
+    fn recipe_render_facts(&self, recipes: &[LaunchRecipe]) -> Vec<(Option<RecipeIssue>, String)> {
+        let store = self
+            .services
+            .store
+            .store
+            .read()
+            .expect("session store lock poisoned");
+        recipes
+            .iter()
+            .map(|recipe| {
+                let issue = recipe
+                    .validate(
+                        store.projects(),
+                        store.hosts(),
+                        store.agent_catalog(recipe.host.as_deref()),
+                        |project| {
+                            project.host.clone().or_else(|| {
+                                store
+                                    .sessions()
+                                    .values()
+                                    .find(|session| session.project_id == project.id)
+                                    .and_then(|session| session.host.clone())
+                            })
+                        },
+                    )
+                    .err();
+                let destination = recipe.host.as_deref().map_or_else(
+                    || "This Mac".to_owned(),
+                    |host| store.host_display_name(host),
+                );
+                (issue, destination)
+            })
+            .collect()
+    }
+
     fn current_recipe(&self, name: String) -> LaunchRecipe {
         let projects = self.projects();
         let project = recipe_project_for_draft(
@@ -664,6 +772,29 @@ impl LauncherOverlay {
             .read()
             .expect("session store lock poisoned");
         recipe.resolve(
+            store.projects(),
+            store.hosts(),
+            store.agent_catalog(recipe.host.as_deref()),
+            |project| {
+                project.host.clone().or_else(|| {
+                    store
+                        .sessions()
+                        .values()
+                        .find(|session| session.project_id == project.id)
+                        .and_then(|session| session.host.clone())
+                })
+            },
+        )
+    }
+
+    fn validate_recipe(&self, recipe: &LaunchRecipe) -> Result<(), RecipeIssue> {
+        let store = self
+            .services
+            .store
+            .store
+            .read()
+            .expect("session store lock poisoned");
+        recipe.validate(
             store.projects(),
             store.hosts(),
             store.agent_catalog(recipe.host.as_deref()),
@@ -777,12 +908,21 @@ impl LauncherOverlay {
             .clone()
             .unwrap_or_else(|| suggested_recipe_name(self.prompt.text()));
         let recipe = self.current_recipe(name.clone());
-        if let Err(issue) = self.resolve_recipe(&recipe) {
+        if let Err(issue) = self.validate_recipe(&recipe) {
             self.fallback_notice = Some(issue.message());
             cx.notify();
             return;
         }
-        let result = self.update_recipe_book(|book| book.add(recipe).map(|_| ()));
+        let mut saved = None;
+        let result = self.update_recipe_book(|book| {
+            saved = Some(book.add(recipe)?.clone());
+            Ok(())
+        });
+        if result.is_ok() {
+            self.active_recipe = saved;
+            self.draft_recipe_name = Some(name.clone());
+            self.recipe_project_edited = false;
+        }
         self.fallback_notice = Some(match result {
             Ok(()) => format!("Saved “{name}” — it is now a one-click recipe"),
             Err(error) => format!("Could not save recipe: {error}"),
@@ -799,7 +939,7 @@ impl LauncherOverlay {
         let id = active.id;
         let name = self.draft_recipe_name.clone().unwrap_or(active.name);
         let mut recipe = self.current_recipe(name.clone());
-        if let Err(issue) = self.resolve_recipe(&recipe) {
+        if let Err(issue) = self.validate_recipe(&recipe) {
             self.fallback_notice = Some(issue.message());
             cx.notify();
             return;
@@ -821,13 +961,14 @@ impl LauncherOverlay {
 
     fn remove_recipe(&mut self, id: &str, cx: &mut Context<Self>) {
         let result = self.update_recipe_book(|book| book.remove(id).map(|_| ()));
-        if self.active_recipe.as_ref().map(|recipe| recipe.id.as_str()) == Some(id) {
+        if delete_clears_active_recipe(result.is_ok(), self.active_recipe.as_ref(), id) {
             self.active_recipe = None;
             self.recipe_project_edited = false;
         }
-        if let Err(error) = result {
-            self.fallback_notice = Some(format!("Could not delete recipe: {error}"));
-        }
+        self.fallback_notice = Some(match result {
+            Ok(()) => "Recipe deleted".to_owned(),
+            Err(error) => format!("Could not delete recipe: {error}"),
+        });
         let count = self.recipes().len().saturating_add(1);
         self.highlight = self.highlight.min(count.saturating_sub(1));
         cx.notify();
@@ -946,7 +1087,11 @@ impl LauncherOverlay {
                     .as_ref()
                     .is_some_and(|active| active.id == id)
                 {
-                    self.preview_recipe(&updated);
+                    // This editor mutates the saved baseline only. The live
+                    // launcher may contain one-off prompt, Agent, project,
+                    // title, or worktree overrides and must not be reloaded.
+                    self.active_recipe = Some(updated.clone());
+                    self.draft_recipe_name = Some(updated.name.clone());
                 }
                 self.recipe_editor = None;
                 self.fallback_notice = Some(format!("Updated “{}”", updated.name));
@@ -1024,7 +1169,8 @@ impl LauncherOverlay {
     }
 
     fn selected_project_label(&self) -> String {
-        self.projects()
+        let project = self
+            .projects()
             .into_iter()
             .find(|project| {
                 project.project.root == self.selected_root && project.host == self.selected_host
@@ -1037,7 +1183,11 @@ impl LauncherOverlay {
                     .map(str::to_owned)
             })
             .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| "Choose project".to_owned())
+            .unwrap_or_else(|| "Choose project".to_owned());
+        format!(
+            "{project} · {}",
+            self.host_label(self.selected_host.as_deref())
+        )
     }
 
     /// Why the prompt cannot be sent yet, as something to show the user.
@@ -1077,7 +1227,7 @@ impl LauncherOverlay {
                 .then(|| "Local paths cannot be used on a remote session".to_owned());
         }
         let recipe = self.current_recipe("New Agent".to_owned());
-        match self.resolve_recipe(&recipe) {
+        match self.validate_recipe(&recipe) {
             Ok(_) => None,
             Err(RecipeIssue::AgentsLoading) => {
                 let scan_error = self
@@ -1314,6 +1464,7 @@ impl LauncherOverlay {
                         self.highlight = (self.highlight as isize + delta)
                             .clamp(0, recipes.len().saturating_sub(1) as isize)
                             as usize;
+                        self.recipe_scroll.scroll_to_item(self.highlight);
                     }
                     return true;
                 }
@@ -1338,6 +1489,9 @@ impl LauncherOverlay {
                 } else {
                     (self.highlight + 1).min(count - 1)
                 };
+                if self.picker == Some(Picker::Recipe) {
+                    self.recipe_scroll.scroll_to_item(self.highlight);
+                }
                 cx.notify();
                 true
             }
@@ -1402,6 +1556,10 @@ impl LauncherOverlay {
         if self.picker == Some(picker) {
             self.picker = None;
             return;
+        }
+        if picker == Picker::Recipe {
+            self.warm_recipe_catalogs();
+            self.recipe_scroll = ScrollHandle::new();
         }
         self.highlight = match picker {
             Picker::Harness => self
@@ -1611,6 +1769,8 @@ impl LauncherOverlay {
             let highlighted = self.highlight == index;
             let root = project.project.root.clone();
             let host = project.host.clone();
+            let destination = self.host_label(host.as_deref());
+            let project_detail = format!("{}  ·  {destination}", project.project.root);
             list = list.child(
                 div()
                     .id(format!("launcher-project-{index}"))
@@ -1621,7 +1781,6 @@ impl LauncherOverlay {
                     .flex()
                     .items_center()
                     .gap(px(9.0))
-                    .group("recipe-row")
                     .rounded(px(8.0))
                     .cursor_pointer()
                     .when(highlighted, |row| row.bg(colors.primary.alpha(0.08)))
@@ -1662,7 +1821,7 @@ impl LauncherOverlay {
                                     .text_color(colors.tertiary)
                                     .whitespace_nowrap()
                                     .overflow_hidden()
-                                    .child(project.project.root),
+                                    .child(project_detail),
                             ),
                     )
                     .when(selected, |row| {
@@ -1704,17 +1863,30 @@ impl LauncherOverlay {
         FloatingSurface::new(colors, list).into_any_element()
     }
 
-    fn render_recipe_picker(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+    fn render_recipe_picker(
+        &self,
+        max_height: f32,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         if let Some(editor) = &self.recipe_editor {
-            return self.render_recipe_editor(editor, colors, cx);
+            return div()
+                .id("launcher-recipe-editor-scroll")
+                .h(px(max_height))
+                .overflow_y_scroll()
+                .child(self.render_recipe_editor(editor, colors, cx))
+                .into_any_element();
         }
         let recipes = self.recipes();
+        let facts = self.recipe_render_facts(&recipes);
         let mut list = div()
             .id("launcher-recipe-list")
+            .debug_selector(|| "launcher-recipe-list".into())
             .py(px(6.0))
-            .w(px(430.0))
-            .max_h(px(320.0))
-            .overflow_y_scroll();
+            .w(px(PANEL_WIDTH - 2.0 * COMPOSER_INSET))
+            .h(px(max_height))
+            .overflow_y_scroll()
+            .track_scroll(&self.recipe_scroll);
 
         if recipes.is_empty() {
             list = list.child(
@@ -1741,7 +1913,7 @@ impl LauncherOverlay {
             );
         }
 
-        for (index, recipe) in recipes.into_iter().enumerate() {
+        for (index, (recipe, (issue, destination))) in recipes.into_iter().zip(facts).enumerate() {
             let id = recipe.id.clone();
             let preview_id = id.clone();
             let edit_id = id.clone();
@@ -1749,21 +1921,25 @@ impl LauncherOverlay {
             let up_id = id.clone();
             let down_id = id.clone();
             let delete_id = id.clone();
-            let issue = self.resolve_recipe(&recipe).err();
             let highlighted = self.highlight == index;
             let active = self
                 .active_recipe
                 .as_ref()
                 .is_some_and(|active| active.id == recipe.id);
             let metadata = format!(
-                "{}  ·  {}",
+                "{}  ·  {}  ·  {}",
                 title_case_id(recipe.agent.id()),
+                destination,
                 recipe.project.display_path()
             );
             let status = issue.as_ref().map(RecipeIssue::message);
             list = list.child(
                 div()
                     .id(format!("launcher-recipe-{id}"))
+                    .debug_selector({
+                        let id = id.clone();
+                        move || format!("launcher-recipe-{id}")
+                    })
                     .mx(px(6.0))
                     .min_h(px(54.0))
                     .px(px(9.0))
@@ -1771,6 +1947,7 @@ impl LauncherOverlay {
                     .flex()
                     .items_center()
                     .gap(px(9.0))
+                    .group(RECIPE_ROW_GROUP)
                     .rounded(px(Radius::ROW))
                     .role(Role::Button)
                     .aria_label(format!("Launch recipe {}", recipe.name))
@@ -1838,7 +2015,7 @@ impl LauncherOverlay {
                             .when(!(highlighted || active), |actions| {
                                 actions
                                     .invisible()
-                                    .group_hover("recipe-row", |style| style.visible())
+                                    .group_hover(RECIPE_ROW_GROUP, |style| style.visible())
                             })
                             .child(recipe_action(
                                 format!("recipe-preview-{preview_id}"),
@@ -1973,7 +2150,7 @@ impl LauncherOverlay {
     ) -> AnyElement {
         let mut form = div()
             .id("launcher-recipe-editor")
-            .w(px(430.0))
+            .w(px(PANEL_WIDTH - 2.0 * COMPOSER_INSET))
             .p(px(12.0))
             .flex()
             .flex_col()
@@ -2018,8 +2195,8 @@ impl LauncherOverlay {
                         cx,
                     )))
                     .child(div().min_w(px(0.0)).flex_1().child(self.recipe_text_field(
-                        "Fresh branch",
-                        "Optional",
+                        "Branch prefix",
+                        "Optional · unique suffix added",
                         editor,
                         RecipeMetadataField::Branch,
                         colors,
@@ -2140,6 +2317,7 @@ impl LauncherOverlay {
 
     fn render_panel(
         &self,
+        viewport_height: f32,
         colors: SemanticColors,
         focused: bool,
         cx: &mut Context<Self>,
@@ -2157,6 +2335,12 @@ impl LauncherOverlay {
         let recipe_count = self.recipes().len();
         let text_height = composer_text_height(self.prompt.line_count());
         let composer_height = text_height + COMPOSER_CONTROLS_HEIGHT;
+        let recipe_picker_budget = recipe_picker_height(viewport_height, composer_height);
+        let recipe_picker_height = recipe_surface_height(
+            recipe_count,
+            self.recipe_editor.is_some(),
+            recipe_picker_budget,
+        );
         // The pickers hang off the bottom of the panel, which now moves with
         // the composer.
         let picker_top = TITLE_HEIGHT + TITLE_GAP + composer_height + SHELF_HEIGHT + 8.0;
@@ -2220,6 +2404,7 @@ impl LauncherOverlay {
                     .child(
                         div()
                             .id("launcher-recipes-button")
+                            .debug_selector(|| "launcher-recipes-button".into())
                             .absolute()
                             .left(px(COMPOSER_INSET))
                             .h(px(28.0))
@@ -2569,9 +2754,17 @@ impl LauncherOverlay {
             })
             .when(recipe_open, |panel| {
                 panel.child(
-                    self.floating(picker_top, cx)
-                        .left(px(COMPOSER_INSET))
-                        .child(self.render_recipe_picker(colors, cx)),
+                    div()
+                        .mt(px(RECIPE_PICKER_GAP))
+                        .ml(px(COMPOSER_INSET))
+                        .w(px(PANEL_WIDTH - 2.0 * COMPOSER_INSET))
+                        .h(px(recipe_picker_height))
+                        .overflow_hidden()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                        )
+                        .child(self.render_recipe_picker(recipe_picker_height, colors, cx)),
                 )
             })
             .when_some(self.drop_notice.clone(), |panel, notice| {
@@ -3168,7 +3361,7 @@ impl Render for LauncherOverlay {
             )
             // Command-N is a high-frequency keyboard action; the destination
             // appears immediately rather than making the user wait on motion.
-            .child(self.render_panel(colors, focused, cx))
+            .child(self.render_panel(window.viewport_size().height.as_f32(), colors, focused, cx))
     }
 }
 
@@ -3217,6 +3410,14 @@ fn text_editor(value: &str) -> QueryEditor {
 fn nonempty(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn delete_clears_active_recipe(
+    persisted: bool,
+    active: Option<&LaunchRecipe>,
+    deleted_id: &str,
+) -> bool {
+    persisted && active.is_some_and(|recipe| recipe.id == deleted_id)
 }
 
 fn recipe_project_for_draft(
@@ -3317,8 +3518,10 @@ fn recipe_action(
     colors: SemanticColors,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
+    let debug_id = id.clone();
     div()
         .id(id)
+        .debug_selector(move || debug_id)
         .size(px(26.0))
         .flex()
         .items_center()
@@ -3340,7 +3543,24 @@ mod tests {
     use crate::sidebar::{PreviewScenario, SidebarPreviewFixture};
     use crate::store::StoreRuntime;
     use crate::usage::UsageSnapshot;
-    use gpui::{Keystroke, TestAppContext};
+    use gpui::{Keystroke, Modifiers, TestAppContext};
+
+    fn test_services(store: Arc<StoreRuntime>) -> Arc<AppServices> {
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let (usage_tx, _) = tokio::sync::watch::channel(UsageSnapshot::default());
+        Arc::new(AppServices {
+            store,
+            usage_tx,
+            updates: crate::updates::inert(),
+            tokio,
+            dev_build: None,
+        })
+    }
 
     fn key(value: &str) -> KeyDownEvent {
         let mut keystroke = Keystroke::parse(value).expect("valid test key");
@@ -3488,6 +3708,255 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    fn saving_a_recipe_binds_the_current_draft_to_its_allocated_identity(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        runtime
+            .store
+            .write()
+            .expect("store lock")
+            .set_agent_catalog(diri_proto::AgentReadinessResult {
+                agents: vec![diri_proto::AgentReadinessItem {
+                    kind: AgentKind::CODEX,
+                    binary: "codex".into(),
+                    path: Some("/usr/bin/codex".into()),
+                    ..diri_proto::AgentReadinessItem::default()
+                }],
+                ..diri_proto::AgentReadinessResult::default()
+            });
+        let services = test_services(Arc::clone(&runtime));
+        let (launcher, _cx) =
+            cx.add_window_view(move |_window, cx| LauncherOverlay::new(services, true, cx));
+
+        launcher.update(cx, |launcher, cx| {
+            launcher.selected_harness = AgentKind::CODEX;
+            launcher.selected_root = "/tmp".into();
+            launcher.prompt.insert_multiline("Review this change");
+            launcher.save_current_recipe(cx);
+            let active = launcher.active_recipe.as_ref().expect("bound saved recipe");
+            assert!(!active.id.is_empty());
+            assert_eq!(launcher.recipes().len(), 1);
+            assert_eq!(launcher.recipes()[0].id, active.id);
+        });
+    }
+
+    #[gpui::test]
+    fn saved_metadata_edits_preserve_live_one_off_overrides(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let stored = {
+            let mut store = runtime.store.write().expect("store lock");
+            store
+                .update_preferences(|prefs| {
+                    prefs
+                        .launch_recipes
+                        .add(LaunchRecipe::draft(
+                            "Review",
+                            AgentKind::CODEX,
+                            RecipeProject::Path {
+                                path: "/tmp".into(),
+                            },
+                            None,
+                            "Stored prompt",
+                        ))
+                        .expect("add recipe");
+                })
+                .expect("save fixture");
+            store.preferences().launch_recipes.items()[0].clone()
+        };
+        let services = test_services(Arc::clone(&runtime));
+        let (launcher, _cx) =
+            cx.add_window_view(move |_window, cx| LauncherOverlay::new(services, true, cx));
+
+        launcher.update(cx, |launcher, cx| {
+            launcher.preview_recipe(&stored);
+            launcher.prompt.clear();
+            launcher.prompt.insert_multiline("One-off prompt");
+            launcher.selected_root = "/private/tmp".into();
+            launcher.recipe_project_edited = true;
+            launcher.selected_harness = AgentKind::SHELL;
+            launcher.selected_title = Some("One-off title".into());
+            launcher.edit_recipe(&stored.id, cx);
+            let editor = launcher.recipe_editor.as_mut().expect("editor");
+            editor.name.select_all();
+            editor.name.insert("Renamed baseline");
+            editor.title.select_all();
+            editor.title.insert("Stored title");
+            launcher.save_recipe_editor(cx);
+
+            assert_eq!(launcher.prompt.text(), "One-off prompt");
+            assert_eq!(launcher.selected_root, "/private/tmp");
+            assert_eq!(launcher.selected_harness, AgentKind::SHELL);
+            assert_eq!(launcher.selected_title.as_deref(), Some("One-off title"));
+            let active = launcher.active_recipe.as_ref().expect("active baseline");
+            assert_eq!(active.name, "Renamed baseline");
+            assert_eq!(active.title.as_deref(), Some("Stored title"));
+        });
+    }
+
+    #[gpui::test]
+    fn opening_recipes_warms_each_valid_destination_and_names_the_host(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        {
+            let mut store = runtime.store.write().expect("store lock");
+            store.set_hosts(vec![diri_proto::HostEntry {
+                id: "forge".into(),
+                name: Some("Build Forge".into()),
+                ssh: "forge".into(),
+                default_cwd: None,
+                node: None,
+            }]);
+            store
+                .update_preferences(|prefs| {
+                    for name in ["Remote review", "Remote tests"] {
+                        prefs
+                            .launch_recipes
+                            .add(LaunchRecipe::draft(
+                                name,
+                                AgentKind::CODEX,
+                                RecipeProject::Path {
+                                    path: "~/diri".into(),
+                                },
+                                Some("forge".into()),
+                                "Run",
+                            ))
+                            .expect("add recipe");
+                    }
+                })
+                .expect("save recipes");
+        }
+        let services = test_services(Arc::clone(&runtime));
+        let (launcher, _cx) =
+            cx.add_window_view(move |_window, cx| LauncherOverlay::new(services, true, cx));
+        launcher.update(cx, |launcher, _| {
+            launcher.selected_root = "~/diri".into();
+            launcher.selected_host = Some("forge".into());
+            launcher.toggle_picker(Picker::Recipe);
+            assert_eq!(launcher.host_label(Some("forge")), "Build Forge");
+            assert_eq!(launcher.selected_project_label(), "diri · Build Forge");
+        });
+        assert!(
+            runtime
+                .store
+                .read()
+                .expect("store lock")
+                .agent_catalog_is_loading(Some("forge")),
+            "opening the picker must start readiness before a row is clicked"
+        );
+    }
+
+    #[test]
+    fn failed_delete_keeps_the_active_recipe_identity() {
+        let mut recipe = LaunchRecipe::draft(
+            "Review",
+            AgentKind::CODEX,
+            RecipeProject::Path {
+                path: "/tmp".into(),
+            },
+            None,
+            "Run",
+        );
+        recipe.id = "recipe-1".into();
+        assert!(!delete_clears_active_recipe(
+            false,
+            Some(&recipe),
+            "recipe-1"
+        ));
+        assert!(delete_clears_active_recipe(true, Some(&recipe), "recipe-1"));
+    }
+
+    #[test]
+    fn recipe_picker_budget_fits_the_minimum_window_even_with_a_tall_composer() {
+        for lines in [COMPOSER_MIN_LINES, COMPOSER_MAX_LINES] {
+            let composer = composer_text_height(lines) + COMPOSER_CONTROLS_HEIGHT;
+            let picker = recipe_picker_height(560.0, composer);
+            let total =
+                TITLE_HEIGHT + TITLE_GAP + composer + SHELF_HEIGHT + RECIPE_PICKER_GAP + picker;
+            assert!(total <= 560.0 - 2.0 * PANEL_EDGE_INSET + 0.01);
+            assert!(picker >= RECIPE_PICKER_MIN_HEIGHT);
+        }
+    }
+
+    #[gpui::test]
+    fn crowded_recipe_picker_stays_in_view_scrolls_with_keys_and_reveals_hover_actions(
+        cx: &mut TestAppContext,
+    ) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        {
+            let mut store = runtime.store.write().expect("store lock");
+            store.set_agent_catalog(diri_proto::AgentReadinessResult {
+                agents: vec![diri_proto::AgentReadinessItem {
+                    kind: AgentKind::CODEX,
+                    binary: "codex".into(),
+                    path: Some("/usr/bin/codex".into()),
+                    ..diri_proto::AgentReadinessItem::default()
+                }],
+                ..diri_proto::AgentReadinessResult::default()
+            });
+            store
+                .update_preferences(|prefs| {
+                    for index in 1..=8 {
+                        prefs
+                            .launch_recipes
+                            .add(LaunchRecipe::draft(
+                                format!("Recipe {index}"),
+                                AgentKind::CODEX,
+                                RecipeProject::Path {
+                                    path: "/tmp".into(),
+                                },
+                                None,
+                                "Run",
+                            ))
+                            .expect("add recipe");
+                    }
+                })
+                .expect("save recipes");
+        }
+        let services = test_services(runtime);
+        let (launcher, cx) =
+            cx.add_window_view(move |_window, cx| LauncherOverlay::new(services, true, cx));
+        launcher.update_in(cx, |launcher, window, cx| {
+            launcher.open(window, cx);
+            launcher.selected_harness = AgentKind::CODEX;
+            launcher.selected_root = "/tmp".into();
+            launcher.toggle_picker(Picker::Recipe);
+            cx.notify();
+        });
+        cx.simulate_resize(gpui::size(px(760.0), px(560.0)));
+
+        assert!(
+            cx.debug_bounds("launcher-recipes-button").is_some(),
+            "open launcher renders"
+        );
+        let list = cx
+            .debug_bounds("launcher-recipe-list")
+            .expect("recipe viewport");
+        assert!(list.top() >= px(0.0));
+        assert!(list.bottom() <= px(560.0));
+
+        let second = cx
+            .debug_bounds("launcher-recipe-recipe-2")
+            .expect("second recipe");
+        cx.simulate_mouse_move(second.center(), None, Modifiers::default());
+        assert!(
+            cx.debug_bounds("recipe-edit-recipe-2").is_some(),
+            "hovering an ordinary row must reveal its management controls"
+        );
+
+        launcher.update_in(cx, |launcher, window, cx| {
+            for _ in 0..7 {
+                assert!(launcher.handle_key_down(&key("down"), window, cx));
+            }
+        });
+        let list = cx
+            .debug_bounds("launcher-recipe-list")
+            .expect("recipe viewport after navigation");
+        let last = cx
+            .debug_bounds("launcher-recipe-recipe-8")
+            .expect("keyboard-selected last recipe");
+        assert!(last.top() >= list.top());
+        assert!(last.bottom() <= list.bottom());
+    }
+
     /// Writes a deterministic visual artifact for design review without live
     /// user state or Screen Recording permission.
     #[cfg(target_os = "macos")]
@@ -3508,6 +3977,14 @@ mod tests {
         cx.update(|cx| crate::fonts::init(cx));
 
         let runtime = Arc::new(StoreRuntime::inert());
+        let repository_root = std::env::current_dir()
+            .expect("fixture repository")
+            .ancestors()
+            .find(|path| path.join(".git").exists())
+            .expect("fixture runs inside a repository")
+            .to_string_lossy()
+            .into_owned();
+        assert!(Path::new(&repository_root).is_dir(), "fixture root exists");
         {
             let mut store = runtime.store.write().expect("store lock");
             store.set_agent_catalog(diri_proto::AgentReadinessResult {
@@ -3525,7 +4002,7 @@ mod tests {
                         "Review this PR",
                         AgentKind::CODEX,
                         RecipeProject::Path {
-                            path: "/tmp".into(),
+                            path: repository_root.clone(),
                         },
                         None,
                         "Review this branch for correctness and product quality",
@@ -3547,6 +4024,36 @@ mod tests {
                             "Find the failure and ship the smallest robust fix",
                         ))
                         .expect("add stale recipe");
+                    for (name, prompt) in [
+                        ("Audit terminal latency", "Profile input-to-paint latency"),
+                        (
+                            "Review accessibility",
+                            "Audit keyboard and screen reader flows",
+                        ),
+                        ("Triage release blockers", "Find and rank release blockers"),
+                        (
+                            "Polish onboarding",
+                            "Make the first-run path feel inevitable",
+                        ),
+                        (
+                            "Harden persistence",
+                            "Stress-test durable state transitions",
+                        ),
+                        ("Prepare changelog", "Draft a concise human changelog"),
+                    ] {
+                        prefs
+                            .launch_recipes
+                            .add(LaunchRecipe::draft(
+                                name,
+                                AgentKind::CODEX,
+                                RecipeProject::Path {
+                                    path: repository_root.clone(),
+                                },
+                                None,
+                                prompt,
+                            ))
+                            .expect("add crowded fixture recipe");
+                    }
                 })
                 .expect("save fixture recipes");
         }
@@ -3565,20 +4072,28 @@ mod tests {
             dev_build: None,
         });
         let window = cx
-            .open_window(gpui::size(px(760.0), px(620.0)), move |window, cx| {
+            .open_window(gpui::size(px(760.0), px(560.0)), move |window, cx| {
                 cx.new(|cx| {
                     let mut launcher = LauncherOverlay::new(services, true, cx);
                     launcher.open(window, cx);
                     launcher
                         .prompt
                         .insert_multiline("Audit this change before merge");
+                    launcher.selected_root.clone_from(&repository_root);
+                    launcher.selected_harness = AgentKind::CODEX;
                     launcher.picker = Some(Picker::Recipe);
+                    launcher.highlight = 7;
+                    launcher.recipe_scroll.scroll_to_item(7);
                     launcher
                 })
             })
             .expect("open headless launcher window");
         cx.run_until_parked();
-        cx.update_window(window.into(), |_, window, _| window.refresh())
+        window
+            .update(&mut cx, |launcher, window, _| {
+                launcher.recipe_scroll.scroll_to_item(7);
+                window.refresh();
+            })
             .expect("refresh launcher window");
         cx.run_until_parked();
         let screenshot = cx

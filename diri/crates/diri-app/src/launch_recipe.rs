@@ -6,6 +6,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use diri_proto::{AgentKind, HostEntry, Project, ProjectId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -15,6 +17,11 @@ use crate::store::{SpawnOptions, WorktreeSpawn};
 
 const CURRENT_VERSION: u32 = 1;
 pub const MAX_RECIPES: usize = 64;
+const MAX_RECIPE_NAME_CHARS: usize = 80;
+const MAX_BRANCH_PREFIX_CHARS: usize = 120;
+const WORKTREE_BRANCH_ATTEMPTS: usize = 16;
+
+static LAUNCH_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -62,6 +69,9 @@ pub enum WorktreePolicy {
     #[default]
     CurrentCheckout,
     Fresh {
+        /// A reusable naming convention, not a literal branch. Every launch
+        /// appends a collision-resistant token so one recipe can be run more
+        /// than once without reusing a branch or sibling worktree path.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         branch: Option<String>,
     },
@@ -196,7 +206,7 @@ impl LaunchRecipeBook {
         if name.is_empty() {
             return Err(RecipeBookError::Missing);
         }
-        recipe.name = name.chars().take(80).collect();
+        recipe.name = name.chars().take(MAX_RECIPE_NAME_CHARS).collect();
         Ok(())
     }
 
@@ -350,6 +360,52 @@ impl LaunchRecipe {
         catalog: Option<&diri_proto::AgentReadinessResult>,
         effective_host: impl Fn(&Project) -> Option<String>,
     ) -> Result<ResolvedRecipe, RecipeIssue> {
+        let cwd = self.validated_cwd(projects, hosts, catalog, &effective_host)?;
+        let worktree = match &self.worktree {
+            WorktreePolicy::CurrentCheckout => None,
+            WorktreePolicy::Fresh { branch } => Some(WorktreeSpawn {
+                create: true,
+                branch: Some(unique_worktree_branch(
+                    branch.as_deref(),
+                    Path::new(&cwd),
+                    launch_token,
+                )?),
+            }),
+        };
+        Ok(ResolvedRecipe {
+            kind: self.agent.clone(),
+            options: SpawnOptions {
+                cwd: Some(cwd),
+                host: self.host.clone(),
+                worktree,
+                title: self.title.clone(),
+                initial_prompt: Some(self.initial_prompt.trim().to_owned()),
+                ..SpawnOptions::default()
+            },
+        })
+    }
+
+    /// Checks every dependency that can go stale without allocating a branch
+    /// token or reading Git refs. Picker paints call this cheap path; only the
+    /// explicit launch materializes and collision-checks a worktree name.
+    pub fn validate(
+        &self,
+        projects: &HashMap<ProjectId, Project>,
+        hosts: &[HostEntry],
+        catalog: Option<&diri_proto::AgentReadinessResult>,
+        effective_host: impl Fn(&Project) -> Option<String>,
+    ) -> Result<(), RecipeIssue> {
+        self.validated_cwd(projects, hosts, catalog, &effective_host)
+            .map(|_| ())
+    }
+
+    fn validated_cwd(
+        &self,
+        projects: &HashMap<ProjectId, Project>,
+        hosts: &[HostEntry],
+        catalog: Option<&diri_proto::AgentReadinessResult>,
+        effective_host: &impl Fn(&Project) -> Option<String>,
+    ) -> Result<String, RecipeIssue> {
         if self.initial_prompt.trim().is_empty() {
             return Err(RecipeIssue::EmptyPrompt);
         }
@@ -388,28 +444,25 @@ impl LaunchRecipe {
             RecipeProject::Path { path } => path.clone(),
         };
 
-        let worktree = match &self.worktree {
-            WorktreePolicy::CurrentCheckout => None,
-            WorktreePolicy::Fresh { branch } => Some(WorktreeSpawn {
-                create: true,
-                branch: branch.clone(),
-            }),
-        };
-        Ok(ResolvedRecipe {
-            kind: self.agent.clone(),
-            options: SpawnOptions {
-                cwd: Some(cwd),
-                host: self.host.clone(),
-                worktree,
-                title: self.title.clone(),
-                initial_prompt: Some(self.initial_prompt.trim().to_owned()),
-                ..SpawnOptions::default()
-            },
-        })
+        if self.host.is_none() && !Path::new(&cwd).is_dir() {
+            return Err(RecipeIssue::MissingPath(cwd));
+        }
+
+        if matches!(self.worktree, WorktreePolicy::Fresh { .. })
+            && !Path::new(&cwd).join(".git").exists()
+        {
+            return Err(RecipeIssue::NotRepository(cwd));
+        }
+        Ok(cwd)
     }
 
     fn normalize(&mut self) {
-        self.name = self.name.trim().chars().take(80).collect();
+        self.name = self
+            .name
+            .trim()
+            .chars()
+            .take(MAX_RECIPE_NAME_CHARS)
+            .collect();
         self.initial_prompt = self.initial_prompt.trim().chars().take(32_768).collect();
         self.title = self
             .title
@@ -419,7 +472,7 @@ impl LaunchRecipe {
         if let WorktreePolicy::Fresh { branch } = &mut self.worktree {
             *branch = branch
                 .take()
-                .map(|branch| branch.trim().chars().take(180).collect::<String>())
+                .map(|branch| normalized_branch_prefix(&branch))
                 .filter(|branch| !branch.is_empty());
         }
     }
@@ -437,6 +490,8 @@ pub enum RecipeIssue {
     MissingHost(String),
     MissingProject(ProjectId),
     MissingPath(String),
+    NotRepository(String),
+    WorktreeCollision(String),
     ProjectMoved {
         expected_host: Option<String>,
         actual_host: Option<String>,
@@ -454,6 +509,12 @@ impl RecipeIssue {
             Self::MissingProject(_) => "Project is missing — choose a new project".to_owned(),
             Self::MissingPath(path) => {
                 format!("Folder ‘{path}’ is missing — choose a new folder")
+            }
+            Self::NotRepository(path) => {
+                format!("Folder ‘{path}’ is not a repository root — choose a repository")
+            }
+            Self::WorktreeCollision(path) => {
+                format!("Worktree destination ‘{path}’ already exists — change the branch prefix")
             }
             Self::ProjectMoved { .. } => {
                 "Project moved to a different host — review the destination".to_owned()
@@ -496,17 +557,118 @@ pub fn suggested_recipe_name(prompt: &str) -> String {
 }
 
 fn unique_copy_name(name: &str, existing: &[LaunchRecipe]) -> String {
-    let base = format!("{} copy", name.trim());
-    if !existing.iter().any(|recipe| recipe.name == base) {
-        return base;
-    }
-    for suffix in 2.. {
-        let candidate = format!("{base} {suffix}");
+    for copy in 1..=existing.len().saturating_add(1) {
+        let suffix = if copy == 1 {
+            " copy".to_owned()
+        } else {
+            format!(" copy {copy}")
+        };
+        let base_budget = MAX_RECIPE_NAME_CHARS.saturating_sub(suffix.chars().count());
+        let base = name.trim().chars().take(base_budget).collect::<String>();
+        let candidate = format!("{}{suffix}", base.trim_end());
         if !existing.iter().any(|recipe| recipe.name == candidate) {
             return candidate;
         }
     }
-    unreachable!()
+    unreachable!("one more copy name than existing recipes must be available")
+}
+
+fn normalized_branch_prefix(value: &str) -> String {
+    let mut result = String::new();
+    let mut separator = false;
+    for character in value
+        .trim()
+        .chars()
+        .take(MAX_BRANCH_PREFIX_CHARS)
+        .flat_map(char::to_lowercase)
+    {
+        if character.is_ascii_alphanumeric() {
+            result.push(character);
+            separator = false;
+        } else if character == '/' {
+            while result.ends_with('-') {
+                result.pop();
+            }
+            if !result.is_empty() && !result.ends_with('/') {
+                result.push('/');
+            }
+            separator = false;
+        } else if !separator && !result.is_empty() && !result.ends_with('/') {
+            result.push('-');
+            separator = true;
+        }
+    }
+    result.trim_matches(['-', '/']).to_owned()
+}
+
+fn launch_token() -> String {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let serial = LAUNCH_NONCE.fetch_add(1, Ordering::Relaxed);
+    let mixed = elapsed
+        ^ serial.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ u64::from(std::process::id()).rotate_left(17);
+    format!("{mixed:016x}")
+}
+
+fn unique_worktree_branch(
+    prefix: Option<&str>,
+    repository: &Path,
+    mut token: impl FnMut() -> String,
+) -> Result<String, RecipeIssue> {
+    let prefix = prefix
+        .map(normalized_branch_prefix)
+        .filter(|prefix| !prefix.is_empty())
+        .unwrap_or_else(|| "dirijor/recipe".to_owned());
+    let mut last_destination = repository.to_path_buf();
+    for _ in 0..WORKTREE_BRANCH_ATTEMPTS {
+        let branch = format!("{prefix}/{}", token());
+        let destination = worktree_destination(repository, &branch);
+        let branch_ref = repository.join(".git/refs/heads").join(&branch);
+        if !destination.exists()
+            && !branch_ref.exists()
+            && !packed_branch_exists(repository, &branch)
+        {
+            return Ok(branch);
+        }
+        last_destination = destination;
+    }
+    Err(RecipeIssue::WorktreeCollision(
+        last_destination.to_string_lossy().into_owned(),
+    ))
+}
+
+fn worktree_destination(repository: &Path, branch: &str) -> std::path::PathBuf {
+    let mut slug = String::with_capacity(branch.len());
+    let mut separator = false;
+    for character in branch.to_lowercase().chars() {
+        if character.is_ascii_lowercase() || character.is_ascii_digit() {
+            slug.push(character);
+            separator = false;
+        } else if !separator {
+            slug.push('-');
+            separator = true;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    let parent = repository.parent().unwrap_or_else(|| Path::new("."));
+    let name = repository
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "repo".into());
+    parent.join(format!("{name}-{slug}"))
+}
+
+fn packed_branch_exists(repository: &Path, branch: &str) -> bool {
+    std::fs::read_to_string(repository.join(".git/packed-refs")).is_ok_and(|packed| {
+        let reference = format!("refs/heads/{branch}");
+        packed.lines().any(|line| {
+            line.split_once(' ')
+                .is_some_and(|(_, candidate)| candidate == reference)
+        })
+    })
 }
 
 #[cfg(test)]
@@ -582,6 +744,9 @@ mod tests {
 
     #[test]
     fn tracked_recipe_resolves_through_the_canonical_spawn_options() {
+        let repository = tempfile::tempdir().expect("repository");
+        std::fs::create_dir(repository.path().join(".git")).expect("git directory");
+        let root = repository.path().to_string_lossy().into_owned();
         let kind = AgentKind::CODEX;
         let mut recipe = LaunchRecipe::draft(
             "Fresh review",
@@ -597,8 +762,7 @@ mod tests {
         recipe.worktree = WorktreePolicy::Fresh {
             branch: Some("review/diri".into()),
         };
-        let projects =
-            HashMap::from([(ProjectId("diri".into()), project("diri", "/new/diri", None))]);
+        let projects = HashMap::from([(ProjectId("diri".into()), project("diri", &root, None))]);
 
         let resolved = recipe
             .resolve(&projects, &[], Some(&catalog(&kind, true)), |project| {
@@ -606,15 +770,15 @@ mod tests {
             })
             .expect("recipe resolves");
         assert_eq!(resolved.kind, kind);
-        assert_eq!(resolved.options.cwd.as_deref(), Some("/new/diri"));
+        assert_eq!(resolved.options.cwd.as_deref(), Some(root.as_str()));
         assert_eq!(resolved.options.title.as_deref(), Some("Review lane"));
-        assert_eq!(
-            resolved.options.worktree,
-            Some(WorktreeSpawn {
-                create: true,
-                branch: Some("review/diri".into())
-            })
-        );
+        let branch = resolved
+            .options
+            .worktree
+            .as_ref()
+            .and_then(|worktree| worktree.branch.clone())
+            .expect("materialized branch");
+        assert!(branch.starts_with("review/diri/"));
 
         let (mut store, mut effects) = SessionStore::headless(Prefs::default());
         store.spawn_kind(resolved.kind, resolved.options);
@@ -622,9 +786,9 @@ mod tests {
             effects.try_recv().expect("canonical spawn effect"),
             StoreEffect::Spawn(SessionSpawnParams {
                 kind: AgentKind::CODEX,
-                cwd: "/new/diri".into(),
+                cwd: root,
                 new_worktree: Some(true),
-                worktree_branch: Some("review/diri".into()),
+                worktree_branch: Some(branch),
                 title: Some("Review lane".into()),
                 initial_prompt: Some("Review this branch".into()),
                 parent: None,
@@ -801,6 +965,107 @@ mod tests {
             )),
             Err(RecipeBookError::Full)
         );
+    }
+
+    #[test]
+    fn fresh_recipe_materializes_a_new_branch_for_every_run() {
+        let repository = tempfile::tempdir().expect("repository");
+        std::fs::create_dir(repository.path().join(".git")).expect("git directory");
+        let root = repository.path().to_string_lossy().into_owned();
+        let kind = AgentKind::CODEX;
+        let mut recipe = LaunchRecipe::draft(
+            "Review",
+            kind.clone(),
+            RecipeProject::Path { path: root },
+            None,
+            "Review this",
+        );
+        recipe.worktree = WorktreePolicy::Fresh {
+            branch: Some("Review / Diri".into()),
+        };
+
+        let first = recipe
+            .resolve(&HashMap::new(), &[], Some(&catalog(&kind, true)), |_| None)
+            .expect("first run")
+            .options
+            .worktree
+            .and_then(|worktree| worktree.branch)
+            .expect("first branch");
+        let second = recipe
+            .resolve(&HashMap::new(), &[], Some(&catalog(&kind, true)), |_| None)
+            .expect("second run")
+            .options
+            .worktree
+            .and_then(|worktree| worktree.branch)
+            .expect("second branch");
+
+        assert!(first.starts_with("review/diri/"));
+        assert!(second.starts_with("review/diri/"));
+        assert_ne!(first, second, "a reusable recipe cannot reuse its branch");
+    }
+
+    #[test]
+    fn local_path_repository_and_worktree_collisions_are_repair_states() {
+        let kind = AgentKind::CODEX;
+        let missing = LaunchRecipe::draft(
+            "Missing",
+            kind.clone(),
+            RecipeProject::Path {
+                path: "/path/that/does/not/exist".into(),
+            },
+            None,
+            "Run",
+        );
+        assert!(matches!(
+            missing.resolve(&HashMap::new(), &[], Some(&catalog(&kind, true)), |_| None),
+            Err(RecipeIssue::MissingPath(_))
+        ));
+
+        let directory = tempfile::tempdir().expect("directory");
+        let root = directory.path().to_string_lossy().into_owned();
+        let mut fresh = LaunchRecipe::draft(
+            "Fresh",
+            kind.clone(),
+            RecipeProject::Path { path: root },
+            None,
+            "Run",
+        );
+        fresh.worktree = WorktreePolicy::Fresh { branch: None };
+        assert!(matches!(
+            fresh.resolve(&HashMap::new(), &[], Some(&catalog(&kind, true)), |_| None),
+            Err(RecipeIssue::NotRepository(_))
+        ));
+
+        std::fs::create_dir(directory.path().join(".git")).expect("git directory");
+        let branch = "review/same";
+        let collision = worktree_destination(directory.path(), branch);
+        std::fs::create_dir(&collision).expect("colliding worktree path");
+        assert!(matches!(
+            unique_worktree_branch(Some("review"), directory.path(), || "same".into()),
+            Err(RecipeIssue::WorktreeCollision(path)) if path == collision.to_string_lossy()
+        ));
+    }
+
+    #[test]
+    fn duplicate_names_remain_distinct_at_the_length_limit() {
+        let mut book = LaunchRecipeBook::default();
+        let original = book
+            .add(LaunchRecipe::draft(
+                "x".repeat(MAX_RECIPE_NAME_CHARS),
+                AgentKind::CODEX,
+                RecipeProject::Path {
+                    path: "/tmp".into(),
+                },
+                None,
+                "Run",
+            ))
+            .expect("original")
+            .clone();
+        let duplicate = book.duplicate(&original.id).expect("duplicate").clone();
+
+        assert_ne!(duplicate.name, original.name);
+        assert!(duplicate.name.ends_with(" copy"));
+        assert!(duplicate.name.chars().count() <= MAX_RECIPE_NAME_CHARS);
     }
 
     #[test]
