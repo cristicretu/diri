@@ -1928,7 +1928,12 @@ impl SessionStore {
         if options.host.is_none() && options.cwd.is_none() && options.same_repo_as.is_none() {
             options.host = self.default_spawn_host();
         }
-        self.spawn_kind(self.prefs.default_agent.clone(), options);
+        let target_host = options.host.clone();
+        let kind = crate::agent_catalog::resolved_target_agent(
+            &self.prefs.default_agent,
+            self.agent_catalog(target_host.as_deref()),
+        );
+        self.spawn_kind(kind, options);
     }
 
     pub fn spawn_shell(&mut self, mut options: SpawnOptions) {

@@ -34,14 +34,13 @@ impl AgentOption {
     }
 }
 
-/// Catalog rows in deterministic product order. An empty response means an
-/// old daemon that predates descriptors, so retain the original four choices
-/// as optimistic compatibility entries instead of making the app unusable.
+/// Complete supported-Agent rows in deterministic product order.
+///
+/// Availability must only come from Engine readiness facts. In particular,
+/// an empty or not-yet-populated response must never be expanded into
+/// optimistic "installed" entries: high-frequency launch surfaces derive
+/// from this collection and must fail closed when detection has no facts.
 pub(crate) fn agent_options(catalog: &AgentReadinessResult) -> Vec<AgentOption> {
-    if catalog.agents.is_empty() {
-        return legacy_options();
-    }
-
     let mut options: Vec<_> = catalog
         .agents
         .iter()
@@ -59,6 +58,15 @@ pub(crate) fn agent_options(catalog: &AgentReadinessResult) -> Vec<AgentOption> 
             .then_with(|| left.kind.id().cmp(right.kind.id()))
     });
     options
+}
+
+/// Settings is the complete supported catalog, grouped by readiness rather
+/// than by name. The stable sort preserves the Engine/catalog order within
+/// each group, so adding a manifest does not introduce a second alphabetical
+/// policy in the UI.
+pub(crate) fn settings_agent_items(mut items: Vec<AgentReadinessItem>) -> Vec<AgentReadinessItem> {
+    items.sort_by_key(|item| !item.available());
+    items
 }
 
 /// Settings and the launcher must expose the shell whenever default resolution
@@ -117,15 +125,15 @@ pub(crate) fn installed_agent_options(catalog: Option<&AgentReadinessResult>) ->
 /// Whether an explicit spawn (shortcut, menu command, launcher submit) may
 /// dispatch this kind. Installed agents qualify even when hidden from quick
 /// create — menu visibility must not turn a saved default into a dead
-/// shortcut — terminals always qualify, and an unfetched catalog does not
-/// veto: availability is then unknown, and the daemon is the authority at
-/// spawn time.
+/// shortcut — and terminals always qualify. An unfetched catalog fails
+/// closed: launch surfaces must not turn missing readiness facts into a claim
+/// that an Agent is installed.
 pub(crate) fn kind_spawnable(kind: &AgentKind, catalog: Option<&AgentReadinessResult>) -> bool {
     if kind.is_terminal() {
         return true;
     }
     let Some(catalog) = catalog else {
-        return true;
+        return false;
     };
     agent_options(catalog)
         .iter()
@@ -150,6 +158,35 @@ pub(crate) fn resolved_default_agent(
         .iter()
         .find(|option| option.available && option.first_class)
         .map_or(AgentKind::SHELL, |option| option.kind.clone())
+}
+
+/// Resolve the Agent actually used by a target-scoped default shortcut.
+///
+/// A saved, installed default remains valid even when the user hides it from
+/// quick-create menus. If it is unavailable on this target, prefer the first
+/// installed and user-enabled Agent shown by those menus, then Terminal. With
+/// no readiness facts, fail closed to Terminal instead of borrowing another
+/// target's PATH or guessing that a manifest binary exists.
+pub(crate) fn resolved_target_agent(
+    saved: &AgentKind,
+    catalog: Option<&AgentReadinessResult>,
+) -> AgentKind {
+    if saved.is_terminal() {
+        return AgentKind::SHELL;
+    }
+    let Some(catalog) = catalog else {
+        return AgentKind::SHELL;
+    };
+    if agent_options(catalog)
+        .iter()
+        .any(|option| option.available && option.kind == *saved)
+    {
+        return saved.clone();
+    }
+    quick_agent_options(Some(catalog))
+        .into_iter()
+        .find(|option| !option.kind.is_terminal())
+        .map_or(AgentKind::SHELL, |option| option.kind)
 }
 
 pub(crate) fn display_name(kind: &AgentKind, catalog: &AgentReadinessResult) -> String {
@@ -237,28 +274,6 @@ fn option_from_readiness(item: &AgentReadinessItem) -> AgentOption {
             .filter(|hint| !hint.is_empty())
             .map(str::to_owned),
     }
-}
-
-fn legacy_options() -> Vec<AgentOption> {
-    [
-        (AgentKind::CLAUDE_CODE, "Claude Code", "claude"),
-        (AgentKind::CODEX, "Codex", "codex"),
-        (AgentKind::CURSOR, "Cursor", "cursor-agent"),
-        (AgentKind::GEMINI, "Gemini", "gemini"),
-    ]
-    .into_iter()
-    .map(|(kind, display_name, binary)| AgentOption {
-        kind,
-        display_name: display_name.to_owned(),
-        binary: binary.to_owned(),
-        available: true,
-        show_in_quick_create: true,
-        first_class: true,
-        setup_url: None,
-        install_hint: format!("Install {binary} and add it to PATH."),
-        sign_in_hint: None,
-    })
-    .collect()
 }
 
 fn terminal_option() -> AgentOption {
@@ -406,6 +421,69 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_catalog_never_invents_installed_agents() {
+        let catalog = AgentReadinessResult::default();
+
+        assert!(agent_options(&catalog).is_empty());
+        assert_eq!(
+            quick_agent_options(Some(&catalog))
+                .into_iter()
+                .map(|option| option.kind)
+                .collect::<Vec<_>>(),
+            vec![AgentKind::SHELL]
+        );
+    }
+
+    #[test]
+    fn settings_groups_installed_agents_first_without_name_sorting() {
+        let items = vec![
+            item("zebra-missing", false, false),
+            item("zulu-installed", true, false),
+            item("alpha-missing", false, false),
+            item("beta-installed", true, false),
+        ];
+
+        assert_eq!(
+            settings_agent_items(items)
+                .into_iter()
+                .map(|item| item.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                AgentKind::new("zulu-installed"),
+                AgentKind::new("beta-installed"),
+                AgentKind::new("zebra-missing"),
+                AgentKind::new("alpha-missing"),
+            ]
+        );
+    }
+
+    #[test]
+    fn target_default_uses_only_that_targets_readiness() {
+        let mut hidden = item("hidden", true, false);
+        hidden.show_in_quick_create = false;
+        let mut visible = item("visible", true, false);
+        visible.show_in_quick_create = true;
+        let unavailable = item("saved", false, true);
+        let catalog = AgentReadinessResult {
+            agents: vec![unavailable, visible, hidden],
+            ..AgentReadinessResult::default()
+        };
+
+        assert_eq!(
+            resolved_target_agent(&AgentKind::new("saved"), Some(&catalog)),
+            AgentKind::new("visible")
+        );
+        assert_eq!(
+            resolved_target_agent(&AgentKind::new("hidden"), Some(&catalog)),
+            AgentKind::new("hidden")
+        );
+        assert_eq!(
+            resolved_target_agent(&AgentKind::new("saved"), None),
+            AgentKind::SHELL
+        );
+    }
+
+    #[test]
     fn quick_create_visibility_never_vetoes_an_explicit_spawn() {
         // Installed but hidden from quick create: the saved default's ⌘T must
         // still spawn it — menu visibility is not availability.
@@ -417,9 +495,8 @@ mod tests {
         };
         assert!(kind_spawnable(&AgentKind::CODEX, Some(&catalog)));
         assert!(!kind_spawnable(&AgentKind::new("absent"), Some(&catalog)));
-        // An unfetched catalog means unknown, not unavailable: the daemon's
-        // spawn-time check is the authority. Terminals are never vetoed.
-        assert!(kind_spawnable(&AgentKind::CLAUDE_CODE, None));
+        // Missing readiness facts fail closed. Terminals are always safe.
+        assert!(!kind_spawnable(&AgentKind::CLAUDE_CODE, None));
         assert!(kind_spawnable(&AgentKind::SHELL, Some(&catalog)));
     }
 

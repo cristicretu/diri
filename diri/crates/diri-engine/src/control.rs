@@ -27,7 +27,12 @@ use crate::registry::Registry;
 
 /// Identifies this engine in the handshake, so a client can tell which
 /// implementation it reached.
-pub const BUILD: &str = concat!("diri-engine-", env!("CARGO_PKG_VERSION"));
+pub const BUILD: &str = concat!(
+    "diri-engine-",
+    env!("CARGO_PKG_VERSION"),
+    "+catalog.",
+    env!("DIRI_AGENT_CATALOG_BUILD_ID")
+);
 
 pub struct ControlServer {
     registry: Arc<Mutex<Registry>>,
@@ -3318,6 +3323,12 @@ mod tests {
                 .is_some_and(|b| b.contains("diri-engine")),
             "the handshake should say which engine answered: {result}"
         );
+        assert!(
+            result["build"]
+                .as_str()
+                .is_some_and(|build| build.contains("+catalog.")),
+            "manifest changes must alter the daemon identity: {result}"
+        );
         assert!(result["pid"].as_i64().is_some_and(|pid| pid > 0));
         assert_eq!(result["engineKind"], diri_proto::RUST_ENGINE_KIND);
         assert_eq!(
@@ -3810,7 +3821,10 @@ mod tests {
         let server = server(temp.path());
         let result = ok_of(call(&server, "agent.readiness", None));
         let agents = result["agents"].as_array().expect("agents");
-        assert!(!agents.is_empty());
+        assert!(
+            agents.len() >= 20,
+            "readiness must expose the complete supported CLI catalog"
+        );
         let claude = agents
             .iter()
             .find(|agent| agent["kind"] == "claude-code")
@@ -3827,6 +3841,12 @@ mod tests {
                 .unwrap_or(false),
             "the raw manifest descriptor rides along: {claude}"
         );
+        let pi = agents
+            .iter()
+            .find(|agent| agent["kind"] == "pi")
+            .expect("Pi remains in Settings even when its executable is absent");
+        assert_eq!(pi["binary"], "pi");
+        assert_eq!(pi["descriptor"]["displayName"], "Pi");
     }
 
     #[test]

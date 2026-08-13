@@ -519,23 +519,41 @@ fn set_executable(path: &Path) {
 }
 
 #[cfg(unix)]
-/// Rust-owned base catalog next to the executable, then user overrides, then
-/// the source-tree fallback used by loose development binaries.
+/// Loads the Rust-owned catalog beside the executable and supplements it with
+/// the source-tree catalog available to loose development builds. The latter
+/// is intentionally later: an old `target/{debug,release}/manifests` directory
+/// must not hide Agents added to the canonical source catalog. Packaged builds
+/// have no source tree at that compiled path and use only their count-checked
+/// sibling catalog. User overrides remain last.
 fn load_manifests(exe_dir: &Path, app_support: &Path) -> (ManifestEngine, Vec<String>) {
-    let mut bases: Vec<PathBuf> = Vec::new();
-    if let Ok(configured) = std::env::var("DIRI_MANIFESTS_DIR") {
-        bases.push(PathBuf::from(configured));
-    }
-    bases.push(exe_dir.join("manifests"));
-    bases.push(diri_engine::detect::bundled_manifest_dir());
-    let base = bases.into_iter().find(|dir| dir.is_dir());
-    let overrides = app_support.join("manifests/overrides");
+    let configured = std::env::var_os("DIRI_MANIFESTS_DIR").map(PathBuf::from);
+    load_manifests_from(
+        exe_dir,
+        app_support,
+        configured.as_deref(),
+        &diri_engine::detect::bundled_manifest_dir(),
+    )
+}
 
-    let mut dirs: Vec<&Path> = Vec::new();
-    if let Some(base) = &base {
-        dirs.push(base);
+fn load_manifests_from(
+    exe_dir: &Path,
+    app_support: &Path,
+    configured: Option<&Path>,
+    source_catalog: &Path,
+) -> (ManifestEngine, Vec<String>) {
+    let overrides = app_support.join("manifests/overrides");
+    let sibling = exe_dir.join("manifests");
+    let mut bases = match configured {
+        Some(configured) => vec![configured.to_path_buf()],
+        None => vec![sibling, source_catalog.to_path_buf()],
+    };
+    bases.retain(|path| path.is_dir());
+    bases.dedup();
+
+    let mut dirs = bases.iter().map(PathBuf::as_path).collect::<Vec<_>>();
+    if overrides.is_dir() {
+        dirs.push(&overrides);
     }
-    dirs.push(&overrides);
     ManifestEngine::load_dirs(&dirs).unwrap_or_else(|error| {
         eprintln!("dirijord-rs: manifest load: {error}");
         (ManifestEngine::new(Vec::new()), Vec::new())
@@ -696,6 +714,33 @@ mod tests {
         install_cli_resource_bundle(&source, &bin);
         assert!(!installed.join("cursor.json").exists());
         assert!(installed.join("codex.json").exists());
+    }
+
+    #[test]
+    fn a_stale_sibling_catalog_cannot_hide_new_source_agents() {
+        let temporary = tempfile::tempdir().expect("temp");
+        let exe_dir = temporary.path().join("bin");
+        let stale = exe_dir.join("manifests");
+        let app_support = temporary.path().join("support");
+        std::fs::create_dir_all(&stale).expect("stale catalog");
+        std::fs::copy(
+            diri_engine::detect::bundled_manifest_dir().join("codex.json"),
+            stale.join("codex.json"),
+        )
+        .expect("copy stale manifest");
+
+        let source_catalog = diri_engine::detect::bundled_manifest_dir();
+        let (engine, failed) = load_manifests_from(&exe_dir, &app_support, None, &source_catalog);
+
+        assert!(failed.is_empty(), "manifests failed to load: {failed:?}");
+        assert!(
+            engine.manifest("pi").is_some(),
+            "the canonical source catalog must supplement an older sibling catalog"
+        );
+        assert!(
+            engine.ids().len() >= 22,
+            "the established Agent catalog must not shrink"
+        );
     }
 
     #[test]

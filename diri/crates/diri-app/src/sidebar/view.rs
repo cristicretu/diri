@@ -512,15 +512,18 @@ impl Sidebar {
         let hovering = self.ui.hovered_control == Some("new-agent");
         let (agent, location) = {
             let store = self.store.read().expect("session store lock poisoned");
-            let agent = store.agent_catalog(None).map_or_else(
-                || crate::agent_catalog::title_case_id(store.preferences().default_agent.id()),
-                |catalog| {
-                    crate::agent_catalog::display_name(&store.preferences().default_agent, catalog)
-                },
+            let host = store.default_spawn_host();
+            let catalog = store.agent_catalog(host.as_deref());
+            let kind = crate::agent_catalog::resolved_target_agent(
+                &store.preferences().default_agent,
+                catalog,
             );
-            let location = store
-                .default_spawn_host()
-                .map_or_else(|| "This Mac".to_owned(), |id| store.host_display_name(&id));
+            let agent = catalog.map_or_else(
+                || "Terminal".to_owned(),
+                |catalog| crate::agent_catalog::display_name(&kind, catalog),
+            );
+            let location =
+                host.map_or_else(|| "This Mac".to_owned(), |id| store.host_display_name(&id));
             (agent, location)
         };
         div()
@@ -1834,7 +1837,10 @@ impl Sidebar {
                 directory
                     .clone()
                     .unwrap_or_else(|| store.default_new_agent_directory()),
-                store.preferences().default_agent.clone(),
+                crate::agent_catalog::resolved_target_agent(
+                    &store.preferences().default_agent,
+                    store.agent_catalog(host.as_deref()),
+                ),
                 store.hosts().to_vec(),
                 store.selected_session().cloned(),
                 store.repo_target(selected_host_id).cloned(),
@@ -2183,7 +2189,7 @@ impl Sidebar {
             let shortcut = shortcut.to_owned();
             let agent_kind = ui_agent_kind(&option.kind);
             let spawn_kind = option.kind.clone();
-            let available = selected_host.is_some() || option.available;
+            let available = option.available;
             let unavailable = (!available).then_some(option.unavailable_detail).flatten();
             let setup_url = (!available).then_some(option.setup_url).flatten();
             content = content.child(

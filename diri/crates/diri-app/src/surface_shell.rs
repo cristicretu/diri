@@ -1822,8 +1822,9 @@ impl UtilitySurfaces {
 
         let mut catalog_rows = div().flex().flex_col();
         if let Some(catalog) = catalog {
-            let agent_count = catalog.agents.len();
-            for (index, item) in catalog.agents.into_iter().enumerate() {
+            let agents = crate::agent_catalog::settings_agent_items(catalog.agents);
+            let agent_count = agents.len();
+            for (index, item) in agents.into_iter().enumerate() {
                 catalog_rows = catalog_rows.child(self.agent_settings_row(index, item, colors, cx));
                 if index + 1 < agent_count {
                     catalog_rows = catalog_rows.child(setting_divider(colors));

@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use diri_proto::{AgentKind, AgentReadinessResult, HostEntry, Project, SessionRecord};
 
 use crate::agent_catalog::{
-    AgentOption, agent_options, display_name, quick_agent_options, resolved_default_agent,
+    AgentOption, display_name, quick_agent_options, resolved_default_agent, resolved_target_agent,
     system_image,
 };
 use crate::commands::{self, CommandId};
@@ -71,28 +71,22 @@ pub fn actions_for_catalogs(
     default_host_id: Option<&str>,
     catalogs: &HashMap<String, AgentReadinessResult>,
 ) -> Vec<PaletteAction> {
-    // Only the default target's catalog is warmed at connect. A host whose
-    // scan has not run yet must not lose its rows to that accident of timing —
-    // fall back to the local catalog as the optimistic guess, the way these
-    // actions were built before per-host catalogs; spawn-time discovery on
-    // the host stays the authority.
-    let catalog = |host: Option<&str>| {
-        catalogs
-            .get(host.unwrap_or("local"))
-            .or_else(|| catalogs.get("local"))
-    };
+    // Readiness is target-specific. Missing remote facts must not inherit the
+    // local machine's PATH: that would advertise Agents the remote cannot
+    // launch. `quick_agent_options(None)` deliberately leaves only Terminal
+    // until that target's scan completes.
+    let catalog = |host: Option<&str>| catalogs.get(host.unwrap_or("local"));
     let default_host = default_host_id.and_then(|id| hosts.iter().find(|host| host.id == id));
     let default_host_id = default_host.map(|host| host.id.as_str());
     let mut result = Vec::new();
-    let default_agents = quick_agent_options(catalog(default_host_id));
-    let has_default = default_agents
-        .iter()
-        .any(|agent| agent.kind == default_agent);
-    for (index, agent) in default_agents.into_iter().enumerate() {
+    let default_catalog = catalog(default_host_id);
+    let target_default = resolved_target_agent(&default_agent, default_catalog);
+    let default_agents = quick_agent_options(default_catalog);
+    for agent in default_agents {
         if agent.kind == AgentKind::SHELL {
             continue;
         }
-        let is_default = agent.kind == default_agent || (index == 0 && !has_default);
+        let is_default = agent.kind == target_default;
         result.push(new_dynamic_agent_action(
             agent.kind,
             agent.display_name,
@@ -105,6 +99,9 @@ pub fn actions_for_catalogs(
         || "New Terminal".to_owned(),
         |host| format!("New Terminal on {}", host.display_name()),
     );
+    if target_default == AgentKind::SHELL {
+        result.push(default_action(terminal_title.clone(), "terminal"));
+    }
     result.extend([
         registered_action_with_title(CommandId::NewTerminal, terminal_title),
         registered_action(CommandId::ToggleQuickOpen),
@@ -264,7 +261,7 @@ pub fn actions_for_default_host(
 ) -> Vec<PaletteAction> {
     let default_host = default_host_id.and_then(|id| hosts.iter().find(|host| host.id == id));
     let default_agent = resolved_default_agent(&default_agent, catalog);
-    let options = agent_options(catalog);
+    let options = quick_agent_options(Some(catalog));
     let mut result = Vec::new();
     if default_agent == AgentKind::SHELL {
         result.push(default_action("New Terminal".into(), "terminal"));
@@ -604,7 +601,15 @@ mod tests {
     use super::*;
 
     fn catalog() -> AgentReadinessResult {
-        AgentReadinessResult::default()
+        AgentReadinessResult {
+            agents: vec![
+                installed_agent("claude-code", "Claude Code", true),
+                installed_agent("codex", "Codex", true),
+                installed_agent("cursor", "Cursor", true),
+                installed_agent("gemini", "Gemini", true),
+            ],
+            ..AgentReadinessResult::default()
+        }
     }
 
     fn catalog_item(
@@ -681,7 +686,7 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_catalog_action_uses_shared_missing_binary_and_safe_setup() {
+    fn unavailable_catalog_agent_is_not_a_quick_palette_action() {
         let catalog = AgentReadinessResult {
             agents: vec![catalog_item(
                 "amp",
@@ -693,43 +698,17 @@ mod tests {
             ..AgentReadinessResult::default()
         };
         let actions = actions(AgentKind::new("amp"), &catalog, &[], &[], None);
-        let amp = actions
-            .iter()
-            .find(|action| action.id == "new-amp")
-            .expect("unavailable Amp row");
-        assert_eq!(
-            amp.detail.as_deref(),
-            Some("Missing amp-bin · Install Amp. · Sign in at ampcode.com, then run amp.")
-        );
-        assert!(amp.enabled);
-        assert_eq!(
-            amp.command,
-            PaletteCommand::UnavailableAgent {
-                setup_url: Some("https://ampcode.com/manual".into())
-            }
-        );
+        assert!(!actions.iter().any(|action| action.id == "new-amp"));
     }
 
     #[test]
-    fn unavailable_action_without_setup_metadata_is_disabled_not_a_noop() {
+    fn unavailable_catalog_agent_without_setup_is_not_a_quick_palette_action() {
         let catalog = AgentReadinessResult {
             agents: vec![catalog_item("private", "Private", false, None, None)],
             ..AgentReadinessResult::default()
         };
         let actions = actions(AgentKind::new("private"), &catalog, &[], &[], None);
-        let private = actions
-            .iter()
-            .find(|action| action.id == "new-private")
-            .expect("unavailable informational row");
-        assert!(!private.enabled);
-        assert_eq!(
-            private.detail.as_deref(),
-            Some("Missing private-bin · Install private-bin and add it to PATH.")
-        );
-        assert_eq!(
-            private.command,
-            PaletteCommand::UnavailableAgent { setup_url: None }
-        );
+        assert!(!actions.iter().any(|action| action.id == "new-private"));
     }
 
     #[test]
@@ -770,7 +749,7 @@ mod tests {
     }
 
     #[test]
-    fn a_host_whose_catalog_has_not_been_fetched_keeps_its_actions() {
+    fn a_host_whose_catalog_has_not_been_fetched_does_not_borrow_local_actions() {
         let host = HostEntry {
             id: "forge".into(),
             name: Some("Forge".into()),
@@ -779,8 +758,8 @@ mod tests {
             node: None,
         };
         // Only the local catalog is warmed at connect; forge has never been
-        // scanned. Its rows fall back to the local catalog instead of
-        // silently vanishing until some surface happens to trigger a scan.
+        // scanned. Local availability says nothing about the remote target,
+        // so Forge must not claim that Codex can be launched there.
         let catalogs = HashMap::from([(
             "local".to_owned(),
             AgentReadinessResult {
@@ -805,7 +784,7 @@ mod tests {
             None,
             &catalogs,
         );
-        assert!(actions.iter().any(|action| {
+        assert!(!actions.iter().any(|action| {
             action.command
                 == PaletteCommand::SpawnAgent {
                     agent: AgentKind::new("codex"),
@@ -816,7 +795,42 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|action| action.title == "New Codex in app on Forge")
+                .all(|action| action.title != "New Codex in app on Forge")
+        );
+    }
+
+    #[test]
+    fn an_unscanned_default_target_exposes_terminal_as_the_safe_default() {
+        let host = HostEntry {
+            id: "forge".into(),
+            name: Some("Forge".into()),
+            ssh: "forge".into(),
+            default_cwd: None,
+            node: None,
+        };
+        let actions = actions_for_catalogs(
+            AgentKind::new("unavailable-agent"),
+            &[],
+            std::slice::from_ref(&host),
+            None,
+            Some("forge"),
+            &HashMap::new(),
+        );
+
+        let default = actions
+            .iter()
+            .find(|action| action.id == "new-default")
+            .expect("safe default action");
+        assert_eq!(default.title, "New Terminal on Forge");
+        assert_eq!(default.shortcut, Some("⌘T"));
+        assert_eq!(
+            default.command,
+            PaletteCommand::Action(CommandId::NewDefaultSession)
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|action| action.id.contains("unavailable-agent"))
         );
     }
 

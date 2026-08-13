@@ -41,6 +41,9 @@ objc2-foundation = { version = "=0.3.2", default-features = false, features = [
     "NSString",
 ] }
 
+[build-dependencies]
+sha2.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 

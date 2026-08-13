@@ -1750,6 +1750,61 @@ fn top_level_shortcuts_spawn_on_the_configured_default_host() {
 }
 
 #[test]
+fn default_shortcut_never_launches_an_agent_unavailable_on_its_target() {
+    let (mut store, mut effects) = SessionStore::headless(Prefs {
+        default_agent: AgentKind::new("saved-agent"),
+        default_spawn_host: Some("forge".into()),
+        ..Prefs::default()
+    });
+    store.set_hosts(vec![diri_proto::HostEntry {
+        id: "forge".into(),
+        name: Some("Forge".into()),
+        ssh: "forge".into(),
+        default_cwd: None,
+        node: None,
+    }]);
+    store.set_agent_catalog(AgentReadinessResult {
+        host: Some("forge".into()),
+        agents: vec![
+            AgentReadinessItem {
+                kind: AgentKind::new("saved-agent"),
+                binary: "saved-agent".into(),
+                path: None,
+                descriptor: Some(AgentDescriptor {
+                    id: "saved-agent".into(),
+                    display_name: "Saved Agent".into(),
+                    ..AgentDescriptor::default()
+                }),
+                ..AgentReadinessItem::default()
+            },
+            AgentReadinessItem {
+                kind: AgentKind::new("installed-agent"),
+                binary: "installed-agent".into(),
+                path: Some("/bin/installed-agent".into()),
+                show_in_quick_create: true,
+                descriptor: Some(AgentDescriptor {
+                    id: "installed-agent".into(),
+                    display_name: "Installed Agent".into(),
+                    ..AgentDescriptor::default()
+                }),
+                ..AgentReadinessItem::default()
+            },
+        ],
+        ..AgentReadinessResult::default()
+    });
+    drain(&mut effects);
+
+    store.spawn_default(super::SpawnOptions::default());
+
+    let params = match effects.try_recv() {
+        Ok(StoreEffect::Spawn(params)) => params,
+        other => panic!("expected spawn effect, got {other:?}"),
+    };
+    assert_eq!(params.kind, AgentKind::new("installed-agent"));
+    assert_eq!(params.host.as_deref(), Some("forge"));
+}
+
+#[test]
 fn selecting_a_default_host_persists_across_store_reloads() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("prefs.json");
