@@ -2570,7 +2570,7 @@ impl ControlServer {
 
     fn daemon_prepare_shutdown(&self) -> Result<JsonValue, ControlError> {
         let mut registry = self.registry.lock().map_err(poisoned)?;
-        let _ = registry.persist();
+        registry.persist_for_shutdown().map_err(io_control_error)?;
         Ok(json!({}))
     }
 
@@ -2583,7 +2583,7 @@ impl ControlServer {
             let mut registry = self.registry.lock().map_err(poisoned)?;
             let live_sessions = registry.live_count();
             if live_sessions == 0 {
-                let _ = registry.persist();
+                registry.persist_for_shutdown().map_err(io_control_error)?;
             }
             live_sessions
         };
@@ -2643,7 +2643,7 @@ impl ControlServer {
     fn daemon_shutdown(&self) -> Result<JsonValue, ControlError> {
         {
             let mut registry = self.registry.lock().map_err(poisoned)?;
-            let _ = registry.persist();
+            registry.persist_for_shutdown().map_err(io_control_error)?;
         }
         let browser = self.browser.get().cloned();
         let socket_path = self.socket_path.clone();
@@ -4571,6 +4571,38 @@ mod tests {
             Some("another control client still requires the Engine")
         );
         assert_eq!(idle_shutdown_refusal(0, 1), None);
+    }
+
+    #[test]
+    fn shutdown_handlers_propagate_persistence_failure_before_scheduling_exit() {
+        let temp = tempfile::tempdir().expect("temp");
+        let blocked_parent = temp.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, b"file").expect("blocking file");
+        let registry = Registry::new(engine(), blocked_parent.join("state.json"));
+        let server = ControlServer::new(
+            Arc::new(Mutex::new(registry)),
+            temp.path().join("daemon.sock"),
+        );
+
+        for error in [
+            server
+                .daemon_prepare_shutdown()
+                .expect_err("prepare must report persistence failure"),
+            server
+                .daemon_shutdown_if_idle()
+                .expect_err("idle shutdown must report persistence failure"),
+            server
+                .daemon_shutdown()
+                .expect_err("forced shutdown must report persistence failure"),
+        ] {
+            assert_eq!(error.code, "internal");
+            assert!(
+                error.message.contains("not-a-directory")
+                    || error.message.contains("Not a directory")
+                    || error.message.contains("File exists"),
+                "unexpected persistence error: {error}"
+            );
+        }
     }
 
     #[test]

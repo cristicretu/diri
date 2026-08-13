@@ -171,6 +171,17 @@ impl Registry {
         self.persist_now()
     }
 
+    /// Commits the latest state before the daemon acknowledges a shutdown.
+    ///
+    /// Shutdown is a durability boundary, not another debounced mutation: the
+    /// process may exit immediately after the acknowledgement, so neither the
+    /// background flusher nor [`Drop`] is guaranteed to run. Always write the
+    /// current snapshot synchronously, even when a recent persist would
+    /// normally be deferred.
+    pub fn persist_for_shutdown(&mut self) -> std::io::Result<()> {
+        self.persist_now()
+    }
+
     /// Writes out a deferred persist, if one is pending.
     pub fn flush_dirty(&mut self) -> std::io::Result<()> {
         if !self.dirty {
@@ -1163,6 +1174,42 @@ mod tests {
         let mut reloaded = Registry::new(engine(), &state_file);
         assert_eq!(reloaded.load().expect("load"), 1);
         assert_eq!(reloaded.records()[0].id.0, "s_1");
+    }
+
+    #[test]
+    fn shutdown_persistence_commits_a_snapshot_deferred_by_the_debounce() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state_file = temp.path().join("state.json");
+        let mut registry = Registry::new(engine(), &state_file);
+
+        registry.insert_record(record("before"));
+        registry.persist().expect("initial persist");
+        registry.insert_record(record("latest"));
+        registry.persist().expect("debounced persist");
+
+        let deferred: PersistedState =
+            serde_json::from_slice(&std::fs::read(&state_file).expect("read deferred state"))
+                .expect("parse deferred state");
+        assert_eq!(
+            deferred.sessions.len(),
+            1,
+            "the second regular persist should still be waiting for the flusher"
+        );
+
+        registry
+            .persist_for_shutdown()
+            .expect("shutdown persistence");
+        let committed: PersistedState =
+            serde_json::from_slice(&std::fs::read(&state_file).expect("read committed state"))
+                .expect("parse committed state");
+        assert_eq!(
+            committed
+                .sessions
+                .iter()
+                .map(|record| record.id.0.as_str())
+                .collect::<Vec<_>>(),
+            ["before", "latest"]
+        );
     }
 
     #[test]
