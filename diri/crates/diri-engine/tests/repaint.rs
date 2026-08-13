@@ -113,9 +113,9 @@ fn an_erase_and_redraw_never_reach_a_client_as_a_blank_screen() {
     }
 
     // A minimal TUI: every line of input repaints the screen the way a real
-    // one does — erase, then draw — as two separate writes. The small gap
-    // deterministically models a writer descheduled between those calls; a
-    // busy macOS runner exposed the same gap naturally.
+    // one does — erase, then draw — as two separate writes. Thirty
+    // milliseconds is deliberately beyond the ordinary 16 ms partial-repaint
+    // settle: only the bounded blank-frame grace can keep this atomic.
     let control = UnixStream::connect(server.socket_path()).expect("connect control");
     let send = |message: &ControlMessage| {
         let mut bytes = serde_json::to_vec(message).expect("encode");
@@ -133,8 +133,12 @@ fn an_erase_and_redraw_never_reach_a_client_as_a_blank_screen() {
                 "-c",
                 "stty -echo; printf 'frame-0\\r\\n'; \
                  while read -r turn; do \
-                   printf '\\033[2J\\033[H'; sleep 0.001; \
-                   printf 'frame-%s\\r\\n' \"$turn\"; \
+                   case \"$turn\" in \
+                     blank) printf '\\033[2J\\033[H' ;; \
+                     additive) printf 'additive-frame\\r\\n' ;; \
+                     *) printf '\\033[2J\\033[H'; sleep 0.030; \
+                        printf 'frame-%s\\r\\n' \"$turn\" ;; \
+                   esac; \
                  done",
             ],
         })),
@@ -197,6 +201,48 @@ fn an_erase_and_redraw_never_reach_a_client_as_a_blank_screen() {
             }
         }
     }
+
+    // An intentional erase must not be hidden forever. With no redraw, the
+    // blank frame is published once the bounded grace expires.
+    let blank_started = Instant::now();
+    data.write_all(&FrameCodec::encode(&Frame::input(b"blank\n".to_vec())).expect("encode"))
+        .expect("send blank");
+    loop {
+        let frame = frames.next_frame("the intentional blank", deadline);
+        if frame.frame_type != FrameType::Grid {
+            continue;
+        }
+        let update = frame.grid_payload().expect("decode").expect("grid");
+        mirror.apply(&update);
+        if mirror.is_blank() {
+            break;
+        }
+    }
+    assert!(
+        blank_started.elapsed() < Duration::from_millis(500),
+        "an intentional clear must publish by a bounded deadline"
+    );
+
+    // Additive output never uses the blank repaint grace. It should remain an
+    // immediate streaming path even after an intentional clear.
+    let additive_started = Instant::now();
+    data.write_all(&FrameCodec::encode(&Frame::input(b"additive\n".to_vec())).expect("encode"))
+        .expect("send additive output");
+    loop {
+        let frame = frames.next_frame("the additive frame", deadline);
+        if frame.frame_type != FrameType::Grid {
+            continue;
+        }
+        let update = frame.grid_payload().expect("decode").expect("grid");
+        mirror.apply(&update);
+        if mirror.text().contains("additive-frame") {
+            break;
+        }
+    }
+    assert!(
+        additive_started.elapsed() < Duration::from_millis(100),
+        "additive output regressed onto the repaint grace path"
+    );
 
     send(&ControlMessage::Request {
         id: 2,

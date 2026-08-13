@@ -3755,11 +3755,32 @@ mod tests {
         assert_eq!(result["resumability"], "live");
 
         let id = result["id"].as_str().expect("session id").to_owned();
+        // End the fixture through its own PTY contract. `kill(-pgid, …)` is a
+        // production path covered by process-tree tests; invoking it here made
+        // this identity-only regression depend on the CI runner granting
+        // process-group signalling (macOS runners intermittently return
+        // EPERM). The resumed command is `sh -c 'read line'`, so one submitted
+        // line exits it naturally and exercises the same status fold.
         registry
             .lock()
             .expect("registry")
-            .terminate(&id, Duration::from_millis(100))
-            .expect("terminate resumed probe");
+            .get(&id)
+            .expect("resumed probe")
+            .send_text("done", true)
+            .expect("finish resumed probe");
+        for _ in 0..100 {
+            let exited = registry
+                .lock()
+                .expect("registry")
+                .record(&id)
+                .is_some_and(|record| {
+                    matches!(record.status, diri_proto::SessionStatus::Exited(_))
+                });
+            if exited {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert_eq!(
             registry
                 .lock()
