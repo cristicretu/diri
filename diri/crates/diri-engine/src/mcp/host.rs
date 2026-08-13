@@ -299,6 +299,54 @@ impl RegistryHost {
     /// control-backed MCP server and returns an error if the child never
     /// accepts it.
     fn spawn_agent(&self, arguments: &Value) -> Result<Value, String> {
+        let Some(request_key) = arguments.get("requestKey").and_then(Value::as_str) else {
+            return self.spawn_agent_once(arguments);
+        };
+        if request_key.is_empty() || request_key.len() > 128 {
+            return Err("requestKey must contain 1 to 128 bytes".into());
+        }
+        let caller = self
+            .caller
+            .as_deref()
+            .ok_or_else(|| "requestKey requires a caller session identity".to_owned())?;
+        let ledger = {
+            let registry = self.registry()?;
+            if registry.record(caller).is_none() {
+                return Err(format!("caller session {caller:?} does not exist"));
+            }
+            registry.spawn_requests()
+        };
+        let mut normalized = arguments.clone();
+        let object = normalized
+            .as_object_mut()
+            .ok_or_else(|| "spawn_agent arguments must be an object".to_owned())?;
+        object.remove("requestKey");
+        object.insert(
+            "worktree".into(),
+            Value::Bool(
+                arguments
+                    .get("worktree")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            ),
+        );
+        let fingerprint = serde_json::to_string(&normalized)
+            .map_err(|error| format!("could not normalize spawn arguments: {error}"))?;
+        ledger
+            .run(caller, "spawn_agent", request_key, fingerprint, || {
+                self.spawn_agent_once(arguments).map_err(|message| {
+                    let code = if message.starts_with("initial_prompt_delivery_failed:") {
+                        "initial_prompt_delivery_failed"
+                    } else {
+                        "mcp_tool_failed"
+                    };
+                    diri_proto::ControlError::new(code, message)
+                })
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    fn spawn_agent_once(&self, arguments: &Value) -> Result<Value, String> {
         let kind = required_str(arguments, "kind")?;
         let cwd = required_str(arguments, "cwd")?;
         if let Some(host) = arguments.get("host").and_then(Value::as_str) {

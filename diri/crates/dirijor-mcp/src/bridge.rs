@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use diri_proto::{
-    AgentKind, AgentReadinessResult, Method, ReadScreenResult, SessionId, SessionListResult,
-    SessionRecord, SessionSpawnParams, SessionStatus,
+    AgentKind, AgentReadinessResult, McpToolErrorEnvelope, Method, ReadScreenResult, SessionId,
+    SessionListResult, SessionRecord, SessionSpawnParams, SessionStatus,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
@@ -65,7 +65,7 @@ impl Bridge {
     }
 
     pub fn call(&self, tool: &str, arguments: &Value) -> Result<Value, String> {
-        match tool {
+        let result = match tool {
             "spawn_agent" => self.spawn_agent(arguments),
             "list_agents" => self.list_agents(),
             "get_status" => self.get_status(arguments),
@@ -85,7 +85,8 @@ impl Bridge {
             "summarize_children" => self.summarize_children(arguments),
             "report_to_parent" => self.report_to_parent(arguments),
             other => Err(format!("unknown tool: {other}")),
-        }
+        };
+        result.map_err(|message| McpToolErrorEnvelope::normalize_text(&message))
     }
 
     pub fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
@@ -128,6 +129,7 @@ impl Bridge {
             initial_rows: None,
             host: optional_string(arguments, "host"),
             same_repo_as: None,
+            request_key: optional_string(arguments, "requestKey"),
         };
         let params = serde_json::to_value(params).map_err(|error| error.to_string())?;
         self.request(Method::SESSION_SPAWN, params, SPAWN_TIMEOUT)
@@ -576,9 +578,122 @@ impl Bridge {
 }
 
 fn render_failure(error: ControlFailure) -> String {
-    match error {
-        ControlFailure::Io(error) => format!("daemon socket: {error}"),
-        other => other.to_string(),
+    let failure = match error {
+        ControlFailure::Daemon(error) => daemon_tool_error(error),
+        ControlFailure::Io(error) => McpToolErrorEnvelope::new(
+            "daemon_unavailable",
+            format!("Diri's Engine is unavailable: {error}"),
+            "Wait briefly for Diri's Engine to start, then retry the same requestKey.",
+            true,
+            None,
+        ),
+        ControlFailure::Timeout => McpToolErrorEnvelope::new(
+            "daemon_timeout",
+            "Diri's Engine did not answer before the tool deadline.",
+            "Inspect list_agents before retrying a mutation; if it did not happen, retry with the same requestKey.",
+            true,
+            Some("list_agents"),
+        ),
+        ControlFailure::Protocol(message) => McpToolErrorEnvelope::new(
+            "daemon_protocol_error",
+            message,
+            "Reconnect to Diri's Engine and retry the same requestKey once.",
+            true,
+            None,
+        ),
+    };
+    failure.to_text()
+}
+
+fn daemon_tool_error(error: diri_proto::ControlError) -> McpToolErrorEnvelope {
+    let lower = error.message.to_ascii_lowercase();
+    match error.code.as_str() {
+        "idempotency_conflict" => McpToolErrorEnvelope::new(
+            "idempotency_conflict",
+            error.message,
+            "Use the original arguments for this requestKey, or choose a new requestKey for a different spawn.",
+            false,
+            None,
+        ),
+        "idempotency_requires_caller" => McpToolErrorEnvelope::new(
+            "idempotency_requires_caller",
+            error.message,
+            "Run spawn_agent inside a Diri session, or omit requestKey for an unscoped call.",
+            false,
+            Some("whoami"),
+        ),
+        "idempotency_caller_not_found" => McpToolErrorEnvelope::new(
+            "idempotency_caller_not_found",
+            error.message,
+            "The calling session no longer exists. Start a new Diri session before spawning a child.",
+            false,
+            Some("whoami"),
+        ),
+        "idempotency_capacity" => McpToolErrorEnvelope::new(
+            "idempotency_capacity",
+            error.message,
+            "Wait for current spawns to settle, then retry the same requestKey.",
+            true,
+            Some("list_agents"),
+        ),
+        "bad_request" if lower.contains("cwd") && lower.contains("not a directory") => {
+            McpToolErrorEnvelope::new(
+                "cwd_not_found",
+                error.message,
+                "Choose an existing project directory and retry with a new requestKey.",
+                false,
+                Some("list_agents"),
+            )
+        }
+        "bad_request" => McpToolErrorEnvelope::new(
+            "invalid_arguments",
+            error.message,
+            "Correct the requested arguments, then retry with a new requestKey.",
+            false,
+            None,
+        ),
+        "not_found" => McpToolErrorEnvelope::new(
+            "resource_not_found",
+            error.message,
+            "Refresh Diri state, choose an existing resource, and retry with a new requestKey.",
+            false,
+            Some("list_agents"),
+        ),
+        "unauthorized" => McpToolErrorEnvelope::new(
+            "authorization_denied",
+            error.message,
+            "Reconnect through the current Diri session; do not retry with the same credentials.",
+            false,
+            Some("whoami"),
+        ),
+        "version_mismatch" => McpToolErrorEnvelope::new(
+            "version_mismatch",
+            error.message,
+            "Restart or update Diri so the MCP adapter and Engine use the same protocol.",
+            false,
+            None,
+        ),
+        "initial_prompt_delivery_failed" => McpToolErrorEnvelope::new(
+            "initial_prompt_delivery_failed",
+            error.message,
+            "The session exists. Inspect list_agents and send_prompt to that session instead of spawning another one.",
+            false,
+            Some("list_agents"),
+        ),
+        "internal" => McpToolErrorEnvelope::new(
+            "internal",
+            error.message,
+            "Inspect list_agents before retrying; if no mutation occurred, retry once with the same requestKey.",
+            true,
+            Some("list_agents"),
+        ),
+        code => McpToolErrorEnvelope::new(
+            code,
+            error.message,
+            "Inspect current Diri state, then retry only when the operation is safe.",
+            false,
+            Some("list_agents"),
+        ),
     }
 }
 
@@ -990,5 +1105,48 @@ mod tests {
         let generic = resolve_agent_kind(&readiness, "htop");
         assert_eq!(generic.id(), AgentKind::GENERIC_ID);
         assert_eq!(generic.command(), Some("htop"));
+    }
+
+    #[test]
+    fn daemon_failures_have_stable_recovery_contracts() {
+        let cases = [
+            (
+                diri_proto::ControlError::bad_request("cwd \"/gone\" is not a directory"),
+                "cwd_not_found",
+                false,
+            ),
+            (
+                diri_proto::ControlError::unauthorized(),
+                "authorization_denied",
+                false,
+            ),
+            (
+                diri_proto::ControlError::not_found("session s_gone"),
+                "resource_not_found",
+                false,
+            ),
+            (
+                diri_proto::ControlError::new("idempotency_conflict", "different arguments"),
+                "idempotency_conflict",
+                false,
+            ),
+            (
+                diri_proto::ControlError::internal("worker stopped"),
+                "internal",
+                true,
+            ),
+        ];
+        for (failure, expected_code, retryable) in cases {
+            let envelope = daemon_tool_error(failure);
+            assert_eq!(envelope.error.code, expected_code);
+            assert_eq!(envelope.error.retryable, retryable);
+            assert!(!envelope.error.model_guidance.is_empty());
+            serde_json::from_str::<Value>(&envelope.to_text()).expect("valid JSON");
+        }
+
+        let timeout = render_failure(ControlFailure::Timeout);
+        let timeout: McpToolErrorEnvelope = serde_json::from_str(&timeout).expect("timeout JSON");
+        assert_eq!(timeout.error.code, "daemon_timeout");
+        assert!(timeout.error.retryable);
     }
 }

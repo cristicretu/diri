@@ -1,5 +1,6 @@
 use std::io::{self, BufRead, Write};
 
+use diri_proto::McpToolErrorEnvelope;
 use dirijor_mcp::Bridge;
 use serde_json::{Value, json};
 
@@ -55,7 +56,10 @@ fn error(id: Value, code: i64, message: impl Into<String>) -> Value {
 fn tool_content(result: Result<Value, String>) -> Value {
     let (value, is_error) = match result {
         Ok(value) => (value, false),
-        Err(message) => (Value::String(message), true),
+        Err(message) => (
+            Value::String(McpToolErrorEnvelope::normalize_text(&message)),
+            true,
+        ),
     };
     let text = value.as_str().map_or_else(
         || serde_json::to_string(&value).unwrap_or_else(|_| "null".to_owned()),
@@ -206,5 +210,18 @@ mod tests {
         assert!(instructions.contains("native kind"));
         assert!(instructions.contains("Never use `shell` to launch an agent CLI"));
         assert!(instructions.contains("Cmd+J"));
+    }
+
+    #[test]
+    fn failed_tool_text_is_always_parseable_typed_json() {
+        let result = tool_content(Err("missing required argument: cwd".into()));
+        assert_eq!(result["isError"], true);
+        let parsed: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().expect("text content"))
+                .expect("valid JSON");
+        assert_eq!(parsed["error"]["code"], "invalid_arguments");
+        assert_eq!(parsed["error"]["retryable"], false);
+        assert!(parsed["error"]["modelGuidance"].is_string());
+        assert!(parsed["error"]["details"].is_object());
     }
 }

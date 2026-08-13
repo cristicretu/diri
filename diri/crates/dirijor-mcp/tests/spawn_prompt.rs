@@ -10,6 +10,10 @@ use std::time::{Duration, Instant};
 use diri_engine::control::ControlServer;
 use diri_engine::detect::ManifestEngine;
 use diri_engine::registry::Registry;
+use diri_proto::{
+    AgentKind, DateMillis, ProjectId, Resumability, SessionId, SessionRecord, SessionStatus,
+    TitleSource,
+};
 use dirijor_mcp::Bridge;
 use serde_json::json;
 
@@ -79,10 +83,40 @@ fn start_server(temp: &Path, fixture: &Path) -> Arc<ControlServer> {
     let (engine, failures) = ManifestEngine::load_dir(&manifests).expect("load manifests");
     assert!(failures.is_empty(), "manifest failures: {failures:?}");
 
-    let registry = Arc::new(Mutex::new(Registry::new(
-        Arc::new(engine),
-        temp.join("state.json"),
-    )));
+    let mut registry = Registry::new(Arc::new(engine), temp.join("state.json"));
+    registry.insert_record(SessionRecord {
+        id: SessionId::new("s_parent"),
+        kind: AgentKind::CODEX,
+        cwd: temp.to_string_lossy().into_owned(),
+        project_id: ProjectId::new("test-parent"),
+        worktree_path: None,
+        git_branch: None,
+        title: "test parent".into(),
+        title_source: TitleSource::Placeholder,
+        originating_prompt: None,
+        agent_session_id: None,
+        transcript_path: None,
+        status: SessionStatus::Idle,
+        status_evidence: None,
+        needs_input: None,
+        resumability: Resumability::Live,
+        parent: None,
+        created_at: DateMillis(0.0),
+        updated_at: DateMillis(0.0),
+        last_turn_completed_at: None,
+        last_seen_at: None,
+        pinned: false,
+        archived_at: None,
+        host: None,
+        remote_persistence: None,
+        hibernation: None,
+        memory_bytes: None,
+        artifacts: None,
+        pull_requests: None,
+        listening_ports: None,
+        foreground_agent: None,
+    });
+    let registry = Arc::new(Mutex::new(registry));
     let server = Arc::new(
         ControlServer::new(registry, temp.join("daemon.sock")).with_logs_dir(temp.join("logs")),
     );
@@ -149,6 +183,57 @@ fn call_spawn_agent_through_mcp(socket: &Path, arguments: serde_json::Value) -> 
             .expect("MCP text content"),
     )
     .expect("decode spawn result")
+}
+
+#[test]
+fn keyed_spawn_survives_mcp_stdio_recreation_without_duplicate_worktree() {
+    let temp = tempfile::tempdir().expect("temp");
+    let repo = temp.path().join("repo");
+    let fixture = temp.path().join("prompt-fixture");
+    initialize_repository(&repo);
+    std::fs::write(&fixture, "#!/bin/sh\nsleep 30\n").expect("write fixture");
+    std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o700))
+        .expect("make fixture executable");
+
+    let server = start_server(temp.path(), &fixture);
+    let arguments = json!({
+        "kind": "prompt-fixture",
+        "cwd": repo,
+        "worktree": true,
+        "branch": "test/idempotent-spawn",
+        "name": "one child, even after reconnect",
+        "requestKey": "turn-12/idempotent-child",
+    });
+
+    // Each helper invocation launches a brand-new stdio MCP process. The
+    // result survives because the Engine, rather than that process, owns it.
+    let first = call_spawn_agent_through_mcp(server.socket_path(), arguments.clone());
+    let replay = call_spawn_agent_through_mcp(server.socket_path(), arguments.clone());
+    assert_eq!(first["id"], replay["id"]);
+    assert_eq!(first["worktreePath"], replay["worktreePath"]);
+
+    let bridge = Bridge::new(server.socket_path().to_path_buf(), Some("s_parent".into()));
+    let conflict = bridge
+        .call(
+            "spawn_agent",
+            &json!({
+                "kind": "prompt-fixture",
+                "cwd": repo,
+                "name": "different operation",
+                "requestKey": "turn-12/idempotent-child",
+            }),
+        )
+        .expect_err("argument drift must conflict");
+    let conflict: serde_json::Value = serde_json::from_str(&conflict).expect("typed JSON");
+    assert_eq!(conflict["error"]["code"], "idempotency_conflict");
+    assert_eq!(conflict["error"]["retryable"], false);
+
+    bridge
+        .call(
+            "release_agent",
+            &json!({"session_id": first["id"].as_str().expect("session id")}),
+        )
+        .expect("release child");
 }
 
 #[test]

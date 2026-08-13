@@ -35,6 +35,7 @@ pub mod history;
 pub mod holder;
 pub mod hooks;
 pub mod hosts;
+mod idempotency;
 pub mod inject;
 pub mod legacy_remote;
 pub mod log;

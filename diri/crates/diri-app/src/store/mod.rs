@@ -2003,6 +2003,7 @@ impl SessionStore {
             initial_rows: None,
             host: session.host.clone(),
             same_repo_as: None,
+            request_key: None,
         }));
         true
     }
@@ -2041,6 +2042,7 @@ impl SessionStore {
             initial_rows: options.initial_rows,
             host,
             same_repo_as: options.same_repo_as,
+            request_key: None,
         }));
     }
 

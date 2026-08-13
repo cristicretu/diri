@@ -231,3 +231,26 @@ Dependencies are noted; tasks with the same phase and no dep arrow are parallel.
 
 ## 11. Later (post-v1 backlog)
 Remote/TCP endpoint + token auth (iOS parity), port-forward channel UI, a Rust daemon (only if ever needed — would ship behind the same wire protocol), Linux/Windows builds, per-session split panes, GPU screenshot-based switcher previews, multi-desktop geometry roles.
+
+---
+
+## MCP mutation contract
+
+`spawn_agent` accepts an optional `requestKey` (1–128 bytes). The Engine
+namespaces it by `(caller session, tool, requestKey)`, coalesces concurrent
+calls, and replays the original successful result—including the same session
+and worktree IDs—across MCP stdio reconnects. Reusing a key with different
+normalized arguments returns `idempotency_conflict`. Omitting the key retains
+the historical non-idempotent behavior.
+
+Successful results are retained for 24 hours, at most 128 entries per caller,
+and are removed when the caller session is removed. Pre-mutation validation or
+infrastructure failures release the key and may be retried with it. The one
+post-mutation failure, `initial_prompt_delivery_failed`, is retained: its
+message names the already-created session, and replay must never create a
+second child.
+
+Failed MCP tool results retain `isError: true`, while their text is serialized
+JSON with stable `code`, `retryable`, `modelGuidance`, optional
+`suggestedTool`, and `details` fields. Older clients can display the JSON;
+newer agents can parse it and choose a corrective action.

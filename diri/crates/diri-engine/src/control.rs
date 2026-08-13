@@ -745,7 +745,47 @@ impl ControlServer {
                     .collect()
             })
             .unwrap_or_default();
-        let p: diri_proto::SessionSpawnParams = decode(Some(raw))?;
+        let mut p: diri_proto::SessionSpawnParams = decode(Some(raw))?;
+        let request_key = p.request_key.take();
+        if let Some(request_key) = request_key {
+            if request_key.trim().is_empty() || request_key.len() > 128 {
+                return Err(ControlError::bad_request(
+                    "requestKey must contain 1 to 128 bytes",
+                ));
+            }
+            let caller = p
+                .parent
+                .as_ref()
+                .map(|caller| caller.0.clone())
+                .ok_or_else(|| {
+                    ControlError::new(
+                        "idempotency_requires_caller",
+                        "requestKey requires a caller session identity",
+                    )
+                })?;
+            let ledger = {
+                let registry = self.registry.lock().map_err(poisoned)?;
+                if registry.record(&caller).is_none() {
+                    return Err(ControlError::new(
+                        "idempotency_caller_not_found",
+                        format!("caller session {caller:?} does not exist"),
+                    ));
+                }
+                registry.spawn_requests()
+            };
+            let fingerprint = spawn_fingerprint(&p, &argv)?;
+            return ledger.run(&caller, "spawn_agent", &request_key, fingerprint, || {
+                self.session_spawn_decoded(p, argv)
+            });
+        }
+        self.session_spawn_decoded(p, argv)
+    }
+
+    fn session_spawn_decoded(
+        &self,
+        p: diri_proto::SessionSpawnParams,
+        argv: Vec<String>,
+    ) -> Result<JsonValue, ControlError> {
         if p.host.is_some() {
             return self.session_spawn_remote(p, argv);
         }
@@ -767,6 +807,24 @@ impl ControlServer {
             argv
         };
 
+        // Resolve every fallible, side-effect-free launch dependency before a
+        // requested worktree is created. A typo in the agent kind must not
+        // leave an orphan checkout behind.
+        let engine = self.registry.lock().map_err(poisoned)?.engine();
+        let manifest = engine
+            .manifest(&kind)
+            .ok_or_else(|| ControlError::not_found(format!("no manifest for agent {kind:?}")))?;
+        let mut descriptor = manifest.agent.clone().unwrap_or_default();
+        if let Some(binary) = descriptor.binary.as_deref() {
+            descriptor.binary = Some(self.resolve_local_agent_executable(&kind, binary)?);
+        }
+        let authority = descriptor.authority();
+        if descriptor.binary.is_none() && argv.is_empty() {
+            return Err(ControlError::bad_request(format!(
+                "agent {kind:?} declares no binary, so argv is required"
+            )));
+        }
+
         // A worktree spawn creates the checkout first, then lands in it.
         let mut cwd = p.cwd.clone();
         let mut worktree_path = None;
@@ -785,17 +843,6 @@ impl ControlServer {
                 "cwd {cwd:?} is not a directory"
             )));
         }
-
-        let mut registry = self.registry.lock().map_err(poisoned)?;
-        let engine = registry.engine();
-        let manifest = engine
-            .manifest(&kind)
-            .ok_or_else(|| ControlError::not_found(format!("no manifest for agent {kind:?}")))?;
-        let mut descriptor = manifest.agent.clone().unwrap_or_default();
-        if let Some(binary) = descriptor.binary.as_deref() {
-            descriptor.binary = Some(self.resolve_local_agent_executable(&kind, binary)?);
-        }
-        let authority = descriptor.authority();
 
         let id = next_session_id();
         // Build the complete agent argv before `spawn_spec`: agents declaring
@@ -847,12 +894,11 @@ impl ControlServer {
         // A linked worktree is an execution cwd inside the project selected
         // by the user; it does not become a new first-level sidebar project.
         record.project_id = crate::registry::session_project_id(&p.cwd, None);
-        registry.ensure_session_project(&p.cwd, None);
         if let Some(title) = &p.title {
             record.title = title.clone();
             record.title_source = diri_proto::TitleSource::DirijorAssigned;
         }
-        record.worktree_path = worktree_path;
+        record.worktree_path = worktree_path.clone();
         record.git_branch = git_branch.or_else(|| crate::git::branch(&cwd_path));
         record.parent = p.parent.clone();
         if let (Some(cols), Some(rows)) = (p.initial_cols, p.initial_rows) {
@@ -899,9 +945,15 @@ impl ControlServer {
             remote: None,
             defer_launch: true,
         };
-        registry
-            .spawn(spec, record)
-            .map_err(|error| ControlError::internal(error.to_string()))?;
+        let mut registry = self.registry.lock().map_err(poisoned)?;
+        registry.ensure_session_project(&p.cwd, None);
+        if let Err(error) = registry.spawn(spec, record) {
+            drop(registry);
+            if let Some(worktree) = worktree_path.as_deref() {
+                let _ = crate::git::remove_worktree(Path::new(&p.cwd), worktree, true);
+            }
+            return Err(ControlError::internal(error.to_string()));
+        }
         let _ = registry.persist();
         self.publish_updated(&registry, &id);
 
@@ -2905,6 +2957,30 @@ fn io_control_error(error: std::io::Error) -> ControlError {
     }
 }
 
+fn spawn_fingerprint(
+    params: &diri_proto::SessionSpawnParams,
+    argv: &[String],
+) -> Result<String, ControlError> {
+    let mut normalized =
+        serde_json::to_value(params).map_err(|error| ControlError::internal(error.to_string()))?;
+    let object = normalized
+        .as_object_mut()
+        .ok_or_else(|| ControlError::internal("spawn parameters did not encode as an object"))?;
+    // `false` and omission are the same operation at the spawn boundary.
+    object.insert(
+        "newWorktree".into(),
+        Value::Bool(params.new_worktree.unwrap_or(false)),
+    );
+    object.insert(
+        "argv".into(),
+        serde_json::to_value(argv).map_err(|error| ControlError::internal(error.to_string()))?,
+    );
+    let bytes = serde_json::to_vec(&normalized)
+        .map_err(|error| ControlError::internal(error.to_string()))?;
+    let digest = Sha256::digest(bytes);
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 fn agent_unavailable(kind: &str, host: Option<&str>, detail: Option<&str>) -> ControlError {
     let target = host.map_or_else(|| "this Mac".to_owned(), ToOwned::to_owned);
     let suffix = detail.map_or_else(String::new, |detail| format!(": {detail}"));
@@ -4411,6 +4487,89 @@ mod tests {
             err_of(call(&server, "session.resize", Some(json!({ "id": "s" })))).code,
             "bad_request"
         );
+    }
+
+    #[test]
+    fn concurrent_keyed_control_spawns_create_exactly_one_session() {
+        let temp = tempfile::tempdir().expect("temp");
+        let server = server(temp.path());
+        server
+            .registry
+            .lock()
+            .expect("registry")
+            .insert_record(test_record("s_parent"));
+        let params = json!({
+            "kind": {"shell": {}},
+            "cwd": temp.path(),
+            "parent": "s_parent",
+            "title": "idempotent child",
+            "requestKey": "turn-9/reviewer",
+        });
+        let gate = Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let server = Arc::clone(&server);
+            let params = params.clone();
+            let gate = Arc::clone(&gate);
+            workers.push(std::thread::spawn(move || {
+                gate.wait();
+                ok_of(call(&server, Method::SESSION_SPAWN, Some(params)))
+            }));
+        }
+        gate.wait();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("spawn worker"))
+            .collect::<Vec<_>>();
+        assert_eq!(results[0]["id"], results[1]["id"]);
+
+        let child_id = results[0]["id"].as_str().expect("child id").to_owned();
+        let records = server.registry.lock().expect("registry").records();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record
+                    .parent
+                    .as_ref()
+                    .is_some_and(|parent| parent.0 == "s_parent"))
+                .count(),
+            1
+        );
+        let mut registry = server.registry.lock().expect("registry");
+        let _ = registry.terminate(&child_id, Duration::from_millis(500));
+        registry.forget(&child_id);
+    }
+
+    #[test]
+    fn keyed_spawn_arguments_are_normalized_before_conflict_checks() {
+        let temp = tempfile::tempdir().expect("temp");
+        let server = server(temp.path());
+        server
+            .registry
+            .lock()
+            .expect("registry")
+            .insert_record(test_record("s_parent"));
+        let base = json!({
+            "kind": {"shell": {}},
+            "cwd": temp.path(),
+            "parent": "s_parent",
+            "requestKey": "turn-9/normalized",
+        });
+        let first = ok_of(call(&server, Method::SESSION_SPAWN, Some(base.clone())));
+        let mut explicit_false = base.clone();
+        explicit_false["newWorktree"] = json!(false);
+        let replay = ok_of(call(&server, Method::SESSION_SPAWN, Some(explicit_false)));
+        assert_eq!(first["id"], replay["id"]);
+
+        let mut changed = base;
+        changed["title"] = json!("different title");
+        let conflict = err_of(call(&server, Method::SESSION_SPAWN, Some(changed)));
+        assert_eq!(conflict.code, "idempotency_conflict");
+
+        let child_id = first["id"].as_str().expect("child id");
+        let mut registry = server.registry.lock().expect("registry");
+        let _ = registry.terminate(child_id, Duration::from_millis(500));
+        registry.forget(child_id);
     }
 
     #[test]
