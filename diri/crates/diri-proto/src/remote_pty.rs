@@ -18,8 +18,9 @@ use crate::grid::{GridCodecError, GridUpdate};
 use crate::terminal::MouseModes;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 4;
+pub const PROTOCOL_MINOR: u16 = 5;
 pub const MOUSE_INPUT_PROTOCOL_MINOR: u16 = 4;
+pub const APPLICATION_CURSOR_PROTOCOL_MINOR: u16 = 5;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_ARGUMENTS: usize = 512;
 pub const MAX_ENVIRONMENT_VARIABLES: usize = 4096;
@@ -91,6 +92,8 @@ pub enum RemoteCapability {
     PersistenceProbe,
     /// Uploaded Helper can activate itself without replacing different bytes.
     AtomicActivation,
+    /// Full snapshots and grid deltas carry the child's DECCKM state.
+    ApplicationCursorKeys,
     AgentEvents,
     McpStdio,
     ResourceInspect,
@@ -119,6 +122,7 @@ impl RemoteCapability {
             Self::ExecutableDiscovery => "executable-discovery",
             Self::PersistenceProbe => "persistence-probe",
             Self::AtomicActivation => "atomic-activation",
+            Self::ApplicationCursorKeys => "application-cursor-keys",
             Self::AgentEvents => "agent-events",
             Self::McpStdio => "mcp-stdio",
             Self::ResourceInspect => "resource-inspect",
@@ -156,6 +160,38 @@ pub const PHASE_ONE_HELPER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::ExecutableDiscovery,
     RemoteCapability::PersistenceProbe,
     RemoteCapability::AtomicActivation,
+];
+
+/// Capabilities advertised by a current Holder. The protocol-1.5 cursor bit
+/// is optional from the Engine's point of view so it can reconnect to a live
+/// 1.4 Holder and reconstruct the unknown mode from retained output.
+pub const CURRENT_HOLDER_CAPABILITIES: &[RemoteCapability] = &[
+    RemoteCapability::FullSnapshot,
+    RemoteCapability::IncrementalGrid,
+    RemoteCapability::ProcessExit,
+    RemoteCapability::Signal,
+    RemoteCapability::ControllerLease,
+    RemoteCapability::Scrollback,
+    RemoteCapability::ApplicationCursorKeys,
+];
+
+/// Full command/capability surface advertised by a current Helper probe.
+/// Baseline validation continues to require only
+/// [`PHASE_ONE_HELPER_CAPABILITIES`] for mixed-version live sessions.
+pub const CURRENT_HELPER_CAPABILITIES: &[RemoteCapability] = &[
+    RemoteCapability::FullSnapshot,
+    RemoteCapability::IncrementalGrid,
+    RemoteCapability::ProcessExit,
+    RemoteCapability::Signal,
+    RemoteCapability::ControllerLease,
+    RemoteCapability::Scrollback,
+    RemoteCapability::SessionManagement,
+    RemoteCapability::EnvironmentCapture,
+    RemoteCapability::DirectoryList,
+    RemoteCapability::ExecutableDiscovery,
+    RemoteCapability::PersistenceProbe,
+    RemoteCapability::AtomicActivation,
+    RemoteCapability::ApplicationCursorKeys,
 ];
 
 /// Authentication bearer shared only by the local Engine and one Holder.
@@ -266,7 +302,10 @@ pub struct FullSnapshot {
     pub sequence: u64,
     pub alt_screen: bool,
     pub bracketed_paste: bool,
-    pub application_cursor_keys: bool,
+    /// `None` means the negotiated Holder predates protocol 1.5 or omitted
+    /// the capability. The Engine must reconstruct it from retained output;
+    /// absence is never interpreted as the terminal default.
+    pub application_cursor_keys: Option<bool>,
     pub mouse: MouseModes,
     pub grid: GridUpdate,
 }
@@ -276,7 +315,7 @@ pub struct GridDelta {
     pub sequence: u64,
     pub alt_screen: bool,
     pub bracketed_paste: bool,
-    pub application_cursor_keys: bool,
+    pub application_cursor_keys: Option<bool>,
     pub mouse: MouseModes,
     pub grid: GridUpdate,
 }
@@ -823,6 +862,9 @@ impl From<GridCodecError> for RemoteCodecError {
 #[derive(Clone, Debug, Default)]
 pub struct RemoteCodec {
     buffer: Vec<u8>,
+    /// Learned from the HelloAck on this exact stream. A zero bit before that
+    /// negotiation (or from a 1.4 Holder) is unknown, not `false`.
+    application_cursor_keys_known: bool,
 }
 
 impl RemoteCodec {
@@ -873,7 +915,7 @@ impl RemoteCodec {
                     // byte extension.
                     | (u8::from(value.mouse.is_reporting()) << 2)
                     | (value.mouse.detail_bits() << 3)
-                    | (u8::from(value.application_cursor_keys) << 6);
+                    | (u8::from(value.application_cursor_keys == Some(true)) << 6);
                 output.push(modes);
                 if !value.grid.is_full_snapshot {
                     return rollback(
@@ -895,7 +937,7 @@ impl RemoteCodec {
                     | (u8::from(value.bracketed_paste) << 1)
                     | (u8::from(value.mouse.is_reporting()) << 2)
                     | (value.mouse.detail_bits() << 3)
-                    | (u8::from(value.application_cursor_keys) << 6);
+                    | (u8::from(value.application_cursor_keys == Some(true)) << 6);
                 output.push(modes);
                 if value.grid.is_full_snapshot {
                     return rollback(
@@ -1009,10 +1051,20 @@ impl RemoteCodec {
             if self.buffer.len() < frame_end {
                 break;
             }
-            messages.push(decode_message(
+            let message = decode_message(
                 kind,
                 &self.buffer[consumed + HEADER_BYTES..frame_end],
-            )?);
+                self.application_cursor_keys_known,
+            )?;
+            if let RemoteMessage::HelloAck(acknowledgement) = &message {
+                self.application_cursor_keys_known = acknowledgement.protocol.major
+                    == PROTOCOL_MAJOR
+                    && acknowledgement.protocol.minor >= APPLICATION_CURSOR_PROTOCOL_MINOR
+                    && acknowledgement
+                        .capabilities
+                        .contains(&RemoteCapability::ApplicationCursorKeys);
+            }
+            messages.push(message);
             consumed = frame_end;
         }
 
@@ -1048,7 +1100,11 @@ fn decode_json<T: DeserializeOwned>(kind: u8, payload: &[u8]) -> Result<T, Remot
     })
 }
 
-fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodecError> {
+fn decode_message(
+    kind: u8,
+    payload: &[u8],
+    application_cursor_keys_known: bool,
+) -> Result<RemoteMessage, RemoteCodecError> {
     if kind <= FrameType::Mouse as u8 {
         return Ok(RemoteMessage::Terminal(Frame::new(
             FrameType::try_from(kind).map_err(|_| RemoteCodecError::UnknownMessageType(kind))?,
@@ -1086,7 +1142,8 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
                 sequence,
                 alt_screen: modes & 1 != 0,
                 bracketed_paste: modes & 2 != 0,
-                application_cursor_keys: modes & (1 << 6) != 0,
+                application_cursor_keys: application_cursor_keys_known
+                    .then_some(modes & (1 << 6) != 0),
                 mouse: MouseModes::from_detail_bits(modes >> 3, modes & 4 != 0),
                 grid,
             }))
@@ -1111,7 +1168,8 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
                 sequence,
                 alt_screen: modes & 1 != 0,
                 bracketed_paste: modes & 2 != 0,
-                application_cursor_keys: modes & (1 << 6) != 0,
+                application_cursor_keys: application_cursor_keys_known
+                    .then_some(modes & (1 << 6) != 0),
                 mouse: MouseModes::from_detail_bits(modes >> 3, modes & 4 != 0),
                 grid,
             }))
@@ -1273,7 +1331,7 @@ mod tests {
             sequence: 42,
             alt_screen: true,
             bracketed_paste: true,
-            application_cursor_keys: true,
+            application_cursor_keys: Some(true),
             mouse: MouseModes::new(
                 crate::terminal::MouseTrackingMode::ButtonMotion,
                 crate::terminal::MouseEncoding::Sgr,
@@ -1288,6 +1346,39 @@ mod tests {
                 changed_rows: vec![ChangedRow::new(0, vec![GridCell::BLANK; 2])],
             },
         }
+    }
+
+    fn hello_ack(protocol: ProtocolVersion, capabilities: Vec<RemoteCapability>) -> RemoteMessage {
+        RemoteMessage::HelloAck(HelloAck {
+            protocol,
+            holder_build_id: "holder-build".into(),
+            session_incarnation: "incarnation-1".into(),
+            capabilities,
+            controller_epoch: 1,
+            process_state: RemoteProcessState::Running { pid: 42 },
+            output_offset: 0,
+            snapshot_sequence: 0,
+        })
+    }
+
+    fn decode_after_ack(
+        message: &RemoteMessage,
+        protocol: ProtocolVersion,
+        capabilities: Vec<RemoteCapability>,
+    ) -> RemoteMessage {
+        let mut codec = RemoteCodec::new();
+        let acknowledgement = hello_ack(protocol, capabilities);
+        assert_eq!(
+            codec
+                .feed(&RemoteCodec::encode(&acknowledgement).expect("encode ack"))
+                .expect("decode ack"),
+            vec![acknowledgement]
+        );
+        codec
+            .feed(&RemoteCodec::encode(message).expect("encode message"))
+            .expect("decode message")
+            .pop()
+            .expect("message")
     }
 
     #[test]
@@ -1329,8 +1420,12 @@ mod tests {
         assert_ne!(encoded[13] & 0b100, 0, "historical any-mouse bit");
         assert_ne!(encoded[13] & (1 << 6), 0, "application cursor bit");
         assert_eq!(
-            RemoteCodec::new().feed(&encoded).expect("decode"),
-            vec![message]
+            decode_after_ack(
+                &message,
+                ProtocolVersion::CURRENT,
+                CURRENT_HOLDER_CAPABILITIES.to_vec()
+            ),
+            message
         );
     }
 
@@ -1346,9 +1441,9 @@ mod tests {
             panic!("snapshot");
         };
         assert_eq!(decoded.mouse, MouseModes::UNKNOWN);
-        assert!(
-            !decoded.application_cursor_keys,
-            "historical snapshots default DECCKM off"
+        assert_eq!(
+            decoded.application_cursor_keys, None,
+            "without a 1.5 capability, DECCKM is unknown"
         );
     }
 
@@ -1378,7 +1473,7 @@ mod tests {
             sequence: 43,
             alt_screen: true,
             bracketed_paste: true,
-            application_cursor_keys: true,
+            application_cursor_keys: Some(true),
             mouse: MouseModes::new(
                 crate::terminal::MouseTrackingMode::ButtonMotion,
                 crate::terminal::MouseEncoding::Sgr,
@@ -1388,9 +1483,54 @@ mod tests {
         let encoded = RemoteCodec::encode(&message).expect("encode");
         assert_eq!(encoded[0], KIND_GRID_DELTA);
         assert_eq!(
-            RemoteCodec::new().feed(&encoded).expect("decode"),
-            vec![message]
+            decode_after_ack(
+                &message,
+                ProtocolVersion::CURRENT,
+                CURRENT_HOLDER_CAPABILITIES.to_vec()
+            ),
+            message
         );
+    }
+
+    #[test]
+    fn application_cursor_requires_protocol_1_5_and_its_capability() {
+        let message = RemoteMessage::FullSnapshot(snapshot());
+
+        for (protocol, capabilities, expected) in [
+            (
+                ProtocolVersion { major: 1, minor: 4 },
+                PHASE_ONE_HOLDER_CAPABILITIES.to_vec(),
+                None,
+            ),
+            (
+                ProtocolVersion::CURRENT,
+                PHASE_ONE_HOLDER_CAPABILITIES.to_vec(),
+                None,
+            ),
+            (
+                ProtocolVersion::CURRENT,
+                CURRENT_HOLDER_CAPABILITIES.to_vec(),
+                Some(true),
+            ),
+        ] {
+            let RemoteMessage::FullSnapshot(decoded) =
+                decode_after_ack(&message, protocol, capabilities)
+            else {
+                panic!("snapshot");
+            };
+            assert_eq!(decoded.application_cursor_keys, expected);
+        }
+
+        let mut disabled = snapshot();
+        disabled.application_cursor_keys = Some(false);
+        let RemoteMessage::FullSnapshot(decoded) = decode_after_ack(
+            &RemoteMessage::FullSnapshot(disabled),
+            ProtocolVersion::CURRENT,
+            CURRENT_HOLDER_CAPABILITIES.to_vec(),
+        ) else {
+            panic!("snapshot");
+        };
+        assert_eq!(decoded.application_cursor_keys, Some(false));
     }
 
     #[test]

@@ -426,6 +426,13 @@ button or motion reports, while wheel intent remains encoded by that Holder's
 authoritative parser. Scrollback is bounded to 4 MiB and served on demand
 through `Scroll`. Raw output is bounded to 32 MiB.
 
+Protocol 1.5 adds the optional `application-cursor-keys` capability and mode
+bit. Capability and minor version must both be present before an unset bit can
+mean `false`; for a live protocol 1.4 Holder the state is `None`, never an
+invented terminal default. In that mixed-version case the Engine reconstructs
+DECCKM from the same ordered retained output it already feeds through its local
+emulator, then publishes the resolved state to desktop attachments.
+
 The PTY reader must never block on a client. The Holder uses bounded queues. It
 coalesces background output for no more than 8 ms, while up to two grid
 publications after interactive input bypass that wait (one trailing publication
@@ -482,7 +489,10 @@ declares terminal, session management, environment capture, directory listing,
 batched executable discovery, persistence probing, and atomic activation as
 required capabilities. Protocol 1.4 additively preserves granular mouse
 tracking/encoding bits and the raw mouse-input frame while retaining the old
-any-mouse compatibility bit.
+any-mouse compatibility bit. Protocol 1.5 additively preserves DECCKM behind
+the optional `application-cursor-keys` capability. The capability is not in the
+required baseline: a new Engine can keep a live 1.4 Holder attached and treats
+its absent bit as unknown until retained-output reconstruction resolves it.
 
 The protocol includes:
 

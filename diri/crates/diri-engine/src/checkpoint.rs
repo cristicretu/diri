@@ -1,6 +1,6 @@
-//! Durable screen checkpoints: `<id>.screen.plist`. Version 2 remains
-//! load-compatible with the historical Swift checkpoint; version 3 preserves
-//! granular mouse state and version 4 preserves application-cursor state.
+//! Durable screen checkpoints: `<id>.screen.plist`. Versions before 4 are
+//! deliberately cache misses because they cannot say whether DECCKM was on;
+//! the retained raw log is authoritative and reconstructs that state exactly.
 //!
 //! A checkpoint pairs an RLE-encoded full grid with the exact raw-log offset
 //! it represents, so a restarted daemon can seed the emulator from a few
@@ -8,11 +8,10 @@
 //! 256 KiB raw tail through the emulator per adopted session.
 //!
 //! Checkpoints are an acceleration cache, never authoritative state: a
-//! malformed, stale, or future-version file is ignored and the bounded
-//! raw-log replay runs instead. The on-disk format is a property list (either
-//! binary or XML is read). Version 2's historical keys still load during an
-//! upgrade; a rollback safely treats newer versions as a cache miss and rebuilds
-//! from the authoritative raw log.
+//! malformed or stale file is ignored and the bounded raw-log replay runs
+//! instead. The on-disk format is a property list (either binary or XML is
+//! read). Future additive versions remain readable when they retain every
+//! version-4 field; deleting or changing one safely turns them into a miss.
 
 use std::path::Path;
 
@@ -22,9 +21,8 @@ use diri_proto::terminal::{MouseEncoding, MouseModes, MouseTrackingMode};
 // Version 1 persisted only the visible grid. Restoring it silently collapsed
 // every adopted session to at most one line of history, so it is deliberately
 // treated as a cache miss and rebuilt from the authoritative raw log.
-const SWIFT_VERSION: u64 = 2;
-const GRANULAR_MOUSE_VERSION: u64 = 3;
-const CURRENT_VERSION: u64 = 4;
+const APPLICATION_CURSOR_VERSION: u64 = 4;
+const CURRENT_VERSION: u64 = APPLICATION_CURSOR_VERSION;
 
 /// A decoded checkpoint, grid already validated.
 pub struct ScreenCheckpoint {
@@ -55,7 +53,13 @@ impl ScreenCheckpoint {
         let value = plist::Value::from_file(path).ok()?;
         let dict = value.as_dictionary()?;
         let version = dict.get("version")?.as_unsigned_integer()?;
-        if !(SWIFT_VERSION..=CURRENT_VERSION).contains(&version) {
+        // A v2/v3 snapshot can reproduce cells, paste, and mouse state, but
+        // silently inventing DECCKM=false would send the wrong arrow bytes to
+        // a still-live TUI. Treat it as the acceleration-cache miss it is and
+        // replay the authoritative retained log. Versions >=4 are additive:
+        // required-field decoding below still fails closed on an incompatible
+        // future shape while preserving the v4 cursor bit in a future v5.
+        if version < APPLICATION_CURSOR_VERSION {
             return None;
         }
         let grid = GridUpdate::decode(as_data(dict.get("gridPayload")?)?).ok()?;
@@ -74,25 +78,14 @@ impl ScreenCheckpoint {
         {
             return None;
         }
-        let mouse = if version < GRANULAR_MOUSE_VERSION {
-            if dict.get("mouseReporting")?.as_boolean()? {
-                // Version 2's restore implementation always synthesized this
-                // exact pair. This is checkpoint compatibility, not a claim
-                // about the unknowable details of an old live wire peer.
-                MouseModes::new(MouseTrackingMode::ButtonEvents, MouseEncoding::Sgr)
-            } else {
-                MouseModes::OFF
-            }
-        } else {
-            MouseModes::new(
-                MouseTrackingMode::from_wire(
-                    u8::try_from(dict.get("mouseTrackingMode")?.as_unsigned_integer()?).ok()?,
-                )?,
-                MouseEncoding::from_wire(
-                    u8::try_from(dict.get("mouseEncoding")?.as_unsigned_integer()?).ok()?,
-                )?,
-            )
-        };
+        let mouse = MouseModes::new(
+            MouseTrackingMode::from_wire(
+                u8::try_from(dict.get("mouseTrackingMode")?.as_unsigned_integer()?).ok()?,
+            )?,
+            MouseEncoding::from_wire(
+                u8::try_from(dict.get("mouseEncoding")?.as_unsigned_integer()?).ok()?,
+            )?,
+        );
         Some(Self {
             log_offset: dict.get("logOffset")?.as_unsigned_integer()?,
             history,
@@ -100,11 +93,7 @@ impl ScreenCheckpoint {
             marker_buffer: as_data(dict.get("markerBuffer")?)?.to_vec(),
             alt_screen: dict.get("altScreen")?.as_boolean()?,
             bracketed_paste: dict.get("bracketedPaste")?.as_boolean()?,
-            application_cursor_keys: if version >= CURRENT_VERSION {
-                dict.get("applicationCursorKeys")?.as_boolean()?
-            } else {
-                false
-            },
+            application_cursor_keys: dict.get("applicationCursorKeys")?.as_boolean()?,
             mouse,
         })
     }
@@ -274,12 +263,10 @@ mod tests {
     }
 
     #[test]
-    fn a_swift_shaped_plist_written_by_apples_tools_loads() {
-        // The forward direction of the mixed-fleet upgrade: a checkpoint
-        // with the same keys and value types PropertyListEncoder uses must
-        // load here. On macOS, additionally convert it with Apple's plist
-        // implementation before loading; Linux has no `plutil`, so it reads
-        // the equivalent standard XML representation directly.
+    fn a_swift_v2_checkpoint_is_a_safe_cache_miss() {
+        // The format remains parseable, but v2 has no DECCKM truth. Returning
+        // a miss makes adoption replay the retained output instead of
+        // inventing false for a child that may still be in application mode.
         let dir = tempfile::tempdir().expect("temp");
         let path = dir.path().join("s_swift.screen.plist");
         let payload = sample().grid.encode().expect("encode");
@@ -319,16 +306,11 @@ mod tests {
             );
         }
 
-        let loaded = ScreenCheckpoint::load(&path).expect("load Swift-shaped plist");
-        assert_eq!(loaded.log_offset, 777);
-        assert_eq!(loaded.history, sample().history);
-        assert_eq!(loaded.grid, sample().grid);
-        assert!(loaded.bracketed_paste);
-        assert_eq!(loaded.mouse, MouseModes::OFF);
+        assert!(ScreenCheckpoint::load(&path).is_none());
     }
 
     #[test]
-    fn version_two_enabled_mouse_state_loads_with_its_historical_semantics() {
+    fn version_two_with_enabled_mouse_is_still_a_cache_miss() {
         let dir = tempfile::tempdir().expect("temp");
         let path = dir.path().join("s_v2.screen.plist");
         sample().write_atomically(&path).expect("write");
@@ -336,27 +318,18 @@ mod tests {
             .expect("read")
             .into_dictionary()
             .expect("dictionary");
-        dict.insert(
-            "version".into(),
-            plist::Value::Integer(SWIFT_VERSION.into()),
-        );
+        dict.insert("version".into(), plist::Value::Integer(2.into()));
         dict.remove("mouseTrackingMode");
         dict.remove("mouseEncoding");
         plist::Value::Dictionary(dict)
             .to_file_binary(&path)
             .expect("rewrite v2");
 
-        let loaded = ScreenCheckpoint::load(&path).expect("load v2");
-        assert_eq!(
-            loaded.mouse,
-            MouseModes::new(MouseTrackingMode::ButtonEvents, MouseEncoding::Sgr),
-            "v2 restore used to synthesize DECSET 1000 and DECSET 1006"
-        );
-        assert!(!loaded.application_cursor_keys);
+        assert!(ScreenCheckpoint::load(&path).is_none());
     }
 
     #[test]
-    fn version_three_defaults_application_cursor_mode_off() {
+    fn version_three_never_invents_application_cursor_mode_off() {
         let dir = tempfile::tempdir().expect("temp");
         let path = dir.path().join("s_v3.screen.plist");
         sample().write_atomically(&path).expect("write");
@@ -364,18 +337,13 @@ mod tests {
             .expect("read")
             .into_dictionary()
             .expect("dictionary");
-        dict.insert(
-            "version".into(),
-            plist::Value::Integer(GRANULAR_MOUSE_VERSION.into()),
-        );
+        dict.insert("version".into(), plist::Value::Integer(3.into()));
         dict.remove("applicationCursorKeys");
         plist::Value::Dictionary(dict)
             .to_file_binary(&path)
             .expect("rewrite v3");
 
-        let loaded = ScreenCheckpoint::load(&path).expect("load v3");
-        assert!(!loaded.application_cursor_keys);
-        assert_eq!(loaded.mouse, sample().mouse);
+        assert!(ScreenCheckpoint::load(&path).is_none());
     }
 
     #[test]
@@ -393,7 +361,9 @@ mod tests {
 
         let mut future = sample();
         future.write_atomically(&path).expect("write");
-        // Rewrite with a future version.
+        // An additive v5 still carries the v4 DECCKM field. Decoding by the
+        // feature's introduction version, rather than CURRENT_VERSION,
+        // prevents a later format bump from silently resetting the mode.
         let mut dict = plist::Value::from_file(&path)
             .expect("read back")
             .into_dictionary()
@@ -405,16 +375,30 @@ mod tests {
         plist::Value::Dictionary(dict)
             .to_file_binary(&path)
             .expect("rewrite");
+        let loaded = ScreenCheckpoint::load(&path).expect("additive v5");
+        assert!(loaded.application_cursor_keys);
+
+        let mut dict = plist::Value::from_file(&path)
+            .expect("read v5")
+            .into_dictionary()
+            .expect("dict");
+        dict.remove("applicationCursorKeys");
+        plist::Value::Dictionary(dict)
+            .to_file_binary(&path)
+            .expect("rewrite incomplete v5");
         assert!(
             ScreenCheckpoint::load(&path).is_none(),
-            "a future version is a miss"
+            "a future shape without the v4 field is a miss"
         );
 
         // A truncated grid payload is a miss, not a panic.
         future.grid.changed_rows.clear();
         future.grid.is_full_snapshot = true;
         let mut dict = plist::Dictionary::new();
-        dict.insert("version".into(), plist::Value::Integer(2.into()));
+        dict.insert(
+            "version".into(),
+            plist::Value::Integer(CURRENT_VERSION.into()),
+        );
         dict.insert("logOffset".into(), plist::Value::Integer(1.into()));
         dict.insert("gridPayload".into(), plist::Value::Data(vec![0xde, 0xad]));
         dict.insert("historyRowCount".into(), plist::Value::Integer(0.into()));

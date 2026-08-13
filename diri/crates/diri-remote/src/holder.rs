@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use diri_proto::frames::{Frame, FrameType, MAX_FRAME_BYTES};
 use diri_proto::remote_pty::{
     ControlGranted, ControlRevoked, FullSnapshot, GridDelta, Hello, HelloAck, LaunchRequest,
-    LaunchResult, PHASE_ONE_HOLDER_CAPABILITIES, ProcessExit, RemoteCodec, RemoteError,
-    RemoteMessage, RemoteProcessState, ScrollbackResponse, validate_terminal_dimensions,
+    LaunchResult, ProcessExit, RemoteCodec, RemoteError, RemoteMessage, RemoteProcessState,
+    ScrollbackResponse, validate_terminal_dimensions,
 };
 use diri_pty::{Exit, ExitWatcher, Pty, PtySpec, PtyStream};
 use diri_terminal_state::HeadlessScreen;
@@ -38,7 +38,7 @@ const REPLAY_BUDGET_BYTES: usize = 4 << 20;
 const PERSIST_OFFSET_INTERVAL: u64 = 1 << 20;
 
 pub const PHASE_ONE_CAPABILITIES: &[diri_proto::remote_pty::RemoteCapability] =
-    PHASE_ONE_HOLDER_CAPABILITIES;
+    diri_proto::remote_pty::CURRENT_HOLDER_CAPABILITIES;
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1021,7 +1021,7 @@ impl Holder {
                 sequence: self.state.snapshot_sequence,
                 alt_screen: self.screen.is_alt_screen(),
                 bracketed_paste: self.screen.bracketed_paste(),
-                application_cursor_keys: self.screen.application_cursor_keys(),
+                application_cursor_keys: Some(self.screen.application_cursor_keys()),
                 mouse: self.screen.mouse_modes(),
                 grid,
             }))?;
@@ -1030,7 +1030,7 @@ impl Holder {
                 sequence: self.state.snapshot_sequence,
                 alt_screen: self.screen.is_alt_screen(),
                 bracketed_paste: self.screen.bracketed_paste(),
-                application_cursor_keys: self.screen.application_cursor_keys(),
+                application_cursor_keys: Some(self.screen.application_cursor_keys()),
                 mouse: self.screen.mouse_modes(),
                 grid,
             }))?;
@@ -1070,7 +1070,7 @@ impl Holder {
             sequence: self.state.snapshot_sequence,
             alt_screen: self.screen.is_alt_screen(),
             bracketed_paste: self.screen.bracketed_paste(),
-            application_cursor_keys: self.screen.application_cursor_keys(),
+            application_cursor_keys: Some(self.screen.application_cursor_keys()),
             mouse: self.screen.mouse_modes(),
             grid: self.screen.full_snapshot(),
         }))

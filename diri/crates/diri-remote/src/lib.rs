@@ -17,9 +17,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use diri_proto::remote_pty::{
-    EnvironmentCaptureRequest, GcResult, HelperProbe, LaunchRequest, PHASE_ONE_HELPER_CAPABILITIES,
-    PROTOCOL_MAJOR, PROTOCOL_MINOR, ProtocolVersion, RemoteProcessState, SessionInspection,
-    SessionSelector,
+    EnvironmentCaptureRequest, GcResult, HelperProbe, LaunchRequest, PROTOCOL_MAJOR,
+    PROTOCOL_MINOR, ProtocolVersion, RemoteProcessState, SessionInspection, SessionSelector,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -32,7 +31,7 @@ pub const BUILD_ID: &str = env!("DIRI_REMOTE_EFFECTIVE_BUILD_ID");
 /// the narrower phase-one terminal subset; `probe` advertises management
 /// commands too so the Engine rejects an old binary before invoking one.
 pub const HELPER_CAPABILITIES: &[diri_proto::remote_pty::RemoteCapability] =
-    PHASE_ONE_HELPER_CAPABILITIES;
+    diri_proto::remote_pty::CURRENT_HELPER_CAPABILITIES;
 
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_FAILURE: i32 = 1;

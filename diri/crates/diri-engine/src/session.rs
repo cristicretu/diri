@@ -2171,6 +2171,19 @@ fn apply_remote_snapshot(
     last_eval_seq: &mut u64,
     snapshot: FullSnapshot,
 ) -> std::io::Result<()> {
+    // Protocol 1.4 has no DECCKM bit. Its absence is unknown, not false: raw
+    // output is ordered before the corresponding grid publication and the
+    // Engine feeds that retained stream through its own emulator, so it is a
+    // trustworthy compatibility source for live old Holders and cold replay.
+    let emulated_application_cursor_keys = shared
+        .screen
+        .lock()
+        .expect("screen")
+        .application_cursor_keys();
+    let application_cursor_keys = resolve_remote_application_cursor_keys(
+        snapshot.application_cursor_keys,
+        emulated_application_cursor_keys,
+    );
     {
         let mut remote = shared.remote_grid.lock().expect("remote grid");
         let remote = remote
@@ -2183,7 +2196,7 @@ fn apply_remote_snapshot(
                 &snapshot.grid,
                 snapshot.alt_screen,
                 snapshot.bracketed_paste,
-                snapshot.application_cursor_keys,
+                application_cursor_keys,
                 snapshot.mouse,
             )
             .map_err(std::io::Error::other)?;
@@ -2204,7 +2217,7 @@ fn apply_remote_snapshot(
             &snapshot.grid,
             snapshot.alt_screen,
             snapshot.bracketed_paste,
-            snapshot.application_cursor_keys,
+            application_cursor_keys,
             snapshot.mouse,
         ) {
             return Err(std::io::Error::new(
@@ -2226,6 +2239,15 @@ fn apply_remote_snapshot(
 }
 
 fn apply_remote_delta(shared: &Shared, delta: GridDelta) -> std::io::Result<()> {
+    let emulated_application_cursor_keys = shared
+        .screen
+        .lock()
+        .expect("screen")
+        .application_cursor_keys();
+    let application_cursor_keys = resolve_remote_application_cursor_keys(
+        delta.application_cursor_keys,
+        emulated_application_cursor_keys,
+    );
     {
         let mut remote = shared.remote_grid.lock().expect("remote grid");
         let remote = remote
@@ -2238,7 +2260,7 @@ fn apply_remote_delta(shared: &Shared, delta: GridDelta) -> std::io::Result<()> 
                 &delta.grid,
                 delta.alt_screen,
                 delta.bracketed_paste,
-                delta.application_cursor_keys,
+                application_cursor_keys,
                 delta.mouse,
             )
             .map_err(std::io::Error::other)?;
@@ -2251,6 +2273,13 @@ fn apply_remote_delta(shared: &Shared, delta: GridDelta) -> std::io::Result<()> 
     }
     shared.grid_wake.notify();
     Ok(())
+}
+
+fn resolve_remote_application_cursor_keys(
+    advertised: Option<bool>,
+    emulated_from_retained_output: bool,
+) -> bool {
+    advertised.unwrap_or(emulated_from_retained_output)
 }
 
 fn record_remote_exit(shared: &Shared, exit: ProcessExit) {
@@ -3095,6 +3124,19 @@ mod prompt_title_tests {
             input.observe(b"\r").as_deref(),
             Some("repair remote titlee")
         );
+    }
+}
+
+#[cfg(test)]
+mod remote_mode_tests {
+    use super::resolve_remote_application_cursor_keys;
+
+    #[test]
+    fn old_holder_unknown_mode_uses_retained_output_truth() {
+        assert!(resolve_remote_application_cursor_keys(None, true));
+        assert!(!resolve_remote_application_cursor_keys(None, false));
+        assert!(resolve_remote_application_cursor_keys(Some(true), false));
+        assert!(!resolve_remote_application_cursor_keys(Some(false), true));
     }
 }
 

@@ -734,9 +734,11 @@ impl HeadlessScreen {
         if bracketed_paste {
             bytes.extend_from_slice(b"\x1b[?2004h");
         }
-        if application_cursor_keys {
-            bytes.extend_from_slice(b"\x1b[?1h");
-        }
+        bytes.extend_from_slice(if application_cursor_keys {
+            b"\x1b[?1h"
+        } else {
+            b"\x1b[?1l"
+        });
         if let Some(mode) = mouse.tracking.dec_private_mode() {
             bytes.extend_from_slice(format!("\x1b[?{mode}h").as_bytes());
         }
@@ -1362,6 +1364,19 @@ mod tests {
             !smaller.restore(&[], &snapshot, false, false, false, MouseModes::OFF),
             "a checkpoint from another geometry is a cache miss"
         );
+    }
+
+    #[test]
+    fn restore_explicitly_clears_existing_application_cursor_mode() {
+        let mut source = HeadlessScreen::new(8, 2);
+        source.feed(b"plain");
+        let snapshot = source.full_snapshot();
+
+        let mut restored = HeadlessScreen::new(8, 2);
+        restored.feed(b"\x1b[?1h");
+        assert!(restored.application_cursor_keys());
+        assert!(restored.restore(&[], &snapshot, false, false, false, MouseModes::OFF));
+        assert!(!restored.application_cursor_keys());
     }
 
     /// The extracted crate forked before checkpoints carried scrollback, so
