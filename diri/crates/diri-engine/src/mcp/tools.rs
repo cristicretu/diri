@@ -121,6 +121,33 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
             }),
         ),
         tool(
+            "search_workspace",
+            "Navigate the calling agent's local repository with Diri's bounded, git-aware index. Use definitions to find declarations, references to find literal call/usage sites without the declaration, files for paths, or all for a compact mixed result. Prefer this over broad grep when locating a symbol or deciding where to edit.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "minLength": 2, "description": "Symbol, identifier, text, or path fragment." },
+                    "kind": { "type": "string", "enum": ["definitions", "references", "files", "all"], "default": "all" },
+                    "limit": { "type": "number", "default": 20, "minimum": 1, "maximum": 100 },
+                    "refresh": { "type": "boolean", "default": false, "description": "Rebuild the bounded index now; use after a large rewrite when immediate freshness matters." }
+                },
+                "required": ["query"]
+            }),
+        ),
+        tool(
+            "read_source",
+            "Read a small numbered source window inside the calling agent's local repository. Use a path returned by search_workspace, optionally centered on its line. Paths outside the workspace, binary files, and oversized files are rejected.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "line": { "type": "number", "minimum": 1 },
+                    "context_lines": { "type": "number", "default": 12, "minimum": 0, "maximum": 100 }
+                },
+                "required": ["path"]
+            }),
+        ),
+        tool(
             "release_agent",
             "End a session and kill its process tree. The record stays in the list.",
             json!({

@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use diri_code_intelligence::{CodeIntelligence, CodeIntelligenceCache, WorkspaceSearchKind};
 use diri_proto::{SessionId, SessionStatus};
 use serde_json::{Value, json};
 
@@ -31,6 +32,7 @@ pub struct RegistryHost {
     holder: Option<crate::session::HolderConfig>,
     /// The session calling these tools, when it identified itself.
     caller: Option<String>,
+    workspace_cache: CodeIntelligenceCache,
 }
 
 impl RegistryHost {
@@ -40,6 +42,7 @@ impl RegistryHost {
             logs_dir: logs_dir.into(),
             holder: None,
             caller: std::env::var(SESSION_ID_ENV).ok(),
+            workspace_cache: CodeIntelligenceCache::default(),
         }
     }
 
@@ -60,6 +63,30 @@ impl RegistryHost {
         self.registry
             .lock()
             .map_err(|_| "engine state is poisoned".to_string())
+    }
+
+    fn caller_workspace(&self, refresh: bool) -> Result<Arc<CodeIntelligence>, String> {
+        let caller = self.caller.as_deref().ok_or_else(|| {
+            format!("workspace tools require an identified Diri session; {SESSION_ID_ENV} is unset")
+        })?;
+        let (cwd, remote) = {
+            let registry = self.registry()?;
+            let record = registry
+                .records()
+                .into_iter()
+                .find(|record| record.id.0 == caller)
+                .ok_or_else(|| format!("no session {caller}"))?;
+            (record.cwd, record.host.is_some())
+        };
+        if remote {
+            return Err(
+                "workspace tools currently require a local Diri session; use the remote agent's shell tools for this repository"
+                    .to_owned(),
+            );
+        }
+        self.workspace_cache
+            .for_session(cwd, refresh)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -168,6 +195,77 @@ impl ToolHost for RegistryHost {
                 Ok(json!({
                     "offset": offset,
                     "output": String::from_utf8_lossy(&bytes),
+                }))
+            }
+
+            "search_workspace" => {
+                let query = required_str(arguments, "query")?;
+                let kind_wire = arguments
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("all");
+                let kind = WorkspaceSearchKind::from_wire(kind_wire)
+                    .ok_or_else(|| format!("unknown workspace search kind {kind_wire:?}"))?;
+                let limit = arguments
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(20)
+                    .clamp(1, 100) as usize;
+                let refresh = arguments
+                    .get("refresh")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let intelligence = self.caller_workspace(refresh)?;
+                let search = intelligence
+                    .search_workspace(&query, kind, limit)
+                    .map_err(|error| error.to_string())?;
+                let stats = intelligence.index_stats();
+                Ok(json!({
+                    "workspace": intelligence.workspace_root(),
+                    "query": query,
+                    "kind": kind_wire,
+                    "truncated": search.truncated,
+                    "coverage": {
+                        "files": stats.files,
+                        "searchableFiles": stats.searchable_files,
+                        "definitions": stats.definitions,
+                        "searchableBytes": stats.searchable_bytes,
+                    },
+                    "matches": search.matches.into_iter().map(|hit| json!({
+                        "path": hit.relative_path,
+                        "kind": hit.kind.as_str(),
+                        "line": hit.line,
+                        "preview": hit.preview,
+                    })).collect::<Vec<_>>(),
+                }))
+            }
+
+            "read_source" => {
+                let path = required_str(arguments, "path")?;
+                let line = arguments
+                    .get("line")
+                    .and_then(Value::as_u64)
+                    .map(|line| line.max(1) as usize);
+                let context_lines = arguments
+                    .get("context_lines")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(12)
+                    .min(100) as usize;
+                let intelligence = self.caller_workspace(false)?;
+                let excerpt = intelligence
+                    .source_excerpt(&path, line, context_lines)
+                    .map_err(|error| error.to_string())?;
+                let focus_line = excerpt.focus_line;
+                Ok(json!({
+                    "workspace": intelligence.workspace_root(),
+                    "path": excerpt.relative_path,
+                    "language": excerpt.language.as_str(),
+                    "focusLine": focus_line,
+                    "lines": excerpt.lines.into_iter().map(|source| json!({
+                        "line": source.number,
+                        "text": source.text,
+                        "focus": source.number == focus_line,
+                    })).collect::<Vec<_>>(),
                 }))
             }
 

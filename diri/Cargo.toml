@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/diri-app",
+    "crates/diri-code-intelligence",
     "crates/diri-client",
     "crates/diri-engine",
     "crates/diri-node",
@@ -25,6 +26,7 @@ license = "Apache-2.0"
 alacritty_terminal = { version = "0.26", default-features = false }
 base64 = "0.23"
 diri-client = { path = "crates/diri-client" }
+diri-code-intelligence = { path = "crates/diri-code-intelligence" }
 diri-engine = { path = "crates/diri-engine" }
 diri-node = { path = "crates/diri-node" }
 diri-proto = { path = "crates/diri-proto" }

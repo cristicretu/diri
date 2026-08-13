@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use diri_code_intelligence::{CodeIntelligence, CodeIntelligenceCache, WorkspaceSearchKind};
 use diri_proto::{
     AgentKind, AgentReadinessResult, Method, ReadScreenResult, SessionId, SessionListResult,
     SessionRecord, SessionSpawnParams, SessionStatus,
@@ -24,6 +26,7 @@ const WRITE_POLICY: &str = "Reads are open across all sessions. Writes to your p
 pub struct Bridge {
     socket_path: PathBuf,
     caller: Option<String>,
+    workspace_cache: Arc<CodeIntelligenceCache>,
 }
 
 impl Default for Bridge {
@@ -40,6 +43,7 @@ impl Bridge {
         Self {
             socket_path,
             caller,
+            workspace_cache: Arc::new(CodeIntelligenceCache::default()),
         }
     }
 
@@ -73,6 +77,8 @@ impl Bridge {
             "wait_for_agent" => self.wait_for_agent(arguments),
             "read_output" => self.read_output(arguments),
             "get_artifacts" => self.get_artifacts(arguments),
+            "search_workspace" => self.search_workspace(arguments),
+            "read_source" => self.read_source(arguments),
             "create_worktree" => self.create_worktree(arguments),
             "list_worktrees" => self.list_worktrees(arguments),
             "remove_worktree" => self.remove_worktree(arguments),
@@ -247,6 +253,81 @@ impl Bridge {
         Ok(json!({
             "artifacts": artifacts,
             "listeningPorts": record.listening_ports,
+        }))
+    }
+
+    fn caller_workspace(&self, refresh: bool) -> Result<Arc<CodeIntelligence>, String> {
+        let caller = self.caller.as_deref().ok_or_else(|| {
+            "workspace tools are scoped to a Diri session and DIRIJOR_SESSION_ID is unset"
+                .to_owned()
+        })?;
+        let sessions = self.sessions()?;
+        let record = find_session(&sessions, caller)?;
+        if record.host.is_some() {
+            return Err(
+                "workspace tools currently require a local Diri session; use the remote agent's shell tools for this repository"
+                    .to_owned(),
+            );
+        }
+        self.workspace_cache
+            .for_session(&record.cwd, refresh)
+            .map_err(|error| error.to_string())
+    }
+
+    fn search_workspace(&self, arguments: &Value) -> Result<Value, String> {
+        let query = required_string(arguments, "query")?;
+        let kind_wire = optional_string(arguments, "kind").unwrap_or_else(|| "all".into());
+        let kind = WorkspaceSearchKind::from_wire(&kind_wire)
+            .ok_or_else(|| format!("unknown workspace search kind {kind_wire:?}"))?;
+        let limit = optional_number(arguments, "limit")
+            .unwrap_or(20.0)
+            .clamp(1.0, 100.0) as usize;
+        let refresh = optional_bool(arguments, "refresh").unwrap_or(false);
+        let intelligence = self.caller_workspace(refresh)?;
+        let search = intelligence
+            .search_workspace(&query, kind, limit)
+            .map_err(|error| error.to_string())?;
+        let stats = intelligence.index_stats();
+        Ok(json!({
+            "workspace": intelligence.workspace_root(),
+            "query": query,
+            "kind": kind_wire,
+            "truncated": search.truncated,
+            "coverage": {
+                "files": stats.files,
+                "searchableFiles": stats.searchable_files,
+                "definitions": stats.definitions,
+                "searchableBytes": stats.searchable_bytes,
+            },
+            "matches": search.matches.into_iter().map(|hit| json!({
+                "path": hit.relative_path,
+                "kind": hit.kind.as_str(),
+                "line": hit.line,
+                "preview": hit.preview,
+            })).collect::<Vec<_>>(),
+        }))
+    }
+
+    fn read_source(&self, arguments: &Value) -> Result<Value, String> {
+        let path = required_string(arguments, "path")?;
+        let line = optional_number(arguments, "line").map(|value| value.max(1.0) as usize);
+        let context_lines = optional_number(arguments, "context_lines")
+            .unwrap_or(12.0)
+            .clamp(0.0, 100.0) as usize;
+        let intelligence = self.caller_workspace(false)?;
+        let excerpt = intelligence
+            .source_excerpt(&path, line, context_lines)
+            .map_err(|error| error.to_string())?;
+        Ok(json!({
+            "workspace": intelligence.workspace_root(),
+            "path": excerpt.relative_path,
+            "language": excerpt.language.as_str(),
+            "focusLine": excerpt.focus_line,
+            "lines": excerpt.lines.into_iter().map(|source| json!({
+                "line": source.number,
+                "text": source.text,
+                "focus": source.number == excerpt.focus_line,
+            })).collect::<Vec<_>>(),
         }))
     }
 

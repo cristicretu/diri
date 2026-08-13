@@ -102,6 +102,33 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
             session_id_schema(),
         ),
         ToolDefinition::new(
+            "search_workspace",
+            "Navigate the calling agent's local repository with Diri's bounded, git-aware index. Use definitions to find declarations, references to find literal call/usage sites without the declaration, files for paths, or all for a compact mixed result. Prefer this over broad grep when locating a symbol or deciding where to edit.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "minLength": 2, "description": "Symbol, identifier, text, or path fragment."},
+                    "kind": {"type": "string", "enum": ["definitions", "references", "files", "all"], "default": "all"},
+                    "limit": {"type": "number", "default": 20, "minimum": 1, "maximum": 100},
+                    "refresh": {"type": "boolean", "default": false, "description": "Rebuild the bounded index now; use after a large rewrite when immediate freshness matters."}
+                },
+                "required": ["query"]
+            }),
+        ),
+        ToolDefinition::new(
+            "read_source",
+            "Read a small numbered source window inside the calling agent's local repository. Use a path returned by search_workspace, optionally centered on its line. Paths outside the workspace, binary files, and oversized files are rejected.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "line": {"type": "number", "minimum": 1},
+                    "context_lines": {"type": "number", "default": 12, "minimum": 0, "maximum": 100}
+                },
+                "required": ["path"]
+            }),
+        ),
+        ToolDefinition::new(
             "create_worktree",
             "Create a git worktree so parallel work does not collide in one checkout.",
             json!({
@@ -304,6 +331,28 @@ mod tests {
         assert_eq!(
             spawn.input_schema["properties"]["kind"]["enum"],
             json!(["opencode", "shell"])
+        );
+    }
+
+    #[test]
+    fn workspace_tools_are_bounded_and_intentional() {
+        let tools = tool_definitions_for(&["codex".into()]);
+        let search = tools
+            .iter()
+            .find(|tool| tool.name == "search_workspace")
+            .expect("workspace search");
+        assert_eq!(search.input_schema["properties"]["limit"]["maximum"], 100);
+        assert_eq!(
+            search.input_schema["properties"]["kind"]["enum"],
+            json!(["definitions", "references", "files", "all"])
+        );
+        let source = tools
+            .iter()
+            .find(|tool| tool.name == "read_source")
+            .expect("source reader");
+        assert_eq!(
+            source.input_schema["properties"]["context_lines"]["maximum"],
+            100
         );
     }
 }

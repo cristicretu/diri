@@ -243,6 +243,8 @@ mod tests {
             "release_agent",
             "create_worktree",
             "whoami",
+            "search_workspace",
+            "read_source",
         ] {
             assert!(
                 names.contains(&expected),

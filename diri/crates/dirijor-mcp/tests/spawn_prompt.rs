@@ -244,3 +244,59 @@ fn spawn_agent_waits_for_a_large_multiline_prompt_in_a_new_worktree() {
     );
     assert!(acted, "the spawned agent must act on the submitted prompt");
 }
+
+#[test]
+fn production_bridge_scopes_workspace_navigation_to_its_calling_session() {
+    let temp = tempfile::tempdir().expect("temp");
+    let repo = temp.path().join("repo");
+    let fixture = temp.path().join("prompt-fixture");
+    initialize_repository(&repo);
+    std::fs::create_dir_all(repo.join("src")).expect("source directory");
+    std::fs::write(
+        repo.join("src/lib.rs"),
+        "pub struct WorkspaceNeedle;\nfn use_it() -> WorkspaceNeedle { todo!() }\n",
+    )
+    .expect("source");
+    std::fs::write(&fixture, "#!/bin/sh\nsleep 30\n").expect("fixture");
+    std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o700))
+        .expect("fixture executable");
+
+    let server = start_server(temp.path(), &fixture);
+    let root = Bridge::new(server.socket_path().to_path_buf(), None);
+    let spawned = root
+        .call(
+            "spawn_agent",
+            &json!({"kind": "prompt-fixture", "cwd": repo}),
+        )
+        .expect("spawn local caller");
+    let id = spawned["id"].as_str().expect("session id");
+    let agent = Bridge::new(server.socket_path().to_path_buf(), Some(id.to_owned()));
+
+    let definitions = agent
+        .call(
+            "search_workspace",
+            &json!({"query": "WorkspaceNeedle", "kind": "definitions"}),
+        )
+        .expect("workspace definitions");
+    assert_eq!(definitions["matches"][0]["path"], "src/lib.rs");
+    assert_eq!(definitions["matches"][0]["kind"], "definition");
+    assert!(definitions["coverage"]["searchableFiles"].as_u64().unwrap() >= 2);
+
+    let excerpt = agent
+        .call(
+            "read_source",
+            &json!({"path": "src/lib.rs", "line": 2, "context_lines": 1}),
+        )
+        .expect("source excerpt");
+    assert_eq!(excerpt["focusLine"], 2);
+    assert_eq!(excerpt["lines"][1]["focus"], true);
+
+    let outside = tempfile::NamedTempFile::new().expect("outside");
+    let error = agent
+        .call("read_source", &json!({"path": outside.path()}))
+        .expect_err("outside source");
+    assert!(error.contains("outside the workspace"), "{error}");
+
+    root.call("release_agent", &json!({"session_id": id}))
+        .expect("release caller");
+}
