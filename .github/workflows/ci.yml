@@ -98,7 +98,7 @@ jobs:
       run:
         working-directory: diri
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install target
         run: rustup target add "${{ matrix.target }}"
       - name: Install native musl linker
@@ -130,7 +130,7 @@ jobs:
       run:
         working-directory: diri
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Start disposable ordinary-user SSH endpoint
         run: |
           sudo apt-get update
