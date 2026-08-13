@@ -7,6 +7,12 @@ use diri_proto::methods::ReadScrollbackResult;
 use crate::buffer::GridBuffer;
 use crate::scrollback::ScrollbackViewport;
 
+mod scheduler;
+mod search;
+
+pub use scheduler::{FindSearchScheduler, ReadCompletion, ScanCompletion};
+pub use search::{SearchJob, SearchResult};
+
 pub const SEARCH_DEBOUNCE: Duration = Duration::from_millis(200);
 pub const OUTPUT_RESCAN_DELAY: Duration = Duration::from_millis(100);
 pub const MATCH_CAP: usize = 500;
@@ -17,7 +23,6 @@ pub struct FindMatch {
     pub absolute_row: i64,
     pub start_col: usize,
     pub end_col_exclusive: usize,
-    pub text: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -123,7 +128,16 @@ impl TerminalFindModel {
     /// Returns true only when this call armed the rescan, so the host schedules
     /// exactly one follow-up timer per burst.
     pub fn on_output(&mut self, now: Duration) -> bool {
-        if self.query.is_empty() || self.rescan_due.is_some() {
+        if self.query.is_empty() {
+            return false;
+        }
+        // Content is part of a search generation. Any job that captured the
+        // previous live grid must not overwrite a newer screen when it returns.
+        self.generation = self.generation.wrapping_add(1);
+        // A not-yet-started debounced query search will capture the newest
+        // generation, so arming a second earlier rescan would only defeat the
+        // query debounce and duplicate its work.
+        if self.search_due.is_some() || self.rescan_due.is_some() {
             return false;
         }
         self.rescan_due = Some(now.saturating_add(OUTPUT_RESCAN_DELAY));
@@ -131,7 +145,7 @@ impl TerminalFindModel {
     }
 
     /// Pulls one due request. The app asynchronously reads a scrollback text
-    /// snapshot, then returns it through [`Self::apply_snapshot`].
+    /// snapshot and submits it through [`Self::prepare_search`].
     pub fn take_due_search(&mut self, now: Duration) -> Option<SearchRequest> {
         let is_rescan = if self.search_due.is_some_and(|due| due <= now) {
             self.search_due = None;
@@ -149,37 +163,49 @@ impl TerminalFindModel {
         })
     }
 
-    /// Discards stale async responses, builds sorted matches, and preserves the
-    /// current index only for a same-geometry/content rescan.
-    pub fn apply_snapshot(
-        &mut self,
+    /// Validates an asynchronously-read history snapshot and captures the live
+    /// grid with a short clone. [`SearchJob::run`] owns the expensive scan and
+    /// must be dispatched to a background executor.
+    #[must_use]
+    pub fn prepare_search(
+        &self,
         request: &SearchRequest,
         snapshot: FindSnapshot,
         live: &GridBuffer,
+    ) -> Option<SearchJob> {
+        self.is_current(request)
+            .then(|| SearchJob::new(request.clone(), snapshot, live.clone()))
+    }
+
+    /// Discards stale background results and preserves the current index only
+    /// for a same-geometry/content rescan.
+    pub fn apply_result(
+        &mut self,
+        result: SearchResult,
         viewport: &mut ScrollbackViewport,
     ) -> bool {
-        if request.generation != self.generation || request.query != self.query {
+        if !self.is_current(&result.request) {
             return false;
         }
-        let sequence_changed = self.cached_content_seq != Some(snapshot.content_seq)
-            || self.cached_cols != Some(snapshot.cols);
-        self.matches = build_matches(&request.query, &snapshot, live);
-        self.is_alt_screen = snapshot.is_alt_screen;
-        self.cached_visible_start_row = Some(snapshot.visible_start_row);
-        self.cached_rows = usize::try_from(snapshot.rows.max(0)).unwrap_or(usize::MAX);
-        self.cached_content_seq = Some(snapshot.content_seq);
-        self.cached_cols = Some(snapshot.cols);
+        let sequence_changed = self.cached_content_seq != Some(result.content_seq)
+            || self.cached_cols != Some(result.cols);
+        self.matches = result.matches;
+        self.is_alt_screen = result.is_alt_screen;
+        self.cached_visible_start_row = Some(result.visible_start_row);
+        self.cached_rows = usize::try_from(result.rows.max(0)).unwrap_or(usize::MAX);
+        self.cached_content_seq = Some(result.content_seq);
+        self.cached_cols = Some(result.cols);
         viewport.apply_geometry(
-            snapshot.visible_start_row,
-            snapshot.visible_start_row.max(0),
-            snapshot.content_seq,
+            result.visible_start_row,
+            result.visible_start_row.max(0),
+            result.content_seq,
             self.cached_rows,
         );
 
-        if request.is_rescan && !sequence_changed {
+        if result.request.is_rescan && !sequence_changed {
             self.current_index = self.current_index.min(self.matches.len().saturating_sub(1));
         } else {
-            let window_top = snapshot
+            let window_top = result
                 .visible_start_row
                 .saturating_sub(viewport.view_offset());
             self.current_index = self
@@ -189,6 +215,10 @@ impl TerminalFindModel {
                 .unwrap_or(0);
         }
         true
+    }
+
+    fn is_current(&self, request: &SearchRequest) -> bool {
+        request.generation == self.generation && request.query == self.query
     }
 
     #[must_use]
@@ -252,120 +282,6 @@ impl TerminalFindModel {
     }
 }
 
-fn build_matches(query: &str, snapshot: &FindSnapshot, live: &GridBuffer) -> Vec<FindMatch> {
-    let needle: Vec<char> = query.chars().collect();
-    if needle.is_empty() {
-        return Vec::new();
-    }
-    let mut matches = Vec::new();
-    // One char scratch reused across every scanned line: a rescan walks the
-    // whole scrollback, and a fresh Vec per line dominated the scan.
-    let mut scratch: Vec<char> = Vec::new();
-
-    if !snapshot.is_alt_screen {
-        for (index, line) in snapshot.lines.iter().enumerate() {
-            let absolute_row = snapshot
-                .first_row
-                .saturating_add(i64::try_from(index).unwrap_or(i64::MAX));
-            if absolute_row >= snapshot.visible_start_row {
-                continue;
-            }
-            append_matches(
-                line,
-                None,
-                absolute_row,
-                &needle,
-                &mut scratch,
-                &mut matches,
-            );
-            if matches.len() >= MATCH_CAP {
-                matches.truncate(MATCH_CAP);
-                return matches;
-            }
-        }
-    }
-
-    let live_rows = usize::try_from(snapshot.rows.max(0))
-        .unwrap_or(usize::MAX)
-        .min(usize::from(live.rows));
-    for row in 0..live_rows {
-        let Some((line, columns)) = live.row_text_with_columns(row) else {
-            continue;
-        };
-        append_matches(
-            &line,
-            Some(&columns),
-            snapshot
-                .visible_start_row
-                .saturating_add(i64::try_from(row).unwrap_or(i64::MAX)),
-            &needle,
-            &mut scratch,
-            &mut matches,
-        );
-        if matches.len() >= MATCH_CAP {
-            matches.truncate(MATCH_CAP);
-            return matches;
-        }
-    }
-    matches.sort_by_key(|item| (item.absolute_row, item.start_col));
-    matches.truncate(MATCH_CAP);
-    matches
-}
-
-fn append_matches(
-    line: &str,
-    columns: Option<&[usize]>,
-    absolute_row: i64,
-    needle: &[char],
-    scratch: &mut Vec<char>,
-    output: &mut Vec<FindMatch>,
-) {
-    scratch.clear();
-    scratch.extend(line.chars());
-    let haystack: &[char] = scratch;
-    if haystack.len() < needle.len() {
-        return;
-    }
-    let mut index = 0;
-    while index + needle.len() <= haystack.len() && output.len() < MATCH_CAP {
-        if chars_equal_ci(&haystack[index..index + needle.len()], needle) {
-            let start_col = column_for(index, columns);
-            let end_col_exclusive = column_past_end(index + needle.len(), columns);
-            output.push(FindMatch {
-                absolute_row,
-                start_col,
-                end_col_exclusive,
-                text: line.to_owned(),
-            });
-            index += needle.len();
-        } else {
-            index += 1;
-        }
-    }
-}
-
-fn chars_equal_ci(haystack: &[char], needle: &[char]) -> bool {
-    haystack.iter().zip(needle).all(|(left, right)| {
-        // Exact match first: it skips the case-fold on the overwhelmingly
-        // common path, including every mismatching position the scan visits.
-        left == right || left.to_lowercase().eq(right.to_lowercase())
-    })
-}
-
-fn column_for(index: usize, columns: Option<&[usize]>) -> usize {
-    columns.map_or(index, |columns| {
-        columns
-            .get(index)
-            .copied()
-            .or_else(|| columns.last().map(|last| last + 1))
-            .unwrap_or(index)
-    })
-}
-
-fn column_past_end(index: usize, columns: Option<&[usize]>) -> usize {
-    column_for(index, columns)
-}
-
 #[cfg(test)]
 mod tests {
     use diri_proto::grid::{GridCell, TermColor, TermStyle};
@@ -412,7 +328,8 @@ mod tests {
     ) {
         model.set_query(query, Duration::ZERO);
         let request = model.take_due_search(SEARCH_DEBOUNCE).unwrap();
-        assert!(model.apply_snapshot(&request, snapshot, live, viewport));
+        let job = model.prepare_search(&request, snapshot, live).unwrap();
+        assert!(model.apply_result(job.run(), viewport));
     }
 
     #[test]
@@ -516,6 +433,8 @@ mod tests {
             &mut viewport,
         );
         assert_eq!(model.matches().len(), MATCH_CAP);
+        assert_eq!(model.matches().first().unwrap().absolute_row, 101);
+        assert_eq!(model.matches().last().unwrap().absolute_row, 600);
 
         model.set_query("", Duration::from_secs(1));
         search(
@@ -533,13 +452,13 @@ mod tests {
     }
 
     #[test]
-    fn matching_is_case_insensitive_and_non_overlapping() {
+    fn matching_is_utf8_case_insensitive_and_non_overlapping() {
         let mut viewport = ScrollbackViewport::default();
-        let live = live_buffer(&["BaNaNa", "", ""], 8);
+        let live = live_buffer(&["CAFÉ BaNaNa", "", ""], 16);
         let mut model = TerminalFindModel::default();
         search(
             &mut model,
-            "ana",
+            "café",
             snapshot(Vec::new(), false),
             &live,
             &mut viewport,
@@ -550,7 +469,77 @@ mod tests {
                 model.matches()[0].start_col,
                 model.matches()[0].end_col_exclusive
             ),
-            (1, 4)
+            (0, 4)
         );
+
+        model.set_query("", Duration::from_secs(1));
+        search(
+            &mut model,
+            "ana",
+            snapshot(Vec::new(), false),
+            &live,
+            &mut viewport,
+        );
+        assert_eq!(model.matches().len(), 1);
+        assert_eq!(model.matches()[0].start_col, 6);
+    }
+
+    #[test]
+    fn output_invalidates_an_in_flight_search() {
+        let mut model = TerminalFindModel::default();
+        model.set_query("needle", Duration::ZERO);
+        let request = model.take_due_search(SEARCH_DEBOUNCE).unwrap();
+        let old_live = live_buffer(&["old needle", "", ""], 20);
+        let old_job = model
+            .prepare_search(&request, snapshot(Vec::new(), false), &old_live)
+            .unwrap();
+        assert!(model.on_output(Duration::from_secs(1)));
+
+        let new_request = model
+            .take_due_search(Duration::from_secs(1) + OUTPUT_RESCAN_DELAY)
+            .unwrap();
+        let new_live = live_buffer(&["needle", "", ""], 20);
+        let new_job = model
+            .prepare_search(
+                &new_request,
+                FindSnapshot {
+                    content_seq: 2,
+                    ..snapshot(Vec::new(), false)
+                },
+                &new_live,
+            )
+            .unwrap();
+        let mut viewport = ScrollbackViewport::default();
+        assert!(model.apply_result(new_job.run(), &mut viewport));
+        assert_eq!(model.matches()[0].start_col, 0);
+
+        assert!(!model.apply_result(old_job.run(), &mut viewport));
+        assert_eq!(model.matches()[0].start_col, 0);
+    }
+
+    #[test]
+    fn stale_query_result_cannot_overwrite_the_current_result() {
+        let mut model = TerminalFindModel::default();
+        let live = live_buffer(&["old fresh", "", ""], 20);
+
+        model.set_query("old", Duration::ZERO);
+        let old_request = model.take_due_search(SEARCH_DEBOUNCE).unwrap();
+        let old_job = model
+            .prepare_search(&old_request, snapshot(Vec::new(), false), &live)
+            .unwrap();
+
+        model.set_query("fresh", Duration::from_secs(1));
+        let fresh_request = model
+            .take_due_search(Duration::from_secs(1) + SEARCH_DEBOUNCE)
+            .unwrap();
+        let fresh_job = model
+            .prepare_search(&fresh_request, snapshot(Vec::new(), false), &live)
+            .unwrap();
+        let mut viewport = ScrollbackViewport::default();
+        assert!(model.apply_result(fresh_job.run(), &mut viewport));
+        assert_eq!(model.matches()[0].start_col, 4);
+
+        assert!(!model.apply_result(old_job.run(), &mut viewport));
+        assert_eq!(model.matches()[0].start_col, 4);
     }
 }

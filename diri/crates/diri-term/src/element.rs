@@ -13,7 +13,10 @@ use gpui::{
 };
 
 use crate::buffer::{ApplySummary, GridBuffer};
-use crate::find::{FindSnapshot, FindSpan, NavigationTarget, SearchRequest, TerminalFindModel};
+use crate::find::{
+    FindSnapshot, FindSpan, NavigationTarget, SearchJob, SearchRequest, SearchResult,
+    TerminalFindModel,
+};
 use crate::metrics::CellMetrics;
 use crate::scrollback::{
     ScrollRouter, ScrollbackApplyError, ScrollbackRequest, ScrollbackViewport, ScrolledState,
@@ -648,19 +651,21 @@ impl TerminalElement {
         *mutex_lock(&self.shared.find_spans) = spans;
     }
 
-    pub fn apply_find_snapshot(
+    /// Captures the small live grid and packages it with daemon history for a
+    /// lock-free background scan. No history matching happens on the GPUI
+    /// thread.
+    pub fn prepare_find_search(
         &self,
-        model: &mut TerminalFindModel,
+        model: &TerminalFindModel,
         request: &SearchRequest,
         snapshot: FindSnapshot,
-    ) -> bool {
+    ) -> Option<SearchJob> {
         let buffer = read_lock(&self.buffer);
-        model.apply_snapshot(
-            request,
-            snapshot,
-            &buffer,
-            &mut mutex_lock(&self.shared.viewport),
-        )
+        model.prepare_search(request, snapshot, &buffer)
+    }
+
+    pub fn apply_find_result(&self, model: &mut TerminalFindModel, result: SearchResult) -> bool {
+        model.apply_result(result, &mut mutex_lock(&self.shared.viewport))
     }
 
     pub fn find_next(&self, model: &mut TerminalFindModel) -> Option<NavigationTarget> {

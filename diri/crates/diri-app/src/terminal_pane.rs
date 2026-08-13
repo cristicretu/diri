@@ -18,7 +18,10 @@ use diri_proto::{
 };
 use diri_term::buffer::GridBuffer;
 use diri_term::element::{SharedGridBuffer, TerminalElement, TerminalReference};
-use diri_term::find::{FindSnapshot, SearchRequest, TerminalFindModel};
+use diri_term::find::{
+    FindSearchScheduler, FindSnapshot, ReadCompletion, SearchRequest, SearchResult,
+    TerminalFindModel,
+};
 use diri_term::keys::{
     Key as TermKey, KeyEvent as TermKeyEvent, Modifiers as TermModifiers, NamedKey, TermInputModes,
     encode_key, paste,
@@ -500,7 +503,13 @@ enum PaneEvent {
     AttachmentState(SessionId, AttachmentGeneration, AttachmentState),
     Chunk(SessionId, AttachmentGeneration, TerminalChunk),
     GridBatch(SessionId, AttachmentGeneration, Vec<GridUpdate>),
-    FindSnapshot(SessionId, SearchRequest, FindSnapshot),
+    FindSnapshot(
+        SessionId,
+        AttachmentGeneration,
+        SearchRequest,
+        Option<FindSnapshot>,
+    ),
+    FindResult(SessionId, AttachmentGeneration, SearchRequest, SearchResult),
     ScrollbackCells(SessionId, diri_proto::ReadScrollbackCellsResult, usize),
     ScrollbackFailed(SessionId),
     ClipboardUploadFinished(SessionId, Result<String, String>),
@@ -524,6 +533,45 @@ struct PaneEventReceiver {
     wake: mpsc::Receiver<()>,
 }
 
+/// The one completion a resident's single-flight find pipeline can be waiting
+/// to deliver. It has a mailbox class of its own: semantic queue pressure must
+/// never strand the scheduler in Reading or Scanning forever.
+enum FindCompletion {
+    Snapshot {
+        generation: AttachmentGeneration,
+        request: SearchRequest,
+        snapshot: Option<FindSnapshot>,
+    },
+    Result {
+        generation: AttachmentGeneration,
+        request: SearchRequest,
+        result: SearchResult,
+    },
+}
+
+impl FindCompletion {
+    const fn generation(&self) -> AttachmentGeneration {
+        match self {
+            Self::Snapshot { generation, .. } | Self::Result { generation, .. } => *generation,
+        }
+    }
+
+    fn into_event(self, id: SessionId) -> PaneEvent {
+        match self {
+            Self::Snapshot {
+                generation,
+                request,
+                snapshot,
+            } => PaneEvent::FindSnapshot(id, generation, request, snapshot),
+            Self::Result {
+                generation,
+                request,
+                result,
+            } => PaneEvent::FindResult(id, generation, request, result),
+        }
+    }
+}
+
 #[derive(Default)]
 struct PaneMailboxState {
     events: VecDeque<PaneEvent>,
@@ -532,6 +580,10 @@ struct PaneMailboxState {
     /// must not be erased.
     grids: HashMap<SessionId, (AttachmentGeneration, Vec<GridUpdate>)>,
     grid_order: VecDeque<SessionId>,
+    /// Exactly one completion per session. Terminal residency bounds the
+    /// producer set, and replacement generations overwrite detached work.
+    find_completions: HashMap<SessionId, FindCompletion>,
+    find_order: VecDeque<SessionId>,
 }
 
 fn pane_event_channel() -> (PaneEventSender, PaneEventReceiver) {
@@ -584,6 +636,26 @@ impl PaneEventSender {
                     state.grids.insert(id, (generation, vec![update]));
                 }
             }
+            PaneEvent::FindSnapshot(id, generation, request, snapshot) => {
+                state.queue_find_completion(
+                    id,
+                    FindCompletion::Snapshot {
+                        generation,
+                        request,
+                        snapshot,
+                    },
+                );
+            }
+            PaneEvent::FindResult(id, generation, request, result) => {
+                state.queue_find_completion(
+                    id,
+                    FindCompletion::Result {
+                        generation,
+                        request,
+                        result,
+                    },
+                );
+            }
             event => {
                 if state.events.len() >= PANE_EVENT_QUEUE_CAPACITY {
                     return Err(());
@@ -604,13 +676,36 @@ impl PaneEventReceiver {
             return false;
         }
         let mut state = self.state.lock().expect("pane event mailbox");
+        // Preserve ordinary semantic ordering, then apply every queued grid
+        // before find completions. Grid damage increments the find content
+        // generation, so a scan of the preceding screen can never flash stale
+        // highlights for one rescan interval.
         batch.extend(state.events.drain(..));
         while let Some(id) = state.grid_order.pop_front() {
             if let Some((generation, updates)) = state.grids.remove(&id) {
                 batch.push(PaneEvent::GridBatch(id, generation, updates));
             }
         }
+        while let Some(id) = state.find_order.pop_front() {
+            if let Some(completion) = state.find_completions.remove(&id) {
+                batch.push(completion.into_event(id));
+            }
+        }
         true
+    }
+}
+
+impl PaneMailboxState {
+    fn queue_find_completion(&mut self, id: SessionId, completion: FindCompletion) {
+        if let Some(queued) = self.find_completions.get(&id)
+            && completion.generation() < queued.generation()
+        {
+            return;
+        }
+        if !self.find_completions.contains_key(&id) {
+            self.find_order.push_back(id.clone());
+        }
+        self.find_completions.insert(id, completion);
     }
 }
 
@@ -622,6 +717,10 @@ struct ResidentTerminal {
     attachment_generation: AttachmentGeneration,
     attachment_state: AttachmentState,
     find: Option<TerminalFindModel>,
+    /// Single flight across both the daemon history read and blocking scan.
+    /// One newer request may replace the dirty follow-up; snapshots never
+    /// queue behind CPU work.
+    find_scheduler: FindSearchScheduler,
     /// The editable text behind `find`'s query, so ⌘F gets the same caret,
     /// selection, and readline keys as the other query fields.
     find_query: QueryEditor,
@@ -938,6 +1037,7 @@ impl TerminalPane {
                     attachment_generation: generation,
                     attachment_state: AttachmentState::Attaching,
                     find: None,
+                    find_scheduler: FindSearchScheduler::default(),
                     find_query: QueryEditor::default(),
                     last_size: (0, 0),
                     pointer_owner: None,
@@ -1149,18 +1249,76 @@ impl TerminalPane {
                 }
             }
             PaneEvent::Chunk(_, _, TerminalChunk::Pong) => {}
-            PaneEvent::FindSnapshot(id, request, snapshot) => {
-                let visible = self.selected_id().as_ref() == Some(&id);
-                if let Some(resident) = self.residents.get_mut(&id)
-                    && let Some(find) = resident.find.as_mut()
-                    && resident
-                        .element
-                        .apply_find_snapshot(find, &request, snapshot)
-                {
-                    resident.element.sync_find_highlights(find);
-                    if visible {
-                        cx.notify();
+            PaneEvent::FindSnapshot(id, generation, request, snapshot) => {
+                if !self.attachment_is_current(&id, generation) {
+                    return;
+                }
+                let read_completion = self
+                    .residents
+                    .get_mut(&id)
+                    .map(|resident| {
+                        resident
+                            .find_scheduler
+                            .finish_read(&request, snapshot.is_some())
+                    })
+                    .unwrap_or(ReadCompletion::Ignore);
+                match read_completion {
+                    ReadCompletion::Ignore | ReadCompletion::Idle => {}
+                    ReadCompletion::Read(next) => {
+                        self.launch_find_read(id, generation, next);
                     }
+                    ReadCompletion::Scan => {
+                        let job = snapshot.and_then(|snapshot| {
+                            self.residents.get(&id).and_then(|resident| {
+                                resident.find.as_ref().and_then(|find| {
+                                    resident
+                                        .element
+                                        .prepare_find_search(find, &request, snapshot)
+                                })
+                            })
+                        });
+                        if let Some(job) = job {
+                            let pane_tx = self.pane_tx.clone();
+                            self.tokio.spawn_blocking(move || {
+                                let result = job.run();
+                                let _ = pane_tx
+                                    .send(PaneEvent::FindResult(id, generation, request, result));
+                            });
+                        } else {
+                            let next = self
+                                .residents
+                                .get_mut(&id)
+                                .and_then(|resident| resident.find_scheduler.finish_scan(&request))
+                                .and_then(|completion| completion.into_next_request());
+                            if let Some(next) = next {
+                                self.launch_find_read(id, generation, next);
+                            }
+                        }
+                    }
+                }
+            }
+            PaneEvent::FindResult(id, generation, request, result) => {
+                if !self.attachment_is_current(&id, generation) {
+                    return;
+                }
+                let visible = self.selected_id().as_ref() == Some(&id);
+                let mut next = None;
+                if let Some(resident) = self.residents.get_mut(&id)
+                    && let Some(completion) = resident.find_scheduler.finish_scan(&request)
+                {
+                    if completion.should_apply_result()
+                        && let Some(find) = resident.find.as_mut()
+                        && resident.element.apply_find_result(find, result)
+                    {
+                        resident.element.sync_find_highlights(find);
+                        if visible {
+                            cx.notify();
+                        }
+                    }
+                    next = completion.into_next_request();
+                }
+                if let Some(next) = next {
+                    self.launch_find_read(id, generation, next);
                 }
             }
             PaneEvent::ScrollbackCells(id, result, visible_rows) => {
@@ -1302,21 +1460,27 @@ impl TerminalPane {
 
     fn start_due_find(&mut self, id: &SessionId) {
         let now = self.started_at.elapsed();
-        let Some(request) = self
-            .residents
-            .get_mut(id)
-            .and_then(|resident| resident.find.as_mut())
-            .and_then(|find| find.take_due_search(now))
-        else {
+        let Some((generation, request)) = self.residents.get_mut(id).and_then(|resident| {
+            let request = resident.find.as_mut()?.take_due_search(now)?;
+            let request = resident.find_scheduler.schedule(request)?;
+            Some((resident.attachment_generation, request))
+        }) else {
             return;
         };
+        self.launch_find_read(id.clone(), generation, request);
+    }
+
+    fn launch_find_read(
+        &self,
+        id: SessionId,
+        generation: AttachmentGeneration,
+        request: SearchRequest,
+    ) {
         let client = Arc::clone(self.runtime.client());
         let pane_tx = self.pane_tx.clone();
-        let id = id.clone();
         self.tokio.spawn(async move {
-            if let Ok(snapshot) = client.read_scrollback(&id).await {
-                let _ = pane_tx.send(PaneEvent::FindSnapshot(id, request, snapshot.into()));
-            }
+            let snapshot = client.read_scrollback(&id).await.ok().map(Into::into);
+            let _ = pane_tx.send(PaneEvent::FindSnapshot(id, generation, request, snapshot));
         });
     }
 
@@ -1381,6 +1545,7 @@ impl TerminalPane {
         if resident.find.take().is_none() {
             return false;
         }
+        resident.find_scheduler.cancel();
         resident.element.set_find_highlights(Vec::new());
         true
     }
@@ -1913,6 +2078,7 @@ impl TerminalPane {
             match event.keystroke.key.as_str() {
                 "escape" => {
                     resident.find = None;
+                    resident.find_scheduler.cancel();
                     resident.element.set_find_highlights(Vec::new());
                     cx.notify();
                 }
@@ -3821,6 +3987,55 @@ mod tests {
 
     use super::*;
 
+    fn due_find_request(
+        model: &mut TerminalFindModel,
+        query: &str,
+        now: Duration,
+    ) -> SearchRequest {
+        model.set_query(query, now);
+        model
+            .take_due_search(now + diri_term::find::SEARCH_DEBOUNCE)
+            .expect("find request should be due")
+    }
+
+    fn find_snapshot(content_seq: u64) -> FindSnapshot {
+        FindSnapshot {
+            lines: Vec::new(),
+            first_row: 0,
+            visible_start_row: 0,
+            cols: 8,
+            rows: 1,
+            content_seq,
+            is_alt_screen: false,
+        }
+    }
+
+    fn find_result(model: &TerminalFindModel, request: &SearchRequest) -> SearchResult {
+        let mut live = GridBuffer::new(8, 1);
+        for (index, ch) in "needle".chars().enumerate() {
+            live.cells[index] = GridCell::new(
+                u32::from(ch),
+                TermColor::Default,
+                TermColor::DefaultInverted,
+                TermStyle::empty(),
+            );
+        }
+        model
+            .prepare_search(request, find_snapshot(1), &live)
+            .expect("search job")
+            .run()
+    }
+
+    fn fill_semantic_mailbox(sender: &PaneEventSender) {
+        for _ in 0..PANE_EVENT_QUEUE_CAPACITY {
+            assert!(
+                sender
+                    .send(PaneEvent::ScrollbackFailed(SessionId::new("pressure")))
+                    .is_ok()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn pane_mailbox_retains_one_exact_final_grid_per_session() {
         let (sender, mut receiver) = pane_event_channel();
@@ -3916,6 +4131,144 @@ mod tests {
         assert_eq!(generation, 4);
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].changed_rows[0].cells[0].scalar, u32::from('n'));
+    }
+
+    #[tokio::test]
+    async fn full_semantic_mailbox_cannot_strand_a_find_read() {
+        let (sender, mut receiver) = pane_event_channel();
+        let id = SessionId::new("find-read-pressure");
+        let generation = 7;
+        let mut model = TerminalFindModel::default();
+        let first = due_find_request(&mut model, "first", Duration::ZERO);
+        let latest = due_find_request(&mut model, "latest", Duration::from_secs(1));
+        let mut scheduler = FindSearchScheduler::default();
+        assert_eq!(scheduler.schedule(first.clone()), Some(first.clone()));
+        assert_eq!(scheduler.schedule(latest.clone()), None);
+
+        fill_semantic_mailbox(&sender);
+        assert!(
+            sender
+                .send(PaneEvent::FindSnapshot(
+                    id,
+                    generation,
+                    first.clone(),
+                    Some(find_snapshot(1)),
+                ))
+                .is_ok(),
+            "find completion must not share rejectable semantic capacity"
+        );
+
+        let mut batch = Vec::new();
+        assert!(receiver.recv_batch(&mut batch).await);
+        let delivered = batch.into_iter().find_map(|event| match event {
+            PaneEvent::FindSnapshot(_, _, request, snapshot) => Some((request, snapshot)),
+            _ => None,
+        });
+        let (delivered_request, snapshot) = delivered.expect("guaranteed read completion");
+        assert!(snapshot.is_some());
+        assert_eq!(delivered_request, first);
+        assert_eq!(
+            scheduler.finish_read(&delivered_request, true),
+            ReadCompletion::Read(latest),
+            "the latest search must run after the pressured read completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_semantic_mailbox_cannot_strand_a_find_scan() {
+        let (sender, mut receiver) = pane_event_channel();
+        let id = SessionId::new("find-scan-pressure");
+        let generation = 9;
+        let mut model = TerminalFindModel::default();
+        let first = due_find_request(&mut model, "needle", Duration::ZERO);
+        let result = find_result(&model, &first);
+        let latest = due_find_request(&mut model, "latest", Duration::from_secs(1));
+        let mut scheduler = FindSearchScheduler::default();
+        assert_eq!(scheduler.schedule(first.clone()), Some(first.clone()));
+        assert_eq!(scheduler.finish_read(&first, true), ReadCompletion::Scan);
+        assert_eq!(scheduler.schedule(latest.clone()), None);
+
+        fill_semantic_mailbox(&sender);
+        assert!(
+            sender
+                .send(PaneEvent::FindResult(id, generation, first.clone(), result))
+                .is_ok(),
+            "find result must not share rejectable semantic capacity"
+        );
+
+        let mut batch = Vec::new();
+        assert!(receiver.recv_batch(&mut batch).await);
+        let delivered_request = batch.into_iter().find_map(|event| match event {
+            PaneEvent::FindResult(_, _, request, _) => Some(request),
+            _ => None,
+        });
+        let delivered_request = delivered_request.expect("guaranteed scan completion");
+        let completion = scheduler
+            .finish_scan(&delivered_request)
+            .expect("active scan completion");
+        assert_eq!(
+            completion.into_next_request(),
+            Some(latest),
+            "the latest search must run after the pressured scan completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn pane_mailbox_delivers_grid_damage_before_an_older_find_result() {
+        let (sender, mut receiver) = pane_event_channel();
+        let id = SessionId::new("grid-before-find");
+        let generation = 11;
+        let mut model = TerminalFindModel::default();
+        let request = due_find_request(&mut model, "needle", Duration::ZERO);
+        let result = find_result(&model, &request);
+        let mut scheduler = FindSearchScheduler::default();
+        assert_eq!(scheduler.schedule(request.clone()), Some(request.clone()));
+        assert_eq!(scheduler.finish_read(&request, true), ReadCompletion::Scan);
+
+        // The result reaches the mailbox first, but the grid is newer content
+        // already waiting in the same GPUI wake.
+        assert!(
+            sender
+                .send(PaneEvent::FindResult(
+                    id.clone(),
+                    generation,
+                    request.clone(),
+                    result,
+                ))
+                .is_ok()
+        );
+        assert!(
+            sender
+                .send(PaneEvent::Chunk(
+                    id,
+                    generation,
+                    TerminalChunk::Grid(filled_grid('n')),
+                ))
+                .is_ok()
+        );
+
+        let mut batch = Vec::new();
+        assert!(receiver.recv_batch(&mut batch).await);
+        assert!(matches!(batch.first(), Some(PaneEvent::GridBatch(..))));
+        assert!(matches!(batch.last(), Some(PaneEvent::FindResult(..))));
+
+        let mut viewport = diri_term::scrollback::ScrollbackViewport::default();
+        for event in batch {
+            match event {
+                PaneEvent::GridBatch(..) => {
+                    assert!(model.on_output(Duration::from_secs(1)));
+                }
+                PaneEvent::FindResult(_, _, delivered, result) => {
+                    assert!(scheduler.finish_scan(&delivered).is_some());
+                    assert!(
+                        !model.apply_result(result, &mut viewport),
+                        "queued newer grid must invalidate the older result before apply"
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert!(model.matches().is_empty());
     }
 
     /// Replays a drag as the render loop sees it -- a geometry change every
@@ -4533,7 +4886,9 @@ mod tests {
     }
 
     #[gpui::test]
-    fn stale_detached_attachment_cannot_overwrite_a_reselected_session(cx: &mut TestAppContext) {
+    fn stale_detached_attachment_events_cannot_overwrite_a_reselected_session(
+        cx: &mut TestAppContext,
+    ) {
         let runtime = Arc::new(StoreRuntime::inert());
         let tokio = Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -4621,6 +4976,89 @@ mod tests {
                 buffer.cells[0].scalar,
                 u32::from('n'),
                 "a detached attachment repainted the newly selected terminal"
+            );
+        });
+
+        // Find crosses two additional async handoffs. Exercise both with a
+        // request that would otherwise be valid for the new resident: only the
+        // attachment generation distinguishes the old producer.
+        let mut find = TerminalFindModel::default();
+        find.set_query("needle", Duration::ZERO);
+        let request = find
+            .take_due_search(Duration::from_millis(200))
+            .expect("find request");
+        let snapshot = FindSnapshot {
+            lines: Vec::new(),
+            first_row: 0,
+            visible_start_row: 0,
+            cols: 8,
+            rows: 1,
+            content_seq: 1,
+            is_alt_screen: false,
+        };
+        let mut live = GridBuffer::new(8, 1);
+        for (index, ch) in "needle".chars().enumerate() {
+            live.cells[index] = GridCell::new(
+                u32::from(ch),
+                TermColor::Default,
+                TermColor::DefaultInverted,
+                TermStyle::empty(),
+            );
+        }
+        let result = find
+            .prepare_search(&request, snapshot.clone(), &live)
+            .expect("search job")
+            .run();
+
+        pane.update_in(cx, move |pane, window, cx| {
+            let resident = pane
+                .residents
+                .get_mut(&reselected.id)
+                .expect("reselected resident");
+            resident.find = Some(find);
+            assert_eq!(
+                resident.find_scheduler.schedule(request.clone()),
+                Some(request.clone())
+            );
+
+            pane.handle_pane_event(
+                PaneEvent::FindSnapshot(
+                    reselected.id.clone(),
+                    old_generation,
+                    request.clone(),
+                    Some(snapshot.clone()),
+                ),
+                window,
+                cx,
+            );
+            let resident = pane
+                .residents
+                .get_mut(&reselected.id)
+                .expect("reselected resident");
+            assert_eq!(
+                resident.find_scheduler.finish_read(&request, true),
+                ReadCompletion::Scan,
+                "stale snapshot advanced the new resident's scheduler"
+            );
+
+            pane.handle_pane_event(
+                PaneEvent::FindResult(
+                    reselected.id.clone(),
+                    old_generation,
+                    request.clone(),
+                    result,
+                ),
+                window,
+                cx,
+            );
+            let resident = pane
+                .residents
+                .get_mut(&reselected.id)
+                .expect("reselected resident");
+            assert!(resident.find.as_ref().unwrap().matches().is_empty());
+            assert!(
+                resident.find_scheduler.finish_scan(&request).is_some(),
+                "stale result completed the new resident's active scan"
             );
         });
     }
