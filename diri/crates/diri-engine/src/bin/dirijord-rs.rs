@@ -604,7 +604,7 @@ fn load_manifests_from(
 
     let mut dirs = base.iter().map(PathBuf::as_path).collect::<Vec<_>>();
     if overrides.is_dir() {
-        dirs.push(&overrides);
+        dirs.push(overrides);
     }
     ManifestEngine::load_dirs(&dirs).unwrap_or_else(|error| {
         eprintln!("dirijord-rs: manifest load: {error}");
