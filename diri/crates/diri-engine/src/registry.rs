@@ -216,6 +216,7 @@ impl Registry {
     ///
     /// [`spawn`]: Registry::spawn
     pub fn insert_record(&mut self, record: SessionRecord) {
+        self.spawn_requests.activate_caller(&record.id.0);
         self.records.insert(record.id.0.clone(), record);
     }
 
@@ -223,6 +224,7 @@ impl Registry {
     pub fn spawn(&mut self, spec: SessionSpec, record: SessionRecord) -> std::io::Result<String> {
         let id = spec.id.clone();
         let session = Session::spawn(spec, Arc::clone(&self.engine))?;
+        self.spawn_requests.activate_caller(&id);
         self.records.insert(id.clone(), record);
         self.sessions.insert(id.clone(), session);
         Ok(id)
@@ -556,6 +558,7 @@ impl Registry {
             if record.host.is_none() && !Path::new(&record.cwd).exists() {
                 continue; // the folder is gone; try the next candidate
             }
+            self.spawn_requests.activate_caller(&record.id.0);
             self.records.insert(record.id.0.clone(), record.clone());
             return Some(record);
         }

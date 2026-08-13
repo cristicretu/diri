@@ -245,10 +245,11 @@ the historical non-idempotent behavior.
 
 Successful results are retained for 24 hours, at most 128 entries per caller,
 and are removed when the caller session is removed. Pre-mutation validation or
-infrastructure failures release the key and may be retried with it. The one
-post-mutation failure, `initial_prompt_delivery_failed`, is retained: its
-message names the already-created session, and replay must never create a
-second child.
+infrastructure failures release the key and may be retried with it. Outcomes
+that imply a possible commit — `initial_prompt_delivery_failed` and
+`idempotency_outcome_uncertain` after a panic — remain sticky for the caller's
+whole lifetime: recovery must inspect the existing sessions/worktrees and
+never create a second child automatically.
 
 Failed MCP tool results retain `isError: true`, while their text is serialized
 JSON with stable `code`, `retryable`, `modelGuidance`, optional

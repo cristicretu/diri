@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::control::ControlError;
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct McpToolErrorEnvelope {
     pub error: McpToolError,
@@ -125,6 +127,109 @@ impl McpToolErrorEnvelope {
             None,
         )
     }
+
+    /// Translates the Engine's stable control failures into the equally
+    /// stable recovery contract exposed by every MCP adapter. Keeping this in
+    /// `diri-proto` prevents the stdio bridge and embedded host from assigning
+    /// different codes or retry guidance to the same daemon outcome.
+    pub fn from_control(error: ControlError) -> Self {
+        let lower = error.message.to_ascii_lowercase();
+        match error.code.as_str() {
+            "idempotency_conflict" => Self::new(
+                "idempotency_conflict",
+                error.message,
+                "Use the original arguments for this requestKey, or choose a new requestKey for a different spawn.",
+                false,
+                None,
+            ),
+            "idempotency_requires_caller" => Self::new(
+                "idempotency_requires_caller",
+                error.message,
+                "Run spawn_agent inside a Diri session, or omit requestKey for an unscoped call.",
+                false,
+                Some("whoami"),
+            ),
+            "idempotency_caller_not_found" | "idempotency_caller_retired" => Self::new(
+                error.code,
+                error.message,
+                "The calling session no longer exists. Start or reopen a Diri session before spawning a child.",
+                false,
+                Some("whoami"),
+            ),
+            "idempotency_capacity" => Self::new(
+                "idempotency_capacity",
+                error.message,
+                "Wait for current spawns to settle, then retry the same requestKey.",
+                true,
+                Some("list_agents"),
+            ),
+            "idempotency_outcome_uncertain" => Self::new(
+                "idempotency_outcome_uncertain",
+                error.message,
+                "Do not spawn again with this key. Inspect list_agents and the repository worktrees before deciding how to recover.",
+                false,
+                Some("list_agents"),
+            ),
+            "bad_request" if lower.contains("cwd") && lower.contains("not a directory") => {
+                Self::new(
+                    "cwd_not_found",
+                    error.message,
+                    "Choose an existing project directory and retry with a new requestKey.",
+                    false,
+                    Some("list_agents"),
+                )
+            }
+            "bad_request" => Self::new(
+                "invalid_arguments",
+                error.message,
+                "Correct the requested arguments, then retry with a new requestKey.",
+                false,
+                None,
+            ),
+            "not_found" => Self::new(
+                "resource_not_found",
+                error.message,
+                "Refresh Diri state, choose an existing resource, and retry with a new requestKey.",
+                false,
+                Some("list_agents"),
+            ),
+            "unauthorized" => Self::new(
+                "authorization_denied",
+                error.message,
+                "Reconnect through the current Diri session; do not retry with the same credentials.",
+                false,
+                Some("whoami"),
+            ),
+            "version_mismatch" => Self::new(
+                "version_mismatch",
+                error.message,
+                "Restart or update Diri so the MCP adapter and Engine use the same protocol.",
+                false,
+                None,
+            ),
+            "initial_prompt_delivery_failed" => Self::new(
+                "initial_prompt_delivery_failed",
+                error.message,
+                "The session exists. Inspect list_agents and send_prompt to that session instead of spawning another one.",
+                false,
+                Some("list_agents"),
+            ),
+            "internal" => Self::new(
+                "internal",
+                error.message,
+                "Inspect list_agents before retrying; if no mutation occurred, retry once with the same requestKey.",
+                true,
+                Some("list_agents"),
+            ),
+            code => Self::new(
+                code,
+                error.message,
+                "Inspect current Diri state, then retry only when the operation is safe.",
+                false,
+                Some("list_agents"),
+            ),
+        }
+    }
 }
 
 fn empty_details() -> Value {
@@ -165,5 +270,24 @@ mod tests {
         ))
         .expect("valid JSON");
         assert_eq!(upgraded["error"]["code"], "invalid_arguments");
+    }
+
+    #[test]
+    fn control_mapping_covers_safe_idempotency_recovery() {
+        let uncertain = McpToolErrorEnvelope::from_control(ControlError::new(
+            "idempotency_outcome_uncertain",
+            "the spawn panicked after it may have committed",
+        ));
+        assert_eq!(uncertain.error.code, "idempotency_outcome_uncertain");
+        assert!(!uncertain.error.retryable);
+        assert_eq!(
+            uncertain.error.suggested_tool.as_deref(),
+            Some("list_agents")
+        );
+
+        let validation = McpToolErrorEnvelope::from_control(ControlError::bad_request(
+            "requestKey must be a string containing 1 to 128 bytes",
+        ));
+        assert_eq!(validation.error.code, "invalid_arguments");
     }
 }

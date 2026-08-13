@@ -105,6 +105,10 @@ fn call(server: &McpServer<RegistryHost>, tool: &str, arguments: Value) -> Resul
     Ok(serde_json::from_str(&text).unwrap_or(Value::String(text)))
 }
 
+fn typed_error(text: &str) -> Value {
+    serde_json::from_str(text).expect("MCP failures must be typed JSON")
+}
+
 #[test]
 fn the_binary_free_shell_manifest_spawns_the_users_login_shell() {
     let temp = tempfile::tempdir().expect("temp");
@@ -365,6 +369,52 @@ fn worktree_tools_work_against_a_real_repository() {
     );
 
     let repo_arg = repo.to_string_lossy().to_string();
+
+    let baseline =
+        call(&server, "list_worktrees", json!({ "repo": repo_arg })).expect("baseline worktrees");
+    let baseline_count = baseline["worktrees"].as_array().expect("array").len();
+
+    let invalid = call(
+        &server,
+        "spawn_agent",
+        json!({"kind": "not-an-agent", "cwd": repo_arg, "worktree": true}),
+    )
+    .expect_err("invalid agent");
+    assert_eq!(typed_error(&invalid)["error"]["code"], "resource_not_found");
+    let after_validation = call(&server, "list_worktrees", json!({ "repo": repo_arg }))
+        .expect("worktrees after validation failure");
+    assert_eq!(
+        after_validation["worktrees"]
+            .as_array()
+            .expect("array")
+            .len(),
+        baseline_count,
+        "side-effect-free validation must precede worktree creation"
+    );
+
+    // Force Registry::spawn to fail after checkout creation. The rollback
+    // guard must remove that checkout before returning the typed failure.
+    let blocked_logs = temp.path().join("blocked-logs");
+    std::fs::write(&blocked_logs, "not a directory").expect("block logs path");
+    let failing_server = McpServer::new(
+        tool_definitions(),
+        RegistryHost::new(Arc::clone(&registry), &blocked_logs),
+    );
+    let failed_spawn = call(
+        &failing_server,
+        "spawn_agent",
+        json!({"kind": "shell", "cwd": repo_arg, "worktree": true}),
+    )
+    .expect_err("spawn must fail at the blocked log path");
+    assert_eq!(typed_error(&failed_spawn)["error"]["code"], "internal");
+    let after_rollback = call(&server, "list_worktrees", json!({ "repo": repo_arg }))
+        .expect("worktrees after rollback");
+    assert_eq!(
+        after_rollback["worktrees"].as_array().expect("array").len(),
+        baseline_count,
+        "post-checkout spawn failures must roll the worktree back"
+    );
+
     let created = call(&server, "create_worktree", json!({ "repo": repo_arg })).expect("create");
     let path = created["path"].as_str().expect("a path").to_string();
     assert!(Path::new(&path).is_dir());
@@ -414,6 +464,7 @@ fn spawn_agent_starts_a_session_owned_by_its_caller() {
     )
     .expect_err("unknown agent");
     assert!(unknown.contains("no manifest"), "got {unknown}");
+    assert_eq!(typed_error(&unknown)["error"]["code"], "resource_not_found");
 
     // A missing directory is caught before anything is started.
     let bad_cwd = call(
@@ -423,6 +474,7 @@ fn spawn_agent_starts_a_session_owned_by_its_caller() {
     )
     .expect_err("bad cwd");
     assert!(bad_cwd.contains("not a directory"), "got {bad_cwd}");
+    assert_eq!(typed_error(&bad_cwd)["error"]["code"], "cwd_not_found");
 
     // Old clients may still send `host`; fail before cwd inspection, host
     // lookup, code sync, or session creation while the new transport is dark.
@@ -435,6 +487,53 @@ fn spawn_agent_starts_a_session_owned_by_its_caller() {
     assert!(
         unavailable.contains("remote_transport_unavailable"),
         "got {unavailable}"
+    );
+    assert_eq!(
+        typed_error(&unavailable)["error"]["code"],
+        "remote_transport_unavailable"
+    );
+
+    for request_key in [json!(""), json!(42), Value::Null] {
+        let malformed = call(
+            &server,
+            "spawn_agent",
+            json!({
+                "kind": "shell",
+                "cwd": "/tmp",
+                "requestKey": request_key,
+            }),
+        )
+        .expect_err("malformed key must not spawn");
+        assert_eq!(
+            typed_error(&malformed)["error"]["code"],
+            "invalid_arguments"
+        );
+    }
+
+    let unknown_caller = call(
+        &server,
+        "spawn_agent",
+        json!({"kind": "shell", "cwd": "/tmp", "requestKey": "turn-1/child"}),
+    )
+    .expect_err("keyed spawn requires a live caller record");
+    assert_eq!(
+        typed_error(&unknown_caller)["error"]["code"],
+        "idempotency_caller_not_found"
+    );
+
+    let unscoped_server = McpServer::new(
+        tool_definitions(),
+        RegistryHost::new(Arc::clone(&registry), &logs).with_caller(None),
+    );
+    let missing_caller = call(
+        &unscoped_server,
+        "spawn_agent",
+        json!({"kind": "shell", "cwd": "/tmp", "requestKey": "turn-1/child"}),
+    )
+    .expect_err("keyed spawn requires a caller identity");
+    assert_eq!(
+        typed_error(&missing_caller)["error"]["code"],
+        "idempotency_requires_caller"
     );
 
     assert_eq!(

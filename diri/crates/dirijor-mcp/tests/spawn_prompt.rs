@@ -186,6 +186,40 @@ fn call_spawn_agent_through_mcp(socket: &Path, arguments: serde_json::Value) -> 
 }
 
 #[test]
+fn malformed_request_key_is_typed_and_never_spawns() {
+    let temp = tempfile::tempdir().expect("temp");
+    let fixture = temp.path().join("prompt-fixture");
+    std::fs::write(&fixture, "#!/bin/sh\nsleep 30\n").expect("write fixture");
+    std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o700))
+        .expect("make fixture executable");
+    let server = start_server(temp.path(), &fixture);
+    let bridge = Bridge::new(server.socket_path().to_path_buf(), Some("s_parent".into()));
+
+    for request_key in [json!(""), json!(42), serde_json::Value::Null] {
+        let failure = bridge
+            .call(
+                "spawn_agent",
+                &json!({
+                    "kind": "prompt-fixture",
+                    "cwd": temp.path(),
+                    "requestKey": request_key,
+                }),
+            )
+            .expect_err("malformed key must be rejected");
+        let failure: serde_json::Value = serde_json::from_str(&failure).expect("typed JSON");
+        assert_eq!(failure["error"]["code"], "invalid_arguments");
+        assert_eq!(failure["error"]["retryable"], false);
+    }
+
+    let sessions = bridge.call("list_agents", &json!({})).expect("list agents");
+    assert_eq!(
+        sessions["agents"].as_array().expect("agents").len(),
+        1,
+        "only the parent record should exist"
+    );
+}
+
+#[test]
 fn keyed_spawn_survives_mcp_stdio_recreation_without_duplicate_worktree() {
     let temp = tempfile::tempdir().expect("temp");
     let repo = temp.path().join("repo");

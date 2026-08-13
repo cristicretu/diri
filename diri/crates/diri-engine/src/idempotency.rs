@@ -2,10 +2,12 @@
 //!
 //! The stdio MCP adapter is intentionally disposable. Retry state therefore
 //! lives here, in the long-running Engine, and is shared by every control
-//! connection. Only successful mutations are retained: failures release the
-//! key so a later request can try again.
+//! connection. Successful mutations are retained; failures release the key
+//! unless their outcome proves or may imply that the mutation already
+//! committed.
 
 use std::collections::HashMap;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -18,6 +20,7 @@ const DEFAULT_MAX_ENTRIES_PER_CALLER: usize = 128;
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct RequestIdentity {
     caller: String,
+    generation: u64,
     tool: &'static str,
     request_key: String,
 }
@@ -37,9 +40,33 @@ struct Entry {
     state: EntryState,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct State {
     entries: HashMap<RequestIdentity, Entry>,
+    caller_generations: HashMap<String, u64>,
+    retired_callers: HashMap<String, Instant>,
+    next_generation: u64,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            caller_generations: HashMap::new(),
+            retired_callers: HashMap::new(),
+            next_generation: 1,
+        }
+    }
+}
+
+impl State {
+    fn allocate_generation(&mut self, caller: &str) -> u64 {
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.saturating_add(1);
+        self.caller_generations
+            .insert(caller.to_owned(), generation);
+        generation
+    }
 }
 
 /// A bounded, process-lifetime registry for successful mutation results.
@@ -71,9 +98,9 @@ impl MutationLedger {
 
     /// Runs `mutation` at most once for a successful identity/fingerprint.
     ///
-    /// Errors are deliberately not cached. A reservation guard removes a
-    /// running entry even during unwinding, so a crashed worker cannot wedge
-    /// every future retry behind a key that will never finish.
+    /// Pre-commit errors are deliberately not cached. Panics fail closed as a
+    /// sticky uncertain outcome because they cannot prove whether the
+    /// mutation had already crossed its irreversible commit point.
     pub fn run(
         &self,
         caller: &str,
@@ -82,15 +109,25 @@ impl MutationLedger {
         fingerprint: String,
         mutation: impl FnOnce() -> Result<Value, ControlError>,
     ) -> Result<Value, ControlError> {
+        let mut state = self.state.lock().map_err(poisoned)?;
+        let generation = state
+            .caller_generations
+            .get(caller)
+            .copied()
+            .unwrap_or_else(|| state.allocate_generation(caller));
         let identity = RequestIdentity {
             caller: caller.to_owned(),
+            generation,
             tool,
             request_key: request_key.to_owned(),
         };
-
-        let mut state = self.state.lock().map_err(poisoned)?;
         loop {
             self.prune_expired(&mut state);
+            if state.retired_callers.contains_key(caller)
+                || state.caller_generations.get(caller).copied() != Some(generation)
+            {
+                return Err(caller_retired(caller));
+            }
             match state.entries.get(&identity) {
                 Some(entry) if entry.fingerprint != fingerprint => {
                     return Err(ControlError::new(
@@ -109,7 +146,7 @@ impl MutationLedger {
                     state = self.changed.wait(state).map_err(poisoned)?;
                 }
                 None => {
-                    self.make_room(&mut state, caller)?;
+                    self.make_room(&mut state, caller, generation)?;
                     state.entries.insert(
                         identity.clone(),
                         Entry {
@@ -129,22 +166,55 @@ impl MutationLedger {
             fingerprint,
             finished: false,
         };
-        let result = mutation();
-        if match &result {
-            Ok(_) => true,
-            Err(error) => cacheable_error(error),
-        } {
-            reservation.complete(result.clone());
+        match catch_unwind(AssertUnwindSafe(mutation)) {
+            Ok(result) => {
+                if match &result {
+                    Ok(_) => true,
+                    Err(error) => cacheable_error(error),
+                } {
+                    reservation.complete(result.clone());
+                }
+                result
+            }
+            Err(_) => {
+                // Once arbitrary mutation code has started, a panic cannot
+                // prove whether a process/worktree was already created. Keep
+                // the key sticky so recovery can inspect state but can never
+                // accidentally repeat the mutation.
+                let error = ControlError::new(
+                    "idempotency_outcome_uncertain",
+                    "the mutation panicked after its outcome became uncertain",
+                );
+                reservation.complete(Err(error.clone()));
+                Err(error)
+            }
         }
-        result
     }
 
-    /// Drops retry history when its caller session is removed from Diri.
+    /// Retires a caller lifetime without reopening any mutation already in
+    /// flight. Completed history is discarded immediately; running owners are
+    /// allowed to settle, while all old waiters fail closed.
     pub fn forget_caller(&self, caller: &str) {
         if let Ok(mut state) = self.state.lock() {
+            self.prune_expired(&mut state);
             state
-                .entries
-                .retain(|identity, _| identity.caller != caller);
+                .retired_callers
+                .insert(caller.to_owned(), Instant::now());
+            state.entries.retain(|identity, entry| {
+                identity.caller != caller || matches!(entry.state, EntryState::Running)
+            });
+            self.changed.notify_all();
+        }
+    }
+
+    /// Begins a new lifetime for a session ID that was explicitly removed and
+    /// later reopened. The generation makes old owners and waiters incapable
+    /// of completing or reserving entries in the new lifetime.
+    pub fn activate_caller(&self, caller: &str) {
+        if let Ok(mut state) = self.state.lock()
+            && state.retired_callers.remove(caller).is_some()
+        {
+            state.allocate_generation(caller);
             self.changed.notify_all();
         }
     }
@@ -153,15 +223,43 @@ impl MutationLedger {
         let ttl = self.entry_ttl;
         state.entries.retain(|_, entry| match entry.state {
             EntryState::Running => true,
-            EntryState::Complete { completed_at, .. } => completed_at.elapsed() < ttl,
+            EntryState::Complete {
+                ref result,
+                completed_at,
+            } => sticky_result(result) || completed_at.elapsed() < ttl,
         });
+
+        // Tombstones only coordinate requests that crossed a caller-removal
+        // race. Once their TTL elapsed and no old owner remains, the daemon
+        // does not need to retain removed session IDs forever.
+        let expired_callers = state
+            .retired_callers
+            .iter()
+            .filter(|(caller, retired_at)| {
+                retired_at.elapsed() >= ttl
+                    && !state
+                        .entries
+                        .keys()
+                        .any(|identity| &identity.caller == *caller)
+            })
+            .map(|(caller, _)| caller.clone())
+            .collect::<Vec<_>>();
+        for caller in expired_callers {
+            state.retired_callers.remove(&caller);
+            state.caller_generations.remove(&caller);
+        }
     }
 
-    fn make_room(&self, state: &mut State, caller: &str) -> Result<(), ControlError> {
+    fn make_room(
+        &self,
+        state: &mut State,
+        caller: &str,
+        generation: u64,
+    ) -> Result<(), ControlError> {
         let caller_count = state
             .entries
             .keys()
-            .filter(|identity| identity.caller == caller)
+            .filter(|identity| identity.caller == caller && identity.generation == generation)
             .count();
         if caller_count < self.max_entries_per_caller {
             return Ok(());
@@ -171,7 +269,13 @@ impl MutationLedger {
             .entries
             .iter()
             .filter_map(|(identity, entry)| match entry.state {
-                EntryState::Complete { completed_at, .. } if identity.caller == caller => {
+                EntryState::Complete {
+                    ref result,
+                    completed_at,
+                } if identity.caller == caller
+                    && identity.generation == generation
+                    && !sticky_result(result) =>
+                {
                     Some((identity.clone(), completed_at))
                 }
                 _ => None,
@@ -199,17 +303,29 @@ struct Reservation<'a> {
 
 impl Reservation<'_> {
     fn complete(&mut self, result: Result<Value, ControlError>) {
-        if let Ok(mut state) = self.ledger.state.lock()
-            && let Some(entry) = state.entries.get_mut(&self.identity)
-            && entry.fingerprint == self.fingerprint
-            && matches!(entry.state, EntryState::Running)
-        {
-            entry.state = EntryState::Complete {
-                result,
-                completed_at: Instant::now(),
-            };
-            self.finished = true;
-            self.ledger.changed.notify_all();
+        if let Ok(mut state) = self.ledger.state.lock() {
+            let is_current = !state.retired_callers.contains_key(&self.identity.caller)
+                && state.caller_generations.get(&self.identity.caller).copied()
+                    == Some(self.identity.generation);
+            let owns_entry = state.entries.get(&self.identity).is_some_and(|entry| {
+                entry.fingerprint == self.fingerprint && matches!(entry.state, EntryState::Running)
+            });
+            if owns_entry {
+                if is_current {
+                    state
+                        .entries
+                        .get_mut(&self.identity)
+                        .expect("checked")
+                        .state = EntryState::Complete {
+                        result,
+                        completed_at: Instant::now(),
+                    };
+                } else {
+                    state.entries.remove(&self.identity);
+                }
+                self.finished = true;
+                self.ledger.changed.notify_all();
+            }
         }
     }
 }
@@ -235,11 +351,28 @@ fn poisoned<T>(_: std::sync::PoisonError<T>) -> ControlError {
     ControlError::internal("idempotency registry lock was poisoned")
 }
 
+fn caller_retired(caller: &str) -> ControlError {
+    ControlError::new(
+        "idempotency_caller_retired",
+        format!("caller session {caller:?} was removed while the mutation was running"),
+    )
+}
+
 /// A prompt-delivery failure is reported only after the session exists. It is
 /// retained to prevent a retry from creating a second child. Validation and
 /// infrastructure failures happen before acknowledgement and remain retryable.
 fn cacheable_error(error: &ControlError) -> bool {
     error.code == "initial_prompt_delivery_failed"
+}
+
+/// Outcomes that may follow an irreversible side effect are never evicted or
+/// expired within a caller lifetime. The per-caller capacity remains the hard
+/// memory bound; retirement clears them when that lifetime ends.
+fn sticky_result(result: &Result<Value, ControlError>) -> bool {
+    result.as_ref().is_err_and(|error| {
+        error.code == "initial_prompt_delivery_failed"
+            || error.code == "idempotency_outcome_uncertain"
+    })
 }
 
 #[cfg(test)]
@@ -341,11 +474,87 @@ mod tests {
         assert_ne!(first, second);
 
         ledger.forget_caller("one");
+        ledger.activate_caller("one");
         let replayed_as_new = ledger
             .run("one", "spawn_agent", "b", "b".into(), || {
                 Ok(serde_json::json!({"id": 3}))
             })
             .expect("new lifetime");
         assert_eq!(replayed_as_new["id"], 3);
+    }
+
+    #[test]
+    fn retiring_a_caller_never_reopens_its_running_key() {
+        let ledger = Arc::new(MutationLedger::default());
+        let mutations = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let owner = {
+            let ledger = Arc::clone(&ledger);
+            let mutations = Arc::clone(&mutations);
+            std::thread::spawn(move || {
+                ledger.run("parent", "spawn_agent", "same", "same".into(), || {
+                    mutations.fetch_add(1, Ordering::SeqCst);
+                    started_tx.send(()).expect("announce mutation");
+                    finish_rx.recv().expect("finish mutation");
+                    Ok(serde_json::json!({"id": "s_only"}))
+                })
+            })
+        };
+        started_rx.recv().expect("owner started");
+        ledger.forget_caller("parent");
+
+        let retry = ledger
+            .run("parent", "spawn_agent", "same", "same".into(), || {
+                mutations.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::json!({"id": "s_duplicate"}))
+            })
+            .expect_err("retired caller must fail closed");
+        assert_eq!(retry.code, "idempotency_caller_retired");
+        assert_eq!(mutations.load(Ordering::SeqCst), 1);
+
+        finish_tx.send(()).expect("release owner");
+        assert_eq!(
+            owner.join().expect("owner thread").expect("owner result")["id"],
+            "s_only"
+        );
+        assert_eq!(mutations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn panics_become_sticky_uncertain_outcomes() {
+        let ledger = MutationLedger::new(Duration::ZERO, 128);
+        let mutations = AtomicUsize::new(0);
+        for _ in 0..2 {
+            let error = ledger
+                .run("parent", "spawn_agent", "panic", "same".into(), || {
+                    mutations.fetch_add(1, Ordering::SeqCst);
+                    panic!("after a hypothetical process launch")
+                })
+                .expect_err("panic must fail closed");
+            assert_eq!(error.code, "idempotency_outcome_uncertain");
+        }
+        assert_eq!(mutations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn settled_retirement_tombstones_expire_without_generation_aliasing() {
+        let ledger = MutationLedger::new(Duration::ZERO, 8);
+        ledger
+            .run("old", "spawn_agent", "k", "same".into(), || {
+                Ok(serde_json::json!({"id": "s_old"}))
+            })
+            .expect("old lifetime");
+        ledger.forget_caller("old");
+
+        ledger
+            .run("other", "spawn_agent", "k", "same".into(), || {
+                Ok(serde_json::json!({"id": "s_other"}))
+            })
+            .expect("trigger pruning");
+
+        let state = ledger.state.lock().expect("ledger");
+        assert!(!state.retired_callers.contains_key("old"));
+        assert!(!state.caller_generations.contains_key("old"));
     }
 }

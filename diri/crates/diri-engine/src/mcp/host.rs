@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use diri_proto::{SessionId, SessionStatus};
+use diri_proto::{ControlError, McpToolErrorEnvelope, SessionId, SessionStatus};
 use serde_json::{Value, json};
 
 use super::ToolHost;
@@ -24,6 +24,32 @@ const DEFAULT_CHILDREN_WAIT_SECONDS: f64 = 600.0;
 /// How often a wait re-checks. Long enough not to spin, short enough that a
 /// state change is noticed promptly.
 const WAIT_POLL: Duration = Duration::from_millis(100);
+
+/// Owns a newly-created worktree until the session record owns it. Any
+/// validation, registry-lock, or PTY failure in between rolls the checkout
+/// back, so a retry starts from the same repository state.
+struct WorktreeRollback {
+    repo: PathBuf,
+    worktree: Option<String>,
+}
+
+impl WorktreeRollback {
+    fn new(repo: PathBuf, worktree: Option<String>) -> Self {
+        Self { repo, worktree }
+    }
+
+    fn disarm(&mut self) {
+        self.worktree = None;
+    }
+}
+
+impl Drop for WorktreeRollback {
+    fn drop(&mut self) {
+        if let Some(worktree) = self.worktree.as_deref() {
+            let _ = git::remove_worktree(&self.repo, worktree, true);
+        }
+    }
+}
 
 pub struct RegistryHost {
     registry: Arc<Mutex<Registry>>,
@@ -61,6 +87,12 @@ impl RegistryHost {
             .lock()
             .map_err(|_| "engine state is poisoned".to_string())
     }
+
+    fn registry_control(&self) -> Result<std::sync::MutexGuard<'_, Registry>, ControlError> {
+        self.registry
+            .lock()
+            .map_err(|_| ControlError::internal("engine state is poisoned"))
+    }
 }
 
 fn required_str(arguments: &Value, key: &str) -> Result<String, String> {
@@ -69,6 +101,23 @@ fn required_str(arguments: &Value, key: &str) -> Result<String, String> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| format!("{key} is required"))
+}
+
+fn strict_request_key(arguments: &Value) -> Result<Option<String>, ControlError> {
+    let Some(value) = arguments.get("requestKey") else {
+        return Ok(None);
+    };
+    let Some(value) = value.as_str() else {
+        return Err(ControlError::bad_request(
+            "requestKey must be a string containing 1 to 128 bytes",
+        ));
+    };
+    if value.trim().is_empty() || value.len() > 128 {
+        return Err(ControlError::bad_request(
+            "requestKey must be a string containing 1 to 128 bytes",
+        ));
+    }
+    Ok(Some(value.to_owned()))
 }
 
 fn status_word(status: &SessionStatus) -> &'static str {
@@ -299,27 +348,34 @@ impl RegistryHost {
     /// control-backed MCP server and returns an error if the child never
     /// accepts it.
     fn spawn_agent(&self, arguments: &Value) -> Result<Value, String> {
-        let Some(request_key) = arguments.get("requestKey").and_then(Value::as_str) else {
+        self.spawn_agent_control(arguments)
+            .map_err(|error| McpToolErrorEnvelope::from_control(error).to_text())
+    }
+
+    fn spawn_agent_control(&self, arguments: &Value) -> Result<Value, ControlError> {
+        let Some(request_key) = strict_request_key(arguments)? else {
             return self.spawn_agent_once(arguments);
         };
-        if request_key.is_empty() || request_key.len() > 128 {
-            return Err("requestKey must contain 1 to 128 bytes".into());
-        }
-        let caller = self
-            .caller
-            .as_deref()
-            .ok_or_else(|| "requestKey requires a caller session identity".to_owned())?;
+        let caller = self.caller.as_deref().ok_or_else(|| {
+            ControlError::new(
+                "idempotency_requires_caller",
+                "requestKey requires a caller session identity",
+            )
+        })?;
         let ledger = {
-            let registry = self.registry()?;
+            let registry = self.registry_control()?;
             if registry.record(caller).is_none() {
-                return Err(format!("caller session {caller:?} does not exist"));
+                return Err(ControlError::new(
+                    "idempotency_caller_not_found",
+                    format!("caller session {caller:?} does not exist"),
+                ));
             }
             registry.spawn_requests()
         };
         let mut normalized = arguments.clone();
         let object = normalized
             .as_object_mut()
-            .ok_or_else(|| "spawn_agent arguments must be an object".to_owned())?;
+            .ok_or_else(|| ControlError::bad_request("spawn_agent arguments must be an object"))?;
         object.remove("requestKey");
         object.insert(
             "worktree".into(),
@@ -330,31 +386,25 @@ impl RegistryHost {
                     .unwrap_or(false),
             ),
         );
-        let fingerprint = serde_json::to_string(&normalized)
-            .map_err(|error| format!("could not normalize spawn arguments: {error}"))?;
-        ledger
-            .run(caller, "spawn_agent", request_key, fingerprint, || {
-                self.spawn_agent_once(arguments).map_err(|message| {
-                    let code = if message.starts_with("initial_prompt_delivery_failed:") {
-                        "initial_prompt_delivery_failed"
-                    } else {
-                        "mcp_tool_failed"
-                    };
-                    diri_proto::ControlError::new(code, message)
-                })
-            })
-            .map_err(|error| error.to_string())
+        let fingerprint = serde_json::to_string(&normalized).map_err(|error| {
+            ControlError::internal(format!("could not normalize spawn arguments: {error}"))
+        })?;
+        ledger.run(caller, "spawn_agent", &request_key, fingerprint, || {
+            self.spawn_agent_once(arguments)
+        })
     }
 
-    fn spawn_agent_once(&self, arguments: &Value) -> Result<Value, String> {
-        let kind = required_str(arguments, "kind")?;
-        let cwd = required_str(arguments, "cwd")?;
+    fn spawn_agent_once(&self, arguments: &Value) -> Result<Value, ControlError> {
+        let kind = required_str(arguments, "kind").map_err(ControlError::bad_request)?;
+        let cwd = required_str(arguments, "cwd").map_err(ControlError::bad_request)?;
         if let Some(host) = arguments.get("host").and_then(Value::as_str) {
             return self.spawn_agent_remote(arguments, &kind, &cwd, host);
         }
         let cwd_path = PathBuf::from(&cwd);
         if !cwd_path.is_dir() {
-            return Err(format!("cwd {cwd:?} is not a directory"));
+            return Err(ControlError::bad_request(format!(
+                "cwd {cwd:?} is not a directory"
+            )));
         }
         let wants_worktree = arguments
             .get("worktree")
@@ -369,24 +419,35 @@ impl RegistryHost {
             .and_then(Value::as_str)
             .map(str::to_string);
 
-        // A worktree is created before the session so the agent starts inside
-        // it, rather than in the repo and moving later.
+        // Resolve every fallible, side-effect-free launch dependency before
+        // creating a checkout. A typo must not leave an orphan worktree.
+        let (descriptor, authority) = {
+            let registry = self.registry_control()?;
+            let engine = registry.engine();
+            let manifest = engine.manifest(&kind).ok_or_else(|| {
+                ControlError::not_found(format!("no manifest for agent {kind:?}"))
+            })?;
+            let descriptor = manifest.agent.clone().unwrap_or_default();
+            let authority = descriptor.authority();
+            (descriptor, authority)
+        };
+        if descriptor.binary.is_none() && kind != diri_proto::AgentKind::SHELL_ID {
+            return Err(ControlError::bad_request(format!(
+                "agent {kind:?} declares no binary, so it cannot be spawned by name"
+            )));
+        }
+
+        // The rollback guard owns the checkout until Registry::spawn commits.
         let (working_dir, worktree_path, branch) = if wants_worktree {
-            let info = git::create_worktree(&cwd_path, None, None)
-                .map_err(|error| format!("could not create a worktree: {error}"))?;
+            let info = git::create_worktree(&cwd_path, None, None).map_err(|error| {
+                ControlError::internal(format!("could not create a worktree: {error}"))
+            })?;
             let path = PathBuf::from(&info.path);
             (path, Some(info.path), info.branch)
         } else {
             (cwd_path, None, git::branch(Path::new(&cwd)))
         };
-
-        let mut registry = self.registry()?;
-        let engine = registry.engine();
-        let manifest = engine
-            .manifest(&kind)
-            .ok_or_else(|| format!("no manifest for agent {kind:?}"))?;
-        let descriptor = manifest.agent.clone().unwrap_or_default();
-        let authority = descriptor.authority();
+        let mut rollback = WorktreeRollback::new(PathBuf::from(&cwd), worktree_path.clone());
 
         let inherited: Vec<(String, String)> = std::env::vars().collect();
         let pty = if let Some(pty) = descriptor.spawn_spec(&working_dir, inherited.clone(), &[]) {
@@ -397,9 +458,9 @@ impl RegistryHost {
             pty.env = inherited;
             pty
         } else {
-            return Err(format!(
+            return Err(ControlError::bad_request(format!(
                 "agent {kind:?} declares no binary, so it cannot be spawned by name"
-            ));
+            )));
         };
 
         let id = crate::control::next_session_id();
@@ -422,9 +483,11 @@ impl RegistryHost {
             remote: None,
             defer_launch: true,
         };
+        let mut registry = self.registry_control()?;
         registry
             .spawn(spec, record)
-            .map_err(|error| format!("could not start {kind}: {error}"))?;
+            .map_err(|error| ControlError::internal(format!("could not start {kind}: {error}")))?;
+        rollback.disarm();
         let _ = registry.persist();
         drop(registry);
 
@@ -437,8 +500,11 @@ impl RegistryHost {
                 Some(prompt),
             )
             .map_err(|error| {
-                format!(
-                    "initial_prompt_delivery_failed: session {id} was created, but its initial prompt was not delivered: {error}"
+                ControlError::new(
+                    "initial_prompt_delivery_failed",
+                    format!(
+                        "session {id} was created, but its initial prompt was not delivered: {error}"
+                    ),
                 )
             })?;
         } else if accept_claude_workspace {
@@ -480,12 +546,8 @@ impl RegistryHost {
         _kind: &str,
         _cwd: &str,
         _host_id: &str,
-    ) -> Result<Value, String> {
-        Err(format!(
-            "{}: {}",
-            crate::remote::TRANSPORT_UNAVAILABLE_CODE,
-            crate::remote::transport_unavailable().message
-        ))
+    ) -> Result<Value, ControlError> {
+        Err(crate::remote::transport_unavailable())
     }
 
     fn wait_for(&self, id: &str, until: &str, timeout_seconds: f64) -> Result<Value, String> {
