@@ -549,6 +549,7 @@ impl UtilitySurfaces {
         {
             self.activity = format!("Could not save settings: {error}");
         } else {
+            self.store_runtime.publish_local_change();
             self.activity = "Settings saved for diri".to_owned();
         }
     }

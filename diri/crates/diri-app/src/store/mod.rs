@@ -2581,6 +2581,13 @@ impl StoreRuntime {
         self.change_tx.subscribe()
     }
 
+    /// Publishes a synchronous local store mutation to views that subscribe to
+    /// the runtime's invalidation stream. Daemon events already do this in the
+    /// coalescing task; settings saves use this path after updating preferences.
+    pub fn publish_local_change(&self) {
+        let _ = self.change_tx.send(());
+    }
+
     pub fn client(&self) -> &Arc<DaemonClient> {
         &self.client
     }
