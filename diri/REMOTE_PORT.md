@@ -426,16 +426,20 @@ button or motion reports, while wheel intent remains encoded by that Holder's
 authoritative parser. Scrollback is bounded to 4 MiB and served on demand
 through `Scroll`. Raw output is bounded to 32 MiB.
 
-Protocol 1.5 adds the optional `application-cursor-keys` capability and mode
-bit. Capability and minor version must both be present before an unset bit can
-mean `false`; for a live protocol 1.4 Holder the state is `None`, never an
-invented terminal default. In that mixed-version case the Engine reconstructs
-DECCKM from the same ordered retained output it already feeds through its local
-emulator, then publishes the resolved state to desktop attachments. Cold
-adoption hydrates that emulator from locally retained OutputLog bytes before
-resuming at the persisted remote tail. If rotation removed the authoritative
-prefix and no retained transition resolves DECCKM, the state remains unknown:
-the Engine emits a desktop Modes seed with the additive value-known bit clear.
+Protocol 1.5 adds the optional `application-cursor-keys` capability and two
+mode bits: bit 6 is the value and bit 7 says that value is known for this
+individual snapshot. Capability, minor version, and the per-frame known bit
+must all be present before an unset value bit can mean `false`; for a live
+protocol 1.4 Holder or a 1.5 Holder sampled between parser boundaries the state
+is `None`, never an invented terminal default. In the mixed-version case the
+Engine reconstructs DECCKM from the same ordered retained output it already
+feeds through its local emulator, then publishes the resolved state to desktop
+attachments. Cold adoption hydrates that emulator from locally retained
+OutputLog bytes before resuming at the persisted remote tail. If rotation
+removed the authoritative prefix and no retained transition resolves DECCKM,
+the state remains unknown: the Engine emits a desktop Modes seed with the
+additive value-known bit clear.
+
 The app becomes degraded Live, preserves the independently authoritative paste
 and mouse state, and accepts ordinary input while withholding only unmodified
 cursor arrows whose CSI/SS3 encoding depends on DECCKM. A later authoritative

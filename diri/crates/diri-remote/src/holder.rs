@@ -1306,6 +1306,36 @@ fn terminate_process_group(pid: u32) {
 mod tests {
     use super::*;
 
+    fn decode_current_snapshot(snapshot: FullSnapshot) -> FullSnapshot {
+        let acknowledgement = RemoteMessage::HelloAck(HelloAck {
+            protocol: diri_proto::remote_pty::ProtocolVersion::CURRENT,
+            holder_build_id: "holder-build".into(),
+            session_incarnation: "incarnation-1".into(),
+            capabilities: PHASE_ONE_CAPABILITIES.to_vec(),
+            controller_epoch: 1,
+            process_state: RemoteProcessState::Running { pid: 42 },
+            output_offset: 0,
+            snapshot_sequence: 0,
+        });
+        let mut codec = RemoteCodec::new();
+        let decoded_acknowledgement = codec
+            .feed(&RemoteCodec::encode(&acknowledgement).expect("encode HelloAck"))
+            .expect("decode HelloAck");
+        assert_eq!(decoded_acknowledgement, vec![acknowledgement]);
+        let decoded = codec
+            .feed(
+                &RemoteCodec::encode(&RemoteMessage::FullSnapshot(snapshot))
+                    .expect("encode snapshot"),
+            )
+            .expect("decode snapshot")
+            .pop()
+            .expect("snapshot message");
+        let RemoteMessage::FullSnapshot(snapshot) = decoded else {
+            panic!("full snapshot");
+        };
+        snapshot
+    }
+
     #[test]
     fn pending_bytes_compact_after_a_complete_write() {
         let mut pending = PendingBytes::default();
@@ -1332,5 +1362,34 @@ mod tests {
         let error = validate_live_build_id("different-build").expect_err("build mismatch");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("different-build"));
+    }
+
+    #[test]
+    fn split_cursor_csi_stays_unknown_on_the_negotiated_wire_until_ground() {
+        let mut screen = HeadlessScreen::new(8, 2);
+        screen.feed(b"\x1b[");
+        let partial = decode_current_snapshot(FullSnapshot {
+            sequence: 1,
+            alt_screen: screen.is_alt_screen(),
+            bracketed_paste: screen.bracketed_paste(),
+            application_cursor_keys: screen.application_cursor_keys_at_parser_boundary(),
+            mouse: screen.mouse_modes(),
+            grid: screen.full_snapshot(),
+        });
+        assert_eq!(
+            partial.application_cursor_keys, None,
+            "protocol negotiation cannot turn a mid-CSI sample into known-off"
+        );
+
+        screen.feed(b"?1h");
+        let complete = decode_current_snapshot(FullSnapshot {
+            sequence: 2,
+            alt_screen: screen.is_alt_screen(),
+            bracketed_paste: screen.bracketed_paste(),
+            application_cursor_keys: screen.application_cursor_keys_at_parser_boundary(),
+            mouse: screen.mouse_modes(),
+            grid: screen.full_snapshot(),
+        });
+        assert_eq!(complete.application_cursor_keys, Some(true));
     }
 }
