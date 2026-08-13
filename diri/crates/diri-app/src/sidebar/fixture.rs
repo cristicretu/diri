@@ -178,6 +178,14 @@ tokio::spawn(async move { clone_repository(request).await });
                 fetched_at: DateMillis(now),
             }]);
         }
+        let (release_summary, release_risk) = if scenario == PreviewScenario::Stress {
+            (
+                "Delete the old release worktree before publishing?",
+                RiskHint::Destructive,
+            )
+        } else {
+            ("Wants to publish the release tag", RiskHint::Network)
+        };
         let claude: SessionRecord = session(
             "preview-claude",
             AgentKind::CLAUDE_CODE,
@@ -191,10 +199,10 @@ tokio::spawn(async move { clone_repository(request).await });
             kind: NeedsInputKind::Permission,
             source: NeedsInputSource::ClaudePermissionHook,
             tool_name: Some("Bash".into()),
-            summary: "Wants to publish the release tag".into(),
+            summary: release_summary.into(),
             prompt_excerpt: None,
             options: None,
-            risk_hint: RiskHint::Network,
+            risk_hint: release_risk,
             occurred_at: DateMillis(now - 45_000.0),
         })
         .into();
@@ -537,6 +545,22 @@ mod tests {
     }
 
     #[test]
+    fn typical_fixture_exercises_the_complete_fleet_pulse_hierarchy() {
+        let mut store = SidebarPreviewFixture::make(PreviewScenario::Typical).into_store();
+        let pulse = store.fleet_pulse();
+
+        assert_eq!(pulse.needs_you(), 2);
+        assert_eq!(pulse.destructive(), 0);
+        assert_eq!(pulse.done_unseen(), 1);
+        assert_eq!(pulse.working(), 3);
+        assert_eq!(
+            pulse.next_actionable(),
+            Some(&SessionId::new("preview-claude"))
+        );
+        assert_eq!(pulse.summary(), Some("Wants to publish the release tag"));
+    }
+
+    #[test]
     fn stress_fixture_adds_three_edge_cases() {
         let fixture = SidebarPreviewFixture::make(PreviewScenario::Stress);
         assert_eq!(fixture.list.sessions.len(), 13);
@@ -547,6 +571,20 @@ mod tests {
                 .iter()
                 .any(|session| { session.title.starts_with("Investigate why exceptionally") })
         );
+        let mut store = fixture.into_store();
+        let pulse = store.fleet_pulse();
+        assert_eq!(pulse.destructive(), 1);
+        assert!(pulse.next_is_destructive());
+        assert_eq!(
+            pulse.summary(),
+            Some("Delete the old release worktree before publishing?")
+        );
+    }
+
+    #[test]
+    fn empty_fixture_omits_the_fleet_pulse() {
+        let mut store = SidebarPreviewFixture::make(PreviewScenario::Empty).into_store();
+        assert_eq!(store.fleet_pulse().state(), None);
     }
 
     #[test]

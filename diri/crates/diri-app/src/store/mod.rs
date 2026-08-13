@@ -1,5 +1,6 @@
 //! Headless application state and the thin asynchronous daemon adapter.
 
+mod fleet_pulse;
 mod prefs;
 mod projection;
 mod residency;
@@ -31,6 +32,7 @@ use crate::switcher::{
     SessionSwitcherState, SwitcherKey, SwitcherOutcome,
 };
 
+pub use fleet_pulse::{FleetPulse, FleetPulseState};
 pub use prefs::{InspectorTab, Prefs, WindowMode, WindowPlacement};
 pub use projection::{SidebarProject, SidebarProjection, SidebarRow};
 pub use residency::{ResidencyUpdate, TerminalResidency};
@@ -1118,6 +1120,11 @@ impl SessionStore {
             .iter()
             .map(|session| session.as_ref().clone())
             .collect()
+    }
+
+    /// Revision-cached attention queue shared by every fleet-level surface.
+    pub fn fleet_pulse(&mut self) -> FleetPulse {
+        self.sidebar_projection().fleet_pulse.clone()
     }
 
     pub fn selected_session(&self) -> Option<&SessionRecord> {

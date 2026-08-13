@@ -17,7 +17,7 @@ use diri_ui::{
 use gpui::{
     Anchor, Animation, AnimationExt, AnyElement, App, AppContext as _, Bounds, Context,
     CursorStyle, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, FontWeight, Hsla,
-    IntoElement, MouseButton, Pixels, Point, Render, Rgba, ScrollHandle, SharedString, Task,
+    IntoElement, MouseButton, Pixels, Point, Render, Rgba, Role, ScrollHandle, SharedString, Task,
     Window, anchored, deferred, div, linear_color_stop, linear_gradient, point, prelude::*, px,
 };
 use tokio::sync::mpsc;
@@ -30,7 +30,8 @@ use crate::navigation::query_label;
 use crate::query_editor::{self, ClipboardEdit, Edit};
 use crate::seam::toggle_has_settled;
 use crate::store::{
-    ClickModifiers, DirectoryListingState, SessionStore, SpawnOptions, StoreEffect, StoreRuntime,
+    ClickModifiers, DirectoryListingState, FleetPulse, FleetPulseState, SessionStore, SpawnOptions,
+    StoreEffect, StoreRuntime,
 };
 use crate::updates::{UpdateCommand, UpdatePhase, UpdateState};
 use crate::usage::{UsageFormat, UsageSnapshot};
@@ -838,6 +839,166 @@ impl Sidebar {
                     ),
             )
             .into_any_element()
+    }
+
+    fn fleet_pulse_strip(
+        &self,
+        pulse: &FleetPulse,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let state = pulse.state()?;
+        let headline = pulse.headline()?;
+        let accessibility_label = pulse.accessibility_label()?;
+        let interactive = pulse.next_actionable().is_some();
+        let (signal, symbol, secondary, base_opacity, hover_opacity) = match state {
+            FleetPulseState::Urgent { destructive } => {
+                let signal = if destructive {
+                    Ink::DANGER
+                } else {
+                    Ink::ATTENTION
+                };
+                (
+                    signal,
+                    "exclamationmark.triangle",
+                    pulse.summary().unwrap_or("Review the next request"),
+                    0.10,
+                    0.15,
+                )
+            }
+            FleetPulseState::Ready => (
+                Ink::FRESH,
+                "checkmark.circle.fill",
+                pulse.summary().unwrap_or("Review completed work"),
+                0.075,
+                0.12,
+            ),
+            FleetPulseState::Quiet => (
+                colors.secondary,
+                "waveform.circle.fill",
+                "Live across your fleet",
+                0.045,
+                0.075,
+            ),
+        };
+        let description = match state {
+            FleetPulseState::Urgent { .. } => {
+                "Open the next request. Destructive requests are prioritized."
+            }
+            FleetPulseState::Ready => "Open the next finished agent.",
+            FleetPulseState::Quiet => "Diri is watching active agents.",
+        };
+        let shortcut = (matches!(state, FleetPulseState::Urgent { .. }))
+            .then(|| {
+                crate::commands::command(CommandId::SelectNextAttentionSession)
+                    .shortcut_label()
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let a11y_entity = cx.entity().downgrade();
+
+        Some(
+            div()
+                .id("fleet-pulse")
+                .debug_selector(|| "FLEET_PULSE".into())
+                .mx(px(Space::INSET))
+                .mb(px(6.0))
+                .px(px(Space::ROW_H))
+                .h(px(42.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .rounded(px(Radius::ROW))
+                .border_1()
+                .border_color(signal.alpha(if matches!(state, FleetPulseState::Quiet) {
+                    0.10
+                } else {
+                    0.22
+                }))
+                .bg(signal.alpha(base_opacity))
+                .role(if interactive {
+                    Role::Button
+                } else {
+                    Role::Status
+                })
+                .aria_label(accessibility_label)
+                .aria_description(description)
+                .when(interactive, |row| {
+                    row.focusable()
+                        .tab_stop(true)
+                        .cursor_pointer()
+                        .hover(move |row| row.bg(signal.alpha(hover_opacity)))
+                        .active(move |row| row.bg(signal.alpha(hover_opacity + 0.035)))
+                        .focus_visible(move |row| row.border_color(signal.alpha(0.78)))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.activate_fleet_pulse(cx);
+                        }))
+                        .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                this.activate_fleet_pulse(cx);
+                                cx.stop_propagation();
+                            }
+                        }))
+                        .on_a11y_action(gpui::accesskit::Action::Click, move |_, _, cx| {
+                            let _ = a11y_entity.update(cx, |this, cx| {
+                                this.activate_fleet_pulse(cx);
+                            });
+                        })
+                })
+                .when(!shortcut.is_empty(), |row| {
+                    row.aria_keyshortcuts("Meta+Shift+J")
+                })
+                .child(
+                    div()
+                        .flex_none()
+                        .size(px(24.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(Radius::BADGE))
+                        .bg(signal.alpha(0.12))
+                        .child(sf_symbol(symbol, 13.0, signal)),
+                )
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap(px(1.0))
+                        .child(
+                            div()
+                                .whitespace_nowrap()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .text_size(px(Typo::ROW_EMPHASIZED.size))
+                                .font_weight(Typo::ROW_EMPHASIZED.weight)
+                                .text_color(colors.primary)
+                                .child(headline),
+                        )
+                        .child(
+                            div()
+                                .whitespace_nowrap()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .text_size(px(Typo::META.size))
+                                .font_weight(Typo::META.weight)
+                                .text_color(colors.secondary)
+                                .child(secondary.to_owned()),
+                        ),
+                )
+                .when(!shortcut.is_empty(), |row| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .text_size(px(Typo::META.size))
+                            .text_color(signal.alpha(0.86))
+                            .child(shortcut),
+                    )
+                })
+                .into_any_element(),
+        )
     }
 
     fn top_bar(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
@@ -4099,29 +4260,36 @@ impl Sidebar {
         true
     }
 
-    /// ⌘J: select the next session waiting on a human, in sidebar order and
-    /// wrapping past the current row. Returns false when nothing is waiting.
+    fn activate_fleet_pulse(&mut self, cx: &mut Context<Self>) -> bool {
+        self.commit_rename();
+        {
+            let mut store = self.store.write().expect("session store lock poisoned");
+            let pulse = store.fleet_pulse();
+            let Some(next) = pulse.next_actionable().cloned() else {
+                return false;
+            };
+            store.select(next);
+        }
+        cx.emit(SidebarEvent::SessionActivated);
+        cx.notify();
+        true
+    }
+
+    /// ⇧⌘J: select the next session waiting on a human. Destructive requests
+    /// lead, then the user's project/session order wraps past the current row.
+    /// Returns false when nothing is waiting.
     pub fn select_next_needing_input(&mut self, cx: &mut Context<Self>) -> bool {
         self.commit_rename();
         {
             let mut store = self.store.write().expect("session store lock poisoned");
-            let sessions = store.ordered_sessions();
-            if sessions.is_empty() {
+            let pulse = store.fleet_pulse();
+            if pulse.needs_you() == 0 {
                 return false;
             }
-            let current = store
-                .selected_session_id()
-                .and_then(|id| sessions.iter().position(|session| &session.id == id));
-            // Start one past the selection so repeated ⌘J walks the queue
-            // instead of landing on the same row.
-            let start = current.map_or(0, |index| index + 1);
-            let Some(next) = (0..sessions.len())
-                .map(|offset| &sessions[(start + offset) % sessions.len()])
-                .find(|session| session.attention() == ProtoAttentionLevel::NeedsInput)
-            else {
+            let Some(next) = pulse.next_actionable().cloned() else {
                 return false;
             };
-            store.select(next.id.clone());
+            store.select(next);
         }
         cx.emit(SidebarEvent::SessionActivated);
         cx.notify();
@@ -4475,6 +4643,9 @@ impl Render for Sidebar {
             )
             .child(self.top_bar(colors, cx))
             .child(self.new_agent_row(colors, cx));
+        if let Some(pulse) = self.fleet_pulse_strip(&projection.fleet_pulse, colors, cx) {
+            root = root.child(pulse);
+        }
         if projection.projects.is_empty() {
             root = root.child(self.empty_state(colors, cx));
         } else {
@@ -5375,6 +5546,81 @@ mod tests {
                 Some(&cursor)
             );
         });
+    }
+
+    #[gpui::test]
+    fn fleet_pulse_click_walks_the_risk_order_and_reveals_collapsed_sessions(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Stress, cx));
+            SidebarPopoverHarness { sidebar }
+        });
+        let pulse = cx.debug_bounds("FLEET_PULSE").expect("fleet pulse");
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+
+        cx.simulate_click(pulse.center(), Modifiers::default());
+        cx.run_until_parked();
+        sidebar.read_with(cx, |sidebar, _| {
+            assert_eq!(
+                sidebar
+                    .store
+                    .read()
+                    .expect("session store lock poisoned")
+                    .selected_session_id(),
+                Some(&SessionId::new("preview-claude"))
+            );
+        });
+
+        let pulse = cx.debug_bounds("FLEET_PULSE").expect("fleet pulse");
+        cx.simulate_click(pulse.center(), Modifiers::default());
+        cx.run_until_parked();
+        sidebar.read_with(cx, |sidebar, _| {
+            let store = sidebar.store.read().expect("session store lock poisoned");
+            assert_eq!(
+                store.selected_session_id(),
+                Some(&SessionId::new("preview-question"))
+            );
+            assert!(
+                !store
+                    .preferences()
+                    .sidebar_collapsed_projects
+                    .contains(&ProjectId::new("preview-anara"))
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn fleet_pulse_is_a_keyboard_button(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        view.update_in(cx, |_, window, cx| window.focus_next(cx));
+
+        cx.simulate_keystrokes("enter");
+
+        sidebar.read_with(cx, |sidebar, _| {
+            assert_eq!(
+                sidebar
+                    .store
+                    .read()
+                    .expect("session store lock poisoned")
+                    .selected_session_id(),
+                Some(&SessionId::new("preview-claude"))
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn resting_fleet_does_not_reserve_sidebar_space(cx: &mut TestAppContext) {
+        let (_view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Empty, cx));
+            SidebarPopoverHarness { sidebar }
+        });
+
+        assert!(cx.debug_bounds("FLEET_PULSE").is_none());
     }
 
     #[gpui::test]
