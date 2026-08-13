@@ -475,9 +475,11 @@ daemon's held-output follower is raised only while the session is recently
 attached or receiving input, then returns to default QoS.
 
 Current local Holders also report their parser-owned DECCKM value in `stat`.
-The field is optional for live older Holders. If both that field and the
+The field is optional for live older Holders and while the sampled log tail is
+inside an unfinished control sequence; a boolean cannot replace the parser
+continuation after that offset. If both that field and the
 pre-rotation output prefix are unavailable, adoption keeps DECCKM unknown,
-does not write a v4 checkpoint with a guessed value, and uses the same degraded
+does not write a v5 checkpoint with a guessed value, and uses the same degraded
 Live behavior as remote compatibility. Holder mode reports are paired with the
 reported log tail; if rotation passes that tail before replay, the Engine
 downgrades the stale report to unknown. The replay cursor remains live after
@@ -486,6 +488,11 @@ before the retained suffix is parsed, because the missing interval could hold
 a sticky toggle. The same rule applies when a remote Holder's bounded
 `ReplayBegin` advances beyond the Engine's acknowledged raw-output offset;
 protocol 1.4 snapshot data cannot make that skipped DECCKM interval known.
+Protocol 1.5 Holders likewise leave the snapshot field unset until their raw
+parser reaches a control-sequence boundary, so an `ESC` and its `[?1h` suffix
+are never separated by a boolean snapshot. The Engine also preserves its
+locally retained parser continuation when an earlier 1.5 peer supplies a
+boolean, so the following contiguous suffix remains effective.
 
 Desktop Modes frames carry an optional opaque acknowledgement token after the
 one-byte mode bitset. Current clients return it only after the UI has applied

@@ -1021,7 +1021,7 @@ impl Holder {
                 sequence: self.state.snapshot_sequence,
                 alt_screen: self.screen.is_alt_screen(),
                 bracketed_paste: self.screen.bracketed_paste(),
-                application_cursor_keys: Some(self.screen.application_cursor_keys()),
+                application_cursor_keys: self.screen.application_cursor_keys_at_parser_boundary(),
                 mouse: self.screen.mouse_modes(),
                 grid,
             }))?;
@@ -1030,7 +1030,7 @@ impl Holder {
                 sequence: self.state.snapshot_sequence,
                 alt_screen: self.screen.is_alt_screen(),
                 bracketed_paste: self.screen.bracketed_paste(),
-                application_cursor_keys: Some(self.screen.application_cursor_keys()),
+                application_cursor_keys: self.screen.application_cursor_keys_at_parser_boundary(),
                 mouse: self.screen.mouse_modes(),
                 grid,
             }))?;
@@ -1070,7 +1070,7 @@ impl Holder {
             sequence: self.state.snapshot_sequence,
             alt_screen: self.screen.is_alt_screen(),
             bracketed_paste: self.screen.bracketed_paste(),
-            application_cursor_keys: Some(self.screen.application_cursor_keys()),
+            application_cursor_keys: self.screen.application_cursor_keys_at_parser_boundary(),
             mouse: self.screen.mouse_modes(),
             grid: self.screen.full_snapshot(),
         }))

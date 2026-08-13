@@ -1,8 +1,11 @@
 //! Durable screen checkpoints: `<id>.screen.plist`. Versions before 4 are
 //! deliberately cache misses because they cannot say whether DECCKM was on;
-//! retained output reconstructs it only when the Holder incarnation prefix is
-//! still present. Otherwise the mode stays unknown until the current Holder or
-//! a later terminal transition supplies authority.
+//! version 4 is also a miss because it can split the control sequence that
+//! produced the boolean from the output replay that follows it. Version 5
+//! certifies that the raw parser was at a sequence boundary. Retained output
+//! reconstructs an older or uncertified checkpoint only when the Holder
+//! incarnation prefix is still present. Otherwise the mode stays unknown until
+//! the current Holder or a later terminal transition supplies authority.
 //!
 //! A checkpoint pairs an RLE-encoded full grid with the exact raw-log offset
 //! it represents, so a restarted daemon can seed the emulator from a few
@@ -13,7 +16,7 @@
 //! malformed or stale file is ignored and the bounded raw-log replay runs
 //! instead. The on-disk format is a property list (either binary or XML is
 //! read). Future additive versions remain readable when they retain every
-//! version-4 field; deleting or changing one safely turns them into a miss.
+//! version-5 fields; deleting or changing one safely turns them into a miss.
 
 use std::path::Path;
 
@@ -24,7 +27,8 @@ use diri_proto::terminal::{MouseEncoding, MouseModes, MouseTrackingMode};
 // every adopted session to at most one line of history, so it is deliberately
 // treated as a cache miss and rebuilt from retained output where possible.
 const APPLICATION_CURSOR_VERSION: u64 = 4;
-const CURRENT_VERSION: u64 = APPLICATION_CURSOR_VERSION;
+const PARSER_BOUNDARY_VERSION: u64 = 5;
+const CURRENT_VERSION: u64 = PARSER_BOUNDARY_VERSION;
 
 /// A decoded checkpoint, grid already validated.
 pub struct ScreenCheckpoint {
@@ -58,10 +62,16 @@ impl ScreenCheckpoint {
         // A v2/v3 snapshot can reproduce cells, paste, and mouse state, but
         // silently inventing DECCKM=false would send the wrong arrow bytes to
         // a still-live TUI. Treat it as the acceleration-cache miss it is and
-        // replay retained output without inventing a mode. Versions >=4 are additive:
+        // replay retained output without inventing a mode. Versions >=5 are additive:
         // required-field decoding below still fails closed on an incompatible
-        // future shape while preserving the v4 cursor bit in a future v5.
+        // future shape while preserving the v4 cursor bit and v5 boundary proof.
         if version < APPLICATION_CURSOR_VERSION {
+            return None;
+        }
+        // A v4 boolean may have been sampled after `ESC` while replay starts
+        // with `[?1h`. It is not a parser boundary and therefore not a valid
+        // acceleration checkpoint for sticky input modes.
+        if version < PARSER_BOUNDARY_VERSION || !dict.get("cursorParserAtBoundary")?.as_boolean()? {
             return None;
         }
         let grid = GridUpdate::decode(as_data(dict.get("gridPayload")?)?).ok()?;
@@ -142,6 +152,7 @@ impl ScreenCheckpoint {
             "applicationCursorKeys".into(),
             plist::Value::Boolean(self.application_cursor_keys),
         );
+        dict.insert("cursorParserAtBoundary".into(), plist::Value::Boolean(true));
         dict.insert(
             "mouseReporting".into(),
             plist::Value::Boolean(self.mouse.is_reporting()),
@@ -239,6 +250,7 @@ mod tests {
             "altScreen",
             "bracketedPaste",
             "applicationCursorKeys",
+            "cursorParserAtBoundary",
             "mouseReporting",
             "mouseTrackingMode",
             "mouseEncoding",
@@ -349,6 +361,24 @@ mod tests {
     }
 
     #[test]
+    fn version_four_boolean_without_parser_boundary_is_a_cache_miss() {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("s_v4.screen.plist");
+        sample().write_atomically(&path).expect("write");
+        let mut dict = plist::Value::from_file(&path)
+            .expect("read")
+            .into_dictionary()
+            .expect("dictionary");
+        dict.insert("version".into(), plist::Value::Integer(4.into()));
+        dict.remove("cursorParserAtBoundary");
+        plist::Value::Dictionary(dict)
+            .to_file_binary(&path)
+            .expect("rewrite v4");
+
+        assert!(ScreenCheckpoint::load(&path).is_none());
+    }
+
+    #[test]
     fn version_and_shape_mismatches_are_cache_misses() {
         let dir = tempfile::tempdir().expect("temp");
         let path = dir.path().join("s_x.screen.plist");
@@ -363,9 +393,8 @@ mod tests {
 
         let mut future = sample();
         future.write_atomically(&path).expect("write");
-        // An additive v5 still carries the v4 DECCKM field. Decoding by the
-        // feature's introduction version, rather than CURRENT_VERSION,
-        // prevents a later format bump from silently resetting the mode.
+        // An additive future version still carries both the v4 DECCKM field
+        // and the v5 parser-boundary proof, so it remains readable.
         let mut dict = plist::Value::from_file(&path)
             .expect("read back")
             .into_dictionary()
@@ -377,7 +406,7 @@ mod tests {
         plist::Value::Dictionary(dict)
             .to_file_binary(&path)
             .expect("rewrite");
-        let loaded = ScreenCheckpoint::load(&path).expect("additive v5");
+        let loaded = ScreenCheckpoint::load(&path).expect("additive future checkpoint");
         assert!(loaded.application_cursor_keys);
 
         let mut dict = plist::Value::from_file(&path)

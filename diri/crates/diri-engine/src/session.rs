@@ -2495,7 +2495,7 @@ fn apply_remote_snapshot(
         .application_cursor_keys
         .lock()
         .expect("application cursor mode")
-        .value();
+        .value_at_parser_boundary();
     let application_cursor_keys = resolve_remote_application_cursor_keys(
         snapshot.application_cursor_keys,
         emulated_application_cursor_keys,
@@ -2505,7 +2505,7 @@ fn apply_remote_snapshot(
             .application_cursor_keys
             .lock()
             .expect("application cursor mode")
-            .set_known(value);
+            .set_known_preserving_parser(value);
     }
     let restored_application_cursor_keys = application_cursor_keys.unwrap_or_else(|| {
         shared
@@ -2573,7 +2573,7 @@ fn apply_remote_delta(shared: &Shared, delta: GridDelta) -> std::io::Result<()> 
         .application_cursor_keys
         .lock()
         .expect("application cursor mode")
-        .value();
+        .value_at_parser_boundary();
     let application_cursor_keys = resolve_remote_application_cursor_keys(
         delta.application_cursor_keys,
         emulated_application_cursor_keys,
@@ -2583,7 +2583,7 @@ fn apply_remote_delta(shared: &Shared, delta: GridDelta) -> std::io::Result<()> 
             .application_cursor_keys
             .lock()
             .expect("application cursor mode")
-            .set_known(value);
+            .set_known_preserving_parser(value);
     }
     let mirrored_application_cursor_keys = application_cursor_keys.unwrap_or_else(|| {
         shared
@@ -3306,14 +3306,24 @@ fn persist_checkpoint(
         .application_cursor_keys
         .lock()
         .expect("application cursor mode")
-        .value()
+        .value_at_parser_boundary()
     else {
-        // A checkpoint turns absence into a durable boolean. Never write one
-        // until retained output or Holder state has established DECCKM.
+        // A checkpoint turns absence or partial parser state into a durable
+        // boolean. Never write one until DECCKM is known at a raw-stream
+        // control-sequence boundary.
         return;
     };
     let (history, grid, alt_screen, bracketed_paste, application_cursor_keys, mouse, content_seq) = {
         let screen = shared.screen.lock().expect("screen");
+        if screen
+            .application_cursor_keys_at_parser_boundary()
+            .is_none()
+        {
+            // The display replay can begin later than the full-prefix mode
+            // replay. Certify both parsers: restoring a grid while its VTE
+            // processor awaited a suffix would lose that continuation too.
+            return;
+        }
         (
             screen.history_snapshot(),
             screen.full_snapshot(),
@@ -3602,6 +3612,46 @@ mod remote_mode_tests {
         assert_eq!(mode.value(), Some(true));
         mode.feed(b"\x1b[?1l");
         assert_eq!(mode.value(), Some(false));
+    }
+
+    #[test]
+    fn split_holder_stat_boundary_replays_the_complete_sequence() {
+        // The Holder has appended ESC, but its parser has not reached a raw
+        // boundary. Its stat must omit authority rather than bind `false` to
+        // offset 1 and make the contiguous "[?1h" suffix unparsable.
+        let mut holder_mode = ApplicationCursorModeTracker::known(false);
+        holder_mode.feed(b"\x1b");
+        assert_eq!(holder_mode.value(), Some(false));
+        assert_eq!(holder_mode.value_at_parser_boundary(), None);
+
+        // With no stat authority, adoption reconstructs from the complete
+        // Holder-incarnation prefix. A no-gap split across reads still
+        // completes DECCKM normally.
+        let mut adopted_mode = ApplicationCursorModeTracker::unknown();
+        seed_default_application_cursor_from_complete_prefix(&mut adopted_mode, 0, 0, true);
+        let mut expected = 0;
+        feed_application_cursor_log_chunk(&mut adopted_mode, &mut expected, 0, b"\x1b");
+        feed_application_cursor_log_chunk(&mut adopted_mode, &mut expected, 1, b"[?1h");
+        assert_eq!(adopted_mode.value(), Some(true));
+        assert_eq!(adopted_mode.value_at_parser_boundary(), Some(true));
+    }
+
+    #[test]
+    fn split_checkpoint_boundary_is_suppressed_and_replayed() {
+        let mut live_mode = ApplicationCursorModeTracker::known(false);
+        live_mode.feed(b"\x1b[");
+        assert_eq!(
+            live_mode.value_at_parser_boundary(),
+            None,
+            "checkpoint persistence must be suppressed mid-CSI"
+        );
+
+        // The previous certified checkpoint was at offset zero. Replaying
+        // both sides of the split from that boundary reaches the real mode.
+        let mut restored_mode = ApplicationCursorModeTracker::known(false);
+        restored_mode.feed(b"\x1b[");
+        restored_mode.feed(b"?1h");
+        assert_eq!(restored_mode.value_at_parser_boundary(), Some(true));
     }
 
     #[test]

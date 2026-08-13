@@ -527,7 +527,7 @@ fn current_stat(shared: &Shared) -> HolderStat {
         cols: size.map(|(cols, _)| cols),
         rows: size.map(|(_, rows)| rows),
         epoch_offset: Some(shared.epoch_offset),
-        application_cursor_keys: output.application_cursor_keys.value(),
+        application_cursor_keys: output.application_cursor_keys.value_at_parser_boundary(),
     }
 }
 
