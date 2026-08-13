@@ -581,9 +581,15 @@ impl TerminalElement {
     }
 
     pub fn select_word(&self, col: usize, window_row: usize) {
-        let viewport = mutex_lock(&self.shared.viewport).clone();
+        let viewport = mutex_lock(&self.shared.viewport);
         let buffer = read_lock(&self.buffer);
         mutex_lock(&self.shared.selection).select_word(&viewport, &buffer, window_row, col);
+    }
+
+    pub fn select_line(&self, window_row: usize) {
+        let viewport = mutex_lock(&self.shared.viewport);
+        let buffer = read_lock(&self.buffer);
+        mutex_lock(&self.shared.selection).select_line(&viewport, &buffer, window_row);
     }
 
     pub fn clear_selection(&self) {
@@ -607,7 +613,7 @@ impl TerminalElement {
     /// the path itself. Multi-row references are deliberately out of scope.
     #[must_use]
     pub fn reference_at(&self, col: usize, window_row: usize) -> Option<TerminalReference> {
-        let viewport = mutex_lock(&self.shared.viewport).clone();
+        let viewport = mutex_lock(&self.shared.viewport);
         let buffer = read_lock(&self.buffer);
         let absolute_row = viewport.absolute_row(window_row);
         let row = viewport.row_at_absolute(&buffer, absolute_row);
@@ -637,7 +643,7 @@ impl TerminalElement {
 
     #[must_use]
     pub fn selected_text(&self) -> String {
-        let viewport = mutex_lock(&self.shared.viewport).clone();
+        let viewport = mutex_lock(&self.shared.viewport);
         let buffer = read_lock(&self.buffer);
         mutex_lock(&self.shared.selection).selected_text(&viewport, &buffer)
     }

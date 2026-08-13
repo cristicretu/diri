@@ -118,6 +118,31 @@ impl TerminalSelection {
         });
     }
 
+    /// Expands a triple-click to the complete visual row. Terminal padding is
+    /// retained in the range so dragging can continue naturally, while copy
+    /// still trims the padding through [`Self::selected_text`].
+    pub fn select_line(
+        &mut self,
+        viewport: &ScrollbackViewport,
+        buffer: &GridBuffer,
+        window_row: usize,
+    ) {
+        let row = viewport.window_row(buffer, window_row);
+        if row.is_empty() {
+            self.clear();
+            return;
+        }
+        let absolute_row = viewport.absolute_row(window_row);
+        self.anchor = Some(SelectionPoint {
+            row: absolute_row,
+            col: 0,
+        });
+        self.head = Some(SelectionPoint {
+            row: absolute_row,
+            col: row.len(),
+        });
+    }
+
     #[must_use]
     pub fn range(&self) -> Option<SelectionRange> {
         let anchor = self.anchor?;
@@ -225,13 +250,23 @@ fn columns_for_row(range: SelectionRange, row: i64, cols: usize) -> (usize, usiz
 
 fn word_class(cell: GridCell) -> WordClass {
     let ch = cell_char(cell);
-    if ch.is_alphanumeric() || ch == '_' {
+    if ch.is_alphanumeric() || is_terminal_word_punctuation(ch) {
         WordClass::Word
     } else if ch.is_whitespace() {
         WordClass::Whitespace
     } else {
         WordClass::Punctuation
     }
+}
+
+/// Punctuation people expect to travel with paths, URLs, flags, and common
+/// identifiers when double-clicking in a terminal. Shell separators and quote
+/// delimiters deliberately remain punctuation boundaries.
+fn is_terminal_word_punctuation(ch: char) -> bool {
+    matches!(
+        ch,
+        '_' | '-' | '.' | '/' | '~' | ':' | '@' | '%' | '+' | '=' | '?' | '&' | '#'
+    )
 }
 
 pub(crate) fn cell_char(cell: GridCell) -> char {
@@ -325,6 +360,52 @@ mod tests {
         selection.select_word(&viewport, &buffer, 0, 6);
 
         assert_eq!(selection.selected_text(&viewport, &buffer), "two_three");
+    }
+
+    #[test]
+    fn double_click_keeps_paths_urls_and_flags_together() {
+        let viewport = ScrollbackViewport::default();
+        let text = "open ./crates/diri-app:42 https://diri.dev/a?q=1&v=2, --all | next";
+        let mut buffer = GridBuffer::new(text.len() as u16, 1);
+        buffer.cells = row(text, text.len());
+        let mut selection = TerminalSelection::default();
+
+        selection.select_word(&viewport, &buffer, 0, text.find("diri-app").expect("path"));
+        assert_eq!(
+            selection.selected_text(&viewport, &buffer),
+            "./crates/diri-app:42"
+        );
+
+        selection.select_word(&viewport, &buffer, 0, text.find("diri.dev").expect("url"));
+        assert_eq!(
+            selection.selected_text(&viewport, &buffer),
+            "https://diri.dev/a?q=1&v=2"
+        );
+
+        selection.select_word(&viewport, &buffer, 0, text.find("--all").expect("flag"));
+        assert_eq!(selection.selected_text(&viewport, &buffer), "--all");
+
+        selection.select_word(&viewport, &buffer, 0, text.find('|').expect("pipe"));
+        assert_eq!(selection.selected_text(&viewport, &buffer), "|");
+    }
+
+    #[test]
+    fn triple_click_selects_the_visual_line_without_terminal_padding() {
+        let viewport = ScrollbackViewport::default();
+        let mut buffer = GridBuffer::new(16, 2);
+        buffer.cells = [row("first", 16), row("whole line", 16)].concat();
+        let mut selection = TerminalSelection::default();
+
+        selection.select_line(&viewport, &buffer, 1);
+
+        assert_eq!(selection.selected_text(&viewport, &buffer), "whole line");
+        assert_eq!(
+            selection.range(),
+            Some(SelectionRange {
+                start: SelectionPoint { row: 1, col: 0 },
+                end: SelectionPoint { row: 1, col: 16 },
+            })
+        );
     }
 
     #[test]

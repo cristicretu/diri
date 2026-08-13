@@ -35,9 +35,9 @@ use diri_ui::{
 };
 use gpui::{
     AnyElement, ClickEvent, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter,
-    FocusHandle, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton, Render, ScrollDelta,
-    ScrollWheelEvent, SharedString, StatefulInteractiveElement, Task, Window, div, font,
-    prelude::*, px, rgba,
+    FocusHandle, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton, Render, Role,
+    ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Task, Window, div,
+    font, prelude::*, px, rgba,
 };
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
@@ -1697,7 +1697,8 @@ impl TerminalPane {
             PointerOwner::LocalSelection => {
                 match event.click_count {
                     1 => resident.element.begin_selection(col, row),
-                    _ => resident.element.select_word(col, row),
+                    2 => resident.element.select_word(col, row),
+                    _ => resident.element.select_line(row),
                 }
                 cx.notify();
             }
@@ -2619,22 +2620,23 @@ impl TerminalPane {
         &mut self,
         session: &SessionRecord,
         theme: TermTheme,
+        colors: SemanticColors,
         font_size: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if session.is_archived() {
-            return self.render_archived_overlay(session, cx);
+            return self.render_archived_overlay(session, colors, cx);
         }
         let exited = matches!(session.status, SessionStatus::Exited(_));
         // An exited agent leaves its last screen behind in the daemon, and that
         // output is exactly what people want to read after closing an agent --
         // so only take the pane over when there is no terminal left to show.
-        if exited && let Some(takeover) = self.render_exited_takeover(session, cx) {
+        if exited && let Some(takeover) = self.render_exited_takeover(session, colors, cx) {
             return takeover;
         }
         let Some(resident) = self.residents.get(&session.id) else {
-            return centered_message("Preparing terminal…", "").into_any_element();
+            return centered_message("Preparing terminal…", "", colors).into_any_element();
         };
         let element = resident
             .element
@@ -2718,14 +2720,16 @@ impl TerminalPane {
                     .rounded(px(999.0))
                     .px(px(12.0))
                     .py(px(6.0))
-                    .bg(rgba(0x303238e8))
+                    .bg(colors.floating_surface())
+                    .border_1()
+                    .border_color(colors.floating_stroke())
                     .text_size(px(11.5))
-                    .text_color(rgba(0xffffff99))
+                    .text_color(colors.secondary)
                     .cursor_pointer()
                     .flex()
                     .items_center()
                     .gap(px(5.0))
-                    .child(sf_symbol("arrow.down", 11.5, rgba(0xffffff99)))
+                    .child(sf_symbol("arrow.down", 11.5, colors.secondary))
                     .child(format!("{view_offset} lines · Return to live"))
                     .on_click(cx.listener(move |this, _, _window, cx| {
                         if let Some(resident) = this.residents.get_mut(&return_id) {
@@ -2752,21 +2756,28 @@ impl TerminalPane {
                     .rounded(px(999.0))
                     .px(px(12.0))
                     .py(px(6.0))
-                    .bg(rgba(0x303238e8))
+                    .bg(colors.floating_surface())
+                    .border_1()
+                    .border_color(colors.floating_stroke())
                     .text_size(px(11.5))
-                    .text_color(rgba(0xffffff99))
+                    .text_color(colors.secondary)
                     .child(message),
             );
         }
         if exited {
-            body = body.child(self.render_exit_pill(session, cx));
+            body = body.child(self.render_exit_pill(session, colors, cx));
         }
         body.into_any_element()
     }
 
     /// Slim status pill over an exited session's last screen: says what happened
     /// and offers the resume that the pane-filling card used to.
-    fn render_exit_pill(&self, session: &SessionRecord, cx: &mut Context<Self>) -> AnyElement {
+    fn render_exit_pill(
+        &self,
+        session: &SessionRecord,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let id = session.id.clone();
         let resumable = session.resumability == Resumability::Resumable;
         let mut pill = div()
@@ -2775,13 +2786,15 @@ impl TerminalPane {
             .pl(px(12.0))
             .pr(if resumable { px(4.0) } else { px(12.0) })
             .py(px(4.0))
-            .bg(rgba(0x303238e8))
+            .bg(colors.floating_surface())
+            .border_1()
+            .border_color(colors.floating_stroke())
             .flex()
             .items_center()
             .gap(px(8.0))
             .text_size(px(11.5))
-            .text_color(rgba(0xffffff99))
-            .child(sf_symbol("power", 11.0, rgba(0xffffff66)))
+            .text_color(colors.secondary)
+            .child(sf_symbol("power", 11.0, colors.tertiary))
             .child(exit_description(session));
         if resumable {
             pill = pill.child(
@@ -2790,10 +2803,10 @@ impl TerminalPane {
                     .rounded(px(999.0))
                     .px(px(9.0))
                     .py(px(3.0))
-                    .bg(rgba(0xffffff1a))
-                    .hover(|style| style.bg(rgba(0xffffff2e)))
+                    .bg(colors.primary.alpha(0.08))
+                    .hover(move |style| style.bg(colors.primary.alpha(0.14)))
                     .cursor_pointer()
-                    .text_color(rgba(0xffffffe6))
+                    .text_color(colors.primary)
                     .child("Resume")
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.runtime
@@ -2805,11 +2818,7 @@ impl TerminalPane {
                     })),
             );
         } else if session.resumability == Resumability::TranscriptMissing {
-            pill = pill.child(
-                div()
-                    .text_color(rgba(0xffffff4d))
-                    .child("· transcript gone"),
-            );
+            pill = pill.child(div().text_color(colors.tertiary).child("· transcript gone"));
         }
         // Centered by a full-width row rather than a guessed half-width offset,
         // since the description's length varies with the exit reason.
@@ -2832,7 +2841,8 @@ impl TerminalPane {
     ) -> Option<AnyElement> {
         let resident = self.residents.get(&session.id)?;
         let find = resident.find.as_ref()?;
-        let count = if find.matches().is_empty() {
+        let has_matches = !find.matches().is_empty();
+        let count = if !has_matches {
             if find.query().is_empty() {
                 String::new()
             } else {
@@ -2868,35 +2878,53 @@ impl TerminalPane {
                                 .items_center()
                                 .gap(px(8.0))
                                 .text_size(px(Typo::ROW.size))
-                                .text_color(rgba(0xffffffd9))
-                                .child(sf_symbol("magnifyingglass", 12.0, rgba(0xffffff66)))
+                                .text_color(colors.primary)
+                                .child(sf_symbol("magnifyingglass", 12.0, colors.tertiary))
                                 .child(div().flex_1().child(query))
                                 .child(
                                     div()
                                         .text_size(px(Typo::META.size))
-                                        .text_color(rgba(0xffffff4d))
+                                        .text_color(colors.tertiary)
                                         .child(count),
                                 )
-                                .child(div().w(px(1.0)).h(px(16.0)).bg(rgba(0xffffff1a)))
+                                .child(div().w(px(1.0)).h(px(16.0)).bg(colors.primary.alpha(0.10)))
                                 .child(find_icon_button(
-                                    "find-previous",
-                                    "chevron.up",
+                                    FindButtonSpec {
+                                        id: "find-previous",
+                                        system_image: "chevron.up",
+                                        label: "Previous match",
+                                        shortcut: "Shift+Enter",
+                                    },
+                                    colors,
+                                    has_matches,
                                     cx,
                                     |this, _w, cx| {
                                         this.navigate_find(true, cx);
                                     },
                                 ))
                                 .child(find_icon_button(
-                                    "find-next",
-                                    "chevron.down",
+                                    FindButtonSpec {
+                                        id: "find-next",
+                                        system_image: "chevron.down",
+                                        label: "Next match",
+                                        shortcut: "Enter",
+                                    },
+                                    colors,
+                                    has_matches,
                                     cx,
                                     |this, _w, cx| {
                                         this.navigate_find(false, cx);
                                     },
                                 ))
                                 .child(find_icon_button(
-                                    "find-close",
-                                    "xmark",
+                                    FindButtonSpec {
+                                        id: "find-close",
+                                        system_image: "xmark",
+                                        label: "Close find",
+                                        shortcut: "Escape",
+                                    },
+                                    colors,
+                                    true,
                                     cx,
                                     |this, _w, cx| {
                                         this.close_find_for_selected();
@@ -2909,7 +2937,7 @@ impl TerminalPane {
                                 div()
                                     .pl(px(20.0))
                                     .text_size(px(Typo::META.size))
-                                    .text_color(rgba(0xffffff4d))
+                                    .text_color(colors.tertiary)
                                     .child("full-screen app — screen only"),
                             )
                         }),
@@ -2923,6 +2951,7 @@ impl TerminalPane {
     fn render_exited_takeover(
         &self,
         session: &SessionRecord,
+        colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let (auto_resuming, migrating) = {
@@ -2939,10 +2968,12 @@ impl TerminalPane {
         // Mid-migration the source agent is briefly down; show the busy state
         // instead of an exit card with a doomed Resume button.
         if migrating {
-            return Some(centered_message("◌", "Moving session…").into_any_element());
+            return Some(centered_message("◌", "Moving session…", colors).into_any_element());
         }
         if auto_resuming {
-            return Some(centered_message("◌", "Resuming conversation…").into_any_element());
+            return Some(
+                centered_message("◌", "Resuming conversation…", colors).into_any_element(),
+            );
         }
         if self
             .residents
@@ -2951,17 +2982,23 @@ impl TerminalPane {
         {
             return None;
         }
-        Some(self.render_exited_card(session, cx))
+        Some(self.render_exited_card(session, colors, cx))
     }
 
-    fn render_exited_card(&self, session: &SessionRecord, cx: &mut Context<Self>) -> AnyElement {
+    fn render_exited_card(
+        &self,
+        session: &SessionRecord,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let id = session.id.clone();
-        let content = centered_message("", &exit_description(session));
+        let content = centered_message("", &exit_description(session), colors);
         if session.resumability == Resumability::Resumable {
             content
                 .child(primary_button(
                     "resume-conversation",
                     "Resume Conversation",
+                    colors,
                     cx,
                     move |this, cx| {
                         this.runtime
@@ -2978,7 +3015,7 @@ impl TerminalPane {
                 .child(
                     div()
                         .text_size(px(11.5))
-                        .text_color(rgba(0xffffff4d))
+                        .text_color(colors.tertiary)
                         .child("Transcript is gone — start a fresh session in the same folder."),
                 )
                 .into_any_element()
@@ -2990,21 +3027,23 @@ impl TerminalPane {
     fn render_archived_overlay(
         &self,
         session: &SessionRecord,
+        colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = session.id.clone();
-        let mut content = centered_symbol_message("archivebox", 30.0, &session.title).child(
-            div()
-                .text_size(px(13.0))
-                .text_color(rgba(0xffffff99))
-                .child("Archived"),
-        );
+        let mut content = centered_symbol_message("archivebox", 30.0, &session.title, colors)
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .text_color(colors.secondary)
+                    .child("Archived"),
+            );
         if session.resumability == Resumability::NotResumable {
             content = content.child(
                 div()
                     .max_w(px(320.0))
                     .text_size(px(11.5))
-                    .text_color(rgba(0xffffff4d))
+                    .text_color(colors.tertiary)
                     .child(
                         "This session can't resume its conversation; revive restores it as ended.",
                     ),
@@ -3014,6 +3053,7 @@ impl TerminalPane {
             .child(primary_button(
                 "revive-session",
                 "Revive Session",
+                colors,
                 cx,
                 move |this, cx| {
                     this.runtime
@@ -3070,7 +3110,7 @@ impl TerminalPane {
                     .items_center()
                     .gap(px(8.0))
                     .px(px(8.0))
-                    .hover(|style| style.bg(rgba(0xffffff0f)))
+                    .hover(move |style| style.bg(colors.primary.alpha(0.06)))
                     .when(url.is_some(), |row| row.cursor_pointer())
                     .child(div().size(px(6.0)).rounded(px(3.0)).bg(color))
                     .child(
@@ -3079,7 +3119,7 @@ impl TerminalPane {
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_size(px(Typo::ROW.size))
-                            .text_color(rgba(0xffffffd9))
+                            .text_color(colors.primary)
                             .child(check.name),
                     )
                     .child(
@@ -3133,18 +3173,18 @@ impl TerminalPane {
                                         .py(px(8.0))
                                         .text_size(px(Typo::ROW_EMPHASIZED.size))
                                         .font_weight(Typo::ROW_EMPHASIZED.weight)
-                                        .text_color(rgba(0xffffffff))
+                                        .text_color(colors.primary)
                                         .child(headline),
                                 )
-                                .child(div().h(px(1.0)).bg(rgba(0xffffff14)))
+                                .child(div().h(px(1.0)).bg(colors.primary.alpha(0.08)))
                                 .child(div().max_h(px(246.0)).overflow_hidden().child(rows))
-                                .child(div().h(px(1.0)).bg(rgba(0xffffff14)))
+                                .child(div().h(px(1.0)).bg(colors.primary.alpha(0.08)))
                                 .child(
                                     div()
                                         .px(px(12.0))
                                         .py(px(7.0))
                                         .text_size(px(Typo::META.size))
-                                        .text_color(rgba(0xffffff99))
+                                        .text_color(colors.secondary)
                                         .child(footer),
                                 ),
                         )),
@@ -3180,13 +3220,13 @@ impl TerminalPane {
                     .gap(px(7.0))
                     .px(px(8.0))
                     .text_size(px(Typo::ROW.size))
-                    .text_color(rgba(0xffffffd9))
-                    .hover(|style| style.bg(rgba(0xffffff0f)))
+                    .text_color(colors.primary)
+                    .hover(move |style| style.bg(colors.primary.alpha(0.06)))
                     .cursor_pointer()
                     .child(sf_symbol(
                         chip.system_image,
                         11.0,
-                        tint.unwrap_or(rgba(0xffffff99)),
+                        tint.unwrap_or(colors.secondary),
                     ))
                     .child(div().min_w(px(0.0)).flex_1().truncate().child(chip.label))
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -3307,7 +3347,9 @@ impl Render for TerminalPane {
                 .rounded_tr(px(Radius::CARD))
                 .overflow_hidden()
                 .bg(theme.background)
-                .child(self.render_grid_and_overlays(&session, theme, font_size, window, cx));
+                .child(
+                    self.render_grid_and_overlays(&session, theme, colors, font_size, window, cx),
+                );
             pane = pane.child(terminal_surface);
             if let Some(find) = self.render_find_bar(&session, colors, cx) {
                 pane = pane.child(find);
@@ -3461,36 +3503,66 @@ fn finish_pointer_state(
     (owner, pending)
 }
 
-fn find_icon_button(
+#[derive(Clone, Copy)]
+struct FindButtonSpec {
     id: &'static str,
     system_image: &'static str,
+    label: &'static str,
+    shortcut: &'static str,
+}
+
+fn find_icon_button(
+    spec: FindButtonSpec,
+    colors: SemanticColors,
+    enabled: bool,
     cx: &mut Context<TerminalPane>,
     handler: impl Fn(&mut TerminalPane, &mut Window, &mut Context<TerminalPane>) + 'static,
 ) -> AnyElement {
     div()
-        .id(id)
-        .size(px(20.0))
-        .rounded(px(4.0))
+        .id(spec.id)
+        .size(px(28.0))
+        .rounded(px(Radius::CHIP))
         .flex()
         .items_center()
         .justify_center()
+        .role(Role::Button)
+        .aria_label(spec.label)
+        .aria_keyshortcuts(spec.shortcut)
+        .aria_description(if enabled {
+            "Activate this terminal find action"
+        } else {
+            "Unavailable because there are no matches"
+        })
         .text_size(px(11.0))
-        .text_color(rgba(0xffffff99))
-        .hover(|style| style.bg(rgba(0xffffff0f)))
-        .cursor_pointer()
+        .text_color(if enabled {
+            colors.secondary
+        } else {
+            colors.tertiary
+        })
+        .when(enabled, |button| {
+            button
+                .hover(move |style| style.bg(colors.primary.alpha(0.08)))
+                .active(move |style| style.bg(colors.primary.alpha(0.12)))
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, window, cx| handler(this, window, cx)))
+        })
         .child(sf_symbol_weighted(
-            system_image,
+            spec.system_image,
             11.0,
             SymbolWeight::Semibold,
-            rgba(0xffffff99),
+            if enabled {
+                colors.secondary
+            } else {
+                colors.tertiary
+            },
         ))
-        .on_click(cx.listener(move |this, _, window, cx| handler(this, window, cx)))
         .into_any_element()
 }
 
 fn primary_button(
     id: &'static str,
     label: &'static str,
+    colors: SemanticColors,
     cx: &mut Context<TerminalPane>,
     handler: impl Fn(&mut TerminalPane, &mut Context<TerminalPane>) + 'static,
 ) -> AnyElement {
@@ -3500,18 +3572,19 @@ fn primary_button(
         .rounded(px(7.0))
         .px(px(14.0))
         .py(px(7.0))
-        .bg(rgba(0xffffffeb))
+        .bg(colors.primary)
         .text_size(px(13.0))
         .font_weight(Typo::ROW_EMPHASIZED.weight)
-        .text_color(rgba(0x121318ff))
-        .hover(|style| style.bg(rgba(0xffffffff)))
+        .text_color(colors.background)
+        .hover(move |style| style.opacity(0.86))
+        .active(move |style| style.opacity(0.72))
         .cursor_pointer()
         .child(label)
         .on_click(cx.listener(move |this, _, _, cx| handler(this, cx)))
         .into_any_element()
 }
 
-fn centered_message(icon: &str, message: &str) -> gpui::Div {
+fn centered_message(icon: &str, message: &str, colors: SemanticColors) -> gpui::Div {
     div()
         .flex_1()
         .size_full()
@@ -3524,7 +3597,7 @@ fn centered_message(icon: &str, message: &str) -> gpui::Div {
             content.child(
                 div()
                     .text_size(px(30.0))
-                    .text_color(rgba(0xffffff4d))
+                    .text_color(colors.tertiary)
                     .child(icon.to_owned()),
             )
         })
@@ -3532,13 +3605,18 @@ fn centered_message(icon: &str, message: &str) -> gpui::Div {
             content.child(
                 div()
                     .text_size(px(13.0))
-                    .text_color(rgba(0xffffff99))
+                    .text_color(colors.secondary)
                     .child(message.to_owned()),
             )
         })
 }
 
-fn centered_symbol_message(system_image: &str, size: f32, message: &str) -> gpui::Div {
+fn centered_symbol_message(
+    system_image: &str,
+    size: f32,
+    message: &str,
+    colors: SemanticColors,
+) -> gpui::Div {
     div()
         .flex_1()
         .size_full()
@@ -3551,13 +3629,13 @@ fn centered_symbol_message(system_image: &str, size: f32, message: &str) -> gpui
             system_image,
             size,
             SymbolWeight::Regular,
-            rgba(0xffffff4d),
+            colors.tertiary,
         ))
         .when(!message.is_empty(), |content| {
             content.child(
                 div()
                     .text_size(px(13.0))
-                    .text_color(rgba(0xffffff99))
+                    .text_color(colors.secondary)
                     .child(message.to_owned()),
             )
         })
