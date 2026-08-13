@@ -642,7 +642,7 @@ impl Sidebar {
         if self.ui.peek.active().is_some() {
             return;
         }
-        self.ui.peek.clear_completion_guards();
+        self.ui.peek.begin_pointer_gesture();
         self.cancel_pending_pointer_peek();
         self.pending_pointer_peek = Some(id);
         let generation = self.peek_generation;
@@ -661,7 +661,7 @@ impl Sidebar {
         .detach();
     }
 
-    fn finish_pointer_gesture(&mut self, released_row: Option<&SessionId>, cx: &mut Context<Self>) {
+    fn finish_pointer_gesture(&mut self, cx: &mut Context<Self>) {
         let was_pointer_peek = self
             .ui
             .peek
@@ -669,23 +669,14 @@ impl Sidebar {
             .is_some_and(|peek| peek.source == PeekSource::Pointer);
         self.cancel_pending_pointer_peek();
         if self.ui.peek.end(Some(PeekSource::Pointer)) {
-            // GPUI follows mouse-up with Click/Drop. Those events belong to
-            // the completed hold and must not turn restoration into a commit.
-            self.ui
-                .peek
-                .suppress_pointer_completion(released_row.is_some(), was_pointer_peek);
+            // GPUI follows mouse-up with either Click or Drop. Whichever one
+            // arrives belongs to this completed hold and consumes the single
+            // completion guard.
+            if was_pointer_peek {
+                self.ui.peek.suppress_pointer_completion();
+            }
             self.emit_peek(cx);
         }
-    }
-
-    fn finish_pointer_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        let released_row = self
-            .row_bounds
-            .borrow()
-            .iter()
-            .find(|(_, bounds)| bounds.contains(&position))
-            .map(|(id, _)| id.clone());
-        self.finish_pointer_gesture(released_row.as_ref(), cx);
     }
 
     pub fn cancel_peek(&mut self, cx: &mut Context<Self>) -> bool {
@@ -699,7 +690,7 @@ impl Sidebar {
         self.ui.peek.release_space();
         if self.ui.peek.end(None) {
             if pointer_active {
-                self.ui.peek.suppress_pointer_completion(true, true);
+                self.ui.peek.suppress_pointer_completion();
             }
             self.emit_peek(cx);
             true
@@ -708,7 +699,7 @@ impl Sidebar {
                 // Escape owns the rest of a pending hold too. Without these
                 // guards, releasing the still-depressed pointer would turn a
                 // cancelled preview into an ordinary activating click.
-                self.ui.peek.suppress_pointer_completion(true, true);
+                self.ui.peek.suppress_pointer_completion();
                 cx.notify();
             }
             pending
@@ -721,6 +712,12 @@ impl Sidebar {
         let Some(peek) = self.ui.peek.take() else {
             return false;
         };
+        if peek.source == PeekSource::Pointer {
+            // Enter commits immediately, while the initiating pointer can
+            // still be depressed. Its eventual Click/Drop belongs to the old
+            // hold and must not select or move anything a second time.
+            self.ui.peek.suppress_pointer_completion();
+        }
         let exists = {
             let mut store = self.store.write().expect("session store lock poisoned");
             let exists = store.sessions().contains_key(&peek.id);
@@ -754,9 +751,9 @@ impl Sidebar {
             .active()
             .is_some_and(|peek| peek.source == PeekSource::Pointer);
         if pointer_active {
-            self.finish_pointer_gesture(None, cx);
+            self.finish_pointer_gesture(cx);
         }
-        if pointer_active || self.ui.peek.consume_pointer_drop() {
+        if pointer_active || self.ui.peek.consume_pointer_completion() {
             self.finish_drag();
             cx.notify();
             true
@@ -1825,7 +1822,7 @@ impl Sidebar {
             )
             .on_click(
                 cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                    if this.ui.peek.consume_pointer_click() {
+                    if this.ui.peek.consume_pointer_completion() {
                         cx.stop_propagation();
                         cx.notify();
                         return;
@@ -2379,7 +2376,7 @@ impl Sidebar {
                 }),
             )
             .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
-                if this.ui.peek.consume_pointer_click() {
+                if this.ui.peek.consume_pointer_completion() {
                     cx.stop_propagation();
                     cx.notify();
                     return;
@@ -4978,16 +4975,22 @@ impl Render for Sidebar {
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_key_up(cx.listener(Self::on_key_up))
-            .on_mouse_up(
+            .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
-                    this.finish_pointer_at(event.position, cx);
-                }),
+                cx.listener(|this, _, _, _| this.ui.peek.begin_pointer_gesture()),
             )
+            // Finish in capture phase, before GPUI synthesizes the row Click
+            // during bubbling. Otherwise a long hold released on its origin
+            // activates that row before the completion guard exists.
+            .capture_any_mouse_up(cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
+                if event.button == MouseButton::Left {
+                    this.finish_pointer_gesture(cx);
+                }
+            }))
             .on_mouse_up_out(
                 MouseButton::Left,
-                cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
-                    this.finish_pointer_at(event.position, cx);
+                cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| {
+                    this.finish_pointer_gesture(cx);
                     if this.ui.drag.is_some() {
                         this.finish_drag();
                         cx.notify();
@@ -5608,6 +5611,35 @@ mod tests {
         }
     }
 
+    struct PeekCommitHarness {
+        sidebar: Entity<Sidebar>,
+        activations: usize,
+    }
+
+    impl PeekCommitHarness {
+        fn new(cx: &mut Context<Self>) -> Self {
+            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+            cx.subscribe(&sidebar, |this, _, event, _| {
+                if matches!(event, SidebarEvent::SessionActivated) {
+                    this.activations += 1;
+                }
+            })
+            .detach();
+            Self {
+                sidebar,
+                activations: 0,
+            }
+        }
+    }
+
+    impl Render for PeekCommitHarness {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(div().h_full().w(px(248.0)).child(self.sidebar.clone()))
+        }
+    }
+
     #[test]
     fn long_paths_keep_final_component() {
         let result = clamp_path("/Users/preview/Projects/a/very/long/path/settings-kit");
@@ -6072,6 +6104,32 @@ mod tests {
             sidebar.read_with(cx, |sidebar, _| sidebar.ui.peek.target().cloned()),
             Some(targets[0].clone())
         );
+        cx.simulate_event(MouseUpEvent {
+            button: MouseButton::Left,
+            position: bounds[0].center(),
+            click_count: 1,
+            ..Default::default()
+        });
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(!sidebar.is_peeking());
+            assert_eq!(
+                sidebar
+                    .store
+                    .read()
+                    .expect("session store lock poisoned")
+                    .selected_session_id(),
+                Some(&active),
+                "release on the pressed row must restore, not synthesize activation"
+            );
+        });
+
+        cx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: bounds[0].center(),
+            ..Default::default()
+        });
+        cx.executor().advance_clock(SESSION_PEEK_DELAY);
+        cx.run_until_parked();
 
         sidebar.update(cx, |sidebar, cx| {
             sidebar.follow_peek(targets[1].clone(), PeekSource::Pointer, cx);
@@ -6117,6 +6175,124 @@ mod tests {
                 "peek must emit no MarkSeen, wake, residency, or input effect"
             );
         });
+    }
+
+    #[gpui::test]
+    fn pointer_enter_commit_consumes_the_original_click_once(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| PeekCommitHarness::new(cx));
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        sidebar.update_in(cx, |sidebar, window, cx| sidebar.focus(window, cx));
+        sidebar.update(cx, |sidebar, _| {
+            let effects = sidebar
+                ._preview_effects
+                .as_mut()
+                .expect("preview effect queue");
+            while effects.try_recv().is_ok() {}
+        });
+        let (active, targets) = sidebar.read_with(cx, |sidebar, _| {
+            let store = sidebar.store.read().expect("session store lock poisoned");
+            let active = store
+                .selected_session_id()
+                .cloned()
+                .expect("preview selection");
+            let targets = sidebar
+                .row_bounds
+                .borrow()
+                .keys()
+                .filter(|id| *id != &active)
+                .filter(|id| {
+                    store.sessions().get(*id).is_some_and(|session| {
+                        !session.is_archived() && session.hibernation.is_none()
+                    })
+                })
+                .take(2)
+                .cloned()
+                .collect::<Vec<_>>();
+            (active, targets)
+        });
+        assert_eq!(targets.len(), 2, "fixture needs two live commit targets");
+        let committed = targets[0].clone();
+        let original_press = targets[1].clone();
+        let original_bounds = sidebar.read_with(cx, |sidebar, _| {
+            sidebar.row_bounds.borrow()[&original_press]
+        });
+
+        // The pointer went down on C, then the held preview scrubbed to B.
+        // Enter commits B while C still owns GPUI's pending Click.
+        cx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: original_bounds.center(),
+            ..Default::default()
+        });
+        cx.executor().advance_clock(SESSION_PEEK_DELAY);
+        cx.run_until_parked();
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.follow_peek(committed.clone(), PeekSource::Pointer, cx);
+            assert_eq!(sidebar.ui.peek.target(), Some(&committed));
+        });
+        cx.simulate_event(KeyDownEvent {
+            keystroke: Keystroke::parse("enter").expect("keystroke"),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        cx.run_until_parked();
+
+        // Releasing over C synthesizes C's Click. It belongs to the original
+        // hold and must not overwrite B or emit a second activation.
+        cx.simulate_event(MouseUpEvent {
+            button: MouseButton::Left,
+            position: original_bounds.center(),
+            click_count: 1,
+            ..Default::default()
+        });
+        cx.run_until_parked();
+
+        let effects = sidebar.update(cx, |sidebar, _| {
+            let effects = sidebar
+                ._preview_effects
+                .as_mut()
+                .expect("preview effect queue");
+            let mut drained = Vec::new();
+            while let Ok(effect) = effects.try_recv() {
+                drained.push(effect);
+            }
+            drained
+        });
+        view.read_with(cx, |harness, _| assert_eq!(harness.activations, 1));
+        sidebar.read_with(cx, |sidebar, _| {
+            let store = sidebar.store.read().expect("session store lock poisoned");
+            assert_eq!(store.selected_session_id(), Some(&committed));
+            assert_eq!(
+                store
+                    .terminal_residency()
+                    .resident()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                vec![committed.clone()]
+            );
+        });
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, StoreEffect::MarkSeen(id) if id == &committed))
+                .count(),
+            1
+        );
+        assert_eq!(
+            effects
+                .iter()
+                .filter(
+                    |effect| matches!(effect, StoreEffect::DetachAttachment(id) if id == &active)
+                )
+                .count(),
+            1
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, StoreEffect::MarkSeen(id) if id == &original_press)),
+            "the pointer's stale Click activated its original row"
+        );
     }
 
     #[gpui::test]

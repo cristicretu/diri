@@ -38,8 +38,11 @@ pub struct SessionPeek {
 pub struct PeekState {
     active: Option<SessionPeek>,
     space_held: bool,
-    suppress_pointer_click: bool,
-    suppress_pointer_drop: bool,
+    /// A held peek can finish as either a GPUI `Click` or `Drop`. They are
+    /// mutually exclusive terminal events for one pointer gesture, so the
+    /// first one must consume the whole guard rather than leaving its sibling
+    /// armed for an unrelated gesture.
+    suppress_pointer_completion: bool,
 }
 
 impl PeekState {
@@ -96,30 +99,24 @@ impl PeekState {
         std::mem::take(&mut self.space_held)
     }
 
-    pub fn suppress_pointer_completion(&mut self, click: bool, drop: bool) {
-        self.suppress_pointer_click = click;
-        self.suppress_pointer_drop = drop;
+    pub fn suppress_pointer_completion(&mut self) {
+        self.suppress_pointer_completion = true;
     }
 
-    pub fn consume_pointer_click(&mut self) -> bool {
-        std::mem::take(&mut self.suppress_pointer_click)
+    pub fn begin_pointer_gesture(&mut self) {
+        self.suppress_pointer_completion = false;
+    }
+
+    pub fn consume_pointer_completion(&mut self) -> bool {
+        std::mem::take(&mut self.suppress_pointer_completion)
     }
 
     pub fn guards_pointer_drop(&self) -> bool {
-        self.suppress_pointer_drop
+        self.suppress_pointer_completion
             || self
                 .active
                 .as_ref()
                 .is_some_and(|peek| peek.source == PeekSource::Pointer)
-    }
-
-    pub fn consume_pointer_drop(&mut self) -> bool {
-        std::mem::take(&mut self.suppress_pointer_drop)
-    }
-
-    pub fn clear_completion_guards(&mut self) {
-        self.suppress_pointer_click = false;
-        self.suppress_pointer_drop = false;
     }
 }
 
@@ -468,13 +465,18 @@ mod tests {
     }
 
     #[test]
-    fn pointer_completion_guards_are_one_shot() {
+    fn pointer_completion_is_mutually_exclusive_and_new_gestures_start_clean() {
         let mut peek = PeekState::default();
-        peek.suppress_pointer_completion(true, true);
+        peek.suppress_pointer_completion();
 
-        assert!(peek.consume_pointer_click());
-        assert!(!peek.consume_pointer_click());
-        assert!(peek.consume_pointer_drop());
-        assert!(!peek.consume_pointer_drop());
+        assert!(peek.guards_pointer_drop());
+        assert!(peek.consume_pointer_completion());
+        assert!(!peek.consume_pointer_completion());
+        assert!(!peek.guards_pointer_drop());
+
+        peek.suppress_pointer_completion();
+        peek.begin_pointer_gesture();
+        assert!(!peek.consume_pointer_completion());
+        assert!(!peek.guards_pointer_drop());
     }
 }
