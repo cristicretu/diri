@@ -129,12 +129,27 @@ impl Frame {
 
     #[must_use]
     pub fn modes(alt_screen: bool, mouse: MouseModes) -> Self {
+        Self::modes_with_bracketed_paste(alt_screen, false, mouse)
+    }
+
+    /// Builds the additive terminal-mode payload. [`Self::modes`] remains the
+    /// source-compatible constructor for peers that only know screen and
+    /// mouse state.
+    #[must_use]
+    pub fn modes_with_bracketed_paste(
+        alt_screen: bool,
+        bracketed_paste: bool,
+        mouse: MouseModes,
+    ) -> Self {
         // Bit 1 stays the historical "any mouse reporting" flag so older
         // clients continue to route the pointer to the terminal. Granular
-        // tracking and encoding live in previously unused bits.
+        // tracking, encoding, and bracketed paste live in previously unused
+        // bits. Old clients ignore bit 5; new clients decode it as false from
+        // every frame emitted before this extension.
         let bits = u8::from(alt_screen)
             | (u8::from(mouse.is_reporting()) << 1)
-            | (mouse.detail_bits() << 2);
+            | (mouse.detail_bits() << 2)
+            | (u8::from(bracketed_paste) << 5);
         Self::new(FrameType::Modes, vec![bits])
     }
 
@@ -191,12 +206,21 @@ impl Frame {
 
     #[must_use]
     pub fn modes_payload(&self) -> Option<(bool, MouseModes)> {
+        self.terminal_modes_payload()
+            .map(|(alt_screen, _, mouse)| (alt_screen, mouse))
+    }
+
+    /// Decodes all currently defined mode bits. [`Self::modes_payload`]
+    /// retains its original two-field API for existing consumers.
+    #[must_use]
+    pub fn terminal_modes_payload(&self) -> Option<(bool, bool, MouseModes)> {
         if self.frame_type != FrameType::Modes {
             return None;
         }
         self.payload.first().map(|bits| {
             (
                 bits & 1 != 0,
+                bits & (1 << 5) != 0,
                 MouseModes::from_detail_bits(bits >> 2, bits & 2 != 0),
             )
         })
@@ -384,31 +408,43 @@ mod tests {
         assert_eq!(scroll.scroll_payload(), Some((1, 0x0203, 0x0405, 0x0607)));
 
         for alt_screen in [false, true] {
-            for mouse in [
-                MouseModes::OFF,
-                MouseModes::UNKNOWN,
-                MouseModes::new(
-                    crate::terminal::MouseTrackingMode::Off,
-                    crate::terminal::MouseEncoding::Sgr,
-                ),
-                MouseModes::new(
-                    crate::terminal::MouseTrackingMode::ButtonEvents,
-                    crate::terminal::MouseEncoding::Legacy,
-                ),
-                MouseModes::new(
-                    crate::terminal::MouseTrackingMode::ButtonMotion,
-                    crate::terminal::MouseEncoding::Sgr,
-                ),
-                MouseModes::new(
-                    crate::terminal::MouseTrackingMode::AnyMotion,
-                    crate::terminal::MouseEncoding::Sgr,
-                ),
-            ] {
-                let modes = Frame::modes(alt_screen, mouse);
-                assert_eq!(modes.modes_payload(), Some((alt_screen, mouse)));
-                assert_eq!(modes.payload[0] & 0b10 != 0, mouse.is_reporting());
+            for bracketed_paste in [false, true] {
+                for mouse in [
+                    MouseModes::OFF,
+                    MouseModes::UNKNOWN,
+                    MouseModes::new(
+                        crate::terminal::MouseTrackingMode::Off,
+                        crate::terminal::MouseEncoding::Sgr,
+                    ),
+                    MouseModes::new(
+                        crate::terminal::MouseTrackingMode::ButtonEvents,
+                        crate::terminal::MouseEncoding::Legacy,
+                    ),
+                    MouseModes::new(
+                        crate::terminal::MouseTrackingMode::ButtonMotion,
+                        crate::terminal::MouseEncoding::Sgr,
+                    ),
+                    MouseModes::new(
+                        crate::terminal::MouseTrackingMode::AnyMotion,
+                        crate::terminal::MouseEncoding::Sgr,
+                    ),
+                ] {
+                    let modes =
+                        Frame::modes_with_bracketed_paste(alt_screen, bracketed_paste, mouse);
+                    assert_eq!(
+                        modes.terminal_modes_payload(),
+                        Some((alt_screen, bracketed_paste, mouse))
+                    );
+                    assert_eq!(modes.modes_payload(), Some((alt_screen, mouse)));
+                    assert_eq!(modes.payload[0] & 0b10 != 0, mouse.is_reporting());
+                    assert_eq!(modes.payload[0] & 0b10_0000 != 0, bracketed_paste);
+                }
             }
         }
+        assert_eq!(
+            Frame::modes(true, MouseModes::OFF).terminal_modes_payload(),
+            Some((true, false, MouseModes::OFF))
+        );
         assert_eq!(Frame::ping().payload, Vec::<u8>::new());
         assert_eq!(Frame::pong().payload, Vec::<u8>::new());
         assert_eq!(Frame::input(b"input".to_vec()).payload, b"input");
@@ -418,8 +454,8 @@ mod tests {
     #[test]
     fn modes_decode_the_historical_boolean_wire_format() {
         assert_eq!(
-            Frame::new(FrameType::Modes, vec![0b11]).modes_payload(),
-            Some((true, MouseModes::UNKNOWN))
+            Frame::new(FrameType::Modes, vec![0b11]).terminal_modes_payload(),
+            Some((true, false, MouseModes::UNKNOWN))
         );
     }
 
@@ -503,6 +539,10 @@ mod tests {
         );
         assert_eq!(
             Frame::new(FrameType::Modes, Vec::new()).modes_payload(),
+            None
+        );
+        assert_eq!(
+            Frame::new(FrameType::Modes, Vec::new()).terminal_modes_payload(),
             None
         );
         assert_eq!(

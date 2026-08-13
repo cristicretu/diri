@@ -33,7 +33,11 @@ const CHUNK_QUEUE_CAPACITY: usize = 256;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalChunk {
     Grid(GridUpdate),
-    Modes { alt_screen: bool, mouse: MouseModes },
+    Modes {
+        alt_screen: bool,
+        bracketed_paste: bool,
+        mouse: MouseModes,
+    },
     Pong,
 }
 
@@ -321,9 +325,13 @@ async fn process_incoming(
                 .map_err(|_| ())?;
         }
         FrameType::Modes => {
-            let (alt_screen, mouse) = frame.modes_payload().ok_or(())?;
+            let (alt_screen, bracketed_paste, mouse) = frame.terminal_modes_payload().ok_or(())?;
             chunks
-                .send(TerminalChunk::Modes { alt_screen, mouse })
+                .send(TerminalChunk::Modes {
+                    alt_screen,
+                    bracketed_paste,
+                    mouse,
+                })
                 .await
                 .map_err(|_| ())?;
         }
@@ -350,12 +358,14 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use diri_proto::control::{ControlMessage, decode_line, encode_line};
+    use diri_proto::frames::Frame;
     use diri_proto::grid::GridCell;
     use diri_proto::methods::{
         HelloParams, HelloResult, Method, SessionIdParams, SessionSpawnParams,
     };
     use diri_proto::model::{AgentKind, SessionId, SessionRecord};
     use diri_proto::paths::{DirijorEnv, DirijorPaths};
+    use diri_proto::terminal::{MouseEncoding, MouseModes, MouseTrackingMode};
     use serde::Serialize;
     use serde::de::DeserializeOwned;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -363,7 +373,31 @@ mod tests {
     use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
     use tokio::time::timeout;
 
-    use super::{SessionAttachment, TerminalChunk};
+    use super::{SessionAttachment, TerminalChunk, process_incoming};
+
+    #[tokio::test]
+    async fn mode_frames_keep_bracketed_paste_state() {
+        let (mut stream, _peer) = UnixStream::pair().expect("unix stream pair");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mouse = MouseModes::new(MouseTrackingMode::ButtonMotion, MouseEncoding::Sgr);
+
+        process_incoming(
+            Frame::modes_with_bracketed_paste(true, true, mouse),
+            &mut stream,
+            &tx,
+        )
+        .await
+        .expect("valid modes frame");
+
+        assert_eq!(
+            rx.recv().await,
+            Some(TerminalChunk::Modes {
+                alt_screen: true,
+                bracketed_paste: true,
+                mouse,
+            })
+        );
+    }
 
     struct TestControl {
         reader: BufReader<OwnedReadHalf>,

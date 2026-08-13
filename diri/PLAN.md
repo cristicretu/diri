@@ -109,7 +109,7 @@ Everything below is verified against the Swift source; cite these files in code 
 
 **Transport** — one unix socket, role decided by the first line of each connection (`ConnectionHub.swift:223`):
 - Control channel: newline-delimited JSON `ControlMessage` — `request{id,method,params}` / `response{id,ok|err{code,message}}` / `event{event,seq,params}`. Max line 4 MiB.
-- Data channel: first line is NDJSON `AttachRequest{attach: <sessionID>, fromOffset?, token?, role}`, then binary frames both ways: `[type u8][len u32 BE][payload]`, max 16 MiB. Types: `input=2`, `resize=3` (cols u16 + rows u16 BE), `ping=6`/`pong=7`, `grid=8`, `scroll=9` (dir u8, lines u16, col u16, row u16 BE), `modes=10` (bit0 altScreen, bit1 historical any-mouse compatibility, bits2–3 mouse tracking off/1000/1002/1003, bit4 legacy/SGR encoding), `mouse=11` (pre-encoded report bytes on the raw interactive path). Types 1/4/5 are legacy byte-replay — ignore.
+- Data channel: first line is NDJSON `AttachRequest{attach: <sessionID>, fromOffset?, token?, role}`, then binary frames both ways: `[type u8][len u32 BE][payload]`, max 16 MiB. Types: `input=2`, `resize=3` (cols u16 + rows u16 BE), `ping=6`/`pong=7`, `grid=8`, `scroll=9` (dir u8, lines u16, col u16, row u16 BE), `modes=10` (bit0 altScreen, bit1 historical any-mouse compatibility, bits2–3 mouse tracking off/1000/1002/1003, bit4 legacy/SGR encoding, bit5 bracketed paste), `mouse=11` (pre-encoded report bytes on the raw interactive path). Types 1/4/5 are legacy byte-replay — ignore.
 - Port-forward channel exists (`ForwardRequest`) — v1 skip.
 
 **Grid codec** (`Grid.swift:100-234`) — must match bit-for-bit, big-endian throughout:

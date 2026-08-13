@@ -353,6 +353,22 @@ enum AttachmentState {
     Reconnecting,
 }
 
+/// A reconnect has no trustworthy child modes until its fresh seed arrives.
+/// Keeping bracketed paste across that gap can send control framing to a shell
+/// that never requested it, so every non-live transition returns to the wire
+/// protocol's backward-compatible raw-paste default.
+fn bracketed_paste_after_attachment_state(current: bool, state: AttachmentState) -> bool {
+    if state == AttachmentState::Live {
+        current
+    } else {
+        false
+    }
+}
+
+fn terminal_paste(text: &str, bracketed_paste: bool) -> Vec<u8> {
+    paste(text, bracketed_paste)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PointerOwner {
     LocalSelection,
@@ -621,6 +637,9 @@ struct ResidentTerminal {
     /// predecessor was detached.
     attachment_generation: AttachmentGeneration,
     attachment_state: AttachmentState,
+    /// Last mode advertised by this attachment generation. Reset while the
+    /// transport is not live so paste never trusts state from a dead child.
+    bracketed_paste: bool,
     find: Option<TerminalFindModel>,
     /// The editable text behind `find`'s query, so ⌘F gets the same caret,
     /// selection, and readline keys as the other query fields.
@@ -937,6 +956,7 @@ impl TerminalPane {
                     attachment,
                     attachment_generation: generation,
                     attachment_state: AttachmentState::Attaching,
+                    bracketed_paste: false,
                     find: None,
                     find_query: QueryEditor::default(),
                     last_size: (0, 0),
@@ -1093,6 +1113,8 @@ impl TerminalPane {
                     return;
                 }
                 if let Some(resident) = self.residents.get_mut(&id) {
+                    resident.bracketed_paste =
+                        bracketed_paste_after_attachment_state(resident.bracketed_paste, state);
                     if resident.attachment_state != state {
                         resident.pointer_owner = None;
                         resident.mouse_motion.reset();
@@ -1133,7 +1155,15 @@ impl TerminalPane {
                 }
                 self.apply_grid_updates(id, updates, window, cx);
             }
-            PaneEvent::Chunk(id, generation, TerminalChunk::Modes { alt_screen, mouse }) => {
+            PaneEvent::Chunk(
+                id,
+                generation,
+                TerminalChunk::Modes {
+                    alt_screen,
+                    bracketed_paste,
+                    mouse,
+                },
+            ) => {
                 if !self.attachment_is_current(&id, generation) {
                     return;
                 }
@@ -1142,6 +1172,7 @@ impl TerminalPane {
                         resident.pointer_owner = None;
                         resident.mouse_motion.reset();
                     }
+                    resident.bracketed_paste = bracketed_paste;
                     resident.element.set_modes(alt_screen, mouse);
                 }
                 if self.selected_id().as_ref() == Some(&id) {
@@ -1185,7 +1216,9 @@ impl TerminalPane {
             PaneEvent::ClipboardUploadFinished(id, result) => match result {
                 Ok(remote_path) => {
                     if let Some(resident) = self.residents.get(&id) {
-                        resident.attachment.input(paste(&remote_path, false));
+                        resident
+                            .attachment
+                            .input(terminal_paste(&remote_path, resident.bracketed_paste));
                     }
                 }
                 Err(error) => eprintln!("diri: clipboard image upload failed: {error}"),
@@ -1817,7 +1850,9 @@ impl TerminalPane {
             } else {
                 let local_path = staged.path().to_string_lossy().into_owned();
                 if let Some(resident) = self.residents.get(&id) {
-                    resident.attachment.input(paste(&local_path, false));
+                    resident
+                        .attachment
+                        .input(terminal_paste(&local_path, resident.bracketed_paste));
                 }
                 self.local_clipboard_images.push(staged);
                 if self.local_clipboard_images.len() > 32 {
@@ -1842,7 +1877,9 @@ impl TerminalPane {
             find.set_query(query, now);
             self.schedule_find(id, Duration::from_millis(200), window, cx);
         } else {
-            resident.attachment.input(paste(&text, false));
+            resident
+                .attachment
+                .input(terminal_paste(&text, resident.bracketed_paste));
         }
         cx.stop_propagation();
         cx.notify();
@@ -4759,6 +4796,33 @@ mod tests {
         assert_eq!(bytes, b"clipboard png");
         assert_eq!(extension, "png");
         assert_eq!(item.text(), None);
+    }
+
+    #[test]
+    fn clipboard_paste_respects_the_childs_bracketed_paste_mode() {
+        let text = "first command\nsecond command";
+
+        assert_eq!(terminal_paste(text, false), text.as_bytes());
+        assert_eq!(
+            terminal_paste(text, true),
+            b"\x1b[200~first command\nsecond command\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn reattachment_drops_stale_bracketed_paste_until_fresh_modes_arrive() {
+        assert!(bracketed_paste_after_attachment_state(
+            true,
+            AttachmentState::Live
+        ));
+        assert!(!bracketed_paste_after_attachment_state(
+            true,
+            AttachmentState::Reconnecting
+        ));
+        assert!(!bracketed_paste_after_attachment_state(
+            true,
+            AttachmentState::Attaching
+        ));
     }
 
     #[test]

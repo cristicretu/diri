@@ -407,7 +407,7 @@ fn grid_wake_event(state: &GridWakeState, observed: u64) -> GridWakeEvent {
 
 pub(crate) struct AttachmentSeed {
     pub grid: diri_proto::grid::GridUpdate,
-    pub modes: (bool, MouseModes),
+    pub modes: (bool, bool, MouseModes),
     pub signature: GridSignature,
     pub wake: GridWake,
     pub wake_generation: u64,
@@ -1126,10 +1126,10 @@ impl Session {
                     let grid = remote.mirror.full_update()?;
                     let (cols, rows) = remote.mirror.size();
                     let (cursor_col, cursor_row, cursor_visible) = remote.mirror.cursor();
-                    let (alt_screen, _, mouse) = remote.mirror.modes();
+                    let (alt_screen, bracketed_paste, mouse) = remote.mirror.modes();
                     Some((
                         grid,
-                        (alt_screen, mouse),
+                        (alt_screen, bracketed_paste, mouse),
                         GridSignature {
                             content_seq: remote.revision,
                             size: (usize::from(cols), usize::from(rows)),
@@ -1144,7 +1144,11 @@ impl Session {
                 let screen = self.shared.screen.lock().expect("screen");
                 (
                     screen.full_snapshot(),
-                    (screen.is_alt_screen(), screen.mouse_modes()),
+                    (
+                        screen.is_alt_screen(),
+                        screen.bracketed_paste(),
+                        screen.mouse_modes(),
+                    ),
                     GridSignature {
                         content_seq: screen.content_seq(),
                         size: screen.size(),
@@ -1234,8 +1238,8 @@ impl Session {
         self.shared.screen.lock().expect("screen").bracketed_paste()
     }
 
-    /// Current alternate-screen and granular mouse modes.
-    pub fn modes(&self) -> (bool, MouseModes) {
+    /// Current alternate-screen, bracketed-paste, and granular mouse modes.
+    pub fn modes(&self) -> (bool, bool, MouseModes) {
         if let Some(remote) = self
             .shared
             .remote_grid
@@ -1244,11 +1248,14 @@ impl Session {
             .as_ref()
             && remote.mirror.sequence().is_some()
         {
-            let (alt_screen, _, mouse) = remote.mirror.modes();
-            return (alt_screen, mouse);
+            return remote.mirror.modes();
         }
         let screen = self.shared.screen.lock().expect("screen");
-        (screen.is_alt_screen(), screen.mouse_modes())
+        (
+            screen.is_alt_screen(),
+            screen.bracketed_paste(),
+            screen.mouse_modes(),
+        )
     }
 
     /// A wheel event from an attached client: forwarded to the child when it
