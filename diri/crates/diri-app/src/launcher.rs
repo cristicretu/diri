@@ -12,7 +12,7 @@ use diri_ui::{
 };
 use gpui::{
     AnyElement, App, Context, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle,
-    KeyDownEvent, MouseButton, PathPromptOptions, Render, Task, Window, div, prelude::*, px,
+    KeyDownEvent, MouseButton, PathPromptOptions, Render, Task, Window, div, prelude::*, px, rgba,
 };
 
 use crate::AppServices;
