@@ -880,7 +880,10 @@ mod tests {
             .find(|action| action.id == "new-default")
             .expect("default action");
         assert_eq!(default.title, "New Saved Agent on Forge");
-        assert_eq!(default.shortcut.as_deref(), Some("⌘T"));
+        assert_eq!(
+            default.shortcut,
+            commands::command(CommandId::NewDefaultSession).shortcut_label()
+        );
         assert_eq!(
             default.command,
             PaletteCommand::Action(CommandId::NewDefaultSession)
@@ -913,7 +916,10 @@ mod tests {
             .find(|action| action.id == "new-default")
             .expect("default action");
         assert_eq!(default.title, "New Codex Session");
-        assert_eq!(default.shortcut.as_deref(), Some("⌘T"));
+        assert_eq!(
+            default.shortcut,
+            commands::command(CommandId::NewDefaultSession).shortcut_label()
+        );
     }
 
     #[test]
