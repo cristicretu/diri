@@ -443,7 +443,11 @@ fn a_spawned_session_records_its_parent_and_appears_as_a_child() {
             "id": "sleeper",
             "version": "1",
             "statusModel": "processOnly",
-            "agent": { "binary": "/bin/cat", "statusAuthority": "process" },
+            "agent": {
+                "binary": "/bin/sh",
+                "spawnArgs": ["-c", "stty -echo; printf '\\033[?2004h> '; exec cat"],
+                "statusAuthority": "process"
+            },
             "rules": []
         }"#,
     )
@@ -472,9 +476,9 @@ fn a_spawned_session_records_its_parent_and_appears_as_a_child() {
     let id = spawned["id"].as_str().expect("an id").to_string();
     assert!(id.starts_with("s_"));
     assert_eq!(spawned["parent"], "s_parent");
-    assert_eq!(
-        spawned["pendingPrompt"], "do the thing",
-        "the prompt is returned rather than typed into a terminal that is still starting"
+    assert!(
+        spawned.get("pendingPrompt").is_none(),
+        "a successful spawn has already delivered its prompt"
     );
 
     let children = call(&server, "list_children", json!({})).expect("children");

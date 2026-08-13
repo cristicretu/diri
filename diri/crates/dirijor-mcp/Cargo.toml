@@ -22,4 +22,5 @@ serde_json.workspace = true
 libc = "0.2"
 
 [dev-dependencies]
+diri-engine.workspace = true
 tempfile.workspace = true

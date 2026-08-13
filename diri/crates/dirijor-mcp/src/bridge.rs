@@ -13,6 +13,11 @@ use crate::control::{ControlClient, ControlFailure, default_socket_path};
 use crate::tools::{ToolDefinition, tool_definitions_for};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(3);
+// The Engine may wait through a first-run trust/login wall before it can
+// confirm an initial prompt. Keep the MCP request alive longer than the
+// Engine's bounded delivery window so callers receive its delivery result,
+// rather than a client-side timeout while the session continues in limbo.
+const SPAWN_TIMEOUT: Duration = Duration::from_secs(300);
 const WRITE_POLICY: &str = "Reads are open across all sessions. Writes to your parent or direct children are delivered verbatim; writes to anyone else are attributed to you. You cannot send_prompt to yourself, and release_agent refuses to kill you or any ancestor.";
 
 #[derive(Clone, Debug)]
@@ -125,7 +130,7 @@ impl Bridge {
             same_repo_as: None,
         };
         let params = serde_json::to_value(params).map_err(|error| error.to_string())?;
-        self.request(Method::SESSION_SPAWN, params, Duration::from_secs(60))
+        self.request(Method::SESSION_SPAWN, params, SPAWN_TIMEOUT)
     }
 
     fn list_agents(&self) -> Result<Value, String> {

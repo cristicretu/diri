@@ -1637,6 +1637,7 @@ version = "0.1.0"
 name = "dirijor-mcp"
 version = "0.1.0"
 dependencies = [
+ "diri-engine",
  "diri-proto",
  "libc",
  "serde",

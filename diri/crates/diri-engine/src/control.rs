@@ -868,24 +868,29 @@ impl ControlServer {
         // raced Claude Code's boot and lost keystrokes into a composer that
         // did not exist yet.
         let prompt = p.initial_prompt.clone().filter(|prompt| !prompt.is_empty());
-        if kind == diri_proto::AgentKind::CLAUDE_CODE_ID || prompt.is_some() {
-            let registry = Arc::clone(&self.registry);
-            let session_id = id.clone();
-            std::thread::spawn(move || {
-                prepare_agent_input(
-                    &registry,
-                    &session_id,
-                    kind == diri_proto::AgentKind::CLAUDE_CODE_ID,
-                    prompt.as_deref(),
-                );
-            });
-        }
-
+        let accept_claude_workspace = kind == diri_proto::AgentKind::CLAUDE_CODE_ID;
         let record = registry
             .records()
             .into_iter()
             .find(|record| record.id.0 == id)
             .ok_or_else(|| ControlError::internal("the new session vanished"))?;
+        drop(registry);
+
+        // A supplied prompt is part of the spawn contract: do not acknowledge
+        // the request until delivery is confirmed. With no prompt, Claude's
+        // workspace-trust convenience remains background work so an ordinary
+        // launch still returns as soon as its session exists.
+        if let Some(prompt) = prompt {
+            prepare_agent_input(&self.registry, &id, accept_claude_workspace, Some(&prompt))
+                .map_err(|error| initial_prompt_control_error(&id, error))?;
+        } else if accept_claude_workspace {
+            let registry = Arc::clone(&self.registry);
+            let session_id = id.clone();
+            std::thread::spawn(move || {
+                let _ = prepare_agent_input(&registry, &session_id, true, None);
+            });
+        }
+
         // SessionSpawnResult is the record itself, as the Swift daemon
         // answers — not wrapped.
         serde_json::to_value(&record).map_err(|error| ControlError::internal(error.to_string()))
@@ -1076,23 +1081,24 @@ impl ControlServer {
         self.publish_updated(&registry, &id);
 
         let prompt = p.initial_prompt.filter(|prompt| !prompt.is_empty());
-        if kind == diri_proto::AgentKind::CLAUDE_CODE_ID || prompt.is_some() {
-            let registry = Arc::clone(&self.registry);
-            let session_id = id.clone();
-            std::thread::spawn(move || {
-                prepare_agent_input(
-                    &registry,
-                    &session_id,
-                    kind == diri_proto::AgentKind::CLAUDE_CODE_ID,
-                    prompt.as_deref(),
-                );
-            });
-        }
+        let accept_claude_workspace = kind == diri_proto::AgentKind::CLAUDE_CODE_ID;
         let record = registry
             .records()
             .into_iter()
             .find(|record| record.id.0 == id)
             .ok_or_else(|| ControlError::internal("the new remote session vanished"))?;
+        drop(registry);
+
+        if let Some(prompt) = prompt {
+            prepare_agent_input(&self.registry, &id, accept_claude_workspace, Some(&prompt))
+                .map_err(|error| initial_prompt_control_error(&id, error))?;
+        } else if accept_claude_workspace {
+            let registry = Arc::clone(&self.registry);
+            let session_id = id.clone();
+            std::thread::spawn(move || {
+                let _ = prepare_agent_input(&registry, &session_id, true, None);
+            });
+        }
         serde_json::to_value(&record).map_err(|error| ControlError::internal(error.to_string()))
     }
 
@@ -1966,16 +1972,15 @@ impl ControlServer {
             .find(|record| record.id.0 == id)
             .ok_or_else(|| ControlError::internal("the resumed session vanished"))?;
         drop(registry);
-        if kind == diri_proto::AgentKind::CLAUDE_CODE_ID || prompt.is_some() {
+        let accept_claude_workspace = kind == diri_proto::AgentKind::CLAUDE_CODE_ID;
+        if let Some(prompt) = prompt {
+            prepare_agent_input(&self.registry, &id, accept_claude_workspace, Some(&prompt))
+                .map_err(|error| initial_prompt_control_error(&id, error))?;
+        } else if accept_claude_workspace {
             let registry = Arc::clone(&self.registry);
             let session_id = id.clone();
             std::thread::spawn(move || {
-                prepare_agent_input(
-                    &registry,
-                    &session_id,
-                    kind == diri_proto::AgentKind::CLAUDE_CODE_ID,
-                    prompt.as_deref(),
-                );
+                let _ = prepare_agent_input(&registry, &session_id, true, None);
             });
         }
         serde_json::to_value(&record).map_err(|error| ControlError::internal(error.to_string()))
@@ -2834,13 +2839,52 @@ fn prepare_agent_input(
     session_id: &str,
     accept_claude_workspace: bool,
     prompt: Option<&str>,
-) {
+) -> Result<(), InitialPromptFailure> {
     if accept_claude_workspace {
         accept_claude_workspace_trust(registry, session_id);
     }
     if let Some(prompt) = prompt {
-        inject_initial_prompt(registry, session_id, prompt);
+        inject_initial_prompt(registry, session_id, prompt)?;
     }
+    Ok(())
+}
+
+pub(crate) fn prepare_agent_input_for_spawn(
+    registry: &Arc<Mutex<Registry>>,
+    session_id: &str,
+    accept_claude_workspace: bool,
+    prompt: Option<&str>,
+) -> Result<(), String> {
+    prepare_agent_input(registry, session_id, accept_claude_workspace, prompt)
+        .map_err(|failure| failure.to_string())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum InitialPromptFailure {
+    SessionEnded,
+    TimedOut,
+    SubmissionUnconfirmed,
+}
+
+impl std::fmt::Display for InitialPromptFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SessionEnded => formatter.write_str("the session ended before accepting it"),
+            Self::TimedOut => formatter.write_str("the agent did not accept it before the timeout"),
+            Self::SubmissionUnconfirmed => {
+                formatter.write_str("the agent never confirmed that it submitted")
+            }
+        }
+    }
+}
+
+fn initial_prompt_control_error(session_id: &str, failure: InitialPromptFailure) -> ControlError {
+    ControlError::new(
+        "initial_prompt_delivery_failed",
+        format!(
+            "session {session_id} was created, but its initial prompt was not delivered: {failure}"
+        ),
+    )
 }
 
 /// Answers Claude Code's "do you trust this folder?" picker on the user's
@@ -2916,28 +2960,31 @@ fn is_claude_workspace_trust_screen(screen: &str) -> bool {
 /// one that lands. Nothing here consults the session's status — Codex reads
 /// as `Working` even at an idle composer, so the echo is the only tell worth
 /// trusting.
-fn inject_initial_prompt(registry: &Arc<Mutex<Registry>>, session_id: &str, prompt: &str) {
+fn inject_initial_prompt(
+    registry: &Arc<Mutex<Registry>>,
+    session_id: &str,
+    prompt: &str,
+) -> Result<(), InitialPromptFailure> {
     if !wait_until_ready(registry, session_id) {
-        return;
+        return Err(InitialPromptFailure::SessionEnded);
     }
     let give_up_at = Instant::now() + PROMPT_INJECTION_WINDOW;
     loop {
         let Some(before) = screen_text(registry, session_id) else {
-            return;
+            return Err(InitialPromptFailure::SessionEnded);
         };
         // A word already on screen (a path in the banner, a word from the
         // tips panel) proves nothing, so the probe is chosen against the
         // pre-typing screen.
         let probe = verification_probe(prompt, &before);
         if with_session(registry, session_id, |session| session.paste_text(prompt)).is_none() {
-            return;
+            return Err(InitialPromptFailure::SessionEnded);
         }
         match wait_for_echo(registry, session_id, probe.as_deref(), &before, ECHO_WINDOW) {
-            EchoOutcome::Gone => return,
+            EchoOutcome::Gone => return Err(InitialPromptFailure::SessionEnded),
             // The composer is holding our text: the Enter is safe.
             EchoOutcome::Visible => {
-                submit_typed_prompt(registry, session_id, probe.as_deref());
-                return;
+                return submit_typed_prompt(registry, session_id, probe.as_deref());
             }
             EchoOutcome::Missing => {}
         }
@@ -2956,7 +3003,7 @@ fn inject_initial_prompt(registry: &Arc<Mutex<Registry>>, session_id: &str, prom
         // the exposure is unchanged; narrowing it would need the holder to
         // report termios.
         if with_session(registry, session_id, |session| session.submit_input()).is_none() {
-            return;
+            return Err(InitialPromptFailure::SessionEnded);
         }
         match wait_for_echo(
             registry,
@@ -2965,14 +3012,15 @@ fn inject_initial_prompt(registry: &Arc<Mutex<Registry>>, session_id: &str, prom
             &before,
             LANDED_WINDOW,
         ) {
-            EchoOutcome::Gone | EchoOutcome::Visible => return,
+            EchoOutcome::Gone => return Err(InitialPromptFailure::SessionEnded),
+            EchoOutcome::Visible => return Ok(()),
             EchoOutcome::Missing => {}
         }
 
         // Truly swallowed. Empty the composer before retyping so a late echo
         // cannot concatenate with the retry.
         if with_session(registry, session_id, |session| session.clear_input_line()).is_none() {
-            return;
+            return Err(InitialPromptFailure::SessionEnded);
         }
         if !sleep_until(give_up_at, PROMPT_RETRY_DELAY) {
             break;
@@ -2983,6 +3031,7 @@ fn inject_initial_prompt(registry: &Arc<Mutex<Registry>>, session_id: &str, prom
          {}s — left untyped rather than submitted blind",
         PROMPT_INJECTION_WINDOW.as_secs()
     );
+    Err(InitialPromptFailure::TimedOut)
 }
 
 /// How long a prompt waits for a composer that will take it. Long enough to
@@ -3052,13 +3101,17 @@ fn wait_for_echo(
 /// confirms the composer let go of it. A prompt still sitting there after the
 /// first Enter gets exactly one more — never a retype, which is what would
 /// double-send.
-fn submit_typed_prompt(registry: &Arc<Mutex<Registry>>, session_id: &str, probe: Option<&str>) {
+fn submit_typed_prompt(
+    registry: &Arc<Mutex<Registry>>,
+    session_id: &str,
+    probe: Option<&str>,
+) -> Result<(), InitialPromptFailure> {
     for _ in 0..2 {
         if with_session(registry, session_id, |session| session.submit_input()).is_none() {
-            return;
+            return Err(InitialPromptFailure::SessionEnded);
         }
         let Some(probe) = probe else {
-            return;
+            return Ok(());
         };
         // Submitting moves the prompt out of the composer and into the
         // transcript above it; either way the agent now owns it. Only a
@@ -3066,16 +3119,17 @@ fn submit_typed_prompt(registry: &Arc<Mutex<Registry>>, session_id: &str, probe:
         for _ in 0..20 {
             std::thread::sleep(Duration::from_millis(100));
             match screen_text(registry, session_id) {
-                None => return,
+                None => return Err(InitialPromptFailure::SessionEnded),
                 Some(now)
                     if !now.contains(probe) || agent_started_working(registry, session_id) =>
                 {
-                    return;
+                    return Ok(());
                 }
                 Some(_) => {}
             }
         }
     }
+    Err(InitialPromptFailure::SubmissionUnconfirmed)
 }
 
 /// True once the session's own status reducer says the agent is doing

@@ -294,11 +294,10 @@ impl RegistryHost {
     /// The new session records its caller as `parent`, which is what makes the
     /// lineage tools — `list_children`, `wait_for_children` — mean anything.
     ///
-    /// An initial prompt is *not* written here. The agent has not drawn its
-    /// input box yet, and typing into a terminal that is still starting loses
-    /// the text; delivery waits for readiness, which the caller drives with
-    /// `wait_for_agent` then `send_prompt`. The pending prompt is returned so
-    /// the caller knows it still owes it.
+    /// A supplied initial prompt is part of the spawn acknowledgement: this
+    /// call waits for the same readiness-gated, verified delivery as the
+    /// control-backed MCP server and returns an error if the child never
+    /// accepts it.
     fn spawn_agent(&self, arguments: &Value) -> Result<Value, String> {
         let kind = required_str(arguments, "kind")?;
         let cwd = required_str(arguments, "cwd")?;
@@ -355,6 +354,7 @@ impl RegistryHost {
         record.git_branch = branch.clone();
         if let Some(title) = title {
             record.title = title;
+            record.title_source = diri_proto::TitleSource::DirijorAssigned;
         }
 
         let spec = crate::session::SessionSpec {
@@ -371,6 +371,33 @@ impl RegistryHost {
             .spawn(spec, record)
             .map_err(|error| format!("could not start {kind}: {error}"))?;
         let _ = registry.persist();
+        drop(registry);
+
+        let accept_claude_workspace = kind == diri_proto::AgentKind::CLAUDE_CODE_ID;
+        if let Some(prompt) = prompt.as_deref() {
+            crate::control::prepare_agent_input_for_spawn(
+                &self.registry,
+                &id,
+                accept_claude_workspace,
+                Some(prompt),
+            )
+            .map_err(|error| {
+                format!(
+                    "initial_prompt_delivery_failed: session {id} was created, but its initial prompt was not delivered: {error}"
+                )
+            })?;
+        } else if accept_claude_workspace {
+            let registry = Arc::clone(&self.registry);
+            let session_id = id.clone();
+            std::thread::spawn(move || {
+                let _ = crate::control::prepare_agent_input_for_spawn(
+                    &registry,
+                    &session_id,
+                    true,
+                    None,
+                );
+            });
+        }
 
         Ok(json!({
             "id": id,
@@ -379,7 +406,6 @@ impl RegistryHost {
             "worktree": worktree_path,
             "branch": branch,
             "parent": self.caller,
-            "pendingPrompt": prompt,
         }))
     }
 
