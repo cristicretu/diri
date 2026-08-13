@@ -113,7 +113,9 @@ fn an_erase_and_redraw_never_reach_a_client_as_a_blank_screen() {
     }
 
     // A minimal TUI: every line of input repaints the screen the way a real
-    // one does — erase, then draw — as two separate writes.
+    // one does — erase, then draw — as two separate writes. The small gap
+    // deterministically models a writer descheduled between those calls; a
+    // busy macOS runner exposed the same gap naturally.
     let control = UnixStream::connect(server.socket_path()).expect("connect control");
     let send = |message: &ControlMessage| {
         let mut bytes = serde_json::to_vec(message).expect("encode");
@@ -131,7 +133,7 @@ fn an_erase_and_redraw_never_reach_a_client_as_a_blank_screen() {
                 "-c",
                 "stty -echo; printf 'frame-0\\r\\n'; \
                  while read -r turn; do \
-                   printf '\\033[2J\\033[H'; \
+                   printf '\\033[2J\\033[H'; sleep 0.001; \
                    printf 'frame-%s\\r\\n' \"$turn\"; \
                  done",
             ],

@@ -15,8 +15,8 @@ use diri_proto::{
     SessionArtifact, SessionDiffBase, SessionId, SessionRecord, SessionStatus,
 };
 use diri_ui::{
-    AgentKind, AgentLogo, Fill, FloatingSurface, Ink, LoadingIndicator, Metrics, Radius,
-    SemanticColors, Typo,
+    AgentKind, AgentLogo, Appearance, Fill, FloatingSurface, Ink, LoadingIndicator, Metrics,
+    Radius, SemanticColors, Typo,
 };
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Context, DragMoveEvent, Entity, EventEmitter,
@@ -204,7 +204,14 @@ impl WorkbenchInspector {
         cx: &mut Context<Self>,
     ) -> Self {
         let tokio = tokio_owner.handle().clone();
-        let code_viewer = cx.new(|cx| CodeViewer::new(tokio.clone(), cx));
+        let (selected_tab, code_colors) = {
+            let store = runtime.store.read().expect("session store lock poisoned");
+            (
+                store.preferences().inspector_tab,
+                crate::app_theme::sidebar_colors(&store.preferences().terminal_theme),
+            )
+        };
+        let code_viewer = cx.new(|cx| CodeViewer::new(tokio.clone(), code_colors, cx));
         let focus = cx.focus_handle();
         let mut changes = runtime.changes();
         let store_changes = cx.spawn(async move |this, cx| {
@@ -222,12 +229,6 @@ impl WorkbenchInspector {
                 }
             }
         });
-        let selected_tab = runtime
-            .store
-            .read()
-            .expect("session store lock poisoned")
-            .preferences()
-            .inspector_tab;
         Self {
             runtime,
             _tokio_owner: tokio_owner,
@@ -354,6 +355,16 @@ impl WorkbenchInspector {
     }
 
     fn refresh_if_context_changed(&mut self, cx: &mut Context<Self>) {
+        let colors = {
+            let store = self
+                .runtime
+                .store
+                .read()
+                .expect("session store lock poisoned");
+            crate::app_theme::sidebar_colors(&store.preferences().terminal_theme)
+        };
+        self.code_viewer
+            .update(cx, |viewer, cx| viewer.set_colors(colors, cx));
         if !self.visible {
             return;
         }
@@ -4191,14 +4202,11 @@ fn render_row(
     let repo_root = &context.repo_root;
     let layer = context.layer;
     let armed_hunk = context.armed_hunk;
-    let (background, foreground, marker) = match row.kind {
-        DiffRowKind::Addition => (rgba(0x2f7d4a24), rgba(0xc7ebd2ff), "+"),
-        DiffRowKind::Deletion => (rgba(0x9f3a4424), rgba(0xf0c4c8ff), "−"),
-        DiffRowKind::Hunk => (rgba(0x4675a31c), rgba(0x9bbde0ff), ""),
-        DiffRowKind::File => (rgba(0xffffff09), colors.primary, ""),
-        DiffRowKind::Context => (rgba(0x00000000), rgba(0xffffffb8), ""),
-        DiffRowKind::Meta => (rgba(0x00000000), rgba(0xffffff66), ""),
-    };
+    let DiffRowStyle {
+        background,
+        foreground,
+        marker,
+    } = diff_row_style(row.kind, colors);
     let line_number = |line: Option<u32>| line.map_or_else(String::new, |line| line.to_string());
     let text = if row.kind == DiffRowKind::File {
         SharedString::from(row.text.clone())
@@ -4533,6 +4541,35 @@ fn render_row(
         .into_any_element()
 }
 
+#[derive(Clone, Copy)]
+struct DiffRowStyle {
+    background: gpui::Rgba,
+    foreground: gpui::Rgba,
+    marker: &'static str,
+}
+
+fn diff_row_style(kind: DiffRowKind, colors: SemanticColors) -> DiffRowStyle {
+    let (background, foreground, marker) = match (colors.appearance, kind) {
+        (Appearance::Dark, DiffRowKind::Addition) => (rgba(0x2f7d4a24), rgba(0xc7ebd2ff), "+"),
+        (Appearance::Dark, DiffRowKind::Deletion) => (rgba(0x9f3a4424), rgba(0xf0c4c8ff), "−"),
+        (Appearance::Dark, DiffRowKind::Hunk) => (rgba(0x4675a31c), rgba(0x9bbde0ff), ""),
+        (Appearance::Dark, DiffRowKind::File) => (rgba(0xffffff09), colors.primary, ""),
+        (Appearance::Dark, DiffRowKind::Context) => (rgba(0x00000000), rgba(0xffffffb8), ""),
+        (Appearance::Dark, DiffRowKind::Meta) => (rgba(0x00000000), rgba(0xffffff66), ""),
+        (Appearance::Light, DiffRowKind::Addition) => (rgba(0x2f7d4a18), rgba(0x24522eff), "+"),
+        (Appearance::Light, DiffRowKind::Deletion) => (rgba(0x9f3a4418), rgba(0x812c32ff), "−"),
+        (Appearance::Light, DiffRowKind::Hunk) => (rgba(0x4675a316), rgba(0x285b85ff), ""),
+        (Appearance::Light, DiffRowKind::File) => (rgba(0x00000008), rgba(0x34312dff), ""),
+        (Appearance::Light, DiffRowKind::Context) => (rgba(0x00000000), rgba(0x34312dff), ""),
+        (Appearance::Light, DiffRowKind::Meta) => (rgba(0x00000000), rgba(0x5a5650ff), ""),
+    };
+    DiffRowStyle {
+        background,
+        foreground,
+        marker,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4542,6 +4579,39 @@ mod tests {
 
     struct InspectorHarness {
         inspector: Entity<WorkbenchInspector>,
+    }
+
+    fn composite(foreground: gpui::Rgba, background: gpui::Rgba) -> gpui::Rgba {
+        let alpha = foreground.a + background.a * (1.0 - foreground.a);
+        if alpha == 0.0 {
+            return rgba(0x00000000);
+        }
+        gpui::Rgba {
+            r: (foreground.r * foreground.a + background.r * background.a * (1.0 - foreground.a))
+                / alpha,
+            g: (foreground.g * foreground.a + background.g * background.a * (1.0 - foreground.a))
+                / alpha,
+            b: (foreground.b * foreground.a + background.b * background.a * (1.0 - foreground.a))
+                / alpha,
+            a: alpha,
+        }
+    }
+
+    fn relative_luminance(color: gpui::Rgba) -> f32 {
+        fn linear(channel: f32) -> f32 {
+            if channel <= 0.03928 {
+                channel / 12.92
+            } else {
+                ((channel + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        0.2126 * linear(color.r) + 0.7152 * linear(color.g) + 0.0722 * linear(color.b)
+    }
+
+    fn contrast(left: gpui::Rgba, right: gpui::Rgba) -> f32 {
+        let left = relative_luminance(left);
+        let right = relative_luminance(right);
+        (left.max(right) + 0.05) / (left.min(right) + 0.05)
     }
 
     impl Render for InspectorHarness {
@@ -4559,6 +4629,104 @@ mod tests {
         assert!(InspectorTab::Info.index() < InspectorTab::Changes.index());
         assert!(InspectorTab::Changes.index() < InspectorTab::Code.index());
         assert!(InspectorTab::Code.index() < InspectorTab::Artifacts.index());
+    }
+
+    #[gpui::test]
+    fn light_theme_reaches_the_code_tab(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        runtime
+            .store
+            .write()
+            .expect("session store lock poisoned")
+            .update_preferences(|preferences| {
+                preferences.terminal_theme = "dirijor-light".to_owned();
+                preferences.inspector_tab = InspectorTab::Code;
+            })
+            .expect("inert preferences update");
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let inspector_runtime = Arc::clone(&runtime);
+        let (harness, cx) = cx.add_window_view(move |_window, cx| {
+            let inspector = cx.new(|cx| WorkbenchInspector::new(inspector_runtime, tokio, cx));
+            InspectorHarness { inspector }
+        });
+        let code_viewer = harness.read_with(cx, |harness, cx| {
+            harness
+                .inspector
+                .read_with(cx, |inspector, _| inspector.code_viewer.clone())
+        });
+
+        assert_eq!(
+            code_viewer.read_with(cx, |viewer, _| viewer.appearance()),
+            diri_ui::Appearance::Light
+        );
+    }
+
+    #[gpui::test]
+    fn code_tab_tracks_live_light_theme_changes(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let inspector_runtime = Arc::clone(&runtime);
+        let (harness, cx) = cx.add_window_view(move |_window, cx| {
+            let inspector = cx.new(|cx| WorkbenchInspector::new(inspector_runtime, tokio, cx));
+            InspectorHarness { inspector }
+        });
+        let inspector = harness.read_with(cx, |harness, _| harness.inspector.clone());
+        let code_viewer = inspector.read_with(cx, |inspector, _| inspector.code_viewer.clone());
+        assert_eq!(
+            code_viewer.read_with(cx, |viewer, _| viewer.appearance()),
+            diri_ui::Appearance::Dark
+        );
+
+        runtime
+            .store
+            .write()
+            .expect("session store lock poisoned")
+            .update_preferences(|preferences| {
+                preferences.terminal_theme = "dirijor-light".to_owned();
+            })
+            .expect("inert preferences update");
+        runtime.publish_local_change();
+        cx.run_until_parked();
+
+        assert_eq!(
+            code_viewer.read_with(cx, |viewer, _| viewer.appearance()),
+            diri_ui::Appearance::Light
+        );
+    }
+
+    #[test]
+    fn light_review_rows_keep_readable_contrast() {
+        for theme in ["dirijor-light", "solarized-light", "github-light"] {
+            let colors = crate::app_theme::sidebar_colors(theme);
+            let inspector_surface = composite(colors.sidebar_surface(), colors.background);
+
+            for kind in [
+                DiffRowKind::Addition,
+                DiffRowKind::Deletion,
+                DiffRowKind::Hunk,
+                DiffRowKind::File,
+                DiffRowKind::Context,
+                DiffRowKind::Meta,
+            ] {
+                let style = diff_row_style(kind, colors);
+                let row_surface = composite(style.background, inspector_surface);
+                let text = composite(style.foreground, row_surface);
+                assert!(
+                    contrast(text, row_surface) >= 4.5,
+                    "{kind:?} contrast must remain readable with {theme}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -5,11 +5,16 @@
 #![cfg(unix)]
 
 use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use diri_engine::OutputLog;
-use diri_engine::holder::protocol::DEFAULT_DISK_CAPACITY;
+use diri_engine::holder::protocol::{
+    DEFAULT_DISK_CAPACITY, HolderOperation, HolderRequest, HolderResponse,
+};
 use diri_engine::holder::{
     HolderClient, HolderExitMarker, HolderLaunchSpec, HolderLauncher, HolderManagerClient,
     HolderManagerPaths, HolderManagerServer, HolderPaths, HolderServer,
@@ -56,6 +61,21 @@ fn log_bytes(logs: &Path, session_id: &str) -> Vec<u8> {
     log.refresh_from_disk();
     let tail = log.tail_offset();
     log.read(0, tail as usize).1
+}
+
+fn legacy_write(path: &Path, bytes: &[u8]) {
+    let mut request = HolderRequest::op(HolderOperation::Write);
+    request.data = Some(base64::engine::general_purpose::STANDARD.encode(bytes));
+    let mut stream = UnixStream::connect(path).expect("legacy connect");
+    serde_json::to_writer(&mut stream, &request).expect("legacy encode");
+    stream.write_all(b"\n").expect("legacy request");
+    let mut response = Vec::new();
+    let mut byte = [0_u8; 1];
+    while stream.read_exact(&mut byte).is_ok() && byte[0] != b'\n' {
+        response.push(byte[0]);
+    }
+    let response: HolderResponse = serde_json::from_slice(&response).expect("legacy response");
+    assert!(response.ok, "legacy input rejected: {:?}", response.error);
 }
 
 /// Short-path holder directories, or the socket path exceeds sun_path.
@@ -126,6 +146,65 @@ fn a_holder_owns_a_session_end_to_end() {
 
     assert!(!paths.socket().exists(), "control files are removed");
     assert!(!paths.pid_file().exists());
+}
+
+#[test]
+#[ignore = "release-only local UDS input latency benchmark"]
+fn holder_input_latency_is_reported() {
+    let root = holders_dir("lat");
+    let logs = root.join("logs");
+    let paths = HolderPaths::new(&root, "s_latency");
+    let launch = spec(&paths, &logs, &["/bin/cat"]);
+    let server = std::thread::spawn(move || HolderServer::run(launch));
+    let client = HolderClient::new(paths.socket());
+    wait_until("holder ready", Duration::from_secs(5), || client.is_alive());
+
+    // Measure the exact pre-upgrade request shape on the same Holder and
+    // machine, then compare the persistent stream without scheduler or build
+    // differences muddying the result.
+    for _ in 0..20 {
+        legacy_write(&paths.socket(), b"x");
+    }
+    let mut legacy = Vec::with_capacity(500);
+    for _ in 0..500 {
+        let started = Instant::now();
+        legacy_write(&paths.socket(), b"x");
+        legacy.push(started.elapsed());
+    }
+    legacy.sort_unstable();
+
+    for _ in 0..20 {
+        client.write(b"x").expect("warm stream input");
+    }
+    let mut samples = Vec::with_capacity(500);
+    for _ in 0..500 {
+        let started = Instant::now();
+        client.write(b"x").expect("input");
+        samples.push(started.elapsed());
+    }
+    samples.sort_unstable();
+    let legacy_p50 = legacy[legacy.len() / 2];
+    let legacy_p95 = legacy[legacy.len() * 95 / 100];
+    let p50 = samples[samples.len() / 2];
+    let p95 = samples[samples.len() * 95 / 100];
+    eprintln!(
+        "local holder input: legacy p50 {}us/p95 {}us; stream p50 {}us/p95 {}us",
+        legacy_p50.as_micros(),
+        legacy_p95.as_micros(),
+        p50.as_micros(),
+        p95.as_micros()
+    );
+    assert!(
+        p95 < legacy_p95,
+        "persistent input p95 {p95:?} did not beat legacy {legacy_p95:?}"
+    );
+    assert!(
+        p95 <= Duration::from_millis(1),
+        "persistent local input p95 {p95:?} exceeded the 1ms gate"
+    );
+
+    client.kill_tree().expect("kill");
+    server.join().expect("join").expect("clean end");
 }
 
 #[test]

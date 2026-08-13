@@ -13,6 +13,7 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{AnyThread, DefinedClass, MainThreadOnly, Message, define_class, msg_send, sel};
 use objc2_app_kit::{
+    NSAppearance, NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua,
     NSApplication, NSApplicationActivationOptions, NSAutoresizingMaskOptions, NSBackingStoreType,
     NSBox, NSBoxType, NSButton, NSCellImagePosition, NSColor, NSEvent, NSEventMask,
     NSEventModifierFlags, NSFocusRingType, NSFont, NSFontWeightMedium, NSFontWeightRegular,
@@ -20,17 +21,20 @@ use objc2_app_kit::{
     NSImageView, NSLineBreakMode, NSPanel, NSPopUpMenuWindowLevel, NSRunningApplication,
     NSScrollView, NSStatusBar, NSStatusBarButton, NSStatusItem, NSTextAlignment, NSTextField,
     NSTrackingArea, NSTrackingAreaOptions, NSVariableStatusItemLength, NSView,
-    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
-    NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
-    NSWorkspaceDidActivateApplicationNotification,
+    NSViewBoundsDidChangeNotification, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
+    NSVisualEffectState, NSVisualEffectView, NSWindowAnimationBehavior, NSWindowCollectionBehavior,
+    NSWindowStyleMask, NSWorkspace, NSWorkspaceDidActivateApplicationNotification,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
+    MainThreadMarker, NSNotification, NSNotificationCenter, NSObject, NSObjectProtocol, NSPoint,
+    NSRect, NSSize, NSString,
 };
 
 use diri_proto::{AgentKind, AttentionLevel, ProjectId, SessionId};
-use diri_ui::{BrandMarkKind, Chip, Fill, Ink, Radius};
+use diri_ui::{Appearance, BrandMarkKind, Chip, Fill, Ink, Radius, SemanticColors};
+use gpui::Rgba;
 
+use crate::app_theme;
 use crate::macos::brand_raster;
 use crate::menu_inbox::{InboxModel, InboxRow, InboxSessionRow, TrailingStatus, build_inbox};
 use crate::store::{SessionStore, SpawnOptions};
@@ -86,6 +90,57 @@ const CLOSE_CHIP_GAP: f64 = 4.0;
 const SELECTED_FILL_ALPHA: f64 = 0.10;
 const HOVER_FILL_ALPHA: f64 = 0.06;
 
+/// The panel's palette, resolved from the active diri theme rather than from
+/// system colors. AppKit's `labelColor` family tracks macOS light/dark, which
+/// is the wrong axis: a Dracula or Solarized workbench should not hand its menu
+/// bar a stock grey panel. Colors are converted once per theme change, not per
+/// row, because every row rebuild would otherwise re-cross the bridge.
+struct MenuTheme {
+    id: String,
+    is_dark: bool,
+    primary: Retained<NSColor>,
+    secondary: Retained<NSColor>,
+    tertiary: Retained<NSColor>,
+    surface: Retained<NSColor>,
+    separator: Retained<NSColor>,
+}
+
+impl MenuTheme {
+    fn new(id: String, colors: SemanticColors) -> Self {
+        Self {
+            id,
+            is_dark: colors.appearance == Appearance::Dark,
+            primary: rgba_color(colors.primary),
+            secondary: rgba_color(colors.secondary),
+            tertiary: rgba_color(colors.tertiary),
+            surface: rgba_color(colors.floating_surface()),
+            separator: rgba_color(colors.floating_stroke()),
+        }
+    }
+
+    /// Fills and quiet text tones are the foreground at reduced alpha, exactly
+    /// as `Fill::subtle` and friends derive them on the GPUI side.
+    fn primary_alpha(&self, alpha: f64) -> Retained<NSColor> {
+        self.primary.colorWithAlphaComponent(alpha)
+    }
+
+    /// Anything AppKit still draws itself — the scroller, focus rings — follows
+    /// the window's appearance, so a light theme has to say so explicitly or it
+    /// gets a dark scrollbar over a light panel.
+    fn appearance(&self) -> Option<Retained<NSAppearance>> {
+        let name = if self.is_dark {
+            unsafe { NSAppearanceNameDarkAqua }
+        } else {
+            unsafe { NSAppearanceNameAqua }
+        };
+        NSAppearance::appearanceNamed(name)
+    }
+}
+
+fn rgba_color(color: Rgba) -> Retained<NSColor> {
+    rgba_ns(color.r, color.g, color.b, color.a)
+}
+
 pub struct NativeMenuBar {
     store: Arc<RwLock<SessionStore>>,
     _status_item: Retained<NSStatusItem>,
@@ -98,13 +153,21 @@ pub struct NativeMenuBar {
     new_agent_chrome: Retained<MenuBarHoverChrome>,
     settings_chrome: Retained<MenuBarHoverChrome>,
     quit_chrome: Retained<MenuBarHoverChrome>,
+    backdrop: Retained<NSBox>,
     header_divider: Retained<NSBox>,
+    footer_divider: Retained<NSBox>,
     scroll: Retained<NSScrollView>,
     body: Retained<NSView>,
     target: Retained<MenuBarTarget>,
+    /// Re-syncs row hover while the list scrolls; see [`MenuBarHoverRow::sync_hover_to_pointer`].
+    scroll_observer: Option<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
     last_fingerprint: Option<u64>,
     /// Last level pushed to the status item; see [`NativeMenuBar::set_attention`].
     last_attention: Option<AttentionLevel>,
+    theme: MenuTheme,
+    /// Colors are baked into views when they are built, so a theme change has
+    /// to repaint even though the model behind the fingerprint is unchanged.
+    needs_full_repaint: bool,
 }
 
 impl Drop for NativeMenuBar {
@@ -112,12 +175,27 @@ impl Drop for NativeMenuBar {
         // The dismiss monitors are process-global and retain this target; clear
         // them so a rebuilt menu bar cannot stack observers on the same status item.
         self.target.remove_monitors();
+        if let Some(observer) = self.scroll_observer.take() {
+            // SAFETY: observer came from addObserverForName on this same center.
+            unsafe { NSNotificationCenter::defaultCenter().removeObserver(observer.as_ref()) };
+        }
     }
 }
 
 impl NativeMenuBar {
     #[must_use]
     pub fn new(mtm: MainThreadMarker, store: Arc<RwLock<SessionStore>>) -> Option<Self> {
+        let theme = {
+            let prefs_theme = store
+                .read()
+                .expect("session store lock poisoned")
+                .preferences()
+                .terminal_theme
+                .clone();
+            let colors = app_theme::sidebar_colors(&prefs_theme);
+            MenuTheme::new(prefs_theme, colors)
+        };
+
         let status_item =
             NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
         let button = status_item.button(mtm)?;
@@ -157,10 +235,28 @@ impl NativeMenuBar {
                 let _: () = msg_send![layer, setMasksToBounds: true];
             }
         }
+        // The vibrancy view stays for the shadow and rounding, but an opaque
+        // themed plate sits on top of it: a Dracula workbench should not open a
+        // stock grey menu. Painted as an NSBox rather than a layer color so this
+        // file still does not need a second graphics binding just for one fill.
+        let backdrop = NSBox::initWithFrame(NSBox::alloc(mtm), rect(0.0, 0.0, POPUP_WIDTH, 140.0));
+        backdrop.setBoxType(NSBoxType::Custom);
+        backdrop.setBorderWidth(0.0);
+        backdrop.setCornerRadius(10.0);
+        backdrop.setContentViewMargins(NSSize::new(0.0, 0.0));
+        backdrop.setFillColor(&theme.surface);
+        backdrop.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable
+                | NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
+        surface.addSubview(&backdrop);
+
+        panel.setAppearance(theme.appearance().as_deref());
         panel.setContentView(Some(&surface));
 
         let header_divider = separator(
             rect(ROW_INSET, 0.0, POPUP_WIDTH - ROW_INSET * 2.0, 1.0),
+            &theme,
             mtm,
         );
         surface.addSubview(&header_divider);
@@ -185,8 +281,34 @@ impl NativeMenuBar {
         );
         surface.addSubview(&scroll);
 
+        // `updateTrackingAreas` is supposed to run as the visible rect moves,
+        // but hover correctness should not rest on that: watch the clip view
+        // directly so every scroll re-derives hover from the pointer.
+        let clip = scroll.contentView();
+        clip.setPostsBoundsChangedNotifications(true);
+        let scroll_observer = {
+            let body = body.clone();
+            let handler = RcBlock::new(move |_notification: NonNull<NSNotification>| {
+                for child in body.subviews().iter() {
+                    if let Some(row) = child.downcast_ref::<MenuBarHoverRow>() {
+                        row.sync_hover_to_pointer();
+                    }
+                }
+            });
+            // SAFETY: retained below and removed in `Drop for NativeMenuBar`.
+            unsafe {
+                NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
+                    Some(NSViewBoundsDidChangeNotification),
+                    Some(&clip),
+                    None,
+                    &handler,
+                )
+            }
+        };
+
         let footer_divider = separator(
             rect(ROW_INSET, FOOTER_HEIGHT, POPUP_WIDTH - ROW_INSET * 2.0, 1.0),
+            &theme,
             mtm,
         );
         surface.addSubview(&footer_divider);
@@ -199,6 +321,7 @@ impl NativeMenuBar {
             mtm,
             rect(ROW_INSET, 0.0, BRAND_HIT_WIDTH, 28.0),
             target.clone(),
+            &theme.primary,
         );
         // One rasterization, shared by the status item and the panel header:
         // same fixed vector at the same fixed size, only the tint differs.
@@ -225,7 +348,7 @@ impl NativeMenuBar {
             ));
             view.setImageAlignment(NSImageAlignment::AlignCenter);
             view.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
-            view.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
+            view.setContentTintColor(Some(&theme.secondary));
             view
         };
         brand_hit.addSubview(&header_icon);
@@ -233,7 +356,7 @@ impl NativeMenuBar {
             "diri",
             13.0,
             FontStyle::Semibold,
-            &NSColor::labelColor(),
+            &theme.primary,
             rect(
                 ROW_PAD + DIRI_LOGO_WIDTH + ROW_GAP - TEXT_INSET,
                 7.0,
@@ -254,6 +377,7 @@ impl NativeMenuBar {
                 28.0,
             ),
             6.0,
+            &theme.primary,
         );
         let new_agent_button = unsafe {
             NSButton::buttonWithTitle_target_action(
@@ -264,15 +388,19 @@ impl NativeMenuBar {
             )
         };
         // Match session/project title weight so the header action does not look oversized.
-        style_plain_button(&new_agent_button, false);
+        style_plain_button(&new_agent_button, false, &theme);
         new_agent_button.setImage(Some(&symbol_image("plus", "plus.circle")));
         new_agent_button.setImagePosition(NSCellImagePosition::ImageLeading);
         new_agent_button.setImageHugsTitle(true);
         new_agent_chrome.attach_control(&new_agent_button);
         surface.addSubview(&new_agent_chrome);
 
-        let settings_chrome =
-            MenuBarHoverChrome::new(mtm, rect(ROW_INSET, 7.0, SETTINGS_HIT, 28.0), 6.0);
+        let settings_chrome = MenuBarHoverChrome::new(
+            mtm,
+            rect(ROW_INSET, 7.0, SETTINGS_HIT, 28.0),
+            6.0,
+            &theme.primary,
+        );
         let settings_button = unsafe {
             NSButton::buttonWithTitle_target_action(
                 &NSString::new(),
@@ -281,7 +409,7 @@ impl NativeMenuBar {
                 mtm,
             )
         };
-        style_plain_button(&settings_button, false);
+        style_plain_button(&settings_button, false, &theme);
         // Sidebar title-bar settings: `sf_symbol("gearshape", 15)` → IconName::Settings SVG.
         if let Some(image) = brand_raster::template_settings_ns_image(16.0) {
             settings_button.setImage(Some(&image));
@@ -297,6 +425,7 @@ impl NativeMenuBar {
             mtm,
             rect(POPUP_WIDTH - ROW_INSET - QUIT_WIDTH, 7.0, QUIT_WIDTH, 28.0),
             6.0,
+            &theme.primary,
         );
         let quit_button = unsafe {
             NSButton::buttonWithTitle_target_action(
@@ -306,7 +435,7 @@ impl NativeMenuBar {
                 mtm,
             )
         };
-        style_plain_button(&quit_button, false);
+        style_plain_button(&quit_button, false, &theme);
         quit_chrome.attach_control(&quit_button);
         surface.addSubview(&quit_chrome);
 
@@ -333,40 +462,68 @@ impl NativeMenuBar {
             new_agent_chrome,
             settings_chrome,
             quit_chrome,
+            backdrop,
             header_divider,
+            footer_divider,
             scroll,
             body,
             target,
+            scroll_observer: Some(scroll_observer),
             last_fingerprint: None,
             last_attention: None,
+            theme,
+            needs_full_repaint: false,
         };
         menu_bar.set_attention(AttentionLevel::None);
         Some(menu_bar)
+    }
+
+    /// Re-resolve the palette when the workbench theme changes, and force a
+    /// full repaint: every color in the panel is baked into views at build time.
+    fn sync_theme(&mut self, theme_id: &str) {
+        if self.theme.id == theme_id {
+            return;
+        }
+        self.theme = MenuTheme::new(theme_id.to_owned(), app_theme::sidebar_colors(theme_id));
+        self.header_icon
+            .setContentTintColor(Some(&self.theme.secondary));
+        self.title_label.setTextColor(Some(&self.theme.primary));
+        self.backdrop.setFillColor(&self.theme.surface);
+        self.panel.setAppearance(self.theme.appearance().as_deref());
+        self.header_divider.setFillColor(&self.theme.separator);
+        self.footer_divider.setFillColor(&self.theme.separator);
+        self.last_attention = None;
+        self.needs_full_repaint = true;
     }
 
     pub fn refresh(&mut self) {
         // Closed panel: only the status-item tint. Building the inbox first
         // would put the most expensive work on the hottest path.
         if !self.panel.isVisible() {
-            let attention = self
-                .store
-                .read()
-                .expect("session store lock poisoned")
-                .global_attention();
+            let (attention, theme_id) = {
+                let store = self.store.read().expect("session store lock poisoned");
+                (
+                    store.global_attention(),
+                    store.preferences().terminal_theme.clone(),
+                )
+            };
+            self.sync_theme(&theme_id);
             self.set_attention(attention);
             self.last_fingerprint = None;
             return;
         }
 
         let collapsed = self.target.collapsed_projects();
-        let (model, selected, attention) = {
+        let (model, selected, attention, theme_id) = {
             let mut store = self.store.write().expect("session store lock poisoned");
             let projection = store.menu_bar_projection();
             let model = build_inbox(&projection, &collapsed);
             let selected = store.selected_session_id().cloned();
             let attention = store.global_attention();
-            (model, selected, attention)
+            let theme_id = store.preferences().terminal_theme.clone();
+            (model, selected, attention, theme_id)
         };
+        self.sync_theme(&theme_id);
         self.apply_model(&model, selected.as_ref(), attention);
     }
 
@@ -382,9 +539,16 @@ impl NativeMenuBar {
         };
 
         let fingerprint = panel_fingerprint(model, selected_session_id);
-        if self.last_fingerprint == Some(fingerprint) {
+        // A theme change repaints without being an open, so the viewport is
+        // still restored rather than snapped back to the first project.
+        let forced = std::mem::take(&mut self.needs_full_repaint);
+        if !forced && self.last_fingerprint == Some(fingerprint) {
             return;
         }
+        // `refresh` clears the fingerprint whenever the panel goes away, so a
+        // missing one means this is the first paint since it opened — the only
+        // time the list should jump back to the first project.
+        let opening = self.last_fingerprint.is_none();
         self.last_fingerprint = Some(fingerprint);
 
         let content_height = content_height_for(model);
@@ -442,7 +606,7 @@ impl NativeMenuBar {
             28.0,
         ));
 
-        self.rebuild_body(model, content_height, selected_session_id, mtm);
+        self.rebuild_body(model, content_height, selected_session_id, opening, mtm);
     }
 
     /// Retint the template status-item / header mark. Same Ink map as row
@@ -453,7 +617,13 @@ impl NativeMenuBar {
         }
         self.last_attention = Some(attention);
 
-        let tint = match attention {
+        // Absolute sRGB only, and nil for anything that is not a real signal.
+        // A dynamic color like `labelColor` resolves against the app's
+        // appearance rather than the menu bar's, so tinting with it paints the
+        // mark black on a dark bar — which is what made the working state
+        // disappear. Leaving the tint nil lets AppKit render the template the
+        // way it renders every other status item.
+        let signal_tint = match attention {
             AttentionLevel::NeedsInput => Some(rgba_ns(
                 Ink::ATTENTION.r,
                 Ink::ATTENTION.g,
@@ -463,12 +633,20 @@ impl NativeMenuBar {
             AttentionLevel::DoneUnseen => {
                 Some(rgba_ns(Ink::FRESH.r, Ink::FRESH.g, Ink::FRESH.b, 1.0))
             }
-            AttentionLevel::Working => Some(NSColor::labelColor().colorWithAlphaComponent(0.82)),
-            AttentionLevel::IdleSeen | AttentionLevel::None | AttentionLevel::Unknown => None,
+            AttentionLevel::Working
+            | AttentionLevel::IdleSeen
+            | AttentionLevel::None
+            | AttentionLevel::Unknown => None,
         };
-        self.button.setContentTintColor(tint.as_deref());
-        self.header_icon
-            .setContentTintColor(Some(tint.as_deref().unwrap_or(&*NSColor::labelColor())));
+        self.button.setContentTintColor(signal_tint.as_deref());
+
+        // The header mark sits inside the panel, where `labelColor` resolves
+        // against the right appearance, so it can keep the quieter idle tones.
+        let header_tint = signal_tint.unwrap_or_else(|| match attention {
+            AttentionLevel::Working => self.theme.primary_alpha(0.82),
+            _ => Retained::clone(&self.theme.primary),
+        });
+        self.header_icon.setContentTintColor(Some(&header_tint));
     }
 
     fn rebuild_body(
@@ -476,8 +654,13 @@ impl NativeMenuBar {
         model: &InboxModel,
         content_height: f64,
         selected_session_id: Option<&SessionId>,
+        opening: bool,
         mtm: MainThreadMarker,
     ) {
+        // Every state change rebuilds the body, and selecting a row is a state
+        // change — so restoring the offset is what keeps a click from throwing
+        // the user back to the top of the list.
+        let anchor = (!opening).then(|| self.scroll_offset_from_top());
         for child in self.body.subviews().iter() {
             child.removeFromSuperview();
         }
@@ -489,7 +672,7 @@ impl NativeMenuBar {
             self.target.set_project_ids(Vec::new());
             self.add_empty_state(content_height, mtm);
             self.scroll.setDocumentView(Some(&self.body));
-            self.scroll_body_to_top();
+            self.restore_scroll(anchor);
             return;
         }
 
@@ -541,17 +724,31 @@ impl NativeMenuBar {
             }
         }
         self.scroll.setDocumentView(Some(&self.body));
-        self.scroll_body_to_top();
+        self.restore_scroll(anchor);
     }
 
-    fn scroll_body_to_top(&self) {
-        // Non-flipped document: y=0 is the bottom. Pin the clip to the top of
-        // the body so opening the menu always starts at the first project.
+    /// Distance from the top of the list, which is the thing worth preserving:
+    /// the document is non-flipped, so a raw `y` would hold position relative to
+    /// the *bottom* and drift every time a row is added or removed above.
+    fn scroll_offset_from_top(&self) -> f64 {
         let clip = self.scroll.contentView();
-        let doc_height = self.body.frame().size.height;
-        let clip_height = clip.bounds().size.height;
-        let top_y = (doc_height - clip_height).max(0.0);
-        clip.scrollToPoint(NSPoint::new(0.0, top_y));
+        offset_from_top(
+            self.body.frame().size.height,
+            clip.bounds().size.height,
+            clip.bounds().origin.y,
+        )
+    }
+
+    /// `None` pins to the top (the panel just opened); otherwise re-apply the
+    /// captured distance, clamped to whatever the rebuilt list can now show.
+    fn restore_scroll(&self, from_top: Option<f64>) {
+        let clip = self.scroll.contentView();
+        let y = clip_y_for_offset(
+            self.body.frame().size.height,
+            clip.bounds().size.height,
+            from_top,
+        );
+        clip.scrollToPoint(NSPoint::new(0.0, y));
         self.scroll.reflectScrolledClipView(&clip);
     }
 
@@ -571,6 +768,7 @@ impl NativeMenuBar {
                 PROJECT_HEIGHT - 2.0,
             ),
             HOVER_FILL_ALPHA,
+            &self.theme.primary,
             mtm,
         );
         hover_fill.setHidden(true);
@@ -602,12 +800,12 @@ impl NativeMenuBar {
         badge.setBorderWidth(0.0);
         badge.setCornerRadius(5.0);
         badge.setContentViewMargins(NSSize::new(0.0, 0.0));
-        badge.setFillColor(&NSColor::labelColor().colorWithAlphaComponent(0.08));
+        badge.setFillColor(&self.theme.primary_alpha(0.08));
         let folder = glyph_view(
             "folder.fill",
             "folder",
             GLYPH_BOX_COMPACT,
-            &NSColor::secondaryLabelColor(),
+            &self.theme.secondary,
             rect(0.0, 0.0, FOLDER_BADGE, FOLDER_BADGE),
             mtm,
         );
@@ -626,7 +824,7 @@ impl NativeMenuBar {
             name,
             13.0,
             FontStyle::Medium,
-            &NSColor::labelColor(),
+            &self.theme.primary,
             rect(
                 name_x - TEXT_INSET,
                 (PROJECT_HEIGHT - 16.0) / 2.0 + 1.0,
@@ -646,7 +844,7 @@ impl NativeMenuBar {
             },
             "chevron.right",
             GLYPH_BOX_COMPACT,
-            &NSColor::tertiaryLabelColor(),
+            &self.theme.tertiary,
             rect(CONTENT_RIGHT - INDENT, 0.0, INDENT, PROJECT_HEIGHT),
             mtm,
         );
@@ -666,7 +864,7 @@ impl NativeMenuBar {
         // starting at the shared content column.
         let icon_x = CONTENT_X + f64::from(session.depth) * DEPTH_STEP + INDENT + ROW_GAP;
         let title_x = icon_x + GLYPH_SIZE + ROW_GAP;
-        let trailing = trailing_label(session);
+        let trailing = trailing_label(session, &self.theme);
         // Sidebar flex: title absorbs width; chips then trailing ✕ on hover.
         let chip_width = trailing.as_ref().map_or(0.0, |status| status.width);
         let trailing_slot = if chip_width > 0.0 {
@@ -686,11 +884,12 @@ impl NativeMenuBar {
                 ROW_HEIGHT - 2.0,
             ),
             HOVER_FILL_ALPHA,
+            &self.theme.primary,
             mtm,
         );
         hover_fill.setHidden(true);
 
-        let icon_color = glyph_tint(session);
+        let icon_color = glyph_tint(session, &self.theme);
         let agent_mark = agent_mark_view(&session.agent_id, &icon_color, icon_x, mtm);
 
         let close_button = MenuBarCloseHit::new(
@@ -703,6 +902,8 @@ impl NativeMenuBar {
             ),
             self.target.clone(),
             tag,
+            &self.theme.primary,
+            &self.theme.secondary,
         );
         close_button.setHidden(true);
 
@@ -726,9 +927,7 @@ impl NativeMenuBar {
             chip.setBorderWidth(0.0);
             chip.setCornerRadius(f64::from(Radius::CHIP));
             chip.setContentViewMargins(NSSize::new(0.0, 0.0));
-            chip.setFillColor(
-                &NSColor::labelColor().colorWithAlphaComponent(f64::from(Fill::SUBTLE_OPACITY)),
-            );
+            chip.setFillColor(&self.theme.primary_alpha(f64::from(Fill::SUBTLE_OPACITY)));
             // Non-flipped: center the label, then +1pt optical (NSTextField sits low).
             let label_h = font_size + 2.0;
             let label_y = ((chip_h - label_h) / 2.0) + 1.0;
@@ -765,6 +964,7 @@ impl NativeMenuBar {
                     ROW_HEIGHT - 2.0,
                 ),
                 SELECTED_FILL_ALPHA,
+                &self.theme.primary,
                 mtm,
             );
             row.addSubview(&selected_fill);
@@ -787,7 +987,7 @@ impl NativeMenuBar {
             &session.title,
             13.0,
             FontStyle::Regular,
-            &NSColor::labelColor().colorWithAlphaComponent(title_alpha),
+            &self.theme.primary_alpha(title_alpha),
             rect(
                 title_x - TEXT_INSET,
                 title_y,
@@ -809,7 +1009,7 @@ impl NativeMenuBar {
             "plus.circle",
             "waveform",
             20.0,
-            &NSColor::tertiaryLabelColor(),
+            &self.theme.tertiary,
             rect(
                 (POPUP_WIDTH - 20.0) / 2.0,
                 content_height - 36.0,
@@ -824,7 +1024,7 @@ impl NativeMenuBar {
             "No active sessions",
             13.0,
             FontStyle::Medium,
-            &NSColor::secondaryLabelColor(),
+            &self.theme.secondary,
             rect(24.0, content_height - 58.0, POPUP_WIDTH - 48.0, 18.0),
             mtm,
         );
@@ -835,7 +1035,7 @@ impl NativeMenuBar {
             "Start one from New Agent",
             11.0,
             FontStyle::Regular,
-            &NSColor::tertiaryLabelColor(),
+            &self.theme.tertiary,
             rect(24.0, content_height - 76.0, POPUP_WIDTH - 48.0, 16.0),
             mtm,
         );
@@ -850,7 +1050,7 @@ struct TrailingLabel {
     color: Retained<NSColor>,
 }
 
-fn trailing_label(session: &InboxSessionRow) -> Option<TrailingLabel> {
+fn trailing_label(session: &InboxSessionRow, theme: &MenuTheme) -> Option<TrailingLabel> {
     match session.trailing? {
         TrailingStatus::NeedsYou => Some(TrailingLabel {
             text: "needs you",
@@ -869,7 +1069,7 @@ fn trailing_label(session: &InboxSessionRow) -> Option<TrailingLabel> {
         TrailingStatus::Zzz => Some(TrailingLabel {
             text: "Zzz",
             width: 28.0,
-            color: NSColor::tertiaryLabelColor(),
+            color: Retained::clone(&theme.tertiary),
         }),
     }
 }
@@ -936,7 +1136,7 @@ fn agent_mark_kind(agent_id: &str) -> Option<BrandMarkKind> {
     }
 }
 
-fn glyph_tint(session: &InboxSessionRow) -> Retained<NSColor> {
+fn glyph_tint(session: &InboxSessionRow, theme: &MenuTheme) -> Retained<NSColor> {
     match session.trailing {
         Some(TrailingStatus::NeedsYou) if session.destructive => {
             rgba_ns(Ink::DANGER.r, Ink::DANGER.g, Ink::DANGER.b, 1.0)
@@ -945,7 +1145,7 @@ fn glyph_tint(session: &InboxSessionRow) -> Retained<NSColor> {
             rgba_ns(Ink::ATTENTION.r, Ink::ATTENTION.g, Ink::ATTENTION.b, 1.0)
         }
         Some(TrailingStatus::Done) => rgba_ns(Ink::FRESH.r, Ink::FRESH.g, Ink::FRESH.b, 1.0),
-        Some(TrailingStatus::Zzz) => NSColor::labelColor().colorWithAlphaComponent(0.36),
+        Some(TrailingStatus::Zzz) => theme.primary_alpha(0.36),
         None if session.working => match session.agent_id.as_str() {
             AgentKind::CLAUDE_CODE_ID => {
                 NSColor::colorWithSRGBRed_green_blue_alpha(0.851, 0.467, 0.341, 0.96)
@@ -953,9 +1153,9 @@ fn glyph_tint(session: &InboxSessionRow) -> Retained<NSColor> {
             AgentKind::GEMINI_ID => {
                 NSColor::colorWithSRGBRed_green_blue_alpha(0.306, 0.510, 0.933, 0.96)
             }
-            _ => NSColor::labelColor().colorWithAlphaComponent(0.82),
+            _ => theme.primary_alpha(0.82),
         },
-        None => NSColor::labelColor().colorWithAlphaComponent(0.42),
+        None => theme.primary_alpha(0.42),
     }
 }
 
@@ -996,12 +1196,17 @@ fn agent_mark_view(
     host
 }
 
-fn row_fill_box(frame: NSRect, alpha: f64, mtm: MainThreadMarker) -> Retained<NSBox> {
+fn row_fill_box(
+    frame: NSRect,
+    alpha: f64,
+    tone: &NSColor,
+    mtm: MainThreadMarker,
+) -> Retained<NSBox> {
     let fill = NSBox::initWithFrame(NSBox::alloc(mtm), frame);
     fill.setBoxType(NSBoxType::Custom);
     fill.setBorderWidth(0.0);
     fill.setCornerRadius(6.0);
-    fill.setFillColor(&NSColor::labelColor().colorWithAlphaComponent(alpha));
+    fill.setFillColor(&tone.colorWithAlphaComponent(alpha));
     fill
 }
 
@@ -1118,13 +1323,17 @@ fn activate_diri(mtm: MainThreadMarker) {
     );
 }
 
-fn separator(frame: NSRect, mtm: MainThreadMarker) -> Retained<NSBox> {
+fn separator(frame: NSRect, theme: &MenuTheme, mtm: MainThreadMarker) -> Retained<NSBox> {
+    // Custom rather than NSBoxType::Separator: the stock hairline is a system
+    // color and would ignore the theme like everything else here used to.
     let separator = NSBox::initWithFrame(NSBox::alloc(mtm), frame);
-    separator.setBoxType(NSBoxType::Separator);
+    separator.setBoxType(NSBoxType::Custom);
+    separator.setBorderWidth(0.0);
+    separator.setFillColor(&theme.separator);
     separator
 }
 
-fn style_plain_button(button: &NSButton, prominent: bool) {
+fn style_plain_button(button: &NSButton, prominent: bool, theme: &MenuTheme) {
     button.setFont(Some(&system_font(
         13.0,
         if prominent {
@@ -1135,9 +1344,9 @@ fn style_plain_button(button: &NSButton, prominent: bool) {
     )));
     button.setBordered(false);
     let tint = if prominent {
-        NSColor::labelColor()
+        Retained::clone(&theme.primary)
     } else {
-        NSColor::secondaryLabelColor()
+        Retained::clone(&theme.secondary)
     };
     button.setContentTintColor(Some(&tint));
     button.setRefusesFirstResponder(true);
@@ -1146,6 +1355,21 @@ fn style_plain_button(button: &NSButton, prominent: bool) {
 
 fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
+}
+
+/// Clip origin, in the non-flipped document space the panel scrolls, that is
+/// `from_top` points below the first row. `None` means pin to the top.
+fn clip_y_for_offset(doc_height: f64, clip_height: f64, from_top: Option<f64>) -> f64 {
+    let top_y = (doc_height - clip_height).max(0.0);
+    match from_top {
+        Some(offset) => (top_y - offset.min(top_y)).max(0.0),
+        None => top_y,
+    }
+}
+
+/// Inverse of [`clip_y_for_offset`]: how far below the first row the viewport sits.
+fn offset_from_top(doc_height: f64, clip_height: f64, clip_y: f64) -> f64 {
+    ((doc_height - clip_height).max(0.0) - clip_y).max(0.0)
 }
 
 fn point_in_rect(point: NSPoint, frame: NSRect) -> bool {
@@ -1239,10 +1463,16 @@ define_class!(
 );
 
 impl MenuBarHoverChrome {
-    fn new(mtm: MainThreadMarker, frame: NSRect, corner_radius: f64) -> Retained<Self> {
+    fn new(
+        mtm: MainThreadMarker,
+        frame: NSRect,
+        corner_radius: f64,
+        tone: &NSColor,
+    ) -> Retained<Self> {
         let hover_fill = row_fill_box(
             rect(0.0, 0.0, frame.size.width, frame.size.height),
             HOVER_FILL_ALPHA,
+            tone,
             mtm,
         );
         hover_fill.setCornerRadius(corner_radius);
@@ -1338,10 +1568,12 @@ impl MenuBarBrandHit {
         mtm: MainThreadMarker,
         frame: NSRect,
         target: Retained<MenuBarTarget>,
+        tone: &NSColor,
     ) -> Retained<Self> {
         let hover_fill = row_fill_box(
             rect(0.0, 0.0, frame.size.width, frame.size.height),
             HOVER_FILL_ALPHA,
+            tone,
             mtm,
         );
         hover_fill.setCornerRadius(6.0);
@@ -1436,8 +1668,15 @@ impl MenuBarCloseHit {
         frame: NSRect,
         target: Retained<MenuBarTarget>,
         tag: isize,
+        tone: &NSColor,
+        tint: &NSColor,
     ) -> Retained<Self> {
-        let hover_fill = row_fill_box(rect(0.0, 0.0, CLOSE_HIT, CLOSE_HIT), HOVER_FILL_ALPHA, mtm);
+        let hover_fill = row_fill_box(
+            rect(0.0, 0.0, CLOSE_HIT, CLOSE_HIT),
+            HOVER_FILL_ALPHA,
+            tone,
+            mtm,
+        );
         hover_fill.setCornerRadius(CLOSE_RADIUS);
         hover_fill.setHidden(true);
 
@@ -1456,7 +1695,7 @@ impl MenuBarCloseHit {
         let glyph = NSImageView::imageViewWithImage(&close_xmark_image(), mtm);
         glyph.setFrame(rect(0.0, 0.0, CLOSE_HIT, CLOSE_HIT));
         glyph.setImageAlignment(NSImageAlignment::AlignCenter);
-        glyph.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
+        glyph.setContentTintColor(Some(tint));
         this.addSubview(&glyph);
         this
     }
@@ -1506,6 +1745,12 @@ define_class!(
                 )
             };
             self.addTrackingArea(&area);
+            // Scrolling slides rows under a stationary cursor. AppKit
+            // synthesizes mouseEntered: for each row that passes beneath it but
+            // does not reliably pair those with mouseExited:, so hover state
+            // accumulates and every scrolled-past row stays filled. Re-derive it
+            // from where the pointer actually is instead of trusting the events.
+            self.sync_hover_to_pointer();
         }
 
         #[unsafe(method(acceptsFirstMouse:))]
@@ -1572,6 +1817,23 @@ impl MenuBarHoverRow {
         });
         // SAFETY: designated NSView initializer.
         unsafe { msg_send![super(this), initWithFrame: frame] }
+    }
+
+    /// True when the pointer is over the part of this row the clip view is
+    /// actually showing. `visibleRect` is what makes a row scrolled off the top
+    /// or bottom of the panel stop counting as hovered.
+    fn pointer_is_inside(&self) -> bool {
+        let Some(window) = self.window() else {
+            return false;
+        };
+        let on_screen = NSRect::new(NSEvent::mouseLocation(), NSSize::new(0.0, 0.0));
+        let in_window = window.convertRectFromScreen(on_screen).origin;
+        let point = self.convertPoint_fromView(in_window, None);
+        point_in_rect(point, self.visibleRect())
+    }
+
+    fn sync_hover_to_pointer(&self) {
+        self.set_hovered(self.pointer_is_inside());
     }
 
     fn set_hovered(&self, hovered: bool) {
@@ -2008,6 +2270,62 @@ impl MenuBarTarget {
 mod tests {
     use super::*;
     use diri_ui::{Metrics, Space};
+
+    /// Selecting a row rebuilds the body, so without an anchor every click threw
+    /// the list back to the first project.
+    #[test]
+    fn rebuilding_the_list_keeps_the_viewport_where_the_user_left_it() {
+        let (doc, clip) = (400.0, 360.0);
+        let resting = clip_y_for_offset(doc, clip, None);
+        assert_eq!(
+            resting, 40.0,
+            "no anchor pins to the top of a scrollable list"
+        );
+
+        // Scrolled 25pt down, then rebuilt with the same content.
+        let scrolled = 15.0;
+        let offset = offset_from_top(doc, clip, scrolled);
+        assert_eq!(offset, 25.0);
+        assert_eq!(clip_y_for_offset(doc, clip, Some(offset)), scrolled);
+    }
+
+    #[test]
+    fn a_shrinking_list_clamps_instead_of_scrolling_past_its_own_end() {
+        // Parked 100pt down, then all but one row goes away.
+        let offset = offset_from_top(600.0, 360.0, 140.0);
+        assert_eq!(offset, 100.0);
+        assert_eq!(clip_y_for_offset(380.0, 360.0, Some(offset)), 0.0);
+
+        // Content shorter than the viewport has nowhere to scroll at all.
+        assert_eq!(clip_y_for_offset(120.0, 360.0, Some(offset)), 0.0);
+        assert_eq!(offset_from_top(120.0, 360.0, 0.0), 0.0);
+    }
+
+    /// The panel used to paint itself out of `NSColor`'s label family, which
+    /// tracks the macOS appearance rather than the workbench theme — so a
+    /// Dracula or Solarized diri handed its menu a stock grey panel.
+    #[test]
+    fn the_panel_palette_follows_the_workbench_theme() {
+        let dracula = MenuTheme::new("dracula".to_owned(), app_theme::sidebar_colors("dracula"));
+        let solarized = MenuTheme::new(
+            "solarized-dark".to_owned(),
+            app_theme::sidebar_colors("solarized-dark"),
+        );
+        assert_ne!(
+            app_theme::sidebar_colors("dracula").floating_surface(),
+            app_theme::sidebar_colors("solarized-dark").floating_surface(),
+            "two themes must not resolve to the same panel surface"
+        );
+        assert!(dracula.is_dark && solarized.is_dark);
+
+        // Light themes have to carry the appearance too, or AppKit keeps
+        // drawing a dark scroller over a light panel.
+        let light = MenuTheme::new(
+            "dirijor-light".to_owned(),
+            app_theme::sidebar_colors("dirijor-light"),
+        );
+        assert!(!light.is_dark);
+    }
 
     /// The panel hand-places what the sidebar lays out with flexbox, so the
     /// columns silently drift the moment a sidebar token changes.

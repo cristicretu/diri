@@ -26,6 +26,7 @@ const READ_BUFFER_BYTES: usize = 64 * 1024;
 const KEEPALIVE_CHECK_EVERY: Duration = Duration::from_secs(5);
 const PING_AFTER: Duration = Duration::from_secs(20);
 const DEAD_AFTER: Duration = Duration::from_secs(30);
+const CHUNK_QUEUE_CAPACITY: usize = 256;
 
 /// A decoded event from the daemon's authoritative terminal data channel.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,7 +45,7 @@ pub enum TerminalChunk {
 /// need a stream extension trait for the common one-at-a-time use case.
 #[derive(Debug)]
 pub struct AttachmentChunks {
-    receiver: mpsc::UnboundedReceiver<TerminalChunk>,
+    receiver: mpsc::Receiver<TerminalChunk>,
 }
 
 impl AttachmentChunks {
@@ -183,7 +184,11 @@ impl SessionAttachment {
         stream.write_all(&line).await?;
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
-        let (chunk_tx, chunk_rx) = mpsc::unbounded_channel();
+        // Bound decoded terminal work between the socket and UI. The daemon's
+        // PTY drain is independent of this connection, so brief UI stalls
+        // backpressure only the attach writer instead of growing client memory
+        // without limit.
+        let (chunk_tx, chunk_rx) = mpsc::channel(CHUNK_QUEUE_CAPACITY);
         let task = tokio::spawn(run_connection(stream, command_rx, chunk_tx));
 
         Ok(Self {
@@ -248,7 +253,7 @@ enum Command {
 async fn run_connection(
     mut stream: UnixStream,
     mut commands: mpsc::UnboundedReceiver<Command>,
-    chunks: mpsc::UnboundedSender<TerminalChunk>,
+    chunks: mpsc::Sender<TerminalChunk>,
 ) {
     let mut codec = FrameCodec::new();
     let mut read_buffer = vec![0_u8; READ_BUFFER_BYTES];
@@ -298,12 +303,15 @@ async fn run_connection(
 async fn process_incoming(
     frame: Frame,
     stream: &mut UnixStream,
-    chunks: &mpsc::UnboundedSender<TerminalChunk>,
+    chunks: &mpsc::Sender<TerminalChunk>,
 ) -> Result<(), ()> {
     match frame.frame_type {
         FrameType::Grid => {
             let update = frame.grid_payload().map_err(|_| ())?.ok_or(())?;
-            chunks.send(TerminalChunk::Grid(update)).map_err(|_| ())?;
+            chunks
+                .send(TerminalChunk::Grid(update))
+                .await
+                .map_err(|_| ())?;
         }
         FrameType::Modes => {
             let (alt_screen, mouse_reporting) = frame.modes_payload().ok_or(())?;
@@ -312,10 +320,11 @@ async fn process_incoming(
                     alt_screen,
                     mouse_reporting,
                 })
+                .await
                 .map_err(|_| ())?;
         }
         FrameType::Ping => write_frame(stream, &Frame::pong()).await.map_err(|_| ())?,
-        FrameType::Pong => chunks.send(TerminalChunk::Pong).map_err(|_| ())?,
+        FrameType::Pong => chunks.send(TerminalChunk::Pong).await.map_err(|_| ())?,
         // These byte-replay frames belong to the retired VT-parsing client.
         FrameType::Output | FrameType::ReplayBegin | FrameType::ReplayEnd => {}
         // The daemon does not send client-to-daemon frame types.

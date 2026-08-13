@@ -15,6 +15,7 @@
       "agy"
     ],
     "firstClass": true,
+    "catalogOrder": 30,
     "setup": {
       "url": "https://antigravity.google/docs/cli-install",
       "installHint": "Install agy with Google's platform installer.",

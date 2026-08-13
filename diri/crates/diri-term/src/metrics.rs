@@ -15,6 +15,13 @@ impl CellMetrics {
     #[must_use]
     pub fn measure(text_system: &TextSystem, font: &Font, font_size: Pixels) -> Self {
         let font_id = text_system.resolve_font(font);
+        Self::measure_font(text_system, font_id, font_size)
+    }
+
+    /// Measure an already-resolved font. Terminal renderers cache this value
+    /// by `(FontId, size)` so unchanged frames do no CoreText metric work.
+    #[must_use]
+    pub fn measure_font(text_system: &TextSystem, font_id: FontId, font_size: Pixels) -> Self {
         let cell_width = text_system
             .advance(font_id, font_size, 'M')
             .map_or(font_size * 0.6, |advance| advance.width);

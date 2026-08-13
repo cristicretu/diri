@@ -13,6 +13,7 @@
       "gemini-cli"
     ],
     "firstClass": true,
+    "catalogOrder": 50,
     "setup": {
       "url": "https://github.com/google-gemini/gemini-cli",
       "installHint": "Follow Google's Gemini CLI installation guide.",

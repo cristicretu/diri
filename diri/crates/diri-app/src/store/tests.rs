@@ -1737,6 +1737,8 @@ fn top_level_shortcuts_spawn_on_the_configured_default_host() {
         default_cwd: None,
         node: None,
     }]);
+    let default_agent = store.preferences().default_agent.clone();
+    store.set_agent_catalog(installed_catalog(Some("forge"), &default_agent));
     drain(&mut effects);
 
     store.spawn_default(super::SpawnOptions::default());
@@ -1747,6 +1749,121 @@ fn top_level_shortcuts_spawn_on_the_configured_default_host() {
     };
     assert_eq!(params.host.as_deref(), Some("forge"));
     assert_eq!(params.cwd, "~");
+}
+
+/// Readiness facts in which `kind` is installed on `host`, so `spawn_default`
+/// has something to resolve against instead of declining.
+fn installed_catalog(host: Option<&str>, kind: &AgentKind) -> AgentReadinessResult {
+    AgentReadinessResult {
+        host: host.map(str::to_owned),
+        agents: vec![AgentReadinessItem {
+            kind: kind.clone(),
+            binary: kind.id().to_owned(),
+            path: Some(format!("/usr/local/bin/{}", kind.id())),
+            show_in_quick_create: true,
+            ..AgentReadinessItem::default()
+        }],
+        ..AgentReadinessResult::default()
+    }
+}
+
+#[test]
+fn the_default_shortcut_declines_and_rescans_when_readiness_is_unknown() {
+    let (mut store, mut effects) = SessionStore::headless(Prefs {
+        default_spawn_host: Some("forge".into()),
+        ..Prefs::default()
+    });
+    store.set_hosts(vec![diri_proto::HostEntry {
+        id: "forge".into(),
+        name: Some("Forge".into()),
+        ssh: "forge".into(),
+        default_cwd: None,
+        node: None,
+    }]);
+    drain(&mut effects);
+
+    // Forge has never been scanned. Resolving that to Terminal would launch a
+    // shell the user never chose — and, because a failed scan is remembered,
+    // would keep doing so for as long as the app runs.
+    assert!(!store.spawn_default(super::SpawnOptions::default()));
+    assert_eq!(
+        effects.try_recv().ok(),
+        Some(StoreEffect::RefreshAgents {
+            host: Some("forge".into()),
+            force: false
+        }),
+        "declining must re-arm the scan so the next press decides on real facts"
+    );
+    assert!(
+        store
+            .action_failure()
+            .is_some_and(|failure| failure.detail.contains("Forge")),
+        "the refusal has to be visible, not a shortcut that does nothing"
+    );
+
+    store.set_agent_catalog(installed_catalog(
+        Some("forge"),
+        &store.preferences().default_agent.clone(),
+    ));
+    drain(&mut effects);
+
+    assert!(store.spawn_default(super::SpawnOptions::default()));
+    assert!(matches!(effects.try_recv(), Ok(StoreEffect::Spawn(_))));
+}
+
+#[test]
+fn default_shortcut_never_launches_an_agent_unavailable_on_its_target() {
+    let (mut store, mut effects) = SessionStore::headless(Prefs {
+        default_agent: AgentKind::new("saved-agent"),
+        default_spawn_host: Some("forge".into()),
+        ..Prefs::default()
+    });
+    store.set_hosts(vec![diri_proto::HostEntry {
+        id: "forge".into(),
+        name: Some("Forge".into()),
+        ssh: "forge".into(),
+        default_cwd: None,
+        node: None,
+    }]);
+    store.set_agent_catalog(AgentReadinessResult {
+        host: Some("forge".into()),
+        agents: vec![
+            AgentReadinessItem {
+                kind: AgentKind::new("saved-agent"),
+                binary: "saved-agent".into(),
+                path: None,
+                descriptor: Some(AgentDescriptor {
+                    id: "saved-agent".into(),
+                    display_name: "Saved Agent".into(),
+                    ..AgentDescriptor::default()
+                }),
+                ..AgentReadinessItem::default()
+            },
+            AgentReadinessItem {
+                kind: AgentKind::new("installed-agent"),
+                binary: "installed-agent".into(),
+                path: Some("/bin/installed-agent".into()),
+                show_in_quick_create: true,
+                descriptor: Some(AgentDescriptor {
+                    id: "installed-agent".into(),
+                    display_name: "Installed Agent".into(),
+                    ..AgentDescriptor::default()
+                }),
+                ..AgentReadinessItem::default()
+            },
+        ],
+        ..AgentReadinessResult::default()
+    });
+    drain(&mut effects);
+
+    store.spawn_default(super::SpawnOptions::default());
+
+    let params = match effects.try_recv() {
+        Ok(StoreEffect::Spawn(params)) => params,
+        other => panic!("expected spawn effect, got {other:?}"),
+    };
+    assert_eq!(params.kind, AgentKind::new("installed-agent"));
+    assert_eq!(params.host.as_deref(), Some("forge"));
 }
 
 #[test]
@@ -1794,8 +1911,12 @@ fn a_remote_default_host_round_trips_back_to_local() {
 
     assert_eq!(store.default_spawn_host(), None);
     assert_eq!(Prefs::load(&path).unwrap().default_spawn_host, None);
+    store.set_agent_catalog(installed_catalog(
+        None,
+        &store.preferences().default_agent.clone(),
+    ));
     drain(&mut effects);
-    store.spawn_default(super::SpawnOptions::default());
+    assert!(store.spawn_default(super::SpawnOptions::default()));
     let params = match effects.try_recv() {
         Ok(StoreEffect::Spawn(params)) => params,
         other => panic!("expected spawn effect, got {other:?}"),

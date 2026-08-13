@@ -44,6 +44,8 @@ jobs:
         run: cargo test --workspace
       - name: Remote Holder acceptance and latency gates
         run: scripts/remote-acceptance.sh
+      - name: Terminal interaction and rendering hot-path gates
+        run: scripts/terminal-perf-gate.sh
       - name: Release build
         run: cargo build --workspace --release
 

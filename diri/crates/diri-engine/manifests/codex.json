@@ -13,6 +13,7 @@
       "openai-codex"
     ],
     "firstClass": true,
+    "catalogOrder": 20,
     "setup": {
       "url": "https://developers.openai.com/codex/cli/",
       "installHint": "Follow OpenAI's Codex CLI installation guide.",

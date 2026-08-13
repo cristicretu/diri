@@ -554,23 +554,58 @@ fn set_executable(path: &Path) {
 }
 
 #[cfg(unix)]
-/// Rust-owned base catalog next to the executable, then user overrides, then
-/// the source-tree fallback used by loose development binaries.
+/// Selects exactly one Rust-owned base catalog, then applies user overrides.
+/// An explicit development catalog wins; otherwise packaged builds use their
+/// count-checked sibling or platform resource catalog, and loose builds fall
+/// back to the source tree.
+/// Base catalogs must never be merged because that could produce a catalog
+/// different from the one identified when this Engine binary was built.
 fn load_manifests(exe_dir: &Path, overrides: &Path) -> (ManifestEngine, Vec<String>) {
-    let mut bases: Vec<PathBuf> = Vec::new();
-    if let Ok(configured) = std::env::var("DIRI_MANIFESTS_DIR") {
-        bases.push(PathBuf::from(configured));
-    }
-    bases.push(exe_dir.join("manifests"));
-    bases.push(DirijorPaths::packaged_resources(exe_dir.join("dirijord-rs")).join("manifests"));
-    bases.push(diri_engine::detect::bundled_manifest_dir());
-    let base = bases.into_iter().find(|dir| dir.is_dir());
+    let configured = std::env::var_os("DIRI_MANIFESTS_DIR").map(PathBuf::from);
+    load_manifests_from(
+        exe_dir,
+        overrides,
+        configured.as_deref(),
+        &diri_engine::detect::bundled_manifest_dir(),
+    )
+}
 
-    let mut dirs: Vec<&Path> = Vec::new();
-    if let Some(base) = &base {
-        dirs.push(base);
+#[cfg(unix)]
+fn load_manifests_from(
+    exe_dir: &Path,
+    overrides: &Path,
+    configured: Option<&Path>,
+    source_catalog: &Path,
+) -> (ManifestEngine, Vec<String>) {
+    let sibling = exe_dir.join("manifests");
+    let packaged = DirijorPaths::packaged_resources(exe_dir.join("dirijord-rs")).join("manifests");
+    // A configured directory that does not exist is a misconfiguration, not an
+    // instruction to run without Agents: an empty catalog silently costs every
+    // session its status detection and leaves the client with Terminal only.
+    // Say so and continue down the normal search order.
+    let configured = configured.filter(|configured| {
+        configured.is_dir() || {
+            eprintln!(
+                "dirijord-rs: DIRI_MANIFESTS_DIR={} is not a directory; using the built-in catalog",
+                configured.display()
+            );
+            false
+        }
+    });
+    let base = configured.map(Path::to_path_buf).or_else(|| {
+        sibling.is_dir().then_some(sibling).or_else(|| {
+            packaged.is_dir().then_some(packaged).or_else(|| {
+                source_catalog
+                    .is_dir()
+                    .then(|| source_catalog.to_path_buf())
+            })
+        })
+    });
+
+    let mut dirs = base.iter().map(PathBuf::as_path).collect::<Vec<_>>();
+    if overrides.is_dir() {
+        dirs.push(&overrides);
     }
-    dirs.push(overrides);
     ManifestEngine::load_dirs(&dirs).unwrap_or_else(|error| {
         eprintln!("dirijord-rs: manifest load: {error}");
         (ManifestEngine::new(Vec::new()), Vec::new())
@@ -731,6 +766,74 @@ mod tests {
         install_cli_resource_bundle(&source, &bin);
         assert!(!installed.join("cursor.json").exists());
         assert!(installed.join("codex.json").exists());
+    }
+
+    #[test]
+    fn adjacent_catalog_is_not_merged_with_the_source_catalog() {
+        let temporary = tempfile::tempdir().expect("temp");
+        let exe_dir = temporary.path().join("bin");
+        let adjacent = exe_dir.join("manifests");
+        let app_support = temporary.path().join("support");
+        std::fs::create_dir_all(&adjacent).expect("adjacent catalog");
+        std::fs::copy(
+            diri_engine::detect::bundled_manifest_dir().join("codex.json"),
+            adjacent.join("codex.json"),
+        )
+        .expect("copy adjacent manifest");
+
+        let source_catalog = diri_engine::detect::bundled_manifest_dir();
+        let (engine, failed) = load_manifests_from(&exe_dir, &app_support, None, &source_catalog);
+
+        assert!(failed.is_empty(), "manifests failed to load: {failed:?}");
+        assert!(
+            engine.manifest("codex").is_some(),
+            "the adjacent packaged catalog must be selected"
+        );
+        assert!(
+            engine.manifest("pi").is_none(),
+            "a source-tree catalog must not be merged into an adjacent packaged catalog"
+        );
+        assert_eq!(engine.ids(), ["codex"]);
+    }
+
+    #[test]
+    fn loose_build_uses_source_catalog_when_no_adjacent_catalog_exists() {
+        let temporary = tempfile::tempdir().expect("temp");
+        let exe_dir = temporary.path().join("bin");
+        let app_support = temporary.path().join("support");
+        let source_catalog = diri_engine::detect::bundled_manifest_dir();
+
+        let (engine, failed) = load_manifests_from(&exe_dir, &app_support, None, &source_catalog);
+
+        assert!(failed.is_empty(), "manifests failed to load: {failed:?}");
+        for id in ["claude-code", "codex", "cursor", "gemini", "pi", "shell"] {
+            assert!(
+                engine.manifest(id).is_some(),
+                "the source catalog must supply {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_configured_catalog_that_does_not_exist_falls_back_to_the_source_catalog() {
+        let temporary = tempfile::tempdir().expect("temp");
+        let exe_dir = temporary.path().join("bin");
+        let app_support = temporary.path().join("support");
+        let missing = temporary.path().join("typo-manifests");
+        let source_catalog = diri_engine::detect::bundled_manifest_dir();
+
+        let (engine, failed) = load_manifests_from(
+            &exe_dir,
+            &app_support,
+            Some(missing.as_path()),
+            &source_catalog,
+        );
+
+        assert!(failed.is_empty(), "manifests failed to load: {failed:?}");
+        assert!(
+            engine.manifest("claude-code").is_some(),
+            "a stale DIRI_MANIFESTS_DIR must not strand the daemon with an empty catalog"
+        );
     }
 
     #[test]

@@ -10,6 +10,7 @@ mod daemon_launch;
 mod dev_build;
 mod diagnostics;
 pub mod diff;
+mod external_drop;
 pub mod fonts;
 pub mod fuzzy;
 mod git_review;

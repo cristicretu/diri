@@ -106,16 +106,23 @@ const LIVENESS_INTERVAL: Duration = Duration::from_secs(2);
 /// flickering. A terminal emulator never shows that state because its reader
 /// drains everything queued before it renders. Draining alone is not enough
 /// here: the daemon is usually parked in `poll` and wakes on the *first* write
-/// of a repaint, with the rest microseconds behind. This is the quiet window
-/// that lets the rest arrive. It is only ever waited out by a screen that
-/// just lost content, so typed echo is not slowed by it.
-const OUTPUT_SETTLE: Duration = Duration::from_millis(3);
+/// of a repaint, with the rest usually microseconds behind but occasionally a
+/// scheduler quantum behind on a loaded machine. This is the quiet window that
+/// lets the rest arrive. It is only ever waited out by a screen that just lost
+/// content, so typed echo and additive scrolling are not slowed by it. The
+/// wait returns as soon as bytes arrive; 16 ms is only its worst-case ceiling.
+const OUTPUT_SETTLE: Duration = Duration::from_millis(16);
 
 /// Ceiling on how long one batch may hold back a repaint. Output that never
 /// goes quiet (a build log) would otherwise wait on `OUTPUT_SETTLE` forever.
-/// Well under the 16ms grid flush interval, so continuous streaming publishes
-/// at exactly the same rate it did before.
+/// One 120 Hz display interval, so continuous streaming cannot be held longer
+/// than the renderer's own frame cadence.
 const OUTPUT_BATCH_CEILING: Duration = Duration::from_millis(8);
+
+/// A destructive repaint gets one 60 Hz interval to recover from an erase.
+/// This is deliberately separate from [`OUTPUT_BATCH_CEILING`], so a build log
+/// that continuously adds content still publishes at up to 120 Hz.
+const OUTPUT_REPAINT_CEILING: Duration = Duration::from_millis(16);
 
 /// Byte ceiling on one batch, matching `alacritty_terminal`'s
 /// `MAX_LOCKED_READ`. A child that writes faster than it can be parsed must
@@ -215,6 +222,9 @@ struct Shared {
     /// Seconds since UNIX_EPOCH of the last attach-pump poll or input write.
     /// Keeps interactive sessions on the fast quiet-tick.
     last_hot: AtomicU64,
+    /// Unlike `last_hot`, starts cold: restored/background sessions should not
+    /// receive interactive scheduler priority until actually attached or used.
+    last_interaction: AtomicU64,
     /// URLs scanned off the visible screen (PRs, previews, links).
     artifacts: Mutex<Vec<diri_proto::SessionArtifact>>,
     /// True while the child tree is SIGSTOPped. Writing into a stopped
@@ -244,19 +254,26 @@ impl Shared {
     }
 
     fn note_hot(&self) {
-        self.last_hot.store(unix_secs(), Ordering::Relaxed);
+        let now = unix_secs();
+        self.last_hot.store(now, Ordering::Relaxed);
+        self.last_interaction.store(now, Ordering::Relaxed);
     }
 
     /// Fast quiet-tick while the session is attached/touched or Working;
     /// everything else can wait a second.
     fn wants_fast_tick(&self) -> bool {
-        if unix_secs().saturating_sub(self.last_hot.load(Ordering::Relaxed)) <= HOT_WINDOW_SECS {
+        if self.was_recently_touched() {
             return true;
         }
         matches!(
             *self.status.lock().expect("status"),
             SessionStatus::Working | SessionStatus::Starting
         )
+    }
+
+    fn was_recently_touched(&self) -> bool {
+        let last = self.last_interaction.load(Ordering::Relaxed);
+        last != 0 && unix_secs().saturating_sub(last) <= HOT_WINDOW_SECS
     }
 
     fn quiet_tick(&self) -> Duration {
@@ -1395,10 +1412,8 @@ impl Session {
         // so the echo renders promptly.
         self.shared.note_hot();
         if !bytes.is_empty() {
-            // The next grid changes are likely a trailing echo already in
-            // flight and the TUI's response. Let the attachment pump interrupt
-            // its background coalescing wait instead of making typed input
-            // cross a 16 ms frame boundary before the host can render it.
+            // Let the attachment pump interrupt a background coalescing wait
+            // instead of making typed input cross an 8 ms frame boundary.
             self.shared.grid_wake.prioritize_interactive_changes();
         }
         self.observe_prompt_input(bytes);
@@ -1656,6 +1671,7 @@ fn new_shared(spec: &SessionSpec, log: OutputLog, engine: &ManifestEngine) -> Ar
         stop: AtomicBool::new(false),
         state_version: AtomicU64::new(0),
         last_hot: AtomicU64::new(unix_secs()),
+        last_interaction: AtomicU64::new(0),
         artifacts: Mutex::new(Vec::new()),
         hibernated: AtomicBool::new(false),
         queued_input: Mutex::new(Vec::new()),
@@ -2351,7 +2367,9 @@ fn feed_output_batch(
     buffer: &mut [u8],
     first: usize,
 ) -> bool {
-    let deadline = Instant::now() + OUTPUT_BATCH_CEILING;
+    let started_at = Instant::now();
+    let batch_deadline = started_at + OUTPUT_BATCH_CEILING;
+    let repaint_deadline = started_at + OUTPUT_REPAINT_CEILING;
     let mut count = first;
     let mut total = 0usize;
     let mut filled_before = None;
@@ -2370,6 +2388,11 @@ fn feed_output_batch(
         };
         total += count;
 
+        let deadline = if mid_repaint {
+            repaint_deadline
+        } else {
+            batch_deadline
+        };
         let remaining = deadline.saturating_duration_since(Instant::now());
         if total >= OUTPUT_BATCH_BYTES || remaining.is_zero() {
             return false;
@@ -2504,6 +2527,7 @@ fn pump_held(
     let mut last_scan_at = None;
     let mut last_scan_seq = 0u64;
     let mut exit_status: Option<HolderExitStatus> = None;
+    let mut interactive_qos = false;
     // Set while a repaint is being assembled across more than one log read.
     let mut publish_pending: Option<Instant> = None;
     // Until the tail is first caught up, bytes are history, not activity:
@@ -2550,6 +2574,11 @@ fn pump_held(
                     &marker_buffer,
                     &mut last_checkpoint_key,
                 );
+            }
+            let should_be_interactive = shared.was_recently_touched();
+            if should_be_interactive != interactive_qos {
+                set_current_thread_interactive(should_be_interactive);
+                interactive_qos = should_be_interactive;
             }
             // Quiet: block on the log watcher, which wakes the instant the
             // holder appends — the tick interval is only the ceiling for
@@ -2656,6 +2685,10 @@ fn pump_held(
         }
     }
 
+    if interactive_qos {
+        set_current_thread_interactive(false);
+    }
+
     // A repaint still being assembled when the holder exited is the last thing
     // clients will ever see of this session: publish it.
     if publish_pending.take().is_some() {
@@ -2696,6 +2729,25 @@ fn pump_held(
     apply(&shared, &outcome);
     shared.exited.store(true, Ordering::SeqCst);
 }
+
+/// The held-output follower is on the input-to-pixel path while a terminal is
+/// attached, but the same thread may later follow background work. Raise its
+/// Apple QoS only for the existing hot window and restore the default class
+/// when it cools; other platforms keep their native scheduler behavior.
+#[cfg(target_vendor = "apple")]
+fn set_current_thread_interactive(interactive: bool) {
+    let qos = if interactive {
+        libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE
+    } else {
+        libc::qos_class_t::QOS_CLASS_DEFAULT
+    };
+    // SAFETY: this changes only the calling thread's QoS class. Priority zero
+    // is the documented relative priority for both selected classes.
+    let _ = unsafe { libc::pthread_set_qos_class_self_np(qos, 0) };
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn set_current_thread_interactive(_interactive: bool) {}
 
 /// Records a deferred launch that never produced a child: the session
 /// reports exit 127, the spawn-failure convention the app already knows.

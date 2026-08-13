@@ -421,17 +421,37 @@ and sequence. Scrollback is bounded to 4 MiB and served on demand through
 `Scroll`. Raw output is bounded to 32 MiB.
 
 The PTY reader must never block on a client. The Holder uses bounded queues. It
-coalesces background output for no more than 16 ms, while up to two grid
+coalesces background output for no more than 8 ms, while up to two grid
 publications after interactive input bypass that wait (one trailing publication
-may already be in flight before the actual response). When no client is
-attached, it continues parsing terminal state but does not construct or
-serialize diffs. If an attached client falls behind, stale updates are discarded
-and the connection is reseeded from a complete snapshot after reconnect.
+may already be in flight before the actual response). If a destructive repaint
+temporarily removes screen content, the Holder instead gives its redraw bytes up
+to 16 ms to arrive, returning immediately when they do. That longer ceiling is
+isolated from typed echo and additive scrolling. When no client is attached, it
+continues parsing terminal state but does not construct or serialize diffs. If
+an attached client falls behind, stale updates are discarded and the connection
+is reseeded from a complete snapshot after reconnect.
 
 One owner/event loop handles PTY drain, terminal parsing, diff construction, and
 attach writes. The hot path does not put an `Arc<Mutex<Terminal>>` across tasks.
 Buffers are reused where practical, and idle Holders do not poll, heartbeat, or
 run GC.
+
+### Local Holder input compatibility
+
+The durable local Holder is outside the remote Helper wire protocol, but it
+shares the survival invariant: an application upgrade must not abandon a live
+Holder and Agent. Local input therefore starts with an additive `streamVersion`
+negotiation over the legacy JSON request interface. A new Holder accepts version
+1 and keeps the Unix connection open for bounded binary input and resize frames,
+acknowledging each operation. An old live Holder rejects the unknown operation
+in its normal way; the new client then pins that Holder to legacy JSON/base64
+requests. Control and lifecycle operations remain independent request/response
+connections. A stream error after a frame may have reached the PTY is reported
+without retry, so a keystroke can never be duplicated. On Apple platforms the
+dedicated input thread uses interactive QoS so persistence does not trade a
+faster socket acknowledgement for slower end-to-grid delivery. The local
+daemon's held-output follower is raised only while the session is recently
+attached or receiving input, then returns to default QoS.
 
 ## Controller lease
 

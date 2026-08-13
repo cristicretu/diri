@@ -176,6 +176,30 @@ pub struct GridUpdate {
 }
 
 impl GridUpdate {
+    /// Folds a newer contiguous update into this one while preserving the
+    /// exact final grid. The newest row wins; a new snapshot or geometry
+    /// replaces everything before it. This is the safe primitive used to
+    /// collapse transport bursts before touching the renderer.
+    pub fn coalesce(&mut self, newer: Self) {
+        if newer.is_full_snapshot || newer.cols != self.cols || newer.rows != self.rows {
+            *self = newer;
+            return;
+        }
+        self.cursor_col = newer.cursor_col;
+        self.cursor_row = newer.cursor_row;
+        self.cursor_visible = newer.cursor_visible;
+        for row in newer.changed_rows {
+            // Decoding intentionally accepts duplicate row ids. Sequential
+            // application makes the last one authoritative, so remove every
+            // older occurrence before appending the newer row.
+            self.changed_rows.retain(|existing| existing.y != row.y);
+            self.changed_rows.push(row);
+        }
+        // Stable ordering preserves the original last-write-wins meaning for
+        // any untouched duplicate rows in an accepted input update.
+        self.changed_rows.sort_by_key(|row| row.y);
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>, GridCodecError> {
         let row_count = u16::try_from(self.changed_rows.len())
             .map_err(|_| GridCodecError::TooManyRows(self.changed_rows.len()))?;
@@ -292,7 +316,11 @@ impl GridRowCodec {
             return Err(GridCodecError::TooManyCells(cells.len()));
         }
 
-        let mut runs = Vec::new();
+        // Reserve the run-count field and backfill it after writing runs
+        // directly into the caller's buffer. The old implementation allocated
+        // and copied a temporary Vec for every changed terminal row.
+        let count_offset = encoded.len();
+        encoded.extend_from_slice(&0_u16.to_be_bytes());
         let mut run_count = 0_u16;
         let mut index = 0;
         while index < cells.len() {
@@ -303,16 +331,15 @@ impl GridRowCodec {
                 repeat += 1;
                 next += 1;
             }
-            put_u16(&mut runs, repeat);
-            put_u32(&mut runs, cell.scalar);
-            put_u32(&mut runs, cell.fg.packed());
-            put_u32(&mut runs, cell.bg.packed());
-            put_u16(&mut runs, cell.style.bits());
+            put_u16(encoded, repeat);
+            put_u32(encoded, cell.scalar);
+            put_u32(encoded, cell.fg.packed());
+            put_u32(encoded, cell.bg.packed());
+            put_u16(encoded, cell.style.bits());
             run_count += 1;
             index = next;
         }
-        put_u16(encoded, run_count);
-        encoded.extend_from_slice(&runs);
+        encoded[count_offset..count_offset + 2].copy_from_slice(&run_count.to_be_bytes());
         Ok(())
     }
 
@@ -514,6 +541,59 @@ mod tests {
         let encoded = update.encode().unwrap();
         assert_eq!(encoded, expected);
         assert_eq!(GridUpdate::decode(&encoded).unwrap(), update);
+    }
+
+    #[test]
+    fn coalescing_contiguous_updates_preserves_the_final_grid() {
+        let blank = vec![GridCell::BLANK; 3];
+        let mut first = GridUpdate {
+            cols: 3,
+            rows: 2,
+            cursor_col: 0,
+            cursor_row: 0,
+            cursor_visible: true,
+            is_full_snapshot: true,
+            changed_rows: vec![
+                ChangedRow::new(0, blank.clone()),
+                ChangedRow::new(1, blank.clone()),
+            ],
+        };
+        let mut row_zero = blank.clone();
+        row_zero[0].scalar = u32::from('a');
+        let second = GridUpdate {
+            cols: 3,
+            rows: 2,
+            cursor_col: 1,
+            cursor_row: 0,
+            cursor_visible: true,
+            is_full_snapshot: false,
+            changed_rows: vec![ChangedRow::new(0, row_zero)],
+        };
+        let mut row_one = blank;
+        row_one[0].scalar = u32::from('b');
+        let third = GridUpdate {
+            cols: 3,
+            rows: 2,
+            cursor_col: 1,
+            cursor_row: 1,
+            cursor_visible: false,
+            is_full_snapshot: false,
+            changed_rows: vec![ChangedRow::new(1, row_one)],
+        };
+
+        let mut sequential = Vec::new();
+        first.apply(&mut sequential);
+        second.apply(&mut sequential);
+        third.apply(&mut sequential);
+
+        first.coalesce(second);
+        first.coalesce(third);
+        let mut coalesced = Vec::new();
+        first.apply(&mut coalesced);
+        assert_eq!(coalesced, sequential);
+        assert_eq!((first.cursor_col, first.cursor_row), (1, 1));
+        assert!(!first.cursor_visible);
+        assert!(first.is_full_snapshot);
     }
 
     #[test]

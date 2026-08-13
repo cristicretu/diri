@@ -27,7 +27,12 @@ use crate::registry::Registry;
 
 /// Identifies this engine in the handshake, so a client can tell which
 /// implementation it reached.
-pub const BUILD: &str = concat!("diri-engine-", env!("CARGO_PKG_VERSION"));
+pub const BUILD: &str = concat!(
+    "diri-engine-",
+    env!("CARGO_PKG_VERSION"),
+    "+catalog.",
+    env!("DIRI_AGENT_CATALOG_BUILD_ID")
+);
 
 #[cfg(target_os = "macos")]
 const fn default_shell() -> &'static str {
@@ -2268,17 +2273,23 @@ impl ControlServer {
                 .filter_map(|id| {
                     let descriptor = engine.manifest(id)?.agent.as_ref()?;
                     let binary = descriptor.binary.clone()?;
-                    Some((id.to_owned(), binary, engine.raw_agent(id).cloned()))
+                    Some((
+                        id.to_owned(),
+                        binary,
+                        descriptor.catalog_order.unwrap_or(u16::MAX),
+                        engine.raw_agent(id).cloned(),
+                    ))
                 })
                 .collect::<Vec<_>>();
-            manifests.sort_by(|left, right| left.0.cmp(&right.0));
+            manifests
+                .sort_by(|left, right| left.2.cmp(&right.2).then_with(|| left.0.cmp(&right.0)));
             manifests
         };
         let preferences = {
             let catalog = self.agent_catalog.lock().map_err(poisoned)?;
             manifests
                 .iter()
-                .map(|(id, _, _)| catalog.preference(params.host.as_deref(), id))
+                .map(|(id, _, _, _)| catalog.preference(params.host.as_deref(), id))
                 .collect::<Vec<_>>()
         };
 
@@ -2295,7 +2306,7 @@ impl ControlServer {
                         queries: manifests
                             .iter()
                             .zip(&preferences)
-                            .map(|((id, binary, _), preference)| {
+                            .map(|((id, binary, _, _), preference)| {
                                 diri_proto::remote_pty::ExecutableQuery {
                                     id: id.clone(),
                                     binary: binary.clone(),
@@ -2315,7 +2326,7 @@ impl ControlServer {
                 .collect::<std::collections::HashMap<_, _>>();
             manifests
                 .iter()
-                .map(|(id, _, _)| {
+                .map(|(id, _, _, _)| {
                     let item = by_id.get(id);
                     crate::agent_catalog::ExecutableResolution {
                         detected_path: item.and_then(|item| item.detected_path.clone()),
@@ -2328,7 +2339,7 @@ impl ControlServer {
             manifests
                 .iter()
                 .zip(&preferences)
-                .map(|((_, binary, _), preference)| {
+                .map(|((_, binary, _, _), preference)| {
                     crate::agent_catalog::resolve_local(
                         binary,
                         preference.executable_path.as_deref(),
@@ -2338,7 +2349,7 @@ impl ControlServer {
         };
 
         let mut agents = Vec::with_capacity(manifests.len());
-        for (((id, binary, raw_descriptor), preference), resolution) in
+        for (((id, binary, _, raw_descriptor), preference), resolution) in
             manifests.into_iter().zip(preferences).zip(resolutions)
         {
             let path = resolution
@@ -3328,6 +3339,12 @@ mod tests {
                 .is_some_and(|b| b.contains("diri-engine")),
             "the handshake should say which engine answered: {result}"
         );
+        assert!(
+            result["build"]
+                .as_str()
+                .is_some_and(|build| build.contains("+catalog.")),
+            "manifest changes must alter the daemon identity: {result}"
+        );
         assert!(result["pid"].as_i64().is_some_and(|pid| pid > 0));
         assert_eq!(result["engineKind"], diri_proto::RUST_ENGINE_KIND);
         assert_eq!(
@@ -3820,7 +3837,25 @@ mod tests {
         let server = server(temp.path());
         let result = ok_of(call(&server, "agent.readiness", None));
         let agents = result["agents"].as_array().expect("agents");
-        assert!(!agents.is_empty());
+        // Readiness is the whole supported catalog, not just what happens to be
+        // installed. Naming manifests keeps that honest when one is retired; a
+        // count threshold would only ever be quietly loosened.
+        for id in ["claude-code", "codex", "cursor", "gemini", "amp", "pi"] {
+            assert!(
+                agents.iter().any(|agent| agent["kind"] == id),
+                "readiness must expose the supported Agent {id}"
+            );
+        }
+        assert_eq!(
+            agents
+                .iter()
+                .take(5)
+                .filter_map(|agent| agent["kind"].as_str())
+                .collect::<Vec<_>>(),
+            ["claude-code", "codex", "antigravity", "cursor", "gemini"],
+            "every first-class Agent needs an explicit catalogOrder, or it falls \
+             into the alphabetical tail behind Agents most users never install"
+        );
         let claude = agents
             .iter()
             .find(|agent| agent["kind"] == "claude-code")
@@ -3837,6 +3872,12 @@ mod tests {
                 .unwrap_or(false),
             "the raw manifest descriptor rides along: {claude}"
         );
+        let pi = agents
+            .iter()
+            .find(|agent| agent["kind"] == "pi")
+            .expect("Pi remains in Settings even when its executable is absent");
+        assert_eq!(pi["binary"], "pi");
+        assert_eq!(pi["descriptor"]["displayName"], "Pi");
     }
 
     #[test]

@@ -51,8 +51,8 @@ pub(crate) fn is_auxiliary_terminal(session: &SessionRecord) -> bool {
 
 // Session titles, badges, and sidebar metadata change at human speed. Publishing
 // daemon bursts at display refresh rate rebuilt the whole sidebar 60 times/sec
-// while several agents were working; terminal grids retain their independent
-// 20fps direct path.
+// while several agents were working. Terminal grids bypass store publication:
+// the selected pane invalidates directly and GPUI presents on its display link.
 const UI_PUBLISH_INTERVAL: Duration = Duration::from_millis(50);
 
 // A stalled remote scan may be overlapped by exactly one forced rescan. Beyond
@@ -1924,11 +1924,49 @@ impl SessionStore {
         self.emit(StoreEffect::ReopenLast);
     }
 
-    pub fn spawn_default(&mut self, mut options: SpawnOptions) {
+    /// Spawns the Agent this target resolves the saved default to. Returns
+    /// whether a session was actually requested.
+    ///
+    /// Missing readiness facts are not a licence to substitute a shell: a
+    /// remote catalog is warmed asynchronously after connect and a failed scan
+    /// is remembered, so resolving `None` to Terminal would silently launch
+    /// something the user never chose — potentially forever. The request is
+    /// declined instead, and the scan is (re)armed so the next press decides on
+    /// real facts. Callers that own a shortcut surface the refusal; `⌘T` opens
+    /// the launcher, where the choice is visible and editable.
+    pub fn spawn_default(&mut self, mut options: SpawnOptions) -> bool {
         if options.host.is_none() && options.cwd.is_none() && options.same_repo_as.is_none() {
             options.host = self.default_spawn_host();
         }
-        self.spawn_kind(self.prefs.default_agent.clone(), options);
+        let target_host = options.host.clone();
+        if self.agent_catalog(target_host.as_deref()).is_none() {
+            let target = target_host
+                .as_deref()
+                .map_or_else(|| "this Mac".to_owned(), |id| self.host_display_name(id));
+            // A recorded failure suppresses passive requests, so a shortcut
+            // press — an explicit user action — retries the way Settings'
+            // Refresh does. Otherwise it just joins the in-flight scan.
+            let failed = self.agent_catalog_error(target_host.as_deref());
+            let detail = failed.map_or_else(
+                || format!("Checking which Agents are installed on {target}."),
+                |error| format!("Could not check which Agents are installed on {target}: {error}"),
+            );
+            let force = failed.is_some();
+            self.last_action_failure = Some(ActionFailure {
+                title: "No Agent to launch yet".to_owned(),
+                detail,
+                retrying: false,
+                retry: None,
+            });
+            self.request_agent_catalog(target_host, force);
+            return false;
+        }
+        let kind = crate::agent_catalog::resolved_target_agent(
+            &self.prefs.default_agent,
+            self.agent_catalog(target_host.as_deref()),
+        );
+        self.spawn_kind(kind, options);
+        true
     }
 
     pub fn spawn_shell(&mut self, mut options: SpawnOptions) {
@@ -2579,6 +2617,13 @@ impl StoreRuntime {
     /// while daemon/store state is unchanged.
     pub fn changes(&self) -> broadcast::Receiver<()> {
         self.change_tx.subscribe()
+    }
+
+    /// Publishes a synchronous local store mutation to views that subscribe to
+    /// the runtime's invalidation stream. Daemon events already do this in the
+    /// coalescing task; settings saves use this path after updating preferences.
+    pub fn publish_local_change(&self) {
+        let _ = self.change_tx.send(());
     }
 
     pub fn client(&self) -> &Arc<DaemonClient> {

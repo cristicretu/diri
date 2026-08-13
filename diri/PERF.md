@@ -29,6 +29,68 @@ cargo build -p diri-app --release
 The shared target is measurement/build cache only. It must never be packaged or
 shipped.
 
+## Terminal interaction hot path (2026-08-13)
+
+Release-mode measurements below compare untouched `main` at `39af365` with the
+terminal performance branch on the same Apple Silicon Mac running macOS 26.5.2.
+The terminal-state fixture is 160×50 and reports the median of five 5,000-
+interaction rounds. The renderer fixture scrolls the same 160×50 build log
+through GPUI's production text system and the real headless Metal renderer.
+The input-to-grid fixture reports the median of 101 echoed writes, long enough
+to include the viewport's scrolling phase.
+
+| Interaction | `main` | Optimized | Change |
+| --- | ---: | ---: | ---: |
+| Prompt typing, parser through grid diff | 36,322 ns | 771 ns | 47.1× faster |
+| Cursor-only traffic | 34,814 ns | 796 ns | 43.7× faster |
+| Full-height build-log scroll | 34,543 ns | 32,242 ns | 6.7% faster |
+| Metal scrolling frame, Criterion estimate | 881.59 µs | 868.24 µs | 1.5% faster |
+| Metal scrolling frame p95 | 872 µs | 869 µs | no regression |
+| Holder write p50, legacy vs persistent stream | 32 µs | 12 µs | 2.7× faster |
+| Holder write p95, legacy vs persistent stream | 40 µs | 15 µs | 2.7× faster |
+| Local input-to-grid median, including scroll | 75 µs | 64 µs | 15% faster |
+
+The Metal sample recorded one invalidation per frame and zero 120 Hz frame-
+budget overruns. The renderer benchmark rejects a steady-state average CPU
+frame cost at or above 8 ms; Criterion's tiny cold-start calibration batches
+are excluded until at least 32 frames have been observed. The terminal-state
+benchmark has absolute budgets for typing,
+scrolling, and cursor traffic, while the Holder and attach tests enforce their
+release latency ceilings.
+
+The measured changes are deliberately distributed along the existing deep
+terminal interface rather than hidden behind another wrapper:
+
+- Alacritty damage is preserved at row granularity, so typing and cursor motion
+  no longer hash and compare the entire viewport. Grid publication still
+  compares actual cells before sending a row.
+- Adjacent grid frames coalesce before one authoritative buffer mutation and
+  one selected-pane notification. The client handoff is bounded; offscreen
+  terminals remain current without invalidating the window.
+- The daemon publishes the leading edge immediately, lets two interactive
+  response publications bypass coalescing, and caps only continuous output at
+  8 ms (120 Hz). A destructive erase may wait up to 16 ms for its redraw bytes,
+  but the wait ends as soon as they arrive and never applies to typed echo or
+  additive scrolling. GPUI's display link is the sole client-side repaint
+  pacer.
+- Held sessions negotiate an additive persistent binary input/resize stream.
+  Old live Holders reject the optional negotiation and continue over the exact
+  legacy JSON/base64 request path. On Apple platforms the dedicated input lane
+  uses interactive QoS. The daemon's held-output follower uses the same class
+  only during its existing recently-attached/input hot window, then restores
+  default QoS; together they improve end-to-grid latency without elevating idle
+  or background sessions indefinitely.
+- Font metrics are retained by font and size, and ordinary undecorated rows
+  skip two independent quad scans through a single plain-row check.
+- Frame decoding advances a read cursor and compacts occasionally instead of
+  shifting the receive buffer after every decoded frame.
+
+Run all terminal-specific gates with:
+
+```sh
+diri/scripts/terminal-perf-gate.sh
+```
+
 ## Memory
 
 `DIRI_PERF_LARGE_WINDOW=1` is a retained profiling switch that starts the app at
@@ -77,14 +139,14 @@ are opaque, avoiding a persistent WindowServer backdrop/blur composition pass.
   the current viewport. Evicted rows remain daemon-owned and are fetched again
   if revisited. Three resident terminals therefore cannot retain an entire
   repeatedly traversed history indefinitely.
-- Every incoming terminal diff still updates its authoritative buffer, but
-  selected-session paints are paced to one every 50 ms and background residents
-  never invalidate the window. An active find arms only one output-rescan timer.
-- The daemon source uses the same 20 fps grid ceiling and skips screen-to-cell
-  extraction entirely while no output sink is attached. A later attachment
-  receives a fresh full grid. These daemon changes take effect only after a
-  future daemon restart; this optimization work never signaled or replaced the
-  daemon that was already running.
+- Every incoming terminal diff still updates its authoritative buffer, but a
+  receiver burst folds adjacent rows into one final update and one selected-
+  session notification. Background residents never invalidate the window. An
+  active find arms only one output-rescan timer.
+- The daemon skips screen-to-cell extraction entirely while no output sink is
+  attached. With a sink, leading-edge and interactive output is immediate;
+  continuous output is capped at 120 publications per second. A later
+  attachment receives a fresh full grid.
 
 ### Acceptance
 
@@ -154,6 +216,7 @@ historical development-binary numbers.
 ```sh
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+diri/scripts/terminal-perf-gate.sh
 diri/scripts/perf-gate.sh --app diri/dist/diri.app --scenario all
 ```
 

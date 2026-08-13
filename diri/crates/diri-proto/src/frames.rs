@@ -218,6 +218,7 @@ impl Error for FrameCodecError {}
 #[derive(Clone, Debug, Default)]
 pub struct FrameCodec {
     buffer: Vec<u8>,
+    start: usize,
 }
 
 impl FrameCodec {
@@ -249,9 +250,9 @@ impl FrameCodec {
     pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<Frame>, FrameCodecError> {
         self.buffer.extend_from_slice(bytes);
         let mut frames = Vec::new();
-        let mut consumed = 0;
+        let mut consumed = self.start;
 
-        while self.buffer.len() - consumed >= 5 {
+        while self.buffer.len().saturating_sub(consumed) >= 5 {
             let frame_type = FrameType::try_from(self.buffer[consumed])?;
             let length = u32::from_be_bytes(
                 self.buffer[consumed + 1..consumed + 5]
@@ -275,8 +276,14 @@ impl FrameCodec {
             consumed = frame_end;
         }
 
-        if consumed != 0 {
-            self.buffer.drain(..consumed);
+        self.start = consumed;
+        if self.start == self.buffer.len() {
+            self.buffer.clear();
+            self.start = 0;
+        } else if self.start >= 64 * 1024 && self.start >= self.buffer.len() / 2 {
+            self.buffer.copy_within(self.start.., 0);
+            self.buffer.truncate(self.buffer.len() - self.start);
+            self.start = 0;
         }
         Ok(frames)
     }
@@ -288,7 +295,7 @@ impl FrameCodec {
 
     #[must_use]
     pub fn buffered_len(&self) -> usize {
-        self.buffer.len()
+        self.buffer.len() - self.start
     }
 }
 
