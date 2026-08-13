@@ -151,6 +151,10 @@ pub(crate) struct LauncherOverlay {
     recipe_project_edited: bool,
     recipe_editor: Option<RecipeMetadataEditor>,
     pending_recipe_delete: Option<String>,
+    /// A recipe click made before its host catalog arrives is still one
+    /// launch action. Readiness changes retry this identity automatically;
+    /// closing the launcher or choosing another recipe cancels it.
+    pending_recipe_activation: Option<String>,
     fallback_notice: Option<String>,
     /// Finder drops may partially succeed. Keep their ignored-path detail
     /// inline with the staged draft until the user sends or replaces it; a
@@ -316,6 +320,7 @@ impl LauncherOverlay {
                     Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         if this
                             .update(cx, |this, cx| {
+                                this.resume_pending_recipe_activation(cx);
                                 if this.open
                                     && matches!(this.target, LauncherTarget::NewSession)
                                     && matches!(this.mode, LauncherMode::NewSession)
@@ -356,6 +361,7 @@ impl LauncherOverlay {
             recipe_project_edited: false,
             recipe_editor: None,
             pending_recipe_delete: None,
+            pending_recipe_activation: None,
             fallback_notice: None,
             drop_notice: None,
             picker: None,
@@ -535,6 +541,7 @@ impl LauncherOverlay {
         }
         self.open = false;
         self.picker = None;
+        self.pending_recipe_activation = None;
         self.restore_new_prompt();
         cx.emit(LauncherEvent::Closed);
         cx.notify();
@@ -814,21 +821,38 @@ impl LauncherOverlay {
     /// the ordinary launcher with its fields preserved and one specific repair
     /// message, so no missing dependency can silently retarget a run.
     fn activate_recipe(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // A second recipe choice supersedes a cold launch that was still
+        // waiting for readiness. There must never be two delayed launches.
+        self.pending_recipe_activation = None;
         let Some(recipe) = self.recipes().into_iter().find(|recipe| recipe.id == id) else {
             self.fallback_notice = Some("This recipe no longer exists".to_owned());
             return;
         };
         match self.resolve_recipe(&recipe) {
             Ok(resolved) if !self.preview => {
+                self.complete_recipe_activation(resolved, cx);
+            }
+            Err(RecipeIssue::AgentsLoading) if !self.preview => {
+                self.preview_recipe(&recipe);
+                self.pending_recipe_activation = Some(recipe.id.clone());
+                let force = self
+                    .services
+                    .store
+                    .store
+                    .read()
+                    .expect("session store lock poisoned")
+                    .agent_catalog_error(recipe.host.as_deref())
+                    .is_some();
+                self.fallback_notice = Some(RecipeIssue::AgentsLoading.message());
                 self.services
                     .store
                     .store
                     .write()
                     .expect("session store lock poisoned")
-                    .spawn_kind(resolved.kind, resolved.options);
-                self.new_session_draft.clear();
-                self.prompt.clear();
-                self.close(cx);
+                    .request_agent_catalog(recipe.host.clone(), force);
+                self.picker = None;
+                window.focus(&self.focus, cx);
+                cx.notify();
             }
             result => {
                 self.preview_recipe(&recipe);
@@ -849,7 +873,76 @@ impl LauncherOverlay {
         }
     }
 
+    fn complete_recipe_activation(
+        &mut self,
+        resolved: crate::launch_recipe::ResolvedRecipe,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_recipe_activation = None;
+        self.services
+            .store
+            .store
+            .write()
+            .expect("session store lock poisoned")
+            .spawn_kind(resolved.kind, resolved.options);
+        self.new_session_draft.clear();
+        self.prompt.clear();
+        self.close(cx);
+    }
+
+    /// Store readiness is asynchronous, but a recipe activation is not a
+    /// two-click interaction. Keep retrying the exact saved identity until its
+    /// catalog arrives, then launch it through the canonical resolver. Any
+    /// terminal repair state leaves the populated launcher open.
+    fn resume_pending_recipe_activation(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.pending_recipe_activation.clone() else {
+            return;
+        };
+        let Some(recipe) = self.recipes().into_iter().find(|recipe| recipe.id == id) else {
+            self.pending_recipe_activation = None;
+            self.fallback_notice = Some("This recipe no longer exists".to_owned());
+            return;
+        };
+        match self.resolve_recipe(&recipe) {
+            Ok(resolved) if !self.preview => self.complete_recipe_activation(resolved, cx),
+            Err(RecipeIssue::AgentsLoading) => {
+                let (error, still_loading) = {
+                    let store = self
+                        .services
+                        .store
+                        .store
+                        .read()
+                        .expect("session store lock poisoned");
+                    (
+                        store
+                            .agent_catalog_error(recipe.host.as_deref())
+                            .map(str::to_owned),
+                        store.agent_catalog_is_loading(recipe.host.as_deref()),
+                    )
+                };
+                if let Some(error) = error
+                    && !still_loading
+                {
+                    self.pending_recipe_activation = None;
+                    self.fallback_notice = Some(format!(
+                        "Could not check Agents on this host: {error}. Choose the recipe again to retry."
+                    ));
+                }
+            }
+            Err(issue) => {
+                self.pending_recipe_activation = None;
+                self.fallback_notice = Some(issue.message());
+            }
+            Ok(_) => {
+                // Preview launchers never enqueue activations, but avoid
+                // retaining stale state if a test or future caller does.
+                self.pending_recipe_activation = None;
+            }
+        }
+    }
+
     fn preview_recipe(&mut self, recipe: &LaunchRecipe) {
+        self.pending_recipe_activation = None;
         self.selected_harness.clone_from(&recipe.agent);
         self.selected_host.clone_from(&recipe.host);
         self.selected_worktree.clone_from(&recipe.worktree);
@@ -897,6 +990,19 @@ impl LauncherOverlay {
         })
     }
 
+    /// Rebind callers to the book's normalized value, never to the input
+    /// draft. The book owns trimming and length limits, so keeping the draft
+    /// object would make the active baseline disagree with durable prefs.
+    fn replace_recipe(&self, id: &str, recipe: LaunchRecipe) -> Result<LaunchRecipe, String> {
+        let mut persisted = None;
+        self.update_recipe_book(|book| {
+            book.replace(id, recipe)?;
+            persisted = book.get(id).cloned();
+            Ok(())
+        })?;
+        persisted.ok_or_else(|| "updated recipe disappeared".to_owned())
+    }
+
     fn save_current_recipe(&mut self, cx: &mut Context<Self>) {
         if self.prompt.text().trim().is_empty() || self.selected_root.is_empty() {
             self.fallback_notice = Some("Add a task and project before saving a recipe".to_owned());
@@ -920,7 +1026,10 @@ impl LauncherOverlay {
         });
         if result.is_ok() {
             self.active_recipe = saved;
-            self.draft_recipe_name = Some(name.clone());
+            self.draft_recipe_name = self
+                .active_recipe
+                .as_ref()
+                .map(|recipe| recipe.name.clone());
             self.recipe_project_edited = false;
         }
         self.fallback_notice = Some(match result {
@@ -938,22 +1047,20 @@ impl LauncherOverlay {
         };
         let id = active.id;
         let name = self.draft_recipe_name.clone().unwrap_or(active.name);
-        let mut recipe = self.current_recipe(name.clone());
+        let recipe = self.current_recipe(name.clone());
         if let Err(issue) = self.validate_recipe(&recipe) {
             self.fallback_notice = Some(issue.message());
             cx.notify();
             return;
         }
-        let stored = recipe.clone();
-        let result = self.update_recipe_book(|book| book.replace(&id, recipe));
-        if result.is_ok() {
-            recipe = stored;
-            recipe.id = id;
-            self.active_recipe = Some(recipe);
+        let result = self.replace_recipe(&id, recipe);
+        if let Ok(persisted) = &result {
+            self.draft_recipe_name = Some(persisted.name.clone());
+            self.active_recipe = Some(persisted.clone());
             self.recipe_project_edited = false;
         }
         self.fallback_notice = Some(match result {
-            Ok(()) => format!("Updated “{name}”"),
+            Ok(persisted) => format!("Updated “{}”", persisted.name),
             Err(error) => format!("Could not update recipe: {error}"),
         });
         cx.notify();
@@ -991,6 +1098,7 @@ impl LauncherOverlay {
     }
 
     fn edit_recipe(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.pending_recipe_activation = None;
         let Some(recipe) = self.recipes().into_iter().find(|recipe| recipe.id == id) else {
             self.fallback_notice = Some("This recipe no longer exists".to_owned());
             cx.notify();
@@ -1002,6 +1110,7 @@ impl LauncherOverlay {
     }
 
     fn edit_launch_details(&mut self, cx: &mut Context<Self>) {
+        self.pending_recipe_activation = None;
         let name = self
             .draft_recipe_name
             .clone()
@@ -1063,6 +1172,12 @@ impl LauncherOverlay {
             cx.notify();
             return;
         };
+        let preserve_live_name_override = self
+            .active_recipe
+            .as_ref()
+            .filter(|active| active.id == id)
+            .zip(self.draft_recipe_name.as_ref())
+            .is_some_and(|(active, draft)| draft != &active.name);
         recipe.name = name.to_owned();
         recipe.title = nonempty(editor.title.text());
         if let WorktreePolicy::Fresh { branch } = &mut recipe.worktree {
@@ -1079,9 +1194,8 @@ impl LauncherOverlay {
             cx.notify();
             return;
         }
-        let updated = recipe.clone();
-        match self.update_recipe_book(|book| book.replace(&id, recipe)) {
-            Ok(()) => {
+        match self.replace_recipe(&id, recipe) {
+            Ok(persisted) => {
                 if self
                     .active_recipe
                     .as_ref()
@@ -1090,11 +1204,13 @@ impl LauncherOverlay {
                     // This editor mutates the saved baseline only. The live
                     // launcher may contain one-off prompt, Agent, project,
                     // title, or worktree overrides and must not be reloaded.
-                    self.active_recipe = Some(updated.clone());
-                    self.draft_recipe_name = Some(updated.name.clone());
+                    if !preserve_live_name_override {
+                        self.draft_recipe_name = Some(persisted.name.clone());
+                    }
+                    self.active_recipe = Some(persisted.clone());
                 }
                 self.recipe_editor = None;
-                self.fallback_notice = Some(format!("Updated “{}”", updated.name));
+                self.fallback_notice = Some(format!("Updated “{}”", persisted.name));
             }
             Err(error) => {
                 if let Some(editor) = &mut self.recipe_editor {
@@ -1508,6 +1624,7 @@ impl LauncherOverlay {
         match self.picker {
             Some(Picker::Harness) => {
                 if let Some(choice) = self.harness_choices().get(self.highlight) {
+                    self.pending_recipe_activation = None;
                     self.selected_harness = choice.kind.clone();
                     self.fallback_notice = None;
                 }
@@ -1516,6 +1633,7 @@ impl LauncherOverlay {
                 let projects = self.projects();
                 match project_commit(projects.len(), self.highlight) {
                     ProjectCommit::Recent(index) => {
+                        self.pending_recipe_activation = None;
                         self.selected_root.clone_from(&projects[index].project.root);
                         self.selected_host.clone_from(&projects[index].host);
                         self.recipe_project_edited = true;
@@ -1591,11 +1709,13 @@ impl LauncherOverlay {
             .unwrap_or(0);
         let count = choices.len() as isize;
         let next = (current as isize + delta).rem_euclid(count) as usize;
+        self.pending_recipe_activation = None;
         self.selected_harness = choices[next].kind.clone();
         self.fallback_notice = None;
     }
 
     fn toggle_worktree(&mut self) {
+        self.pending_recipe_activation = None;
         self.selected_worktree = match &self.selected_worktree {
             WorktreePolicy::Fresh { .. } => WorktreePolicy::CurrentCheckout,
             WorktreePolicy::CurrentCheckout if self.selected_host.is_none() => {
@@ -1612,16 +1732,19 @@ impl LauncherOverlay {
         };
         match edit {
             Edit::Local(local) => {
+                self.pending_recipe_activation = None;
                 self.prompt.apply(local);
             }
             Edit::Clipboard(ClipboardEdit::Copy) => {
                 query_editor::copy_selection(self.prompt.editor(), cx);
             }
             Edit::Clipboard(ClipboardEdit::Cut) => {
+                self.pending_recipe_activation = None;
                 query_editor::cut_selection(self.prompt.editor_mut(), cx);
             }
             Edit::Clipboard(ClipboardEdit::Paste) => {
                 if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                    self.pending_recipe_activation = None;
                     self.prompt.insert_multiline(&text);
                 }
             }
@@ -1657,6 +1780,7 @@ impl LauncherOverlay {
             };
             let _ = this.update_in(cx, |this, window, cx| {
                 if apply_folder_choice(&mut this.selected_root, selected.as_deref()) {
+                    this.pending_recipe_activation = None;
                     this.selected_host = None;
                     this.recipe_project_edited = true;
                     this.services
@@ -1704,6 +1828,7 @@ impl LauncherOverlay {
                     .cursor_pointer()
                     .hover(move |row| row.bg(colors.primary.alpha(0.06)))
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        this.pending_recipe_activation = None;
                         this.selected_harness = kind.clone();
                         this.fallback_notice = None;
                         this.picker = None;
@@ -1786,6 +1911,7 @@ impl LauncherOverlay {
                     .when(highlighted, |row| row.bg(colors.primary.alpha(0.08)))
                     .hover(move |row| row.bg(colors.primary.alpha(0.06)))
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        this.pending_recipe_activation = None;
                         this.selected_root.clone_from(&root);
                         this.selected_host.clone_from(&host);
                         this.recipe_project_edited = true;
@@ -3790,6 +3916,128 @@ mod tests {
             let active = launcher.active_recipe.as_ref().expect("active baseline");
             assert_eq!(active.name, "Renamed baseline");
             assert_eq!(active.title.as_deref(), Some("Stored title"));
+        });
+    }
+
+    #[gpui::test]
+    fn metadata_rename_preserves_a_live_name_override_and_rebinds_the_normalized_baseline(
+        cx: &mut TestAppContext,
+    ) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let stored = {
+            let mut store = runtime.store.write().expect("store lock");
+            store
+                .update_preferences(|prefs| {
+                    prefs
+                        .launch_recipes
+                        .add(LaunchRecipe::draft(
+                            "Review",
+                            AgentKind::CODEX,
+                            RecipeProject::Path {
+                                path: "/tmp".into(),
+                            },
+                            None,
+                            "Stored prompt",
+                        ))
+                        .expect("add recipe");
+                })
+                .expect("save fixture");
+            store.preferences().launch_recipes.items()[0].clone()
+        };
+        let services = test_services(Arc::clone(&runtime));
+        let (launcher, _cx) =
+            cx.add_window_view(move |_window, cx| LauncherOverlay::new(services, true, cx));
+
+        launcher.update(cx, |launcher, cx| {
+            launcher.preview_recipe(&stored);
+            launcher.draft_recipe_name = Some("One-off display name".into());
+            launcher.edit_recipe(&stored.id, cx);
+            let editor = launcher.recipe_editor.as_mut().expect("editor");
+            editor.name.select_all();
+            editor.name.insert(&"N".repeat(100));
+            launcher.save_recipe_editor(cx);
+
+            let persisted = launcher.recipes().into_iter().next().expect("recipe");
+            let active = launcher.active_recipe.as_ref().expect("active baseline");
+            assert_eq!(active, &persisted);
+            assert_eq!(active.name.chars().count(), 80);
+            assert_eq!(
+                launcher.draft_recipe_name.as_deref(),
+                Some("One-off display name")
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn cold_remote_recipe_launches_when_readiness_arrives_without_a_second_action(
+        cx: &mut TestAppContext,
+    ) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let stored = {
+            let mut store = runtime.store.write().expect("store lock");
+            store.set_hosts(vec![diri_proto::HostEntry {
+                id: "forge".into(),
+                name: Some("Build Forge".into()),
+                ssh: "forge".into(),
+                default_cwd: None,
+                node: None,
+            }]);
+            store
+                .update_preferences(|prefs| {
+                    prefs
+                        .launch_recipes
+                        .add(LaunchRecipe::draft(
+                            "Remote review",
+                            AgentKind::CODEX,
+                            RecipeProject::Path {
+                                path: "~/diri".into(),
+                            },
+                            Some("forge".into()),
+                            "Review the change",
+                        ))
+                        .expect("add recipe");
+                })
+                .expect("save fixture");
+            store.preferences().launch_recipes.items()[0].clone()
+        };
+        let services = test_services(Arc::clone(&runtime));
+        let (launcher, cx) =
+            cx.add_window_view(move |_window, cx| LauncherOverlay::new(services, false, cx));
+
+        launcher.update_in(cx, |launcher, window, cx| {
+            launcher.open(window, cx);
+            launcher.activate_recipe(&stored.id, window, cx);
+            assert!(launcher.open, "the launcher stays visible while checking");
+            assert_eq!(
+                launcher.pending_recipe_activation.as_deref(),
+                Some(stored.id.as_str())
+            );
+        });
+
+        runtime
+            .store
+            .write()
+            .expect("store lock")
+            .set_agent_catalog(diri_proto::AgentReadinessResult {
+                host: Some("forge".into()),
+                agents: vec![diri_proto::AgentReadinessItem {
+                    kind: AgentKind::CODEX,
+                    binary: "codex".into(),
+                    path: Some("/usr/bin/codex".into()),
+                    ..diri_proto::AgentReadinessItem::default()
+                }],
+                ..diri_proto::AgentReadinessResult::default()
+            });
+        runtime.publish_local_change();
+        cx.run_until_parked();
+
+        launcher.read_with(cx, |launcher, _| {
+            assert!(
+                !launcher.open,
+                "readiness must complete the original activation"
+            );
+            assert!(launcher.pending_recipe_activation.is_none());
+            assert!(launcher.prompt.is_empty());
         });
     }
 
