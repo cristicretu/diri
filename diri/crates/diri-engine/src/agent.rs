@@ -82,6 +82,20 @@ pub struct SetupSpec {
     pub sign_in_hint: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ImageInputStrategy {
+    PromptPath,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageInputSpec {
+    pub strategy: ImageInputStrategy,
+    #[serde(default)]
+    pub supports_image_only: bool,
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentDescriptor {
@@ -132,6 +146,8 @@ pub struct AgentDescriptor {
     pub approve: Option<ApproveSpec>,
     #[serde(default)]
     pub setup: Option<SetupSpec>,
+    #[serde(default)]
+    pub image_input: Option<ImageInputSpec>,
 }
 
 impl AgentDescriptor {
@@ -514,6 +530,21 @@ mod tests {
             missing.is_empty(),
             "CLI Agents without setup URLs: {missing:?}"
         );
+    }
+
+    #[test]
+    fn claude_and_codex_declare_verified_visual_input() {
+        let (engine, failed) = ManifestEngine::load_dir(&manifest_dir()).expect("load");
+        assert!(failed.is_empty(), "manifests failed to decode: {failed:?}");
+        for id in ["claude-code", "codex"] {
+            let image_input = engine
+                .manifest(id)
+                .and_then(|manifest| manifest.agent.as_ref())
+                .and_then(|agent| agent.image_input.as_ref())
+                .unwrap_or_else(|| panic!("{id} has no image-input declaration"));
+            assert_eq!(image_input.strategy, ImageInputStrategy::PromptPath);
+            assert!(image_input.supports_image_only);
+        }
     }
 
     #[cfg(unix)]

@@ -4,6 +4,7 @@
 //! `diri-client::SessionAttachment`, `diri-term`, and the T9 session store.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -27,19 +28,18 @@ use diri_term::metrics::CellMetrics;
 use diri_term::scrollback::{WheelDelta, WheelEvent, WheelRoute};
 use diri_term::theme::TermTheme;
 use diri_ui::{
-    AgentKind as UiAgentKind, Fill, FloatingSurface, Ink, Metrics, Radius, SemanticColors,
+    AgentKind as UiAgentKind, Fill, FloatingSurface, Ink, Metrics, Palette, Radius, SemanticColors,
     StatusGlyph, StatusState, Typo,
 };
 use gpui::{
     AnyElement, ClickEvent, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter,
-    FocusHandle, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton, Render, ScrollDelta,
-    ScrollWheelEvent, SharedString, StatefulInteractiveElement, Task, Window, div, font,
-    prelude::*, px, rgba,
+    ExternalPaths, FocusHandle, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton,
+    Render, ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Task, Window,
+    div, font, prelude::*, px, rgba,
 };
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
-use crate::clipboard_transfer::StagedClipboardImage;
 use crate::commands::{
     CloseFind, CopySelection, FindNext, FindPrevious, OpenFind, Paste, ResetZoom, TERMINAL_CONTEXT,
     ToggleInspector, ToggleSidebar, ZoomIn, ZoomOut,
@@ -105,6 +105,15 @@ pub enum TerminalPaneEvent {
         reference: String,
         cwd: String,
         session_id: SessionId,
+    },
+    StageImagePaths {
+        session_id: SessionId,
+        paths: Vec<PathBuf>,
+    },
+    StageClipboardImage {
+        session_id: SessionId,
+        bytes: Vec<u8>,
+        extension: String,
     },
 }
 
@@ -503,7 +512,6 @@ enum PaneEvent {
     FindSnapshot(SessionId, SearchRequest, FindSnapshot),
     ScrollbackCells(SessionId, diri_proto::ReadScrollbackCellsResult, usize),
     ScrollbackFailed(SessionId),
-    ClipboardUploadFinished(SessionId, Result<String, String>),
 }
 
 /// Identifies one attachment task, not the durable session it reads. A session
@@ -725,7 +733,6 @@ pub struct TerminalPane {
     inspector_open: bool,
     navigation: Option<Entity<NavigationOverlay>>,
     utility_surfaces: Option<Entity<UtilitySurfaces>>,
-    local_clipboard_images: Vec<StagedClipboardImage>,
     _pane_events: Task<()>,
     _store_changes: Task<()>,
 }
@@ -847,7 +854,6 @@ impl TerminalPane {
             inspector_open: false,
             navigation: None,
             utility_surfaces: None,
-            local_clipboard_images: Vec::new(),
             _pane_events: pane_events,
             _store_changes: store_changes,
         };
@@ -1182,14 +1188,6 @@ impl TerminalPane {
                     cx.notify();
                 }
             }
-            PaneEvent::ClipboardUploadFinished(id, result) => match result {
-                Ok(remote_path) => {
-                    if let Some(resident) = self.residents.get(&id) {
-                        resident.attachment.input(paste(&remote_path, false));
-                    }
-                }
-                Err(error) => eprintln!("diri: clipboard image upload failed: {error}"),
-            },
         }
     }
 
@@ -1785,45 +1783,11 @@ impl TerminalPane {
                 return;
             }
 
-            let staged = match StagedClipboardImage::stage(bytes, extension) {
-                Ok(staged) => staged,
-                Err(error) => {
-                    eprintln!("diri: could not stage clipboard image: {error}");
-                    return;
-                }
-            };
-            let ssh = {
-                let store = self
-                    .runtime
-                    .store
-                    .read()
-                    .expect("session store lock poisoned");
-                store
-                    .selected_session()
-                    .and_then(|session| session.host.as_deref())
-                    .and_then(|host_id| store.host(host_id))
-                    .map(|host| host.ssh.clone())
-            };
-
-            if let Some(ssh) = ssh {
-                let pane_tx = self.pane_tx.clone();
-                let upload_id = id.clone();
-                self.tokio.spawn(async move {
-                    let result = tokio::task::spawn_blocking(move || staged.upload(&ssh))
-                        .await
-                        .unwrap_or_else(|error| Err(format!("upload task failed: {error}")));
-                    let _ = pane_tx.send(PaneEvent::ClipboardUploadFinished(upload_id, result));
-                });
-            } else {
-                let local_path = staged.path().to_string_lossy().into_owned();
-                if let Some(resident) = self.residents.get(&id) {
-                    resident.attachment.input(paste(&local_path, false));
-                }
-                self.local_clipboard_images.push(staged);
-                if self.local_clipboard_images.len() > 32 {
-                    self.local_clipboard_images.remove(0);
-                }
-            }
+            cx.emit(TerminalPaneEvent::StageClipboardImage {
+                session_id: id,
+                bytes: bytes.to_vec(),
+                extension: extension.to_owned(),
+            });
             cx.stop_propagation();
             cx.notify();
             return;
@@ -2479,6 +2443,8 @@ impl TerminalPane {
         let view_offset = resident.element.view_offset();
         let attachment_state = resident.attachment_state;
         let overflow = self.grid_row_overflow(resident.element.grid_rows(), font_size, window);
+        let accepts_images =
+            session.effective_kind() != &ProtoAgentKind::SHELL && session.host.is_none();
 
         let id_for_focus = session.id.clone();
         let follows_selection = matches!(self.session_source, SessionSource::FollowSelection);
@@ -2491,6 +2457,31 @@ impl TerminalPane {
             .px(px(12.0))
             .bg(theme.background)
             .track_focus(&self.focus)
+            .drag_over::<ExternalPaths>(move |element, paths, _, _| {
+                if accepts_images
+                    && paths
+                        .paths()
+                        .iter()
+                        .any(|path| crate::image_attachments::inspect_path_for_drag(path).is_ok())
+                {
+                    element
+                        .bg(Palette::GEMINI_BLUE.alpha(0.08))
+                        .border_1()
+                        .border_color(Palette::GEMINI_BLUE.alpha(0.40))
+                } else {
+                    element
+                }
+            })
+            .on_drop(cx.listener({
+                let id = session.id.clone();
+                move |_, paths: &ExternalPaths, _, cx| {
+                    cx.stop_propagation();
+                    cx.emit(TerminalPaneEvent::StageImagePaths {
+                        session_id: id.clone(),
+                        paths: paths.paths().to_vec(),
+                    });
+                }
+            }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {

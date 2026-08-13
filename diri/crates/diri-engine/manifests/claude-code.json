@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "id": "claude-code",
-  "version": "2026.07.07.1",
+  "version": "2026.08.13",
   "statusModel": "full",
   "agent": {
     "id": "claude-code",
@@ -19,6 +19,10 @@
       "url": "https://docs.anthropic.com/en/docs/claude-code/getting-started",
       "installHint": "Follow Anthropic's Claude Code installation guide.",
       "signInHint": "Run claude and choose an Anthropic Console or Claude account."
+    },
+    "imageInput": {
+      "strategy": "promptPath",
+      "supportsImageOnly": true
     },
     "statusAuthority": "hooks",
     "binary": "claude",

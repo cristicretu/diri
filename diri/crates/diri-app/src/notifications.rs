@@ -702,6 +702,7 @@ mod tests {
                 submit: true,
             }),
             setup: None,
+            image_input: None,
             extra: Default::default(),
         };
         let current = session(

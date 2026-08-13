@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "id": "codex",
-  "version": "2026.07.07",
+  "version": "2026.08.13",
   "statusModel": "full",
   "agent": {
     "id": "codex",
@@ -18,6 +18,10 @@
       "url": "https://developers.openai.com/codex/cli/",
       "installHint": "Follow OpenAI's Codex CLI installation guide.",
       "signInHint": "Run codex and choose Sign in with ChatGPT or another offered method."
+    },
+    "imageInput": {
+      "strategy": "promptPath",
+      "supportsImageOnly": true
     },
     "statusAuthority": "screen",
     "binary": "codex",

@@ -24,7 +24,9 @@ use tokio::sync::mpsc;
 
 use crate::commands::{CommandId, OpenSettings};
 use crate::delegation::{HandoffProposal, handoff_proposal, sibling_proposal, validate_handoff};
-use crate::external_drop::{ExternalDropPlan, ExternalDropTarget, plan_external_drop};
+use crate::external_drop::{
+    ExternalDropPlan, ExternalDropTarget, can_accept_external_drop, plan_external_drop,
+};
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::query_label;
 use crate::query_editor::{self, ClipboardEdit, Edit};
@@ -894,7 +896,7 @@ impl Sidebar {
     }
 
     fn can_accept_external_drop(paths: &ExternalPaths, target: ExternalDropTarget) -> bool {
-        plan_external_drop(paths.paths(), target).accepts_drop()
+        can_accept_external_drop(paths.paths(), &target)
     }
 
     fn external_drop_feedback(

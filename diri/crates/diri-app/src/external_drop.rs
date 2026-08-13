@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 
 use diri_proto::SessionId;
 
+use crate::image_attachments::{ImageRejection, inspect_path_for_drag, is_supported_image_path};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExternalPathKind {
     File,
@@ -41,6 +43,7 @@ pub(crate) enum ExternalPathRejection {
     RequiresDirectory,
     AdditionalPath,
     RemoteTarget,
+    Image(ImageRejection),
 }
 
 impl ExternalPathRejection {
@@ -54,6 +57,7 @@ impl ExternalPathRejection {
             Self::RequiresDirectory => "is not a directory",
             Self::AdditionalPath => "only the first directory starts the session",
             Self::RemoteTarget => "is local, but the target runs on another host",
+            Self::Image(reason) => reason.explanation(),
         }
     }
 }
@@ -79,6 +83,7 @@ pub(crate) enum ExternalDropAction {
     OpenSessionComposer {
         session_id: SessionId,
         insertion: String,
+        image_paths: Vec<PathBuf>,
     },
 }
 
@@ -89,10 +94,6 @@ pub(crate) struct ExternalDropPlan {
 }
 
 impl ExternalDropPlan {
-    pub fn accepts_drop(&self) -> bool {
-        self.action.is_some()
-    }
-
     /// Short, visible copy for the inline sidebar/composer feedback surface.
     pub fn feedback(&self) -> Option<String> {
         if self.rejected.is_empty() {
@@ -127,9 +128,9 @@ impl ExternalDropPlan {
 
 /// Validate and route a Finder payload for one sidebar target.
 ///
-/// This function is intentionally safe to call for drag highlighting as well
-/// as release: inspection is read-only, no contents are consumed, and dataless
-/// files are rejected before `open` could ask the provider to materialize one.
+/// This full plan belongs to the explicit release: it checks readability and
+/// image signatures. Hover uses [`can_accept_external_drop`] so crossing the
+/// sidebar cannot open or materialize a File Provider object.
 pub(crate) fn plan_external_drop(
     paths: &[PathBuf],
     target: ExternalDropTarget,
@@ -137,7 +138,84 @@ pub(crate) fn plan_external_drop(
     if let Some(plan) = remote_refusal(paths, &target) {
         return plan;
     }
+    if let ExternalDropTarget::Session { id, remote: false } = &target {
+        return plan_local_session_drop(paths, id.clone());
+    }
     plan_staged_drop(target, stage_external_paths(paths))
+}
+
+/// Route image-shaped paths without opening them. Signature validation and
+/// private copying happen on the launcher's background staging task, keeping
+/// the sidebar release handler responsive even for File Provider paths.
+fn plan_local_session_drop(paths: &[PathBuf], id: SessionId) -> ExternalDropPlan {
+    let mut accepted = Vec::new();
+    let mut image_paths = Vec::new();
+    let mut rejected = Vec::new();
+    let probe = FileSystemProbe;
+    for path in paths {
+        if is_supported_image_path(path) {
+            match inspect_path_for_drag(path) {
+                Ok(()) => image_paths.push(path.clone()),
+                Err(reason) => rejected.push(RejectedExternalPath {
+                    path: path.clone(),
+                    reason: ExternalPathRejection::Image(reason),
+                }),
+            }
+        } else {
+            match stage_path(path, &probe) {
+                Ok(path) => accepted.push(path),
+                Err(error) => rejected.push(error),
+            }
+        }
+    }
+    let insertion = accepted
+        .iter()
+        .map(StagedExternalPath::quoted)
+        .collect::<Vec<_>>()
+        .join(" ");
+    ExternalDropPlan {
+        action: (!insertion.is_empty() || !image_paths.is_empty()).then_some(
+            ExternalDropAction::OpenSessionComposer {
+                session_id: id,
+                insertion,
+                image_paths,
+            },
+        ),
+        rejected,
+    }
+}
+
+pub(crate) fn can_accept_external_drop(paths: &[PathBuf], target: &ExternalDropTarget) -> bool {
+    let remote = matches!(
+        target,
+        ExternalDropTarget::Project { remote: true }
+            | ExternalDropTarget::Session { remote: true, .. }
+    );
+    if remote {
+        return false;
+    }
+    paths.iter().any(|path| {
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            return false;
+        };
+        if !is_materialized(&metadata) {
+            return false;
+        }
+        match target {
+            ExternalDropTarget::EmptySpace | ExternalDropTarget::Project { remote: false } => {
+                metadata.file_type().is_dir()
+            }
+            ExternalDropTarget::Session { remote: false, .. } => {
+                if is_supported_image_path(path) {
+                    inspect_path_for_drag(path).is_ok()
+                } else {
+                    metadata.file_type().is_file() || metadata.file_type().is_dir()
+                }
+            }
+            ExternalDropTarget::Project { remote: true }
+            | ExternalDropTarget::Session { remote: true, .. } => false,
+        }
+    })
 }
 
 #[cfg(test)]
@@ -187,9 +265,13 @@ fn plan_staged_drop(
     match target {
         ExternalDropTarget::Session { id, remote: false } => {
             let mut accepted = Vec::new();
+            let mut image_paths = Vec::new();
             let mut rejected = Vec::new();
             for result in staged {
                 match result {
+                    Ok(path) if is_supported_image_path(&path.path) => {
+                        image_paths.push(path.path);
+                    }
                     Ok(path) => accepted.push(path),
                     Err(error) => rejected.push(error),
                 }
@@ -200,10 +282,11 @@ fn plan_staged_drop(
                 .collect::<Vec<_>>()
                 .join(" ");
             ExternalDropPlan {
-                action: (!insertion.is_empty()).then_some(
+                action: (!insertion.is_empty() || !image_paths.is_empty()).then_some(
                     ExternalDropAction::OpenSessionComposer {
                         session_id: id,
                         insertion,
+                        image_paths,
                     },
                 ),
                 rejected,
@@ -488,9 +571,85 @@ mod tests {
             Some(ExternalDropAction::OpenSessionComposer {
                 session_id: SessionId("session-1".into()),
                 insertion: "'/tmp/a folder' '/tmp/$HOME; rm -rf nope'".into(),
+                image_paths: Vec::new(),
             })
         );
         assert!(plan.rejected.is_empty());
+    }
+
+    #[test]
+    fn session_target_routes_raster_images_as_pending_attachments_not_prompt_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first image.png");
+        let second = directory.path().join("second.webp");
+        fs::write(&first, b"\x89PNG\r\n\x1a\nimage").unwrap();
+        fs::write(&second, b"RIFF\x04\0\0\0WEBPimage").unwrap();
+
+        let plan = plan_external_drop(
+            &[first.clone(), second.clone()],
+            ExternalDropTarget::Session {
+                id: SessionId("session-1".into()),
+                remote: false,
+            },
+        );
+        assert_eq!(
+            plan.action,
+            Some(ExternalDropAction::OpenSessionComposer {
+                session_id: SessionId("session-1".into()),
+                insertion: String::new(),
+                image_paths: vec![first, second],
+            })
+        );
+        assert!(plan.rejected.is_empty());
+    }
+
+    #[test]
+    fn raster_signature_validation_is_deferred_to_background_staging() {
+        let directory = tempfile::tempdir().unwrap();
+        let fake = directory.path().join("not-really.png");
+        fs::write(&fake, b"plain text").unwrap();
+        let plan = plan_external_drop(
+            std::slice::from_ref(&fake),
+            ExternalDropTarget::Session {
+                id: SessionId("session-1".into()),
+                remote: false,
+            },
+        );
+        assert_eq!(
+            plan.action,
+            Some(ExternalDropAction::OpenSessionComposer {
+                session_id: SessionId("session-1".into()),
+                insertion: String::new(),
+                image_paths: vec![fake.clone()],
+            })
+        );
+        assert!(plan.rejected.is_empty());
+        assert_eq!(
+            crate::image_attachments::PendingImage::stage_path(&fake).unwrap_err(),
+            ImageRejection::InvalidContents
+        );
+    }
+
+    #[test]
+    fn hover_is_metadata_only_and_remote_targets_stay_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let image_shaped = directory.path().join("cloud-like.png");
+        fs::write(&image_shaped, b"signature is intentionally invalid").unwrap();
+        let local = ExternalDropTarget::Session {
+            id: SessionId("session-1".into()),
+            remote: false,
+        };
+        assert!(can_accept_external_drop(
+            std::slice::from_ref(&image_shaped),
+            &local
+        ));
+        assert!(!can_accept_external_drop(
+            &[image_shaped],
+            &ExternalDropTarget::Session {
+                id: SessionId("session-1".into()),
+                remote: true,
+            }
+        ));
     }
 
     #[test]
