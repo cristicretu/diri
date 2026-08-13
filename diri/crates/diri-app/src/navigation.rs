@@ -101,8 +101,8 @@ pub struct NavigationOverlay {
     scan_task: Option<Task<()>>,
     rank_task: Option<Task<()>>,
     /// This view is `.cached()` in RootView, so ambient window redraws no
-    /// longer reach it: store changes must notify it directly, or an open
-    /// palette's session rows go stale.
+    /// longer reach it: store changes must rebuild an open command palette and
+    /// notify it directly, or its catalog actions and session rows go stale.
     _store_changes: Option<Task<()>>,
 }
 
@@ -115,7 +115,10 @@ impl NavigationOverlay {
             loop {
                 match changes.recv().await {
                     Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        if this
+                            .update(cx, |this, cx| this.handle_store_change(cx))
+                            .is_err()
+                        {
                             return;
                         }
                     }
@@ -175,6 +178,13 @@ impl NavigationOverlay {
 
     pub fn is_open(&self) -> bool {
         self.overlay.is_some()
+    }
+
+    fn handle_store_change(&mut self, cx: &mut Context<Self>) {
+        if self.overlay == Some(Overlay::CommandPalette) {
+            self.refresh_command_items();
+        }
+        cx.notify();
     }
 
     pub(crate) fn toggle_command_palette(
@@ -1254,6 +1264,10 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+    use crate::commands::CommandId;
+    use diri_proto::{
+        AgentDescriptor, AgentPathSource, AgentReadinessItem, AgentReadinessResult, HostEntry,
+    };
     use gpui::{Entity, ScrollDelta, ScrollWheelEvent, TestAppContext, point};
 
     #[test]
@@ -1319,6 +1333,77 @@ mod tests {
         assert!(cramped.top_inset < px(180.0 / 12.0));
         assert_eq!(cramped.list_height, px(MIN_LIST_HEIGHT));
         assert_eq!(layout(800.0, 150.0).top_inset, px(MIN_TOP_INSET));
+    }
+
+    #[gpui::test]
+    fn open_palette_rebuilds_terminal_fallback_when_agent_readiness_arrives(
+        cx: &mut TestAppContext,
+    ) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        {
+            let mut store = runtime.store.write().expect("session store lock poisoned");
+            store.set_hosts(vec![HostEntry {
+                id: "forge".into(),
+                name: Some("Forge".into()),
+                ssh: "forge.example".into(),
+                default_cwd: None,
+                node: None,
+            }]);
+            store.set_default_spawn_host(Some("forge".into()));
+        }
+        let runtime_for_view = Arc::clone(&runtime);
+        let (overlay, cx) = cx.add_window_view(move |_window, cx| {
+            let mut overlay = NavigationOverlay::opened_for_test(runtime_for_view, cx);
+            overlay.refresh_command_items();
+            overlay
+        });
+
+        assert!(overlay.read_with(cx, |overlay, _| {
+            overlay.ranked_actions.iter().any(|ranked| {
+                ranked.item.title == "New Terminal on Forge"
+                    && ranked.item.command == PaletteCommand::Action(CommandId::NewDefaultSession)
+            })
+        }));
+
+        runtime
+            .store
+            .write()
+            .expect("session store lock poisoned")
+            .set_agent_catalog(AgentReadinessResult {
+                host: Some("forge".into()),
+                agents: vec![AgentReadinessItem {
+                    kind: AgentKind::CODEX,
+                    binary: "codex".into(),
+                    path: Some("/usr/bin/codex".into()),
+                    detected_path: Some("/usr/bin/codex".into()),
+                    path_source: Some(AgentPathSource::SystemPath),
+                    show_in_quick_create: true,
+                    descriptor: Some(AgentDescriptor {
+                        id: AgentKind::CODEX_ID.into(),
+                        display_name: "Codex".into(),
+                        first_class: true,
+                        ..AgentDescriptor::default()
+                    }),
+                    ..AgentReadinessItem::default()
+                }],
+                ..AgentReadinessResult::default()
+            });
+        overlay.update(cx, |overlay, cx| overlay.handle_store_change(cx));
+
+        assert!(overlay.read_with(cx, |overlay, _| {
+            !overlay.ranked_actions.iter().any(|ranked| {
+                ranked.item.title == "New Terminal on Forge"
+                    && ranked.item.command == PaletteCommand::Action(CommandId::NewDefaultSession)
+            }) && overlay.ranked_actions.iter().any(|ranked| {
+                ranked.item.title == "New Codex on Forge"
+                    && ranked.item.command
+                        == PaletteCommand::SpawnAgent {
+                            agent: AgentKind::CODEX,
+                            cwd: None,
+                            host: Some("forge".into()),
+                        }
+            })
+        }));
     }
 
     struct WheelHarness {

@@ -519,12 +519,11 @@ fn set_executable(path: &Path) {
 }
 
 #[cfg(unix)]
-/// Loads the Rust-owned catalog beside the executable and supplements it with
-/// the source-tree catalog available to loose development builds. The latter
-/// is intentionally later: an old `target/{debug,release}/manifests` directory
-/// must not hide Agents added to the canonical source catalog. Packaged builds
-/// have no source tree at that compiled path and use only their count-checked
-/// sibling catalog. User overrides remain last.
+/// Selects exactly one Rust-owned base catalog, then applies user overrides.
+/// An explicit development catalog wins; otherwise packaged builds use their
+/// count-checked sibling catalog and loose builds fall back to the source tree.
+/// Base catalogs must never be merged because that could produce a catalog
+/// different from the one identified when this Engine binary was built.
 fn load_manifests(exe_dir: &Path, app_support: &Path) -> (ManifestEngine, Vec<String>) {
     let configured = std::env::var_os("DIRI_MANIFESTS_DIR").map(PathBuf::from);
     load_manifests_from(
@@ -543,14 +542,16 @@ fn load_manifests_from(
 ) -> (ManifestEngine, Vec<String>) {
     let overrides = app_support.join("manifests/overrides");
     let sibling = exe_dir.join("manifests");
-    let mut bases = match configured {
-        Some(configured) => vec![configured.to_path_buf()],
-        None => vec![sibling, source_catalog.to_path_buf()],
+    let base = match configured {
+        Some(configured) => configured.is_dir().then(|| configured.to_path_buf()),
+        None => sibling.is_dir().then_some(sibling).or_else(|| {
+            source_catalog
+                .is_dir()
+                .then(|| source_catalog.to_path_buf())
+        }),
     };
-    bases.retain(|path| path.is_dir());
-    bases.dedup();
 
-    let mut dirs = bases.iter().map(PathBuf::as_path).collect::<Vec<_>>();
+    let mut dirs = base.iter().map(PathBuf::as_path).collect::<Vec<_>>();
     if overrides.is_dir() {
         dirs.push(&overrides);
     }
@@ -717,30 +718,45 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_sibling_catalog_cannot_hide_new_source_agents() {
+    fn adjacent_catalog_is_not_merged_with_the_source_catalog() {
         let temporary = tempfile::tempdir().expect("temp");
         let exe_dir = temporary.path().join("bin");
-        let stale = exe_dir.join("manifests");
+        let adjacent = exe_dir.join("manifests");
         let app_support = temporary.path().join("support");
-        std::fs::create_dir_all(&stale).expect("stale catalog");
+        std::fs::create_dir_all(&adjacent).expect("adjacent catalog");
         std::fs::copy(
             diri_engine::detect::bundled_manifest_dir().join("codex.json"),
-            stale.join("codex.json"),
+            adjacent.join("codex.json"),
         )
-        .expect("copy stale manifest");
+        .expect("copy adjacent manifest");
 
         let source_catalog = diri_engine::detect::bundled_manifest_dir();
         let (engine, failed) = load_manifests_from(&exe_dir, &app_support, None, &source_catalog);
 
         assert!(failed.is_empty(), "manifests failed to load: {failed:?}");
         assert!(
-            engine.manifest("pi").is_some(),
-            "the canonical source catalog must supplement an older sibling catalog"
+            engine.manifest("codex").is_some(),
+            "the adjacent packaged catalog must be selected"
         );
         assert!(
-            engine.ids().len() >= 22,
-            "the established Agent catalog must not shrink"
+            engine.manifest("pi").is_none(),
+            "a source-tree catalog must not be merged into an adjacent packaged catalog"
         );
+        assert_eq!(engine.ids(), ["codex"]);
+    }
+
+    #[test]
+    fn loose_build_uses_source_catalog_when_no_adjacent_catalog_exists() {
+        let temporary = tempfile::tempdir().expect("temp");
+        let exe_dir = temporary.path().join("bin");
+        let app_support = temporary.path().join("support");
+        let source_catalog = diri_engine::detect::bundled_manifest_dir();
+
+        let (engine, failed) = load_manifests_from(&exe_dir, &app_support, None, &source_catalog);
+
+        assert!(failed.is_empty(), "manifests failed to load: {failed:?}");
+        assert!(engine.manifest("pi").is_some());
+        assert!(engine.ids().len() >= 22);
     }
 
     #[test]
