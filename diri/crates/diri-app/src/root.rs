@@ -283,6 +283,13 @@ impl RootView {
                     launcher.update(cx, |launcher, cx| launcher.focus(window, cx));
                 });
             }
+            if let SidebarEvent::PeekChanged(id) = event
+                && let Some(terminal) = &this.terminal
+            {
+                terminal.update(cx, |terminal, cx| {
+                    terminal.set_peeked_session(id.clone(), cx);
+                });
+            }
             if matches!(event, SidebarEvent::SessionActivated) {
                 if this.launcher.read(cx).is_open() {
                     this.launcher
@@ -954,10 +961,36 @@ impl RootView {
             cx.stop_propagation();
             return;
         }
+        let sidebar_focused = self.sidebar.read(cx).is_focused(window);
+        if !sidebar_focused && self.sidebar.read(cx).has_peek_in_flight() {
+            match event.keystroke.key.as_str() {
+                "escape" => {
+                    self.sidebar.update(cx, |sidebar, cx| {
+                        sidebar.cancel_peek(cx);
+                    });
+                    cx.stop_propagation();
+                    return;
+                }
+                "enter" if self.sidebar.read(cx).is_peeking() => {
+                    self.sidebar.update(cx, |sidebar, cx| {
+                        sidebar.commit_peek(cx);
+                    });
+                    cx.stop_propagation();
+                    return;
+                }
+                _ if self.sidebar.read(cx).is_peeking() => {
+                    // Pointer peeks preserve the original terminal focus, but
+                    // the borrowed presentation is strictly read-only.
+                    cx.stop_propagation();
+                    return;
+                }
+                _ => {}
+            }
+        }
         // The sidebar is a real keyboard surface. Let its bubble handler own
         // navigation and rename input instead of mirroring the same keystroke
         // into the live terminal during root capture.
-        if self.sidebar.read(cx).is_focused(window) {
+        if sidebar_focused {
             return;
         }
         if self.launcher.read(cx).is_open() {
@@ -1420,6 +1453,20 @@ impl RootView {
     }
 
     fn on_key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let sidebar_focused = self.sidebar.read(cx).is_focused(window);
+        if !sidebar_focused && event.keystroke.key.as_str() == "space" {
+            let released = self
+                .sidebar
+                .update(cx, |sidebar, cx| sidebar.release_keyboard_peek(cx));
+            if released {
+                cx.stop_propagation();
+                return;
+            }
+        }
+        if !sidebar_focused && self.sidebar.read(cx).is_peeking() {
+            cx.stop_propagation();
+            return;
+        }
         if let Some(surfaces) = &self.session_surfaces {
             surfaces.update(cx, |surfaces, cx| {
                 surfaces.handle_key_up(event, window, cx);
@@ -1433,6 +1480,10 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.sidebar.read(cx).is_focused(window) && self.sidebar.read(cx).is_peeking() {
+            cx.stop_propagation();
+            return;
+        }
         if let Some(surfaces) = &self.session_surfaces {
             surfaces.update(cx, |surfaces, cx| {
                 surfaces.handle_modifiers_changed(event, window, cx);

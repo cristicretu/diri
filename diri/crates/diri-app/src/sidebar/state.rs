@@ -16,6 +16,113 @@ pub enum CursorMove {
     End,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeekSource {
+    Pointer,
+    Keyboard,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionPeek {
+    pub id: SessionId,
+    pub source: PeekSource,
+}
+
+/// Owns the transient session-preview state machine.
+///
+/// Its interface deliberately knows nothing about `SessionStore`: callers can
+/// borrow and restore presentation without accidentally selecting, waking, or
+/// acknowledging a session. Gesture bookkeeping lives here as well so a
+/// pointer release cannot later masquerade as a click or drop.
+#[derive(Debug, Default)]
+pub struct PeekState {
+    active: Option<SessionPeek>,
+    space_held: bool,
+    suppress_pointer_click: bool,
+    suppress_pointer_drop: bool,
+}
+
+impl PeekState {
+    pub fn active(&self) -> Option<&SessionPeek> {
+        self.active.as_ref()
+    }
+
+    pub fn target(&self) -> Option<&SessionId> {
+        self.active.as_ref().map(|peek| &peek.id)
+    }
+
+    pub fn begin(&mut self, id: SessionId, source: PeekSource) -> bool {
+        let next = SessionPeek { id, source };
+        let changed = self.active.as_ref() != Some(&next);
+        self.active = Some(next);
+        changed
+    }
+
+    pub fn follow(&mut self, id: SessionId, source: PeekSource) -> bool {
+        if self
+            .active
+            .as_ref()
+            .is_none_or(|peek| peek.source != source)
+        {
+            return false;
+        }
+        self.begin(id, source)
+    }
+
+    pub fn end(&mut self, source: Option<PeekSource>) -> bool {
+        if source.is_some_and(|source| {
+            self.active
+                .as_ref()
+                .is_none_or(|peek| peek.source != source)
+        }) {
+            return false;
+        }
+        self.active.take().is_some()
+    }
+
+    pub fn take(&mut self) -> Option<SessionPeek> {
+        self.active.take()
+    }
+
+    pub fn hold_space(&mut self) -> bool {
+        if self.space_held {
+            return false;
+        }
+        self.space_held = true;
+        true
+    }
+
+    pub fn release_space(&mut self) -> bool {
+        std::mem::take(&mut self.space_held)
+    }
+
+    pub fn suppress_pointer_completion(&mut self, click: bool, drop: bool) {
+        self.suppress_pointer_click = click;
+        self.suppress_pointer_drop = drop;
+    }
+
+    pub fn consume_pointer_click(&mut self) -> bool {
+        std::mem::take(&mut self.suppress_pointer_click)
+    }
+
+    pub fn guards_pointer_drop(&self) -> bool {
+        self.suppress_pointer_drop
+            || self
+                .active
+                .as_ref()
+                .is_some_and(|peek| peek.source == PeekSource::Pointer)
+    }
+
+    pub fn consume_pointer_drop(&mut self) -> bool {
+        std::mem::take(&mut self.suppress_pointer_drop)
+    }
+
+    pub fn clear_completion_guards(&mut self) {
+        self.suppress_pointer_click = false;
+        self.suppress_pointer_drop = false;
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DragItem {
     Project(ProjectId),
@@ -82,6 +189,7 @@ pub struct SidebarUiState {
     /// previous row at the end) if that session disappears.
     pub focus_cursor: Option<SessionId>,
     focus_order: Vec<SessionId>,
+    pub peek: PeekState,
 }
 
 impl SidebarUiState {
@@ -106,6 +214,7 @@ impl SidebarUiState {
             preview_account: false,
             focus_cursor: None,
             focus_order: Vec::new(),
+            peek: PeekState::default(),
         }
     }
 
@@ -330,5 +439,42 @@ mod tests {
         assert!(state.pending_sibling.is_none());
         assert!(state.delegation_notice.is_none());
         assert!(state.delegation_mark.is_none());
+    }
+
+    #[test]
+    fn pointer_peek_follows_and_release_restores_presentation_only() {
+        let one = SessionId::new("one");
+        let two = SessionId::new("two");
+        let mut peek = PeekState::default();
+
+        assert!(peek.begin(one, PeekSource::Pointer));
+        assert!(peek.follow(two.clone(), PeekSource::Pointer));
+        assert_eq!(peek.target(), Some(&two));
+        assert!(peek.end(Some(PeekSource::Pointer)));
+        assert!(peek.target().is_none());
+    }
+
+    #[test]
+    fn gesture_ownership_prevents_cross_source_release() {
+        let mut peek = PeekState::default();
+        peek.begin(SessionId::new("keyboard"), PeekSource::Keyboard);
+
+        assert!(!peek.end(Some(PeekSource::Pointer)));
+        assert_eq!(
+            peek.active().map(|peek| peek.source),
+            Some(PeekSource::Keyboard)
+        );
+        assert!(!peek.release_space());
+    }
+
+    #[test]
+    fn pointer_completion_guards_are_one_shot() {
+        let mut peek = PeekState::default();
+        peek.suppress_pointer_completion(true, true);
+
+        assert!(peek.consume_pointer_click());
+        assert!(!peek.consume_pointer_click());
+        assert!(peek.consume_pointer_drop());
+        assert!(!peek.consume_pointer_drop());
     }
 }
