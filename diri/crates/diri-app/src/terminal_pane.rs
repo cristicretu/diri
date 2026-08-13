@@ -478,7 +478,6 @@ impl AttachmentControl {
         if bytes.is_empty() {
             return;
         }
-        let _ = self.pane_tx.send(PaneEvent::InteractiveInput);
         let _ = self.tx.send(AttachmentCommand::Mouse(bytes));
     }
 
@@ -1101,10 +1100,7 @@ impl TerminalPane {
                 }
                 self.apply_grid_updates(id, updates, window, cx);
             }
-            PaneEvent::Chunk(
-                id,
-                TerminalChunk::Modes { alt_screen, mouse },
-            ) => {
+            PaneEvent::Chunk(id, TerminalChunk::Modes { alt_screen, mouse }) => {
                 if let Some(resident) = self.residents.get_mut(&id) {
                     if resident.element.mouse_modes() != mouse {
                         resident.pointer_owner = None;
