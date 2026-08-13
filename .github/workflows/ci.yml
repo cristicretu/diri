@@ -164,7 +164,7 @@ jobs:
       run:
         working-directory: diri
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install target
         run: rustup target add "${{ matrix.target }}"
       - name: Install native musl linker
@@ -196,7 +196,7 @@ jobs:
       run:
         working-directory: diri
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Start disposable ordinary-user SSH endpoint
         run: |
           sudo apt-get update
@@ -350,7 +350,7 @@ jobs:
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.0.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
@@ -414,7 +414,7 @@ jobs:
           xvfb-run -a env -u WAYLAND_DISPLAY APPIMAGE_EXTRACT_AND_RUN=1 \
             DIRI_UI_SMOKE_TEST=1 "${appimage}"
       - name: Upload Linux release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: linux-packages-${{ github.event.pull_request.head.sha || github.sha }}
           path: |
@@ -433,7 +433,7 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.0.0
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: linux-packages-${{ github.event.pull_request.head.sha || github.sha }}
           path: diri/dist/linux
