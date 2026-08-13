@@ -275,10 +275,12 @@ pub fn template_ns_image(kind: BrandMarkKind, point_size: f32) -> Option<Retaine
     path.fill();
     NSGraphicsContext::restoreGraphicsState_class();
 
-    let image = NSImage::initWithSize(
-        NSImage::alloc(),
-        NSSize::new(f64::from(point_size), f64::from(point_size)),
-    );
+    let size = NSSize::new(f64::from(point_size), f64::from(point_size));
+    // Declare the rep as `size` points backed by 2x pixels. Without this its
+    // size defaults to the pixel count, so a 16pt image carries a rep claiming
+    // to be 32pt and AppKit scales — or mis-renders the template — to reconcile.
+    bitmap.setSize(size);
+    let image = NSImage::initWithSize(NSImage::alloc(), size);
     image.addRepresentation(bitmap.as_ref());
     image.setTemplate(true);
     Some(image)
@@ -349,10 +351,9 @@ pub fn template_settings_ns_image(point_size: f32) -> Option<Retained<NSImage>> 
     strokes.stroke();
     NSGraphicsContext::restoreGraphicsState_class();
 
-    let image = NSImage::initWithSize(
-        NSImage::alloc(),
-        NSSize::new(f64::from(point_size), f64::from(point_size)),
-    );
+    let size = NSSize::new(f64::from(point_size), f64::from(point_size));
+    bitmap.setSize(size);
+    let image = NSImage::initWithSize(NSImage::alloc(), size);
     image.addRepresentation(bitmap.as_ref());
     image.setTemplate(true);
     Some(image)
@@ -426,10 +427,9 @@ pub fn template_diri_logo_ns_image(height: f32) -> Option<Retained<NSImage>> {
     strokes.stroke();
     NSGraphicsContext::restoreGraphicsState_class();
 
-    let image = NSImage::initWithSize(
-        NSImage::alloc(),
-        NSSize::new(f64::from(width), f64::from(height)),
-    );
+    let size = NSSize::new(f64::from(width), f64::from(height));
+    bitmap.setSize(size);
+    let image = NSImage::initWithSize(NSImage::alloc(), size);
     image.addRepresentation(bitmap.as_ref());
     // Black ink + alpha is the AppKit template convention; white ink reads
     // inverted on the dark menu bar when the status item stays untinted.
