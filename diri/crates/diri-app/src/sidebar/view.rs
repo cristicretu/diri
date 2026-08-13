@@ -17,8 +17,8 @@ use diri_ui::{
 use gpui::{
     Anchor, Animation, AnimationExt, AnyElement, App, AppContext as _, Bounds, Context, Entity,
     EventEmitter, ExternalPaths, FocusHandle, Focusable, FontWeight, Hsla, IntoElement,
-    MouseButton, Pixels, Point, Render, Rgba, ScrollHandle, SharedString, Task, Window, anchored,
-    deferred, div, linear_color_stop, linear_gradient, point, prelude::*, px,
+    MouseButton, PathPromptOptions, Pixels, Point, Render, Rgba, ScrollHandle, SharedString, Task,
+    Window, anchored, deferred, div, linear_color_stop, linear_gradient, point, prelude::*, px,
 };
 use tokio::sync::mpsc;
 
@@ -349,6 +349,43 @@ impl Sidebar {
 
     pub fn show_new_agent(&mut self, cx: &mut Context<Self>) {
         self.open_new_agent_popover(None, cx);
+    }
+
+    fn browse_local_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Start Here".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(mut paths))) = paths.await else {
+                return;
+            };
+            let Some(path) = paths.pop() else {
+                return;
+            };
+            let _ = this.update_in(cx, |this, _window, cx| {
+                this.apply_browsed_local_folder(path.to_string_lossy().into_owned());
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// NSOpenPanel paths are This Mac only. Ignore the pick if New Agent moved
+    /// to a remote host or another sidebar menu opened while the panel was up.
+    fn apply_browsed_local_folder(&mut self, path: String) {
+        match &self.ui.popover {
+            Some(Popover::NewAgent { host: None, .. }) | None => {
+                self.directory_picker_open = false;
+                self.ui.popover = Some(Popover::NewAgent {
+                    directory: Some(path),
+                    host: None,
+                });
+            }
+            Some(_) => {}
+        }
     }
 
     /// Opens the new-agent picker, refreshing the host catalog first so
@@ -2480,7 +2517,33 @@ impl Sidebar {
                             .request_directory_listing(browse_host.clone(), browse_target.clone());
                         cx.notify();
                     }))
-            });
+            })
+            .when(
+                selected_host.is_none() && self.directory_picker_open,
+                |header| {
+                    header.child(
+                        div()
+                            .id("new-agent-browse")
+                            .debug_selector(|| "new-agent-browse".into())
+                            .px(px(4.0))
+                            .py(px(3.0))
+                            .ml(px(-4.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(5.0))
+                            .rounded(px(Radius::CHIP))
+                            .cursor_pointer()
+                            .hover(move |row| row.bg(colors.primary.alpha(0.06)))
+                            .text_size(px(Typo::META.size))
+                            .text_color(colors.secondary)
+                            .child(sf_symbol("plus", 11.0, colors.secondary))
+                            .child("Browse…")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.browse_local_folder(window, cx);
+                            })),
+                    )
+                },
+            );
         if let Some(subtitle) = subtitle {
             // Repo-resolution state: "locating repo…" or the visible fallback
             // ("anara not on Forge — opens in code").
@@ -5096,6 +5159,130 @@ mod tests {
         );
         assert!(cx.debug_bounds("AGENT_OPTION_0").is_some());
         assert!(cx.debug_bounds("AGENT_OPTION_1").is_some());
+    }
+
+    #[gpui::test]
+    fn new_agent_browse_is_hidden_until_the_folder_browser_opens(cx: &mut TestAppContext) {
+        let (_view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| {
+                let mut sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                sidebar.ui.popover = Some(Popover::NewAgent {
+                    directory: None,
+                    host: None,
+                });
+                sidebar
+            });
+            SidebarPopoverHarness { sidebar }
+        });
+
+        assert!(cx.debug_bounds("AGENT_OPTION_0").is_some());
+        assert!(cx.debug_bounds("new-agent-browse").is_none());
+    }
+
+    #[gpui::test]
+    fn new_agent_browse_is_visible_in_the_local_folder_browser(cx: &mut TestAppContext) {
+        let (_view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| {
+                let mut sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                sidebar.directory_picker_open = true;
+                sidebar.ui.popover = Some(Popover::NewAgent {
+                    directory: Some("/Users/preview".to_owned()),
+                    host: None,
+                });
+                sidebar
+            });
+            SidebarPopoverHarness { sidebar }
+        });
+
+        assert!(cx.debug_bounds("new-agent-browse").is_some());
+        assert!(cx.debug_bounds("AGENT_OPTION_0").is_none());
+    }
+
+    #[gpui::test]
+    fn new_agent_browse_is_hidden_on_a_remote_host(cx: &mut TestAppContext) {
+        let (_view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| {
+                let mut sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                sidebar
+                    .store
+                    .write()
+                    .expect("session store lock poisoned")
+                    .set_hosts(vec![diri_proto::HostEntry {
+                        id: "forge".into(),
+                        name: Some("Forge".into()),
+                        ssh: "you@forge".into(),
+                        default_cwd: None,
+                        node: None,
+                    }]);
+                sidebar.directory_picker_open = true;
+                sidebar.ui.popover = Some(Popover::NewAgent {
+                    directory: None,
+                    host: Some("forge".into()),
+                });
+                sidebar
+            });
+            SidebarPopoverHarness { sidebar }
+        });
+
+        assert!(cx.debug_bounds("new-agent-browse").is_none());
+    }
+
+    #[gpui::test]
+    fn browsed_folder_applies_only_while_new_agent_is_on_this_mac(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| {
+                let mut sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                sidebar.directory_picker_open = true;
+                sidebar.ui.popover = Some(Popover::NewAgent {
+                    directory: Some("/Users/preview".to_owned()),
+                    host: None,
+                });
+                sidebar
+            });
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.apply_browsed_local_folder("/Users/me/code".into());
+            cx.notify();
+        });
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.ui.popover.clone()),
+            Some(Popover::NewAgent {
+                directory: Some("/Users/me/code".to_owned()),
+                host: None,
+            })
+        );
+        assert!(!sidebar.read_with(cx, |sidebar, _| sidebar.directory_picker_open));
+
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.directory_picker_open = true;
+            sidebar.ui.popover = Some(Popover::NewAgent {
+                directory: Some("/old".to_owned()),
+                host: Some("forge".into()),
+            });
+            sidebar.apply_browsed_local_folder("/Users/me/code".into());
+            cx.notify();
+        });
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.ui.popover.clone()),
+            Some(Popover::NewAgent {
+                directory: Some("/old".to_owned()),
+                host: Some("forge".into()),
+            })
+        );
+        assert!(sidebar.read_with(cx, |sidebar, _| sidebar.directory_picker_open));
+
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.ui.popover = Some(Popover::Account);
+            sidebar.apply_browsed_local_folder("/Users/me/code".into());
+            cx.notify();
+        });
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.ui.popover.clone()),
+            Some(Popover::Account)
+        );
     }
 
     #[gpui::test]
