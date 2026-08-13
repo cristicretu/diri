@@ -536,10 +536,12 @@ mod tests {
             server.join().expect("fixture server"),
             vec![Method::HELLO, Method::DAEMON_SHUTDOWN]
         );
-        for _ in 0..50 {
-            if marker.exists() {
-                break;
-            }
+        // Wait on a deadline, not a fixed iteration count. This is a real
+        // spawned process writing a real file, and 50 × 10ms only ever bought
+        // half a second — enough on an idle machine, not enough on a loaded CI
+        // runner, where this failed with the marker simply not written yet.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !marker.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(
