@@ -59,15 +59,16 @@ const IDLE_TICK_INTERVAL: Duration = Duration::from_secs(1);
 /// How long an attach poll or input write keeps a session on the fast tick.
 const HOT_WINDOW_SECS: u64 = 30;
 
-/// Maximum raw log tail replayed when starting or adopting a held session.
-/// The same hard startup-work bound the Swift daemon enforced.
+/// Normal raw-log tail budget for display reconstruction and for deciding
+/// whether a current checkpoint is cheap enough to resume. A legacy or
+/// unusable checkpoint deliberately bypasses it once to recover sticky modes
+/// from the bounded retained prefix.
 const REPLAY_BUDGET: usize = 256 << 10;
 const MAX_REPLAY_BUDGET: usize = 32 << 20;
 
-/// The normal startup bound is intentionally small, but an old checkpoint
-/// format can require a one-time raw-log migration to rebuild scrollback.
-/// Operators can raise the bound for that restart without changing the
-/// steady-state cost; malformed values fall back to the default.
+/// Operators can raise the normal checkpoint-to-tail allowance for a restart
+/// without changing the retained-prefix correctness migration. Malformed
+/// values fall back to the default.
 fn replay_budget() -> usize {
     std::env::var("DIRIJOR_REPLAY_BUDGET_BYTES")
         .ok()
@@ -742,6 +743,14 @@ impl Session {
         engine: Arc<ManifestEngine>,
         initial_status: Option<(SessionStatus, Option<NeedsInputDetail>)>,
     ) -> std::io::Result<Self> {
+        let log = OutputLog::writer(&spec.logs_dir, &spec.id)?;
+        let shared = new_shared(&spec, log, &engine);
+        // A live 1.4 Holder cannot report DECCKM. Rebuild the local emulator
+        // before asking that Holder for an incremental replay: otherwise a
+        // persisted tail offset plus a quiet remote process produces an empty
+        // replay and the first `None` snapshot is resolved against a freshly
+        // constructed (and falsely definitive) terminal default.
+        let retained_output_tail = hydrate_screen_from_retained_output(&shared);
         let client = Arc::new(RemoteSessionClient::new(
             remote.manager,
             remote.helper,
@@ -751,11 +760,9 @@ impl Session {
             remote.binding_store,
             remote.output_offset,
         ));
-        let log = OutputLog::writer(&spec.logs_dir, &spec.id)?;
-        let shared = new_shared(&spec, log, &engine);
         shared
             .remote_output_offset
-            .store(remote.output_offset, Ordering::SeqCst);
+            .store(retained_output_tail, Ordering::SeqCst);
         *shared.remote_grid.lock().expect("remote grid") = Some(RemoteGridState {
             mirror: GridMirror::new(),
             revision: 0,
@@ -1744,6 +1751,34 @@ fn new_shared(spec: &SessionSpec, log: OutputLog, engine: &ManifestEngine) -> Ar
     })
 }
 
+/// Replays the complete locally retained remote-output prefix into a fresh
+/// emulator and returns the first offset the remote Holder still owes us.
+///
+/// This deliberately ignores the normal 256 KiB presentation replay budget.
+/// Terminal modes such as DECCKM are sticky, and protocol-1.4 Holders cannot
+/// put their current value in a snapshot. The bounded OutputLog spill is the
+/// only authoritative cold-adoption source available to a new Engine.
+fn hydrate_screen_from_retained_output(shared: &Shared) -> u64 {
+    let mut log = shared.log.lock().expect("log");
+    let mut screen = shared.screen.lock().expect("screen");
+    hydrate_screen_from_log(&mut log, &mut screen)
+}
+
+fn hydrate_screen_from_log(log: &mut OutputLog, screen: &mut HeadlessScreen) -> u64 {
+    log.refresh_from_disk();
+    let tail = log.tail_offset();
+    let mut offset = log.oldest_available_offset();
+    while offset < tail {
+        let (start, bytes) = log.read(offset, LOG_READ_BUDGET);
+        if bytes.is_empty() {
+            break;
+        }
+        screen.feed(&bytes);
+        offset = start.saturating_add(bytes.len() as u64);
+    }
+    offset.min(tail)
+}
+
 /// Waits for a freshly launched holder and returns the exit-marker floor:
 /// 250 × 20ms.
 ///
@@ -2603,9 +2638,16 @@ fn pump_held(
                 watcher,
                 checkpoint.marker_buffer,
             ),
+            // A checkpoint miss is a correctness migration, not the normal
+            // repaint fast path. Replay every retained byte in this Holder
+            // incarnation so sticky modes that precede the 256 KiB
+            // display-tail budget are reconstructed.
+            // The spill file is independently bounded; once this pass catches
+            // up it writes a current v4 checkpoint and future adoption is the
+            // cheap path again.
             None => (
                 checkpoint_path,
-                log.preferred_replay_start(replay_budget),
+                log.oldest_available_offset().max(exit_marker_floor),
                 watcher,
                 Vec::new(),
             ),
@@ -3129,7 +3171,10 @@ mod prompt_title_tests {
 
 #[cfg(test)]
 mod remote_mode_tests {
-    use super::resolve_remote_application_cursor_keys;
+    use super::{
+        HeadlessScreen, OutputLog, REPLAY_BUDGET, hydrate_screen_from_log,
+        resolve_remote_application_cursor_keys,
+    };
 
     #[test]
     fn old_holder_unknown_mode_uses_retained_output_truth() {
@@ -3137,6 +3182,34 @@ mod remote_mode_tests {
         assert!(!resolve_remote_application_cursor_keys(None, false));
         assert!(resolve_remote_application_cursor_keys(Some(true), false));
         assert!(!resolve_remote_application_cursor_keys(Some(false), true));
+    }
+
+    #[test]
+    fn old_holder_cold_adoption_hydrates_truth_before_a_quiet_tail_resume() {
+        let root = tempfile::tempdir().expect("temp");
+        let persisted_tail = {
+            let mut log = OutputLog::writer(root.path(), "remote").expect("writer");
+            log.append(b"\x1b[?1h").expect("mode transition");
+            log.append(&vec![b'x'; REPLAY_BUDGET + (64 << 10)])
+                .expect("output after the transition");
+            log.flush().expect("flush");
+            log.tail_offset()
+        };
+
+        // A restarted Engine has a fresh emulator and the binding already
+        // points at the quiet tail. Hydration must precede the 1.4 snapshot,
+        // whose absent bit decodes as None and supplies no corrective output.
+        let mut retained = OutputLog::writer(root.path(), "remote").expect("cold reader");
+        let mut screen = HeadlessScreen::new(80, 24);
+        assert!(!screen.application_cursor_keys());
+        assert_eq!(
+            hydrate_screen_from_log(&mut retained, &mut screen),
+            persisted_tail
+        );
+        assert!(resolve_remote_application_cursor_keys(
+            None,
+            screen.application_cursor_keys()
+        ));
     }
 }
 

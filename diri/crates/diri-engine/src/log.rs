@@ -130,6 +130,17 @@ impl OutputLog {
         self.ring_start_offset
     }
 
+    /// Oldest byte this process can still reconstruct from either the spill
+    /// file or its in-memory ring. Cold terminal-mode recovery must start
+    /// here, rather than at a latency-oriented tail window: DEC modes are
+    /// sticky and their last transition may be arbitrarily far behind the
+    /// visible screen.
+    pub fn oldest_available_offset(&self) -> u64 {
+        self.ring_start_offset
+            .min(self.file_base_offset)
+            .min(self.tail_offset)
+    }
+
     pub fn sync_points(&self) -> &[u64] {
         &self.sync_points
     }
@@ -166,8 +177,7 @@ impl OutputLog {
     /// Reads up to `max_bytes` from `from_offset`, clamped to what remains
     /// available. Returns the actual start offset and the bytes.
     pub fn read(&mut self, from_offset: u64, max_bytes: usize) -> (u64, Vec<u8>) {
-        let oldest_available = self.ring_start_offset.min(self.file_base_offset);
-        let start = from_offset.max(oldest_available);
+        let start = from_offset.max(self.oldest_available_offset());
         if start >= self.tail_offset {
             return (self.tail_offset, Vec::new());
         }

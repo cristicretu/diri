@@ -431,7 +431,10 @@ bit. Capability and minor version must both be present before an unset bit can
 mean `false`; for a live protocol 1.4 Holder the state is `None`, never an
 invented terminal default. In that mixed-version case the Engine reconstructs
 DECCKM from the same ordered retained output it already feeds through its local
-emulator, then publishes the resolved state to desktop attachments.
+emulator, then publishes the resolved state to desktop attachments. Cold
+adoption hydrates that emulator from the complete locally retained OutputLog
+prefix before resuming at the persisted remote tail, so a quiet 1.4 Holder
+cannot turn an absent bit into a false terminal default.
 
 The PTY reader must never block on a client. The Holder uses bounded queues. It
 coalesces background output for no more than 8 ms, while up to two grid

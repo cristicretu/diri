@@ -488,6 +488,9 @@ enum AttachmentCommand {
         col: u16,
         row: u16,
     },
+    /// GPUI has applied this generation's initial Modes event, so encoding
+    /// and routing input can no longer race the seed.
+    ModesApplied,
     Close,
 }
 
@@ -522,6 +525,10 @@ impl AttachmentControl {
             col,
             row,
         });
+    }
+
+    fn modes_applied(&self) {
+        let _ = self.tx.send(AttachmentCommand::ModesApplied);
     }
 
     fn close(&self) {
@@ -1201,6 +1208,7 @@ impl TerminalPane {
                     resident.bracketed_paste = bracketed_paste;
                     resident.application_cursor_keys = application_cursor_keys;
                     resident.element.set_modes(alt_screen, mouse);
+                    resident.attachment.modes_applied();
                 }
                 if self.selected_id().as_ref() == Some(&id) {
                     cx.notify();
@@ -3557,11 +3565,83 @@ fn spawn_attachment(
             if let Some((cols, rows)) = last_resize {
                 let _ = writer.resize(cols, rows);
             }
-            let _ = pane_tx.send(PaneEvent::AttachmentState(
-                id.clone(),
-                generation,
-                AttachmentState::Live,
-            ));
+
+            // A connected socket is not yet input-ready. Reattachment reset
+            // both sticky input modes above, and the authoritative Modes seed
+            // follows the initial grid on this stream. Forward seed chunks so
+            // the terminal can paint, but do not publish Live or send input
+            // until GPUI acknowledges that it applied the Modes event. This
+            // closes the smaller race between queueing the seed and encoding
+            // a key on the UI thread before that queue was drained.
+            let mut modes_seeded = false;
+            let seed_outcome = loop {
+                tokio::select! {
+                    chunk = attachment.chunks.recv() => {
+                        let Some(chunk) = chunk else { break None };
+                        let is_modes = matches!(chunk, TerminalChunk::Modes { .. });
+                        if pane_tx
+                            .send(PaneEvent::Chunk(id.clone(), generation, chunk))
+                            .is_err()
+                        {
+                            break Some(true);
+                        }
+                        if is_modes {
+                            modes_seeded = true;
+                        }
+                    }
+                    command = commands.recv() => {
+                        match command {
+                            Some(AttachmentCommand::Resize(cols, rows)) => {
+                                last_resize = Some((cols, rows));
+                                let _ = writer.resize(cols, rows);
+                            }
+                            Some(AttachmentCommand::Close) | None => break Some(true),
+                            Some(AttachmentCommand::ModesApplied) if modes_seeded => {
+                                break Some(false);
+                            }
+                            Some(AttachmentCommand::ModesApplied) => {}
+                            // Keystrokes, paste framing, pointer reports, and
+                            // wheel routing all depend on the fresh mode seed.
+                            // Input during this short attaching window is
+                            // deliberately rejected, as it already is during
+                            // reconnect backoff.
+                            Some(AttachmentCommand::Input(_))
+                            | Some(AttachmentCommand::Mouse(_))
+                            | Some(AttachmentCommand::Scroll { .. }) => {}
+                        }
+                    }
+                }
+            };
+            match seed_outcome {
+                Some(false) => {}
+                Some(true) => {
+                    attachment.close().await;
+                    return;
+                }
+                None => {
+                    attachment.close().await;
+                    let _ = pane_tx.send(PaneEvent::AttachmentState(
+                        id.clone(),
+                        generation,
+                        AttachmentState::Reconnecting,
+                    ));
+                    if wait_for_retry(&mut commands, &mut last_resize).await {
+                        return;
+                    }
+                    continue;
+                }
+            }
+            if pane_tx
+                .send(PaneEvent::AttachmentState(
+                    id.clone(),
+                    generation,
+                    AttachmentState::Live,
+                ))
+                .is_err()
+            {
+                attachment.close().await;
+                return;
+            }
 
             let should_close = loop {
                 tokio::select! {
@@ -3589,6 +3669,7 @@ fn spawn_attachment(
                             Some(AttachmentCommand::Scroll { direction, lines, col, row }) => {
                                 let _ = writer.scroll(direction, lines, col, row);
                             }
+                            Some(AttachmentCommand::ModesApplied) => {}
                             Some(AttachmentCommand::Close) | None => break true,
                         }
                     }
@@ -3623,6 +3704,7 @@ async fn wait_for_retry(
             command = commands.recv() => match command {
                 Some(AttachmentCommand::Resize(cols, rows)) => *last_resize = Some((cols, rows)),
                 Some(AttachmentCommand::Close) | None => return true,
+                Some(AttachmentCommand::ModesApplied) => {}
                 Some(AttachmentCommand::Input(_))
                 | Some(AttachmentCommand::Mouse(_))
                 | Some(AttachmentCommand::Scroll { .. }) => {}
@@ -3888,6 +3970,105 @@ mod tests {
     use gpui::{Image, ImageFormat, KeyDownEvent, Keystroke, Modifiers, TestAppContext, point};
 
     use super::*;
+
+    #[tokio::test]
+    async fn attachment_rejects_input_and_withholds_live_until_the_modes_seed() {
+        use diri_proto::frames::{Frame, FrameCodec, FrameType};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+        use tokio::sync::oneshot;
+        use tokio::time::{Duration, timeout};
+
+        let root = tempfile::tempdir().expect("temp");
+        let socket = root.path().join("attachment.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let (connected_tx, connected_rx) = oneshot::channel();
+        let (pre_seed_tx, pre_seed_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let (live_input_tx, live_input_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut attach_line = Vec::new();
+            BufReader::new(&mut stream)
+                .read_until(b'\n', &mut attach_line)
+                .await
+                .expect("attach line");
+            connected_tx.send(()).expect("connected signal");
+
+            let mut byte = [0_u8; 1];
+            let rejected = timeout(Duration::from_millis(150), stream.read(&mut byte))
+                .await
+                .is_err();
+            pre_seed_tx.send(rejected).expect("pre-seed result");
+
+            release_rx.await.expect("release modes");
+            let modes = Frame::modes_with_bracketed_paste(true, true, MouseModes::OFF)
+                .with_application_cursor_keys(true);
+            stream
+                .write_all(&FrameCodec::encode(&modes).expect("encode modes"))
+                .await
+                .expect("write modes");
+
+            let mut codec = FrameCodec::new();
+            let input = timeout(Duration::from_secs(2), async {
+                loop {
+                    let read = stream.read(&mut byte).await.expect("read input");
+                    assert_ne!(read, 0, "attachment closed before live input");
+                    for frame in codec.feed(&byte[..read]).expect("decode input") {
+                        if frame.frame_type == FrameType::Input {
+                            return frame.payload;
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("live input timeout");
+            live_input_tx.send(input).expect("live input result");
+        });
+
+        let (pane_tx, mut pane_rx) = pane_event_channel();
+        let control = spawn_attachment(
+            &tokio::runtime::Handle::current(),
+            socket,
+            SessionId::new("mode-seed"),
+            1,
+            pane_tx,
+        );
+        connected_rx.await.expect("attachment connected");
+        control.input(b"before-modes".to_vec());
+        assert!(pre_seed_rx.await.expect("pre-seed observation"));
+
+        let mut batch = Vec::new();
+        assert!(pane_rx.recv_batch(&mut batch).await);
+        assert!(batch.iter().all(|event| !matches!(
+            event,
+            PaneEvent::AttachmentState(_, _, AttachmentState::Live)
+        )));
+
+        release_tx.send(()).expect("release");
+        let mut saw_modes = false;
+        loop {
+            batch.clear();
+            assert!(pane_rx.recv_batch(&mut batch).await);
+            for event in &batch {
+                match event {
+                    PaneEvent::Chunk(_, _, TerminalChunk::Modes { .. }) => {
+                        saw_modes = true;
+                        control.modes_applied();
+                    }
+                    PaneEvent::AttachmentState(_, _, AttachmentState::Live) => {
+                        assert!(saw_modes, "Modes must be queued before Live");
+                        control.input(b"after-modes".to_vec());
+                        assert_eq!(live_input_rx.await.expect("live input"), b"after-modes");
+                        control.close();
+                        server.await.expect("server");
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn pane_mailbox_retains_one_exact_final_grid_per_session() {
