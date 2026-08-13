@@ -150,8 +150,12 @@ pub(crate) struct AppServices {
     pub(crate) store: Arc<StoreRuntime>,
     pub(crate) usage_tx: tokio::sync::watch::Sender<UsageSnapshot>,
     pub(crate) updates: UpdateHandle,
-    pub(crate) tokio: Arc<Runtime>,
     pub(crate) dev_build: Option<DevBuildIdentity>,
+    #[cfg(unix)]
+    daemon_startup: Option<daemon_launch::DeferredDaemonStartup>,
+    // Declared last so every service and its owned startup handle drops before
+    // the executor during early unwinding as well as ordinary app shutdown.
+    pub(crate) tokio: Arc<Runtime>,
 }
 
 fn main() {
@@ -328,8 +332,10 @@ fn main() {
         store: store_runtime,
         usage_tx,
         updates,
-        tokio,
         dev_build,
+        #[cfg(unix)]
+        daemon_startup,
+        tokio,
     });
 
     let app = application().with_assets(diri_ui::IconAssets);
@@ -349,15 +355,32 @@ fn main() {
         diri_ui::set_mark_rasterizer(macos::brand_raster::raster_mark);
         commands::bind_default_keys(cx);
         install_app_menus(cx);
-        let quit_store = Arc::clone(&services.store);
+        let quit_services = Arc::clone(&services);
         let quit_updates = services.updates.clone();
         let release_owned_daemon =
             !preview && std::env::var_os(diri_proto::paths::ENV_SOCKET).is_none();
         cx.on_app_quit(move |_| {
-            let quit_store = Arc::clone(&quit_store);
+            let quit_services = Arc::clone(&quit_services);
             let quit_updates = quit_updates.clone();
+            // This runs while GPUI is constructing the quit future, before its
+            // 200 ms grace period begins. The coordinator never transfers its
+            // sole task handle into that cancellable future: pending startup
+            // and idle release remain owned by runtime blocking workers.
+            #[cfg(unix)]
+            let startup_owns_release =
+                quit_services
+                    .daemon_startup
+                    .as_ref()
+                    .is_some_and(|startup| {
+                        startup
+                            .request_shutdown(&quit_services.tokio, quit_services.store.client());
+                        true
+                    });
+            #[cfg(not(unix))]
+            let startup_owns_release = false;
             async move {
-                if let Err(error) = quit_store
+                if let Err(error) = quit_services
+                    .store
                     .store
                     .write()
                     .expect("session store lock poisoned")
@@ -370,11 +393,12 @@ fn main() {
                 // exit and deliberately does not reopen an app the user quit.
                 quit_updates.install_on_quit();
                 if release_owned_daemon
-                    && let Err(error) = quit_store.client().shutdown_daemon_if_idle().await
+                    && !startup_owns_release
+                    && let Err(error) = quit_services.store.client().shutdown_daemon_if_idle().await
                 {
                     eprintln!("diri: could not release the idle Engine while quitting: {error}");
                 }
-                quit_store.shutdown().await;
+                quit_services.store.shutdown().await;
             }
         })
         .detach();
@@ -386,7 +410,7 @@ fn main() {
         // only after replacement is complete, so the UI cannot race a daemon
         // that is about to shut down.
         #[cfg(unix)]
-        if let Some(startup) = daemon_startup {
+        if let Some(startup) = services.daemon_startup.as_ref() {
             startup.after_window_open(&services.tokio, Arc::clone(services.store.client()));
         }
         if smoke_test {

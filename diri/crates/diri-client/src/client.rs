@@ -335,9 +335,18 @@ impl DaemonClient {
         *lifecycle = Some(tokio::spawn(async move { run_lifecycle(core).await }));
     }
 
+    /// Synchronously asks the connect/reconnect loop to close its control
+    /// connection. This is the non-waiting half of [`Self::shutdown`] for
+    /// lifecycle callbacks whose futures may be cancelled immediately.
+    ///
+    /// The signal is idempotent and never sends a daemon shutdown request.
+    pub fn begin_shutdown(&self) {
+        self.core.shutdown_tx.send_replace(true);
+    }
+
     /// Stops this client only. This never sends a shutdown request to the daemon.
     pub async fn shutdown(&self) {
-        self.core.shutdown_tx.send_replace(true);
+        self.begin_shutdown();
         let task = self
             .lifecycle
             .lock()
@@ -834,7 +843,7 @@ impl DaemonClient {
 
 impl Drop for DaemonClient {
     fn drop(&mut self) {
-        self.core.shutdown_tx.send_replace(true);
+        self.begin_shutdown();
         if let Ok(slot) = self.lifecycle.get_mut()
             && let Some(task) = slot.take()
         {
@@ -988,6 +997,16 @@ mod tests {
     use std::error::Error;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn begin_shutdown_publishes_without_an_async_runtime_turn() {
+        let client = DaemonClient::with_socket_path("/nonexistent/diri-test.sock");
+        let shutdown = client.core.shutdown_tx.subscribe();
+
+        client.begin_shutdown();
+
+        assert!(*shutdown.borrow());
+    }
 
     #[tokio::test]
     async fn retry_now_wakes_the_lifecycle_signal_without_spawning_a_daemon() {

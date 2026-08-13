@@ -2162,6 +2162,8 @@ mod tests {
             updates: crate::updates::inert(),
             tokio,
             dev_build: None,
+            #[cfg(unix)]
+            daemon_startup: None,
         });
         let (launcher, cx) =
             cx.add_window_view(move |_window, cx| LauncherOverlay::new(services, true, cx));
@@ -2344,6 +2346,8 @@ mod tests {
             updates: crate::updates::inert(),
             tokio,
             dev_build: None,
+            #[cfg(unix)]
+            daemon_startup: None,
         });
         let (launcher, cx) =
             cx.add_window_view(move |_window, cx| LauncherOverlay::new(services, true, cx));
