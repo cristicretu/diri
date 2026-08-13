@@ -65,7 +65,9 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
                 "properties": {
                     "session_id": {"type": "string"},
                     "text": {"type": "string"},
-                    "submit": {"type": "boolean", "description": "Press Enter after typing; defaults to true."}
+                    "submit": {"type": "boolean", "description": "Press Enter after typing; defaults to true."},
+                    "run_id": {"type": "integer", "minimum": 1, "description": "Reject the write if this run is no longer current."},
+                    "request_id": {"type": "string", "minLength": 1, "maxLength": 256, "description": "Stable idempotency key. Reuse it when retrying after a lost response."}
                 },
                 "required": ["session_id", "text"]
             }),
@@ -77,8 +79,9 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "session_id": {"type": "string"},
-                    "until": {"type": "string", "enum": ["done", "needs_me", "idle", "exited"]},
-                    "timeout_s": {"type": "number", "default": 600}
+                    "until": {"type": "string", "enum": ["done", "completed", "failed", "aborted", "needs_me", "idle", "exited"], "description": "done returns on any terminal run; completed requires success."},
+                    "timeout_s": {"type": "number", "default": 600},
+                    "run_id": {"type": "integer", "minimum": 1, "description": "Pin the wait to this run; returns superseded if a newer run exists."}
                 },
                 "required": ["session_id"]
             }),
@@ -130,6 +133,19 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
                     "force": {"type": "boolean"}
                 },
                 "required": ["repo", "path"]
+            }),
+        ),
+        ToolDefinition::new(
+            "interrupt_agent",
+            "Abort the current run with Ctrl-C while keeping the session reusable for a later prompt.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "run_id": {"type": "integer", "minimum": 1},
+                    "request_id": {"type": "string", "minLength": 1, "maxLength": 256, "description": "Stable idempotency key. Reuse it when retrying after a lost response."}
+                },
+                "required": ["session_id"]
             }),
         ),
         ToolDefinition::new(
@@ -213,7 +229,9 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
                     "changed_paths": string_array(),
                     "artifacts": string_array(),
                     "proof": string_array(),
-                    "submit": {"type": "boolean"}
+                    "submit": {"type": "boolean"},
+                    "run_id": {"type": "integer", "minimum": 1, "description": "Reject a delayed report from an older run."},
+                    "request_id": {"type": "string", "minLength": 1, "maxLength": 256, "description": "Stable idempotency key. Reuse it when retrying after a lost response."}
                 },
                 "required": ["summary"]
             }),

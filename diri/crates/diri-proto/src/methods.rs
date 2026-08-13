@@ -2,7 +2,7 @@
 
 use crate::control::{JsonValue, WIRE_VERSION};
 use crate::model::{
-    AgentKind, DateMillis, PortInfo, Project, SessionArtifact, SessionId, SessionRecord,
+    AgentKind, AgentRun, DateMillis, PortInfo, Project, SessionArtifact, SessionId, SessionRecord,
     SessionStatus, WorktreeInfo,
 };
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,9 @@ impl Method {
     pub const SESSION_RENAME: &'static str = "session.rename";
     pub const SESSION_RESUME: &'static str = "session.resume";
     pub const SESSION_SEND_TEXT: &'static str = "session.send_text";
+    pub const SESSION_RUN_SEND: &'static str = "session.run.send";
+    pub const SESSION_RUN_INTERRUPT: &'static str = "session.run.interrupt";
+    pub const SESSION_RUN_REPORT: &'static str = "session.run.report";
     pub const SESSION_RESIZE: &'static str = "session.resize";
     pub const SESSION_READ_SCREEN: &'static str = "session.read_screen";
     pub const SESSION_READ_SCROLLBACK: &'static str = "session.read_scrollback";
@@ -489,6 +492,66 @@ pub type SendTextResult = EmptyResult;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SessionRunSendParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    pub text: String,
+    pub submit: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_run_id: Option<u64>,
+    /// Caller-generated idempotency key. Retrying the same request id replays
+    /// its durable result instead of delivering the text again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRunSendResult {
+    pub queued: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<AgentRun>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRunInterruptParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_run_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRunInterruptResult {
+    pub run: AgentRun,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRunReportParams {
+    #[serde(rename = "reporterSessionID")]
+    pub reporter_session_id: SessionId,
+    pub text: String,
+    #[serde(default = "default_true")]
+    pub submit: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_run_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
+pub type SessionRunReportResult = SessionRunSendResult;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ResizeParams {
     #[serde(rename = "sessionID")]
     pub session_id: SessionId,
@@ -823,6 +886,10 @@ pub struct EventsWaitParams {
     pub session_id: SessionId,
     pub until: Vec<String>,
     pub timeout_ms: i64,
+    /// Pins the wait to one turn. A newer generation supersedes it instead of
+    /// letting an old completion satisfy the new run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -830,6 +897,17 @@ pub struct EventsWaitParams {
 pub struct EventsWaitResult {
     pub session: SessionRecord,
     pub timed_out: bool,
+    #[serde(default)]
+    pub superseded: bool,
+    /// Whether the requested target was actually reached. Older daemons omit
+    /// this field; callers can continue to infer success from `timedOut` and
+    /// `superseded` when talking to them.
+    #[serde(default)]
+    pub reached: bool,
+    /// Exact run that resolved a pinned wait. This can differ from
+    /// `session.run` after a FIFO advances to the next generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<AgentRun>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -964,5 +1042,29 @@ mod base64_bytes {
             b'/' => Some(63),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod run_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_idempotency_fields_are_additive_for_old_clients() {
+        let send: SessionRunSendParams = serde_json::from_value(serde_json::json!({
+            "sessionID": "agent",
+            "text": "hello",
+            "submit": true,
+            "expectedRunId": 4
+        }))
+        .unwrap();
+        assert!(send.request_id.is_none());
+
+        let result: SessionRunSendResult = serde_json::from_value(serde_json::json!({
+            "queued": true
+        }))
+        .unwrap();
+        assert!(result.request_id.is_none());
+        assert!(result.run.is_none());
     }
 }

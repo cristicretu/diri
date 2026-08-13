@@ -21,9 +21,6 @@ pub const SESSION_ID_ENV: &str = "DIRIJOR_SESSION_ID";
 const DEFAULT_READ_BYTES: usize = 8_000;
 const DEFAULT_WAIT_SECONDS: f64 = 300.0;
 const DEFAULT_CHILDREN_WAIT_SECONDS: f64 = 600.0;
-/// How often a wait re-checks. Long enough not to spin, short enough that a
-/// state change is noticed promptly.
-const WAIT_POLL: Duration = Duration::from_millis(100);
 
 pub struct RegistryHost {
     registry: Arc<Mutex<Registry>>,
@@ -86,7 +83,8 @@ impl ToolHost for RegistryHost {
     fn call(&self, tool: &str, arguments: &Value) -> Result<Value, String> {
         match tool {
             "list_agents" => {
-                let registry = self.registry()?;
+                let mut registry = self.registry()?;
+                registry.sync_orchestration();
                 let agents: Vec<Value> = registry
                     .records()
                     .into_iter()
@@ -98,6 +96,7 @@ impl ToolHost for RegistryHost {
                             "status": status_word(&record.status),
                             "cwd": record.cwd,
                             "parent": record.parent.map(|parent| parent.0),
+                            "run": record.run,
                         })
                     })
                     .collect();
@@ -106,7 +105,8 @@ impl ToolHost for RegistryHost {
 
             "get_status" => {
                 let id = required_str(arguments, "session_id")?;
-                let registry = self.registry()?;
+                let mut registry = self.registry()?;
+                registry.sync_orchestration();
                 let record = registry
                     .records()
                     .into_iter()
@@ -122,6 +122,7 @@ impl ToolHost for RegistryHost {
                         "summary": detail.summary,
                         "options": detail.options,
                     })),
+                    "run": record.run,
                 }))
             }
 
@@ -133,19 +134,43 @@ impl ToolHost for RegistryHost {
                     .and_then(Value::as_bool)
                     .unwrap_or(true);
 
-                let registry = self.registry()?;
-                let session = registry
-                    .get(&id)
-                    .ok_or_else(|| format!("no session {id}"))?;
-                let payload = if submit {
-                    format!("{text}\r")
-                } else {
-                    text.clone()
-                };
-                session
-                    .write_input(payload.as_bytes())
+                let expected = arguments.get("run_id").and_then(Value::as_u64);
+                let request_id = arguments
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let mut registry = self.registry()?;
+                let (queued, run) = registry
+                    .send_run_text(
+                        &id,
+                        text.clone(),
+                        submit,
+                        expected,
+                        true,
+                        request_id.clone(),
+                    )
                     .map_err(|error| error.to_string())?;
-                Ok(json!({ "sent": text.len(), "submitted": submit }))
+                Ok(json!({
+                    "sent": text.len(),
+                    "submitted": submit,
+                    "queued": queued,
+                    "run": run,
+                    "requestId": request_id,
+                }))
+            }
+
+            "interrupt_agent" => {
+                let id = required_str(arguments, "session_id")?;
+                let expected = arguments.get("run_id").and_then(Value::as_u64);
+                let request_id = arguments
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let mut registry = self.registry()?;
+                let run = registry
+                    .interrupt_run(&id, expected, request_id.clone())
+                    .map_err(|error| error.to_string())?;
+                Ok(json!({"run": run, "requestId": request_id}))
             }
 
             "read_output" => {
@@ -195,7 +220,8 @@ impl ToolHost for RegistryHost {
                     .get("timeout_seconds")
                     .and_then(Value::as_f64)
                     .unwrap_or(DEFAULT_WAIT_SECONDS);
-                self.wait_for(&id, &until, timeout)
+                let run_id = arguments.get("run_id").and_then(Value::as_u64);
+                self.wait_for(&id, &until, timeout, run_id)
             }
 
             "create_worktree" => {
@@ -233,7 +259,8 @@ impl ToolHost for RegistryHost {
                 let caller = self.caller.clone().ok_or_else(|| {
                     format!("this session did not identify itself; {SESSION_ID_ENV} is unset")
                 })?;
-                let registry = self.registry()?;
+                let mut registry = self.registry()?;
+                registry.sync_orchestration();
                 let record = registry
                     .records()
                     .into_iter()
@@ -245,6 +272,7 @@ impl ToolHost for RegistryHost {
                     "title": record.title,
                     "cwd": record.cwd,
                     "parent": record.parent.map(|parent| parent.0),
+                    "run": record.run,
                 }))
             }
 
@@ -252,7 +280,8 @@ impl ToolHost for RegistryHost {
                 let caller = self.caller.clone().ok_or_else(|| {
                     format!("this session did not identify itself; {SESSION_ID_ENV} is unset")
                 })?;
-                let registry = self.registry()?;
+                let mut registry = self.registry()?;
+                registry.sync_orchestration();
                 let children: Vec<Value> = registry
                     .records()
                     .into_iter()
@@ -263,6 +292,7 @@ impl ToolHost for RegistryHost {
                             "kind": record.kind.id(),
                             "title": record.title,
                             "status": status_word(&record.status),
+                            "run": record.run,
                         })
                     })
                     .collect();
@@ -357,6 +387,9 @@ impl RegistryHost {
         let id = crate::control::next_session_id();
         let mut record = crate::control::new_record(&id, &kind, &working_dir.to_string_lossy());
         record.parent = self.caller.clone().map(SessionId);
+        if record.parent.is_some() {
+            record.run = Some(diri_proto::AgentRun::starting(1, record.created_at));
+        }
         record.worktree_path = worktree_path.clone();
         record.git_branch = branch.clone();
         if let Some(title) = title {
@@ -440,85 +473,117 @@ impl RegistryHost {
         ))
     }
 
-    fn wait_for(&self, id: &str, until: &str, timeout_seconds: f64) -> Result<Value, String> {
+    fn wait_for(
+        &self,
+        id: &str,
+        until: &str,
+        timeout_seconds: f64,
+        run_id: Option<u64>,
+    ) -> Result<Value, String> {
         let deadline = Instant::now() + Duration::from_secs_f64(timeout_seconds.max(0.0));
-        // "done" means a turn finished: idle *after* having worked. Treating a
-        // session that is merely idle as done would return instantly for one
-        // that has not started yet.
-        let mut has_worked = false;
+        let changes = self.registry()?.state_changes();
+        let mut observed = changes.observe();
 
         loop {
-            let status = {
-                let registry = self.registry()?;
-                let session = registry.get(id).ok_or_else(|| format!("no session {id}"))?;
-                session.status()
+            let targets = vec![until.to_owned()];
+            let (record, decision) = {
+                let mut registry = self.registry()?;
+                registry.sync_orchestration();
+                let record = registry
+                    .records()
+                    .into_iter()
+                    .find(|record| record.id.0 == id)
+                    .ok_or_else(|| format!("no session {id}"))?;
+                let decision = registry
+                    .wait_decision(id, run_id, &targets)
+                    .ok_or_else(|| format!("no session {id}"))?;
+                (record, decision)
             };
-            if matches!(status, SessionStatus::Working) {
-                has_worked = true;
-            }
-
-            let reached = match until {
-                "done" => has_worked && matches!(status, SessionStatus::Idle),
-                "needsInput" => matches!(status, SessionStatus::NeedsInput(_)),
-                "exited" => matches!(status, SessionStatus::Exited(_)),
-                "any" => !matches!(status, SessionStatus::Starting),
-                other => return Err(format!("unknown wait target {other:?}")),
-            };
-            // A dead session will never reach anything else.
-            let dead = matches!(status, SessionStatus::Exited(_));
-
-            if reached || dead {
+            if decision.resolved {
                 return Ok(json!({
                     "id": id,
-                    "status": status_word(&status),
-                    "reached": reached,
+                    "status": status_word(&record.status),
+                    "reached": decision.reached,
+                    "superseded": decision.superseded,
+                    "run": decision.run,
                 }));
             }
             if Instant::now() >= deadline {
                 return Ok(json!({
                     "id": id,
-                    "status": status_word(&status),
+                    "status": status_word(&record.status),
                     "reached": false,
                     "timedOut": true,
+                    "run": decision.run,
                 }));
             }
-            std::thread::sleep(WAIT_POLL);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            observed = changes.wait_after(observed, remaining);
         }
     }
 
     fn wait_for_children(&self, caller: &str, timeout_seconds: f64) -> Result<Value, String> {
         let deadline = Instant::now() + Duration::from_secs_f64(timeout_seconds.max(0.0));
         let parent = SessionId(caller.to_string());
+        let changes = self.registry()?.state_changes();
+        let mut observed = changes.observe();
 
         loop {
-            let statuses: Vec<(String, SessionStatus)> = {
-                let registry = self.registry()?;
+            let records: Vec<diri_proto::SessionRecord> = {
+                let mut registry = self.registry()?;
+                registry.sync_orchestration();
                 registry
                     .records()
                     .into_iter()
                     .filter(|record| record.parent.as_ref() == Some(&parent))
-                    .map(|record| (record.id.0, record.status))
                     .collect()
             };
 
-            let pending: Vec<&String> = statuses
+            let pending: Vec<&String> = records
                 .iter()
-                .filter(|(_, status)| {
-                    matches!(status, SessionStatus::Working | SessionStatus::Starting)
+                .filter(|record| {
+                    record.run.as_ref().map_or_else(
+                        || {
+                            !matches!(
+                                record.status,
+                                SessionStatus::Idle | SessionStatus::Exited(_)
+                            )
+                        },
+                        |run| !run.state.is_terminal(),
+                    )
                 })
-                .map(|(id, _)| id)
+                .map(|record| &record.id.0)
                 .collect();
+            let unsettled = records.iter().any(|record| {
+                record.run.as_ref().map_or_else(
+                    || {
+                        !matches!(
+                            record.status,
+                            SessionStatus::Idle
+                                | SessionStatus::NeedsInput(_)
+                                | SessionStatus::Exited(_)
+                        )
+                    },
+                    |run| {
+                        !run.state.is_terminal()
+                            && !matches!(run.state, diri_proto::AgentRunState::NeedsInput)
+                    },
+                )
+            });
 
-            if pending.is_empty() || Instant::now() >= deadline {
+            if !unsettled || Instant::now() >= deadline {
                 return Ok(json!({
-                    "children": statuses.iter().map(|(id, status)| json!({
-                        "id": id,
-                        "status": status_word(status),
+                    "children": records.iter().map(|record| json!({
+                        "id": record.id.0,
+                        "status": status_word(&record.status),
+                        "run": record.run,
                     })).collect::<Vec<_>>(),
                     "allDone": pending.is_empty(),
+                    "needsInput": records.iter().any(|record| record.run.as_ref().is_some_and(|run| matches!(run.state, diri_proto::AgentRunState::NeedsInput))),
                 }));
             }
-            std::thread::sleep(WAIT_POLL);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            observed = changes.wait_after(observed, remaining);
         }
     }
 

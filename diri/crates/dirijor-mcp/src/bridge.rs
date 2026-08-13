@@ -70,6 +70,7 @@ impl Bridge {
             "list_agents" => self.list_agents(),
             "get_status" => self.get_status(arguments),
             "send_prompt" => self.send_prompt(arguments),
+            "interrupt_agent" => self.interrupt_agent(arguments),
             "wait_for_agent" => self.wait_for_agent(arguments),
             "read_output" => self.read_output(arguments),
             "get_artifacts" => self.get_artifacts(arguments),
@@ -159,16 +160,36 @@ impl Bridge {
             ));
         }
         let delivered = lineage.frame(&text, relation);
-        self.request(
-            Method::SESSION_SEND_TEXT,
-            json!({"sessionID": id, "text": delivered, "submit": submit}),
+        let delivery = self.request(
+            Method::SESSION_RUN_SEND,
+            json!({
+                "sessionID": id,
+                "text": delivered,
+                "submit": submit,
+                "expectedRunId": optional_number(arguments, "run_id").map(|id| id as u64),
+                "requestId": optional_string(arguments, "request_id"),
+            }),
             DEFAULT_TIMEOUT,
         )?;
         Ok(json!({
             "ok": true,
             "relation": relation.as_str(),
             "attributed": delivered != text,
+            "delivery": delivery,
         }))
+    }
+
+    fn interrupt_agent(&self, arguments: &Value) -> Result<Value, String> {
+        let id = required_string(arguments, "session_id")?;
+        self.request(
+            Method::SESSION_RUN_INTERRUPT,
+            json!({
+                "sessionID": id,
+                "expectedRunId": optional_number(arguments, "run_id").map(|id| id as u64),
+                "requestId": optional_string(arguments, "request_id"),
+            }),
+            DEFAULT_TIMEOUT,
+        )
     }
 
     fn wait_for_agent(&self, arguments: &Value) -> Result<Value, String> {
@@ -183,6 +204,7 @@ impl Bridge {
                 "sessionID": id,
                 "until": [until],
                 "timeoutMs": (timeout_seconds * 1000.0) as i64,
+                "runId": optional_number(arguments, "run_id").map(|id| id as u64),
             }),
             Duration::from_secs_f64(timeout_seconds + 5.0),
         )
@@ -420,8 +442,8 @@ impl Bridge {
                 .into_iter()
                 .filter(|record| wanted.contains(&record.id.0))
                 .collect();
-            let settled = latest.len() != wanted.len()
-                || latest.iter().all(|record| reached(&mode, &record.status));
+            let settled =
+                latest.len() != wanted.len() || latest.iter().all(|record| reached(&mode, record));
             Ok((latest, settled))
         };
         let (mut latest, mut settled) = reassess()?;
@@ -432,12 +454,21 @@ impl Bridge {
                 "sessions": wanted.iter().cloned().collect::<Vec<_>>(),
                 "kinds": ["session.updated", "session.removed"],
             });
-            let result = client.subscribe(subscription, deadline, |_, _, _| {
+            let refresh = || {
                 (latest, settled) = reassess().map_err(|message| {
                     ControlFailure::Protocol(format!("could not refresh children: {message}"))
                 })?;
                 Ok(!settled)
-            });
+            };
+            // Both callbacks are sequential, but they need access to the same
+            // mutable reassessment closure.
+            let refresh = std::cell::RefCell::new(refresh);
+            let result = client.subscribe_after(
+                subscription,
+                deadline,
+                || refresh.borrow_mut()(),
+                |_, _, _| refresh.borrow_mut()(),
+            );
             if !matches!(result, Ok(()) | Err(ControlFailure::Timeout)) {
                 result.map_err(render_failure)?;
             }
@@ -445,6 +476,8 @@ impl Bridge {
         Ok(json!({
             "settled": settled,
             "timed_out": !settled,
+            "all_done": latest.iter().all(run_is_done),
+            "needs_input": latest.iter().any(|record| record.run.as_ref().is_some_and(|run| matches!(run.state, diri_proto::AgentRunState::NeedsInput))),
             "children": latest.iter().map(|record| detailed(record, Relation::Child)).collect::<Vec<_>>(),
             "waited_for": mode,
         }))
@@ -551,12 +584,14 @@ impl Bridge {
             }
         }
         let delivered = lines.join("\n");
-        self.request(
-            Method::SESSION_SEND_TEXT,
+        let delivery = self.request(
+            Method::SESSION_RUN_REPORT,
             json!({
-                "sessionID": parent,
+                "reporterSessionID": caller,
                 "text": delivered,
                 "submit": optional_bool(arguments, "submit").unwrap_or(true),
+                "expectedRunId": optional_number(arguments, "run_id").map(|id| id as u64),
+                "requestId": optional_string(arguments, "request_id"),
             }),
             DEFAULT_TIMEOUT,
         )?;
@@ -565,6 +600,7 @@ impl Bridge {
             "parent": parent,
             "status": status,
             "delivered": delivered,
+            "delivery": delivery,
         }))
     }
 
@@ -680,6 +716,9 @@ fn compact(record: &SessionRecord) -> Value {
     }
     if let Some(host) = &record.host {
         object.insert("host".into(), json!(host));
+    }
+    if let Some(run) = &record.run {
+        object.insert("run".into(), json!(run));
     }
     Value::Object(object)
 }
@@ -886,15 +925,40 @@ fn child_subset<'a>(
         .collect()
 }
 
-fn reached(mode: &str, status: &SessionStatus) -> bool {
+fn reached(mode: &str, record: &SessionRecord) -> bool {
+    if let Some(run) = &record.run {
+        return match mode {
+            "exited" => matches!(record.status, SessionStatus::Exited(_)),
+            "done" => run.state.is_terminal(),
+            _ => {
+                run.state.is_terminal()
+                    || matches!(run.state, diri_proto::AgentRunState::NeedsInput)
+            }
+        };
+    }
     match mode {
-        "exited" => matches!(status, SessionStatus::Exited(_)),
-        "done" => matches!(status, SessionStatus::Idle | SessionStatus::Exited(_)),
+        "exited" => matches!(record.status, SessionStatus::Exited(_)),
+        "done" => matches!(
+            record.status,
+            SessionStatus::Idle | SessionStatus::Exited(_)
+        ),
         _ => matches!(
-            status,
+            record.status,
             SessionStatus::Idle | SessionStatus::NeedsInput(_) | SessionStatus::Exited(_)
         ),
     }
+}
+
+fn run_is_done(record: &SessionRecord) -> bool {
+    record.run.as_ref().map_or_else(
+        || {
+            matches!(
+                record.status,
+                SessionStatus::Idle | SessionStatus::Exited(_)
+            )
+        },
+        |run| run.state.is_terminal(),
+    )
 }
 
 #[cfg(test)]
@@ -934,6 +998,7 @@ mod tests {
             pull_requests: None,
             listening_ports: None,
             foreground_agent: None,
+            run: None,
         }
     }
 
@@ -959,15 +1024,20 @@ mod tests {
 
     #[test]
     fn settled_counts_input_and_exit_but_done_does_not_count_input() {
-        assert!(reached(
-            "settled",
-            &SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Question)
-        ));
-        assert!(!reached(
-            "done",
-            &SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Question)
-        ));
-        assert!(reached("done", &SessionStatus::Idle));
+        let mut paused = record("child", Some("caller"));
+        paused.status = SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Question);
+        paused.run = Some(diri_proto::AgentRun {
+            id: 1,
+            state: diri_proto::AgentRunState::NeedsInput,
+            started_at: paused.created_at,
+            finished_at: None,
+            terminal_outcome: None,
+        });
+        assert!(reached("settled", &paused));
+        assert!(!reached("done", &paused));
+        paused.status = SessionStatus::Idle;
+        paused.run.as_mut().unwrap().state = diri_proto::AgentRunState::Completed;
+        assert!(reached("done", &paused));
     }
 
     #[test]

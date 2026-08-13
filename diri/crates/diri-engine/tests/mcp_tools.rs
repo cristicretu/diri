@@ -16,6 +16,7 @@ use diri_engine::pty::PtySpec;
 use diri_engine::registry::Registry;
 use diri_engine::session::SessionSpec;
 use diri_engine::status::Authority;
+use diri_engine::status::ClaudeHook;
 use diri_proto::{
     AgentKind, DateMillis, ProjectId, Resumability, SessionId, SessionRecord, SessionStatus,
     TitleSource,
@@ -65,6 +66,7 @@ fn record(id: &str, parent: Option<&str>) -> SessionRecord {
         pull_requests: None,
         listening_ports: None,
         foreground_agent: None,
+        run: None,
     }
 }
 
@@ -82,6 +84,12 @@ fn spec(id: &str, script: &str, logs: &Path) -> SessionSpec {
         remote: None,
         defer_launch: false,
     }
+}
+
+fn hook_spec(id: &str, script: &str, logs: &Path) -> SessionSpec {
+    let mut spec = spec(id, script, logs);
+    spec.authority = Authority::HooksPrimary;
+    spec
 }
 
 /// Calls a tool through the full MCP server and returns the parsed result.
@@ -103,6 +111,259 @@ fn call(server: &McpServer<RegistryHost>, tool: &str, arguments: Value) -> Resul
         return Err(text);
     }
     Ok(serde_json::from_str(&text).unwrap_or(Value::String(text)))
+}
+
+fn output_contains(registry: &Arc<Mutex<Registry>>, id: &str, needle: &str) -> bool {
+    let registry = registry.lock().expect("registry");
+    let Some(session) = registry.get(id) else {
+        return false;
+    };
+    session.screen_lines().join("\n").contains(needle)
+}
+
+#[test]
+fn queued_followups_survive_mcp_reconnect_and_interrupt_keeps_session_reusable() {
+    let temp = tempfile::tempdir().expect("temp");
+    let logs = temp.path().join("logs");
+    let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+    let mut child = record("child", Some("parent"));
+    child.run = Some(diri_proto::AgentRun::starting(1, child.created_at));
+    registry
+        .spawn(
+            hook_spec(
+                "child",
+                "trap '' INT; while IFS= read -r line; do printf 'GOT:%s\\n' \"$line\"; done",
+                &logs,
+            ),
+            child,
+        )
+        .expect("spawn child");
+    let registry = Arc::new(Mutex::new(registry));
+    {
+        let registry = registry.lock().expect("registry");
+        registry
+            .get("child")
+            .unwrap()
+            .claude_hook(ClaudeHook::UserPromptSubmit, false);
+    }
+
+    // The first MCP process queues two follow-ups while run 1 is working.
+    {
+        let server = McpServer::new(
+            tool_definitions(),
+            RegistryHost::new(Arc::clone(&registry), &logs).with_caller(Some("parent".into())),
+        );
+        for text in ["first", "second"] {
+            let sent = call(
+                &server,
+                "send_prompt",
+                json!({"session_id": "child", "text": text, "run_id": 1}),
+            )
+            .expect("queue follow-up");
+            assert_eq!(sent["queued"], true);
+        }
+    }
+    assert!(!output_contains(&registry, "child", "GOT:first"));
+
+    // The MCP process reconnects. One completion boundary releases exactly
+    // one FIFO item and starts run 2; the second remains queued.
+    {
+        let mut registry = registry.lock().expect("registry");
+        registry
+            .get("child")
+            .unwrap()
+            .claude_hook(ClaudeHook::UserPromptSubmit, false);
+        registry
+            .get("child")
+            .unwrap()
+            .claude_hook(ClaudeHook::Stop, false);
+        std::thread::sleep(Duration::from_millis(150));
+        registry
+            .get("child")
+            .unwrap()
+            .feed_signal(diri_engine::status::StatusSignal::Tick);
+        registry.sync_orchestration();
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline && !output_contains(&registry, "child", "GOT:first")
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(output_contains(&registry, "child", "GOT:first"));
+    assert!(!output_contains(&registry, "child", "GOT:second"));
+
+    // A delayed command carrying run 1 cannot land in run 2.
+    let reconnected = McpServer::new(
+        tool_definitions(),
+        RegistryHost::new(Arc::clone(&registry), &logs).with_caller(Some("parent".into())),
+    );
+    let stale = call(
+        &reconnected,
+        "send_prompt",
+        json!({"session_id": "child", "text": "stale", "run_id": 1}),
+    )
+    .expect_err("stale generation");
+    assert!(stale.contains("stale"), "{stale}");
+
+    {
+        let mut registry = registry.lock().expect("registry");
+        registry
+            .get("child")
+            .unwrap()
+            .claude_hook(ClaudeHook::UserPromptSubmit, false);
+        registry
+            .get("child")
+            .unwrap()
+            .claude_hook(ClaudeHook::Stop, false);
+        std::thread::sleep(Duration::from_millis(150));
+        registry
+            .get("child")
+            .unwrap()
+            .feed_signal(diri_engine::status::StatusSignal::Tick);
+        registry.sync_orchestration();
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline && !output_contains(&registry, "child", "GOT:second")
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(output_contains(&registry, "child", "GOT:second"));
+
+    let interrupted = call(
+        &reconnected,
+        "interrupt_agent",
+        json!({
+            "session_id": "child",
+            "run_id": 3,
+            "request_id": "interrupt-response-loss-1"
+        }),
+    )
+    .expect("interrupt current run");
+    assert_eq!(interrupted["run"]["state"], "aborted");
+    let replayed_interrupt = call(
+        &reconnected,
+        "interrupt_agent",
+        json!({
+            "session_id": "child",
+            "run_id": 3,
+            "request_id": "interrupt-response-loss-1"
+        }),
+    )
+    .expect("replay interrupt response");
+    assert_eq!(replayed_interrupt["run"], interrupted["run"]);
+    let next = call(
+        &reconnected,
+        "send_prompt",
+        json!({"session_id": "child", "text": "after-abort", "run_id": 3}),
+    )
+    .expect("reuse after abort");
+    assert_eq!(next["run"]["id"], 4);
+}
+
+#[test]
+fn reports_wait_for_the_parent_composer_and_preserve_fifo_order() {
+    let temp = tempfile::tempdir().expect("temp");
+    let logs = temp.path().join("logs");
+    let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+    let mut parent = record("parent", None);
+    parent.kind = AgentKind::CODEX;
+    let mut reporter = record("reporter", Some("parent"));
+    reporter.kind = AgentKind::CODEX;
+    for (record, script) in [
+        (
+            parent,
+            "trap '' INT; while IFS= read -r line; do printf 'PARENT:%s\\n' \"$line\"; done",
+        ),
+        (
+            reporter,
+            "trap '' INT; while IFS= read -r line; do printf 'REPORTER:%s\\n' \"$line\"; done",
+        ),
+    ] {
+        let id = record.id.0.clone();
+        registry
+            .spawn(hook_spec(&id, script, &logs), record)
+            .expect("spawn");
+    }
+    registry
+        .get("parent")
+        .unwrap()
+        .claude_hook(ClaudeHook::UserPromptSubmit, false);
+    let first = registry
+        .report_to_parent(
+            "reporter",
+            "report-one".into(),
+            true,
+            Some(1),
+            Some("report-response-loss-1".into()),
+        )
+        .expect("queue first report");
+    let replay = registry
+        .report_to_parent(
+            "reporter",
+            "report-one".into(),
+            true,
+            Some(1),
+            Some("report-response-loss-1".into()),
+        )
+        .expect("replay first report");
+    assert_eq!(replay, first);
+    let (parent, queued, _) = registry
+        .report_to_parent("reporter", "report-two".into(), true, Some(1), None)
+        .expect("queue report");
+    assert_eq!(parent, "parent");
+    assert!(queued);
+    let registry = Arc::new(Mutex::new(registry));
+    assert!(!output_contains(&registry, "parent", "PARENT:report-one"));
+
+    for (completion, absent) in [
+        ("PARENT:report-one", "PARENT:report-two"),
+        ("PARENT:report-two", "PARENT:never"),
+    ] {
+        {
+            let mut registry = registry.lock().expect("registry");
+            registry
+                .get("parent")
+                .unwrap()
+                .claude_hook(ClaudeHook::Stop, false);
+            std::thread::sleep(Duration::from_millis(150));
+            registry
+                .get("parent")
+                .unwrap()
+                .feed_signal(diri_engine::status::StatusSignal::Tick);
+            registry.sync_orchestration();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline
+            && !output_contains(&registry, "parent", completion)
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(output_contains(&registry, "parent", completion));
+        assert!(!output_contains(&registry, "parent", absent));
+        if completion.ends_with("one") {
+            registry
+                .lock()
+                .expect("registry")
+                .get("parent")
+                .unwrap()
+                .claude_hook(ClaudeHook::UserPromptSubmit, false);
+        }
+    }
+
+    // Merely acknowledging reporter run 2 must not stale the still-current
+    // run 1: that run must remain able to deliver its final report until the
+    // future generation actually becomes active.
+    let mut registry = registry.lock().expect("registry");
+    registry
+        .interrupt_run("reporter", Some(1), None)
+        .expect("abort");
+    registry
+        .send_run_text("reporter", "next".into(), true, Some(1), true, None)
+        .expect("start next run");
+    let accepted = registry
+        .report_to_parent("reporter", "late".into(), true, Some(1), None)
+        .expect("current report remains valid while run 2 is only queued");
+    assert_eq!(accepted.0, "parent");
 }
 
 #[test]
@@ -193,7 +454,7 @@ fn send_prompt_types_into_a_session_and_submits() {
         .spawn(
             spec(
                 "s_ask",
-                "read answer; printf 'got:%s\\n' \"$answer\"; sleep 30",
+                "for i in 1 2; do read answer; printf 'got:%s\\n' \"$answer\"; done; sleep 30",
                 &logs,
             ),
             record("s_ask", None),
@@ -206,30 +467,63 @@ fn send_prompt_types_into_a_session_and_submits() {
         RegistryHost::new(Arc::clone(&registry), &logs),
     );
 
-    call(
+    let first = call(
         &server,
         "send_prompt",
-        json!({ "session_id": "s_ask", "text": "hello-there" }),
+        json!({
+            "session_id": "s_ask",
+            "text": "hello-there",
+            "request_id": "lost-response-retry-1"
+        }),
     )
     .expect("send");
+    // Model a response lost after the daemon committed delivery: the caller
+    // retries the same request id and must receive the original result without
+    // another PTY write.
+    let replay = call(
+        &server,
+        "send_prompt",
+        json!({
+            "session_id": "s_ask",
+            "text": "hello-there",
+            "request_id": "lost-response-retry-1"
+        }),
+    )
+    .expect("replay");
+    assert_eq!(replay["queued"], first["queued"]);
+    assert_eq!(replay["run"], first["run"]);
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let mut seen = false;
-    while std::time::Instant::now() < deadline && !seen {
+    let mut output = String::new();
+    while std::time::Instant::now() < deadline && !output.contains("got:hello-there") {
         let read = call(
             &server,
             "read_output",
             json!({ "session_id": "s_ask", "max_bytes": 4096 }),
         )
         .expect("read");
-        seen = read["output"]
-            .as_str()
-            .is_some_and(|text| text.contains("got:hello-there"));
-        if !seen {
+        output = read["output"].as_str().unwrap_or_default().to_owned();
+        if !output.contains("got:hello-there") {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
-    assert!(seen, "the session never received the submitted prompt");
+    assert!(
+        output.contains("got:hello-there"),
+        "the session never received the submitted prompt"
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    let read = call(
+        &server,
+        "read_output",
+        json!({ "session_id": "s_ask", "max_bytes": 4096 }),
+    )
+    .expect("read after replay");
+    let output = read["output"].as_str().unwrap_or_default();
+    assert_eq!(
+        output.matches("got:hello-there").count(),
+        1,
+        "a response-loss retry must not submit the prompt twice: {output:?}"
+    );
 }
 
 #[test]
@@ -261,10 +555,78 @@ fn waiting_on_an_exited_session_returns_immediately() {
     .expect("wait");
 
     assert_eq!(waited["status"], "exited");
+    assert_eq!(waited["reached"], false);
     assert!(
         started.elapsed() < Duration::from_secs(20),
         "waiting on a dead session must not run to the timeout"
     );
+}
+
+#[test]
+fn embedded_waits_match_run_generation_and_idle_semantics() {
+    let temp = tempfile::tempdir().expect("temp");
+    let logs = temp.path().join("logs");
+    let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+    let mut agent = record("agent", None);
+    agent.kind = AgentKind::CODEX;
+    agent.status = SessionStatus::Idle;
+    agent.run = Some(diri_proto::AgentRun::starting(3, agent.created_at));
+    registry.insert_record(agent);
+    let mut dead = record("dead", None);
+    dead.kind = AgentKind::CODEX;
+    dead.status = SessionStatus::Exited(diri_proto::ExitInfo {
+        reason: diri_proto::ExitReason::Exited,
+        code: Some(0),
+        signal: None,
+    });
+    dead.run = Some(diri_proto::AgentRun {
+        id: 1,
+        state: diri_proto::AgentRunState::Failed,
+        started_at: dead.created_at,
+        finished_at: Some(dead.updated_at),
+        terminal_outcome: Some("process_exited".into()),
+    });
+    registry.insert_record(dead);
+    let server = McpServer::new(
+        tool_definitions(),
+        RegistryHost::new(Arc::new(Mutex::new(registry)), &logs),
+    );
+
+    let stale = call(
+        &server,
+        "wait_for_agent",
+        json!({"session_id": "agent", "run_id": 2, "timeout_seconds": 0}),
+    )
+    .expect("stale wait");
+    assert_eq!(stale["superseded"], true);
+
+    let idle = call(
+        &server,
+        "wait_for_agent",
+        json!({"session_id": "agent", "run_id": 3, "until": "idle", "timeout_seconds": 0}),
+    )
+    .expect("idle wait");
+    assert_eq!(idle["reached"], true);
+
+    let future = call(
+        &server,
+        "wait_for_agent",
+        json!({"session_id": "agent", "run_id": 4, "timeout_seconds": 0}),
+    )
+    .expect("future wait");
+    assert_eq!(future["timedOut"], true);
+    assert_ne!(future["reached"], true);
+
+    let started = std::time::Instant::now();
+    let dead_future = call(
+        &server,
+        "wait_for_agent",
+        json!({"session_id": "dead", "run_id": 2, "timeout_seconds": 60}),
+    )
+    .expect("dead future wait");
+    assert_eq!(dead_future["reached"], false);
+    assert_eq!(dead_future["superseded"], false);
+    assert!(started.elapsed() < Duration::from_secs(1));
 }
 
 #[test]

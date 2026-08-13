@@ -90,6 +90,7 @@ fn record(id: &str) -> diri_proto::SessionRecord {
         pull_requests: None,
         listening_ports: None,
         foreground_agent: None,
+        run: None,
     }
 }
 

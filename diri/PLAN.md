@@ -115,7 +115,34 @@ Everything below is verified against the Swift source; cite these files in code 
 **Grid codec** (`Grid.swift:100-234`) — must match bit-for-bit, big-endian throughout:
 `cols u16, rows u16, cursorCol u16, cursorRow u16, flags u8 (bit0 cursorVisible, bit1 fullSnapshot), rowCount u16`, then per row: `y u16, runCount u16`, runs of `[repeat u16, scalar u32, fgPacked u32, bgPacked u32, style u16]`. `TermColor` packs default/defaultInverted/ansi(u8)/rgb into u32; `TermStyle` is a u16 bitset (bold, underline, blink, inverse, invisible, dim, italic, crossedOut — SwiftTerm bit layout). The same row codec is reused by `session.read_scrollback_cells` (base64 in JSON).
 
-**Methods** (full list in `Methods.swift`; client wrappers in `DaemonClient.swift:222-399`): `hello`, `session.{spawn,list,kill,remove,rename,resume,send_text,resize,set_owner,read_screen,read_scrollback,read_scrollback_cells,mark_seen,hibernate,wake,archive,unarchive,reopen_last,history,resume_from_history}`, `worktree.{create,list,remove,overview}`, `project.add`, `client.set_active`, `governor.configure`, `agent.readiness`, `events.subscribe`, `events.wait`, `hook.report`, `test.run`. `daemon.shutdown` is scoped to the explicit remote-config reload described in §3; `daemon.prepare_shutdown` remains unused.
+**Methods** (full list in `Methods.swift`; client wrappers in `DaemonClient.swift:222-399`): `hello`, `session.{spawn,list,kill,remove,rename,resume,send_text,run.send,run.interrupt,run.report,resize,set_owner,read_screen,read_scrollback,read_scrollback_cells,mark_seen,hibernate,wake,archive,unarchive,reopen_last,history,resume_from_history}`, `worktree.{create,list,remove,overview}`, `project.add`, `client.set_active`, `governor.configure`, `agent.readiness`, `events.subscribe`, `events.wait`, `hook.report`, `test.run`. `daemon.shutdown` is scoped to the explicit remote-config reload described in §3; `daemon.prepare_shutdown` remains unused.
+
+**Agent runs are explicit.** Child turns carry a monotonic `run.id` and one of
+`starting → running → needsInput | completed | failed | aborted`. Terminal
+`idle` alone is never completion: the Engine records the reducer's lossless
+turn-completion edge. MCP writes may carry `expectedRunId`; stale writes,
+reports, waits, and interrupts are rejected or returned as `superseded` rather
+than landing in a newer turn. Submitted queue entries receive their future run
+identity when acknowledged. Follow-ups and child reports wait FIFO inside a
+durable Engine outbox until the target has a manifest-confirmed safe composer,
+so neither an MCP-proxy reconnect nor an Engine restart loses them. Dispatch is
+two-phase: a crash in the PTY-send window fails the exact run as
+`delivery_outcome_uncertain` rather than silently replaying it, and durable
+output-offset provenance reconciles later holder activity back to that same
+run. Mutating run methods accept an additive caller-generated `requestId`;
+bounded durable replay records make response-loss retries idempotent.
+`run.interrupt` durably records intent before Ctrl-C, leaves the session
+reusable, preserves acknowledged future turns, and never rewrites an
+already-terminal outcome.
+
+`events.wait` is edge-triggered from the session reducer. `done` matches any
+terminal run and preserves its exact completed/failed/aborted outcome;
+`completed` matches success only. `needsInput` remains a distinct paused state,
+and an idle child that has not begun work does not satisfy completion. The
+Engine keeps a bounded durable terminal-run ledger, so a FIFO advancing to the
+next generation cannot erase a pinned wait's result. Control and embedded MCP
+share one wait decision and the same edge-triggered change signal instead of a
+100 ms polling loop.
 
 **Client behaviors to replicate** (`DaemonClient.swift`, `SessionAttachment.swift`):
 - Request correlation by monotonic u64 id; auto-reconnect with 0.5→8 s exponential backoff; idle heartbeat = cheap `hello` every 25 s.

@@ -613,39 +613,45 @@ impl ControlServer {
             ),
         );
 
-        let current = |registry: &Registry| -> Option<diri_proto::SessionRecord> {
-            registry
+        let assess = |registry: &Registry| {
+            let record = registry
                 .records()
                 .into_iter()
-                .find(|record| record.id.0 == p.session_id.0)
-        };
-        let matches = |record: &diri_proto::SessionRecord| {
-            p.until
-                .iter()
-                .any(|target| crate::events::satisfies_wait_target(&record.status, target))
+                .find(|record| record.id.0 == p.session_id.0)?;
+            let decision = registry.wait_decision(&p.session_id.0, p.run_id, &p.until)?;
+            Some((record, decision))
         };
 
-        let mut latest = {
-            let registry = self.registry.lock().map_err(poisoned)?;
-            current(&registry).ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?
+        let (mut latest, mut decision) = {
+            let mut registry = self.registry.lock().map_err(poisoned)?;
+            registry.sync_orchestration();
+            assess(&registry).ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?
         };
         loop {
-            if matches(&latest) {
+            if decision.resolved {
                 return encode(&diri_proto::EventsWaitResult {
                     session: latest,
                     timed_out: false,
+                    superseded: decision.superseded,
+                    reached: decision.reached,
+                    run: decision.run,
                 });
             }
             let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
                 return encode(&diri_proto::EventsWaitResult {
                     session: latest,
                     timed_out: true,
+                    superseded: false,
+                    reached: false,
+                    run: decision.run,
                 });
             };
             if stream.recv(remaining).is_some() {
-                let registry = self.registry.lock().map_err(poisoned)?;
-                if let Some(record) = current(&registry) {
+                let mut registry = self.registry.lock().map_err(poisoned)?;
+                registry.sync_orchestration();
+                if let Some((record, next_decision)) = assess(&registry) {
                     latest = record;
+                    decision = next_decision;
                 }
             }
         }
@@ -657,6 +663,9 @@ impl ControlServer {
             Method::SESSION_SPAWN => self.session_spawn(params),
             Method::SESSION_LIST | Method::STATE_SNAPSHOT => self.session_list(),
             Method::SESSION_SEND_TEXT => self.session_send_text(params),
+            Method::SESSION_RUN_SEND => self.session_run_send(params),
+            Method::SESSION_RUN_INTERRUPT => self.session_run_interrupt(params),
+            Method::SESSION_RUN_REPORT => self.session_run_report(params),
             Method::SESSION_RESIZE => self.session_resize(params),
             Method::SESSION_READ_SCREEN => self.session_read_screen(params),
             Method::SESSION_READ_SCROLLBACK => self.session_read_scrollback(params),
@@ -855,6 +864,9 @@ impl ControlServer {
         record.worktree_path = worktree_path;
         record.git_branch = git_branch.or_else(|| crate::git::branch(&cwd_path));
         record.parent = p.parent.clone();
+        if record.parent.is_some() {
+            record.run = Some(diri_proto::AgentRun::starting(1, record.created_at));
+        }
         if let (Some(cols), Some(rows)) = (p.initial_cols, p.initial_rows) {
             pty.cols = cols.clamp(2, u16::MAX as i64) as u16;
             pty.rows = rows.clamp(2, u16::MAX as i64) as u16;
@@ -1095,6 +1107,9 @@ impl ControlServer {
         record.project_id = crate::registry::session_project_id(&captured.cwd, Some(&host.id));
         record.remote_persistence = Some(persistence);
         record.parent = p.parent.clone();
+        if record.parent.is_some() {
+            record.run = Some(diri_proto::AgentRun::starting(1, record.created_at));
+        }
         record.agent_session_id = agent_session_id;
         if let Some(title) = &p.title {
             record.title = title.clone();
@@ -1677,7 +1692,8 @@ impl ControlServer {
     /// `session.list` and `state.snapshot` are the same view: every record
     /// plus the project list, exactly as the Swift daemon answers them.
     fn session_list(&self) -> Result<JsonValue, ControlError> {
-        let registry = self.registry.lock().map_err(poisoned)?;
+        let mut registry = self.registry.lock().map_err(poisoned)?;
+        registry.sync_orchestration();
         serde_json::to_value(json!({
             "sessions": registry.records(),
             "projects": registry.projects_raw(),
@@ -1692,13 +1708,68 @@ impl ControlServer {
         // flushed after SIGCONT, so no keystroke is lost.
         let _ = registry.wake_session(&p.session_id.0);
         self.publish_updated(&registry, &p.session_id.0);
-        let session = registry
-            .get(&p.session_id.0)
-            .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
-        session
-            .send_text(&p.text, p.submit)
-            .map_err(|error| ControlError::internal(error.to_string()))?;
+        registry
+            .send_user_text(&p.session_id.0, p.text, p.submit)
+            .map_err(run_control_error)?;
         Ok(json!({}))
+    }
+
+    fn session_run_send(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::SessionRunSendParams = decode(params)?;
+        let mut registry = self.registry.lock().map_err(poisoned)?;
+        let _ = registry.wake_session(&p.session_id.0);
+        let (queued, run) = registry
+            .send_run_text(
+                &p.session_id.0,
+                p.text,
+                p.submit,
+                p.expected_run_id,
+                true,
+                p.request_id.clone(),
+            )
+            .map_err(run_control_error)?;
+        let _ = registry.persist();
+        self.publish_updated(&registry, &p.session_id.0);
+        encode(&diri_proto::SessionRunSendResult {
+            queued,
+            run,
+            request_id: p.request_id,
+        })
+    }
+
+    fn session_run_interrupt(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::SessionRunInterruptParams = decode(params)?;
+        let mut registry = self.registry.lock().map_err(poisoned)?;
+        let run = registry
+            .interrupt_run(&p.session_id.0, p.expected_run_id, p.request_id.clone())
+            .map_err(run_control_error)?;
+        let _ = registry.persist();
+        self.publish_updated(&registry, &p.session_id.0);
+        encode(&diri_proto::SessionRunInterruptResult {
+            run,
+            request_id: p.request_id,
+        })
+    }
+
+    fn session_run_report(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::SessionRunReportParams = decode(params)?;
+        let mut registry = self.registry.lock().map_err(poisoned)?;
+        let (parent, queued, run) = registry
+            .report_to_parent(
+                &p.reporter_session_id.0,
+                p.text,
+                p.submit,
+                p.expected_run_id,
+                p.request_id.clone(),
+            )
+            .map_err(run_control_error)?;
+        let _ = registry.persist();
+        self.publish_updated(&registry, &parent);
+        encode(&diri_proto::SessionRunReportResult {
+            queued,
+            run,
+            request_id: p.request_id,
+        })
     }
 
     fn session_resize(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
@@ -2815,6 +2886,7 @@ pub(crate) fn new_record(id: &str, kind: &str, cwd: &str) -> diri_proto::Session
         pull_requests: None,
         listening_ports: None,
         foreground_agent: None,
+        run: None,
     }
 }
 
@@ -2902,6 +2974,32 @@ fn io_control_error(error: std::io::Error) -> ControlError {
     match error.kind() {
         std::io::ErrorKind::NotFound => ControlError::not_found(error.to_string()),
         _ => ControlError::internal(error.to_string()),
+    }
+}
+
+fn run_control_error(error: crate::registry::RegistryRunError) -> ControlError {
+    use crate::registry::RegistryRunError as E;
+    match error {
+        E::NotFound(id) => ControlError::not_found(id),
+        E::NoParent => ControlError::bad_request("this session has no parent"),
+        E::Stale { expected, current } => ControlError::new(
+            "stale_run",
+            format!("run {expected} is stale; current run is {current}"),
+        ),
+        E::Exited => ControlError::new("run_exited", "the session process has exited"),
+        E::AlreadyTerminal { current } => ControlError::new(
+            "run_terminal",
+            format!("run {current} is already terminal; nothing was interrupted"),
+        ),
+        E::OutcomeUncertain(detail) => ControlError::new("outcome_uncertain", detail),
+        E::InvalidRequestId => {
+            ControlError::bad_request("request id must be non-empty and no longer than 256 bytes")
+        }
+        E::RequestConflict(request_id) => ControlError::new(
+            "request_conflict",
+            format!("request id {request_id:?} was reused with different input"),
+        ),
+        E::Io(error) => ControlError::internal(error.to_string()),
     }
 }
 
@@ -3441,6 +3539,7 @@ mod tests {
             pull_requests: None,
             listening_ports: None,
             foreground_agent: None,
+            run: None,
         }
     }
 
@@ -3557,6 +3656,99 @@ mod tests {
             Some(64),
             "the app needs a stable content identity for upgrade coordination"
         );
+    }
+
+    #[test]
+    fn run_wait_distinguishes_a_queued_future_from_a_superseded_generation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let server = server(temp.path());
+        let mut record = test_record("agent");
+        record.kind = diri_proto::AgentKind::CODEX;
+        record.run = Some(diri_proto::AgentRun {
+            id: 1,
+            state: diri_proto::AgentRunState::Completed,
+            started_at: record.created_at,
+            finished_at: Some(record.updated_at),
+            terminal_outcome: Some("completed".into()),
+        });
+        server
+            .registry
+            .lock()
+            .unwrap()
+            .insert_record(record.clone());
+
+        let future = ok_of(call(
+            &server,
+            Method::EVENTS_WAIT,
+            Some(json!({
+                "sessionID": "agent",
+                "until": ["done"],
+                "timeoutMs": 0,
+                "runId": 2,
+            })),
+        ));
+        assert_eq!(future["timedOut"], true);
+        assert_eq!(future["superseded"], false);
+
+        server
+            .registry
+            .lock()
+            .unwrap()
+            .update_record("agent", |record| {
+                record.run = Some(diri_proto::AgentRun::starting(3, record.updated_at));
+            });
+        let stale = ok_of(call(
+            &server,
+            Method::EVENTS_WAIT,
+            Some(json!({
+                "sessionID": "agent",
+                "until": ["done"],
+                "timeoutMs": 0,
+                "runId": 2,
+            })),
+        ));
+        assert_eq!(stale["superseded"], true);
+        assert_eq!(stale["timedOut"], false);
+
+        let exact_old = ok_of(call(
+            &server,
+            Method::EVENTS_WAIT,
+            Some(json!({
+                "sessionID": "agent",
+                "until": ["completed"],
+                "timeoutMs": 0,
+                "runId": 1,
+            })),
+        ));
+        assert_eq!(exact_old["reached"], true);
+        assert_eq!(exact_old["superseded"], false);
+        assert_eq!(exact_old["run"]["id"], 1);
+        assert_eq!(exact_old["run"]["state"], "completed");
+
+        server
+            .registry
+            .lock()
+            .unwrap()
+            .update_record("agent", |record| {
+                record.status = diri_proto::SessionStatus::Exited(diri_proto::ExitInfo {
+                    reason: diri_proto::ExitReason::Exited,
+                    code: Some(0),
+                    signal: None,
+                });
+            });
+        let dead_future = ok_of(call(
+            &server,
+            Method::EVENTS_WAIT,
+            Some(json!({
+                "sessionID": "agent",
+                "until": ["done"],
+                "timeoutMs": 60_000,
+                "runId": 4,
+            })),
+        ));
+        assert_eq!(dead_future["timedOut"], false);
+        assert_eq!(dead_future["reached"], false);
+        assert_eq!(dead_future["superseded"], false);
     }
 
     #[test]

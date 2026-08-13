@@ -220,6 +220,12 @@ struct Shared {
     /// registry watcher compares this instead of cloning and JSON-serializing
     /// every record on every poll.
     state_version: AtomicU64,
+    /// Lossless turn-completion edge count. Status can move Working→Idle
+    /// between registry snapshots; the counter makes that edge observable.
+    turn_completion_seq: AtomicU64,
+    /// Registry-wide wake source used by event waiters. Kept optional because
+    /// a Session can be constructed directly in low-level tests.
+    state_changes: Mutex<Option<crate::orchestration::StateChanges>>,
     /// Seconds since UNIX_EPOCH of the last attach-pump poll or input write.
     /// Keeps interactive sessions on the fast quiet-tick.
     last_hot: AtomicU64,
@@ -252,6 +258,9 @@ struct RemoteGridState {
 impl Shared {
     fn bump_state_version(&self) {
         self.state_version.fetch_add(1, Ordering::SeqCst);
+        if let Some(changes) = self.state_changes.lock().expect("state changes").as_ref() {
+            changes.notify();
+        }
     }
 
     fn note_hot(&self) {
@@ -1068,6 +1077,14 @@ impl Session {
         self.shared.state_version.load(Ordering::SeqCst)
     }
 
+    pub fn turn_completion_seq(&self) -> u64 {
+        self.shared.turn_completion_seq.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn bind_state_changes(&self, changes: crate::orchestration::StateChanges) {
+        *self.shared.state_changes.lock().expect("state changes") = Some(changes);
+    }
+
     pub fn status(&self) -> SessionStatus {
         self.shared.status.lock().expect("status").clone()
     }
@@ -1695,6 +1712,8 @@ fn new_shared(spec: &SessionSpec, log: OutputLog, engine: &ManifestEngine) -> Ar
         exited: AtomicBool::new(false),
         stop: AtomicBool::new(false),
         state_version: AtomicU64::new(0),
+        turn_completion_seq: AtomicU64::new(0),
+        state_changes: Mutex::new(None),
         last_hot: AtomicU64::new(unix_secs()),
         last_interaction: AtomicU64::new(0),
         artifacts: Mutex::new(Vec::new()),
@@ -1780,6 +1799,10 @@ fn apply(shared: &Shared, outcome: &ReducerOutcome) {
             *current = None;
             changed = true;
         }
+    }
+    if outcome.turn_completed {
+        shared.turn_completion_seq.fetch_add(1, Ordering::SeqCst);
+        changed = true;
     }
     if changed {
         shared.bump_state_version();

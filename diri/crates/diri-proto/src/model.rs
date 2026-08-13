@@ -693,6 +693,55 @@ pub struct PortInfo {
     pub process_name: String,
 }
 
+/// The lifecycle of one agent turn. This is intentionally separate from the
+/// terminal's coarse [`SessionStatus`]: an idle terminal can mean "not yet
+/// started" or "finished", and a needs-input turn is paused rather than done.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentRunState {
+    Starting,
+    Running,
+    NeedsInput,
+    Completed,
+    Failed,
+    Aborted,
+}
+
+impl AgentRunState {
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Aborted)
+    }
+}
+
+/// Monotonic identity and terminal outcome for a child-agent turn.
+///
+/// `id` increases whenever a completed/failed/aborted session accepts a new
+/// submitted prompt. Callers echo it on reports, waits, and interrupts so a
+/// delayed event from an older turn cannot mutate the current one.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRun {
+    pub id: u64,
+    pub state: AgentRunState,
+    pub started_at: DateMillis,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<DateMillis>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_outcome: Option<String>,
+}
+
+impl AgentRun {
+    pub fn starting(id: u64, now: DateMillis) -> Self {
+        Self {
+            id,
+            state: AgentRunState::Starting,
+            started_at: now,
+            finished_at: None,
+            terminal_outcome: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRecord {
@@ -755,6 +804,10 @@ pub struct SessionRecord {
     pub listening_ports: Option<Vec<PortInfo>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub foreground_agent: Option<AgentKind>,
+    /// Explicit child-turn lifecycle. Absent on roots and records produced by
+    /// older Engines, which keeps the wire format backwards-compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<AgentRun>,
 }
 
 impl SessionRecord {
@@ -845,4 +898,27 @@ where
         .get("_0")
         .ok_or_else(|| E::custom("associated-value payload is missing _0"))?;
     serde_json::from_value(value.clone()).map_err(E::custom)
+}
+
+#[cfg(test)]
+mod run_tests {
+    use super::*;
+
+    #[test]
+    fn run_state_wire_names_are_stable_and_terminal_is_explicit() {
+        let run = AgentRun {
+            id: 7,
+            state: AgentRunState::NeedsInput,
+            started_at: DateMillis(1.0),
+            finished_at: None,
+            terminal_outcome: None,
+        };
+        let value = serde_json::to_value(&run).unwrap();
+        assert_eq!(value["id"], 7);
+        assert_eq!(value["state"], "needsInput");
+        assert!(!run.state.is_terminal());
+        assert!(AgentRunState::Completed.is_terminal());
+        assert!(AgentRunState::Failed.is_terminal());
+        assert!(AgentRunState::Aborted.is_terminal());
+    }
 }

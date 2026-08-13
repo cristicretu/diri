@@ -59,6 +59,7 @@ fn session(value: &str, project: &str, created: f64) -> SessionRecord {
         pull_requests: None,
         listening_ports: None,
         foreground_agent: None,
+        run: None,
     }
 }
 

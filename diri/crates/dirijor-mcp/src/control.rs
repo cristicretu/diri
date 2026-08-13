@@ -116,6 +116,24 @@ impl ControlClient {
         deadline: Instant,
         mut on_event: impl FnMut(&str, u64, &Value) -> Result<bool, ControlFailure>,
     ) -> Result<(), ControlFailure> {
+        self.subscribe_after(
+            params,
+            deadline,
+            || Ok(true),
+            |name, seq, params| on_event(name, seq, params),
+        )
+    }
+
+    /// Subscribes, then runs one gap-closing assessment after the daemon has
+    /// installed the subscription but before waiting for the first event.
+    /// This is the event-driven equivalent of subscribe-before-read.
+    pub fn subscribe_after(
+        &mut self,
+        params: Value,
+        deadline: Instant,
+        mut after_subscribe: impl FnMut() -> Result<bool, ControlFailure>,
+        mut on_event: impl FnMut(&str, u64, &Value) -> Result<bool, ControlFailure>,
+    ) -> Result<(), ControlFailure> {
         let now = Instant::now();
         if now >= deadline {
             return Err(ControlFailure::Timeout);
@@ -126,6 +144,9 @@ impl ControlClient {
             return Err(ControlFailure::Protocol(
                 "daemon did not acknowledge the event subscription".into(),
             ));
+        }
+        if !after_subscribe()? {
+            return Ok(());
         }
 
         loop {
@@ -191,6 +212,50 @@ impl ControlClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn subscribe_after_closes_the_ack_to_first_event_gap() {
+        let (client_stream, mut server_stream) = UnixStream::pair().expect("pair");
+        let server = std::thread::spawn(move || {
+            let mut request = String::new();
+            BufReader::new(server_stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let request: ControlMessage = serde_json::from_str(&request).unwrap();
+            let ControlMessage::Request { id, .. } = request else {
+                panic!("request")
+            };
+            serde_json::to_writer(
+                &mut server_stream,
+                &ControlMessage::Response {
+                    id,
+                    result: Ok(serde_json::json!({"subscribed": true})),
+                },
+            )
+            .unwrap();
+            server_stream.write_all(b"\n").unwrap();
+        });
+        let reader = BufReader::new(client_stream.try_clone().unwrap());
+        let mut client = ControlClient {
+            stream: client_stream,
+            reader,
+        };
+        let mut assessed = false;
+        client
+            .subscribe_after(
+                serde_json::json!({}),
+                Instant::now() + Duration::from_secs(1),
+                || {
+                    assessed = true;
+                    Ok(false)
+                },
+                |_, _, _| panic!("no event should be needed"),
+            )
+            .unwrap();
+        assert!(assessed);
+        server.join().unwrap();
+    }
 
     #[test]
     fn explicit_socket_override_wins() {

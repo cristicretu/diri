@@ -89,21 +89,25 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
                 "properties": {
                     "session_id": { "type": "string" },
                     "text": { "type": "string", "description": "The text to send." },
-                    "submit": { "type": "boolean", "description": "Press return afterwards. Defaults to true." }
+                    "submit": { "type": "boolean", "description": "Press return afterwards. Defaults to true." },
+                    "run_id": { "type": "integer", "minimum": 1, "description": "Reject if this run is no longer current." },
+                    "request_id": { "type": "string", "minLength": 1, "maxLength": 256, "description": "Stable idempotency key. Reuse it when retrying after a lost response." }
                 },
                 "required": ["session_id", "text"]
             }),
         ),
         tool(
             "wait_for_agent",
-            "Block until a session reaches a state: done (idle after working), needsInput, or \
-             exited. Returns as soon as the state is reached or the timeout elapses.",
+            "Block until a specific agent run reaches a state. done means any terminal outcome; \
+             completed means success only; needsInput is paused, not done. A pinned future run \
+             waits until it starts, while a newer run returns superseded.",
             json!({
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "string" },
-                    "until": { "type": "string", "enum": ["done", "needsInput", "exited", "any"], "description": "What to wait for. Defaults to done." },
-                    "timeout_seconds": { "type": "number", "description": "Give up after this long. Defaults to 300." }
+                    "until": { "type": "string", "enum": ["done", "completed", "failed", "aborted", "needsInput", "idle", "exited", "any"], "description": "What to wait for. Defaults to done." },
+                    "timeout_seconds": { "type": "number", "description": "Give up after this long. Defaults to 300." },
+                    "run_id": { "type": "integer", "minimum": 1, "description": "Pin the wait to this current or queued future run." }
                 },
                 "required": ["session_id"]
             }),
@@ -116,6 +120,19 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
                 "properties": {
                     "session_id": { "type": "string" },
                     "max_bytes": { "type": "number", "description": "How much to read from the end. Defaults to 8000." }
+                },
+                "required": ["session_id"]
+            }),
+        ),
+        tool(
+            "interrupt_agent",
+            "Abort the current run with Ctrl-C but keep the session available for a later prompt.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "run_id": { "type": "integer", "minimum": 1 },
+                    "request_id": { "type": "string", "minLength": 1, "maxLength": 256, "description": "Stable idempotency key. Reuse it when retrying after a lost response." }
                 },
                 "required": ["session_id"]
             }),

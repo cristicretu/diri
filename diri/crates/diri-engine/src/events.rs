@@ -371,6 +371,30 @@ pub fn satisfies_wait_target(status: &diri_proto::SessionStatus, target: &str) -
     }
 }
 
+/// Run-aware wait semantics. In particular `needsInput` is paused—not done—
+/// and a never-started idle terminal cannot satisfy `done`.
+pub fn run_satisfies_wait_target(record: &diri_proto::SessionRecord, target: &str) -> bool {
+    use diri_proto::AgentRunState as R;
+    let Some(run) = record.run.as_ref() else {
+        return satisfies_wait_target(&record.status, target);
+    };
+    match target {
+        "done" | "settled" => run.state.is_terminal(),
+        "completed" => matches!(run.state, R::Completed),
+        "running" | "working" => matches!(run.state, R::Running),
+        "starting" => matches!(run.state, R::Starting),
+        "idle" => matches!(record.status, diri_proto::SessionStatus::Idle),
+        "needsInput" | "needs_input" | "needs-input" | "needs_me" | "blocked" => {
+            matches!(run.state, R::NeedsInput)
+        }
+        "failed" => matches!(run.state, R::Failed),
+        "aborted" => matches!(run.state, R::Aborted),
+        "exited" | "dead" => matches!(record.status, diri_proto::SessionStatus::Exited(_)),
+        "any" => !matches!(run.state, R::Starting),
+        _ => false,
+    }
+}
+
 /// Publishes `session.updated` whenever a live session's observable state
 /// changes, by diffing registry views on a short cadence. The Swift daemon
 /// publishes at each mutation site inside its status engine; this engine's
@@ -388,12 +412,15 @@ pub fn spawn_registry_watcher(
             // integer compare per live session — the previous implementation
             // cloned and JSON-serialized every record (live and archived) on
             // every pass, all under the registry lock.
-            let mut published: HashMap<String, u64> = HashMap::new();
+            let mut published: HashMap<String, (u64, u64)> = HashMap::new();
+            let changes = registry.lock().expect("registry").state_changes();
+            let mut observed = changes.observe();
             while !stop.load(Ordering::SeqCst) {
                 let changed = {
                     let Ok(mut registry) = registry.lock() else {
                         break;
                     };
+                    registry.sync_orchestration();
                     registry.changed_since(&mut published)
                 };
                 for (id, record) in changed {
@@ -403,7 +430,7 @@ pub fn spawn_registry_watcher(
                         Some(&id),
                     );
                 }
-                std::thread::sleep(Duration::from_millis(150));
+                observed = changes.wait_after(observed, Duration::from_millis(250));
             }
         })
         .expect("spawn watcher")
@@ -521,5 +548,40 @@ mod tests {
         assert!(satisfies_wait_target(&exited, "exited"));
         assert!(satisfies_wait_target(&exited, "dead"));
         assert!(!satisfies_wait_target(&exited, "nonsense"));
+    }
+
+    #[test]
+    fn run_waits_distinguish_idle_before_work_pause_and_completion() {
+        use diri_proto::{AgentRun, AgentRunState, SessionStatus};
+
+        let now = std::time::SystemTime::now().into();
+        let mut record = crate::control::new_record("s_run", "codex", "/tmp");
+        record.status = SessionStatus::Idle;
+        record.run = Some(AgentRun::starting(7, now));
+
+        assert!(
+            !run_satisfies_wait_target(&record, "done"),
+            "an idle composer before the prompt starts is not a completed turn"
+        );
+
+        record.run.as_mut().expect("run").state = AgentRunState::NeedsInput;
+        assert!(run_satisfies_wait_target(&record, "needsInput"));
+        assert!(
+            !run_satisfies_wait_target(&record, "done"),
+            "a paused child still owes its caller an outcome"
+        );
+
+        record.run.as_mut().expect("run").state = AgentRunState::Completed;
+        assert!(run_satisfies_wait_target(&record, "done"));
+        assert!(run_satisfies_wait_target(&record, "settled"));
+
+        record.run.as_mut().expect("run").state = AgentRunState::Failed;
+        assert!(run_satisfies_wait_target(&record, "done"));
+        assert!(!run_satisfies_wait_target(&record, "completed"));
+        assert!(run_satisfies_wait_target(&record, "failed"));
+
+        record.run.as_mut().expect("run").state = AgentRunState::Aborted;
+        assert!(run_satisfies_wait_target(&record, "done"));
+        assert!(run_satisfies_wait_target(&record, "aborted"));
     }
 }
