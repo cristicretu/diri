@@ -603,3 +603,61 @@ fn a_spawned_session_records_its_parent_and_appears_as_a_child() {
 
     call(&server, "release_agent", json!({ "session_id": id })).expect("release");
 }
+
+#[test]
+fn embedded_keyed_spawn_normalizes_null_and_unknown_fields() {
+    let temp = tempfile::tempdir().expect("temp");
+    let logs = temp.path().join("logs");
+    let mut inner = Registry::new(engine(), temp.path().join("state.json"));
+    inner.insert_record(record("s_parent", None));
+    let registry = Arc::new(Mutex::new(inner));
+    let server = McpServer::new(
+        tool_definitions(),
+        RegistryHost::new(Arc::clone(&registry), &logs).with_caller(Some("s_parent".into())),
+    );
+
+    let first = call(
+        &server,
+        "spawn_agent",
+        json!({
+            "kind": "shell",
+            "cwd": "/tmp",
+            "requestKey": "turn-2/normalized",
+        }),
+    )
+    .expect("first spawn");
+    let replay = call(
+        &server,
+        "spawn_agent",
+        json!({
+            "kind": "shell",
+            "cwd": "/tmp",
+            "worktree": false,
+            "prompt": null,
+            "name": null,
+            "host": null,
+            "futureField": "ignored",
+            "requestKey": "turn-2/normalized",
+        }),
+    )
+    .expect("semantic replay");
+    assert_eq!(first["id"], replay["id"]);
+
+    let conflict = call(
+        &server,
+        "spawn_agent",
+        json!({
+            "kind": "shell",
+            "cwd": "/tmp",
+            "name": "a real change",
+            "requestKey": "turn-2/normalized",
+        }),
+    )
+    .expect_err("semantic change conflicts");
+    assert_eq!(
+        typed_error(&conflict)["error"]["code"],
+        "idempotency_conflict"
+    );
+
+    call(&server, "release_agent", json!({"session_id": first["id"]})).expect("release child");
+}

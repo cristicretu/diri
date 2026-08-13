@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use diri_proto::{ControlError, McpToolErrorEnvelope, SessionId, SessionStatus};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use super::ToolHost;
 use crate::git;
@@ -24,32 +25,6 @@ const DEFAULT_CHILDREN_WAIT_SECONDS: f64 = 600.0;
 /// How often a wait re-checks. Long enough not to spin, short enough that a
 /// state change is noticed promptly.
 const WAIT_POLL: Duration = Duration::from_millis(100);
-
-/// Owns a newly-created worktree until the session record owns it. Any
-/// validation, registry-lock, or PTY failure in between rolls the checkout
-/// back, so a retry starts from the same repository state.
-struct WorktreeRollback {
-    repo: PathBuf,
-    worktree: Option<String>,
-}
-
-impl WorktreeRollback {
-    fn new(repo: PathBuf, worktree: Option<String>) -> Self {
-        Self { repo, worktree }
-    }
-
-    fn disarm(&mut self) {
-        self.worktree = None;
-    }
-}
-
-impl Drop for WorktreeRollback {
-    fn drop(&mut self) {
-        if let Some(worktree) = self.worktree.as_deref() {
-            let _ = git::remove_worktree(&self.repo, worktree, true);
-        }
-    }
-}
 
 pub struct RegistryHost {
     registry: Arc<Mutex<Registry>>,
@@ -372,23 +347,7 @@ impl RegistryHost {
             }
             registry.spawn_requests()
         };
-        let mut normalized = arguments.clone();
-        let object = normalized
-            .as_object_mut()
-            .ok_or_else(|| ControlError::bad_request("spawn_agent arguments must be an object"))?;
-        object.remove("requestKey");
-        object.insert(
-            "worktree".into(),
-            Value::Bool(
-                arguments
-                    .get("worktree")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-            ),
-        );
-        let fingerprint = serde_json::to_string(&normalized).map_err(|error| {
-            ControlError::internal(format!("could not normalize spawn arguments: {error}"))
-        })?;
+        let fingerprint = spawn_agent_fingerprint_digest(arguments)?;
         ledger.run(caller, "spawn_agent", &request_key, fingerprint, || {
             self.spawn_agent_once(arguments)
         })
@@ -447,7 +406,8 @@ impl RegistryHost {
         } else {
             (cwd_path, None, git::branch(Path::new(&cwd)))
         };
-        let mut rollback = WorktreeRollback::new(PathBuf::from(&cwd), worktree_path.clone());
+        let mut rollback =
+            git::WorktreeRollback::new(PathBuf::from(&cwd), worktree_path.clone(), branch.clone());
 
         let inherited: Vec<(String, String)> = std::env::vars().collect();
         let pty = if let Some(pty) = descriptor.spawn_spec(&working_dir, inherited.clone(), &[]) {
@@ -635,5 +595,65 @@ impl RegistryHost {
     /// Where session logs live, for hosts that spawn.
     pub fn logs_dir(&self) -> &Path {
         &self.logs_dir
+    }
+}
+
+fn spawn_agent_fingerprint(arguments: &Value) -> Result<Value, ControlError> {
+    let kind = required_str(arguments, "kind").map_err(ControlError::bad_request)?;
+    let cwd = required_str(arguments, "cwd").map_err(ControlError::bad_request)?;
+    Ok(json!({
+        "kind": kind,
+        "cwd": cwd,
+        "host": arguments.get("host").and_then(Value::as_str),
+        "worktree": arguments.get("worktree").and_then(Value::as_bool).unwrap_or(false),
+        "prompt": arguments.get("prompt").and_then(Value::as_str),
+        "name": arguments.get("name").and_then(Value::as_str),
+    }))
+}
+
+fn spawn_agent_fingerprint_digest(arguments: &Value) -> Result<String, ControlError> {
+    let normalized = spawn_agent_fingerprint(arguments)?;
+    let bytes = serde_json::to_vec(&normalized).map_err(|error| {
+        ControlError::internal(format!("could not normalize spawn arguments: {error}"))
+    })?;
+    let digest = Sha256::digest(bytes);
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+
+    #[test]
+    fn omitted_null_and_unknown_fields_share_one_semantic_fingerprint() {
+        let base = json!({"kind": "shell", "cwd": "/tmp"});
+        let noisy = json!({
+            "kind": "shell",
+            "cwd": "/tmp",
+            "host": null,
+            "worktree": false,
+            "prompt": null,
+            "name": null,
+            "requestKey": "ignored",
+            "futureField": {"ignored": true},
+        });
+        assert_eq!(
+            spawn_agent_fingerprint(&base).expect("base"),
+            spawn_agent_fingerprint(&noisy).expect("normalized")
+        );
+
+        let changed = json!({"kind": "shell", "cwd": "/tmp", "name": "worker"});
+        assert_ne!(
+            spawn_agent_fingerprint(&base).expect("base"),
+            spawn_agent_fingerprint(&changed).expect("changed")
+        );
+        assert_eq!(
+            spawn_agent_fingerprint_digest(&base).expect("base digest"),
+            spawn_agent_fingerprint_digest(&noisy).expect("normalized digest")
+        );
+        assert_ne!(
+            spawn_agent_fingerprint_digest(&base).expect("base digest"),
+            spawn_agent_fingerprint_digest(&changed).expect("changed digest")
+        );
     }
 }

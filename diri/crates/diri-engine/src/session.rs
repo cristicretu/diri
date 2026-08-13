@@ -581,6 +581,36 @@ struct RemoteLaunchCleanup {
     armed: bool,
 }
 
+/// Owns a direct PTY until the pump thread has successfully taken over. A
+/// failure after `fork` but before `Session` construction must kill and reap
+/// the child; dropping `std::process::Child` alone does neither.
+struct DirectLaunchCleanup {
+    pty: Arc<Mutex<Pty>>,
+    armed: bool,
+}
+
+impl DirectLaunchCleanup {
+    fn new(pty: Arc<Mutex<Pty>>) -> Self {
+        Self { pty, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DirectLaunchCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(mut pty) = self.pty.lock() {
+            let _ = pty.kill_group(libc::SIGKILL);
+            let _ = pty.wait();
+        }
+    }
+}
+
 impl RemoteLaunchCleanup {
     fn disarm(&mut self) {
         self.armed = false;
@@ -778,13 +808,17 @@ impl Session {
     }
 
     fn spawn_direct(spec: SessionSpec, engine: Arc<ManifestEngine>) -> std::io::Result<Self> {
-        let pty = Pty::spawn(&spec.pty)?;
+        let pty = Arc::new(Mutex::new(Pty::spawn(&spec.pty)?));
+        let mut cleanup = DirectLaunchCleanup::new(Arc::clone(&pty));
         let log = OutputLog::writer(&spec.logs_dir, &spec.id)?;
         let shared = new_shared(&spec, log, &engine);
-        shared.child_pid.store(pty.pid() as i32, Ordering::SeqCst);
-
-        let reader = pty.reader()?;
-        let pty = Arc::new(Mutex::new(pty));
+        let (pid, reader) = {
+            let pty = pty
+                .lock()
+                .map_err(|_| std::io::Error::other("new PTY lock was poisoned"))?;
+            (pty.pid(), pty.reader()?)
+        };
+        shared.child_pid.store(pid as i32, Ordering::SeqCst);
 
         let pump = {
             let shared = Arc::clone(&shared);
@@ -795,6 +829,7 @@ impl Session {
                 .name(format!("diri-session-{}", spec.id))
                 .spawn(move || pump(shared, engine, pty, reader, manifest_id))?
         };
+        cleanup.disarm();
 
         Ok(Self {
             shared,
@@ -1635,6 +1670,33 @@ impl Session {
             let _ = pump.join();
         }
         Ok(exit)
+    }
+}
+
+#[cfg(test)]
+mod direct_launch_cleanup_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_direct_launch_guard_kills_and_reaps_its_child() {
+        let spec = PtySpec::new(
+            vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+            "/tmp",
+        )
+        .env("PATH", "/usr/bin:/bin")
+        .env("TERM", "xterm-256color");
+        let pty = Arc::new(Mutex::new(Pty::spawn(&spec).expect("spawn test child")));
+        let pid = pty.lock().expect("pty").pid() as i32;
+        let cleanup = DirectLaunchCleanup::new(Arc::clone(&pty));
+        drop(cleanup);
+
+        // SAFETY: signal 0 only probes whether this exact PID still exists.
+        let result = unsafe { libc::kill(pid, 0) };
+        assert_eq!(result, -1, "cleanup must not leave the child running");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
     }
 }
 

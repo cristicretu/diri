@@ -80,7 +80,10 @@ impl McpToolErrorEnvelope {
                 None,
             );
         }
-        if lower.contains("no session") || lower.contains("session not found") {
+        if lower.contains("no session")
+            || lower.contains("no such session")
+            || lower.contains("session not found")
+        {
             return Self::new(
                 "session_not_found",
                 message,
@@ -90,8 +93,11 @@ impl McpToolErrorEnvelope {
             );
         }
         if lower.contains("cannot target")
+            || lower.contains("cannot terminate")
             || lower.contains("refuses to kill")
             || lower.contains("must run inside a diri session")
+            || lower.contains("did not identify itself")
+            || lower.contains("dirijor_session_id is unset")
         {
             return Self::new(
                 "authorization_denied",
@@ -117,6 +123,24 @@ impl McpToolErrorEnvelope {
                 "Use the original arguments for this requestKey, or choose a new requestKey for a different spawn.",
                 false,
                 None,
+            );
+        }
+        if lower.contains("timed out") || lower.contains("timeout") {
+            return Self::new(
+                "timeout",
+                message,
+                "Inspect current Diri state before retrying a mutation with the same requestKey.",
+                true,
+                Some("list_agents"),
+            );
+        }
+        if lower.contains("poisoned") || lower.contains("internal error") {
+            return Self::new(
+                "internal",
+                message,
+                "Inspect current Diri state, then retry once if no mutation occurred.",
+                true,
+                Some("list_agents"),
             );
         }
         Self::new(
@@ -270,6 +294,28 @@ mod tests {
         ))
         .expect("valid JSON");
         assert_eq!(upgraded["error"]["code"], "invalid_arguments");
+
+        for (message, code, retryable) in [
+            ("no such session: s_gone", "session_not_found", false),
+            (
+                "release_agent cannot terminate its caller",
+                "authorization_denied",
+                false,
+            ),
+            (
+                "this session did not identify itself; DIRIJOR_SESSION_ID is unset",
+                "authorization_denied",
+                false,
+            ),
+            ("engine state is poisoned", "internal", true),
+            ("operation timed out", "timeout", true),
+        ] {
+            let upgraded: McpToolErrorEnvelope =
+                serde_json::from_str(&McpToolErrorEnvelope::normalize_text(message))
+                    .expect("typed JSON");
+            assert_eq!(upgraded.error.code, code, "{message}");
+            assert_eq!(upgraded.error.retryable, retryable, "{message}");
+        }
     }
 
     #[test]

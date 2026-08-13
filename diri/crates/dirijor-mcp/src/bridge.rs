@@ -1112,4 +1112,24 @@ mod tests {
             assert!(!envelope.error.retryable);
         }
     }
+
+    #[test]
+    fn real_bridge_prose_paths_normalize_to_stable_codes() {
+        let missing = find_session(&[], "s_gone").expect_err("missing session");
+        let missing: McpToolErrorEnvelope =
+            serde_json::from_str(&McpToolErrorEnvelope::normalize_text(&missing))
+                .expect("typed missing-session error");
+        assert_eq!(missing.error.code, "session_not_found");
+
+        for policy_error in [
+            "release_agent cannot terminate its caller",
+            "release_agent cannot terminate the session waiting on this result",
+        ] {
+            let envelope: McpToolErrorEnvelope =
+                serde_json::from_str(&McpToolErrorEnvelope::normalize_text(policy_error))
+                    .expect("typed authorization error");
+            assert_eq!(envelope.error.code, "authorization_denied");
+            assert!(!envelope.error.retryable);
+        }
+    }
 }

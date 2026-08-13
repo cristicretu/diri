@@ -6,7 +6,7 @@
 //! unless their outcome proves or may imply that the mutation already
 //! committed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -45,6 +45,7 @@ struct State {
     entries: HashMap<RequestIdentity, Entry>,
     caller_generations: HashMap<String, u64>,
     retired_callers: HashMap<String, Instant>,
+    pending_activations: HashSet<String>,
     next_generation: u64,
 }
 
@@ -54,6 +55,7 @@ impl Default for State {
             entries: HashMap::new(),
             caller_generations: HashMap::new(),
             retired_callers: HashMap::new(),
+            pending_activations: HashSet::new(),
             next_generation: 1,
         }
     }
@@ -66,6 +68,18 @@ impl State {
         self.caller_generations
             .insert(caller.to_owned(), generation);
         generation
+    }
+
+    fn activate_after_owner_settles(&mut self, identity: &RequestIdentity) {
+        let old_owner_running = self.entries.iter().any(|(candidate, entry)| {
+            candidate.caller == identity.caller
+                && candidate.generation == identity.generation
+                && matches!(entry.state, EntryState::Running)
+        });
+        if !old_owner_running && self.pending_activations.remove(&identity.caller) {
+            self.retired_callers.remove(&identity.caller);
+            self.allocate_generation(&identity.caller);
+        }
     }
 }
 
@@ -110,6 +124,7 @@ impl MutationLedger {
         mutation: impl FnOnce() -> Result<Value, ControlError>,
     ) -> Result<Value, ControlError> {
         let mut state = self.state.lock().map_err(poisoned)?;
+        self.prune_expired(&mut state);
         let generation = state
             .caller_generations
             .get(caller)
@@ -197,6 +212,9 @@ impl MutationLedger {
     pub fn forget_caller(&self, caller: &str) {
         if let Ok(mut state) = self.state.lock() {
             self.prune_expired(&mut state);
+            // A second removal supersedes any pending reopen from the prior
+            // lifetime. Only a later explicit activation may reopen it.
+            state.pending_activations.remove(caller);
             state
                 .retired_callers
                 .insert(caller.to_owned(), Instant::now());
@@ -211,9 +229,24 @@ impl MutationLedger {
     /// later reopened. The generation makes old owners and waiters incapable
     /// of completing or reserving entries in the new lifetime.
     pub fn activate_caller(&self, caller: &str) {
-        if let Ok(mut state) = self.state.lock()
-            && state.retired_callers.remove(caller).is_some()
-        {
+        if let Ok(mut state) = self.state.lock() {
+            if !state.retired_callers.contains_key(caller) {
+                return;
+            }
+            let old_owner_running = state.entries.iter().any(|(identity, entry)| {
+                identity.caller == caller && matches!(entry.state, EntryState::Running)
+            });
+            if old_owner_running {
+                // A reopened record may be visible while its previous
+                // lifetime's mutation is still settling. Keep that lifetime
+                // retired: allowing a new generation now would let the same
+                // requestKey execute twice concurrently. The old reservation
+                // completes the deferred activation after the last old owner
+                // settles.
+                state.pending_activations.insert(caller.to_owned());
+                return;
+            }
+            state.retired_callers.remove(caller);
             state.allocate_generation(caller);
             self.changed.notify_all();
         }
@@ -247,6 +280,7 @@ impl MutationLedger {
         for caller in expired_callers {
             state.retired_callers.remove(&caller);
             state.caller_generations.remove(&caller);
+            state.pending_activations.remove(&caller);
         }
     }
 
@@ -322,6 +356,7 @@ impl Reservation<'_> {
                     };
                 } else {
                     state.entries.remove(&self.identity);
+                    state.activate_after_owner_settles(&self.identity);
                 }
                 self.finished = true;
                 self.ledger.changed.notify_all();
@@ -341,6 +376,7 @@ impl Drop for Reservation<'_> {
             });
             if should_remove {
                 state.entries.remove(&self.identity);
+                state.activate_after_owner_settles(&self.identity);
             }
             self.ledger.changed.notify_all();
         }
@@ -503,6 +539,7 @@ mod tests {
         };
         started_rx.recv().expect("owner started");
         ledger.forget_caller("parent");
+        ledger.activate_caller("parent");
 
         let retry = ledger
             .run("parent", "spawn_agent", "same", "same".into(), || {
@@ -519,6 +556,15 @@ mod tests {
             "s_only"
         );
         assert_eq!(mutations.load(Ordering::SeqCst), 1);
+
+        let new_lifetime = ledger
+            .run("parent", "spawn_agent", "same", "same".into(), || {
+                mutations.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::json!({"id": "s_reopened"}))
+            })
+            .expect("the reopened caller activates after the old owner settles");
+        assert_eq!(new_lifetime["id"], "s_reopened");
+        assert_eq!(mutations.load(Ordering::SeqCst), 2);
     }
 
     #[test]

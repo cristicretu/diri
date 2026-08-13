@@ -837,6 +837,11 @@ impl ControlServer {
             cwd.clone_from(&info.path);
             worktree_path = Some(info.path);
         }
+        let mut worktree_rollback = crate::git::WorktreeRollback::new(
+            PathBuf::from(&p.cwd),
+            worktree_path.clone(),
+            git_branch.clone(),
+        );
         let cwd_path = PathBuf::from(&cwd);
         if !cwd_path.is_dir() {
             return Err(ControlError::bad_request(format!(
@@ -947,13 +952,10 @@ impl ControlServer {
         };
         let mut registry = self.registry.lock().map_err(poisoned)?;
         registry.ensure_session_project(&p.cwd, None);
-        if let Err(error) = registry.spawn(spec, record) {
-            drop(registry);
-            if let Some(worktree) = worktree_path.as_deref() {
-                let _ = crate::git::remove_worktree(Path::new(&p.cwd), worktree, true);
-            }
-            return Err(ControlError::internal(error.to_string()));
-        }
+        registry
+            .spawn(spec, record)
+            .map_err(|error| ControlError::internal(error.to_string()))?;
+        worktree_rollback.disarm();
         let _ = registry.persist();
         self.publish_updated(&registry, &id);
 
