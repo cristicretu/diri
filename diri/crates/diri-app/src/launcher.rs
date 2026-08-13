@@ -11,7 +11,7 @@ use diri_ui::{
 };
 use gpui::{
     AnyElement, App, Context, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle,
-    KeyDownEvent, MouseButton, PathPromptOptions, Render, Task, Window, div, prelude::*, px, rgba,
+    KeyDownEvent, MouseButton, PathPromptOptions, Render, Task, Window, div, prelude::*, px,
 };
 
 use crate::AppServices;
@@ -49,6 +49,23 @@ const COMPOSER_CONTROLS_HEIGHT: f32 = 44.0;
 /// The width text actually wraps at, derived from the panel so the two cannot
 /// drift apart: the panel, less the composer's margin, padding and border.
 const COMPOSER_TEXT_WIDTH: f32 = PANEL_WIDTH - 2.0 * COMPOSER_INSET - 2.0 * COMPOSER_PADDING - 2.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LauncherSurfaceFills {
+    composer: gpui::Rgba,
+    shelf: gpui::Rgba,
+}
+
+fn launcher_colors_for_theme(theme_id: &str) -> SemanticColors {
+    crate::app_theme::colors(theme_id)
+}
+
+fn launcher_surface_fills(colors: SemanticColors) -> LauncherSurfaceFills {
+    LauncherSurfaceFills {
+        composer: colors.floating_surface(),
+        shelf: colors.sidebar_surface(),
+    }
+}
 
 const fn composer_text_height(lines: usize) -> f32 {
     let visible = if lines < COMPOSER_MIN_LINES {
@@ -181,6 +198,20 @@ impl LauncherOverlay {
             self.fallback_notice = None;
         }
         self.activate_new_session(window, cx);
+    }
+
+    /// Command-N owns a reversible main-pane destination: invoking it again
+    /// returns to the session that was already underneath the launcher.
+    /// Returns whether the launcher is open after the transition so RootView
+    /// only schedules focus for the branch it is about to mount.
+    pub(crate) fn toggle(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.open {
+            self.close(cx);
+            false
+        } else {
+            self.open(window, cx);
+            true
+        }
     }
 
     /// Open Command-N at a validated local directory. The Finder gesture only
@@ -915,16 +946,7 @@ impl LauncherOverlay {
         let harness_label = self.selected_harness_label();
         let project_label = self.selected_project_label();
         let logo = ui_agent_kind(&self.selected_harness);
-        let composer_fill = if colors.appearance == diri_ui::Appearance::Dark {
-            rgba(0x26282dff)
-        } else {
-            rgba(0xf2f1efff)
-        };
-        let shelf_fill = if colors.appearance == diri_ui::Appearance::Dark {
-            rgba(0x1d1f23ff)
-        } else {
-            rgba(0xe8e7e4ff)
-        };
+        let fills = launcher_surface_fills(colors);
 
         // Wrapped lines are children of a scroll container so the composer's
         // handle can scroll BY LINE to keep the caret on screen — the whole
@@ -987,7 +1009,7 @@ impl LauncherOverlay {
                     .mx(px(COMPOSER_INSET))
                     .h(px(composer_height))
                     .rounded(px(Radius::PANEL))
-                    .bg(composer_fill)
+                    .bg(fills.composer)
                     .border_1()
                     .border_color(if focused {
                         Palette::CLAY.alpha(0.42)
@@ -1147,7 +1169,7 @@ impl LauncherOverlay {
                     .justify_between()
                     .rounded_bl(px(Radius::PANEL))
                     .rounded_br(px(Radius::PANEL))
-                    .bg(shelf_fill)
+                    .bg(fills.shelf)
                     .border_1()
                     .border_color(colors.primary.alpha(0.055))
                     .child(
@@ -1282,16 +1304,7 @@ impl LauncherOverlay {
         let can_submit = self.can_submit();
         let text_height = composer_text_height(self.prompt.line_count());
         let composer_height = text_height + COMPOSER_CONTROLS_HEIGHT;
-        let composer_fill = if colors.appearance == diri_ui::Appearance::Dark {
-            rgba(0x26282dff)
-        } else {
-            rgba(0xf2f1efff)
-        };
-        let shelf_fill = if colors.appearance == diri_ui::Appearance::Dark {
-            rgba(0x1d1f23ff)
-        } else {
-            rgba(0xe8e7e4ff)
-        };
+        let fills = launcher_surface_fills(colors);
         let prompt = if self.prompt.is_empty() {
             div()
                 .h(px(COMPOSER_LINE_HEIGHT))
@@ -1355,7 +1368,7 @@ impl LauncherOverlay {
                     .mx(px(COMPOSER_INSET))
                     .h(px(composer_height))
                     .rounded(px(Radius::PANEL))
-                    .bg(composer_fill)
+                    .bg(fills.composer)
                     .border_1()
                     .border_color(if focused {
                         Palette::GEMINI_BLUE.alpha(0.46)
@@ -1437,7 +1450,7 @@ impl LauncherOverlay {
                     .gap(px(8.0))
                     .rounded_bl(px(Radius::PANEL))
                     .rounded_br(px(Radius::PANEL))
-                    .bg(shelf_fill)
+                    .bg(fills.shelf)
                     .border_1()
                     .border_color(colors.primary.alpha(0.055))
                     .child(AgentLogo::new(logo, 17.0, colors).badged(false))
@@ -1535,10 +1548,16 @@ impl Render for LauncherOverlay {
             window,
         );
 
-        // The session workbench is intentionally always dark, independent of
-        // macOS appearance. This is a destination in that workbench—not a
-        // translucent window overlay—so paint the same fully opaque surface.
-        let colors = SemanticColors::dark();
+        let theme_id = self
+            .services
+            .store
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .terminal_theme
+            .clone();
+        let colors = launcher_colors_for_theme(&theme_id);
         let focused = self.focus.is_focused(window);
         root.size_full()
             .relative()
@@ -1656,11 +1675,56 @@ fn apply_folder_choice(selected_root: &mut String, chosen: Option<&Path>) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::StoreRuntime;
+    use crate::usage::UsageSnapshot;
+    use gpui::TestAppContext;
 
     #[test]
     fn manifest_ids_have_readable_fallback_labels() {
         assert_eq!(title_case_id("claude-code"), "Claude Code");
         assert_eq!(title_case_id("open_code"), "Open Code");
+    }
+
+    #[gpui::test]
+    fn command_n_toggles_the_launcher_open_then_closed(cx: &mut TestAppContext) {
+        let store = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let (usage_tx, _) = tokio::sync::watch::channel(UsageSnapshot::default());
+        let services = Arc::new(AppServices {
+            store,
+            usage_tx,
+            updates: crate::updates::inert(),
+            tokio,
+            dev_build: None,
+        });
+        let (launcher, cx) =
+            cx.add_window_view(move |_window, cx| LauncherOverlay::new(services, true, cx));
+
+        assert!(!launcher.read_with(cx, |launcher, _| launcher.is_open()));
+        launcher.update_in(cx, |launcher, window, cx| {
+            assert!(launcher.toggle(window, cx));
+        });
+        assert!(launcher.read_with(cx, |launcher, _| launcher.is_open()));
+        launcher.update_in(cx, |launcher, window, cx| {
+            assert!(!launcher.toggle(window, cx));
+        });
+        assert!(!launcher.read_with(cx, |launcher, _| launcher.is_open()));
+    }
+
+    #[test]
+    fn launcher_uses_the_selected_diri_theme_and_semantic_surfaces() {
+        let colors = launcher_colors_for_theme("dirijor-light");
+        let expected = crate::app_theme::colors("dirijor-light");
+        let fills = launcher_surface_fills(colors);
+
+        assert_eq!(colors, expected);
+        assert_eq!(fills.composer, expected.floating_surface());
+        assert_eq!(fills.shelf, expected.sidebar_surface());
     }
 
     #[test]
