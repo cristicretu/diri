@@ -435,8 +435,11 @@ emulator, then publishes the resolved state to desktop attachments. Cold
 adoption hydrates that emulator from locally retained OutputLog bytes before
 resuming at the persisted remote tail. If rotation removed the authoritative
 prefix and no retained transition resolves DECCKM, the state remains unknown:
-the Engine emits no desktop Modes seed, the app stays Attaching, and input is
-gated until an authoritative Holder report or later transition arrives.
+the Engine emits a desktop Modes seed with the additive value-known bit clear.
+The app becomes degraded Live, preserves the independently authoritative paste
+and mouse state, and accepts ordinary input while withholding only unmodified
+cursor arrows whose CSI/SS3 encoding depends on DECCKM. A later authoritative
+Holder report or terminal transition emits a known Modes update.
 
 The PTY reader must never block on a client. The Holder uses bounded queues. It
 coalesces background output for no more than 8 ms, while up to two grid
@@ -474,8 +477,10 @@ attached or receiving input, then returns to default QoS.
 Current local Holders also report their parser-owned DECCKM value in `stat`.
 The field is optional for live older Holders. If both that field and the
 pre-rotation output prefix are unavailable, adoption keeps DECCKM unknown,
-does not write a v4 checkpoint with a guessed value, and uses the same
-Modes-before-input readiness gate as remote compatibility.
+does not write a v4 checkpoint with a guessed value, and uses the same degraded
+Live behavior as remote compatibility. Holder mode reports are paired with the
+reported log tail; if rotation passes that tail before replay, the Engine
+downgrades the stale report to unknown.
 
 ## Controller lease
 

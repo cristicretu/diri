@@ -45,8 +45,9 @@ struct Shared {
     /// The PTY, kept for write/resize/stat access. The master stays open for
     /// the holder's whole life; closing happens when `run` returns.
     pty: Mutex<Pty>,
-    log: Mutex<OutputLog>,
-    application_cursor_keys: Mutex<ApplicationCursorModeTracker>,
+    /// Appended bytes and the parser state they produce share one lock, so a
+    /// stat's mode value is bound to its exact log offset.
+    output: Mutex<HolderOutput>,
     /// Log tail at the moment this holder started: the boundary between prior
     /// incarnations' bytes and bytes attributable to THIS child.
     epoch_offset: u64,
@@ -55,6 +56,11 @@ struct Shared {
     /// Weak handles let the exit path interrupt blocking input reads without
     /// making idle Holder streams wake on a timer.
     input_streams: Mutex<Vec<Weak<std::os::unix::net::UnixStream>>>,
+}
+
+struct HolderOutput {
+    log: OutputLog,
+    application_cursor_keys: ApplicationCursorModeTracker,
 }
 
 impl HolderServer {
@@ -121,8 +127,10 @@ impl HolderServer {
         let shared = Arc::new(Shared {
             child_pid,
             pty: Mutex::new(pty),
-            log: Mutex::new(log),
-            application_cursor_keys: Mutex::new(ApplicationCursorModeTracker::known(false)),
+            output: Mutex::new(HolderOutput {
+                log,
+                application_cursor_keys: ApplicationCursorModeTracker::known(false),
+            }),
             epoch_offset,
             finished: AtomicBool::new(false),
             listen_fd: AtomicI32::new(listen_fd),
@@ -224,12 +232,9 @@ fn pump_pty(shared: &Shared, reader: &mut crate::pty::PtyStream) {
                     // the exit watcher joins this thread before writing the
                     // marker, so nothing can land beyond it — but a byte
                     // consumed from the kernel and then dropped would be lost.
-                    shared
-                        .application_cursor_keys
-                        .lock()
-                        .expect("application cursor mode")
-                        .feed(&buffer[..count]);
-                    let _ = shared.log.lock().expect("log").append(&buffer[..count]);
+                    let mut output = shared.output.lock().expect("output");
+                    let _ = output.log.append(&buffer[..count]);
+                    output.application_cursor_keys.feed(&buffer[..count]);
                     if shared.finished.load(Ordering::SeqCst) {
                         return;
                     }
@@ -289,12 +294,9 @@ fn watch_exit(shared: &Shared, pump: std::thread::JoinHandle<()>) {
             match drain.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(count) => {
-                    shared
-                        .application_cursor_keys
-                        .lock()
-                        .expect("application cursor mode")
-                        .feed(&buffer[..count]);
-                    let _ = shared.log.lock().expect("log").append(&buffer[..count]);
+                    let mut output = shared.output.lock().expect("output");
+                    let _ = output.log.append(&buffer[..count]);
+                    output.application_cursor_keys.feed(&buffer[..count]);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break, // WouldBlock: nothing buffered
@@ -303,9 +305,9 @@ fn watch_exit(shared: &Shared, pump: std::thread::JoinHandle<()>) {
     }
 
     {
-        let mut log = shared.log.lock().expect("log");
-        let _ = log.append(&HolderExitMarker::encode(&exit));
-        let _ = log.flush();
+        let mut output = shared.output.lock().expect("output");
+        let _ = output.log.append(&HolderExitMarker::encode(&exit));
+        let _ = output.log.flush();
     }
 
     let _ = std::fs::remove_file(&shared.spec.socket_path);
@@ -516,19 +518,16 @@ fn current_stat(shared: &Shared) -> HolderStat {
     // SAFETY: tcgetpgrp on the master; -1 fd yields an error, mapped to None.
     let foreground = unsafe { libc::tcgetpgrp(master_fd) };
     let size = pty.size().ok();
+    let output = shared.output.lock().expect("output");
     HolderStat {
         child_pid: shared.child_pid,
         alive: !finished && child_alive,
-        log_offset: shared.log.lock().expect("log").tail_offset(),
+        log_offset: output.log.tail_offset(),
         foreground_pid: (foreground > 0).then_some(foreground),
         cols: size.map(|(cols, _)| cols),
         rows: size.map(|(_, rows)| rows),
         epoch_offset: Some(shared.epoch_offset),
-        application_cursor_keys: shared
-            .application_cursor_keys
-            .lock()
-            .expect("application cursor mode")
-            .value(),
+        application_cursor_keys: output.application_cursor_keys.value(),
     }
 }
 

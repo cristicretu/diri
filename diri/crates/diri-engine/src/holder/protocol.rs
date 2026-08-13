@@ -84,7 +84,8 @@ pub struct HolderStat {
     )]
     pub epoch_offset: Option<u64>,
     /// Current DECCKM state parsed by this Holder from the complete output it
-    /// has owned. Absent when adopting a Holder built before mode reporting.
+    /// has owned, atomically paired with `logOffset`. Absent when adopting a
+    /// Holder built before mode reporting.
     #[serde(
         rename = "applicationCursorKeys",
         default,

@@ -156,14 +156,15 @@ impl Frame {
     /// Adds the child's DECCKM state to a terminal-modes frame.
     ///
     /// Bit 6 is independent from the historical screen/mouse bits and the
-    /// bracketed-paste extension in bit 5. Keeping this as an orthogonal
-    /// builder lets callers compose additive mode capabilities without
-    /// replacing the source-compatible [`Self::modes`] constructor.
+    /// bracketed-paste extension in bit 5. Bit 7 marks the value as known;
+    /// without it, a new client treats DECCKM as unknown while old clients
+    /// continue to ignore both additive bits.
     #[must_use]
     pub fn with_application_cursor_keys(mut self, enabled: bool) -> Self {
         if self.frame_type == FrameType::Modes
             && let Some(bits) = self.payload.first_mut()
         {
+            *bits |= 1 << 7;
             if enabled {
                 *bits |= 1 << 6;
             } else {
@@ -254,6 +255,20 @@ impl Frame {
             return None;
         }
         self.payload.first().map(|bits| bits & (1 << 6) != 0)
+    }
+
+    /// Decodes DECCKM together with its additive provenance marker.
+    ///
+    /// The outer `Option` distinguishes a malformed/non-mode frame. The inner
+    /// `Option` is `None` for a historical or explicitly unknown Modes frame.
+    #[must_use]
+    pub fn application_cursor_keys_state_payload(&self) -> Option<Option<bool>> {
+        if self.frame_type != FrameType::Modes {
+            return None;
+        }
+        self.payload
+            .first()
+            .map(|bits| (bits & (1 << 7) != 0).then_some(bits & (1 << 6) != 0))
     }
 
     fn offset_frame(frame_type: FrameType, offset: u64) -> Self {
@@ -472,9 +487,14 @@ mod tests {
                             modes.application_cursor_keys_payload(),
                             Some(application_cursor_keys)
                         );
+                        assert_eq!(
+                            modes.application_cursor_keys_state_payload(),
+                            Some(Some(application_cursor_keys))
+                        );
                         assert_eq!(modes.payload[0] & 0b10 != 0, mouse.is_reporting());
                         assert_eq!(modes.payload[0] & 0b10_0000 != 0, bracketed_paste);
                         assert_eq!(modes.payload[0] & 0b100_0000 != 0, application_cursor_keys);
+                        assert_ne!(modes.payload[0] & 0b1000_0000, 0, "DECCKM is known");
                     }
                 }
             }
@@ -501,6 +521,10 @@ mod tests {
             Some((true, MouseModes::UNKNOWN))
         );
         assert_eq!(historical.application_cursor_keys_payload(), Some(false));
+        assert_eq!(
+            historical.application_cursor_keys_state_payload(),
+            Some(None)
+        );
 
         let composed =
             Frame::new(FrameType::Modes, vec![1 << 5]).with_application_cursor_keys(true);
@@ -508,6 +532,10 @@ mod tests {
             composed.payload[0] & ((1 << 5) | (1 << 6)),
             (1 << 5) | (1 << 6),
             "adding DECCKM preserves the independent bracketed-paste bit"
+        );
+        assert_eq!(
+            composed.application_cursor_keys_state_payload(),
+            Some(Some(true))
         );
     }
 

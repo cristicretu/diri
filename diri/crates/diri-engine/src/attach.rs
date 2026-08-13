@@ -90,15 +90,7 @@ impl AttachHub {
             if write_frame(&writer, &grid_frame).is_err() {
                 return;
             }
-            if let Some(application_cursor_keys) = seed.modes.application_cursor_keys {
-                let modes = Frame::modes_with_bracketed_paste(
-                    seed.modes.alt_screen,
-                    seed.modes.bracketed_paste,
-                    seed.modes.mouse,
-                )
-                .with_application_cursor_keys(application_cursor_keys);
-                let _ = write_frame(&writer, &modes);
-            }
+            let _ = write_frame(&writer, &terminal_modes_frame(seed.modes));
             seed
         };
 
@@ -285,20 +277,11 @@ impl AttachHub {
                 {
                     frames.push(frame);
                 }
-                // Fresh sinks get their initial modes at seed time; the pump
-                // only broadcasts changes.
-                if let Some(previous) = last_modes
-                    && previous != modes
-                    && let Some(application_cursor_keys) = modes.application_cursor_keys
-                {
-                    frames.push(
-                        Frame::modes_with_bracketed_paste(
-                            modes.alt_screen,
-                            modes.bracketed_paste,
-                            modes.mouse,
-                        )
-                        .with_application_cursor_keys(application_cursor_keys),
-                    );
+                // A replacement deliberately clears `last_modes`: its first
+                // sample must reseed this same socket even when it is unknown,
+                // so clients cannot retain the previous child's DECCKM state.
+                if let Some(frame) = changed_terminal_modes_frame(last_modes, modes) {
+                    frames.push(frame);
                 }
                 last_modes = Some(modes);
             }
@@ -350,6 +333,22 @@ impl AttachHub {
     }
 }
 
+fn terminal_modes_frame(modes: crate::session::AttachmentModes) -> Frame {
+    let frame =
+        Frame::modes_with_bracketed_paste(modes.alt_screen, modes.bracketed_paste, modes.mouse);
+    match modes.application_cursor_keys {
+        Some(value) => frame.with_application_cursor_keys(value),
+        None => frame,
+    }
+}
+
+fn changed_terminal_modes_frame(
+    previous: Option<crate::session::AttachmentModes>,
+    current: crate::session::AttachmentModes,
+) -> Option<Frame> {
+    (previous != Some(current)).then(|| terminal_modes_frame(current))
+}
+
 fn write_frame(writer: &Arc<Mutex<UnixStream>>, frame: &Frame) -> std::io::Result<()> {
     let bytes =
         FrameCodec::encode(frame).map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -358,4 +357,43 @@ fn write_frame(writer: &Arc<Mutex<UnixStream>>, frame: &Frame) -> std::io::Resul
         .map_err(|_| std::io::Error::other("writer poisoned"))?;
     stream.write_all(&bytes)?;
     stream.flush()
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::*;
+    use crate::session::AttachmentModes;
+    use diri_proto::terminal::MouseModes;
+
+    fn modes(application_cursor_keys: Option<bool>) -> AttachmentModes {
+        AttachmentModes {
+            alt_screen: true,
+            bracketed_paste: true,
+            application_cursor_keys,
+            mouse: MouseModes::OFF,
+        }
+    }
+
+    #[test]
+    fn same_socket_replacement_reseeds_known_and_unknown_cursor_state() {
+        let known = changed_terminal_modes_frame(None, modes(Some(false)))
+            .expect("replacement known reseed");
+        assert_eq!(
+            known.application_cursor_keys_state_payload(),
+            Some(Some(false))
+        );
+        assert_eq!(
+            known.terminal_modes_payload(),
+            Some((true, true, MouseModes::OFF))
+        );
+
+        let unknown =
+            changed_terminal_modes_frame(None, modes(None)).expect("replacement unknown reseed");
+        assert_eq!(unknown.application_cursor_keys_state_payload(), Some(None));
+        assert_eq!(
+            unknown.terminal_modes_payload(),
+            Some((true, true, MouseModes::OFF)),
+            "unknown DECCKM does not discard the replacement's paste state"
+        );
+    }
 }

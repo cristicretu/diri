@@ -429,6 +429,48 @@ pub(crate) struct AttachmentModes {
     pub mouse: MouseModes,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HolderCursorModeAuthority {
+    value: bool,
+    /// Output tail the Holder had committed before reporting `value`.
+    /// Replay must begin at or before this offset; otherwise a later toggle
+    /// could have rotated out and the report is no longer current.
+    log_offset: u64,
+}
+
+fn bind_holder_cursor_authority(
+    tracker: &mut ApplicationCursorModeTracker,
+    authority: HolderCursorModeAuthority,
+    oldest_available: u64,
+) -> u64 {
+    if oldest_available <= authority.log_offset {
+        tracker.set_known(authority.value);
+        authority.log_offset
+    } else {
+        // Bytes after the stat may contain a later toggle. If that interval
+        // rotated out before adoption, the stat is no longer current truth.
+        tracker.set_unknown();
+        oldest_available
+    }
+}
+
+fn bind_checkpoint_cursor_authority(
+    tracker: &mut ApplicationCursorModeTracker,
+    value: bool,
+    log_offset: u64,
+    oldest_available: u64,
+) -> u64 {
+    if oldest_available <= log_offset {
+        tracker.set_known(value);
+        log_offset
+    } else {
+        // The checkpoint is an exact past value, but a rotated gap after its
+        // bound may hide a later toggle. Keep its grid cache, not its mode.
+        tracker.set_unknown();
+        oldest_available
+    }
+}
+
 /// Who owns the PTY.
 enum Transport {
     /// This process does; dropping the session kills the child.
@@ -863,7 +905,16 @@ impl Session {
         let client = HolderClient::new(paths.socket());
         let floor = wait_for_holder(&client, &spec.logs_dir, &spec.id, pre_spawn_tail)
             .map_err(holder_io_error)?;
-        Self::attach(spec, client, floor, Some(false), engine)
+        Self::attach(
+            spec,
+            client,
+            floor,
+            Some(HolderCursorModeAuthority {
+                value: false,
+                log_offset: floor,
+            }),
+            engine,
+        )
     }
 
     /// Spawns through a holder, but not yet: the exec waits for the first
@@ -935,9 +986,19 @@ impl Session {
                         mark_launch_failed(&shared);
                         return;
                     };
-                    if let Ok(stat) = client.stat() {
+                    let cursor_authority = if let Ok(stat) = client.stat() {
                         shared.child_pid.store(stat.child_pid, Ordering::SeqCst);
-                    }
+                        stat.application_cursor_keys
+                            .map(|value| HolderCursorModeAuthority {
+                                value,
+                                log_offset: stat.log_offset,
+                            })
+                    } else {
+                        Some(HolderCursorModeAuthority {
+                            value: false,
+                            log_offset: floor,
+                        })
+                    };
                     let Some(handoff) = deferred.finish_launch((cols, rows)) else {
                         // A terminate raced the launch and believes there is
                         // no child; there is one now, so it goes with us.
@@ -957,7 +1018,7 @@ impl Session {
                             .expect("screen")
                             .resize(cols.max(2) as usize, rows.max(2) as usize);
                     }
-                    pump_held(shared, engine, client, floor, manifest_id)
+                    pump_held(shared, engine, client, floor, cursor_authority, manifest_id)
                 })?
         };
 
@@ -1003,7 +1064,13 @@ impl Session {
             spec.pty.cols = cols;
             spec.pty.rows = rows;
         }
-        let session = Self::attach(spec, client, floor, stat.application_cursor_keys, engine)?;
+        let initial_cursor_authority =
+            stat.application_cursor_keys
+                .map(|value| HolderCursorModeAuthority {
+                    value,
+                    log_offset: stat.log_offset,
+                });
+        let session = Self::attach(spec, client, floor, initial_cursor_authority, engine)?;
         if let Some((status, needs_input)) = initial_status {
             *session.shared.status.lock().expect("status") = status;
             *session.shared.needs_input.lock().expect("needs input") = needs_input;
@@ -1017,31 +1084,52 @@ impl Session {
         spec: SessionSpec,
         client: HolderClient,
         exit_marker_floor: u64,
-        holder_application_cursor_keys: Option<bool>,
+        initial_cursor_authority: Option<HolderCursorModeAuthority>,
         engine: Arc<ManifestEngine>,
     ) -> std::io::Result<Self> {
-        let log = OutputLog::reader(&spec.logs_dir, &spec.id)?;
+        let client_stat = client.stat().ok();
+        let cursor_authority = match client_stat.as_ref() {
+            Some(stat) => stat
+                .application_cursor_keys
+                .map(|value| HolderCursorModeAuthority {
+                    value,
+                    log_offset: stat.log_offset,
+                }),
+            None => initial_cursor_authority,
+        };
+        let mut log = OutputLog::reader(&spec.logs_dir, &spec.id)?;
+        log.refresh_from_disk();
+        let oldest_available = log.oldest_available_offset();
         let shared = new_shared(&spec, log, &engine);
-        match holder_application_cursor_keys {
-            Some(value) => {
-                shared
+        if let Some(authority) = cursor_authority {
+            let safe = oldest_available <= authority.log_offset;
+            bind_holder_cursor_authority(
+                &mut shared
                     .application_cursor_keys
                     .lock()
-                    .expect("application cursor mode")
-                    .set_known(value);
-                shared.screen.lock().expect("screen").feed(if value {
-                    b"\x1b[?1h"
-                } else {
-                    b"\x1b[?1l"
-                });
+                    .expect("application cursor mode"),
+                authority,
+                oldest_available,
+            );
+            if safe {
+                shared
+                    .screen
+                    .lock()
+                    .expect("screen")
+                    .feed(if authority.value {
+                        b"\x1b[?1h"
+                    } else {
+                        b"\x1b[?1l"
+                    });
             }
-            None => shared
+        } else {
+            shared
                 .application_cursor_keys
                 .lock()
                 .expect("application cursor mode")
-                .set_unknown(),
+                .set_unknown();
         }
-        if let Ok(stat) = client.stat() {
+        if let Some(stat) = client_stat {
             shared.child_pid.store(stat.child_pid, Ordering::SeqCst);
         }
 
@@ -1052,7 +1140,16 @@ impl Session {
             let manifest_id = spec.manifest_id.clone();
             std::thread::Builder::new()
                 .name(format!("diri-session-{}", spec.id))
-                .spawn(move || pump_held(shared, engine, client, exit_marker_floor, manifest_id))?
+                .spawn(move || {
+                    pump_held(
+                        shared,
+                        engine,
+                        client,
+                        exit_marker_floor,
+                        cursor_authority,
+                        manifest_id,
+                    )
+                })?
         };
 
         Ok(Self {
@@ -2739,10 +2836,11 @@ fn pump_held(
     engine: Arc<ManifestEngine>,
     client: HolderClient,
     exit_marker_floor: u64,
+    cursor_authority: Option<HolderCursorModeAuthority>,
     manifest_id: String,
 ) {
     let replay_budget = replay_budget();
-    let (checkpoint_path, mut offset, mut watcher, mut marker_buffer) = {
+    let (checkpoint_path, mut offset, mut watcher, mut marker_buffer, mode_replay_from) = {
         let mut log = shared.log.lock().expect("log");
         log.refresh_from_disk();
         let checkpoint_path = crate::checkpoint::ScreenCheckpoint::path_for_log(log.path());
@@ -2771,16 +2869,32 @@ fn pump_held(
             });
         match restored {
             Some(checkpoint) => {
-                shared
-                    .application_cursor_keys
-                    .lock()
-                    .expect("application cursor mode")
-                    .set_known(checkpoint.application_cursor_keys);
+                let mode_replay_from = if let Some(authority) = cursor_authority {
+                    bind_holder_cursor_authority(
+                        &mut shared
+                            .application_cursor_keys
+                            .lock()
+                            .expect("application cursor mode"),
+                        authority,
+                        oldest_available,
+                    )
+                } else {
+                    bind_checkpoint_cursor_authority(
+                        &mut shared
+                            .application_cursor_keys
+                            .lock()
+                            .expect("application cursor mode"),
+                        checkpoint.application_cursor_keys,
+                        checkpoint.log_offset,
+                        oldest_available,
+                    )
+                };
                 (
                     checkpoint_path,
                     checkpoint.log_offset,
                     watcher,
                     checkpoint.marker_buffer,
+                    mode_replay_from,
                 )
             }
             // A checkpoint miss is a correctness migration, not the normal
@@ -2794,17 +2908,27 @@ fn pump_held(
                     .application_cursor_keys
                     .lock()
                     .expect("application cursor mode");
-                seed_default_application_cursor_from_complete_prefix(
-                    &mut application_cursor_keys,
-                    oldest_available,
-                    exit_marker_floor,
-                    true,
-                );
+                let mode_replay_from = if let Some(authority) = cursor_authority {
+                    bind_holder_cursor_authority(
+                        &mut application_cursor_keys,
+                        authority,
+                        oldest_available,
+                    )
+                } else {
+                    seed_default_application_cursor_from_complete_prefix(
+                        &mut application_cursor_keys,
+                        oldest_available,
+                        exit_marker_floor,
+                        true,
+                    );
+                    oldest_available.max(exit_marker_floor)
+                };
                 (
                     checkpoint_path,
                     oldest_available.max(exit_marker_floor),
                     watcher,
                     Vec::new(),
+                    mode_replay_from,
                 )
             }
         }
@@ -2916,6 +3040,17 @@ fn pump_held(
             continue;
         }
 
+        let mode_start = mode_replay_from
+            .saturating_sub(start)
+            .min(chunk.len() as u64) as usize;
+        if mode_start < chunk.len() {
+            shared
+                .application_cursor_keys
+                .lock()
+                .expect("application cursor mode")
+                .feed(&chunk[mode_start..]);
+        }
+
         // A rotation can move the readable floor past us; resynchronize.
         if start > offset && !marker_buffer.is_empty() {
             marker_buffer.clear();
@@ -2948,11 +3083,6 @@ fn pump_held(
 
         if !output.is_empty() {
             checkpoint_dirty_at = Some(Instant::now());
-            shared
-                .application_cursor_keys
-                .lock()
-                .expect("application cursor mode")
-                .feed(&output);
             let observation = {
                 let mut screen = shared.screen.lock().expect("screen");
                 screen.feed(&output);
@@ -3343,7 +3473,8 @@ mod prompt_title_tests {
 #[cfg(test)]
 mod remote_mode_tests {
     use super::{
-        ApplicationCursorModeTracker, HeadlessScreen, LOG_READ_BUDGET, OutputLog,
+        ApplicationCursorModeTracker, HeadlessScreen, HolderCursorModeAuthority, LOG_READ_BUDGET,
+        OutputLog, bind_checkpoint_cursor_authority, bind_holder_cursor_authority,
         hydrate_screen_from_log, resolve_remote_application_cursor_keys,
         seed_default_application_cursor_from_complete_prefix,
     };
@@ -3367,6 +3498,39 @@ mod remote_mode_tests {
             resolve_remote_application_cursor_keys(Some(false), Some(true)),
             Some(false)
         );
+    }
+
+    #[test]
+    fn holder_stat_authority_applies_only_to_output_after_its_bound_tail() {
+        let mut mode = ApplicationCursorModeTracker::unknown();
+        let replay_from = bind_holder_cursor_authority(
+            &mut mode,
+            HolderCursorModeAuthority {
+                value: true,
+                log_offset: 100,
+            },
+            50,
+        );
+        assert_eq!(replay_from, 100);
+        assert_eq!(mode.value(), Some(true));
+        mode.feed(b"\x1b[?1l");
+        assert_eq!(mode.value(), Some(false));
+    }
+
+    #[test]
+    fn checkpoint_mode_is_suppressed_when_rotation_passed_its_bound() {
+        let mut mode = ApplicationCursorModeTracker::unknown();
+        assert_eq!(
+            bind_checkpoint_cursor_authority(&mut mode, false, 100, 101),
+            101
+        );
+        assert_eq!(mode.value(), None);
+
+        assert_eq!(
+            bind_checkpoint_cursor_authority(&mut mode, true, 200, 150),
+            200
+        );
+        assert_eq!(mode.value(), Some(true));
     }
 
     #[test]
@@ -3411,31 +3575,58 @@ mod remote_mode_tests {
         let mut writer =
             OutputLog::open(root.path(), "local", 4 << 20, 8 << 20, false).expect("writer");
         writer.append(b"\x1b[?1h").expect("old transition");
+        let stale_stat_offset = writer.tail_offset();
+        writer
+            .append(b"\x1b[?1l")
+            .expect("toggle after the sampled stat");
         writer
             .append(&vec![b'x'; (8 << 20) + (64 << 10)])
-            .expect("rotate past transition");
+            .expect("rotate past stat and later transition");
         writer.flush().expect("flush");
         let tail = writer.tail_offset();
         drop(writer);
 
         let mut retained = OutputLog::reader(root.path(), "local").expect("reader");
-        let mut mode = ApplicationCursorModeTracker::unknown();
         retained.refresh_from_disk();
         let oldest = retained.oldest_available_offset();
         assert!(oldest > 0, "fixture rotated");
-        seed_default_application_cursor_from_complete_prefix(&mut mode, oldest, 0, true);
+        assert!(oldest > stale_stat_offset, "stat/replay interval rotated");
+        let mut legacy_mode = ApplicationCursorModeTracker::unknown();
+        seed_default_application_cursor_from_complete_prefix(&mut legacy_mode, oldest, 0, true);
         let mut offset = oldest;
         while offset < tail {
             let (start, bytes) = retained.read(offset, LOG_READ_BUDGET);
             assert!(!bytes.is_empty(), "retained suffix remains readable");
-            mode.feed(&bytes);
+            legacy_mode.feed(&bytes);
+            offset = start.saturating_add(bytes.len() as u64);
+        }
+        assert_eq!(legacy_mode.value(), None);
+
+        let mut retained = OutputLog::reader(root.path(), "local").expect("second reader");
+        let mut stale_stat_mode = ApplicationCursorModeTracker::unknown();
+        assert_eq!(
+            bind_holder_cursor_authority(
+                &mut stale_stat_mode,
+                HolderCursorModeAuthority {
+                    value: true,
+                    log_offset: stale_stat_offset,
+                },
+                oldest,
+            ),
+            oldest
+        );
+        let mut offset = oldest;
+        while offset < tail {
+            let (start, bytes) = retained.read(offset, LOG_READ_BUDGET);
+            assert!(!bytes.is_empty(), "retained suffix remains readable");
+            stale_stat_mode.feed(&bytes);
             offset = start.saturating_add(bytes.len() as u64);
         }
         assert_eq!(
             offset, tail,
             "the local migration inspects the whole retained suffix"
         );
-        assert_eq!(mode.value(), None);
+        assert_eq!(stale_stat_mode.value(), None);
     }
 }
 

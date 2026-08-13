@@ -365,13 +365,16 @@ fn bracketed_paste_after_attachment_state(current: bool, state: AttachmentState)
     }
 }
 
-/// Falling back to CSI arrows is the terminal default and prevents a dead
-/// attachment generation from leaking DECCKM into a replacement child.
-fn application_cursor_after_attachment_state(current: bool, state: AttachmentState) -> bool {
+/// Unknown prevents a dead attachment generation from leaking DECCKM into a
+/// replacement child without making the rest of the terminal unusable.
+fn application_cursor_after_attachment_state(
+    current: Option<bool>,
+    state: AttachmentState,
+) -> Option<bool> {
     if state == AttachmentState::Live {
         current
     } else {
-        false
+        None
     }
 }
 
@@ -379,11 +382,29 @@ fn terminal_paste(text: &str, bracketed_paste: bool) -> Vec<u8> {
     paste(text, bracketed_paste)
 }
 
-fn terminal_input_modes(application_cursor_keys: bool) -> TermInputModes {
+fn terminal_input_modes(application_cursor_keys: Option<bool>) -> TermInputModes {
     TermInputModes {
-        application_cursor_keys,
+        application_cursor_keys: application_cursor_keys.unwrap_or(false),
         ..TermInputModes::default()
     }
+}
+
+/// Only plain arrows change wire form under DECCKM. Modified arrows have an
+/// unambiguous CSI `1;modifier` encoding, while Home/End and every other key
+/// are independent in diri-term's encoder.
+fn key_requires_application_cursor_mode(event: &TermKeyEvent, modifiers: TermModifiers) -> bool {
+    !modifiers.shift
+        && !modifiers.ctrl
+        && !modifiers.alt
+        && matches!(
+            event.key,
+            TermKey::Named(
+                NamedKey::ArrowUp
+                    | NamedKey::ArrowDown
+                    | NamedKey::ArrowRight
+                    | NamedKey::ArrowLeft
+            )
+        )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -664,9 +685,9 @@ struct ResidentTerminal {
     /// Last mode advertised by this attachment generation. Reset while the
     /// transport is not live so paste never trusts state from a dead child.
     bracketed_paste: bool,
-    /// Last DECCKM state advertised by this attachment generation. Reset
-    /// while disconnected so replacement sessions start from CSI arrows.
-    application_cursor_keys: bool,
+    /// Last DECCKM state advertised by this attachment generation. `None`
+    /// is an explicit degraded state: ordinary keys work, plain arrows wait.
+    application_cursor_keys: Option<bool>,
     find: Option<TerminalFindModel>,
     /// The editable text behind `find`'s query, so ⌘F gets the same caret,
     /// selection, and readline keys as the other query fields.
@@ -984,7 +1005,7 @@ impl TerminalPane {
                     attachment_generation: generation,
                     attachment_state: AttachmentState::Attaching,
                     bracketed_paste: false,
-                    application_cursor_keys: false,
+                    application_cursor_keys: None,
                     find: None,
                     find_query: QueryEditor::default(),
                     last_size: (0, 0),
@@ -2046,6 +2067,15 @@ impl TerminalPane {
             alt: event.keystroke.modifiers.alt,
             cmd: event.keystroke.modifiers.platform,
         };
+        if resident.application_cursor_keys.is_none()
+            && key_requires_application_cursor_mode(&term_event, modifiers)
+        {
+            // Do not guess CSI versus SS3. The attachment is otherwise Live,
+            // so text, paste, Enter, modified arrows, and lifecycle controls
+            // continue to work while a legacy session is degraded.
+            cx.stop_propagation();
+            return;
+        }
         let bytes = encode_key(
             &term_event,
             modifiers,
@@ -3972,7 +4002,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn attachment_rejects_input_and_withholds_live_until_the_modes_seed() {
+    async fn unknown_legacy_mode_becomes_degraded_live_and_accepts_ordinary_input() {
         use diri_proto::frames::{Frame, FrameCodec, FrameType};
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         use tokio::net::UnixListener;
@@ -4002,8 +4032,9 @@ mod tests {
             pre_seed_tx.send(rejected).expect("pre-seed result");
 
             release_rx.await.expect("release modes");
-            let modes = Frame::modes_with_bracketed_paste(true, true, MouseModes::OFF)
-                .with_application_cursor_keys(true);
+            // No bit-7 provenance marker: this is the explicit unknown seed
+            // sent for quiet rotated legacy sessions.
+            let modes = Frame::modes_with_bracketed_paste(true, true, MouseModes::OFF);
             stream
                 .write_all(&FrameCodec::encode(&modes).expect("encode modes"))
                 .await
@@ -4052,7 +4083,15 @@ mod tests {
             assert!(pane_rx.recv_batch(&mut batch).await);
             for event in &batch {
                 match event {
-                    PaneEvent::Chunk(_, _, TerminalChunk::Modes { .. }) => {
+                    PaneEvent::Chunk(
+                        _,
+                        _,
+                        TerminalChunk::Modes {
+                            application_cursor_keys,
+                            ..
+                        },
+                    ) => {
+                        assert_eq!(*application_cursor_keys, None);
                         saw_modes = true;
                         control.modes_applied();
                     }
@@ -4822,7 +4861,7 @@ mod tests {
             TerminalChunk::Modes {
                 alt_screen: false,
                 bracketed_paste: true,
-                application_cursor_keys: true,
+                application_cursor_keys: Some(true),
                 mouse: MouseModes::OFF,
             },
         );
@@ -4887,7 +4926,7 @@ mod tests {
                 "a detached attachment leaked bracketed paste into the new generation"
             );
             assert!(
-                !resident.application_cursor_keys,
+                resident.application_cursor_keys.is_none(),
                 "a detached attachment leaked DECCKM into the new generation"
             );
         });
@@ -4992,7 +5031,7 @@ mod tests {
             encode_key(
                 &mapped,
                 TermModifiers::default(),
-                terminal_input_modes(true)
+                terminal_input_modes(Some(true))
             ),
             b"\x1bOA",
             "DECCKM changes an unmodified arrow to its SS3 form"
@@ -5026,17 +5065,42 @@ mod tests {
 
     #[test]
     fn reattachment_drops_stale_application_cursor_mode_until_fresh_modes_arrive() {
-        assert!(application_cursor_after_attachment_state(
-            true,
-            AttachmentState::Live
+        assert_eq!(
+            application_cursor_after_attachment_state(Some(true), AttachmentState::Live),
+            Some(true)
+        );
+        assert_eq!(
+            application_cursor_after_attachment_state(Some(true), AttachmentState::Reconnecting),
+            None
+        );
+        assert_eq!(
+            application_cursor_after_attachment_state(Some(true), AttachmentState::Attaching),
+            None
+        );
+    }
+
+    #[test]
+    fn unknown_cursor_mode_gates_only_plain_arrows() {
+        let plain = TermModifiers::default();
+        let shifted = TermModifiers {
+            shift: true,
+            ..TermModifiers::default()
+        };
+        assert!(key_requires_application_cursor_mode(
+            &TermKeyEvent::named(NamedKey::ArrowUp),
+            plain
         ));
-        assert!(!application_cursor_after_attachment_state(
-            true,
-            AttachmentState::Reconnecting
+        assert!(!key_requires_application_cursor_mode(
+            &TermKeyEvent::named(NamedKey::ArrowUp),
+            shifted
         ));
-        assert!(!application_cursor_after_attachment_state(
-            true,
-            AttachmentState::Attaching
+        assert!(!key_requires_application_cursor_mode(
+            &TermKeyEvent::named(NamedKey::Home),
+            plain
+        ));
+        assert!(!key_requires_application_cursor_mode(
+            &TermKeyEvent::character("x"),
+            plain
         ));
     }
 

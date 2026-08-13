@@ -36,7 +36,10 @@ pub enum TerminalChunk {
     Modes {
         alt_screen: bool,
         bracketed_paste: bool,
-        application_cursor_keys: bool,
+        /// `None` is a legacy/rotated session whose DECCKM state is not yet
+        /// authoritative. Ordinary input remains usable; the UI withholds
+        /// only unmodified cursor arrows until a later Modes update resolves it.
+        application_cursor_keys: Option<bool>,
         mouse: MouseModes,
     },
     Pong,
@@ -327,7 +330,7 @@ async fn process_incoming(
         }
         FrameType::Modes => {
             let (alt_screen, bracketed_paste, mouse) = frame.terminal_modes_payload().ok_or(())?;
-            let application_cursor_keys = frame.application_cursor_keys_payload().ok_or(())?;
+            let application_cursor_keys = frame.application_cursor_keys_state_payload().ok_or(())?;
             chunks
                 .send(TerminalChunk::Modes {
                     alt_screen,
@@ -397,7 +400,7 @@ mod tests {
             Some(TerminalChunk::Modes {
                 alt_screen: true,
                 bracketed_paste: true,
-                application_cursor_keys: false,
+                application_cursor_keys: None,
                 mouse,
             })
         );
@@ -499,7 +502,7 @@ mod tests {
             Some(TerminalChunk::Modes {
                 alt_screen: true,
                 bracketed_paste: false,
-                application_cursor_keys: true,
+                application_cursor_keys: Some(true),
                 mouse,
             })
         );
