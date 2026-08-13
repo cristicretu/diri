@@ -1,8 +1,9 @@
 //! The client-side view of the daemon's manifest/readiness catalog.
 //!
 //! Launch surfaces consume this module instead of each rebuilding a partial
-//! four-agent list. It also centralizes unavailable/setup language so the
-//! launcher, sidebar, Settings, and command palette tell the same story.
+//! four-agent list. Quick-create surfaces only ever see installed Agents;
+//! Settings is the one place that lists an unavailable Agent, and it renders
+//! its own setup copy from the readiness item.
 
 use diri_proto::{AgentKind, AgentReadinessItem, AgentReadinessResult};
 
@@ -15,23 +16,6 @@ pub(crate) struct AgentOption {
     pub show_in_quick_create: bool,
     pub first_class: bool,
     pub setup_url: Option<String>,
-    pub install_hint: String,
-    pub sign_in_hint: Option<String>,
-}
-
-impl AgentOption {
-    pub(crate) fn unavailable_label(&self) -> Option<String> {
-        (!self.available).then(|| missing_binary_label(&self.binary))
-    }
-
-    pub(crate) fn unavailable_detail(&self) -> Option<String> {
-        let mut detail = format!("{} · {}", self.unavailable_label()?, self.install_hint);
-        if let Some(sign_in_hint) = &self.sign_in_hint {
-            detail.push_str(" · ");
-            detail.push_str(sign_in_hint);
-        }
-        Some(detail)
-    }
 }
 
 /// Complete supported-Agent rows in the order supplied by Settings readiness.
@@ -79,8 +63,6 @@ pub(crate) fn default_agent_options(catalog: &AgentReadinessResult) -> Vec<Agent
             show_in_quick_create: true,
             first_class: false,
             setup_url: None,
-            install_hint: "Uses your login shell.".to_owned(),
-            sign_in_hint: None,
         });
     }
     options
@@ -179,6 +161,12 @@ pub(crate) fn resolved_target_agent(
 }
 
 pub(crate) fn display_name(kind: &AgentKind, catalog: &AgentReadinessResult) -> String {
+    // `agent_options` deliberately drops terminal kinds, so without this the
+    // shell falls through to `title_case_id` and surfaces as "Shell" — a name
+    // no other launch surface uses for it.
+    if kind.is_terminal() {
+        return "Terminal".to_owned();
+    }
     agent_options(catalog)
         .into_iter()
         .find(|option| option.kind == *kind)
@@ -226,10 +214,6 @@ pub(crate) fn normal_web_url(url: &str) -> Option<String> {
     .then(|| url.to_owned())
 }
 
-pub(crate) fn missing_binary_label(binary: &str) -> String {
-    format!("Missing {binary}")
-}
-
 fn option_from_readiness(item: &AgentReadinessItem) -> AgentOption {
     let descriptor = item.descriptor.as_ref();
     let setup = descriptor.and_then(|descriptor| descriptor.setup.as_ref());
@@ -238,12 +222,6 @@ fn option_from_readiness(item: &AgentReadinessItem) -> AgentOption {
         .filter(|name| !name.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(|| title_case_id(item.kind.id()));
-    let install_hint = setup
-        .and_then(|setup| setup.install_hint.as_deref())
-        .map(str::trim)
-        .filter(|hint| !hint.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("Install {} and add it to PATH.", item.binary));
     AgentOption {
         kind: item.kind.clone(),
         display_name,
@@ -254,12 +232,6 @@ fn option_from_readiness(item: &AgentReadinessItem) -> AgentOption {
         setup_url: setup
             .and_then(|setup| setup.url.as_deref())
             .and_then(normal_web_url),
-        install_hint,
-        sign_in_hint: setup
-            .and_then(|setup| setup.sign_in_hint.as_deref())
-            .map(str::trim)
-            .filter(|hint| !hint.is_empty())
-            .map(str::to_owned),
     }
 }
 
@@ -272,8 +244,6 @@ fn terminal_option() -> AgentOption {
         show_in_quick_create: true,
         first_class: false,
         setup_url: None,
-        install_hint: "Uses your login shell.".to_owned(),
-        sign_in_hint: None,
     }
 }
 
@@ -312,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_guidance_and_web_url_validation_are_shared() {
+    fn setup_urls_are_carried_through_and_web_url_validation_is_shared() {
         let mut unavailable = item("amp", false, false);
         unavailable.descriptor.as_mut().unwrap().setup = Some(AgentSetup {
             url: Some("https://ampcode.com/manual".into()),
@@ -323,15 +293,6 @@ mod tests {
             agents: vec![unavailable],
             ..AgentReadinessResult::default()
         });
-        assert_eq!(
-            options[0].unavailable_label().as_deref(),
-            Some("Missing amp-bin")
-        );
-        assert_eq!(options[0].install_hint, "Install Amp's CLI.");
-        assert_eq!(
-            options[0].unavailable_detail().as_deref(),
-            Some("Missing amp-bin · Install Amp's CLI. · Sign in at ampcode.com, then run amp.")
-        );
         assert_eq!(
             options[0].setup_url.as_deref(),
             Some("https://ampcode.com/manual")
@@ -486,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn old_daemon_entries_without_descriptors_keep_useful_availability_copy() {
+    fn entries_without_descriptors_are_still_named_and_marked_unavailable() {
         let catalog = AgentReadinessResult {
             agents: vec![AgentReadinessItem {
                 kind: AgentKind::CODEX,
@@ -499,11 +460,7 @@ mod tests {
         };
         let options = agent_options(&catalog);
         assert_eq!(options[0].display_name, "Codex");
-        assert_eq!(
-            options[0].unavailable_label().as_deref(),
-            Some("Missing codex")
-        );
-        assert_eq!(options[0].install_hint, "Install codex and add it to PATH.");
+        assert!(!options[0].available);
         assert_eq!(options[0].setup_url, None);
     }
 }

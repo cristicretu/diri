@@ -11,7 +11,7 @@ use diri_proto::{AgentKind, AgentReadinessResult, HostEntry, Project, SessionRec
 
 use crate::agent_catalog::{
     AgentOption, display_name, quick_agent_options, resolved_default_agent, resolved_target_agent,
-    system_image,
+    system_image, title_case_id,
 };
 use crate::commands::{self, CommandId};
 use crate::fuzzy::{FuzzyMatcher, FuzzyQuery, PreparedText, Score};
@@ -28,9 +28,6 @@ pub enum PaletteCommand {
         /// host's defaultCwd unless overridden).
         host: Option<String>,
     },
-    /// An unavailable local Agent row. A verified HTTP(S) setup URL is opened
-    /// on activation; without one the containing action is disabled.
-    UnavailableAgent { setup_url: Option<String> },
     /// `session.migrate` the SELECTED session; None = back to local.
     MigrateSelected { target_host: Option<String> },
     /// `host.sync_prefs` to one configured host.
@@ -82,11 +79,13 @@ pub fn actions_for_catalogs(
     let default_catalog = catalog(default_host_id);
     let target_default = resolved_target_agent(&default_agent, default_catalog);
     let default_agents = quick_agent_options(default_catalog);
+    let mut default_is_listed = false;
     for agent in default_agents {
         if agent.kind == AgentKind::SHELL {
             continue;
         }
         let is_default = agent.kind == target_default;
+        default_is_listed |= is_default;
         result.push(new_dynamic_agent_action(
             agent.kind,
             agent.display_name,
@@ -99,8 +98,41 @@ pub fn actions_for_catalogs(
         || "New Terminal".to_owned(),
         |host| format!("New Terminal on {}", host.display_name()),
     );
-    if target_default == AgentKind::SHELL {
-        result.push(default_action(terminal_title.clone(), "terminal"));
+    // ⌘T needs exactly one row, and it must describe what ⌘T will actually do.
+    // The quick-create loop above carries the badge whenever it lists the
+    // resolved Agent; it cannot when that Agent is hidden from quick create,
+    // when resolution lands on Terminal, or when this target has no readiness
+    // facts at all. In that last case the shortcut still belongs to the saved
+    // preference — it resolves against real facts, or opens the launcher, at
+    // press time — so labelling the row "Terminal" would promise a session the
+    // user never chose.
+    if !default_is_listed {
+        let pending = default_catalog.is_none();
+        let kind = if pending {
+            default_agent.clone()
+        } else {
+            target_default.clone()
+        };
+        if kind.is_terminal() {
+            result.push(default_action(
+                terminal_title.clone(),
+                "terminal",
+                "shell console zsh bash tty default",
+            ));
+        } else {
+            let name = default_catalog.map_or_else(
+                || title_case_id(kind.id()),
+                |catalog| display_name(&kind, catalog),
+            );
+            result.push(default_action(
+                default_host.map_or_else(
+                    || format!("New {name} Session"),
+                    |host| format!("New {name} on {}", host.display_name()),
+                ),
+                system_image(&kind),
+                &format!("{} agent spawn start create default", kind.id()),
+            ));
+        }
     }
     result.extend([
         registered_action_with_title(CommandId::NewTerminal, terminal_title),
@@ -264,9 +296,25 @@ pub fn actions_for_default_host(
     let options = quick_agent_options(Some(catalog));
     let mut result = Vec::new();
     if default_agent == AgentKind::SHELL {
-        result.push(default_action("New Terminal".into(), "terminal"));
+        result.push(default_action(
+            "New Terminal".into(),
+            "terminal",
+            "shell console zsh bash tty default",
+        ));
     } else if let Some(option) = options.iter().find(|option| option.kind == default_agent) {
         result.push(new_agent_action(option, true, default_host));
+    } else {
+        // Installed, so still what ⌘T launches, but hidden from quick create —
+        // menu visibility must not leave the shortcut without a row.
+        let name = display_name(&default_agent, catalog);
+        result.push(default_action(
+            default_host.map_or_else(
+                || format!("New {name} Session"),
+                |host| format!("New {name} on {}", host.display_name()),
+            ),
+            system_image(&default_agent),
+            &format!("{} agent spawn start create default", default_agent.id()),
+        ));
     }
     result.extend(
         options
@@ -412,7 +460,7 @@ fn registered_action_with_title(id: CommandId, title: String) -> PaletteAction {
     }
 }
 
-fn default_action(title: String, system_image: &'static str) -> PaletteAction {
+fn default_action(title: String, system_image: &'static str, keywords: &str) -> PaletteAction {
     let command = commands::command(CommandId::NewDefaultSession);
     PaletteAction {
         id: command.stable_id.into(),
@@ -422,16 +470,18 @@ fn default_action(title: String, system_image: &'static str) -> PaletteAction {
         detail: None,
         enabled: true,
         command: PaletteCommand::Action(CommandId::NewDefaultSession),
-        keywords: "shell console zsh bash tty default".into(),
+        keywords: keywords.into(),
     }
 }
 
+/// Builds a row for an Agent the target's readiness reports as installed.
+/// Callers pass `quick_agent_options` output, so unavailable Agents never reach
+/// here — Settings is the one surface that lists them, with their setup links.
 fn new_agent_action(
     option: &AgentOption,
     is_default: bool,
     host: Option<&HostEntry>,
 ) -> PaletteAction {
-    let available = host.is_some() || option.available;
     let registered = is_default.then_some(CommandId::NewDefaultSession);
     PaletteAction {
         id: if is_default {
@@ -444,28 +494,21 @@ fn new_agent_action(
             |host| format!("New {} on {}", option.display_name, host.display_name()),
         ),
         system_image: system_image(&option.kind),
-        shortcut: available.then_some(()).and_then(|()| {
-            registered
-                .or((option.kind == AgentKind::CODEX).then_some(CommandId::NewCodexSession))
-                .and_then(|id| commands::command(id).shortcut)
-        }),
-        detail: (!available).then(|| option.unavailable_detail()).flatten(),
-        enabled: available || option.setup_url.is_some(),
-        command: if !available {
-            PaletteCommand::UnavailableAgent {
-                setup_url: option.setup_url.clone(),
-            }
-        } else if let Some(id) = registered {
-            PaletteCommand::Action(id)
-        } else {
-            PaletteCommand::SpawnAgent {
+        shortcut: registered
+            .or((option.kind == AgentKind::CODEX).then_some(CommandId::NewCodexSession))
+            .and_then(|id| commands::command(id).shortcut),
+        detail: None,
+        enabled: true,
+        command: registered.map_or_else(
+            || PaletteCommand::SpawnAgent {
                 agent: option.kind.clone(),
                 cwd: None,
                 host: host.map(|host| host.id.clone()),
-            }
-        },
+            },
+            PaletteCommand::Action,
+        ),
         keywords: format!(
-            "{} {} agent spawn start create tab setup install",
+            "{} {} agent spawn start create tab",
             option.kind.id(),
             option.binary
         ),
@@ -800,7 +843,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unscanned_default_target_exposes_terminal_as_the_safe_default() {
+    fn an_unscanned_default_target_keeps_the_shortcut_on_the_saved_preference() {
         let host = HostEntry {
             id: "forge".into(),
             name: Some("Forge".into()),
@@ -809,7 +852,7 @@ mod tests {
             node: None,
         };
         let actions = actions_for_catalogs(
-            AgentKind::new("unavailable-agent"),
+            AgentKind::new("saved-agent"),
             &[],
             std::slice::from_ref(&host),
             None,
@@ -817,21 +860,49 @@ mod tests {
             &HashMap::new(),
         );
 
+        // Forge has never been scanned, so no Agent may be advertised as
+        // launchable there. ⌘T still belongs to the saved preference — it
+        // resolves against real facts, or opens the launcher, at press time —
+        // so the row must name it rather than promise an unrequested Terminal.
         let default = actions
             .iter()
             .find(|action| action.id == "new-default")
-            .expect("safe default action");
-        assert_eq!(default.title, "New Terminal on Forge");
+            .expect("default action");
+        assert_eq!(default.title, "New Saved Agent on Forge");
         assert_eq!(default.shortcut, Some("⌘T"));
         assert_eq!(
             default.command,
             PaletteCommand::Action(CommandId::NewDefaultSession)
         );
         assert!(
-            !actions
-                .iter()
-                .any(|action| action.id.contains("unavailable-agent"))
+            !actions.iter().any(|action| matches!(
+                &action.command,
+                PaletteCommand::SpawnAgent { agent, .. } if !agent.is_terminal()
+            )),
+            "an unscanned target must not advertise a direct Agent spawn"
         );
+    }
+
+    #[test]
+    fn a_default_hidden_from_quick_create_still_owns_the_shortcut() {
+        // Installed, so ⌘T launches it, but toggled out of the quick-create
+        // menus in Settings. Menu visibility must not leave the shortcut
+        // without any row to sit on.
+        let mut hidden = catalog_item("codex", "Codex", true, None, None);
+        hidden.show_in_quick_create = false;
+        let catalog = AgentReadinessResult {
+            agents: vec![hidden, catalog_item("amp", "Amp", true, None, None)],
+            ..AgentReadinessResult::default()
+        };
+
+        let actions = actions(AgentKind::CODEX, &catalog, &[], &[], None);
+
+        let default = actions
+            .iter()
+            .find(|action| action.id == "new-default")
+            .expect("default action");
+        assert_eq!(default.title, "New Codex Session");
+        assert_eq!(default.shortcut, Some("⌘T"));
     }
 
     #[test]

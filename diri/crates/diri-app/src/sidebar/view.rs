@@ -514,13 +514,19 @@ impl Sidebar {
             let store = self.store.read().expect("session store lock poisoned");
             let host = store.default_spawn_host();
             let catalog = store.agent_catalog(host.as_deref());
-            let kind = crate::agent_catalog::resolved_target_agent(
-                &store.preferences().default_agent,
-                catalog,
-            );
+            // Without readiness facts the row names the saved preference: that
+            // is what this control will attempt, and resolution happens against
+            // real facts at press time. Naming Terminal here would advertise a
+            // session the user never chose.
             let agent = catalog.map_or_else(
-                || "Terminal".to_owned(),
-                |catalog| crate::agent_catalog::display_name(&kind, catalog),
+                || crate::agent_catalog::title_case_id(store.preferences().default_agent.id()),
+                |catalog| {
+                    let kind = crate::agent_catalog::resolved_target_agent(
+                        &store.preferences().default_agent,
+                        Some(catalog),
+                    );
+                    crate::agent_catalog::display_name(&kind, catalog)
+                },
             );
             let location =
                 host.map_or_else(|| "This Mac".to_owned(), |id| store.host_display_name(&id));

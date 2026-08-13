@@ -13,6 +13,7 @@
       "cursor-agent"
     ],
     "firstClass": true,
+    "catalogOrder": 40,
     "setup": {
       "url": "https://docs.cursor.com/en/cli/installation",
       "installHint": "Follow Cursor's CLI installation guide.",

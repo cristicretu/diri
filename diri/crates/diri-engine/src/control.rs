@@ -3827,18 +3827,24 @@ mod tests {
         let server = server(temp.path());
         let result = ok_of(call(&server, "agent.readiness", None));
         let agents = result["agents"].as_array().expect("agents");
-        assert!(
-            agents.len() >= 20,
-            "readiness must expose the complete supported CLI catalog"
-        );
+        // Readiness is the whole supported catalog, not just what happens to be
+        // installed. Naming manifests keeps that honest when one is retired; a
+        // count threshold would only ever be quietly loosened.
+        for id in ["claude-code", "codex", "cursor", "gemini", "amp", "pi"] {
+            assert!(
+                agents.iter().any(|agent| agent["kind"] == id),
+                "readiness must expose the supported Agent {id}"
+            );
+        }
         assert_eq!(
             agents
                 .iter()
-                .take(3)
+                .take(5)
                 .filter_map(|agent| agent["kind"].as_str())
                 .collect::<Vec<_>>(),
-            ["claude-code", "codex", "antigravity"],
-            "the manifest-owned default catalog order must place Antigravity after Claude Code and Codex"
+            ["claude-code", "codex", "antigravity", "cursor", "gemini"],
+            "every first-class Agent needs an explicit catalogOrder, or it falls \
+             into the alphabetical tail behind Agents most users never install"
         );
         let claude = agents
             .iter()

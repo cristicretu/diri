@@ -797,8 +797,7 @@ impl RootView {
         store.spawn_default(SpawnOptions {
             host,
             ..SpawnOptions::default()
-        });
-        true
+        })
     }
 
     fn open_auxiliary_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {

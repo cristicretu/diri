@@ -1,4 +1,6 @@
 use std::cmp::Ordering;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -94,6 +96,10 @@ pub struct NavigationOverlay {
     directory_index: DirectoryIndex,
     quick_snapshot: QuickOpenSnapshot,
     ranked_items: Vec<RankedFolder>,
+    /// Identity of the readiness facts `ranked_actions` was built from, so a
+    /// store change that cannot have altered the Agent rows does not rebuild
+    /// them. See `agent_actions_fingerprint`.
+    agent_actions_fingerprint: u64,
     scroll_handle: ScrollHandle,
     /// Separate slots: the disk-cache load and the filesystem scan both start
     /// at launch, and neither may cancel the other by sharing a `Task` slot.
@@ -139,6 +145,7 @@ impl NavigationOverlay {
             directory_index: DirectoryIndex::default(),
             quick_snapshot: QuickOpenSnapshot::default(),
             ranked_items: Vec::new(),
+            agent_actions_fingerprint: 0,
             scroll_handle: ScrollHandle::new(),
             cache_task: None,
             scan_task: None,
@@ -168,6 +175,7 @@ impl NavigationOverlay {
             directory_index: DirectoryIndex::default(),
             quick_snapshot: QuickOpenSnapshot::default(),
             ranked_items: Vec::new(),
+            agent_actions_fingerprint: 0,
             scroll_handle: ScrollHandle::new(),
             cache_task: None,
             scan_task: None,
@@ -180,11 +188,55 @@ impl NavigationOverlay {
         self.overlay.is_some()
     }
 
+    /// Store changes broadcast on the UI publish tick, so an open palette gets
+    /// one of these several times a second while any session is producing
+    /// output. Rebuilding on each would take a write lock, clone every project
+    /// and session record, and re-rank the whole list — reordering rows under a
+    /// highlight index that is not re-anchored. Only readiness can change the
+    /// Agent rows this handler exists for, so gate on exactly that.
     fn handle_store_change(&mut self, cx: &mut Context<Self>) {
         if self.overlay == Some(Overlay::CommandPalette) {
-            self.refresh_command_items();
+            let fingerprint = {
+                let store = self.store.read().expect("session store lock poisoned");
+                agent_actions_fingerprint(&store)
+            };
+            if fingerprint != self.agent_actions_fingerprint {
+                let highlighted = self.highlighted_command();
+                self.refresh_command_items();
+                self.restore_highlight(highlighted.as_ref());
+            }
         }
         cx.notify();
+    }
+
+    /// The row the user is on, so a rebuild can put the highlight back on it
+    /// rather than on whatever inherits its index.
+    fn highlighted_command(&self) -> Option<CommandSelection> {
+        self.ranked_actions.get(self.highlight).map_or_else(
+            || {
+                self.ranked_sessions
+                    .get(self.highlight.saturating_sub(self.ranked_actions.len()))
+                    .map(|ranked| CommandSelection::Session(ranked.item.id.clone()))
+            },
+            |action| Some(CommandSelection::Action(action.item.command.clone())),
+        )
+    }
+
+    fn restore_highlight(&mut self, previous: Option<&CommandSelection>) {
+        let found = match previous {
+            Some(CommandSelection::Action(command)) => self
+                .ranked_actions
+                .iter()
+                .position(|ranked| ranked.item.command == *command),
+            Some(CommandSelection::Session(id)) => self
+                .ranked_sessions
+                .iter()
+                .position(|ranked| ranked.item.id == *id)
+                .map(|index| index + self.ranked_actions.len()),
+            None => None,
+        };
+        let count = self.ranked_actions.len() + self.ranked_sessions.len();
+        self.highlight = found.unwrap_or(self.highlight).min(count.saturating_sub(1));
     }
 
     pub(crate) fn toggle_command_palette(
@@ -579,11 +631,6 @@ impl NavigationOverlay {
                 }
                 self.close_overlay(cx);
             }
-            PaletteCommand::UnavailableAgent { setup_url } => {
-                if let Some(url) = setup_url {
-                    cx.open_url(&url);
-                }
-            }
             PaletteCommand::MigrateSelected { target_host } => {
                 {
                     let mut store = self.store.write().expect("session store lock poisoned");
@@ -607,7 +654,7 @@ impl NavigationOverlay {
     /// to run on every keystroke — a few hundred candidates against one
     /// matcher — and never run per frame.
     fn refresh_command_items(&mut self) {
-        let (actions, sessions) = {
+        let (actions, sessions, fingerprint) = {
             let mut store = self.store.write().expect("session store lock poisoned");
             let projects: Vec<_> = store
                 .sidebar_projection()
@@ -629,8 +676,10 @@ impl NavigationOverlay {
                 default_host.as_deref(),
                 store.agent_catalogs(),
             );
-            (actions, store.ordered_sessions())
+            let fingerprint = agent_actions_fingerprint(&store);
+            (actions, store.ordered_sessions(), fingerprint)
         };
+        self.agent_actions_fingerprint = fingerprint;
         let query = FuzzyQuery::new(self.query.text());
         self.ranked_actions = palette::rank_actions(actions, &query, &mut self.matcher);
         self.ranked_sessions = palette::rank_sessions(sessions, &query, &mut self.matcher);
@@ -1239,6 +1288,27 @@ fn kind_label(kind: &AgentKind) -> String {
     }
 }
 
+/// Identity of everything the palette's Agent rows are derived from: the saved
+/// default, the target it spawns on, and each target's readiness facts. Session
+/// and project churn is deliberately excluded — it moves on every UI tick and
+/// cannot change which Agents a target can launch.
+fn agent_actions_fingerprint(store: &SessionStore) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    store.preferences().default_agent.id().hash(&mut hasher);
+    store.default_spawn_host().hash(&mut hasher);
+    let mut targets: Vec<_> = store.agent_catalogs().iter().collect();
+    targets.sort_by_key(|(target, _)| *target);
+    for (target, catalog) in targets {
+        target.hash(&mut hasher);
+        for agent in &catalog.agents {
+            agent.kind.id().hash(&mut hasher);
+            agent.available().hash(&mut hasher);
+            agent.show_in_quick_create.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
 fn relative_parent(path: &Path) -> String {
     let Some(parent) = path.parent() else {
         return String::new();
@@ -1336,9 +1406,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn open_palette_rebuilds_terminal_fallback_when_agent_readiness_arrives(
-        cx: &mut TestAppContext,
-    ) {
+    fn an_open_palette_rebuilds_its_agent_rows_when_readiness_arrives(cx: &mut TestAppContext) {
         let runtime = Arc::new(StoreRuntime::inert());
         {
             let mut store = runtime.store.write().expect("session store lock poisoned");
@@ -1358,12 +1426,30 @@ mod tests {
             overlay
         });
 
+        // Forge has not been scanned, so no Agent is advertised as launchable
+        // there — but ⌘T still belongs to the saved preference.
         assert!(overlay.read_with(cx, |overlay, _| {
             overlay.ranked_actions.iter().any(|ranked| {
-                ranked.item.title == "New Terminal on Forge"
+                ranked.item.title == "New Claude Code on Forge"
                     && ranked.item.command == PaletteCommand::Action(CommandId::NewDefaultSession)
             })
         }));
+
+        // A store change that cannot have moved readiness must not rebuild the
+        // list: these arrive on the UI tick, and re-ranking under a fixed
+        // highlight index moves rows out from under the user's selection.
+        let before = overlay.read_with(cx, |overlay, _| overlay.agent_actions_fingerprint);
+        overlay.update(cx, |overlay, cx| {
+            overlay.highlight = 1;
+            overlay.handle_store_change(cx);
+        });
+        assert_eq!(
+            overlay.read_with(cx, |overlay, _| (
+                overlay.agent_actions_fingerprint,
+                overlay.highlight
+            )),
+            (before, 1)
+        );
 
         runtime
             .store

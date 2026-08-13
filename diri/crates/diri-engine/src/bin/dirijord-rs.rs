@@ -534,6 +534,7 @@ fn load_manifests(exe_dir: &Path, app_support: &Path) -> (ManifestEngine, Vec<St
     )
 }
 
+#[cfg(unix)]
 fn load_manifests_from(
     exe_dir: &Path,
     app_support: &Path,
@@ -542,14 +543,26 @@ fn load_manifests_from(
 ) -> (ManifestEngine, Vec<String>) {
     let overrides = app_support.join("manifests/overrides");
     let sibling = exe_dir.join("manifests");
-    let base = match configured {
-        Some(configured) => configured.is_dir().then(|| configured.to_path_buf()),
-        None => sibling.is_dir().then_some(sibling).or_else(|| {
+    // A configured directory that does not exist is a misconfiguration, not an
+    // instruction to run without Agents: an empty catalog silently costs every
+    // session its status detection and leaves the client with Terminal only.
+    // Say so and continue down the normal search order.
+    let configured = configured.filter(|configured| {
+        configured.is_dir() || {
+            eprintln!(
+                "dirijord-rs: DIRI_MANIFESTS_DIR={} is not a directory; using the built-in catalog",
+                configured.display()
+            );
+            false
+        }
+    });
+    let base = configured.map(Path::to_path_buf).or_else(|| {
+        sibling.is_dir().then_some(sibling).or_else(|| {
             source_catalog
                 .is_dir()
                 .then(|| source_catalog.to_path_buf())
-        }),
-    };
+        })
+    });
 
     let mut dirs = base.iter().map(PathBuf::as_path).collect::<Vec<_>>();
     if overrides.is_dir() {
@@ -755,8 +768,34 @@ mod tests {
         let (engine, failed) = load_manifests_from(&exe_dir, &app_support, None, &source_catalog);
 
         assert!(failed.is_empty(), "manifests failed to load: {failed:?}");
-        assert!(engine.manifest("pi").is_some());
-        assert!(engine.ids().len() >= 22);
+        for id in ["claude-code", "codex", "cursor", "gemini", "pi", "shell"] {
+            assert!(
+                engine.manifest(id).is_some(),
+                "the source catalog must supply {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_configured_catalog_that_does_not_exist_falls_back_to_the_source_catalog() {
+        let temporary = tempfile::tempdir().expect("temp");
+        let exe_dir = temporary.path().join("bin");
+        let app_support = temporary.path().join("support");
+        let missing = temporary.path().join("typo-manifests");
+        let source_catalog = diri_engine::detect::bundled_manifest_dir();
+
+        let (engine, failed) = load_manifests_from(
+            &exe_dir,
+            &app_support,
+            Some(missing.as_path()),
+            &source_catalog,
+        );
+
+        assert!(failed.is_empty(), "manifests failed to load: {failed:?}");
+        assert!(
+            engine.manifest("claude-code").is_some(),
+            "a stale DIRI_MANIFESTS_DIR must not strand the daemon with an empty catalog"
+        );
     }
 
     #[test]

@@ -7,8 +7,18 @@ fn main() {
     let manifest_dir = PathBuf::from("manifests");
     println!("cargo:rerun-if-changed={}", manifest_dir.display());
 
-    let mut paths = fs::read_dir(&manifest_dir)
-        .expect("read canonical Agent catalog")
+    // A packaging that ships the crate without its catalog (vendoring, a sparse
+    // checkout) should still build; it just cannot claim a catalog identity.
+    let Ok(entries) = fs::read_dir(&manifest_dir) else {
+        println!(
+            "cargo:warning=no Agent catalog at {}; the Engine build identity will not track manifests",
+            manifest_dir.display()
+        );
+        println!("cargo:rustc-env=DIRI_AGENT_CATALOG_BUILD_ID=unknown");
+        return;
+    };
+
+    let mut paths = entries
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| {
