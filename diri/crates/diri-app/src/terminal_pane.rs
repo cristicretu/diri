@@ -2005,7 +2005,9 @@ impl TerminalPane {
         if let Some(find) = resident.find.as_mut() {
             resident.find_query.insert(&text);
             let query = resident.find_query.text().to_owned();
-            find.set_query(query, now);
+            if find.set_query(query, now) {
+                resident.element.set_find_highlights(Vec::new());
+            }
             self.schedule_find(id, Duration::from_millis(200), window, cx);
         } else {
             resident.attachment.input(paste(&text, false));
@@ -2117,7 +2119,9 @@ impl TerminalPane {
                     };
                     if changed {
                         let query = resident.find_query.text().to_owned();
-                        find.set_query(query, now);
+                        if find.set_query(query, now) {
+                            resident.element.set_find_highlights(Vec::new());
+                        }
                         self.schedule_find(id, Duration::from_millis(200), window, cx);
                     }
                 }

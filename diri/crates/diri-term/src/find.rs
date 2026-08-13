@@ -107,21 +107,27 @@ impl TerminalFindModel {
         self.is_alt_screen
     }
 
-    pub fn set_query(&mut self, query: impl Into<String>, now: Duration) {
+    /// Replaces the query and invalidates results that belong to the previous
+    /// text. Same-query output rescans deliberately bypass this path, so their
+    /// useful matches remain visible until the refreshed snapshot arrives.
+    ///
+    /// Returns whether the query actually changed.
+    pub fn set_query(&mut self, query: impl Into<String>, now: Duration) -> bool {
         let query = query.into();
         if query == self.query {
-            return;
+            return false;
         }
         self.query = query;
         self.generation = self.generation.wrapping_add(1);
         self.rescan_due = None;
+        self.matches.clear();
+        self.current_index = 0;
         if self.query.is_empty() {
-            self.matches.clear();
-            self.current_index = 0;
             self.search_due = None;
         } else {
             self.search_due = Some(now.saturating_add(SEARCH_DEBOUNCE));
         }
+        true
     }
 
     /// Coalesces a busy output stream to at most one pending 100 ms rescan.
@@ -354,6 +360,33 @@ mod tests {
                 .is_rescan
         );
         assert!(model.take_due_search(Duration::from_secs(1)).is_none());
+    }
+
+    #[test]
+    fn query_change_clears_stale_matches_but_output_rescan_retains_them() {
+        let mut viewport = ScrollbackViewport::default();
+        let live = live_buffer(&["needle", "", ""], 12);
+        let mut model = TerminalFindModel::default();
+        search(
+            &mut model,
+            "needle",
+            snapshot(Vec::new(), false),
+            &live,
+            &mut viewport,
+        );
+        assert_eq!(model.matches().len(), 1);
+
+        assert!(model.on_output(Duration::from_secs(1)));
+        assert_eq!(
+            model.matches().len(),
+            1,
+            "same-query rescan keeps useful results"
+        );
+
+        assert!(model.set_query("absent", Duration::from_secs(2)));
+        assert!(model.matches().is_empty());
+        assert_eq!(model.current_index(), 0);
+        assert!(!model.set_query("absent", Duration::from_secs(3)));
     }
 
     #[test]
