@@ -1,6 +1,6 @@
 //! Durable screen checkpoints: `<id>.screen.plist`. Version 2 remains
 //! load-compatible with the historical Swift checkpoint; version 3 preserves
-//! granular mouse state.
+//! granular mouse state and version 4 preserves application-cursor state.
 //!
 //! A checkpoint pairs an RLE-encoded full grid with the exact raw-log offset
 //! it represents, so a restarted daemon can seed the emulator from a few
@@ -11,7 +11,7 @@
 //! malformed, stale, or future-version file is ignored and the bounded
 //! raw-log replay runs instead. The on-disk format is a property list (either
 //! binary or XML is read). Version 2's historical keys still load during an
-//! upgrade; a rollback safely treats version 3 as a cache miss and rebuilds
+//! upgrade; a rollback safely treats newer versions as a cache miss and rebuilds
 //! from the authoritative raw log.
 
 use std::path::Path;
@@ -22,8 +22,9 @@ use diri_proto::terminal::{MouseEncoding, MouseModes, MouseTrackingMode};
 // Version 1 persisted only the visible grid. Restoring it silently collapsed
 // every adopted session to at most one line of history, so it is deliberately
 // treated as a cache miss and rebuilt from the authoritative raw log.
-const PREVIOUS_VERSION: u64 = 2;
-const CURRENT_VERSION: u64 = 3;
+const SWIFT_VERSION: u64 = 2;
+const GRANULAR_MOUSE_VERSION: u64 = 3;
+const CURRENT_VERSION: u64 = 4;
 
 /// A decoded checkpoint, grid already validated.
 pub struct ScreenCheckpoint {
@@ -37,6 +38,7 @@ pub struct ScreenCheckpoint {
     pub marker_buffer: Vec<u8>,
     pub alt_screen: bool,
     pub bracketed_paste: bool,
+    pub application_cursor_keys: bool,
     pub mouse: MouseModes,
 }
 
@@ -53,7 +55,7 @@ impl ScreenCheckpoint {
         let value = plist::Value::from_file(path).ok()?;
         let dict = value.as_dictionary()?;
         let version = dict.get("version")?.as_unsigned_integer()?;
-        if !matches!(version, PREVIOUS_VERSION | CURRENT_VERSION) {
+        if !(SWIFT_VERSION..=CURRENT_VERSION).contains(&version) {
             return None;
         }
         let grid = GridUpdate::decode(as_data(dict.get("gridPayload")?)?).ok()?;
@@ -72,7 +74,7 @@ impl ScreenCheckpoint {
         {
             return None;
         }
-        let mouse = if version == PREVIOUS_VERSION {
+        let mouse = if version < GRANULAR_MOUSE_VERSION {
             if dict.get("mouseReporting")?.as_boolean()? {
                 // Version 2's restore implementation always synthesized this
                 // exact pair. This is checkpoint compatibility, not a claim
@@ -98,6 +100,11 @@ impl ScreenCheckpoint {
             marker_buffer: as_data(dict.get("markerBuffer")?)?.to_vec(),
             alt_screen: dict.get("altScreen")?.as_boolean()?,
             bracketed_paste: dict.get("bracketedPaste")?.as_boolean()?,
+            application_cursor_keys: if version >= CURRENT_VERSION {
+                dict.get("applicationCursorKeys")?.as_boolean()?
+            } else {
+                false
+            },
             mouse,
         })
     }
@@ -139,6 +146,10 @@ impl ScreenCheckpoint {
         dict.insert(
             "bracketedPaste".into(),
             plist::Value::Boolean(self.bracketed_paste),
+        );
+        dict.insert(
+            "applicationCursorKeys".into(),
+            plist::Value::Boolean(self.application_cursor_keys),
         );
         dict.insert(
             "mouseReporting".into(),
@@ -190,6 +201,7 @@ mod tests {
             marker_buffer: vec![0x1b, b']'],
             alt_screen: true,
             bracketed_paste: false,
+            application_cursor_keys: true,
             mouse: MouseModes::new(MouseTrackingMode::AnyMotion, MouseEncoding::Sgr),
         }
     }
@@ -207,6 +219,7 @@ mod tests {
         assert_eq!(loaded.marker_buffer, vec![0x1b, b']']);
         assert!(loaded.alt_screen);
         assert!(!loaded.bracketed_paste);
+        assert!(loaded.application_cursor_keys);
         assert_eq!(loaded.mouse, sample().mouse);
     }
 
@@ -234,6 +247,7 @@ mod tests {
             "markerBuffer",
             "altScreen",
             "bracketedPaste",
+            "applicationCursorKeys",
             "mouseReporting",
             "mouseTrackingMode",
             "mouseEncoding",
@@ -324,7 +338,7 @@ mod tests {
             .expect("dictionary");
         dict.insert(
             "version".into(),
-            plist::Value::Integer(PREVIOUS_VERSION.into()),
+            plist::Value::Integer(SWIFT_VERSION.into()),
         );
         dict.remove("mouseTrackingMode");
         dict.remove("mouseEncoding");
@@ -338,6 +352,30 @@ mod tests {
             MouseModes::new(MouseTrackingMode::ButtonEvents, MouseEncoding::Sgr),
             "v2 restore used to synthesize DECSET 1000 and DECSET 1006"
         );
+        assert!(!loaded.application_cursor_keys);
+    }
+
+    #[test]
+    fn version_three_defaults_application_cursor_mode_off() {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("s_v3.screen.plist");
+        sample().write_atomically(&path).expect("write");
+        let mut dict = plist::Value::from_file(&path)
+            .expect("read")
+            .into_dictionary()
+            .expect("dictionary");
+        dict.insert(
+            "version".into(),
+            plist::Value::Integer(GRANULAR_MOUSE_VERSION.into()),
+        );
+        dict.remove("applicationCursorKeys");
+        plist::Value::Dictionary(dict)
+            .to_file_binary(&path)
+            .expect("rewrite v3");
+
+        let loaded = ScreenCheckpoint::load(&path).expect("load v3");
+        assert!(!loaded.application_cursor_keys);
+        assert_eq!(loaded.mouse, sample().mouse);
     }
 
     #[test]

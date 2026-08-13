@@ -115,7 +115,7 @@ fn an_attach_is_seeded_then_streams_diffs_and_answers_input() {
             "argv": [
                 "/bin/sh",
                 "-c",
-                "stty -echo; printf '\\033[?2004hseeded-screen\\n'; IFS= read -r _; printf '\\033[?2004l'; stty echo; exec cat"
+                "stty -echo; printf '\\033[?2004h\\033[?1hseeded-screen\\n'; IFS= read -r _; printf '\\033[?2004l\\033[?1l'; stty echo; exec cat"
             ],
         })),
     });
@@ -162,10 +162,15 @@ fn an_attach_is_seeded_then_streams_diffs_and_answers_input() {
         Some((false, true, MouseModes::OFF)),
         "the attachment seed carries the child's current paste mode"
     );
+    assert_eq!(
+        modes.application_cursor_keys_payload(),
+        Some(true),
+        "the attachment seed carries the child's current DECCKM mode"
+    );
 
-    // The setup shell drops bracketed paste after its first input. A mode-only
-    // terminal change must wake the attachment pump even when no visible cell
-    // changes with it.
+    // The setup shell drops both input modes after its first input. One
+    // mode-only terminal change must carry the simultaneous transition even
+    // though no visible cell changes with it.
     data.write_all(&FrameCodec::encode(&Frame::input(b"finish-setup\n".to_vec())).expect("encode"))
         .expect("finish child setup");
     let modes = frames.until("updated modes", |frame| {
@@ -175,6 +180,11 @@ fn an_attach_is_seeded_then_streams_diffs_and_answers_input() {
         modes.terminal_modes_payload(),
         Some((false, false, MouseModes::OFF)),
         "live mode changes propagate independently of grid damage"
+    );
+    assert_eq!(
+        modes.application_cursor_keys_payload(),
+        Some(false),
+        "the same live frame carries the simultaneous DECCKM reset"
     );
 
     // Let the per-session pump establish its shared diff baseline. Its first
@@ -191,7 +201,6 @@ fn an_attach_is_seeded_then_streams_diffs_and_answers_input() {
                 .flatten()
                 .is_some_and(|update| grid_text(&update).contains("warm-up-pump"))
     });
-
     // Mouse reports use their own frame kind so the Engine takes the raw
     // interactive path instead of treating escape bytes as prompt text. The
     // payload remains ordered with keyboard input and reaches the same PTY.

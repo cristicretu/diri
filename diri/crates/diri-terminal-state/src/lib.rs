@@ -42,6 +42,7 @@ pub struct GridMirror {
     sequence: Option<u64>,
     alt_screen: bool,
     bracketed_paste: bool,
+    application_cursor_keys: bool,
     mouse: MouseModes,
 }
 
@@ -57,6 +58,7 @@ impl GridMirror {
         grid: &GridUpdate,
         alt_screen: bool,
         bracketed_paste: bool,
+        application_cursor_keys: bool,
         mouse: MouseModes,
     ) -> Result<(), MirrorError> {
         if !grid.is_full_snapshot {
@@ -68,6 +70,7 @@ impl GridMirror {
         self.sequence = Some(sequence);
         self.alt_screen = alt_screen;
         self.bracketed_paste = bracketed_paste;
+        self.application_cursor_keys = application_cursor_keys;
         self.mouse = mouse;
         Ok(())
     }
@@ -78,6 +81,7 @@ impl GridMirror {
         grid: &GridUpdate,
         alt_screen: bool,
         bracketed_paste: bool,
+        application_cursor_keys: bool,
         mouse: MouseModes,
     ) -> Result<(), MirrorError> {
         let Some(previous) = self.sequence else {
@@ -101,6 +105,7 @@ impl GridMirror {
         self.sequence = Some(sequence);
         self.alt_screen = alt_screen;
         self.bracketed_paste = bracketed_paste;
+        self.application_cursor_keys = application_cursor_keys;
         self.mouse = mouse;
         Ok(())
     }
@@ -134,8 +139,13 @@ impl GridMirror {
     }
 
     #[must_use]
-    pub const fn modes(&self) -> (bool, bool, MouseModes) {
-        (self.alt_screen, self.bracketed_paste, self.mouse)
+    pub const fn modes(&self) -> (bool, bool, bool, MouseModes) {
+        (
+            self.alt_screen,
+            self.bracketed_paste,
+            self.application_cursor_keys,
+            self.mouse,
+        )
     }
 
     #[must_use]
@@ -487,6 +497,12 @@ impl HeadlessScreen {
             .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE)
     }
 
+    /// Whether the child enabled DEC private mode 1 (DECCKM), which changes
+    /// unmodified arrow keys from CSI sequences to SS3 sequences.
+    pub fn application_cursor_keys(&self) -> bool {
+        self.term.mode().contains(TermMode::APP_CURSOR)
+    }
+
     /// The current grid geometry.
     pub fn size(&self) -> (usize, usize) {
         (self.geometry.cols, self.geometry.rows)
@@ -645,6 +661,7 @@ impl HeadlessScreen {
         update: &GridUpdate,
         alt_screen: bool,
         bracketed_paste: bool,
+        application_cursor_keys: bool,
         mouse: MouseModes,
     ) -> bool {
         let cols = self.geometry.cols;
@@ -716,6 +733,9 @@ impl HeadlessScreen {
         bytes.extend_from_slice(b"\x1b[0m");
         if bracketed_paste {
             bytes.extend_from_slice(b"\x1b[?2004h");
+        }
+        if application_cursor_keys {
+            bytes.extend_from_slice(b"\x1b[?1h");
         }
         if let Some(mode) = mouse.tracking.dec_private_mode() {
             bytes.extend_from_slice(format!("\x1b[?{mode}h").as_bytes());
@@ -1281,6 +1301,16 @@ mod tests {
     }
 
     #[test]
+    fn application_cursor_mode_is_detected() {
+        let mut screen = HeadlessScreen::new(80, 24);
+        assert!(!screen.application_cursor_keys());
+        screen.feed(b"\x1b[?1h");
+        assert!(screen.application_cursor_keys());
+        screen.feed(b"\x1b[?1l");
+        assert!(!screen.application_cursor_keys());
+    }
+
+    #[test]
     fn a_resize_reflows_to_the_new_width() {
         let mut screen = HeadlessScreen::new(80, 24);
         screen.feed(b"hello\r\n");
@@ -1291,7 +1321,7 @@ mod tests {
     #[test]
     fn a_restored_snapshot_reproduces_the_screen_and_modes() {
         let mut original = HeadlessScreen::new(40, 10);
-        original.feed(b"\x1b[?2004h\x1b[?1000h\x1b[?1006h");
+        original.feed(b"\x1b[?2004h\x1b[?1h\x1b[?1000h\x1b[?1006h");
         original.feed(b"\x1b[1;31mred alert\x1b[0m\r\nplain line\r\n");
         original.feed("wide: ▶ done\r\n".as_bytes());
         let snapshot = original.full_snapshot();
@@ -1303,12 +1333,17 @@ mod tests {
                 &snapshot,
                 false,
                 true,
+                true,
                 MouseModes::new(MouseTrackingMode::ButtonEvents, MouseEncoding::Sgr),
             ),
             "restorable"
         );
         assert_eq!(restored.lines(), original.lines());
         assert!(restored.bracketed_paste(), "bracketed paste mode carried");
+        assert!(
+            restored.application_cursor_keys(),
+            "application cursor mode carried"
+        );
         assert!(restored.mouse_reporting(), "mouse mode carried");
         assert!(!restored.is_alt_screen());
         assert_eq!(restored.cursor(), original.cursor());
@@ -1324,7 +1359,7 @@ mod tests {
 
         let mut smaller = HeadlessScreen::new(39, 10);
         assert!(
-            !smaller.restore(&[], &snapshot, false, false, MouseModes::OFF),
+            !smaller.restore(&[], &snapshot, false, false, false, MouseModes::OFF),
             "a checkpoint from another geometry is a cache miss"
         );
     }
@@ -1342,7 +1377,7 @@ mod tests {
 
         let mut restored = HeadlessScreen::new(12, 2);
         assert!(
-            restored.restore(&history, &snapshot, false, false, MouseModes::OFF),
+            restored.restore(&history, &snapshot, false, false, false, MouseModes::OFF),
             "restorable"
         );
         assert_eq!(restored.scrollback(), original.scrollback());
@@ -1370,11 +1405,11 @@ mod tests {
         let snapshot = screen.full_snapshot();
         let mut mirror = GridMirror::new();
         mirror
-            .apply_snapshot(9, &snapshot, false, true, MouseModes::OFF)
+            .apply_snapshot(9, &snapshot, false, true, true, MouseModes::OFF)
             .expect("snapshot");
         assert_eq!(mirror.sequence(), Some(9));
         assert_eq!(mirror.size(), (8, 2));
-        assert_eq!(mirror.modes(), (false, true, MouseModes::OFF));
+        assert_eq!(mirror.modes(), (false, true, true, MouseModes::OFF));
 
         let mut delta_source = HeadlessScreen::new(8, 2);
         delta_source.feed(b"one");
@@ -1387,6 +1422,7 @@ mod tests {
                 &delta,
                 true,
                 false,
+                false,
                 MouseModes::new(MouseTrackingMode::AnyMotion, MouseEncoding::Sgr),
             )
             .expect("contiguous delta");
@@ -1395,11 +1431,12 @@ mod tests {
             (
                 true,
                 false,
+                false,
                 MouseModes::new(MouseTrackingMode::AnyMotion, MouseEncoding::Sgr)
             )
         );
         assert!(matches!(
-            mirror.apply_delta(12, &delta, false, false, MouseModes::OFF),
+            mirror.apply_delta(12, &delta, false, false, false, MouseModes::OFF),
             Err(MirrorError::SequenceGap {
                 expected: 11,
                 actual: 12

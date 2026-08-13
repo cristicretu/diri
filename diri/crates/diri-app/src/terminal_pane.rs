@@ -365,8 +365,25 @@ fn bracketed_paste_after_attachment_state(current: bool, state: AttachmentState)
     }
 }
 
+/// Falling back to CSI arrows is the terminal default and prevents a dead
+/// attachment generation from leaking DECCKM into a replacement child.
+fn application_cursor_after_attachment_state(current: bool, state: AttachmentState) -> bool {
+    if state == AttachmentState::Live {
+        current
+    } else {
+        false
+    }
+}
+
 fn terminal_paste(text: &str, bracketed_paste: bool) -> Vec<u8> {
     paste(text, bracketed_paste)
+}
+
+fn terminal_input_modes(application_cursor_keys: bool) -> TermInputModes {
+    TermInputModes {
+        application_cursor_keys,
+        ..TermInputModes::default()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -640,6 +657,9 @@ struct ResidentTerminal {
     /// Last mode advertised by this attachment generation. Reset while the
     /// transport is not live so paste never trusts state from a dead child.
     bracketed_paste: bool,
+    /// Last DECCKM state advertised by this attachment generation. Reset
+    /// while disconnected so replacement sessions start from CSI arrows.
+    application_cursor_keys: bool,
     find: Option<TerminalFindModel>,
     /// The editable text behind `find`'s query, so ⌘F gets the same caret,
     /// selection, and readline keys as the other query fields.
@@ -957,6 +977,7 @@ impl TerminalPane {
                     attachment_generation: generation,
                     attachment_state: AttachmentState::Attaching,
                     bracketed_paste: false,
+                    application_cursor_keys: false,
                     find: None,
                     find_query: QueryEditor::default(),
                     last_size: (0, 0),
@@ -1115,6 +1136,10 @@ impl TerminalPane {
                 if let Some(resident) = self.residents.get_mut(&id) {
                     resident.bracketed_paste =
                         bracketed_paste_after_attachment_state(resident.bracketed_paste, state);
+                    resident.application_cursor_keys = application_cursor_after_attachment_state(
+                        resident.application_cursor_keys,
+                        state,
+                    );
                     if resident.attachment_state != state {
                         resident.pointer_owner = None;
                         resident.mouse_motion.reset();
@@ -1161,6 +1186,7 @@ impl TerminalPane {
                 TerminalChunk::Modes {
                     alt_screen,
                     bracketed_paste,
+                    application_cursor_keys,
                     mouse,
                 },
             ) => {
@@ -1173,6 +1199,7 @@ impl TerminalPane {
                         resident.mouse_motion.reset();
                     }
                     resident.bracketed_paste = bracketed_paste;
+                    resident.application_cursor_keys = application_cursor_keys;
                     resident.element.set_modes(alt_screen, mouse);
                 }
                 if self.selected_id().as_ref() == Some(&id) {
@@ -2011,7 +2038,11 @@ impl TerminalPane {
             alt: event.keystroke.modifiers.alt,
             cmd: event.keystroke.modifiers.platform,
         };
-        let bytes = encode_key(&term_event, modifiers, TermInputModes::default());
+        let bytes = encode_key(
+            &term_event,
+            modifiers,
+            terminal_input_modes(resident.application_cursor_keys),
+        );
         if bytes.is_empty() {
             cx.propagate();
         } else {
@@ -4604,6 +4635,16 @@ mod tests {
             old_generation,
             TerminalChunk::Grid(filled_grid('s')),
         );
+        let stale_modes = PaneEvent::Chunk(
+            reselected.id.clone(),
+            old_generation,
+            TerminalChunk::Modes {
+                alt_screen: false,
+                bracketed_paste: true,
+                application_cursor_keys: true,
+                mouse: MouseModes::OFF,
+            },
+        );
 
         // Replace A's resident attachment, exactly as an A -> B -> A switch
         // does with the default residency of one.
@@ -4648,6 +4689,7 @@ mod tests {
         // must not repaint the new resident's buffer.
         pane.update_in(cx, |pane, window, cx| {
             pane.handle_pane_event(stale, window, cx);
+            pane.handle_pane_event(stale_modes, window, cx);
             let resident = pane
                 .residents
                 .get(&reselected.id)
@@ -4658,6 +4700,14 @@ mod tests {
                 buffer.cells[0].scalar,
                 u32::from('n'),
                 "a detached attachment repainted the newly selected terminal"
+            );
+            assert!(
+                !resident.bracketed_paste,
+                "a detached attachment leaked bracketed paste into the new generation"
+            );
+            assert!(
+                !resident.application_cursor_keys,
+                "a detached attachment leaked DECCKM into the new generation"
             );
         });
     }
@@ -4757,6 +4807,15 @@ mod tests {
             encode_key(&mapped, TermModifiers::default(), TermInputModes::default()),
             b"\x1b[A"
         );
+        assert_eq!(
+            encode_key(
+                &mapped,
+                TermModifiers::default(),
+                terminal_input_modes(true)
+            ),
+            b"\x1bOA",
+            "DECCKM changes an unmodified arrow to its SS3 form"
+        );
 
         let command_backspace = KeyDownEvent {
             keystroke: Keystroke {
@@ -4782,6 +4841,22 @@ mod tests {
             ),
             [0x15]
         );
+    }
+
+    #[test]
+    fn reattachment_drops_stale_application_cursor_mode_until_fresh_modes_arrive() {
+        assert!(application_cursor_after_attachment_state(
+            true,
+            AttachmentState::Live
+        ));
+        assert!(!application_cursor_after_attachment_state(
+            true,
+            AttachmentState::Reconnecting
+        ));
+        assert!(!application_cursor_after_attachment_state(
+            true,
+            AttachmentState::Attaching
+        ));
     }
 
     #[test]

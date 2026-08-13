@@ -153,6 +153,26 @@ impl Frame {
         Self::new(FrameType::Modes, vec![bits])
     }
 
+    /// Adds the child's DECCKM state to a terminal-modes frame.
+    ///
+    /// Bit 6 is independent from the historical screen/mouse bits and the
+    /// bracketed-paste extension in bit 5. Keeping this as an orthogonal
+    /// builder lets callers compose additive mode capabilities without
+    /// replacing the source-compatible [`Self::modes`] constructor.
+    #[must_use]
+    pub fn with_application_cursor_keys(mut self, enabled: bool) -> Self {
+        if self.frame_type == FrameType::Modes
+            && let Some(bits) = self.payload.first_mut()
+        {
+            if enabled {
+                *bits |= 1 << 6;
+            } else {
+                *bits &= !(1 << 6);
+            }
+        }
+        self
+    }
+
     pub fn grid_payload(&self) -> Result<Option<GridUpdate>, GridCodecError> {
         if self.frame_type != FrameType::Grid {
             return Ok(None);
@@ -224,6 +244,16 @@ impl Frame {
                 MouseModes::from_detail_bits(bits >> 2, bits & 2 != 0),
             )
         })
+    }
+
+    /// Decodes the additive DECCKM bit. Historical mode frames decode to the
+    /// terminal default (`false`); malformed/non-mode frames remain absent.
+    #[must_use]
+    pub fn application_cursor_keys_payload(&self) -> Option<bool> {
+        if self.frame_type != FrameType::Modes {
+            return None;
+        }
+        self.payload.first().map(|bits| bits & (1 << 6) != 0)
     }
 
     fn offset_frame(frame_type: FrameType, offset: u64) -> Self {
@@ -409,35 +439,43 @@ mod tests {
 
         for alt_screen in [false, true] {
             for bracketed_paste in [false, true] {
-                for mouse in [
-                    MouseModes::OFF,
-                    MouseModes::UNKNOWN,
-                    MouseModes::new(
-                        crate::terminal::MouseTrackingMode::Off,
-                        crate::terminal::MouseEncoding::Sgr,
-                    ),
-                    MouseModes::new(
-                        crate::terminal::MouseTrackingMode::ButtonEvents,
-                        crate::terminal::MouseEncoding::Legacy,
-                    ),
-                    MouseModes::new(
-                        crate::terminal::MouseTrackingMode::ButtonMotion,
-                        crate::terminal::MouseEncoding::Sgr,
-                    ),
-                    MouseModes::new(
-                        crate::terminal::MouseTrackingMode::AnyMotion,
-                        crate::terminal::MouseEncoding::Sgr,
-                    ),
-                ] {
-                    let modes =
-                        Frame::modes_with_bracketed_paste(alt_screen, bracketed_paste, mouse);
-                    assert_eq!(
-                        modes.terminal_modes_payload(),
-                        Some((alt_screen, bracketed_paste, mouse))
-                    );
-                    assert_eq!(modes.modes_payload(), Some((alt_screen, mouse)));
-                    assert_eq!(modes.payload[0] & 0b10 != 0, mouse.is_reporting());
-                    assert_eq!(modes.payload[0] & 0b10_0000 != 0, bracketed_paste);
+                for application_cursor_keys in [false, true] {
+                    for mouse in [
+                        MouseModes::OFF,
+                        MouseModes::UNKNOWN,
+                        MouseModes::new(
+                            crate::terminal::MouseTrackingMode::Off,
+                            crate::terminal::MouseEncoding::Sgr,
+                        ),
+                        MouseModes::new(
+                            crate::terminal::MouseTrackingMode::ButtonEvents,
+                            crate::terminal::MouseEncoding::Legacy,
+                        ),
+                        MouseModes::new(
+                            crate::terminal::MouseTrackingMode::ButtonMotion,
+                            crate::terminal::MouseEncoding::Sgr,
+                        ),
+                        MouseModes::new(
+                            crate::terminal::MouseTrackingMode::AnyMotion,
+                            crate::terminal::MouseEncoding::Sgr,
+                        ),
+                    ] {
+                        let modes =
+                            Frame::modes_with_bracketed_paste(alt_screen, bracketed_paste, mouse)
+                                .with_application_cursor_keys(application_cursor_keys);
+                        assert_eq!(
+                            modes.terminal_modes_payload(),
+                            Some((alt_screen, bracketed_paste, mouse))
+                        );
+                        assert_eq!(modes.modes_payload(), Some((alt_screen, mouse)));
+                        assert_eq!(
+                            modes.application_cursor_keys_payload(),
+                            Some(application_cursor_keys)
+                        );
+                        assert_eq!(modes.payload[0] & 0b10 != 0, mouse.is_reporting());
+                        assert_eq!(modes.payload[0] & 0b10_0000 != 0, bracketed_paste);
+                        assert_eq!(modes.payload[0] & 0b100_0000 != 0, application_cursor_keys);
+                    }
                 }
             }
         }
@@ -453,9 +491,23 @@ mod tests {
 
     #[test]
     fn modes_decode_the_historical_boolean_wire_format() {
+        let historical = Frame::new(FrameType::Modes, vec![0b11]);
         assert_eq!(
-            Frame::new(FrameType::Modes, vec![0b11]).terminal_modes_payload(),
+            historical.terminal_modes_payload(),
             Some((true, false, MouseModes::UNKNOWN))
+        );
+        assert_eq!(
+            historical.modes_payload(),
+            Some((true, MouseModes::UNKNOWN))
+        );
+        assert_eq!(historical.application_cursor_keys_payload(), Some(false));
+
+        let composed =
+            Frame::new(FrameType::Modes, vec![1 << 5]).with_application_cursor_keys(true);
+        assert_eq!(
+            composed.payload[0] & ((1 << 5) | (1 << 6)),
+            (1 << 5) | (1 << 6),
+            "adding DECCKM preserves the independent bracketed-paste bit"
         );
     }
 

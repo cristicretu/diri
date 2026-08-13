@@ -249,6 +249,7 @@ fn adoption_seeds_from_the_checkpoint_not_the_raw_tail() {
         marker_buffer: Vec::new(),
         alt_screen: false,
         bracketed_paste: false,
+        application_cursor_keys: false,
         mouse: MouseModes::OFF,
     }
     .write_atomically(&checkpoint_path(&logs, "s_ad"))
@@ -327,6 +328,7 @@ fn a_stale_checkpoint_falls_back_to_tail_replay() {
         marker_buffer: Vec::new(),
         alt_screen: false,
         bracketed_paste: false,
+        application_cursor_keys: false,
         mouse: MouseModes::OFF,
     }
     .write_atomically(&checkpoint_path(&logs, "s_fb"))

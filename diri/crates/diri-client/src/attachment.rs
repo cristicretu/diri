@@ -36,6 +36,7 @@ pub enum TerminalChunk {
     Modes {
         alt_screen: bool,
         bracketed_paste: bool,
+        application_cursor_keys: bool,
         mouse: MouseModes,
     },
     Pong,
@@ -326,10 +327,12 @@ async fn process_incoming(
         }
         FrameType::Modes => {
             let (alt_screen, bracketed_paste, mouse) = frame.terminal_modes_payload().ok_or(())?;
+            let application_cursor_keys = frame.application_cursor_keys_payload().ok_or(())?;
             chunks
                 .send(TerminalChunk::Modes {
                     alt_screen,
                     bracketed_paste,
+                    application_cursor_keys,
                     mouse,
                 })
                 .await
@@ -394,6 +397,7 @@ mod tests {
             Some(TerminalChunk::Modes {
                 alt_screen: true,
                 bracketed_paste: true,
+                application_cursor_keys: false,
                 mouse,
             })
         );
@@ -474,6 +478,31 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
         format!("diri-t4-test-{}-{nanos}", std::process::id())
+    }
+
+    #[tokio::test]
+    async fn application_cursor_mode_reaches_attachment_consumers() {
+        let (mut stream, _peer) = UnixStream::pair().expect("socket pair");
+        let (chunks, mut receiver) = tokio::sync::mpsc::channel(1);
+        let mouse = diri_proto::terminal::MouseModes::OFF;
+
+        super::process_incoming(
+            diri_proto::frames::Frame::modes(true, mouse).with_application_cursor_keys(true),
+            &mut stream,
+            &chunks,
+        )
+        .await
+        .expect("mode frame");
+
+        assert_eq!(
+            receiver.recv().await,
+            Some(TerminalChunk::Modes {
+                alt_screen: true,
+                bracketed_paste: false,
+                application_cursor_keys: true,
+                mouse,
+            })
+        );
     }
 
     async fn cleanup_session(control: &mut TestControl, session_id: &SessionId) {

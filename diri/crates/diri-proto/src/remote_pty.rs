@@ -266,6 +266,7 @@ pub struct FullSnapshot {
     pub sequence: u64,
     pub alt_screen: bool,
     pub bracketed_paste: bool,
+    pub application_cursor_keys: bool,
     pub mouse: MouseModes,
     pub grid: GridUpdate,
 }
@@ -275,6 +276,7 @@ pub struct GridDelta {
     pub sequence: u64,
     pub alt_screen: bool,
     pub bracketed_paste: bool,
+    pub application_cursor_keys: bool,
     pub mouse: MouseModes,
     pub grid: GridUpdate,
 }
@@ -870,7 +872,8 @@ impl RemoteCodec {
                     // older peer remains compatible with this additive mode
                     // byte extension.
                     | (u8::from(value.mouse.is_reporting()) << 2)
-                    | (value.mouse.detail_bits() << 3);
+                    | (value.mouse.detail_bits() << 3)
+                    | (u8::from(value.application_cursor_keys) << 6);
                 output.push(modes);
                 if !value.grid.is_full_snapshot {
                     return rollback(
@@ -891,7 +894,8 @@ impl RemoteCodec {
                 let modes = u8::from(value.alt_screen)
                     | (u8::from(value.bracketed_paste) << 1)
                     | (u8::from(value.mouse.is_reporting()) << 2)
-                    | (value.mouse.detail_bits() << 3);
+                    | (value.mouse.detail_bits() << 3)
+                    | (u8::from(value.application_cursor_keys) << 6);
                 output.push(modes);
                 if value.grid.is_full_snapshot {
                     return rollback(
@@ -1082,6 +1086,7 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
                 sequence,
                 alt_screen: modes & 1 != 0,
                 bracketed_paste: modes & 2 != 0,
+                application_cursor_keys: modes & (1 << 6) != 0,
                 mouse: MouseModes::from_detail_bits(modes >> 3, modes & 4 != 0),
                 grid,
             }))
@@ -1106,6 +1111,7 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
                 sequence,
                 alt_screen: modes & 1 != 0,
                 bracketed_paste: modes & 2 != 0,
+                application_cursor_keys: modes & (1 << 6) != 0,
                 mouse: MouseModes::from_detail_bits(modes >> 3, modes & 4 != 0),
                 grid,
             }))
@@ -1267,6 +1273,7 @@ mod tests {
             sequence: 42,
             alt_screen: true,
             bracketed_paste: true,
+            application_cursor_keys: true,
             mouse: MouseModes::new(
                 crate::terminal::MouseTrackingMode::ButtonMotion,
                 crate::terminal::MouseEncoding::Sgr,
@@ -1320,6 +1327,7 @@ mod tests {
         let encoded = RemoteCodec::encode(&message).expect("encode");
         assert_eq!(encoded[0], KIND_FULL_SNAPSHOT);
         assert_ne!(encoded[13] & 0b100, 0, "historical any-mouse bit");
+        assert_ne!(encoded[13] & (1 << 6), 0, "application cursor bit");
         assert_eq!(
             RemoteCodec::new().feed(&encoded).expect("decode"),
             vec![message]
@@ -1338,6 +1346,10 @@ mod tests {
             panic!("snapshot");
         };
         assert_eq!(decoded.mouse, MouseModes::UNKNOWN);
+        assert!(
+            !decoded.application_cursor_keys,
+            "historical snapshots default DECCKM off"
+        );
     }
 
     #[test]
@@ -1366,6 +1378,7 @@ mod tests {
             sequence: 43,
             alt_screen: true,
             bracketed_paste: true,
+            application_cursor_keys: true,
             mouse: MouseModes::new(
                 crate::terminal::MouseTrackingMode::ButtonMotion,
                 crate::terminal::MouseEncoding::Sgr,
