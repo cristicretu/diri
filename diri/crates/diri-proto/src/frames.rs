@@ -174,6 +174,30 @@ impl Frame {
         self
     }
 
+    /// Appends an opaque acknowledgement token to a terminal-modes frame.
+    ///
+    /// The first payload byte remains the complete modes bitset, so peers
+    /// predating acknowledgements continue to decode the frame unchanged.
+    #[must_use]
+    pub fn with_modes_token(mut self, token: u64) -> Self {
+        if self.frame_type == FrameType::Modes {
+            if self.payload.len() == 1 {
+                self.payload.extend_from_slice(&token.to_be_bytes());
+            } else if self.payload.len() >= 9 {
+                self.payload[1..9].copy_from_slice(&token.to_be_bytes());
+            }
+        }
+        self
+    }
+
+    /// Builds the client-to-daemon acknowledgement for a Modes frame.
+    /// Older daemons already ignore client-to-daemon Modes frames, making the
+    /// handshake additive in both directions.
+    #[must_use]
+    pub fn modes_ack(token: u64) -> Self {
+        Self::modes(false, MouseModes::OFF).with_modes_token(token)
+    }
+
     pub fn grid_payload(&self) -> Result<Option<GridUpdate>, GridCodecError> {
         if self.frame_type != FrameType::Grid {
             return Ok(None);
@@ -269,6 +293,18 @@ impl Frame {
         self.payload
             .first()
             .map(|bits| (bits & (1 << 7) != 0).then_some(bits & (1 << 6) != 0))
+    }
+
+    /// Returns the opaque acknowledgement token carried after the Modes
+    /// bitset. Historical one-byte frames have no token.
+    #[must_use]
+    pub fn modes_token_payload(&self) -> Option<u64> {
+        if self.frame_type != FrameType::Modes || self.payload.len() < 9 {
+            return None;
+        }
+        Some(u64::from_be_bytes(
+            self.payload[1..9].try_into().expect("length checked"),
+        ))
     }
 
     fn offset_frame(frame_type: FrameType, offset: u64) -> Self {
@@ -507,6 +543,25 @@ mod tests {
         assert_eq!(Frame::pong().payload, Vec::<u8>::new());
         assert_eq!(Frame::input(b"input".to_vec()).payload, b"input");
         assert_eq!(Frame::mouse(b"mouse".to_vec()).payload, b"mouse");
+
+        let token = 0x0102_0304_0506_0708;
+        let acknowledged = Frame::modes(true, MouseModes::OFF)
+            .with_application_cursor_keys(true)
+            .with_modes_token(token);
+        assert_eq!(acknowledged.modes_token_payload(), Some(token));
+        assert_eq!(
+            acknowledged.terminal_modes_payload(),
+            Some((true, false, MouseModes::OFF))
+        );
+        assert_eq!(
+            acknowledged.application_cursor_keys_state_payload(),
+            Some(Some(true))
+        );
+        assert_eq!(Frame::modes_ack(token).modes_token_payload(), Some(token));
+        assert_eq!(
+            Frame::modes(true, MouseModes::OFF).modes_token_payload(),
+            None
+        );
     }
 
     #[test]

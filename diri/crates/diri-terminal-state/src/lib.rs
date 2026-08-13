@@ -80,10 +80,18 @@ impl ApplicationCursorModeTracker {
     }
 
     pub fn set_known(&mut self, value: bool) {
+        // An authoritative snapshot is a parser boundary. Do not let output
+        // preceding it leave a partial control sequence that future bytes
+        // could complete against the new baseline.
+        self.processor = Processor::new();
         self.state.value = Some(value);
     }
 
     pub fn set_unknown(&mut self) {
+        // Losing provenance also invalidates any partial escape sequence. A
+        // retained suffix must never complete a DECSET begun before a missing
+        // log interval.
+        self.processor = Processor::new();
         self.state.value = None;
     }
 

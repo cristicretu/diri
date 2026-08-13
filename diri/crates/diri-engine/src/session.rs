@@ -454,6 +454,45 @@ fn bind_holder_cursor_authority(
     }
 }
 
+/// Feeds one log chunk while preserving the provenance boundary of the
+/// current DECCKM value. A rotation can advance `start` beyond the next byte
+/// we expected after a Holder stat or checkpoint was bound; that missing
+/// interval may contain a sticky toggle, so the known value is discarded
+/// before parsing the retained suffix.
+fn feed_application_cursor_log_chunk(
+    tracker: &mut ApplicationCursorModeTracker,
+    expected_offset: &mut u64,
+    start: u64,
+    bytes: &[u8],
+) -> bool {
+    let before = tracker.value();
+    if start > *expected_offset {
+        tracker.set_unknown();
+        *expected_offset = start;
+    }
+    let mode_start = expected_offset
+        .saturating_sub(start)
+        .min(bytes.len() as u64) as usize;
+    if mode_start < bytes.len() {
+        tracker.feed(&bytes[mode_start..]);
+        *expected_offset = start.saturating_add(bytes.len() as u64);
+    }
+    tracker.value() != before
+}
+
+fn discard_application_cursor_provenance_on_gap(
+    tracker: &mut ApplicationCursorModeTracker,
+    expected_offset: u64,
+    actual_offset: u64,
+) -> bool {
+    if actual_offset <= expected_offset {
+        return false;
+    }
+    let before = tracker.value();
+    tracker.set_unknown();
+    tracker.value() != before
+}
+
 fn bind_checkpoint_cursor_authority(
     tracker: &mut ApplicationCursorModeTracker,
     value: bool,
@@ -1433,6 +1472,21 @@ impl Session {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_application_cursor_mode_for_test(&self, value: Option<bool>) {
+        let mut tracker = self
+            .shared
+            .application_cursor_keys
+            .lock()
+            .expect("application cursor mode");
+        match value {
+            Some(value) => tracker.set_known(value),
+            None => tracker.set_unknown(),
+        }
+        drop(tracker);
+        self.shared.grid_wake.notify();
+    }
+
     /// A wheel event from an attached client: forwarded to the child when it
     /// asked for mouse reporting, otherwise ignored (the client scrolls its
     /// own scrollback).
@@ -2278,6 +2332,27 @@ fn handle_remote_message(
         }
         RemoteMessage::Terminal(frame) => match frame.frame_type {
             FrameType::ReplayBegin => {
+                let Some(start) = frame.offset_payload() else {
+                    return RemoteConnectionDisposition::Fatal;
+                };
+                let expected = shared.remote_output_offset.load(Ordering::SeqCst);
+                let cursor_mode_changed = discard_application_cursor_provenance_on_gap(
+                    &mut shared
+                        .application_cursor_keys
+                        .lock()
+                        .expect("application cursor mode"),
+                    expected,
+                    start,
+                );
+                if start > expected {
+                    // The remote Holder bounded replay and explicitly skipped
+                    // this interval. Bind subsequent output to the new floor;
+                    // an old Holder's snapshot cannot fill in sticky DECCKM.
+                    shared.remote_output_offset.store(start, Ordering::SeqCst);
+                }
+                if cursor_mode_changed {
+                    shared.grid_wake.notify();
+                }
                 *replaying = true;
                 RemoteConnectionDisposition::Continue
             }
@@ -2372,6 +2447,11 @@ fn apply_remote_output(
             .lock()
             .expect("application cursor mode");
         let before = application_cursor_keys.value();
+        discard_application_cursor_provenance_on_gap(
+            &mut application_cursor_keys,
+            expected,
+            offset,
+        );
         application_cursor_keys.feed(bytes);
         application_cursor_keys.value() != before
     };
@@ -2840,7 +2920,7 @@ fn pump_held(
     manifest_id: String,
 ) {
     let replay_budget = replay_budget();
-    let (checkpoint_path, mut offset, mut watcher, mut marker_buffer, mode_replay_from) = {
+    let (checkpoint_path, mut offset, mut watcher, mut marker_buffer, mut mode_replay_offset) = {
         let mut log = shared.log.lock().expect("log");
         log.refresh_from_disk();
         let checkpoint_path = crate::checkpoint::ScreenCheckpoint::path_for_log(log.path());
@@ -2963,8 +3043,20 @@ fn pump_held(
         // same frame instead — bounded, so a holder streaming faster than we
         // parse still updates.
         let caught_up = chunk.len() < LOG_READ_BUDGET;
+        let cursor_mode_changed = feed_application_cursor_log_chunk(
+            &mut shared
+                .application_cursor_keys
+                .lock()
+                .expect("application cursor mode"),
+            &mut mode_replay_offset,
+            start,
+            &chunk,
+        );
 
         if chunk.is_empty() {
+            if cursor_mode_changed {
+                shared.grid_wake.notify();
+            }
             if publish_pending.take().is_some() {
                 shared.grid_wake.notify();
             }
@@ -3040,17 +3132,6 @@ fn pump_held(
             continue;
         }
 
-        let mode_start = mode_replay_from
-            .saturating_sub(start)
-            .min(chunk.len() as u64) as usize;
-        if mode_start < chunk.len() {
-            shared
-                .application_cursor_keys
-                .lock()
-                .expect("application cursor mode")
-                .feed(&chunk[mode_start..]);
-        }
-
         // A rotation can move the readable floor past us; resynchronize.
         if start > offset && !marker_buffer.is_empty() {
             marker_buffer.clear();
@@ -3110,6 +3191,11 @@ fn pump_held(
                 drop(reducer);
                 apply(&shared, &outcome);
             }
+        } else if cursor_mode_changed {
+            // A provenance gap can be observed in a chunk containing only a
+            // stripped Holder marker. There is no screen batch to publish in
+            // that case, but attachments must still drop stale DECCKM state.
+            shared.grid_wake.notify();
         }
     }
 
@@ -3475,6 +3561,7 @@ mod remote_mode_tests {
     use super::{
         ApplicationCursorModeTracker, HeadlessScreen, HolderCursorModeAuthority, LOG_READ_BUDGET,
         OutputLog, bind_checkpoint_cursor_authority, bind_holder_cursor_authority,
+        discard_application_cursor_provenance_on_gap, feed_application_cursor_log_chunk,
         hydrate_screen_from_log, resolve_remote_application_cursor_keys,
         seed_default_application_cursor_from_complete_prefix,
     };
@@ -3515,6 +3602,47 @@ mod remote_mode_tests {
         assert_eq!(mode.value(), Some(true));
         mode.feed(b"\x1b[?1l");
         assert_eq!(mode.value(), Some(false));
+    }
+
+    #[test]
+    fn replay_gap_discards_partial_escape_sequence_before_suffix() {
+        let mut mode = ApplicationCursorModeTracker::known(true);
+        let mut expected = 0;
+        assert!(!feed_application_cursor_log_chunk(
+            &mut mode,
+            &mut expected,
+            0,
+            b"\x1b",
+        ));
+        assert!(feed_application_cursor_log_chunk(
+            &mut mode,
+            &mut expected,
+            2,
+            b"[?1l",
+        ));
+        assert_eq!(
+            mode.value(),
+            None,
+            "a suffix cannot complete a DECCKM sequence across missing bytes"
+        );
+    }
+
+    #[test]
+    fn bounded_remote_replay_gap_discards_old_holder_cursor_authority() {
+        let mut mode = ApplicationCursorModeTracker::known(true);
+        mode.feed(b"\x1b");
+        assert!(discard_application_cursor_provenance_on_gap(
+            &mut mode, 100, 101,
+        ));
+        mode.feed(b"[?1l");
+        assert_eq!(
+            mode.value(),
+            None,
+            "a 1.4 replay suffix cannot retain or complete stale DECCKM"
+        );
+        assert!(!discard_application_cursor_provenance_on_gap(
+            &mut mode, 101, 101,
+        ));
     }
 
     #[test]
@@ -3576,6 +3704,20 @@ mod remote_mode_tests {
             OutputLog::open(root.path(), "local", 4 << 20, 8 << 20, false).expect("writer");
         writer.append(b"\x1b[?1h").expect("old transition");
         let stale_stat_offset = writer.tail_offset();
+        let mut stale_stat_mode = ApplicationCursorModeTracker::unknown();
+        let mut mode_replay_offset = bind_holder_cursor_authority(
+            &mut stale_stat_mode,
+            HolderCursorModeAuthority {
+                value: true,
+                log_offset: stale_stat_offset,
+            },
+            writer.oldest_available_offset(),
+        );
+        assert_eq!(stale_stat_mode.value(), Some(true));
+
+        // The Holder advances after stat was bound, then rotates the entire
+        // stat-to-replay interval before the pump's first read. This is the
+        // race the initial `oldest_available` check cannot see.
         writer
             .append(b"\x1b[?1l")
             .expect("toggle after the sampled stat");
@@ -3603,30 +3745,27 @@ mod remote_mode_tests {
         assert_eq!(legacy_mode.value(), None);
 
         let mut retained = OutputLog::reader(root.path(), "local").expect("second reader");
-        let mut stale_stat_mode = ApplicationCursorModeTracker::unknown();
-        assert_eq!(
-            bind_holder_cursor_authority(
-                &mut stale_stat_mode,
-                HolderCursorModeAuthority {
-                    value: true,
-                    log_offset: stale_stat_offset,
-                },
-                oldest,
-            ),
-            oldest
-        );
         let mut offset = oldest;
         while offset < tail {
             let (start, bytes) = retained.read(offset, LOG_READ_BUDGET);
             assert!(!bytes.is_empty(), "retained suffix remains readable");
-            stale_stat_mode.feed(&bytes);
+            feed_application_cursor_log_chunk(
+                &mut stale_stat_mode,
+                &mut mode_replay_offset,
+                start,
+                &bytes,
+            );
             offset = start.saturating_add(bytes.len() as u64);
         }
         assert_eq!(
             offset, tail,
             "the local migration inspects the whole retained suffix"
         );
-        assert_eq!(stale_stat_mode.value(), None);
+        assert_eq!(
+            stale_stat_mode.value(),
+            None,
+            "a post-bind replay gap invalidates the stale Holder stat"
+        );
     }
 }
 

@@ -41,6 +41,9 @@ pub enum TerminalChunk {
         /// only unmodified cursor arrows until a later Modes update resolves it.
         application_cursor_keys: Option<bool>,
         mouse: MouseModes,
+        /// Opaque daemon token returned only after the UI applies this mode
+        /// snapshot. `None` keeps historical daemon frames compatible.
+        acknowledgement: Option<u64>,
     },
     Pong,
 }
@@ -157,6 +160,13 @@ impl SessionAttachmentHandle {
         row: u16,
     ) -> Result<(), AttachmentClosed> {
         self.send(Frame::scroll(direction, lines, col, row))
+    }
+
+    /// Confirms that the UI has applied a terminal-mode snapshot. New daemons
+    /// use this to keep input behind same-socket replacement reseeds; older
+    /// daemons safely ignore client-to-daemon Modes frames.
+    pub fn acknowledge_modes(&self, token: u64) -> Result<(), AttachmentClosed> {
+        self.send(Frame::modes_ack(token))
     }
 
     pub fn close(&self) -> Result<(), AttachmentClosed> {
@@ -331,12 +341,14 @@ async fn process_incoming(
         FrameType::Modes => {
             let (alt_screen, bracketed_paste, mouse) = frame.terminal_modes_payload().ok_or(())?;
             let application_cursor_keys = frame.application_cursor_keys_state_payload().ok_or(())?;
+            let acknowledgement = frame.modes_token_payload();
             chunks
                 .send(TerminalChunk::Modes {
                     alt_screen,
                     bracketed_paste,
                     application_cursor_keys,
                     mouse,
+                    acknowledgement,
                 })
                 .await
                 .map_err(|_| ())?;
@@ -402,6 +414,7 @@ mod tests {
                 bracketed_paste: true,
                 application_cursor_keys: None,
                 mouse,
+                acknowledgement: None,
             })
         );
     }
@@ -490,7 +503,9 @@ mod tests {
         let mouse = diri_proto::terminal::MouseModes::OFF;
 
         super::process_incoming(
-            diri_proto::frames::Frame::modes(true, mouse).with_application_cursor_keys(true),
+            diri_proto::frames::Frame::modes(true, mouse)
+                .with_application_cursor_keys(true)
+                .with_modes_token(42),
             &mut stream,
             &chunks,
         )
@@ -504,6 +519,7 @@ mod tests {
                 bracketed_paste: false,
                 application_cursor_keys: Some(true),
                 mouse,
+                acknowledgement: Some(42),
             })
         );
     }

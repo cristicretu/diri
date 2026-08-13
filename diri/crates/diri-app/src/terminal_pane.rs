@@ -509,9 +509,10 @@ enum AttachmentCommand {
         col: u16,
         row: u16,
     },
-    /// GPUI has applied this generation's initial Modes event, so encoding
-    /// and routing input can no longer race the seed.
-    ModesApplied,
+    /// GPUI has applied a Modes event, so encoding and routing input can no
+    /// longer race its seed or a same-socket replacement. The optional token
+    /// is absent when connected to a historical daemon.
+    ModesApplied(Option<u64>),
     Close,
 }
 
@@ -548,8 +549,10 @@ impl AttachmentControl {
         });
     }
 
-    fn modes_applied(&self) {
-        let _ = self.tx.send(AttachmentCommand::ModesApplied);
+    fn modes_applied(&self, acknowledgement: Option<u64>) {
+        let _ = self
+            .tx
+            .send(AttachmentCommand::ModesApplied(acknowledgement));
     }
 
     fn close(&self) {
@@ -1216,6 +1219,7 @@ impl TerminalPane {
                     bracketed_paste,
                     application_cursor_keys,
                     mouse,
+                    acknowledgement,
                 },
             ) => {
                 if !self.attachment_is_current(&id, generation) {
@@ -1229,7 +1233,7 @@ impl TerminalPane {
                     resident.bracketed_paste = bracketed_paste;
                     resident.application_cursor_keys = application_cursor_keys;
                     resident.element.set_modes(alt_screen, mouse);
-                    resident.attachment.modes_applied();
+                    resident.attachment.modes_applied(acknowledgement);
                 }
                 if self.selected_id().as_ref() == Some(&id) {
                     cx.notify();
@@ -3626,10 +3630,13 @@ fn spawn_attachment(
                                 let _ = writer.resize(cols, rows);
                             }
                             Some(AttachmentCommand::Close) | None => break Some(true),
-                            Some(AttachmentCommand::ModesApplied) if modes_seeded => {
+                            Some(AttachmentCommand::ModesApplied(acknowledgement)) if modes_seeded => {
+                                if let Some(token) = acknowledgement {
+                                    let _ = writer.acknowledge_modes(token);
+                                }
                                 break Some(false);
                             }
-                            Some(AttachmentCommand::ModesApplied) => {}
+                            Some(AttachmentCommand::ModesApplied(_)) => {}
                             // Keystrokes, paste framing, pointer reports, and
                             // wheel routing all depend on the fresh mode seed.
                             // Input during this short attaching window is
@@ -3699,7 +3706,11 @@ fn spawn_attachment(
                             Some(AttachmentCommand::Scroll { direction, lines, col, row }) => {
                                 let _ = writer.scroll(direction, lines, col, row);
                             }
-                            Some(AttachmentCommand::ModesApplied) => {}
+                            Some(AttachmentCommand::ModesApplied(acknowledgement)) => {
+                                if let Some(token) = acknowledgement {
+                                    let _ = writer.acknowledge_modes(token);
+                                }
+                            }
                             Some(AttachmentCommand::Close) | None => break true,
                         }
                     }
@@ -3734,7 +3745,7 @@ async fn wait_for_retry(
             command = commands.recv() => match command {
                 Some(AttachmentCommand::Resize(cols, rows)) => *last_resize = Some((cols, rows)),
                 Some(AttachmentCommand::Close) | None => return true,
-                Some(AttachmentCommand::ModesApplied) => {}
+                Some(AttachmentCommand::ModesApplied(_)) => {}
                 Some(AttachmentCommand::Input(_))
                 | Some(AttachmentCommand::Mouse(_))
                 | Some(AttachmentCommand::Scroll { .. }) => {}
@@ -4034,7 +4045,8 @@ mod tests {
             release_rx.await.expect("release modes");
             // No bit-7 provenance marker: this is the explicit unknown seed
             // sent for quiet rotated legacy sessions.
-            let modes = Frame::modes_with_bracketed_paste(true, true, MouseModes::OFF);
+            let modes =
+                Frame::modes_with_bracketed_paste(true, true, MouseModes::OFF).with_modes_token(77);
             stream
                 .write_all(&FrameCodec::encode(&modes).expect("encode modes"))
                 .await
@@ -4042,11 +4054,20 @@ mod tests {
 
             let mut codec = FrameCodec::new();
             let input = timeout(Duration::from_secs(2), async {
+                let mut saw_acknowledgement = false;
                 loop {
                     let read = stream.read(&mut byte).await.expect("read input");
                     assert_ne!(read, 0, "attachment closed before live input");
                     for frame in codec.feed(&byte[..read]).expect("decode input") {
+                        if frame.frame_type == FrameType::Modes {
+                            assert_eq!(frame.modes_token_payload(), Some(77));
+                            saw_acknowledgement = true;
+                        }
                         if frame.frame_type == FrameType::Input {
+                            assert!(
+                                saw_acknowledgement,
+                                "input preceded the UI's Modes acknowledgement"
+                            );
                             return frame.payload;
                         }
                     }
@@ -4088,12 +4109,13 @@ mod tests {
                         _,
                         TerminalChunk::Modes {
                             application_cursor_keys,
+                            acknowledgement,
                             ..
                         },
                     ) => {
                         assert_eq!(*application_cursor_keys, None);
                         saw_modes = true;
-                        control.modes_applied();
+                        control.modes_applied(*acknowledgement);
                     }
                     PaneEvent::AttachmentState(_, _, AttachmentState::Live) => {
                         assert!(saw_modes, "Modes must be queued before Live");
@@ -4863,6 +4885,7 @@ mod tests {
                 bracketed_paste: true,
                 application_cursor_keys: Some(true),
                 mouse: MouseModes::OFF,
+                acknowledgement: None,
             },
         );
 

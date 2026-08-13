@@ -480,7 +480,21 @@ pre-rotation output prefix are unavailable, adoption keeps DECCKM unknown,
 does not write a v4 checkpoint with a guessed value, and uses the same degraded
 Live behavior as remote compatibility. Holder mode reports are paired with the
 reported log tail; if rotation passes that tail before replay, the Engine
-downgrades the stale report to unknown.
+downgrades the stale report to unknown. The replay cursor remains live after
+that initial bind: any later readable-offset jump also downgrades provenance
+before the retained suffix is parsed, because the missing interval could hold
+a sticky toggle. The same rule applies when a remote Holder's bounded
+`ReplayBegin` advances beyond the Engine's acknowledged raw-output offset;
+protocol 1.4 snapshot data cannot make that skipped DECCKM interval known.
+
+Desktop Modes frames carry an optional opaque acknowledgement token after the
+one-byte mode bitset. Current clients return it only after the UI has applied
+the snapshot. Once a peer demonstrates support, the Engine admits input only
+when both the acknowledged Session wake source and full mode snapshot still
+match the Registry. A same-socket respawn is therefore an ordered barrier:
+input encoded for the old child cannot reach the replacement before its known
+or explicitly unknown seed is applied. Older clients and daemons ignore the
+additive token and retain their previous best-effort behavior.
 
 ## Controller lease
 
