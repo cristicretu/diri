@@ -2384,14 +2384,39 @@ pub struct StoreRuntime {
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClientStartup {
+    Immediate,
+    Deferred,
+}
+
 impl StoreRuntime {
     pub fn start(client: Arc<DaemonClient>, prefs_path: impl Into<PathBuf>) -> io::Result<Self> {
         let (store, effects) = SessionStore::load(prefs_path)?;
-        Ok(Self::start_with_store(client, store, effects))
+        Ok(Self::start_with_store(
+            client,
+            store,
+            effects,
+            ClientStartup::Immediate,
+        ))
     }
 
     pub fn start_default(client: Arc<DaemonClient>) -> io::Result<Self> {
         Self::start(client, Prefs::path())
+    }
+
+    /// Builds the UI-facing store bridge without opening the daemon socket.
+    /// Process startup uses this while it verifies or refreshes the bundled
+    /// Engine off the GPUI thread; the supervisor starts the client exactly
+    /// once after that authoritative decision finishes.
+    pub(crate) fn start_default_deferred(client: Arc<DaemonClient>) -> io::Result<Self> {
+        let (store, effects) = SessionStore::load(Prefs::path())?;
+        Ok(Self::start_with_store(
+            client,
+            store,
+            effects,
+            ClientStartup::Deferred,
+        ))
     }
 
     /// A task-free runtime for deterministic previews. The preview sidebar
@@ -2425,6 +2450,7 @@ impl StoreRuntime {
         client: Arc<DaemonClient>,
         store: SessionStore,
         effects: mpsc::UnboundedReceiver<StoreEffect>,
+        client_startup: ClientStartup,
     ) -> Self {
         let store = Arc::new(RwLock::new(store));
         let (detach_tx, _) = broadcast::channel(16);
@@ -2494,8 +2520,21 @@ impl StoreRuntime {
         let state_snapshots = snapshot_tx.clone();
         let mut states = client.connection_state();
         tasks.push(tokio::spawn(async move {
+            let mut waiting_for_deferred_start = client_startup == ClientStartup::Deferred;
             loop {
                 let state = states.borrow_and_update().clone();
+                // A deferred client intentionally retains its constructor's
+                // initial Disconnected state while Engine supervision runs.
+                // Keep the visible shell in Connecting until `client.connect`
+                // publishes the real first attempt; otherwise first paint
+                // flashes a false "unreachable" recovery notice.
+                if waiting_for_deferred_start && matches!(state, ConnectionState::Disconnected(_)) {
+                    if states.changed().await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                waiting_for_deferred_start = false;
                 match state {
                     ConnectionState::Connecting => {
                         state_store
@@ -2615,7 +2654,9 @@ impl StoreRuntime {
             }
         }));
 
-        client.connect();
+        if client_startup == ClientStartup::Immediate {
+            client.connect();
+        }
         Self {
             store,
             client,

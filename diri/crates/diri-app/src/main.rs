@@ -187,25 +187,26 @@ fn main() {
             .expect("failed to start diri async runtime"),
     );
 
-    // diri is self-contained: if no daemon socket is live, launch the daemon
-    // bundled in Contents/Resources/bin, then let DaemonClient's reconnect loop
-    // pick it up. A Rust Engine whose executable hash differs from the
-    // bundled one is gracefully replaced so app and remote Helper catalogs
-    // advance together; Holder-owned sessions survive and are adopted.
+    // Plan app-owned Engine supervision now, but do not probe the socket or
+    // hash the bundled executable on GPUI's first-paint path. The one-shot plan
+    // is consumed only after the first window has been opened below.
     #[cfg(unix)]
-    if !preview {
-        let home = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("/nonexistent"));
-        let socket_path = diri_proto::paths::DirijorPaths::socket(home);
-        daemon_launch::ensure_daemon_running(&socket_path);
-    }
+    let daemon_startup = (!preview)
+        .then(daemon_launch::DeferredDaemonStartup::for_process)
+        .flatten();
+    #[cfg(unix)]
+    let defer_client_start = daemon_startup.is_some();
+    #[cfg(not(unix))]
+    let defer_client_start = false;
 
     let client = Arc::new(DaemonClient::new());
     let store_runtime = {
         let _guard = tokio.enter();
         Arc::new(if preview {
             StoreRuntime::inert()
+        } else if defer_client_start {
+            StoreRuntime::start_default_deferred(Arc::clone(&client))
+                .expect("failed to load diri state")
         } else {
             StoreRuntime::start_default(Arc::clone(&client)).expect("failed to load diri state")
         })
@@ -377,8 +378,17 @@ fn main() {
             }
         })
         .detach();
-        open_main_window(cx, services, preview, scenario);
+        open_main_window(cx, Arc::clone(&services), preview, scenario);
         cx.activate(true);
+        // `open_main_window` must stay before this call. The supervisor can
+        // spend up to five seconds probing and retiring an outdated Engine;
+        // it runs on Tokio's blocking pool and releases the reconnect loop
+        // only after replacement is complete, so the UI cannot race a daemon
+        // that is about to shut down.
+        #[cfg(unix)]
+        if let Some(startup) = daemon_startup {
+            startup.after_window_open(&services.tokio, Arc::clone(services.store.client()));
+        }
         if smoke_test {
             cx.spawn(async move |cx| {
                 cx.background_executor()

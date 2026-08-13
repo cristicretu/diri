@@ -15,31 +15,88 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
+use diri_client::DaemonClient;
 use diri_proto::paths::{DirijorPaths, ENV_SOCKET};
 use diri_proto::{ControlMessage, HelloParams, HelloResult, Method, RUST_ENGINE_KIND};
 use sha2::{Digest, Sha256};
+use tokio::runtime::Runtime;
 
 /// Explicit development/test override pointing at an Engine executable.
 const ENV_DAEMON_PATH: &str = "DIRIJORD_PATH";
 
 const BOOT_LOG_FILE_NAME: &str = "dirijord-rs.boot.log";
 
+/// One-shot Engine supervision deferred until the desktop has scheduled its
+/// first window.
+///
+/// The token is deliberately consumed by [`Self::after_window_open`]. This
+/// keeps the process startup order explicit and prevents two app-owned
+/// supervisors from racing to refresh the same Engine. The Engine's `flock`
+/// remains the final singleton authority across independent app processes.
+pub(super) struct DeferredDaemonStartup {
+    socket_path: PathBuf,
+}
+
+impl DeferredDaemonStartup {
+    /// Plans app-owned Engine supervision from the current process layout.
+    ///
+    /// A harness that supplied `DIRIJOR_SOCKET` owns its daemon lifecycle, so
+    /// there is no deferred work and the client may connect immediately.
+    pub(super) fn for_process() -> Option<Self> {
+        if std::env::var_os(ENV_SOCKET).is_some() {
+            return None;
+        }
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/nonexistent"));
+        Some(Self {
+            socket_path: DirijorPaths::socket(home),
+        })
+    }
+
+    /// Starts supervision away from GPUI's main thread, then releases the
+    /// reconnecting client only after the live Engine is authoritative.
+    ///
+    /// Call this after `open_main_window`: identity probes can consume two
+    /// one-second timeouts, upgrade shutdown can wait three seconds, and
+    /// hashing a universal bundled executable performs synchronous file I/O.
+    pub(super) fn after_window_open(self, runtime: &Runtime, client: Arc<DaemonClient>) {
+        schedule_after_window_open(
+            runtime,
+            move || ensure_daemon_running(&self.socket_path),
+            move || client.connect(),
+        );
+    }
+}
+
+/// Run blocking supervision without occupying either GPUI or an async worker.
+/// Completion always runs, even when the blocking task panics, so the client's
+/// own state machine can publish a concrete connection error instead of
+/// leaving the shell in an eternal startup state.
+fn schedule_after_window_open(
+    runtime: &Runtime,
+    supervise: impl FnOnce() + Send + 'static,
+    complete: impl FnOnce() + Send + 'static,
+) {
+    let supervision = runtime.spawn_blocking(supervise);
+    let _task = runtime.spawn(async move {
+        if let Err(error) = supervision.await {
+            eprintln!("diri: Engine startup supervision failed: {error}");
+        }
+        complete();
+    });
+}
+
 /// Ensure a daemon is reachable at `socket_path`, spawning the bundled
 /// `dirijord-rs` detached if the socket is dead.
 ///
-/// Non-blocking: after a spawn we return immediately and let
-/// [`diri_client::DaemonClient`]'s own reconnect loop (500 ms → 8 s backoff)
-/// connect once the daemon's socket comes up. The UI is never blocked on
-/// daemon startup.
-pub fn ensure_daemon_running(socket_path: &Path) {
-    // A dev/test harness that manages its own daemon exports DIRIJOR_SOCKET;
-    // never spawn on top of it.
-    if std::env::var_os(ENV_SOCKET).is_some() {
-        return;
-    }
-
+/// This function performs blocking probes, hashing, and bounded upgrade waits;
+/// it must run through [`schedule_after_window_open`]. After a spawn it returns
+/// immediately and lets [`DaemonClient`]'s reconnect loop discover the socket.
+fn ensure_daemon_running(socket_path: &Path) {
     let boot_log = boot_log_path();
     ensure_daemon_running_with(socket_path, resolve_daemon_path(), boot_log.as_deref());
 }
@@ -396,7 +453,7 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, mpsc};
 
     fn touch_executable(path: &Path) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -439,6 +496,41 @@ mod tests {
             }
             recorded.lock().expect("methods").clone()
         })
+    }
+
+    #[test]
+    fn window_launch_is_not_gated_by_daemon_supervision() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (completed_tx, completed_rx) = mpsc::channel();
+
+        // The call represents the line immediately after `open_main_window`.
+        // It must return while arbitrarily slow supervision remains blocked.
+        schedule_after_window_open(
+            &runtime,
+            move || {
+                started_tx.send(()).expect("publish worker start");
+                release_rx.recv().expect("release supervision");
+            },
+            move || completed_tx.send(()).expect("publish completion"),
+        );
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("blocking work starts away from the caller");
+        assert!(
+            completed_rx.try_recv().is_err(),
+            "the client gate cannot open before supervision finishes"
+        );
+        release_tx.send(()).expect("finish supervision");
+        completed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("completion runs after supervision");
     }
 
     #[test]

@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use diri_client::{ConnectionState, DaemonClient};
 use diri_proto::{
     AgentDescriptor, AgentKind, AgentReadinessItem, AgentReadinessResult, AttentionLevel,
     DateMillis, ExitInfo, ExitReason, Project, ProjectId, Resumability, SessionId,
@@ -13,9 +14,9 @@ use tokio::sync::mpsc;
 use crate::notifications::NotificationSound;
 
 use super::{
-    ClickModifiers, EventEnvelope, InspectorTab, Prefs, SessionStore, SidebarProjection,
-    StoreEffect, StoreEventChange, TerminalResidency, WindowMode, WindowPlacement,
-    event_publication_policy,
+    ClickModifiers, ClientStartup, EventEnvelope, InspectorTab, Prefs, SessionStore,
+    SidebarProjection, StoreEffect, StoreEventChange, StoreRuntime, TerminalResidency, WindowMode,
+    WindowPlacement, event_publication_policy,
 };
 use crate::switcher::{OverviewFilter, OverviewLane, SwitcherKey};
 
@@ -2066,6 +2067,38 @@ fn inert_runtime_has_no_background_tasks_or_live_sessions() {
             .is_empty()
     );
     assert!(runtime.snapshots().borrow().sessions.is_empty());
+}
+
+#[tokio::test]
+async fn deferred_client_start_keeps_first_paint_in_connecting_state() {
+    let tmp = tempdir().expect("temporary socket home");
+    let client = Arc::new(DaemonClient::with_socket_path(
+        tmp.path().join("engine.sock"),
+    ));
+    let (store, effects) = SessionStore::headless(Prefs::default());
+    let runtime = StoreRuntime::start_with_store(
+        Arc::clone(&client),
+        store,
+        effects,
+        ClientStartup::Deferred,
+    );
+
+    // Give the connection-state bridge enough turns to observe the client's
+    // constructor state. Deferred startup must not render that intentional
+    // state as a false daemon failure while the background supervisor runs.
+    for _ in 0..3 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        runtime.store.read().unwrap().daemon_state(),
+        &super::DaemonState::Connecting
+    );
+    assert!(matches!(
+        &*client.connection_state().borrow(),
+        ConnectionState::Disconnected(message) if message == "not connected to daemon"
+    ));
+
+    runtime.shutdown().await;
 }
 
 #[test]
