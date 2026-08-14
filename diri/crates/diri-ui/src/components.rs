@@ -248,6 +248,8 @@ impl RowFill {
 pub struct FloatingSurface {
     colors: SemanticColors,
     child: AnyElement,
+    radius: f32,
+    animate_entry: bool,
 }
 
 impl FloatingSurface {
@@ -255,16 +257,30 @@ impl FloatingSurface {
         Self {
             colors,
             child: child.into_any_element(),
+            radius: Radius::PANEL,
+            animate_entry: true,
         }
+    }
+
+    pub const fn radius(mut self, radius: f32) -> Self {
+        self.radius = radius;
+        self
+    }
+
+    pub const fn animate_entry(mut self, animate: bool) -> Self {
+        self.animate_entry = animate;
+        self
     }
 }
 
 impl RenderOnce for FloatingSurface {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let colors = self.colors;
+        let animate_entry = self.animate_entry;
         let surface = div()
             .relative()
-            .rounded(px(Radius::PANEL))
+            .rounded(px(self.radius))
+            .overflow_hidden()
             // Floating chrome keeps the sidebar hue but uses a denser material
             // so live terminal content never competes with labels or controls.
             .bg(colors.floating_surface())
@@ -287,7 +303,9 @@ impl RenderOnce for FloatingSurface {
                 },
             ])
             .child(self.child);
-        if floating_surface_motion(cx.reduce_motion()) == FloatingSurfaceMotion::Immediate {
+        if !animate_entry
+            || floating_surface_motion(cx.reduce_motion()) == FloatingSurfaceMotion::Immediate
+        {
             surface.into_any_element()
         } else {
             surface

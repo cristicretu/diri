@@ -251,7 +251,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         Some("cmd-p"),
         Some("⌘P"),
         Some(APP_CONTEXT),
-        "Quick Open…",
+        "Open Folder…",
         "magnifyingglass",
         "folder project directory jump goto find"
     ),
