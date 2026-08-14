@@ -13,7 +13,7 @@ use std::time::Duration;
 use diri_engine::detect::ManifestEngine;
 use diri_engine::mcp::{McpServer, RegistryHost, tool_definitions};
 use diri_engine::pty::PtySpec;
-use diri_engine::registry::Registry;
+use diri_engine::registry::{Registry, RegistryRunError};
 use diri_engine::session::SessionSpec;
 use diri_engine::status::Authority;
 use diri_engine::status::ClaudeHook;
@@ -119,6 +119,69 @@ fn output_contains(registry: &Arc<Mutex<Registry>>, id: &str, needle: &str) -> b
         return false;
     };
     session.screen_lines().join("\n").contains(needle)
+}
+
+#[test]
+fn stale_public_mutations_durably_commit_a_raw_successor_before_rejecting() {
+    for interrupt in [false, true] {
+        let temp = tempfile::tempdir().expect("temp");
+        let state_file = temp.path().join("state.json");
+        let logs = temp.path().join("logs");
+        let id = if interrupt { "interrupt" } else { "send" };
+        let mut registry = Registry::new(engine(), &state_file);
+        let mut child = record(id, None);
+        child.kind = AgentKind::CODEX;
+        child.status = SessionStatus::Idle;
+        child.run = Some(diri_proto::AgentRun {
+            id: 1,
+            state: diri_proto::AgentRunState::Completed,
+            started_at: DateMillis(1.0),
+            finished_at: Some(DateMillis(2.0)),
+            terminal_outcome: Some("completed".into()),
+        });
+        registry
+            .spawn(
+                hook_spec(
+                    id,
+                    "trap '' INT; while IFS= read -r line; do printf 'GOT:%s\\n' \"$line\"; done",
+                    &logs,
+                ),
+                child,
+            )
+            .expect("spawn child");
+
+        // This models an attached/raw Enter that reached the PTY between the
+        // last Registry fold and the public mutation. The first public sync
+        // observes run 2; expected generation 1 must be rejected only after
+        // that successor is durable.
+        registry
+            .get(id)
+            .expect("live child")
+            .claude_hook(ClaudeHook::UserPromptSubmit, false);
+        let error = if interrupt {
+            registry.interrupt_run(id, Some(1), None).unwrap_err()
+        } else {
+            registry
+                .send_run_text(id, "stale".into(), true, Some(1), true, None)
+                .unwrap_err()
+        };
+        assert!(matches!(
+            error,
+            RegistryRunError::Stale {
+                expected: 1,
+                current: 2
+            }
+        ));
+
+        let mut restored = Registry::new(engine(), &state_file);
+        restored.load().expect("reload committed successor");
+        let run = restored
+            .record(id)
+            .and_then(|record| record.run)
+            .expect("restored run");
+        assert_eq!(run.id, 2);
+        assert_eq!(run.state, diri_proto::AgentRunState::Running);
+    }
 }
 
 #[test]

@@ -615,15 +615,15 @@ impl Registry {
     /// Reconciles the current run without releasing its queued successor.
     /// Reports validate against this state so the report that closes run N is
     /// not made stale merely by starting acknowledged run N+1 first.
-    fn sync_run_state_for(&mut self, id: &str) {
+    fn sync_run_state_for(&mut self, id: &str) -> bool {
         let Some((view, completion_seq)) = self
             .sessions
             .get(id)
             .map(|session| (session.view(), session.turn_completion_seq()))
         else {
-            return;
+            return false;
         };
-        self.observe_run_state_for_view(id, &view, completion_seq);
+        self.observe_run_state_for_view(id, &view, completion_seq)
     }
 
     /// Every authoritative status fold first consumes Holder receipt
@@ -732,21 +732,21 @@ impl Registry {
         })
     }
 
-    fn sync_orchestration_for(&mut self, id: &str) {
+    fn sync_orchestration_for(&mut self, id: &str) -> bool {
         let Some((view, completion_seq)) = self
             .sessions
             .get(id)
             .map(|session| (session.view(), session.turn_completion_seq()))
         else {
-            return;
+            return false;
         };
-        self.observe_run_state_for_view(id, &view, completion_seq);
+        let observation_changed = self.observe_run_state_for_view(id, &view, completion_seq);
         let orchestration_before = self.orchestration.clone();
         let run_before = self.records.get(id).and_then(|record| record.run.clone());
         let dirty_before = self.dirty;
         let (delivery, mut run_changed) = {
             let Some(record) = self.records.get_mut(id) else {
-                return;
+                return observation_changed;
             };
             let previous_run = record.run.clone();
             let delivery = self.orchestration.begin_ready(
@@ -773,7 +773,7 @@ impl Registry {
                     record.run = run_before;
                 }
                 self.dirty = dirty_before;
-                return;
+                return observation_changed;
             }
             let orchestration_intent = self.orchestration.clone();
             let run_intent = self.records.get(id).and_then(|record| record.run.clone());
@@ -829,6 +829,7 @@ impl Registry {
         if run_changed {
             self.bump_record_version(id);
         }
+        observation_changed || run_changed
     }
 
     fn run_transaction_snapshot(&self, id: &str) -> RunTransactionSnapshot {
@@ -974,7 +975,9 @@ impl Registry {
         {
             // A response-loss retry is also a reconciliation opportunity: a
             // surviving Holder may now prove the original Enter was accepted.
-            self.sync_run_state_for(id);
+            if self.sync_run_state_for(id) {
+                self.persist_intent_now().map_err(RegistryRunError::Io)?;
+            }
         }
         match self.orchestration.lookup_replay(
             id,
@@ -1000,7 +1003,13 @@ impl Registry {
             ));
         }
         self.ensure_run(id)?;
-        self.sync_orchestration_for(id);
+        if self.sync_orchestration_for(id) {
+            // This is the first fold that can discover a raw successor. Land
+            // it before expected-generation validation is allowed to reject
+            // the request; the transaction's second fold is intentionally
+            // idempotent and cannot carry this durability obligation.
+            self.persist_intent_now().map_err(RegistryRunError::Io)?;
+        }
         let (view, completion_seq) = self
             .sessions
             .get(id)
@@ -1290,7 +1299,9 @@ impl Registry {
             None => {}
         }
 
-        self.sync_run_state_for(reporter);
+        if self.sync_run_state_for(reporter) {
+            self.persist_intent_now().map_err(RegistryRunError::Io)?;
+        }
         let record = self
             .records
             .get(reporter)
@@ -1343,7 +1354,9 @@ impl Registry {
             Some(_) => unreachable!("operation-scoped replay variant"),
             None => {}
         }
-        self.sync_orchestration_for(id);
+        if self.sync_orchestration_for(id) {
+            self.persist_intent_now().map_err(RegistryRunError::Io)?;
+        }
         let (view, completion_seq) = self
             .sessions
             .get(id)
