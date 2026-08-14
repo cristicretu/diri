@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use diri_code_intelligence::{CodeIntelligence, CodeIntelligenceCache, WorkspaceSearchKind};
+use diri_code_intelligence::{CodeIntelligenceCache, is_workspace_tool};
 use diri_proto::{SessionId, SessionStatus};
 use serde_json::{Value, json};
 
@@ -65,7 +65,7 @@ impl RegistryHost {
             .map_err(|_| "engine state is poisoned".to_string())
     }
 
-    fn caller_workspace(&self, refresh: bool) -> Result<Arc<CodeIntelligence>, String> {
+    fn caller_workspace_cwd(&self) -> Result<String, String> {
         let caller = self.caller.as_deref().ok_or_else(|| {
             format!("workspace tools require an identified Diri session; {SESSION_ID_ENV} is unset")
         })?;
@@ -84,9 +84,15 @@ impl RegistryHost {
                     .to_owned(),
             );
         }
-        self.workspace_cache
-            .for_session(cwd, refresh)
-            .map_err(|error| error.to_string())
+        Ok(cwd)
+    }
+
+    pub fn workspace_tools_available(&self) -> bool {
+        self.caller_workspace_cwd().is_ok()
+    }
+
+    pub fn tool_definitions(&self) -> Vec<super::ToolDefinition> {
+        super::tools::tool_definitions_with_workspace(self.workspace_tools_available())
     }
 }
 
@@ -198,75 +204,10 @@ impl ToolHost for RegistryHost {
                 }))
             }
 
-            "search_workspace" => {
-                let query = required_str(arguments, "query")?;
-                let kind_wire = arguments
-                    .get("kind")
-                    .and_then(Value::as_str)
-                    .unwrap_or("all");
-                let kind = WorkspaceSearchKind::from_wire(kind_wire)
-                    .ok_or_else(|| format!("unknown workspace search kind {kind_wire:?}"))?;
-                let limit = arguments
-                    .get("limit")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(20)
-                    .clamp(1, 100) as usize;
-                let refresh = arguments
-                    .get("refresh")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let intelligence = self.caller_workspace(refresh)?;
-                let search = intelligence
-                    .search_workspace(&query, kind, limit)
-                    .map_err(|error| error.to_string())?;
-                let stats = intelligence.index_stats();
-                Ok(json!({
-                    "workspace": intelligence.workspace_root(),
-                    "query": query,
-                    "kind": kind_wire,
-                    "truncated": search.truncated,
-                    "coverage": {
-                        "files": stats.files,
-                        "searchableFiles": stats.searchable_files,
-                        "definitions": stats.definitions,
-                        "searchableBytes": stats.searchable_bytes,
-                    },
-                    "matches": search.matches.into_iter().map(|hit| json!({
-                        "path": hit.relative_path,
-                        "kind": hit.kind.as_str(),
-                        "line": hit.line,
-                        "preview": hit.preview,
-                    })).collect::<Vec<_>>(),
-                }))
-            }
-
-            "read_source" => {
-                let path = required_str(arguments, "path")?;
-                let line = arguments
-                    .get("line")
-                    .and_then(Value::as_u64)
-                    .map(|line| line.max(1) as usize);
-                let context_lines = arguments
-                    .get("context_lines")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(12)
-                    .min(100) as usize;
-                let intelligence = self.caller_workspace(false)?;
-                let excerpt = intelligence
-                    .source_excerpt(&path, line, context_lines)
-                    .map_err(|error| error.to_string())?;
-                let focus_line = excerpt.focus_line;
-                Ok(json!({
-                    "workspace": intelligence.workspace_root(),
-                    "path": excerpt.relative_path,
-                    "language": excerpt.language.as_str(),
-                    "focusLine": focus_line,
-                    "lines": excerpt.lines.into_iter().map(|source| json!({
-                        "line": source.number,
-                        "text": source.text,
-                        "focus": source.number == focus_line,
-                    })).collect::<Vec<_>>(),
-                }))
+            tool if is_workspace_tool(tool) => {
+                let cwd = self.caller_workspace_cwd()?;
+                self.workspace_cache
+                    .call_workspace_tool(cwd, tool, arguments)
             }
 
             "release_agent" => {

@@ -5,5 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[dependencies]
+libc = "0.2"
+serde_json.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true

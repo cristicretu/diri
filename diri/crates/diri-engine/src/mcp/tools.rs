@@ -8,6 +8,7 @@
 //! in from the manifest catalog rather than written out, so a new agent
 //! manifest becomes spawnable over MCP with no code change.
 
+use diri_code_intelligence::workspace_tool_definitions;
 use serde_json::{Value, json};
 
 pub struct ToolDefinition {
@@ -36,11 +37,31 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
     ])
 }
 
+pub fn tool_definitions_with_workspace(include_workspace: bool) -> Vec<ToolDefinition> {
+    tool_definitions_for_with_workspace(
+        &[
+            "claude".into(),
+            "codex".into(),
+            "cursor".into(),
+            "gemini".into(),
+            "shell".into(),
+        ],
+        include_workspace,
+    )
+}
+
 /// The tool surface, with `spawn_agent` constrained to `kinds`.
 pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
+    tool_definitions_for_with_workspace(kinds, false)
+}
+
+pub fn tool_definitions_for_with_workspace(
+    kinds: &[String],
+    include_workspace: bool,
+) -> Vec<ToolDefinition> {
     let kind_enum: Vec<Value> = kinds.iter().map(|kind| json!(kind)).collect();
 
-    vec![
+    let mut tools = vec![
         tool(
             "spawn_agent",
             "Open a NEW standalone agent session, or an interactive shell in the current \
@@ -121,33 +142,6 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
             }),
         ),
         tool(
-            "search_workspace",
-            "Navigate the calling agent's local repository with Diri's bounded, git-aware index. Use definitions to find declarations, references to find literal call/usage sites without the declaration, files for paths, or all for a compact mixed result. Prefer this over broad grep when locating a symbol or deciding where to edit.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string", "minLength": 2, "description": "Symbol, identifier, text, or path fragment." },
-                    "kind": { "type": "string", "enum": ["definitions", "references", "files", "all"], "default": "all" },
-                    "limit": { "type": "number", "default": 20, "minimum": 1, "maximum": 100 },
-                    "refresh": { "type": "boolean", "default": false, "description": "Rebuild the bounded index now; use after a large rewrite when immediate freshness matters." }
-                },
-                "required": ["query"]
-            }),
-        ),
-        tool(
-            "read_source",
-            "Read a small numbered source window inside the calling agent's local repository. Use a path returned by search_workspace, optionally centered on its line. Paths outside the workspace, binary files, and oversized files are rejected.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "line": { "type": "number", "minimum": 1 },
-                    "context_lines": { "type": "number", "default": 12, "minimum": 0, "maximum": 100 }
-                },
-                "required": ["path"]
-            }),
-        ),
-        tool(
             "release_agent",
             "End a session and kill its process tree. The record stays in the list.",
             json!({
@@ -217,7 +211,17 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
                 }
             }),
         ),
-    ]
+    ];
+    if include_workspace {
+        tools.extend(workspace_tool_definitions().into_iter().map(|definition| {
+            tool(
+                definition.name,
+                definition.description,
+                definition.input_schema,
+            )
+        }));
+    }
+    tools
 }
 
 #[cfg(test)]
@@ -314,5 +318,28 @@ mod tests {
         names.sort();
         names.dedup();
         assert_eq!(names.len(), total, "duplicate tool names");
+    }
+
+    #[test]
+    fn workspace_tools_are_capability_gated() {
+        let unavailable = tool_definitions();
+        assert!(
+            !unavailable
+                .iter()
+                .any(|tool| tool.name == "search_workspace")
+        );
+        let available = tool_definitions_with_workspace(true);
+        let search = available
+            .iter()
+            .find(|tool| tool.name == "search_workspace")
+            .expect("workspace search");
+        assert_eq!(
+            search.input_schema["properties"]["limit"]["type"],
+            "integer"
+        );
+        assert_eq!(
+            search.input_schema["properties"]["kind"]["enum"],
+            json!(["definitions", "mentions", "files", "all"])
+        );
     }
 }

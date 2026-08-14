@@ -15,7 +15,10 @@ pub mod host;
 mod tools;
 
 pub use host::RegistryHost;
-pub use tools::{ToolDefinition, tool_definitions, tool_definitions_for};
+pub use tools::{
+    ToolDefinition, tool_definitions, tool_definitions_for, tool_definitions_for_with_workspace,
+    tool_definitions_with_workspace,
+};
 
 use serde_json::{Value, json};
 
@@ -243,8 +246,6 @@ mod tests {
             "release_agent",
             "create_worktree",
             "whoami",
-            "search_workspace",
-            "read_source",
         ] {
             assert!(
                 names.contains(&expected),
@@ -258,6 +259,8 @@ mod tests {
                 tool["name"]
             );
         }
+        assert!(!names.contains(&"search_workspace"));
+        assert!(!names.contains(&"read_source"));
     }
 
     #[test]

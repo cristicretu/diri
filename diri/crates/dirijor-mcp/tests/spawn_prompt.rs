@@ -263,6 +263,13 @@ fn production_bridge_scopes_workspace_navigation_to_its_calling_session() {
 
     let server = start_server(temp.path(), &fixture);
     let root = Bridge::new(server.socket_path().to_path_buf(), None);
+    assert!(
+        !root
+            .tool_definitions()
+            .expect("root tool catalog")
+            .iter()
+            .any(|tool| tool.name == "search_workspace")
+    );
     let spawned = root
         .call(
             "spawn_agent",
@@ -271,6 +278,13 @@ fn production_bridge_scopes_workspace_navigation_to_its_calling_session() {
         .expect("spawn local caller");
     let id = spawned["id"].as_str().expect("session id");
     let agent = Bridge::new(server.socket_path().to_path_buf(), Some(id.to_owned()));
+    assert!(
+        agent
+            .tool_definitions()
+            .expect("agent tool catalog")
+            .iter()
+            .any(|tool| tool.name == "search_workspace")
+    );
 
     let definitions = agent
         .call(

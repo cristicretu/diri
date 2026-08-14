@@ -209,10 +209,8 @@ fn an_agent_can_navigate_its_workspace_without_broad_terminal_scraping() {
         .spawn(spec("s_caller", "sleep 30", &logs), caller)
         .expect("spawn caller");
     let registry = Arc::new(Mutex::new(registry));
-    let server = McpServer::new(
-        tool_definitions(),
-        RegistryHost::new(Arc::clone(&registry), &logs).with_caller(Some("s_caller".into())),
-    );
+    let host = RegistryHost::new(Arc::clone(&registry), &logs).with_caller(Some("s_caller".into()));
+    let server = McpServer::new(host.tool_definitions(), host);
 
     let definitions = call(
         &server,
@@ -232,19 +230,19 @@ fn an_agent_can_navigate_its_workspace_without_broad_terminal_scraping() {
     assert_eq!(definitions["matches"][0]["path"], "src/lib.rs");
     assert_eq!(definitions["matches"][0]["line"], 1);
 
-    let references = call(
+    let mentions = call(
         &server,
         "search_workspace",
-        json!({"query": "DurableLedger", "kind": "references"}),
+        json!({"query": "DurableLedger", "kind": "mentions"}),
     )
-    .expect("references");
-    assert_eq!(references["matches"].as_array().expect("matches").len(), 2);
+    .expect("mentions");
+    assert_eq!(mentions["matches"].as_array().expect("matches").len(), 2);
     assert!(
-        references["matches"]
+        mentions["matches"]
             .as_array()
             .expect("matches")
             .iter()
-            .all(|hit| hit["kind"] == "reference")
+            .all(|hit| hit["kind"] == "mention")
     );
 
     let source = call(
@@ -257,6 +255,8 @@ fn an_agent_can_navigate_its_workspace_without_broad_terminal_scraping() {
     assert_eq!(source["focusLine"], 2);
     assert_eq!(source["lines"][1]["focus"], true);
     assert_eq!(source["lines"][1]["line"], 2);
+    assert_eq!(source["truncated"], false);
+    assert!(source["returnedBytes"].as_u64().is_some());
 
     let outside = tempfile::NamedTempFile::new().expect("outside");
     let error = call(&server, "read_source", json!({"path": outside.path()}))
@@ -264,6 +264,38 @@ fn an_agent_can_navigate_its_workspace_without_broad_terminal_scraping() {
     assert!(error.contains("outside the workspace"), "{error}");
 
     call(&server, "release_agent", json!({"session_id": "s_caller"})).expect("release caller");
+}
+
+#[test]
+fn remote_and_unidentified_callers_do_not_pay_for_local_workspace_tools() {
+    let temp = tempfile::tempdir().expect("temp");
+    let logs = temp.path().join("logs");
+    let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+    let mut caller = record("s_remote", None);
+    caller.cwd = "/remote/repository".into();
+    caller.host = Some("remote-host".into());
+    registry
+        .spawn(spec("s_remote", "sleep 30", &logs), caller)
+        .expect("spawn caller fixture");
+    let registry = Arc::new(Mutex::new(registry));
+
+    let remote =
+        RegistryHost::new(Arc::clone(&registry), &logs).with_caller(Some("s_remote".into()));
+    assert!(!remote.workspace_tools_available());
+    assert!(
+        !remote
+            .tool_definitions()
+            .iter()
+            .any(|tool| tool.name == "search_workspace")
+    );
+    let unidentified = RegistryHost::new(Arc::clone(&registry), &logs).with_caller(None);
+    assert!(!unidentified.workspace_tools_available());
+
+    let server = McpServer::new(remote.tool_definitions(), remote);
+    let error = call(&server, "search_workspace", json!({"query": "needle"}))
+        .expect_err("unadvertised remote tool");
+    assert!(error.contains("unknown tool"), "{error}");
+    call(&server, "release_agent", json!({"session_id": "s_remote"})).expect("release caller");
 }
 
 #[test]

@@ -9,18 +9,26 @@
 //! MCP callers run them on their request worker.
 
 use std::collections::{HashMap, HashSet};
+#[cfg(target_os = "macos")]
+use std::ffi::CStr;
 use std::ffi::OsString;
 use std::fmt;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
+use serde_json::{Value, json};
 
 /// Source files larger than this are not loaded into the native viewer.
 pub const MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
@@ -32,7 +40,31 @@ const MAX_SYMBOLS_PER_FILE: usize = 256;
 const MAX_AGENT_SEARCH_RESULTS: usize = 100;
 const MAX_SEARCH_CANDIDATES_PER_KIND: usize = 5_000;
 const MAX_EXCERPT_CONTEXT_LINES: usize = 100;
-const DEFAULT_INDEX_CACHE_AGE: Duration = Duration::from_secs(3);
+/// Agent source windows have their own strict context budget, independent of
+/// the native viewer's larger file-size policy.
+pub const MAX_AGENT_EXCERPT_BYTES: usize = 16 * 1024;
+const MAX_AGENT_EXCERPT_LINE_BYTES: usize = 4 * 1024;
+const MAX_AGENT_PATH_BYTES: usize = 512;
+const MAX_AGENT_PATH_ARGUMENT_CHARS: usize = 4 * 1024;
+const MAX_AGENT_ERROR_BYTES: usize = 1024;
+const MAX_DISCOVERY_PATH_BYTES: usize = 4 * 1024;
+const MAX_DISCOVERY_ENTRIES: usize = 250_000;
+const MAX_INDEX_SYMBOL_NAME_CHARS: usize = 256;
+const DEFAULT_INDEX_CACHE_AGE: Duration = Duration::from_secs(5 * 60);
+
+const GIT_REPOSITORY_ENVIRONMENT: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_PREFIX",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+];
 
 const IGNORED_DIRECTORIES: &[&str] = &[
     ".git",
@@ -60,6 +92,7 @@ pub struct CodeIntelligence {
     workspace_root: PathBuf,
     session_cwd: PathBuf,
     index: OnceLock<WorkspaceIndex>,
+    indexed_at: OnceLock<Instant>,
 }
 
 /// Small process-local cache for callers that issue several navigation tools
@@ -91,41 +124,291 @@ impl CodeIntelligenceCache {
         cwd: impl AsRef<Path>,
         refresh: bool,
     ) -> Result<Arc<CodeIntelligence>, CodeIntelligenceError> {
-        let candidate = CodeIntelligence::for_session(cwd)?;
+        self.for_session_at(cwd.as_ref(), refresh, Instant::now())
+    }
+
+    fn for_session_at(
+        &self,
+        cwd: &Path,
+        refresh: bool,
+        now: Instant,
+    ) -> Result<Arc<CodeIntelligence>, CodeIntelligenceError> {
+        let session_cwd = canonical_session_directory(cwd)?;
         let key = WorkspaceCacheKey {
-            workspace_root: candidate.workspace_root.clone(),
-            session_cwd: candidate.session_cwd.clone(),
+            session_cwd: session_cwd.clone(),
         };
-        let now = Instant::now();
-        let mut entries = self
-            .entries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        entries.retain(|_, entry| now.saturating_duration_since(entry.created_at) <= self.max_age);
-        if !refresh && let Some(entry) = entries.get(&key) {
-            return Ok(Arc::clone(&entry.intelligence));
+        if !refresh {
+            let mut entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            entries.retain(|_, entry| entry.intelligence.index_is_fresh(now, self.max_age));
+            if let Some(entry) = entries.get(&key) {
+                return Ok(Arc::clone(&entry.intelligence));
+            }
         }
-        let intelligence = Arc::new(candidate);
-        entries.insert(
-            key,
-            CachedIntelligence {
-                created_at: now,
-                intelligence: Arc::clone(&intelligence),
-            },
-        );
+
+        // Repository discovery stays outside the lock. Concurrent first
+        // callers may repeat that cheap lookup, but never serialize unrelated
+        // workspaces behind Git or filesystem I/O.
+        let intelligence = Arc::new(CodeIntelligence::for_canonical_session(session_cwd)?);
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                key,
+                CachedIntelligence {
+                    intelligence: Arc::clone(&intelligence),
+                },
+            );
         Ok(intelligence)
     }
+
+    /// Execute one model-facing workspace tool through the same parsing,
+    /// validation, bounds, and wire mapping in every MCP frontend.
+    pub fn call_workspace_tool(
+        &self,
+        cwd: impl AsRef<Path>,
+        tool: &str,
+        arguments: &Value,
+    ) -> Result<Value, String> {
+        match tool {
+            SEARCH_WORKSPACE_TOOL => {
+                validate_tool_arguments(arguments, &["query", "kind", "limit", "refresh"])?;
+                let query = required_tool_string(arguments, "query")?;
+                if query.chars().count() > 512 {
+                    return Err("query must contain at most 512 characters".to_string());
+                }
+                let kind_wire =
+                    optional_tool_string(arguments, "kind")?.unwrap_or_else(|| "all".to_string());
+                let kind = WorkspaceSearchKind::from_wire(&kind_wire).ok_or_else(|| {
+                    "kind must be one of definitions, mentions, files, or all".to_string()
+                })?;
+                let limit = bounded_tool_integer(arguments, "limit", 20, 1, 100)?;
+                let refresh = optional_tool_bool(arguments, "refresh")?.unwrap_or(false);
+                let intelligence = self
+                    .for_session(cwd, refresh)
+                    .map_err(bounded_agent_error)?;
+                let search = intelligence
+                    .search_workspace(&query, kind, limit)
+                    .map_err(bounded_agent_error)?;
+                let stats = intelligence.index_stats();
+                let (workspace, workspace_lossy, workspace_truncated) =
+                    wire_path(intelligence.workspace_root());
+                Ok(json!({
+                    "workspace": workspace,
+                    "workspacePathLossy": workspace_lossy,
+                    "workspacePathTruncated": workspace_truncated,
+                    "query": query,
+                    "kind": kind_wire,
+                    "truncated": search.truncated,
+                    "coverage": {
+                        "files": stats.files,
+                        "searchableFiles": stats.searchable_files,
+                        "definitions": stats.definitions,
+                        "searchableBytes": stats.searchable_bytes,
+                        "fileListTruncated": stats.file_list_truncated,
+                        "textIndexTruncated": stats.text_index_truncated,
+                    },
+                    "matches": search.matches.into_iter().map(|hit| {
+                        let (path, path_lossy, path_truncated) = wire_path(&hit.relative_path);
+                        json!({
+                            "path": path,
+                            "pathLossy": path_lossy,
+                            "pathTruncated": path_truncated,
+                            "kind": hit.kind.as_str(),
+                            "line": hit.line,
+                            "preview": hit.preview,
+                        })
+                    }).collect::<Vec<_>>(),
+                }))
+            }
+            READ_SOURCE_TOOL => {
+                validate_tool_arguments(arguments, &["path", "line", "context_lines"])?;
+                let path = required_tool_string(arguments, "path")?;
+                if path.chars().count() > MAX_AGENT_PATH_ARGUMENT_CHARS {
+                    return Err(format!(
+                        "path must contain at most {MAX_AGENT_PATH_ARGUMENT_CHARS} characters"
+                    ));
+                }
+                let line = optional_tool_integer(arguments, "line", 1, usize::MAX)?;
+                let context_lines = bounded_tool_integer(
+                    arguments,
+                    "context_lines",
+                    12,
+                    0,
+                    MAX_EXCERPT_CONTEXT_LINES,
+                )?;
+                let intelligence = self.for_session(cwd, false).map_err(bounded_agent_error)?;
+                let excerpt = intelligence
+                    .source_excerpt(&path, line, context_lines)
+                    .map_err(bounded_agent_error)?;
+                let (workspace, workspace_lossy, workspace_truncated) =
+                    wire_path(intelligence.workspace_root());
+                let (path, path_lossy, path_truncated) = wire_path(&excerpt.relative_path);
+                Ok(json!({
+                    "workspace": workspace,
+                    "workspacePathLossy": workspace_lossy,
+                    "workspacePathTruncated": workspace_truncated,
+                    "path": path,
+                    "pathLossy": path_lossy,
+                    "pathTruncated": path_truncated,
+                    "language": excerpt.language.as_str(),
+                    "focusLine": excerpt.focus_line,
+                    "truncated": excerpt.truncated,
+                    "returnedBytes": excerpt.returned_bytes,
+                    "maxBytes": excerpt.max_bytes,
+                    "requestedStartLine": excerpt.requested_start_line,
+                    "requestedEndLine": excerpt.requested_end_line,
+                    "lines": excerpt.lines.into_iter().map(|source| json!({
+                        "line": source.number,
+                        "text": source.text,
+                        "focus": source.number == excerpt.focus_line,
+                        "truncated": source.truncated,
+                    })).collect::<Vec<_>>(),
+                }))
+            }
+            _ => Err("unknown workspace tool".to_string()),
+        }
+    }
+}
+
+pub const SEARCH_WORKSPACE_TOOL: &str = "search_workspace";
+pub const READ_SOURCE_TOOL: &str = "read_source";
+
+#[derive(Clone, Debug)]
+pub struct WorkspaceToolDefinition {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub input_schema: Value,
+}
+
+pub fn workspace_tool_definitions() -> Vec<WorkspaceToolDefinition> {
+    vec![
+        WorkspaceToolDefinition {
+            name: SEARCH_WORKSPACE_TOOL,
+            description: "Navigate the calling agent's local repository with Diri's bounded, git-aware index. Definitions are declaration heuristics; mentions are honest literal text matches and may include comments, strings, and documentation (they are not structural callers); files are ranked paths. Prefer this over broad grep when locating a declaration or narrowing where to edit. A lossy/truncated path is display-only; use the shell for that rare filename.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "minLength": 2, "maxLength": 512, "description": "Symbol, identifier, text, or path fragment." },
+                    "kind": { "type": "string", "enum": ["definitions", "mentions", "files", "all"], "default": "all" },
+                    "limit": { "type": "integer", "default": 20, "minimum": 1, "maximum": 100 },
+                    "refresh": { "type": "boolean", "default": false, "description": "Rebuild the bounded index now; use after edits when immediate freshness matters." }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+        },
+        WorkspaceToolDefinition {
+            name: READ_SOURCE_TOOL,
+            description: "Read a small, byte-bounded numbered source window inside the calling agent's local repository. Use a path returned by search_workspace, optionally centered on its line. The result reports truncation; paths outside the workspace, binary files, and oversized files are rejected.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "minLength": 1, "maxLength": MAX_AGENT_PATH_ARGUMENT_CHARS },
+                    "line": { "type": "integer", "minimum": 1 },
+                    "context_lines": { "type": "integer", "default": 12, "minimum": 0, "maximum": MAX_EXCERPT_CONTEXT_LINES }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        },
+    ]
+}
+
+pub fn is_workspace_tool(name: &str) -> bool {
+    matches!(name, SEARCH_WORKSPACE_TOOL | READ_SOURCE_TOOL)
+}
+
+fn validate_tool_arguments(arguments: &Value, allowed: &[&str]) -> Result<(), String> {
+    let object = arguments
+        .as_object()
+        .ok_or_else(|| "tool arguments must be an object".to_string())?;
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err("tool arguments contain an unknown field".to_string());
+    }
+    Ok(())
+}
+
+fn required_tool_string(arguments: &Value, key: &str) -> Result<String, String> {
+    arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{key} must be a non-empty string"))
+}
+
+fn optional_tool_string(arguments: &Value, key: &str) -> Result<Option<String>, String> {
+    match arguments.get(key) {
+        None => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(|value| Some(value.to_owned()))
+            .ok_or_else(|| format!("{key} must be a string")),
+    }
+}
+
+fn optional_tool_bool(arguments: &Value, key: &str) -> Result<Option<bool>, String> {
+    match arguments.get(key) {
+        None => Ok(None),
+        Some(value) => value
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| format!("{key} must be a boolean")),
+    }
+}
+
+fn bounded_tool_integer(
+    arguments: &Value,
+    key: &str,
+    default: usize,
+    minimum: usize,
+    maximum: usize,
+) -> Result<usize, String> {
+    Ok(optional_tool_integer(arguments, key, minimum, maximum)?.unwrap_or(default))
+}
+
+fn optional_tool_integer(
+    arguments: &Value,
+    key: &str,
+    minimum: usize,
+    maximum: usize,
+) -> Result<Option<usize>, String> {
+    let Some(value) = arguments.get(key) else {
+        return Ok(None);
+    };
+    let integer = value
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| format!("{key} must be an integer"))?;
+    if !(minimum..=maximum).contains(&integer) {
+        return Err(format!("{key} must be between {minimum} and {maximum}"));
+    }
+    Ok(Some(integer))
+}
+
+fn wire_path(path: &Path) -> (String, bool, bool) {
+    let (display, lossy) = match path.to_str() {
+        Some(path) => (path.to_string(), false),
+        None => (path.to_string_lossy().into_owned(), true),
+    };
+    let (display, truncated) = truncate_utf8_bytes(&display, MAX_AGENT_PATH_BYTES);
+    (display, lossy, truncated)
+}
+
+fn bounded_agent_error(error: impl fmt::Display) -> String {
+    truncate_utf8_bytes(&error.to_string(), MAX_AGENT_ERROR_BYTES).0
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct WorkspaceCacheKey {
-    workspace_root: PathBuf,
     session_cwd: PathBuf,
 }
 
 #[derive(Debug)]
 struct CachedIntelligence {
-    created_at: Instant,
     intelligence: Arc<CodeIntelligence>,
 }
 
@@ -135,34 +418,16 @@ impl CodeIntelligence {
     /// Indexing is lazy: terminal references can open immediately, while the
     /// file tree and search index are built on their first use.
     pub fn for_session(cwd: impl AsRef<Path>) -> Result<Self, CodeIntelligenceError> {
-        let requested = cwd.as_ref();
-        let canonical = fs::canonicalize(requested).map_err(|error| {
-            CodeIntelligenceError::WorkspaceUnavailable {
-                path: requested.to_path_buf(),
-                message: error.to_string(),
-            }
-        })?;
-        let session_cwd = if canonical.is_file() {
-            canonical.parent().map(Path::to_path_buf).ok_or_else(|| {
-                CodeIntelligenceError::WorkspaceUnavailable {
-                    path: canonical.clone(),
-                    message: "the session path has no parent directory".to_string(),
-                }
-            })?
-        } else if canonical.is_dir() {
-            canonical
-        } else {
-            return Err(CodeIntelligenceError::WorkspaceUnavailable {
-                path: canonical,
-                message: "the session path is not a directory".to_string(),
-            });
-        };
+        Self::for_canonical_session(canonical_session_directory(cwd.as_ref())?)
+    }
 
+    fn for_canonical_session(session_cwd: PathBuf) -> Result<Self, CodeIntelligenceError> {
         let workspace_root = discover_workspace_root(&session_cwd)?;
         Ok(Self {
             workspace_root,
             session_cwd,
             index: OnceLock::new(),
+            indexed_at: OnceLock::new(),
         })
     }
 
@@ -171,7 +436,19 @@ impl CodeIntelligence {
     }
 
     fn index(&self) -> &WorkspaceIndex {
-        self.index.get_or_init(|| build_index(&self.workspace_root))
+        self.index.get_or_init(|| {
+            let index = build_index(&self.workspace_root);
+            // Freshness starts when the expensive snapshot is complete, not
+            // when its lazy container was inserted into the cache.
+            let _ = self.indexed_at.set(Instant::now());
+            index
+        })
+    }
+
+    fn index_is_fresh(&self, now: Instant, max_age: Duration) -> bool {
+        self.indexed_at
+            .get()
+            .is_none_or(|indexed_at| now.saturating_duration_since(*indexed_at) <= max_age)
     }
 
     /// Describe the bounded corpus backing agent searches so callers can tell
@@ -183,6 +460,8 @@ impl CodeIntelligence {
             searchable_files: index.texts.len(),
             definitions: index.symbols.len(),
             searchable_bytes: index.searchable_bytes,
+            file_list_truncated: index.file_list_truncated,
+            text_index_truncated: index.text_index_truncated,
         }
     }
 
@@ -320,10 +599,10 @@ impl CodeIntelligence {
     /// Search the bounded workspace corpus with an explicit semantic intent.
     ///
     /// Definition results come from declaration-aware language heuristics,
-    /// references are literal identifier/text occurrences that are not that
-    /// definition, and files are ranked paths. This is deliberately a compact
-    /// navigation primitive rather than an LSP replacement: callers can ask a
-    /// precise question without receiving an unbounded repository dump.
+    /// mentions are honest literal text occurrences that are not an exact
+    /// declaration line, including comments, strings, and documentation; they
+    /// are not structural callers. Files are ranked paths. This is deliberately
+    /// a compact navigation primitive rather than an LSP replacement.
     pub fn search_workspace(
         &self,
         query: &str,
@@ -379,9 +658,9 @@ impl CodeIntelligence {
 
         if matches!(
             kind,
-            WorkspaceSearchKind::References | WorkspaceSearchKind::All
+            WorkspaceSearchKind::Mentions | WorkspaceSearchKind::All
         ) {
-            let reference_start = results.len();
+            let mention_start = results.len();
             let definition_lines: HashSet<_> = index
                 .symbols
                 .iter()
@@ -402,21 +681,20 @@ impl CodeIntelligence {
                     let path_bonus = path_score(query, &source.display_path)
                         .unwrap_or(0)
                         .min(500);
-                    if results.len().saturating_sub(reference_start)
-                        >= MAX_SEARCH_CANDIDATES_PER_KIND
+                    if results.len().saturating_sub(mention_start) >= MAX_SEARCH_CANDIDATES_PER_KIND
                     {
                         truncated = true;
                         break;
                     }
                     results.push(WorkspaceMatch {
                         relative_path: source.relative_path.clone(),
-                        kind: WorkspaceMatchKind::Reference,
+                        kind: WorkspaceMatchKind::Mention,
                         line: Some(line_number),
                         preview: excerpt(line.trim(), 180),
                         score: 2_000 + u32::from(identifier) * 1_000 + path_bonus,
                     });
                 }
-                if results.len().saturating_sub(reference_start) >= MAX_SEARCH_CANDIDATES_PER_KIND {
+                if results.len().saturating_sub(mention_start) >= MAX_SEARCH_CANDIDATES_PER_KIND {
                     break;
                 }
             }
@@ -481,19 +759,61 @@ impl CodeIntelligence {
         let end = focus_line
             .saturating_add(context_lines)
             .min(snapshot.lines.len());
-        let lines = snapshot.lines[start - 1..end]
-            .iter()
-            .map(|line| SourceExcerptLine {
+        let mut lines = Vec::new();
+        let mut returned_bytes = 0usize;
+        let mut content_truncated = false;
+        let focus_index = focus_line - 1;
+
+        let mut add_line = |index: usize| {
+            let line = &snapshot.lines[index];
+            let source = sanitize_agent_text(&snapshot.text[line.range.clone()]);
+            let remaining = MAX_AGENT_EXCERPT_BYTES.saturating_sub(returned_bytes);
+            if remaining == 0 && !source.is_empty() {
+                return false;
+            }
+            let (text, truncated) =
+                truncate_utf8_bytes(&source, remaining.min(MAX_AGENT_EXCERPT_LINE_BYTES));
+            returned_bytes = returned_bytes.saturating_add(text.len());
+            content_truncated |= truncated;
+            lines.push(SourceExcerptLine {
                 number: line.number,
-                text: snapshot.text[line.range.clone()].to_string(),
-            })
-            .collect();
+                text,
+                truncated,
+            });
+            true
+        };
+
+        // Spend the budget at the focus first, then expand symmetrically. A
+        // giant generated line above the target can never crowd the target out.
+        add_line(focus_index);
+        for distance in 1..=context_lines {
+            let mut added = false;
+            if let Some(index) = focus_index.checked_sub(distance)
+                && index >= start - 1
+            {
+                added |= add_line(index);
+            }
+            let index = focus_index.saturating_add(distance);
+            if index < end {
+                added |= add_line(index);
+            }
+            if !added {
+                break;
+            }
+        }
+        lines.sort_by_key(|line| line.number);
+        let truncated = content_truncated || lines.len() < end.saturating_sub(start - 1);
 
         Ok(SourceExcerpt {
             relative_path: snapshot.relative_path,
             language: snapshot.language,
             focus_line,
             lines,
+            requested_start_line: start,
+            requested_end_line: end,
+            returned_bytes,
+            max_bytes: MAX_AGENT_EXCERPT_BYTES,
+            truncated,
         })
     }
 
@@ -536,56 +856,52 @@ impl CodeIntelligence {
         &self,
         reference: ResolvedReference,
     ) -> Result<SourceSnapshot, CodeIntelligenceError> {
-        let metadata =
-            fs::metadata(&reference.absolute_path).map_err(|error| CodeIntelligenceError::Io {
-                path: reference.absolute_path.clone(),
-                operation: "inspect",
-                message: error.to_string(),
-            })?;
+        let (file, absolute_path, metadata) =
+            open_contained_file(&self.workspace_root, &reference.absolute_path)?;
+        let relative_path = absolute_path
+            .strip_prefix(&self.workspace_root)
+            .expect("opened file containment was checked")
+            .to_path_buf();
         if metadata.len() > MAX_SOURCE_BYTES {
             return Err(CodeIntelligenceError::TooLarge {
-                path: reference.absolute_path,
+                path: absolute_path,
                 size: metadata.len(),
                 limit: MAX_SOURCE_BYTES,
             });
         }
 
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        File::open(&reference.absolute_path)
-            .and_then(|file| {
-                file.take(MAX_SOURCE_BYTES + 1)
-                    .read_to_end(&mut bytes)
-                    .map(|_| ())
-            })
+        file.take(MAX_SOURCE_BYTES + 1)
+            .read_to_end(&mut bytes)
             .map_err(|error| CodeIntelligenceError::Io {
-                path: reference.absolute_path.clone(),
+                path: absolute_path.clone(),
                 operation: "read",
                 message: error.to_string(),
             })?;
         if bytes.len() as u64 > MAX_SOURCE_BYTES {
             return Err(CodeIntelligenceError::TooLarge {
-                path: reference.absolute_path,
+                path: absolute_path,
                 size: bytes.len() as u64,
                 limit: MAX_SOURCE_BYTES,
             });
         }
         if bytes.contains(&0) {
             return Err(CodeIntelligenceError::BinaryFile {
-                path: reference.absolute_path,
+                path: absolute_path,
             });
         }
         let text = String::from_utf8(bytes).map_err(|_| CodeIntelligenceError::NotUtf8 {
-            path: reference.absolute_path.clone(),
+            path: absolute_path.clone(),
         })?;
         let lines = source_lines(&text);
         let target = reference
             .target
             .map(|target| clamp_target(target, &text, &lines));
-        let language = SourceLanguage::from_path(&reference.relative_path);
+        let language = SourceLanguage::from_path(&relative_path);
 
         Ok(SourceSnapshot {
-            absolute_path: reference.absolute_path,
-            relative_path: reference.relative_path,
+            absolute_path,
+            relative_path,
             language,
             text,
             lines,
@@ -594,12 +910,106 @@ impl CodeIntelligence {
     }
 }
 
+/// Open first, then ask the kernel which object the handle actually names.
+/// This closes the canonicalize/open race: later path swaps cannot change the
+/// already-open handle we validate and read from.
+fn open_contained_file(
+    workspace_root: &Path,
+    requested: &Path,
+) -> Result<(File, PathBuf, fs::Metadata), CodeIntelligenceError> {
+    open_contained_file_with(workspace_root, requested, || {})
+}
+
+fn open_contained_file_with(
+    workspace_root: &Path,
+    requested: &Path,
+    after_open: impl FnOnce(),
+) -> Result<(File, PathBuf, fs::Metadata), CodeIntelligenceError> {
+    let file = open_source_handle(requested).map_err(|error| CodeIntelligenceError::Io {
+        path: requested.to_path_buf(),
+        operation: "open",
+        message: error.to_string(),
+    })?;
+    let opened_metadata = file.metadata().map_err(|error| CodeIntelligenceError::Io {
+        path: requested.to_path_buf(),
+        operation: "inspect opened file",
+        message: error.to_string(),
+    })?;
+    after_open();
+    let opened_path = opened_file_path(&file, requested)?;
+    if !opened_path.starts_with(workspace_root) {
+        return Err(CodeIntelligenceError::OutsideWorkspace { path: opened_path });
+    }
+    if !opened_metadata.is_file() {
+        return Err(CodeIntelligenceError::PathChangedDuringRead {
+            path: requested.to_path_buf(),
+        });
+    }
+    Ok((file, opened_path, opened_metadata))
+}
+
+#[cfg(unix)]
+fn open_source_handle(requested: &Path) -> io::Result<File> {
+    // Resolution already canonicalized source-viewer paths, and discovery
+    // rejects indexed symlinks. Refusing a last-component symlink here closes
+    // the most useful swap window before the descriptor exists. Nonblocking
+    // mode also prevents a raced FIFO from hanging an MCP worker before
+    // handle-path and regular-file validation can reject it.
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(requested)
+}
+
+#[cfg(not(unix))]
+fn open_source_handle(requested: &Path) -> io::Result<File> {
+    File::open(requested)
+}
+
+#[cfg(target_os = "linux")]
+fn opened_file_path(file: &File, requested: &Path) -> Result<PathBuf, CodeIntelligenceError> {
+    fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).map_err(|_| {
+        CodeIntelligenceError::PathChangedDuringRead {
+            path: requested.to_path_buf(),
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn opened_file_path(file: &File, requested: &Path) -> Result<PathBuf, CodeIntelligenceError> {
+    let mut buffer = vec![0i8; libc::PATH_MAX as usize];
+    // SAFETY: F_GETPATH writes at most PATH_MAX bytes to the valid writable
+    // buffer, and `file` keeps the descriptor alive for the duration.
+    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr()) };
+    if result == -1 {
+        return Err(CodeIntelligenceError::PathChangedDuringRead {
+            path: requested.to_path_buf(),
+        });
+    }
+    // SAFETY: a successful F_GETPATH writes a nul-terminated C string.
+    let bytes = unsafe { CStr::from_ptr(buffer.as_ptr()) }
+        .to_bytes()
+        .to_vec();
+    Ok(PathBuf::from(OsString::from_vec(bytes)))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn opened_file_path(_file: &File, requested: &Path) -> Result<PathBuf, CodeIntelligenceError> {
+    Err(CodeIntelligenceError::Io {
+        path: requested.to_path_buf(),
+        operation: "validate opened file",
+        message: "race-resistant contained reads are unavailable on this platform".to_string(),
+    })
+}
+
 #[derive(Clone, Debug)]
 struct WorkspaceIndex {
     files: Vec<IndexedFile>,
     symbols: Vec<IndexedSymbol>,
     texts: Vec<IndexedTextFile>,
     searchable_bytes: u64,
+    file_list_truncated: bool,
+    text_index_truncated: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -672,7 +1082,7 @@ pub enum SearchHitKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkspaceSearchKind {
     Definitions,
-    References,
+    Mentions,
     Files,
     All,
 }
@@ -681,7 +1091,7 @@ impl WorkspaceSearchKind {
     pub fn from_wire(value: &str) -> Option<Self> {
         match value {
             "definitions" => Some(Self::Definitions),
-            "references" => Some(Self::References),
+            "mentions" => Some(Self::Mentions),
             "files" => Some(Self::Files),
             "all" => Some(Self::All),
             _ => None,
@@ -713,12 +1123,14 @@ pub struct WorkspaceIndexStats {
     pub searchable_files: usize,
     pub definitions: usize,
     pub searchable_bytes: u64,
+    pub file_list_truncated: bool,
+    pub text_index_truncated: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum WorkspaceMatchKind {
     Definition,
-    Reference,
+    Mention,
     File,
 }
 
@@ -726,7 +1138,7 @@ impl WorkspaceMatchKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Definition => "definition",
-            Self::Reference => "reference",
+            Self::Mention => "mention",
             Self::File => "file",
         }
     }
@@ -738,12 +1150,18 @@ pub struct SourceExcerpt {
     pub language: SourceLanguage,
     pub focus_line: usize,
     pub lines: Vec<SourceExcerptLine>,
+    pub requested_start_line: usize,
+    pub requested_end_line: usize,
+    pub returned_bytes: usize,
+    pub max_bytes: usize,
+    pub truncated: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceExcerptLine {
     pub number: usize,
     pub text: String,
+    pub truncated: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -871,6 +1289,9 @@ pub enum CodeIntelligenceError {
     NotAFile {
         path: PathBuf,
     },
+    PathChangedDuringRead {
+        path: PathBuf,
+    },
     TooLarge {
         path: PathBuf,
         size: u64,
@@ -918,6 +1339,11 @@ impl fmt::Display for CodeIntelligenceError {
             Self::NotAFile { path } => {
                 write!(formatter, "Path is not a file: {}", path.display())
             }
+            Self::PathChangedDuringRead { path } => write!(
+                formatter,
+                "Refusing to read {} because it changed while being opened",
+                path.display()
+            ),
             Self::TooLarge { path, size, limit } => write!(
                 formatter,
                 "{} is too large for the source viewer ({size} bytes; limit {limit})",
@@ -958,9 +1384,44 @@ struct ParsedReference {
     target: Option<SourceTarget>,
 }
 
+fn canonical_session_directory(requested: &Path) -> Result<PathBuf, CodeIntelligenceError> {
+    let canonical = fs::canonicalize(requested).map_err(|error| {
+        CodeIntelligenceError::WorkspaceUnavailable {
+            path: requested.to_path_buf(),
+            message: error.to_string(),
+        }
+    })?;
+    if canonical.is_file() {
+        canonical.parent().map(Path::to_path_buf).ok_or_else(|| {
+            CodeIntelligenceError::WorkspaceUnavailable {
+                path: canonical.clone(),
+                message: "the session path has no parent directory".to_string(),
+            }
+        })
+    } else if canonical.is_dir() {
+        Ok(canonical)
+    } else {
+        Err(CodeIntelligenceError::WorkspaceUnavailable {
+            path: canonical,
+            message: "the session path is not a directory".to_string(),
+        })
+    }
+}
+
+fn git_command(current_dir: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .current_dir(current_dir)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    for variable in GIT_REPOSITORY_ENVIRONMENT {
+        command.env_remove(variable);
+    }
+    command
+}
+
 fn discover_workspace_root(session_cwd: &Path) -> Result<PathBuf, CodeIntelligenceError> {
-    if let Ok(output) = Command::new("git")
-        .current_dir(session_cwd)
+    if let Ok(output) = git_command(session_cwd)
         .args(["rev-parse", "--show-toplevel"])
         .output()
         && output.status.success()
@@ -968,32 +1429,63 @@ fn discover_workspace_root(session_cwd: &Path) -> Result<PathBuf, CodeIntelligen
         let root = String::from_utf8_lossy(&output.stdout);
         let root = root.trim();
         if !root.is_empty() {
-            return fs::canonicalize(root).map_err(|error| {
+            let canonical = fs::canonicalize(root).map_err(|error| {
                 CodeIntelligenceError::WorkspaceUnavailable {
                     path: PathBuf::from(root),
                     message: error.to_string(),
                 }
-            });
+            })?;
+            // Git environment/configuration must never widen a session into
+            // an unrelated tree. A repository root is valid only as a real
+            // ancestor of the canonical session directory.
+            if valid_workspace_root(session_cwd, &canonical) {
+                return Ok(canonical);
+            }
         }
     }
 
     for ancestor in session_cwd.ancestors() {
-        if ancestor.join(".git").exists() {
+        if has_git_marker(ancestor) {
             return Ok(ancestor.to_path_buf());
         }
     }
     Ok(session_cwd.to_path_buf())
 }
 
+fn valid_workspace_root(session_cwd: &Path, candidate: &Path) -> bool {
+    candidate.is_dir() && session_cwd.starts_with(candidate) && has_git_marker(candidate)
+}
+
+fn has_git_marker(candidate: &Path) -> bool {
+    fs::symlink_metadata(candidate.join(".git")).is_ok_and(|metadata| {
+        !metadata.file_type().is_symlink()
+            && (metadata.file_type().is_dir() || metadata.file_type().is_file())
+    })
+}
+
+fn safe_relative_path(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+struct PathDiscovery {
+    paths: Vec<PathBuf>,
+    truncated: bool,
+}
+
 fn build_index(workspace_root: &Path) -> WorkspaceIndex {
-    let paths = git_paths(workspace_root).unwrap_or_else(|| filesystem_paths(workspace_root));
-    let mut files = Vec::with_capacity(paths.len());
+    let discovery = git_paths(workspace_root).unwrap_or_else(|| filesystem_paths(workspace_root));
+    let mut files = Vec::with_capacity(discovery.paths.len());
     let mut symbols = Vec::new();
     let mut texts = Vec::new();
     let mut indexed_bytes = 0u64;
+    let mut text_index_truncated = false;
 
-    for relative_path in paths {
-        if files.len() >= MAX_INDEX_FILES || ignored_path(&relative_path) {
+    for relative_path in discovery.paths {
+        if !safe_relative_path(&relative_path) {
             continue;
         }
         let absolute_path = workspace_root.join(&relative_path);
@@ -1010,11 +1502,17 @@ fn build_index(workspace_root: &Path) -> WorkspaceIndex {
             relative_path: relative_path.clone(),
             display_path: display_path.clone(),
         });
-        if metadata.len() <= MAX_SYMBOL_BYTES
-            && indexed_bytes.saturating_add(metadata.len()) <= MAX_TEXT_INDEX_BYTES
-            && let Some(text) = read_indexable_text(&absolute_path)
+        if indexed_bytes >= MAX_TEXT_INDEX_BYTES {
+            text_index_truncated = true;
+        } else if metadata.len() <= MAX_SYMBOL_BYTES
+            && let Some(text) = read_indexable_text(workspace_root, &absolute_path)
         {
-            indexed_bytes = indexed_bytes.saturating_add(metadata.len());
+            let text_bytes = text.len() as u64;
+            if indexed_bytes.saturating_add(text_bytes) > MAX_TEXT_INDEX_BYTES {
+                text_index_truncated = true;
+                continue;
+            }
+            indexed_bytes = indexed_bytes.saturating_add(text_bytes);
             if language != SourceLanguage::PlainText || is_symbol_text_file(&relative_path) {
                 symbols.extend(index_symbols(&text, &relative_path, language));
             }
@@ -1038,12 +1536,32 @@ fn build_index(workspace_root: &Path) -> WorkspaceIndex {
         symbols,
         texts,
         searchable_bytes: indexed_bytes,
+        file_list_truncated: discovery.truncated,
+        text_index_truncated,
     }
 }
 
-fn git_paths(workspace_root: &Path) -> Option<Vec<PathBuf>> {
-    let output = Command::new("git")
-        .current_dir(workspace_root)
+fn git_paths(workspace_root: &Path) -> Option<PathDiscovery> {
+    git_paths_with_limits(workspace_root, MAX_INDEX_FILES, MAX_DISCOVERY_ENTRIES)
+}
+
+#[cfg(test)]
+fn git_paths_with_limit(workspace_root: &Path, max_files: usize) -> Option<PathDiscovery> {
+    git_paths_with_limits(workspace_root, max_files, MAX_DISCOVERY_ENTRIES)
+}
+
+fn git_paths_with_limits(
+    workspace_root: &Path,
+    max_files: usize,
+    max_entries: usize,
+) -> Option<PathDiscovery> {
+    if max_files == 0 || max_entries == 0 {
+        return Some(PathDiscovery {
+            paths: Vec::new(),
+            truncated: true,
+        });
+    }
+    let mut child = git_command(workspace_root)
         .args([
             "ls-files",
             "--cached",
@@ -1051,21 +1569,71 @@ fn git_paths(workspace_root: &Path) -> Option<Vec<PathBuf>> {
             "--exclude-standard",
             "-z",
         ])
-        .output()
+        .stdout(Stdio::piped())
+        .spawn()
         .ok()?;
-    if !output.status.success() {
-        return None;
+    let mut stdout = child.stdout.take()?;
+    let mut paths = Vec::new();
+    let mut current = Vec::new();
+    let mut oversized = false;
+    let mut truncated = false;
+    let mut entries_seen = 0usize;
+    let mut buffer = [0u8; 8 * 1024];
+
+    'output: loop {
+        let read = match stdout.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        };
+        for byte in &buffer[..read] {
+            if *byte == 0 {
+                entries_seen = entries_seen.saturating_add(1);
+                if !current.is_empty() && !oversized {
+                    let path = bytes_to_path(&current);
+                    if safe_relative_path(&path) && !ignored_path(&path) {
+                        paths.push(path);
+                        if paths.len() >= max_files {
+                            truncated = true;
+                            break 'output;
+                        }
+                    }
+                } else if oversized {
+                    truncated = true;
+                }
+                current.clear();
+                oversized = false;
+                if entries_seen >= max_entries {
+                    truncated = true;
+                    break 'output;
+                }
+            } else if current.len() < MAX_DISCOVERY_PATH_BYTES {
+                current.push(*byte);
+            } else {
+                oversized = true;
+            }
+        }
     }
 
-    Some(
-        output
-            .stdout
-            .split(|byte| *byte == 0)
-            .filter(|path| !path.is_empty())
-            .take(MAX_INDEX_FILES)
-            .map(bytes_to_path)
-            .collect(),
-    )
+    if !current.is_empty() || oversized {
+        // `git ls-files -z` always terminates paths. Treat malformed or
+        // abruptly-ended output as incomplete instead of accepting it as a
+        // complete repository snapshot.
+        truncated = true;
+    }
+
+    drop(stdout);
+    if truncated {
+        let _ = child.kill();
+        let _ = child.wait();
+    } else if !child.wait().ok()?.success() {
+        return None;
+    }
+    Some(PathDiscovery { paths, truncated })
 }
 
 #[cfg(unix)]
@@ -1078,20 +1646,40 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
-fn filesystem_paths(workspace_root: &Path) -> Vec<PathBuf> {
+fn filesystem_paths(workspace_root: &Path) -> PathDiscovery {
+    filesystem_paths_with_limits(workspace_root, MAX_INDEX_FILES, MAX_DISCOVERY_ENTRIES)
+}
+
+fn filesystem_paths_with_limits(
+    workspace_root: &Path,
+    max_files: usize,
+    max_entries: usize,
+) -> PathDiscovery {
+    if max_files == 0 || max_entries == 0 {
+        return PathDiscovery {
+            paths: Vec::new(),
+            truncated: true,
+        };
+    }
     let mut result = Vec::new();
     let mut pending = vec![workspace_root.to_path_buf()];
+    let mut truncated = false;
+    let mut entries_seen = 0usize;
 
-    while let Some(directory) = pending.pop() {
-        if result.len() >= MAX_INDEX_FILES {
+    'walk: while let Some(directory) = pending.pop() {
+        if result.len() >= max_files {
+            truncated = true;
             break;
         }
         let Ok(entries) = fs::read_dir(&directory) else {
             continue;
         };
-        let mut entries: Vec<_> = entries.flatten().collect();
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries.into_iter().rev() {
+        for entry in entries.flatten() {
+            entries_seen = entries_seen.saturating_add(1);
+            if entries_seen > max_entries {
+                truncated = true;
+                break 'walk;
+            }
             let path = entry.path();
             let Ok(relative) = path.strip_prefix(workspace_root) else {
                 continue;
@@ -1106,16 +1694,24 @@ fn filesystem_paths(workspace_root: &Path) -> Vec<PathBuf> {
                 continue;
             }
             if file_type.is_dir() {
-                pending.push(path);
+                if pending.len() < max_entries {
+                    pending.push(path);
+                } else {
+                    truncated = true;
+                }
             } else if file_type.is_file() {
                 result.push(relative.to_path_buf());
-                if result.len() >= MAX_INDEX_FILES {
+                if result.len() >= max_files {
+                    truncated = true;
                     break;
                 }
             }
         }
     }
-    result
+    PathDiscovery {
+        paths: result,
+        truncated,
+    }
 }
 
 fn ignored_path(path: &Path) -> bool {
@@ -1130,10 +1726,19 @@ fn ignored_path(path: &Path) -> bool {
     })
 }
 
-fn read_indexable_text(absolute_path: &Path) -> Option<String> {
-    let file = File::open(absolute_path).ok()?;
+fn read_indexable_text(workspace_root: &Path, absolute_path: &Path) -> Option<String> {
+    let (file, _, metadata) = open_contained_file(workspace_root, absolute_path).ok()?;
+    if metadata.len() > MAX_SYMBOL_BYTES {
+        return None;
+    }
     let mut bytes = Vec::new();
-    if file.take(MAX_SYMBOL_BYTES).read_to_end(&mut bytes).is_err() || bytes.contains(&0) {
+    if file
+        .take(MAX_SYMBOL_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() as u64 > MAX_SYMBOL_BYTES
+        || bytes.contains(&0)
+    {
         return None;
     }
     String::from_utf8(bytes).ok()
@@ -1270,6 +1875,7 @@ fn symbol_name(line: &str, language: SourceLanguage) -> Option<String> {
             character.is_alphanumeric()
                 || matches!(character, '_' | '-' | '.' | ':' | '<' | '>' | '?')
         })
+        .take(MAX_INDEX_SYMBOL_NAME_CHARS)
         .collect();
     (!name.is_empty()).then_some(name)
 }
@@ -1626,6 +2232,42 @@ fn excerpt(text: &str, max_characters: usize) -> String {
     result
 }
 
+fn sanitize_agent_text(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character == '\t' || !character.is_control() {
+                character
+            } else {
+                '\u{fffd}'
+            }
+        })
+        .collect()
+}
+
+fn truncate_utf8_bytes(text: &str, max_bytes: usize) -> (String, bool) {
+    if text.len() <= max_bytes {
+        return (text.to_string(), false);
+    }
+    if max_bytes == 0 {
+        return (String::new(), true);
+    }
+
+    let (content_limit, ellipsis) = if max_bytes >= '…'.len_utf8() {
+        (max_bytes - '…'.len_utf8(), true)
+    } else {
+        (max_bytes, false)
+    };
+    let mut end = content_limit.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut result = text[..end].to_string();
+    if ellipsis {
+        result.push('…');
+    }
+    (result, true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1779,7 +2421,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_search_distinguishes_definitions_references_and_files() {
+    fn agent_search_distinguishes_definitions_mentions_and_files() {
         let workspace = workspace();
         write(
             &workspace.path().join("src/lib.rs"),
@@ -1804,18 +2446,18 @@ mod tests {
         assert_eq!(definitions[0].relative_path, Path::new("src/lib.rs"));
         assert_eq!(definitions[0].line, Some(1));
 
-        let references = intelligence
-            .search_workspace("SessionLedger", WorkspaceSearchKind::References, 10)
+        let mentions = intelligence
+            .search_workspace("SessionLedger", WorkspaceSearchKind::Mentions, 10)
             .unwrap()
             .matches;
-        assert_eq!(references.len(), 4);
+        assert_eq!(mentions.len(), 4);
         assert!(
-            references
+            mentions
                 .iter()
-                .all(|hit| hit.kind == WorkspaceMatchKind::Reference)
+                .all(|hit| hit.kind == WorkspaceMatchKind::Mention)
         );
         assert!(
-            !references
+            !mentions
                 .iter()
                 .any(|hit| hit.relative_path == Path::new("src/lib.rs") && hit.line == Some(1))
         );
@@ -1848,15 +2490,18 @@ mod tests {
             vec![
                 SourceExcerptLine {
                     number: 2,
-                    text: "two".into()
+                    text: "two".into(),
+                    truncated: false,
                 },
                 SourceExcerptLine {
                     number: 3,
-                    text: "three".into()
+                    text: "three".into(),
+                    truncated: false,
                 },
                 SourceExcerptLine {
                     number: 4,
-                    text: "four".into()
+                    text: "four".into(),
+                    truncated: false,
                 },
             ]
         );
@@ -1885,7 +2530,7 @@ mod tests {
             Err(CodeIntelligenceError::SearchQueryTooShort { minimum: 2 })
         ));
         let results = intelligence
-            .search_workspace("needle", WorkspaceSearchKind::References, usize::MAX)
+            .search_workspace("needle", WorkspaceSearchKind::Mentions, usize::MAX)
             .unwrap();
         assert_eq!(results.matches.len(), MAX_AGENT_SEARCH_RESULTS);
         assert!(results.truncated);
@@ -1936,6 +2581,292 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn cache_age_starts_after_the_lazy_index_finishes() {
+        let workspace = workspace();
+        write(&workspace.path().join("src/lib.rs"), "pub struct Cached;\n");
+        let max_age = DEFAULT_INDEX_CACHE_AGE;
+        assert!(max_age >= Duration::from_secs(5 * 60));
+        let cache = CodeIntelligenceCache::default();
+        let inserted = Instant::now();
+        let first = cache
+            .for_session_at(workspace.path(), false, inserted)
+            .unwrap();
+
+        // An unbuilt index has no stale snapshot to expire, even if repository
+        // discovery happened a long time ago.
+        let unbuilt_later = cache
+            .for_session_at(workspace.path(), false, inserted + max_age * 2)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &unbuilt_later));
+
+        assert_eq!(first.index_stats().definitions, 1);
+        let indexed_at = *first.indexed_at.get().expect("index completion time");
+        let still_fresh = cache
+            .for_session_at(
+                workspace.path(),
+                false,
+                indexed_at + max_age - Duration::from_millis(1),
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &still_fresh));
+        let expired = cache
+            .for_session_at(
+                workspace.path(),
+                false,
+                indexed_at + max_age + Duration::from_millis(1),
+            )
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &expired));
+    }
+
+    #[test]
+    fn source_excerpt_has_a_strict_model_context_budget() {
+        let workspace = workspace();
+        let long_line = "x".repeat(MAX_AGENT_EXCERPT_LINE_BYTES * 2);
+        let contents = (0..20)
+            .map(|_| long_line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        write(&workspace.path().join("generated.js"), contents);
+        let intelligence = CodeIntelligence::for_session(workspace.path()).unwrap();
+
+        let excerpt = intelligence
+            .source_excerpt("generated.js", Some(10), 10)
+            .unwrap();
+        assert!(excerpt.truncated);
+        assert!(excerpt.returned_bytes <= MAX_AGENT_EXCERPT_BYTES);
+        assert_eq!(excerpt.max_bytes, MAX_AGENT_EXCERPT_BYTES);
+        assert_eq!(
+            excerpt.returned_bytes,
+            excerpt
+                .lines
+                .iter()
+                .map(|line| line.text.len())
+                .sum::<usize>()
+        );
+        assert!(excerpt.lines.iter().any(|line| line.number == 10));
+        assert!(excerpt.lines.iter().any(|line| line.truncated));
+
+        let cache = CodeIntelligenceCache::default();
+        let wire = cache
+            .call_workspace_tool(
+                workspace.path(),
+                READ_SOURCE_TOOL,
+                &json!({"path": "generated.js", "line": 10, "context_lines": 10}),
+            )
+            .unwrap();
+        assert_eq!(wire["truncated"], true);
+        assert!(wire["returnedBytes"].as_u64().unwrap() <= MAX_AGENT_EXCERPT_BYTES as u64);
+        assert_eq!(wire["maxBytes"], MAX_AGENT_EXCERPT_BYTES);
+    }
+
+    #[test]
+    fn agent_tool_schema_and_validation_share_exact_integer_semantics() {
+        let workspace = workspace();
+        write(&workspace.path().join("src/lib.rs"), "pub struct Needle;\n");
+        let definitions = workspace_tool_definitions();
+        let search = definitions
+            .iter()
+            .find(|definition| definition.name == SEARCH_WORKSPACE_TOOL)
+            .unwrap();
+        assert_eq!(
+            search.input_schema["properties"]["limit"]["type"],
+            "integer"
+        );
+        assert_eq!(
+            search.input_schema["properties"]["kind"]["enum"],
+            json!(["definitions", "mentions", "files", "all"])
+        );
+        let source = definitions
+            .iter()
+            .find(|definition| definition.name == READ_SOURCE_TOOL)
+            .unwrap();
+        assert_eq!(
+            source.input_schema["properties"]["path"]["maxLength"],
+            MAX_AGENT_PATH_ARGUMENT_CHARS
+        );
+
+        let cache = CodeIntelligenceCache::default();
+        for arguments in [
+            json!({"query": "Needle", "limit": 1.5}),
+            json!({"query": "Needle", "limit": 0}),
+            json!({"query": "Needle", "refresh": "yes"}),
+            json!({"query": "Needle", "surprise": true}),
+        ] {
+            assert!(
+                cache
+                    .call_workspace_tool(workspace.path(), SEARCH_WORKSPACE_TOOL, &arguments)
+                    .is_err()
+            );
+        }
+        let result = cache
+            .call_workspace_tool(
+                workspace.path(),
+                SEARCH_WORKSPACE_TOOL,
+                &json!({"query": "Needle", "kind": "definitions", "limit": 1}),
+            )
+            .unwrap();
+        assert_eq!(result["matches"][0]["kind"], "definition");
+
+        let oversized_path = "x".repeat(MAX_AGENT_PATH_ARGUMENT_CHARS + 1);
+        let path_error = cache
+            .call_workspace_tool(
+                workspace.path(),
+                READ_SOURCE_TOOL,
+                &json!({"path": oversized_path}),
+            )
+            .unwrap_err();
+        assert!(path_error.len() <= MAX_AGENT_ERROR_BYTES);
+
+        let maximum_path = "x".repeat(MAX_AGENT_PATH_ARGUMENT_CHARS);
+        let filesystem_error = cache
+            .call_workspace_tool(
+                workspace.path(),
+                READ_SOURCE_TOOL,
+                &json!({"path": maximum_path}),
+            )
+            .unwrap_err();
+        assert!(filesystem_error.len() <= MAX_AGENT_ERROR_BYTES);
+
+        let oversized_key = "x".repeat(MAX_AGENT_ERROR_BYTES * 4);
+        let unknown_error = cache
+            .call_workspace_tool(
+                workspace.path(),
+                SEARCH_WORKSPACE_TOOL,
+                &json!({"query": "Needle", oversized_key: true}),
+            )
+            .unwrap_err();
+        assert_eq!(unknown_error, "tool arguments contain an unknown field");
+
+        let oversized_kind = "x".repeat(MAX_AGENT_ERROR_BYTES * 4);
+        let kind_error = cache
+            .call_workspace_tool(
+                workspace.path(),
+                SEARCH_WORKSPACE_TOOL,
+                &json!({"query": "Needle", "kind": oversized_kind}),
+            )
+            .unwrap_err();
+        assert_eq!(
+            kind_error,
+            "kind must be one of definitions, mentions, files, or all"
+        );
+    }
+
+    #[test]
+    fn git_discovery_neutralizes_overrides_and_filters_before_its_cap() {
+        let workspace = tempfile::tempdir().unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(workspace.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        write(&workspace.path().join("build/generated.rs"), "ignored\n");
+        write(
+            &workspace.path().join("src/lib.rs"),
+            "pub struct Included;\n",
+        );
+        assert!(
+            Command::new("git")
+                .args(["add", "-f", "build/generated.rs", "src/lib.rs"])
+                .current_dir(workspace.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let discovery = git_paths_with_limit(workspace.path(), 1).unwrap();
+        assert_eq!(discovery.paths, vec![PathBuf::from("src/lib.rs")]);
+        assert!(discovery.truncated);
+
+        let globally_bounded = git_paths_with_limits(workspace.path(), 100, 1).unwrap();
+        assert!(globally_bounded.truncated);
+        assert!(globally_bounded.paths.len() <= 1);
+
+        let command = git_command(workspace.path());
+        for variable in GIT_REPOSITORY_ENVIRONMENT {
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(key, value)| key == *variable && value.is_none()),
+                "{variable} must be removed"
+            );
+        }
+        let outside = tempfile::tempdir().unwrap();
+        assert!(!valid_workspace_root(workspace.path(), outside.path()));
+        assert!(valid_workspace_root(
+            &workspace.path().join("src"),
+            workspace.path()
+        ));
+
+        let fallback = tempfile::tempdir().unwrap();
+        write(&fallback.path().join("one.rs"), "one\n");
+        write(&fallback.path().join("two.rs"), "two\n");
+        let fallback = filesystem_paths_with_limits(fallback.path(), 100, 1);
+        assert!(fallback.truncated);
+        assert!(fallback.paths.len() <= 1);
+    }
+
+    #[test]
+    fn pathological_declaration_names_are_bounded_in_the_index() {
+        let workspace = workspace();
+        let name = "a".repeat(MAX_INDEX_SYMBOL_NAME_CHARS * 4);
+        write(
+            &workspace.path().join("src/lib.rs"),
+            format!("pub struct {name};\n"),
+        );
+        let intelligence = CodeIntelligence::for_session(workspace.path()).unwrap();
+        let index = intelligence.index();
+        assert_eq!(index.symbols.len(), 1);
+        assert_eq!(
+            index.symbols[0].name.chars().count(),
+            MAX_INDEX_SYMBOL_NAME_CHARS
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_handle_validation_rejects_a_post_open_symlink_swap() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("workspace");
+        fs::create_dir_all(&root).unwrap();
+        let requested = root.join("source.rs");
+        let outside = parent.path().join("secret.rs");
+        write(&requested, "pub struct Safe;\n");
+        write(&outside, "secret\n");
+
+        let result = open_contained_file_with(&root, &requested, || {
+            fs::remove_file(&requested).unwrap();
+            std::os::unix::fs::symlink(&outside, &requested).unwrap();
+        });
+        match result {
+            Ok((mut file, _, _)) => {
+                let mut text = String::new();
+                file.read_to_string(&mut text).unwrap();
+                assert_eq!(text, "pub struct Safe;\n");
+            }
+            Err(CodeIntelligenceError::OutsideWorkspace { .. })
+            | Err(CodeIntelligenceError::PathChangedDuringRead { .. }) => {}
+            Err(error) => panic!("unexpected contained-open error: {error}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_paths_are_lossy_and_never_panic_mcp_serialization() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let path = PathBuf::from(OsString::from_vec(b"non-utf8-\xff.rs".to_vec()));
+        let (display, lossy, truncated) = wire_path(&path);
+        let result = json!({"path": display, "pathLossy": lossy, "pathTruncated": truncated});
+        assert_eq!(result["pathLossy"], true);
+        assert!(result["path"].as_str().is_some());
+        serde_json::to_string(&result).expect("wire result remains serializable");
     }
 
     #[test]
