@@ -215,17 +215,20 @@ fn apply_sample(
     ports: Option<Vec<PortInfo>>,
     artifacts: Option<Vec<diri_proto::SessionArtifact>>,
 ) {
-    let event = {
+    let artifacts_changed = {
         let Ok(mut guard) = registry.lock() else {
             return;
         };
-        guard.apply_resource_sample(id, memory, ports, artifacts)
-    };
-    if let Some(event) = event {
-        if event.artifacts.is_some() {
-            pr_monitor_wake.wake_session(id.to_owned());
+        let event = guard.apply_resource_sample(id, memory, ports, artifacts);
+        // Keep the registry lock through sequence assignment so session.list
+        // cannot include this sample behind an earlier eventSeq boundary.
+        if let Some(event) = &event {
+            events.publish_encoded(diri_proto::EventName::SESSION_RESOURCES, event, Some(id));
         }
-        events.publish_encoded(diri_proto::EventName::SESSION_RESOURCES, &event, Some(id));
+        event.is_some_and(|event| event.artifacts.is_some())
+    };
+    if artifacts_changed {
+        pr_monitor_wake.wake_session(id.to_owned());
     }
 }
 
@@ -235,16 +238,16 @@ fn hibernate(
     id: &str,
     reason: diri_proto::HibernationReason,
 ) -> std::io::Result<()> {
-    let record = {
+    {
         let Ok(mut guard) = registry.lock() else {
             return Ok(());
         };
         guard.hibernate(id, reason)?;
         let _ = guard.persist();
-        guard.records().into_iter().find(|record| record.id.0 == id)
-    };
-    if let Some(record) = record {
-        events.publish_encoded(diri_proto::EventName::SESSION_UPDATED, &record, Some(id));
+        // Registry -> EventBus is the shared snapshot/publication lock order.
+        if let Some(record) = guard.records().into_iter().find(|record| record.id.0 == id) {
+            events.publish_encoded(diri_proto::EventName::SESSION_UPDATED, &record, Some(id));
+        }
     }
     Ok(())
 }

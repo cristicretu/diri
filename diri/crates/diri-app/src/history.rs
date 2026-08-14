@@ -475,6 +475,7 @@ mod tests {
                             pid: std::process::id() as i32,
                             engine_kind: Some(RUST_ENGINE_KIND.to_owned()),
                             executable_hash: None,
+                            event_incarnation: Some("history-test".to_owned()),
                         })
                         .unwrap()),
                     }

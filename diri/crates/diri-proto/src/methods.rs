@@ -66,6 +66,10 @@ impl Method {
 pub struct EventName;
 
 impl EventName {
+    /// Synthetic backpressure marker emitted when a subscriber's bounded
+    /// daemon queue drops incremental events. Consumers must replace their
+    /// projection from an authoritative snapshot before applying more events.
+    pub const EVENTS_DROPPED: &'static str = "events.dropped";
     pub const SESSION_UPDATED: &'static str = "session.updated";
     pub const SESSION_RESOURCES: &'static str = "session.resources";
     pub const SESSION_REMOVED: &'static str = "session.removed";
@@ -128,6 +132,11 @@ pub struct HelloResult {
     pub engine_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub executable_hash: Option<String>,
+    /// Identifies one daemon event-sequence namespace. Reconnects to the same
+    /// daemon retain it; a restarted daemon returns a new value even when the
+    /// executable and protocol are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_incarnation: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -366,6 +375,10 @@ pub type SessionSpawnResult = SessionRecord;
 pub struct SessionListResult {
     pub sessions: Vec<SessionRecord>,
     pub projects: Vec<Project>,
+    /// Event sequence covered by this authoritative snapshot. Older daemons
+    /// omit it; clients then use their pre-request receive watermark.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "eventSeq")]
+    pub event_seq: Option<u64>,
 }
 
 pub type SessionListParams = EmptyParams;
@@ -964,5 +977,56 @@ mod base64_bytes {
             b'/' => Some(63),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{HelloResult, SessionListResult};
+
+    #[test]
+    fn hello_event_incarnation_is_additive_and_backward_compatible() {
+        let legacy: HelloResult = serde_json::from_value(json!({
+            "proto": 1,
+            "build": "legacy",
+            "pid": 42,
+            "engineKind": "diri-rust-engine"
+        }))
+        .expect("legacy hello");
+        assert_eq!(legacy.event_incarnation, None);
+
+        let current: HelloResult = serde_json::from_value(json!({
+            "proto": 1,
+            "build": "current",
+            "pid": 43,
+            "engineKind": "diri-rust-engine",
+            "eventIncarnation": "event-bus-a"
+        }))
+        .expect("current hello");
+        assert_eq!(current.event_incarnation.as_deref(), Some("event-bus-a"));
+    }
+
+    #[test]
+    fn session_list_event_watermark_is_additive_and_backward_compatible() {
+        let legacy: SessionListResult = serde_json::from_value(json!({
+            "sessions": [],
+            "projects": []
+        }))
+        .expect("legacy session list");
+        assert_eq!(legacy.event_seq, None);
+
+        let current: SessionListResult = serde_json::from_value(json!({
+            "sessions": [],
+            "projects": [],
+            "eventSeq": 42
+        }))
+        .expect("current session list");
+        assert_eq!(current.event_seq, Some(42));
+        assert_eq!(
+            serde_json::to_value(current).expect("encode")["eventSeq"],
+            42
+        );
     }
 }

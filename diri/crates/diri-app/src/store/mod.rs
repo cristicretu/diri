@@ -2,6 +2,7 @@
 
 mod prefs;
 mod projection;
+mod publication;
 mod residency;
 
 use std::collections::{HashMap, HashSet};
@@ -18,8 +19,10 @@ use diri_proto::{
     ExitReason, GovernorConfigureParams, HelloResult, HostEntry, HostsConfig, Project, ProjectId,
     Resumability, SessionId, SessionListResult, SessionRecord, SessionSpawnParams, SessionStatus,
 };
-use tokio::sync::{Notify, broadcast, mpsc};
+use tokio::sync::{Notify, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
+
+use self::publication::{EventAdmission, PublicationMailbox, ResyncWatermark};
 
 use crate::notifications::{
     PendingAttention, SendTextCommand, StatusTransition, attention_signal,
@@ -65,18 +68,6 @@ enum StoreEventChange {
     None,
     Resources,
     Model,
-}
-
-impl StoreEventChange {
-    fn merge(self, other: Self) -> Self {
-        if self == Self::Model || other == Self::Model {
-            Self::Model
-        } else if self == Self::Resources || other == Self::Resources {
-            Self::Resources
-        } else {
-            Self::None
-        }
-    }
 }
 
 fn event_publication_policy(change: StoreEventChange, active: bool) -> (bool, bool) {
@@ -2384,6 +2375,55 @@ pub struct StoreRuntime {
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
+/// Replaces an incremental projection after either daemon-side or client-side
+/// backpressure reports a hole. This deliberately retries until it has an
+/// authoritative snapshot: applying the tail after a failed resync can look
+/// healthy while leaving one dropped final mutation stale forever.
+async fn recover_store_snapshot(
+    client: &DaemonClient,
+    store: &RwLock<SessionStore>,
+    publications: &PublicationMailbox,
+    watermark: &mut ResyncWatermark,
+) {
+    let mut delay = Duration::from_millis(50);
+    loop {
+        // Older daemons do not stamp snapshots. Capturing the receive
+        // watermark before issuing the request is conservative: it may replay
+        // a harmless duplicate, but never skips an event received after the
+        // daemon took its snapshot.
+        let generation = client.event_generation();
+        let received_through = client.last_seq();
+        match client.sessions().await {
+            Ok(list) => {
+                // A response from a connection retired while this request was
+                // in flight cannot define the next connection's sequence
+                // boundary. Discard it and retry on the current generation.
+                if client.event_generation() != generation {
+                    continue;
+                }
+                let covered_through = list.event_seq.unwrap_or(received_through);
+                store
+                    .write()
+                    .expect("session store lock poisoned")
+                    .hydrate(list);
+                watermark.install(generation, covered_through);
+                publications.submit(StoreEventChange::Model);
+                return;
+            }
+            Err(_) => {
+                client.retry_now();
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(2));
+            }
+        }
+    }
+}
+
+struct ConnectionHydration {
+    generation: u64,
+    complete: oneshot::Sender<()>,
+}
+
 impl StoreRuntime {
     pub fn start(client: Arc<DaemonClient>, prefs_path: impl Into<PathBuf>) -> io::Result<Self> {
         let (store, effects) = SessionStore::load(prefs_path)?;
@@ -2438,19 +2478,17 @@ impl StoreRuntime {
         let (action_tx, mut action_rx) = mpsc::unbounded_channel::<SendTextCommand>();
         let mut tasks = Vec::new();
 
-        let (event_publish_tx, mut event_publish_rx) = mpsc::channel::<StoreEventChange>(128);
+        let event_publications = Arc::new(PublicationMailbox::default());
+        let publish_mailbox = Arc::clone(&event_publications);
         let publish_store = Arc::clone(&store);
         let publish_changes = change_tx.clone();
         let publish_snapshots = snapshot_tx.clone();
         tasks.push(tokio::spawn(async move {
-            while let Some(mut change) = event_publish_rx.recv().await {
+            loop {
                 // Apply every daemon event immediately, but collapse bursts
                 // into one UI/menu publication per display interval. Terminal
                 // grid chunks use their own direct path and are unaffected.
-                tokio::time::sleep(UI_PUBLISH_INTERVAL).await;
-                while let Ok(next) = event_publish_rx.try_recv() {
-                    change = change.merge(next);
-                }
+                let change = publish_mailbox.next().await;
                 let (active, snapshot) = {
                     let store = publish_store.read().expect("session store lock poisoned");
                     (store.app_is_active, store.snapshot())
@@ -2468,21 +2506,65 @@ impl StoreRuntime {
             }
         }));
 
+        let (connection_hydrate_tx, mut connection_hydrate_rx) =
+            mpsc::unbounded_channel::<ConnectionHydration>();
         let mut events = client.events();
+        let event_client = Arc::clone(&client);
         let event_store = Arc::clone(&store);
         tasks.push(tokio::spawn(async move {
+            let mut watermark = ResyncWatermark::default();
             loop {
-                match events.recv().await {
+                let received = tokio::select! {
+                    biased;
+                    request = connection_hydrate_rx.recv() => {
+                        let Some(request) = request else {
+                            break;
+                        };
+                        if !watermark.covers_generation(request.generation) {
+                            recover_store_snapshot(
+                                &event_client,
+                                &event_store,
+                                &event_publications,
+                                &mut watermark,
+                            )
+                            .await;
+                        }
+                        let _ = request.complete.send(());
+                        continue;
+                    }
+                    received = events.recv() => received,
+                };
+                match received {
                     Ok(event) => {
+                        match watermark.admit(event.generation, &event.name, event.seq) {
+                            EventAdmission::ResyncGap | EventAdmission::ResyncConnection => {
+                                recover_store_snapshot(
+                                    &event_client,
+                                    &event_store,
+                                    &event_publications,
+                                    &mut watermark,
+                                )
+                                .await;
+                                continue;
+                            }
+                            EventAdmission::SkipCovered => continue,
+                            EventAdmission::Apply => {}
+                        }
                         let changed = event_store
                             .write()
                             .expect("session store lock poisoned")
                             .handle_event_change(event);
-                        if changed != StoreEventChange::None {
-                            let _ = event_publish_tx.try_send(changed);
-                        }
+                        event_publications.submit(changed);
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        recover_store_snapshot(
+                            &event_client,
+                            &event_store,
+                            &event_publications,
+                            &mut watermark,
+                        )
+                        .await;
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
@@ -2491,10 +2573,10 @@ impl StoreRuntime {
         let state_client = Arc::clone(&client);
         let state_store = Arc::clone(&store);
         let state_changes = change_tx.clone();
-        let state_snapshots = snapshot_tx.clone();
+        let state_hydration = connection_hydrate_tx;
         let mut states = client.connection_state();
         tasks.push(tokio::spawn(async move {
-            loop {
+            'connection_states: loop {
                 let state = states.borrow_and_update().clone();
                 match state {
                     ConnectionState::Connecting => {
@@ -2508,7 +2590,10 @@ impl StoreRuntime {
                         store.daemon_state = DaemonState::Unreachable(error);
                         store.daemon_identity = None;
                     }
-                    ConnectionState::Connected(identity) => {
+                    ConnectionState::Connected {
+                        identity,
+                        event_generation,
+                    } => {
                         {
                             let mut store =
                                 state_store.write().expect("session store lock poisoned");
@@ -2530,14 +2615,27 @@ impl StoreRuntime {
                                 .expect("session store lock poisoned")
                                 .set_agent_catalog(agents);
                         }
-                        if let Ok(list) = state_client.sessions().await {
-                            let snapshot = {
-                                let mut store =
-                                    state_store.write().expect("session store lock poisoned");
-                                store.hydrate(list);
-                                store.snapshot()
+                        let (complete, hydrated) = oneshot::channel();
+                        if state_hydration
+                            .send(ConnectionHydration {
+                                generation: event_generation,
+                                complete,
+                            })
+                            .is_ok()
+                        {
+                            let state_changed = tokio::select! {
+                                biased;
+                                result = states.changed() => {
+                                    if result.is_err() {
+                                        break 'connection_states;
+                                    }
+                                    true
+                                },
+                                _ = hydrated => false,
                             };
-                            state_snapshots.send_replace(snapshot);
+                            if state_changed {
+                                continue 'connection_states;
+                            }
                         }
                         let (active, governor) = {
                             let store = state_store.read().expect("session store lock poisoned");

@@ -20,10 +20,21 @@ use std::time::{Duration, Instant};
 use diri_proto::JsonValue;
 use serde_json::json;
 
+fn new_event_incarnation() -> Arc<str> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).expect("the OS random source");
+    Arc::from(
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+    )
+}
+
 /// The synthetic hole marker. Its seq is 0 — outside the published seq space,
-/// which starts at 1 — so a consumer tracking `lastSeq` for gapless resume
-/// can ignore it without special-casing.
-pub const EVENTS_DROPPED: &str = "events.dropped";
+/// which starts at 1 — so it never advances `lastSeq`. Projection consumers
+/// still must special-case its name and rebuild from an authoritative snapshot.
+pub const EVENTS_DROPPED: &str = diri_proto::EventName::EVENTS_DROPPED;
 
 /// One published event, as a subscriber receives it.
 #[derive(Clone, Debug)]
@@ -124,41 +135,45 @@ struct QueueState {
 
 impl SubscriberQueue {
     /// Enqueues without ever blocking the publisher. On overflow the oldest
-    /// queued event is evicted and the hole remembered; the marker is emitted
-    /// on the first enqueue that succeeds without eviction — once the
-    /// consumer has caught up — so a merely-slow subscriber gets one summary
-    /// line instead of a marker interleaved with every event it reads.
+    /// queued event is evicted and the hole remembered. The receive side
+    /// synthesizes the marker ahead of the survivors, so it is outside the
+    /// bounded queue and cannot be evicted or depend on a later publication.
     fn push(&self, event: &Event) {
         let mut state = self.state.lock().expect("queue");
         if state.closed || !state.filter.admits(event) {
             return;
         }
-        if state.queue.len() >= state.capacity {
-            if let Some(evicted) = state.queue.pop_front() {
-                if state.dropped == 0 {
-                    state.first_dropped_seq = evicted.seq;
-                }
-                state.last_dropped_seq = evicted.seq;
-                state.dropped += 1;
+        if state.queue.len() >= state.capacity
+            && let Some(evicted) = state.queue.pop_front()
+        {
+            if state.dropped == 0 {
+                state.first_dropped_seq = evicted.seq;
             }
-        } else if state.dropped > 0 {
-            let marker = Event {
-                name: EVENTS_DROPPED.into(),
-                seq: 0,
-                session_id: None,
-                params: json!({
-                    "dropped": state.dropped,
-                    "fromSeq": state.first_dropped_seq,
-                    "toSeq": state.last_dropped_seq,
-                }),
-            };
-            state.dropped = 0;
-            state.queue.push_back(marker);
+            state.last_dropped_seq = evicted.seq;
+            state.dropped += 1;
         }
         state.queue.push_back(event.clone());
         drop(state);
         self.ready.notify_all();
     }
+}
+
+fn pop_queued(state: &mut QueueState) -> Option<Event> {
+    if state.dropped > 0 {
+        let marker = Event {
+            name: EVENTS_DROPPED.into(),
+            seq: 0,
+            session_id: None,
+            params: json!({
+                "dropped": state.dropped,
+                "fromSeq": state.first_dropped_seq,
+                "toSeq": state.last_dropped_seq,
+            }),
+        };
+        state.dropped = 0;
+        return Some(marker);
+    }
+    state.queue.pop_front()
 }
 
 struct BusInner {
@@ -174,6 +189,7 @@ struct BusInner {
 #[derive(Clone)]
 pub struct EventBus {
     inner: Arc<Mutex<BusInner>>,
+    incarnation: Arc<str>,
     ring_capacity: usize,
     ring_byte_capacity: usize,
     subscriber_capacity: usize,
@@ -206,6 +222,7 @@ impl EventBus {
                 subscribers: HashMap::new(),
                 next_subscriber: 0,
             })),
+            incarnation: new_event_incarnation(),
             ring_capacity,
             ring_byte_capacity,
             subscriber_capacity: subscriber_capacity
@@ -303,6 +320,10 @@ impl EventBus {
         self.inner.lock().expect("bus").next_seq - 1
     }
 
+    pub fn incarnation(&self) -> &str {
+        &self.incarnation
+    }
+
     #[cfg(test)]
     fn subscriber_count(&self) -> usize {
         self.inner.lock().expect("bus").subscribers.len()
@@ -322,7 +343,7 @@ impl EventStream {
         let deadline = Instant::now() + timeout;
         let mut state = self.queue.state.lock().expect("queue");
         loop {
-            if let Some(event) = state.queue.pop_front() {
+            if let Some(event) = pop_queued(&mut state) {
                 return Some(event);
             }
             let remaining = deadline.checked_duration_since(Instant::now())?;
@@ -340,7 +361,7 @@ impl EventStream {
 
     /// An event already queued, without waiting.
     pub fn try_recv(&self) -> Option<Event> {
-        self.queue.state.lock().expect("queue").queue.pop_front()
+        pop_queued(&mut self.queue.state.lock().expect("queue"))
     }
 }
 
@@ -390,23 +411,52 @@ pub fn spawn_registry_watcher(
             // every pass, all under the registry lock.
             let mut published: HashMap<String, u64> = HashMap::new();
             while !stop.load(Ordering::SeqCst) {
-                let changed = {
-                    let Ok(mut registry) = registry.lock() else {
-                        break;
-                    };
-                    registry.changed_since(&mut published)
-                };
-                for (id, record) in changed {
-                    events.publish_encoded(
-                        diri_proto::EventName::SESSION_UPDATED,
-                        &record,
-                        Some(&id),
-                    );
+                if !publish_registry_changes_once(&registry, &events, &mut published) {
+                    break;
                 }
                 std::thread::sleep(Duration::from_millis(150));
             }
         })
         .expect("spawn watcher")
+}
+
+fn publish_registry_changes_once(
+    registry: &Arc<Mutex<crate::registry::Registry>>,
+    events: &EventBus,
+    published: &mut HashMap<String, u64>,
+) -> bool {
+    publish_registry_changes_once_inner(registry, events, published, || {})
+}
+
+#[cfg(test)]
+pub(crate) fn publish_registry_changes_once_with_hook(
+    registry: &Arc<Mutex<crate::registry::Registry>>,
+    events: &EventBus,
+    published: &mut HashMap<String, u64>,
+    after_clone: impl FnOnce(),
+) -> bool {
+    publish_registry_changes_once_inner(registry, events, published, after_clone)
+}
+
+fn publish_registry_changes_once_inner(
+    registry: &Arc<Mutex<crate::registry::Registry>>,
+    events: &EventBus,
+    published: &mut HashMap<String, u64>,
+    after_clone: impl FnOnce(),
+) -> bool {
+    let Ok(mut registry) = registry.lock() else {
+        return false;
+    };
+    let changed = registry.changed_since(published);
+    after_clone();
+    // Assign every sequence while the same registry lock that produced the
+    // record is still held. `session.list` takes registry then EventBus in the
+    // same order, making its eventSeq a true boundary rather than a timestamp
+    // guess.
+    for (id, record) in changed {
+        events.publish_encoded(diri_proto::EventName::SESSION_UPDATED, &record, Some(&id));
+    }
+    true
 }
 
 #[cfg(test)]
@@ -468,22 +518,22 @@ mod tests {
         for n in 0..5 {
             bus.publish("burst", json!({ "n": n }), None);
         }
-        // Queue of 2: events 1..=3 were evicted; the newest two remain.
-        let survivors: Vec<Event> = std::iter::from_fn(|| stream.try_recv()).collect();
-        assert_eq!(survivors.len(), 2);
-        assert_eq!(survivors[0].seq, 4);
-        assert_eq!(survivors[1].seq, 5);
-
-        // The consumer caught up: the next publish carries the marker first.
-        bus.publish("after", json!({}), None);
-        let marker = stream.recv(Duration::from_secs(1)).expect("marker");
+        // No sixth publish is allowed to flush the loss report. A burst that
+        // stops at overflow must still tell the first returning consumer that
+        // its projection has a hole.
+        let marker = stream.try_recv().expect("marker without another publish");
         assert_eq!(marker.name, EVENTS_DROPPED);
         assert_eq!(marker.seq, 0, "outside the published seq space");
         assert_eq!(marker.params["dropped"], 3);
         assert_eq!(marker.params["fromSeq"], 1);
         assert_eq!(marker.params["toSeq"], 3);
-        let after = stream.recv(Duration::from_secs(1)).expect("event");
-        assert_eq!(after.name, "after");
+
+        // Queue of 2: events 1..=3 were evicted; the newest two survive after
+        // the protected, out-of-band marker.
+        let survivors: Vec<Event> = std::iter::from_fn(|| stream.try_recv()).collect();
+        assert_eq!(survivors.len(), 2);
+        assert_eq!(survivors[0].seq, 4);
+        assert_eq!(survivors[1].seq, 5);
     }
 
     #[test]
