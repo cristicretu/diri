@@ -4,6 +4,8 @@ use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixListener;
 use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
 
 use diri_proto::{
@@ -12,14 +14,14 @@ use diri_proto::{
     SessionId, SessionListResult, SessionRecord, SessionStatus, TitleSource,
 };
 use tempfile::tempdir;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, watch};
 
-use crate::notifications::NotificationSound;
+use crate::notifications::{NotificationSound, StatusTransition};
 
 use super::{
-    ClickModifiers, EventEnvelope, InspectorTab, Prefs, SessionStore, SidebarProjection,
-    StoreEffect, StoreEventChange, TerminalResidency, WindowMode, WindowPlacement,
-    event_publication_policy,
+    ActionSequence, ClickModifiers, EffectClass, EventEnvelope, InspectorTab, Prefs, SessionStore,
+    SidebarProjection, StoreEffect, StoreEffectReceiver, StoreEventChange, TerminalResidency,
+    WindowMode, WindowPlacement, event_publication_policy,
 };
 use crate::switcher::{OverviewFilter, OverviewLane, SwitcherKey};
 
@@ -80,7 +82,7 @@ fn hydrated(
     sessions: Vec<SessionRecord>,
     projects: Vec<Project>,
     prefs: Prefs,
-) -> (SessionStore, mpsc::UnboundedReceiver<StoreEffect>) {
+) -> (SessionStore, StoreEffectReceiver) {
     let (mut store, effects) = SessionStore::headless(prefs);
     store.hydrate(SessionListResult {
         sessions,
@@ -90,12 +92,453 @@ fn hydrated(
     (store, effects)
 }
 
-fn drain(effects: &mut mpsc::UnboundedReceiver<StoreEffect>) -> Vec<StoreEffect> {
+fn drain(effects: &mut StoreEffectReceiver) -> Vec<StoreEffect> {
     let mut drained = Vec::new();
     while let Ok(effect) = effects.try_recv() {
         drained.push(effect);
     }
     drained
+}
+
+#[test]
+fn effect_classes_keep_local_work_and_queries_off_the_mutation_lane() {
+    assert_eq!(StoreEffect::UiChanged.execution_class(), EffectClass::Local);
+    assert_eq!(
+        StoreEffect::LocateRepo {
+            generation: 1,
+            key: "local".to_owned(),
+            host: None,
+            session_id: id("one"),
+        }
+        .execution_class(),
+        EffectClass::Concurrent
+    );
+    assert_eq!(
+        StoreEffect::Remove(id("one")).execution_class(),
+        EffectClass::OrderedMutation
+    );
+    assert_eq!(
+        StoreEffect::MarkSeen(id("one")).execution_class(),
+        EffectClass::Concurrent
+    );
+}
+
+#[test]
+fn ingress_coalesces_latest_semantic_queries_by_key() {
+    let (effects, mut receiver) = super::store_effect_channel();
+    for _ in 0..32 {
+        effects.send(StoreEffect::MarkSeen(id("one"))).unwrap();
+    }
+    for generation in 1..=3 {
+        effects
+            .send(StoreEffect::LocateRepo {
+                generation,
+                key: "forge".to_owned(),
+                host: Some("forge".to_owned()),
+                session_id: id("one"),
+            })
+            .unwrap();
+        effects
+            .send(StoreEffect::ListDirectories {
+                request_id: generation,
+                host: Some("forge".to_owned()),
+                path: format!("/work/{generation}"),
+            })
+            .unwrap();
+        effects
+            .send(StoreEffect::RefreshAgents {
+                generation,
+                host: Some("forge".to_owned()),
+                force: generation > 1,
+            })
+            .unwrap();
+    }
+
+    assert_eq!(receiver.scheduled.pending_len(), 4);
+    let queued = drain(&mut receiver);
+    assert_eq!(
+        queued
+            .iter()
+            .filter(|effect| matches!(effect, StoreEffect::MarkSeen(_)))
+            .count(),
+        1
+    );
+    assert!(
+        queued
+            .iter()
+            .any(|effect| matches!(effect, StoreEffect::LocateRepo { generation: 3, .. }))
+    );
+    assert!(
+        queued
+            .iter()
+            .any(|effect| matches!(effect, StoreEffect::ListDirectories { request_id: 3, .. }))
+    );
+    assert!(
+        queued
+            .iter()
+            .any(|effect| matches!(effect, StoreEffect::RefreshAgents { generation: 3, .. }))
+    );
+}
+
+#[test]
+fn saturated_authoritative_ingress_refuses_visibly_without_blocking_local_work() {
+    let (mut store, receiver) = SessionStore::headless(Prefs::default());
+    for _ in 0..super::EFFECT_INGRESS_BACKLOG {
+        store.reopen_last();
+    }
+    assert_eq!(
+        receiver.scheduled.pending_len(),
+        super::EFFECT_INGRESS_BACKLOG
+    );
+    assert!(store.action_failure().is_none());
+
+    store.reopen_last();
+    assert_eq!(
+        receiver.scheduled.pending_len(),
+        super::EFFECT_INGRESS_BACKLOG,
+        "lossless ingress must remain strictly bounded"
+    );
+    assert!(store.action_failure().is_some_and(|failure| {
+        failure.detail.contains("was not started") && failure.title == "Reopen session failed"
+    }));
+    let oldest = receiver.scheduled.try_pop().unwrap();
+    assert!(
+        oldest
+            .action_ticket
+            .is_some_and(|ticket| !receiver.action_sequence.is_current(ticket)),
+        "a queued older success cannot clear the newest admission failure"
+    );
+
+    store.emit(StoreEffect::UiChanged);
+    assert!(matches!(
+        receiver.local.try_pop(),
+        Some(super::EmittedEffect {
+            effect: StoreEffect::UiChanged,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn worker_panic_is_visible_and_does_not_consume_worker_capacity() {
+    let client = Arc::new(diri_client::DaemonClient::new());
+    let (store, _unused_effects) = SessionStore::headless(Prefs::default());
+    let store = Arc::new(std::sync::RwLock::new(store));
+    let (effects, receiver) = super::store_effect_channel();
+    let (detach_tx, _) = broadcast::channel(1);
+    let (change_tx, _) = broadcast::channel(4);
+    let (status_tx, _) = broadcast::channel::<StatusTransition>(1);
+    let initial = store.read().unwrap().snapshot();
+    let (snapshot_tx, _) = watch::channel(initial);
+    super::arm_effect_panic_probe(91_001);
+    let worker = tokio::spawn(super::run_effects(
+        receiver,
+        client,
+        Arc::clone(&store),
+        detach_tx,
+        change_tx,
+        snapshot_tx,
+        status_tx,
+    ));
+
+    effects.send(StoreEffect::TestPanicOnce(91_001)).unwrap();
+    effects.send(StoreEffect::TestPanicOnce(91_001)).unwrap();
+    drop(effects);
+    tokio::time::timeout(Duration::from_secs(2), worker)
+        .await
+        .expect("effect runtime drained after sender close")
+        .unwrap();
+
+    assert!(
+        super::effect_panic_probe_completed(91_001),
+        "later same-key work continued after the panic"
+    );
+    assert_eq!(
+        super::effect_panic_probe_runs(91_001),
+        2,
+        "the failed effect was not replayed; only the later explicit intent ran"
+    );
+    assert!(
+        store
+            .read()
+            .unwrap()
+            .action_failure()
+            .is_some_and(|failure| {
+                failure.detail.contains("was not retried") || failure.detail.contains("not retried")
+            })
+    );
+}
+
+#[tokio::test]
+async fn concurrent_mailbox_is_bounded_and_releases_backpressure_after_a_pop() {
+    let mailbox = super::ConcurrentEffectMailbox::new(2);
+    assert!(
+        mailbox
+            .submit(StoreEffect::MarkSeen(id("one")), None)
+            .await
+            .is_none()
+    );
+    assert!(
+        mailbox
+            .submit(StoreEffect::MarkSeen(id("one")), None)
+            .await
+            .is_some()
+    );
+    assert!(
+        mailbox
+            .submit(StoreEffect::MarkSeen(id("two")), None)
+            .await
+            .is_none()
+    );
+    assert_eq!(mailbox.pending_len(), 2);
+
+    let blocked = mailbox.submit(StoreEffect::MarkSeen(id("three")), None);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), blocked)
+            .await
+            .is_err(),
+        "a distinct third key must wait instead of growing the mailbox"
+    );
+    let popped = mailbox.next().await.unwrap();
+    mailbox.finish(&popped.key);
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        mailbox.submit(StoreEffect::MarkSeen(id("three")), None),
+    )
+    .await
+    .expect("one pop releases one bounded admission slot");
+    assert_eq!(mailbox.pending_len(), 2);
+}
+
+#[test]
+fn an_older_concurrent_action_cannot_overwrite_the_newest_completion() {
+    let sequence = ActionSequence::default();
+    let older = sequence.issue();
+    let newest = sequence.issue();
+    assert!(!sequence.is_current(older));
+    assert!(sequence.is_current(newest));
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn local_publication_bypasses_a_held_ordered_daemon_mutation() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("effect-lanes.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let (request_tx, request_rx) = std_mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std_mpsc::sync_channel(1);
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            let ControlMessage::Request { id, method, .. } = serde_json::from_str(&line).unwrap()
+            else {
+                continue;
+            };
+            if method == Method::SESSION_ARCHIVE {
+                request_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }
+            let result = if method == Method::HELLO {
+                serde_json::json!({
+                    "proto": diri_proto::WIRE_VERSION,
+                    "build": "effect-lane-fixture",
+                    "pid": std::process::id(),
+                    "engineKind": diri_proto::RUST_ENGINE_KIND,
+                })
+            } else {
+                serde_json::json!({})
+            };
+            serde_json::to_writer(
+                &mut writer,
+                &ControlMessage::Response {
+                    id,
+                    result: Ok(result),
+                },
+            )
+            .unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer.flush().unwrap();
+        }
+    });
+
+    let client = Arc::new(diri_client::DaemonClient::with_socket_path(socket));
+    client.connect();
+    client
+        .wait_until_connected(Duration::from_secs(2))
+        .await
+        .unwrap();
+    let (store, _unused_effects) = SessionStore::headless(Prefs::default());
+    let store = Arc::new(std::sync::RwLock::new(store));
+    let (effects_tx, effects_rx) = super::store_effect_channel();
+    let (detach_tx, _) = broadcast::channel(1);
+    let (change_tx, mut changes) = broadcast::channel(4);
+    let (status_tx, _) = broadcast::channel::<StatusTransition>(1);
+    let initial = store.read().unwrap().snapshot();
+    let (snapshot_tx, _) = watch::channel(initial);
+    let worker = tokio::spawn(super::run_effects(
+        effects_rx,
+        Arc::clone(&client),
+        store,
+        detach_tx,
+        change_tx,
+        snapshot_tx,
+        status_tx,
+    ));
+
+    effects_tx.send(StoreEffect::Archive(id("one"))).unwrap();
+    request_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("ordered request reached fixture");
+    effects_tx.send(StoreEffect::UiChanged).unwrap();
+    tokio::time::timeout(Duration::from_millis(250), changes.recv())
+        .await
+        .expect("local publication must bypass held mutation")
+        .expect("change stream");
+
+    release_tx.send(()).unwrap();
+    drop(effects_tx);
+    worker.await.unwrap();
+    client.shutdown().await;
+    drop(client);
+    server.join().unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_effects_have_a_fixed_in_flight_ceiling() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("bounded-effect-lanes.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let admitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let server_admitted = Arc::clone(&admitted);
+    let server_release = Arc::clone(&release);
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let writer = Arc::new(std::sync::Mutex::new(stream.try_clone().unwrap()));
+        let mut reader = BufReader::new(stream);
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            let ControlMessage::Request { id, method, .. } = serde_json::from_str(&line).unwrap()
+            else {
+                continue;
+            };
+            if method == Method::SESSION_MARK_SEEN {
+                server_admitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let writer = Arc::clone(&writer);
+                let release = Arc::clone(&server_release);
+                std::thread::spawn(move || {
+                    let (lock, ready) = &*release;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = ready.wait(released).unwrap();
+                    }
+                    let mut writer = writer.lock().unwrap();
+                    serde_json::to_writer(
+                        &mut *writer,
+                        &ControlMessage::Response {
+                            id,
+                            result: Ok(serde_json::json!({})),
+                        },
+                    )
+                    .unwrap();
+                    writer.write_all(b"\n").unwrap();
+                    writer.flush().unwrap();
+                });
+                continue;
+            }
+            let result = if method == Method::HELLO {
+                serde_json::json!({
+                    "proto": diri_proto::WIRE_VERSION,
+                    "build": "bounded-effect-lane-fixture",
+                    "pid": std::process::id(),
+                    "engineKind": diri_proto::RUST_ENGINE_KIND,
+                })
+            } else {
+                serde_json::json!({})
+            };
+            let mut writer = writer.lock().unwrap();
+            serde_json::to_writer(
+                &mut *writer,
+                &ControlMessage::Response {
+                    id,
+                    result: Ok(result),
+                },
+            )
+            .unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer.flush().unwrap();
+        }
+    });
+
+    let client = Arc::new(diri_client::DaemonClient::with_socket_path(socket));
+    client.connect();
+    client
+        .wait_until_connected(Duration::from_secs(2))
+        .await
+        .unwrap();
+    let (store, _unused_effects) = SessionStore::headless(Prefs::default());
+    let store = Arc::new(std::sync::RwLock::new(store));
+    let (effects_tx, effects_rx) = super::store_effect_channel();
+    let (detach_tx, _) = broadcast::channel(1);
+    let (change_tx, mut changes) = broadcast::channel(4);
+    let (status_tx, _) = broadcast::channel::<StatusTransition>(1);
+    let initial = store.read().unwrap().snapshot();
+    let (snapshot_tx, _) = watch::channel(initial);
+    let worker = tokio::spawn(super::run_effects(
+        effects_rx,
+        Arc::clone(&client),
+        store,
+        detach_tx,
+        change_tx,
+        snapshot_tx,
+        status_tx,
+    ));
+
+    for index in 0..(super::CONCURRENT_EFFECT_WORKERS * 4) {
+        effects_tx
+            .send(StoreEffect::MarkSeen(id(&format!("session-{index}"))))
+            .unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while admitted.load(std::sync::atomic::Ordering::SeqCst) < super::CONCURRENT_EFFECT_WORKERS
+        && Instant::now() < deadline
+    {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        admitted.load(std::sync::atomic::Ordering::SeqCst),
+        super::CONCURRENT_EFFECT_WORKERS
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        admitted.load(std::sync::atomic::Ordering::SeqCst),
+        super::CONCURRENT_EFFECT_WORKERS,
+        "queued lookups must not become additional in-flight tasks"
+    );
+    effects_tx.send(StoreEffect::UiChanged).unwrap();
+    tokio::time::timeout(Duration::from_millis(250), changes.recv())
+        .await
+        .expect("local publication bypasses saturated lookup lanes")
+        .expect("change stream");
+
+    let (released, ready) = &*release;
+    *released.lock().unwrap() = true;
+    ready.notify_all();
+    drop(effects_tx);
+    worker.await.unwrap();
+    client.shutdown().await;
+    drop(client);
+    server.join().unwrap();
 }
 
 #[test]
@@ -1351,8 +1794,147 @@ fn a_configure_issued_during_an_inflight_scan_still_reaches_the_engine() {
     });
     assert!(matches!(
         effects.try_recv(),
-        Ok(StoreEffect::ConfigureAgent(_))
+        Ok(StoreEffect::ConfigureAgent { .. })
     ));
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn older_catalog_response_cannot_overwrite_newer_configuration() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("engine.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let old_catalog = installed_catalog(Some("forge"), &AgentKind::CLAUDE_CODE);
+    let configured_catalog = installed_catalog(Some("forge"), &AgentKind::CODEX);
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut refresh_id = None;
+        let mut configure_id = None;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            let ControlMessage::Request { id, method, .. } = serde_json::from_str(&line).unwrap()
+            else {
+                continue;
+            };
+            match method.as_str() {
+                Method::HELLO => {
+                    serde_json::to_writer(
+                        &mut writer,
+                        &ControlMessage::Response {
+                            id,
+                            result: Ok(serde_json::json!({
+                                "proto": diri_proto::WIRE_VERSION,
+                                "build": "catalog-generation-fixture",
+                                "pid": std::process::id(),
+                                "engineKind": diri_proto::RUST_ENGINE_KIND,
+                            })),
+                        },
+                    )
+                    .unwrap();
+                    writer.write_all(b"\n").unwrap();
+                    writer.flush().unwrap();
+                }
+                Method::AGENT_READINESS => refresh_id = Some(id),
+                Method::AGENT_CONFIGURE => configure_id = Some(id),
+                _ => panic!("unexpected fixture method {method}"),
+            }
+            let (Some(refresh_id), Some(configure_id)) = (refresh_id, configure_id) else {
+                continue;
+            };
+            serde_json::to_writer(
+                &mut writer,
+                &ControlMessage::Response {
+                    id: configure_id,
+                    result: Ok(serde_json::to_value(&configured_catalog).unwrap()),
+                },
+            )
+            .unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(75));
+            serde_json::to_writer(
+                &mut writer,
+                &ControlMessage::Response {
+                    id: refresh_id,
+                    result: Ok(serde_json::to_value(&old_catalog).unwrap()),
+                },
+            )
+            .unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer.flush().unwrap();
+            break;
+        }
+    });
+
+    let client = Arc::new(diri_client::DaemonClient::with_socket_path(socket));
+    client.connect();
+    client
+        .wait_until_connected(Duration::from_secs(2))
+        .await
+        .unwrap();
+    let (store, effects) = SessionStore::headless(Prefs::default());
+    let store = Arc::new(std::sync::RwLock::new(store));
+    let (detach_tx, _) = broadcast::channel(1);
+    let (change_tx, _) = broadcast::channel(4);
+    let (status_tx, _) = broadcast::channel::<StatusTransition>(1);
+    let initial = store.read().unwrap().snapshot();
+    let (snapshot_tx, _) = watch::channel(initial);
+    let worker = tokio::spawn(super::run_effects(
+        effects,
+        Arc::clone(&client),
+        Arc::clone(&store),
+        detach_tx,
+        change_tx,
+        snapshot_tx,
+        status_tx,
+    ));
+    {
+        let mut store = store.write().unwrap();
+        store.request_agent_catalog(Some("forge".to_owned()), false);
+        store.configure_agent(diri_proto::AgentConfigureParams {
+            host: Some("forge".to_owned()),
+            kind: AgentKind::CODEX,
+            executable_path: None,
+            show_in_quick_create: true,
+        });
+    }
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let finished = {
+                let store = store.read().unwrap();
+                !store.agent_catalog_is_loading(Some("forge"))
+                    && store.agent_catalog(Some("forge")).is_some()
+            };
+            if finished {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both reverse-order catalog responses were integrated");
+    assert_eq!(
+        store
+            .read()
+            .unwrap()
+            .agent_catalog(Some("forge"))
+            .unwrap()
+            .agents[0]
+            .kind,
+        AgentKind::CODEX,
+        "generation one completed last but must not replace generation two"
+    );
+
+    worker.abort();
+    let _ = worker.await;
+    client.shutdown().await;
+    server.join().unwrap();
 }
 
 #[test]
@@ -1364,7 +1946,7 @@ fn a_failed_scan_is_retried_only_by_an_explicit_rescan() {
         Ok(StoreEffect::RefreshAgents { .. })
     ));
     // The effect loop reports the failure: the scan retires, error recorded.
-    store.finish_agent_catalog_request("forge");
+    store.retire_agent_catalog_request("forge");
     store
         .agent_catalog_errors
         .insert("forge".into(), "ssh: connect timed out".into());
@@ -1405,9 +1987,9 @@ fn refresh_reaches_the_engine_while_a_stalled_scan_is_still_outstanding() {
 
     // The rescue answers first. The target keeps reading as loading until the
     // stalled scan retires too, and only then does a passive request resume.
-    store.finish_agent_catalog_request("forge");
+    store.retire_agent_catalog_request("forge");
     assert!(store.agent_catalog_is_loading(Some("forge")));
-    store.finish_agent_catalog_request("forge");
+    store.retire_agent_catalog_request("forge");
     assert!(!store.agent_catalog_is_loading(Some("forge")));
     store.request_agent_catalog(Some("forge".into()), false);
     assert!(matches!(
@@ -2098,9 +2680,7 @@ fn remote_spawn_uses_host_default_cwd_and_drops_worktree() {
     store.select(id("one"));
     drain(&mut effects);
 
-    fn spawn_params(
-        effects: &mut mpsc::UnboundedReceiver<StoreEffect>,
-    ) -> diri_proto::SessionSpawnParams {
+    fn spawn_params(effects: &mut StoreEffectReceiver) -> diri_proto::SessionSpawnParams {
         let spawned = drain(effects);
         match spawned.first() {
             Some(StoreEffect::Spawn(params)) => params.clone(),
@@ -2254,6 +2834,7 @@ fn the_default_shortcut_declines_and_rescans_when_readiness_is_unknown() {
     assert_eq!(
         effects.try_recv().ok(),
         Some(StoreEffect::RefreshAgents {
+            generation: 1,
             host: Some("forge".into()),
             force: false
         }),
@@ -2496,6 +3077,7 @@ fn repo_targeting_tracks_the_selected_session_and_dedupes_requests() {
     assert_eq!(
         drain(&mut effects),
         vec![StoreEffect::LocateRepo {
+            generation: 1,
             key: "local".into(),
             host: None,
             session_id: id("one"),
@@ -2504,7 +3086,8 @@ fn repo_targeting_tracks_the_selected_session_and_dedupes_requests() {
     assert_eq!(store.repo_target(None), Some(&super::RepoTarget::Pending));
 
     // The async answer lands under the same key.
-    store.set_repo_target(
+    store.finish_repo_target(
+        1,
         "local".into(),
         super::RepoTarget::Resolved("/work/p".into()),
     );
@@ -2516,6 +3099,15 @@ fn repo_targeting_tracks_the_selected_session_and_dedupes_requests() {
     // Selection changes the repo reference, not the remembered destination.
     store.select(id("two"));
     assert_eq!(store.begin_repo_targeting().as_deref(), Some("forge"));
+    assert_eq!(store.repo_target(None), None);
+
+    // A response already in flight for the previous selected session cannot
+    // repopulate the freshly cleared target map.
+    store.finish_repo_target(
+        1,
+        "local".into(),
+        super::RepoTarget::Resolved("/work/old-session".into()),
+    );
     assert_eq!(store.repo_target(None), None);
 }
 

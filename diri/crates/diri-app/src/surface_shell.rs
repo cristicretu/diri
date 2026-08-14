@@ -551,7 +551,7 @@ impl UtilitySurfaces {
             return;
         };
         self.store
-            .read()
+            .write()
             .expect("session store lock poisoned")
             .reparent_worktree(params);
         self.activity = "Moving session to worktree…".to_owned();

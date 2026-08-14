@@ -2632,7 +2632,7 @@ impl TerminalPane {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.runtime
                             .store
-                            .read()
+                            .write()
                             .expect("session store lock poisoned")
                             .resume(id.clone());
                         cx.notify();
@@ -2800,7 +2800,7 @@ impl TerminalPane {
                     move |this, cx| {
                         this.runtime
                             .store
-                            .read()
+                            .write()
                             .expect("session store lock poisoned")
                             .resume(id.clone());
                         cx.notify();

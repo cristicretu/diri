@@ -4,6 +4,19 @@ use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use crate::commands::{CommandId, OpenSettings};
+use crate::delegation::{HandoffProposal, handoff_proposal, sibling_proposal, validate_handoff};
+use crate::external_drop::{ExternalDropPlan, ExternalDropTarget, plan_external_drop};
+use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
+use crate::navigation::query_label;
+use crate::query_editor::{self, ClipboardEdit, Edit};
+use crate::seam::toggle_has_settled;
+use crate::store::{
+    ClickModifiers, DirectoryListingState, SessionStore, SpawnOptions, StoreEffectReceiver,
+    StoreRuntime,
+};
+use crate::updates::{UpdateCommand, UpdatePhase, UpdateState};
+use crate::usage::{UsageFormat, UsageSnapshot};
 use diri_proto::remote_pty::PersistenceCapability;
 use diri_proto::{
     AgentKind as ProtoAgentKind, AttentionLevel as ProtoAttentionLevel, ProjectId, SessionId,
@@ -20,20 +33,6 @@ use gpui::{
     IntoElement, MouseButton, Pixels, Point, Render, Rgba, ScrollHandle, SharedString, Task,
     Window, anchored, deferred, div, linear_color_stop, linear_gradient, point, prelude::*, px,
 };
-use tokio::sync::mpsc;
-
-use crate::commands::{CommandId, OpenSettings};
-use crate::delegation::{HandoffProposal, handoff_proposal, sibling_proposal, validate_handoff};
-use crate::external_drop::{ExternalDropPlan, ExternalDropTarget, plan_external_drop};
-use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
-use crate::navigation::query_label;
-use crate::query_editor::{self, ClipboardEdit, Edit};
-use crate::seam::toggle_has_settled;
-use crate::store::{
-    ClickModifiers, DirectoryListingState, SessionStore, SpawnOptions, StoreEffect, StoreRuntime,
-};
-use crate::updates::{UpdateCommand, UpdatePhase, UpdateState};
-use crate::usage::{UsageFormat, UsageSnapshot};
 
 use super::{
     CursorMove, DragItem, Popover, PreviewScenario, SidebarPreviewFixture, SidebarUiState,
@@ -128,7 +127,7 @@ impl Render for DragPreview {
 pub struct Sidebar {
     store: Arc<RwLock<SessionStore>>,
     // Preview stores have no daemon adapter, so retain their effect receiver.
-    _preview_effects: Option<mpsc::UnboundedReceiver<StoreEffect>>,
+    _preview_effects: Option<StoreEffectReceiver>,
     _store_changes: Option<Task<()>>,
     ui: SidebarUiState,
     /// Session list scroll position, read back each frame to size the top and
@@ -430,7 +429,7 @@ impl Sidebar {
     /// Reopen the most recently closed session via the daemon's reopen stack.
     pub fn reopen_last(&mut self, cx: &mut Context<Self>) {
         self.store
-            .read()
+            .write()
             .expect("session store lock poisoned")
             .reopen_last();
         cx.notify();
@@ -3449,7 +3448,7 @@ impl Sidebar {
                         let id = id.clone();
                         move |this, _, _, cx| {
                             this.store
-                                .read()
+                                .write()
                                 .expect("session store lock poisoned")
                                 .resume(id.clone());
                             this.ui.popover = None;
