@@ -1054,7 +1054,7 @@ impl RootView {
             }
             CommandId::OpenSettings => {
                 if let Some(surfaces) = &self.utility_surfaces {
-                    surfaces.update(cx, |surfaces, cx| surfaces.open_settings(cx));
+                    surfaces.update(cx, |surfaces, cx| surfaces.toggle_settings(cx));
                 }
             }
             CommandId::ToggleSidebar => {

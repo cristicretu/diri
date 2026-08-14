@@ -54,6 +54,7 @@ pub enum IconName {
     CheckCircle,
     Checklist,
     ChevronDown,
+    ChevronLeft,
     ChevronRight,
     ChevronUp,
     ChevronUpDown,
@@ -95,7 +96,7 @@ pub enum IconName {
 }
 
 impl IconName {
-    pub const ALL: [Self; 46] = [
+    pub const ALL: [Self; 47] = [
         Self::Activity,
         Self::Archive,
         Self::ArrowDown,
@@ -104,6 +105,7 @@ impl IconName {
         Self::CheckCircle,
         Self::Checklist,
         Self::ChevronDown,
+        Self::ChevronLeft,
         Self::ChevronRight,
         Self::ChevronUp,
         Self::ChevronUpDown,
@@ -154,6 +156,7 @@ impl IconName {
             Self::CheckCircle => "icons/check-circle.svg",
             Self::Checklist => "icons/checklist.svg",
             Self::ChevronDown => "icons/chevron-down.svg",
+            Self::ChevronLeft => "icons/chevron-left.svg",
             Self::ChevronRight => "icons/chevron-right.svg",
             Self::ChevronUp => "icons/chevron-up.svg",
             Self::ChevronUpDown => "icons/chevron-up-down.svg",
@@ -207,6 +210,7 @@ impl IconName {
             "checkmark.circle" | "checkmark.circle.fill" => Self::CheckCircle,
             "checklist" => Self::Checklist,
             "chevron.down" => Self::ChevronDown,
+            "arrow.left" | "chevron.left" => Self::ChevronLeft,
             "chevron.right" => Self::ChevronRight,
             "chevron.up" => Self::ChevronUp,
             "chevron.up.chevron.down" => Self::ChevronUpDown,
@@ -310,6 +314,7 @@ fn embedded_svg(path: &str) -> Option<&'static [u8]> {
         "icons/check-circle.svg" => include_bytes!("../assets/icons/check-circle.svg"),
         "icons/checklist.svg" => include_bytes!("../assets/icons/checklist.svg"),
         "icons/chevron-down.svg" => include_bytes!("../assets/icons/chevron-down.svg"),
+        "icons/chevron-left.svg" => include_bytes!("../assets/icons/chevron-left.svg"),
         "icons/chevron-right.svg" => include_bytes!("../assets/icons/chevron-right.svg"),
         "icons/chevron-up.svg" => include_bytes!("../assets/icons/chevron-up.svg"),
         "icons/chevron-up-down.svg" => include_bytes!("../assets/icons/chevron-up-down.svg"),
@@ -418,6 +423,7 @@ mod tests {
             "checkmark.circle",
             "checkmark.circle.fill",
             "chevron.down",
+            "chevron.left",
             "chevron.left.forwardslash.chevron.right",
             "chevron.right",
             "chevron.up",

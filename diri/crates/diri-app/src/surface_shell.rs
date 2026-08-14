@@ -18,12 +18,13 @@ use diri_proto::{AgentKind as ProtoAgentKind, HistoryEntry, HostEntry, HostsConf
 use diri_term::theme::{TermTheme, ThemeAppearance};
 use diri_ui::{
     AgentLogo, Fill, FloatingSurface, HairlineDivider, Ink, LoadingIndicator, Metrics, Palette,
-    Radius, SemanticColors, Space, Typo,
+    Radius, SemanticColors, Typo,
 };
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, FocusHandle, Focusable, FontWeight,
-    IntoElement, KeyDownEvent, MouseButton, PathPromptOptions, Pixels, Render, Rgba, SharedString,
-    Task, TextRun, Window, canvas, deferred, div, font, prelude::*, px, rgba,
+    Animation, AnimationExt, AnyElement, App, Bounds, ClickEvent, Context, CursorStyle,
+    FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton, PathPromptOptions,
+    Pixels, Render, Rgba, ScrollHandle, SharedString, Task, TextRun, Window, canvas, deferred, div,
+    ease_out_quint, font, point, prelude::*, px, rgba,
 };
 use tokio::runtime::Runtime;
 
@@ -31,9 +32,11 @@ use crate::commands::{
     Activate, CloseSurface, CommandId, MoveDown, MoveUp, OpenSettings, OpenWorktrees,
     ToggleHistory, UTILITY_CONTEXT,
 };
-const SETTINGS_WIDTH: f32 = 600.0;
-const SETTINGS_HEIGHT: f32 = 420.0;
-const SETTINGS_NAV_WIDTH: f32 = 150.0;
+const SETTINGS_CONTENT_MAX_WIDTH: f32 = 760.0;
+/// Settings is its own destination with a stable navigation measure. It must
+/// not inherit a workspace sidebar width the user enlarged for long sessions.
+const SETTINGS_RAIL_WIDTH: f32 = 248.0;
+const SETTINGS_TRANSITION_DURATION: Duration = Duration::from_millis(190);
 const SETTINGS_SECTION_GAP: f32 = 16.0;
 const SETTINGS_ROW_HEIGHT: f32 = 50.0;
 const RESULT_LIMIT: usize = 200;
@@ -261,6 +264,10 @@ pub struct UtilitySurfaces {
     history_error: Option<String>,
     worktrees: WorktreesSheet,
     settings_tab: SettingsTab,
+    settings_scroll: ScrollHandle,
+    settings_search: QueryEditor,
+    settings_search_active: bool,
+    settings_transition_generation: u64,
     settings_menu: Option<SettingsMenu>,
     agents_host: Option<String>,
     agent_path_editor: Option<AgentPathEditor>,
@@ -368,6 +375,10 @@ impl UtilitySurfaces {
             history_error: None,
             worktrees: WorktreesSheet::default(),
             settings_tab,
+            settings_scroll: ScrollHandle::new(),
+            settings_search: QueryEditor::default(),
+            settings_search_active: false,
+            settings_transition_generation: 0,
             settings_menu: None,
             agents_host,
             agent_path_editor: None,
@@ -1035,10 +1046,93 @@ impl UtilitySurfaces {
             .preferences()
             .clone();
         self.surface = Surface::Settings;
+        self.settings_scroll.set_offset(point(px(0.0), px(0.0)));
+        self.settings_search.clear();
+        self.settings_search_active = false;
+        self.settings_transition_generation = self.settings_transition_generation.wrapping_add(1);
         self.settings_menu = None;
         self.host_editor = None;
         self.agent_path_editor = None;
         cx.notify();
+    }
+
+    pub(crate) fn toggle_settings(&mut self, cx: &mut Context<Self>) {
+        if self.surface == Surface::Settings {
+            self.close_surface(cx);
+        } else {
+            self.open_settings(cx);
+        }
+    }
+
+    fn visible_settings_tabs(&self) -> Vec<SettingsTab> {
+        SettingsTab::ALL
+            .into_iter()
+            .filter(|tab| settings_tab_matches(*tab, self.settings_search.text()))
+            .collect()
+    }
+
+    fn select_settings_tab(&mut self, tab: SettingsTab, cx: &mut Context<Self>) {
+        if self.settings_tab != tab {
+            self.settings_scroll.set_offset(point(px(0.0), px(0.0)));
+        }
+        self.settings_tab = tab;
+        self.settings_search_active = false;
+        self.settings_menu = None;
+        self.host_editor = None;
+        self.agent_path_editor = None;
+        if tab == SettingsTab::Remote {
+            self.reload_hosts();
+        } else if tab == SettingsTab::Agents {
+            self.store
+                .write()
+                .expect("session store lock poisoned")
+                .request_agent_catalog(self.agents_host.clone(), false);
+        }
+        cx.notify();
+    }
+
+    fn handle_settings_search_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.surface != Surface::Settings || !self.settings_search_active {
+            return false;
+        }
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                if self.settings_search.is_empty() {
+                    self.settings_search_active = false;
+                } else {
+                    self.settings_search.clear();
+                }
+                cx.notify();
+            }
+            "enter" => {
+                if let Some(tab) = self.visible_settings_tabs().first().copied() {
+                    self.select_settings_tab(tab, cx);
+                }
+            }
+            _ => {
+                let Some(edit) = query_editor::edit_for(&event.keystroke) else {
+                    return true;
+                };
+                match edit {
+                    Edit::Local(local) => {
+                        self.settings_search.apply(local);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Copy) => {
+                        query_editor::copy_selection(&self.settings_search, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Cut) => {
+                        query_editor::cut_selection(&mut self.settings_search, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Paste) => {
+                        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                            self.settings_search.insert(&text);
+                        }
+                    }
+                }
+                cx.notify();
+            }
+        }
+        true
     }
 
     pub(crate) fn open_agent_settings(&mut self, host: Option<String>, cx: &mut Context<Self>) {
@@ -1087,6 +1181,10 @@ impl UtilitySurfaces {
             return;
         }
         if self.handle_agent_path_key(event, cx) || self.handle_host_editor_key(event, cx) {
+            return;
+        }
+        if self.handle_settings_search_key(event, cx) {
+            cx.stop_propagation();
             return;
         }
         let key = &event.keystroke;
@@ -1666,13 +1764,42 @@ impl UtilitySurfaces {
     }
 
     fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        /* ─────────────────────────────────────────────────────────
+         * SETTINGS SHELL STORYBOARD
+         *
+         *    0ms   workbench is replaced in place; rail begins 8px left
+         *   70ms   settings rail is legible; canvas follows from 12px right
+         *  190ms   both surfaces settle at their final positions and opacity
+         *
+         * Navigation stays spatially anchored to the old sidebar. Reduced
+         * motion mounts the final layout immediately.
+         * ───────────────────────────────────────────────────────── */
         let colors = self.settings_colors();
-        let tabs = SettingsTab::ALL
-            .into_iter()
-            .map(|tab| {
-                let selected = tab == self.settings_tab;
+        let visible_tabs = self.visible_settings_tabs();
+        let mut tabs = div().flex().flex_col();
+        let mut personal_started = false;
+        let mut system_started = false;
+        for tab in visible_tabs.iter().copied() {
+            let personal = matches!(
+                tab,
+                SettingsTab::General | SettingsTab::Agents | SettingsTab::Terminal
+            );
+            if personal && !personal_started {
+                tabs = tabs.child(settings_nav_section_header("Personal", 8.0, colors));
+                personal_started = true;
+            } else if !personal && !system_started {
+                tabs = tabs.child(settings_nav_section_header(
+                    "System",
+                    if personal_started { 14.0 } else { 8.0 },
+                    colors,
+                ));
+                system_started = true;
+            }
+            let selected = tab == self.settings_tab;
+            tabs = tabs.child(
                 div()
                     .id(SharedString::from(format!("settings-{}", tab.label())))
+                    .debug_selector(move || format!("SETTINGS_TAB_{}", tab.label()))
                     .h(px(30.0))
                     .px(px(8.0))
                     .rounded(px(Radius::ROW))
@@ -1688,29 +1815,25 @@ impl UtilitySurfaces {
                     .cursor_pointer()
                     .hover(move |style| style.bg(Fill::hover(colors, true)))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.settings_tab = tab;
-                        this.settings_menu = None;
-                        this.host_editor = None;
-                        this.agent_path_editor = None;
-                        if tab == SettingsTab::Remote {
-                            this.reload_hosts();
-                        } else if tab == SettingsTab::Agents {
-                            this.store
-                                .write()
-                                .expect("session store lock poisoned")
-                                .request_agent_catalog(this.agents_host.clone(), false);
-                        }
-                        cx.notify();
+                        this.select_settings_tab(tab, cx);
                     }))
-                    .child(sf_symbol(
-                        tab.icon(),
-                        13.0,
-                        if selected {
-                            colors.primary
-                        } else {
-                            colors.tertiary
-                        },
-                    ))
+                    .child(
+                        div()
+                            .w(px(16.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(sf_symbol(
+                                tab.icon(),
+                                12.0,
+                                if selected {
+                                    colors.primary
+                                } else {
+                                    colors.tertiary
+                                },
+                            )),
+                    )
                     .child(
                         div()
                             .text_size(px(Typo::ROW.size))
@@ -1720,10 +1843,89 @@ impl UtilitySurfaces {
                                 FontWeight::NORMAL
                             })
                             .child(tab.label()),
-                    )
-                    .into_any_element()
-            })
-            .collect::<Vec<_>>();
+                    ),
+            );
+        }
+        if visible_tabs.is_empty() {
+            tabs = tabs.child(
+                div()
+                    .px(px(10.0))
+                    .pt(px(14.0))
+                    .text_size(px(Typo::META.size))
+                    .text_color(colors.tertiary)
+                    .child("No settings found"),
+            );
+        }
+        let search_content = if self.settings_search_active {
+            query_label(&self.settings_search)
+        } else if self.settings_search.is_empty() {
+            div()
+                .text_color(colors.tertiary)
+                .child("Search settings…")
+                .into_any_element()
+        } else {
+            div()
+                .text_color(colors.primary)
+                .child(self.settings_search.text().to_owned())
+                .into_any_element()
+        };
+        let search = div()
+            .id("settings-search")
+            .debug_selector(|| "settings-search".into())
+            .h(px(32.0))
+            .mx(px(4.0))
+            .mt(px(8.0))
+            .px(px(9.0))
+            .rounded(px(16.0))
+            .border_1()
+            .border_color(colors.primary.alpha(if self.settings_search_active {
+                0.22
+            } else {
+                0.11
+            }))
+            .bg(colors.primary.alpha(0.025))
+            .flex()
+            .items_center()
+            .gap(px(7.0))
+            .cursor(CursorStyle::IBeam)
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.settings_search_active = true;
+                this.focus.focus(window, cx);
+                cx.notify();
+            }))
+            .child(sf_symbol("magnifyingglass", 12.0, colors.tertiary))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_size(px(Typo::ROW.size))
+                    .child(search_content),
+            )
+            .when(!self.settings_search.is_empty(), |search| {
+                search.child(
+                    div()
+                        .id("clear-settings-search")
+                        .debug_selector(|| "clear-settings-search".into())
+                        .size(px(18.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(Fill::subtle(colors)))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.settings_search.clear();
+                            this.settings_search_active = true;
+                            cx.notify();
+                        }))
+                        .child(sf_symbol("xmark", 8.0, colors.tertiary)),
+                )
+            });
         let pane = match self.settings_tab {
             SettingsTab::General => self.general_settings(cx).into_any_element(),
             SettingsTab::Agents => self.agents_settings(cx).into_any_element(),
@@ -1731,113 +1933,127 @@ impl UtilitySurfaces {
             SettingsTab::Resources => self.resource_settings(cx).into_any_element(),
             SettingsTab::Remote => self.remote_settings(cx).into_any_element(),
         };
-        FloatingSurface::new(
-            colors,
-            div()
-                .id("settings-dialog")
-                .debug_selector(|| "settings-dialog".into())
-                .w(px(SETTINGS_WIDTH))
-                .h(px(SETTINGS_HEIGHT))
-                .rounded(px(Radius::PANEL))
-                .overflow_hidden()
-                .flex()
-                // The dialog owns clicks within its bounds. When a select is
-                // open, any click elsewhere in Settings dismisses that select
-                // before the clicked control runs its own action.
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        if this.settings_menu.take().is_some() {
-                            cx.notify();
-                        }
-                        cx.stop_propagation();
-                    }),
-                )
-                .child(
-                    div()
-                        .w(px(SETTINGS_NAV_WIDTH))
-                        .h_full()
-                        .bg(colors.primary.alpha(0.018))
-                        .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .h(px(Metrics::TITLE_BAR))
-                                .px(px(Metrics::TOOLBAR_EDGE_INSET))
-                                .flex()
-                                .items_center()
-                                .gap(px(Metrics::TOOLBAR_ITEM_GAP))
-                                .child(sf_symbol("gearshape", 15.0, colors.secondary))
-                                .child(
-                                    div()
-                                        .text_size(px(Typo::TITLE.size))
-                                        .font_weight(Typo::TITLE.weight)
-                                        .child("Settings"),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .px(px(Space::INSET))
-                                .pt(px(2.0))
-                                .pb(px(10.0))
-                                .flex_1()
-                                .flex()
-                                .flex_col()
-                                .gap(px(2.0))
-                                .children(tabs),
-                        )
-                        .child(
-                            div()
-                                .px(px(Metrics::TOOLBAR_EDGE_INSET))
-                                .pb(px(10.0))
-                                .text_size(px(Typo::META.size))
-                                .text_color(colors.tertiary)
-                                .child(format!("diri {}", crate::updates::CURRENT_VERSION)),
-                        ),
-                )
-                .child(HairlineDivider::vertical(colors))
-                .child(
-                    div()
-                        .relative()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .h_full()
-                        .child(
-                            div()
-                                .id("settings-pane")
-                                .debug_selector(|| "settings-pane".into())
-                                .absolute()
-                                .inset_0()
-                                .overflow_y_scroll()
-                                .child(pane),
-                        )
-                        .child(
-                            div()
-                                .id("close-settings")
-                                .debug_selector(|| "close-settings".into())
-                                .absolute()
-                                .top(px(8.0))
-                                .right(px(Metrics::TOOLBAR_EDGE_INSET))
-                                .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
-                                .rounded(px(Radius::BADGE))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .cursor_pointer()
-                                .hover(move |style| style.bg(Fill::subtle(colors)))
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.close_surface(cx);
-                                }))
-                                .child(sf_symbol_weighted(
-                                    "xmark",
-                                    13.5,
-                                    SymbolWeight::Bold,
-                                    colors.secondary,
-                                )),
-                        ),
-                ),
-        )
+        let generation = self.settings_transition_generation;
+        let rail = div()
+            .id("settings-rail")
+            .debug_selector(|| "settings-rail".into())
+            .relative()
+            .w(px(SETTINGS_RAIL_WIDTH))
+            .h_full()
+            .bg(colors.sidebar_surface())
+            .border_r_1()
+            .border_color(colors.primary.alpha(0.07))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .pt(px(6.0))
+                    .child(
+                        div()
+                            .id("close-settings")
+                            .debug_selector(|| "close-settings".into())
+                            .h(px(30.0))
+                            .mx(px(12.0))
+                            .px(px(8.0))
+                            .rounded(px(Radius::ROW))
+                            .flex()
+                            .items_center()
+                            .gap(px(7.0))
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(Fill::subtle(colors)))
+                            .on_click(cx.listener(|this, _, _, cx| this.close_surface(cx)))
+                            .child(sf_symbol("chevron.left", 9.5, colors.tertiary))
+                            .child(
+                                div()
+                                    .text_size(px(Typo::META.size))
+                                    .text_color(colors.secondary)
+                                    .child("Back to app"),
+                            ),
+                    )
+                    .child(search),
+            )
+            .child(
+                div()
+                    .id("settings-nav-scroll")
+                    .px(px(4.0))
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .child(tabs),
+            )
+            .child(
+                div()
+                    .px(px(Metrics::TOOLBAR_EDGE_INSET))
+                    .pb(px(12.0))
+                    .text_size(px(Typo::META.size))
+                    .text_color(colors.tertiary)
+                    .child(format!("diri {}", crate::updates::CURRENT_VERSION)),
+            );
+        let rail = if cx.reduce_motion() {
+            rail.into_any_element()
+        } else {
+            rail.with_animation(
+                SharedString::from(format!("settings-rail-enter-{generation}")),
+                Animation::new(SETTINGS_TRANSITION_DURATION).with_easing(ease_out_quint()),
+                |rail, delta| {
+                    rail.left(px((1.0 - delta) * -8.0))
+                        .opacity(0.72 + 0.28 * delta)
+                },
+            )
+            .into_any_element()
+        };
+        let pane = div()
+            .id("settings-pane")
+            .debug_selector(|| "settings-pane".into())
+            .relative()
+            .track_scroll(&self.settings_scroll)
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full()
+            .overflow_y_scroll()
+            .bg(colors.background)
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(SETTINGS_CONTENT_MAX_WIDTH))
+                    .mx_auto()
+                    .child(pane),
+            );
+        let pane = if cx.reduce_motion() {
+            pane.into_any_element()
+        } else {
+            pane.with_animation(
+                SharedString::from(format!("settings-canvas-enter-{generation}")),
+                Animation::new(SETTINGS_TRANSITION_DURATION).with_easing(ease_out_quint()),
+                |pane, delta| {
+                    pane.left(px((1.0 - delta) * 12.0))
+                        .opacity(0.64 + 0.36 * delta)
+                },
+            )
+            .into_any_element()
+        };
+
+        div()
+            .id("settings-shell")
+            .debug_selector(|| "settings-shell".into())
+            .size_full()
+            .pt(px(Metrics::TITLE_BAR))
+            .overflow_hidden()
+            .bg(colors.background)
+            .flex()
+            // Settings owns the whole workbench. Clicking inside still closes
+            // any open select before the clicked control handles its action.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.settings_menu.take().is_some() {
+                        cx.notify();
+                    }
+                    cx.stop_propagation();
+                }),
+            )
+            .child(rail)
+            .child(pane)
     }
 
     fn general_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3881,7 +4097,8 @@ impl Render for UtilitySurfaces {
                 this.open_worktrees(cx);
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
-                this.open_settings(cx);
+                this.toggle_settings(cx);
+                cx.stop_propagation();
             }))
             .on_action(cx.listener(|this, _: &CloseSurface, _, cx| this.close_surface(cx)))
             .on_action(cx.listener(|this, _: &MoveUp, _, cx| this.move_history(-1, cx)))
@@ -3896,40 +4113,54 @@ impl Render for UtilitySurfaces {
             .size_full()
             .text_color(self.colors().primary);
         if let Some(overlay) = overlay {
-            root.inset_0().child(
-                div()
-                    .absolute()
-                    .when(leave_sidebar_exposed, |backdrop| {
-                        backdrop
-                            .top(px(0.0))
-                            .right(px(0.0))
-                            .bottom(px(0.0))
-                            .left(px(sidebar_width))
-                    })
-                    .when(!leave_sidebar_exposed, |backdrop| backdrop.inset_0())
-                    .debug_selector(|| "surface-backdrop".into())
-                    // The modal backdrop dismisses the topmost surface while
-                    // still protecting terminal selection and scrollback.
-                    .occlude()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.close_surface(cx);
-                            cx.stop_propagation();
-                        }),
-                    )
-                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                    .bg(rgba(0x00000040))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .occlude()
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .child(overlay),
-                    ),
-            )
+            if self.surface == Surface::Settings {
+                root.inset_0().child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .debug_selector(|| "surface-backdrop".into())
+                        .occlude()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                        .bg(self.colors().background)
+                        .child(overlay),
+                )
+            } else {
+                root.inset_0().child(
+                    div()
+                        .absolute()
+                        .when(leave_sidebar_exposed, |backdrop| {
+                            backdrop
+                                .top(px(0.0))
+                                .right(px(0.0))
+                                .bottom(px(0.0))
+                                .left(px(sidebar_width))
+                        })
+                        .when(!leave_sidebar_exposed, |backdrop| backdrop.inset_0())
+                        .debug_selector(|| "surface-backdrop".into())
+                        // Modal sheets still dismiss from their backdrop;
+                        // Settings is the full workbench branch above.
+                        .occlude()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.close_surface(cx);
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                        .bg(rgba(0x00000040))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .occlude()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(overlay),
+                        ),
+                )
+            }
         } else {
             root.size(px(0.0))
         }
@@ -4278,6 +4509,47 @@ fn settings_note(
                         .child(wrappable_setting_copy(body.into())),
                 ),
         )
+        .into_any_element()
+}
+
+fn settings_tab_matches(tab: SettingsTab, query: &str) -> bool {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let searchable = match tab {
+        SettingsTab::General => {
+            "general default startup login sessions close confirmation sounds chimes support diagnostics quick open search roots updates"
+        }
+        SettingsTab::Agents => {
+            "agents codex claude cursor gemini executable installed command line quick create default"
+        }
+        SettingsTab::Terminal => "terminal appearance color theme font text size zoom",
+        SettingsTab::Resources => {
+            "resources idle sessions hibernate freeze memory limit performance"
+        }
+        SettingsTab::Remote => {
+            "remote ssh openssh hosts machines connections execution tailscale network"
+        }
+    };
+    query
+        .split_whitespace()
+        .all(|word| searchable.contains(word))
+}
+
+fn settings_nav_section_header(
+    title: &'static str,
+    top_padding: f32,
+    colors: SemanticColors,
+) -> AnyElement {
+    div()
+        .px(px(8.0))
+        .pt(px(top_padding))
+        .pb(px(5.0))
+        .text_size(px(Typo::SECTION_HEADER.size))
+        .font_weight(Typo::SECTION_HEADER.weight)
+        .text_color(colors.tertiary)
+        .child(title)
         .into_any_element()
 }
 
@@ -4663,6 +4935,59 @@ mod tests {
             .expect("save diagnostics screenshot");
     }
 
+    /// Renders the full settings workbench after its entrance transition, so
+    /// layout and visual hierarchy can be reviewed without live user state.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes the deterministic settings-shell screenshot artifact"]
+    fn render_settings_shell_preview_screenshot() {
+        let output = std::env::var_os("DIRI_VISUAL_OUTPUT")
+            .map(PathBuf::from)
+            .expect("set DIRI_VISUAL_OUTPUT to the target PNG path");
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| crate::fonts::init(cx));
+
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let updates = crate::updates::inert();
+        let window = cx
+            .open_window(size(px(1200.0), px(800.0)), move |window, cx| {
+                let surfaces = cx.new(|cx| {
+                    let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
+                    surfaces.open_settings(cx);
+                    // Exercise the user-reported state: Remote selected after
+                    // the workspace sidebar had previously been widened.
+                    surfaces.settings_tab = SettingsTab::Remote;
+                    surfaces.prefs.sidebar_width = 400.0;
+                    surfaces
+                });
+                cx.new(|_| CachedOverlayHarness { surfaces })
+            })
+            .expect("open headless settings window");
+        cx.run_until_parked();
+        cx.advance_clock(SETTINGS_TRANSITION_DURATION + Duration::from_millis(10));
+        cx.update_window(window.into(), |_, window, _| window.refresh())
+            .expect("refresh settings window");
+        cx.run_until_parked();
+        let screenshot = cx
+            .capture_screenshot(window.into())
+            .expect("capture settings screenshot");
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent).expect("create screenshot directory");
+        }
+        screenshot.save(output).expect("save settings screenshot");
+    }
+
     struct SettingsModalHarness {
         surfaces: Entity<UtilitySurfaces>,
         background_events: Arc<AtomicUsize>,
@@ -4950,6 +5275,9 @@ mod tests {
                 background_events: Arc::new(AtomicUsize::new(0)),
             }
         });
+        cx.executor()
+            .advance_clock(SETTINGS_TRANSITION_DURATION + Duration::from_millis(10));
+        cx.run_until_parked();
         let surfaces = view.read_with(cx, |harness, _| harness.surfaces.clone());
         let field = cx.debug_bounds("HOST_FIELD_NAME").expect("name field");
 
@@ -5022,7 +5350,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn cached_settings_modal_stays_inside_window(cx: &mut TestAppContext) {
+    fn cached_settings_shell_fills_the_window(cx: &mut TestAppContext) {
         let runtime = Arc::new(StoreRuntime::inert());
         let tokio = Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -5043,17 +5371,15 @@ mod tests {
         let root = cx
             .debug_bounds("cached-settings-root")
             .expect("settings root should render");
-        let dialog = cx
-            .debug_bounds("settings-dialog")
-            .expect("settings dialog should render");
+        let shell = cx
+            .debug_bounds("settings-shell")
+            .expect("settings shell should render");
 
-        assert_eq!(dialog.center(), root.center());
-        assert!(dialog.top() >= root.top());
-        assert!(dialog.bottom() <= root.bottom());
+        assert_eq!(shell, root);
     }
 
     #[gpui::test]
-    fn settings_modal_blocks_background_selection_and_scroll(cx: &mut TestAppContext) {
+    fn settings_shell_blocks_background_selection_and_scroll(cx: &mut TestAppContext) {
         let runtime = Arc::new(StoreRuntime::inert());
         let tokio = Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -5089,10 +5415,9 @@ mod tests {
         assert_eq!(background_events.load(Ordering::Relaxed), 0);
         assert_eq!(
             surfaces.read_with(cx, |surfaces, _| surfaces.surface),
-            Surface::None
+            Surface::Settings
         );
 
-        surfaces.update(cx, |surfaces, cx| surfaces.open_settings(cx));
         cx.simulate_event(ScrollWheelEvent {
             position: outside_panel,
             delta: ScrollDelta::Pixels(point(px(0.0), px(-40.0))),
@@ -5133,13 +5458,10 @@ mod tests {
             }
         });
 
-        let dialog = cx
-            .debug_bounds("settings-dialog")
-            .expect("settings dialog should render");
-        cx.simulate_click(
-            point(dialog.center().x, dialog.top() + px(29.0)),
-            Modifiers::default(),
-        );
+        let pane = cx
+            .debug_bounds("settings-pane")
+            .expect("settings pane should render");
+        cx.simulate_click(pane.center(), Modifiers::default());
 
         let surfaces = view.read_with(cx, |harness, _| harness.surfaces.clone());
         assert_eq!(
@@ -5154,7 +5476,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn settings_dialog_centers_in_the_window_through_the_cached_wrapper(cx: &mut TestAppContext) {
+    fn settings_shell_keeps_the_sidebar_rail_in_the_cached_wrapper(cx: &mut TestAppContext) {
         let runtime = Arc::new(StoreRuntime::inert());
         let tokio = Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -5175,25 +5497,27 @@ mod tests {
         let viewport = size(px(1200.0), px(800.0));
         cx.simulate_resize(viewport);
 
-        // The backdrop must cover the window. A collapsed root leaves it
-        // 1200x0, which dims nothing and blocks nothing.
         let backdrop = cx
             .debug_bounds("surface-backdrop")
-            .expect("modal backdrop should render");
+            .expect("settings backdrop should render");
         assert_eq!(backdrop.size, viewport);
 
-        let dialog = cx
-            .debug_bounds("settings-dialog")
-            .expect("settings dialog should render");
-        assert_eq!(dialog.size.width, px(SETTINGS_WIDTH));
-        assert_eq!(dialog.size.height, px(SETTINGS_HEIGHT));
-
-        // The dialog is taller than a collapsed root, so a zero-height root
-        // parks it half above the window instead of in the middle.
-        let center = dialog.center();
-        assert_eq!(center.x, viewport.width / 2.0);
-        assert_eq!(center.y, viewport.height / 2.0);
-        assert!(dialog.top() > px(0.0), "dialog hangs above the window top");
+        let shell = cx
+            .debug_bounds("settings-shell")
+            .expect("settings shell should render");
+        let rail = cx
+            .debug_bounds("settings-rail")
+            .expect("settings rail should render");
+        let pane = cx
+            .debug_bounds("settings-pane")
+            .expect("settings pane should render");
+        assert_eq!(shell.size, viewport);
+        assert_eq!(rail.size.width, px(248.0));
+        assert!(rail.left() >= shell.left() - px(8.0));
+        assert!(rail.left() <= shell.left());
+        assert!(pane.left() >= rail.right());
+        assert!(pane.left() <= rail.right() + px(20.0));
+        assert_eq!(rail.top(), px(Metrics::TITLE_BAR));
     }
 
     #[gpui::test]
@@ -5227,6 +5551,188 @@ mod tests {
         assert_eq!(
             surfaces.read_with(cx, |surfaces, _| surfaces.surface),
             Surface::None
+        );
+    }
+
+    #[gpui::test]
+    fn settings_shortcut_action_toggles_the_shell(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let updates = crate::updates::inert();
+        let (view, cx) = cx.add_window_view(move |window, cx| {
+            let surfaces = cx.new(|cx| UtilitySurfaces::new(runtime, tokio, updates, window, cx));
+            SettingsModalHarness {
+                surfaces,
+                background_events: Arc::new(AtomicUsize::new(0)),
+            }
+        });
+        let surfaces = view.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update_in(cx, |surfaces, window, cx| {
+            surfaces.focus.focus(window, cx);
+        });
+
+        cx.dispatch_action(OpenSettings);
+        assert_eq!(
+            surfaces.read_with(cx, |surfaces, _| surfaces.surface),
+            Surface::Settings
+        );
+
+        cx.dispatch_action(OpenSettings);
+        assert_eq!(
+            surfaces.read_with(cx, |surfaces, _| surfaces.surface),
+            Surface::None,
+            "a second Command-, action should return to the app"
+        );
+    }
+
+    #[gpui::test]
+    fn settings_rail_does_not_inherit_a_resized_workspace_sidebar(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let updates = crate::updates::inert();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let surfaces = cx.new(|cx| {
+                let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
+                surfaces.open_settings(cx);
+                surfaces.prefs.sidebar_width = 400.0;
+                surfaces
+            });
+            CachedOverlayHarness { surfaces }
+        });
+        cx.simulate_resize(size(px(1200.0), px(800.0)));
+
+        let rail = cx
+            .debug_bounds("settings-rail")
+            .expect("settings rail should render");
+        assert_eq!(
+            rail.size.width,
+            px(248.0),
+            "settings navigation should keep its own stable measure"
+        );
+    }
+
+    #[test]
+    fn settings_search_matches_page_copy_not_only_tab_titles() {
+        assert!(settings_tab_matches(SettingsTab::Remote, "ssh"));
+        assert!(settings_tab_matches(SettingsTab::Resources, "memory"));
+        assert!(settings_tab_matches(SettingsTab::General, "login"));
+        assert!(!settings_tab_matches(SettingsTab::Terminal, "ssh"));
+    }
+
+    #[gpui::test]
+    fn settings_search_filters_and_opens_the_first_result(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let updates = crate::updates::inert();
+        let (view, cx) = cx.add_window_view(move |window, cx| {
+            let surfaces = cx.new(|cx| {
+                let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
+                surfaces.open_settings(cx);
+                surfaces
+            });
+            SettingsModalHarness {
+                surfaces,
+                background_events: Arc::new(AtomicUsize::new(0)),
+            }
+        });
+        cx.executor()
+            .advance_clock(SETTINGS_TRANSITION_DURATION + Duration::from_millis(10));
+        cx.run_until_parked();
+
+        let search = cx
+            .debug_bounds("settings-search")
+            .expect("settings search should render");
+        cx.simulate_click(search.center(), Modifiers::default());
+        cx.simulate_input("ssh");
+
+        assert!(cx.debug_bounds("SETTINGS_TAB_Remote").is_some());
+        assert!(cx.debug_bounds("SETTINGS_TAB_General").is_none());
+        let surfaces = view.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(surfaces.settings_search.text(), "ssh");
+            assert!(surfaces.settings_search_active);
+        });
+
+        cx.simulate_keystrokes("enter");
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(surfaces.settings_tab, SettingsTab::Remote);
+            assert!(!surfaces.settings_search_active);
+        });
+        assert!(cx.debug_bounds("SETTINGS_NOTE_COPY").is_some());
+    }
+
+    #[gpui::test]
+    fn changing_settings_tabs_resets_the_shared_pane_scroll(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let updates = crate::updates::inert();
+        let (view, cx) = cx.add_window_view(move |window, cx| {
+            let surfaces = cx.new(|cx| {
+                let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
+                surfaces.open_settings(cx);
+                surfaces
+            });
+            SettingsModalHarness {
+                surfaces,
+                background_events: Arc::new(AtomicUsize::new(0)),
+            }
+        });
+        cx.simulate_resize(size(px(900.0), px(520.0)));
+        cx.executor()
+            .advance_clock(SETTINGS_TRANSITION_DURATION + Duration::from_millis(10));
+        cx.run_until_parked();
+
+        let pane = cx
+            .debug_bounds("settings-pane")
+            .expect("settings pane should render");
+        for _ in 0..8 {
+            cx.simulate_event(ScrollWheelEvent {
+                position: pane.center(),
+                delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
+                ..ScrollWheelEvent::default()
+            });
+        }
+
+        let remote = cx
+            .debug_bounds("SETTINGS_TAB_Remote")
+            .expect("Remote tab should render");
+        cx.simulate_click(remote.center(), Modifiers::default());
+
+        let surfaces = view.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(surfaces.settings_tab, SettingsTab::Remote);
+            assert_eq!(surfaces.settings_scroll.offset(), point(px(0.0), px(0.0)));
+        });
+
+        let pane = cx
+            .debug_bounds("settings-pane")
+            .expect("settings pane should remain visible");
+        let copy = cx
+            .debug_bounds("SETTINGS_NOTE_COPY")
+            .expect("Remote page content should render");
+        assert!(
+            copy.bottom() > pane.top() && copy.top() < pane.bottom(),
+            "switching tabs left the Remote page scrolled out of view: {copy:?} vs {pane:?}"
         );
     }
 }
