@@ -32,6 +32,8 @@ pub struct SessionState {
     pub controller_epoch: u64,
     pub persistence: PersistenceCapability,
     pub created_at_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted_delivery_ids: Vec<String>,
 }
 
 impl SessionState {
@@ -50,6 +52,7 @@ impl SessionState {
             controller_epoch: 0,
             persistence: request.persistence,
             created_at_unix_ms: unix_millis(),
+            accepted_delivery_ids: Vec::new(),
         }
     }
 
@@ -67,6 +70,7 @@ impl SessionState {
             snapshot_sequence: self.snapshot_sequence,
             controller_epoch: self.controller_epoch,
             persistence: self.persistence,
+            accepted_delivery_ids: self.accepted_delivery_ids.clone(),
         }
     }
 }

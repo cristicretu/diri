@@ -206,6 +206,8 @@ fn message_kinds(messages: &[RemoteMessage]) -> String {
             RemoteMessage::ReleaseControl(_) => "ReleaseControl",
             RemoteMessage::ScrollbackRequest(_) => "ScrollbackRequest",
             RemoteMessage::ScrollbackResponse(_) => "ScrollbackResponse",
+            RemoteMessage::DeliveryInput(_) => "DeliveryInput",
+            RemoteMessage::DeliveryAccepted(_) => "DeliveryAccepted",
             RemoteMessage::Error(_) => "Error",
         })
         .collect::<Vec<_>>()
@@ -376,6 +378,84 @@ fn detach_reconnect_preserves_pid_snapshot_and_input() {
         killed.process_state,
         RemoteProcessState::Exited { .. }
     ));
+}
+
+#[test]
+fn delivery_receipt_survives_controller_response_loss_and_reconnect() {
+    use diri_proto::remote_pty::DeliveryInput;
+
+    let temporary = tempfile::tempdir().expect("temp");
+    let state_dir = temporary.path().join("state");
+    let request = LaunchRequest {
+        session_id: "delivery-receipt-e2e".into(),
+        session_token: token(),
+        argv: vec!["/bin/cat".into()],
+        cwd: "/".into(),
+        environment: vec![diri_proto::remote_pty::EnvironmentVariable {
+            name: "TERM".into(),
+            value: "xterm-256color".into(),
+        }],
+        cols: 80,
+        rows: 24,
+        persistence: PersistenceCapability::NonPersistent,
+    };
+    let launch: LaunchResult = run_json("launch", &state_dir, Some(&request));
+    let mut first = Attach::open(&state_dir, hello(&launch, Some(0), "receipt-one"));
+    first.receive_until(Duration::from_secs(2), |message| {
+        matches!(message, RemoteMessage::ControlGranted(_))
+    });
+    first.send(RemoteMessage::DeliveryInput(DeliveryInput {
+        delivery_id: "delivery-1".into(),
+        data: b"only once\n".to_vec(),
+    }));
+    first.receive_until(Duration::from_secs(2), |message| {
+        matches!(
+            message,
+            RemoteMessage::DeliveryAccepted(accepted) if accepted.delivery_id == "delivery-1"
+        )
+    });
+    drop(first);
+
+    let inspection: SessionInspection = run_json(
+        "inspect",
+        &state_dir,
+        Some(&SessionSelector {
+            session_id: launch.session_id.clone(),
+            session_token: token(),
+            expected_incarnation: Some(launch.session_incarnation.clone()),
+        }),
+    );
+    assert_eq!(inspection.accepted_delivery_ids, ["delivery-1"]);
+
+    let mut second = Attach::open(&state_dir, hello(&launch, Some(0), "receipt-two"));
+    let hello_messages = second.receive_until(Duration::from_secs(2), |message| {
+        matches!(message, RemoteMessage::ControlGranted(_))
+    });
+    let ack = hello_messages
+        .iter()
+        .find_map(|message| match message {
+            RemoteMessage::HelloAck(ack) => Some(ack),
+            _ => None,
+        })
+        .expect("HelloAck");
+    assert_eq!(ack.accepted_delivery_ids, ["delivery-1"]);
+    second.send(RemoteMessage::DeliveryInput(DeliveryInput {
+        delivery_id: "delivery-1".into(),
+        data: b"only once\n".to_vec(),
+    }));
+    second.receive_until(Duration::from_secs(2), |message| {
+        matches!(
+            message,
+            RemoteMessage::DeliveryAccepted(accepted) if accepted.delivery_id == "delivery-1"
+        )
+    });
+
+    let selector = SessionSelector {
+        session_id: launch.session_id,
+        session_token: token(),
+        expected_incarnation: Some(launch.session_incarnation),
+    };
+    let _: SessionInspection = run_json("kill", &state_dir, Some(&selector));
 }
 
 #[test]

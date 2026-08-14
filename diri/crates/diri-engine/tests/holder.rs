@@ -149,6 +149,39 @@ fn a_holder_owns_a_session_end_to_end() {
 }
 
 #[test]
+fn holder_delivery_receipts_are_idempotent_and_queryable_after_ack_loss() {
+    let root = holders_dir("receipt");
+    let logs = root.join("logs");
+    let paths = HolderPaths::new(&root, "s_receipt");
+    let launch = spec(
+        &paths,
+        &logs,
+        &["/bin/sh", "-c", "stty -echo; exec /bin/cat"],
+    );
+    let server = std::thread::spawn(move || HolderServer::run(launch));
+    let client = HolderClient::new(paths.socket());
+    wait_until("holder ready", Duration::from_secs(5), || client.is_alive());
+
+    client
+        .write_receipted(b"landed once\n", "delivery-1")
+        .expect("first delivery");
+    assert!(client.accepted_delivery("delivery-1").expect("receipt"));
+    client
+        .write_receipted(b"landed once\n", "delivery-1")
+        .expect("idempotent retry");
+    wait_until("echo in log", Duration::from_secs(5), || {
+        log_bytes(&logs, "s_receipt")
+            .windows(b"landed once".len())
+            .filter(|window| *window == b"landed once")
+            .count()
+            == 1
+    });
+
+    client.kill_tree().expect("kill-tree");
+    server.join().expect("join").expect("clean holder exit");
+}
+
+#[test]
 #[ignore = "release-only local UDS input latency benchmark"]
 fn holder_input_latency_is_reported() {
     let root = holders_dir("lat");

@@ -44,6 +44,7 @@ pub const HOLDER_STREAM_INPUT: u8 = 1;
 pub const HOLDER_STREAM_RESIZE: u8 = 2;
 pub const HOLDER_STREAM_ACK: u8 = 0;
 pub const HOLDER_STREAM_MAX_PAYLOAD: usize = 1 << 20;
+pub const HOLDER_DELIVERY_RECEIPT_LIMIT: usize = 64;
 
 /// A (pid, start time) pair. The start time is the identity check that makes
 /// signalling a recycled pid safe.
@@ -83,6 +84,15 @@ pub struct HolderStat {
         skip_serializing_if = "Option::is_none"
     )]
     pub epoch_offset: Option<u64>,
+    /// Bounded Holder-owned provenance for lifecycle submission operations.
+    /// The Holder outlives an Engine daemon restart, so these ids distinguish
+    /// a landed Enter from a paste that merely echoed before a crash.
+    #[serde(
+        rename = "acceptedDeliveryIDs",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub accepted_delivery_ids: Vec<String>,
 }
 
 /// How the held child ended.
@@ -112,6 +122,8 @@ pub enum HolderOperation {
     Stream,
     #[serde(rename = "write")]
     Write,
+    #[serde(rename = "write-receipt")]
+    WriteReceipt,
     #[serde(rename = "resize")]
     Resize,
     #[serde(rename = "signal")]
@@ -140,6 +152,12 @@ pub struct HolderRequest {
     pub rows: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sig: Option<i32>,
+    #[serde(
+        rename = "deliveryID",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub delivery_id: Option<String>,
 }
 
 impl HolderRequest {
@@ -151,6 +169,7 @@ impl HolderRequest {
             cols: None,
             rows: None,
             sig: None,
+            delivery_id: None,
         }
     }
 }

@@ -1417,6 +1417,48 @@ impl Session {
         self.submit_input()
     }
 
+    /// Lifecycle submission variant whose final Enter is acknowledged under
+    /// a stable operation id by transports that outlive this daemon.
+    pub fn send_text_receipted(
+        &self,
+        text: &str,
+        submit: bool,
+        operation_id: Option<&str>,
+    ) -> std::io::Result<()> {
+        if !submit {
+            return self.write_input(text.as_bytes());
+        }
+        self.paste_text(text)?;
+        std::thread::sleep(Duration::from_millis(30));
+        let Some(operation_id) = operation_id else {
+            return self.submit_input();
+        };
+        self.write_delivery_input(b"\r", operation_id)
+    }
+
+    pub fn accepted_delivery(&self, operation_id: &str) -> bool {
+        match &self.transport {
+            Transport::Direct(_) => false,
+            Transport::Held(client) => client.accepted_delivery(operation_id).unwrap_or(false),
+            Transport::Remote(client) => client.accepted_delivery(operation_id),
+        }
+    }
+
+    fn write_delivery_input(&self, bytes: &[u8], operation_id: &str) -> std::io::Result<()> {
+        self.shared.note_hot();
+        self.shared.grid_wake.prioritize_interactive_changes();
+        self.observe_prompt_input(bytes);
+        match &self.transport {
+            Transport::Direct(_) => self.write_input(bytes),
+            Transport::Held(client) => client
+                .write_receipted(bytes, operation_id)
+                .map_err(holder_io_error),
+            Transport::Remote(client) => client.write_delivery(bytes, operation_id),
+        }?;
+        self.feed_signal(StatusSignal::UserKeystroke);
+        Ok(())
+    }
+
     /// Types `text` into the composer WITHOUT submitting it, framed as a
     /// bracketed paste when the child has that mode on. Separated from
     /// [`Self::send_text`] so a caller that cannot see the composer — the
@@ -2030,7 +2072,14 @@ fn handle_remote_message(
             if *hello_accepted
                 || client.validate_hello(&acknowledgement).is_err()
                 || client
-                    .accept_hello(generation, acknowledgement.controller_epoch)
+                    .accept_hello(
+                        generation,
+                        acknowledgement.controller_epoch,
+                        &acknowledgement.accepted_delivery_ids,
+                        acknowledgement
+                            .capabilities
+                            .contains(&diri_proto::remote_pty::RemoteCapability::DeliveryReceipts),
+                    )
                     .is_err()
             {
                 return RemoteConnectionDisposition::Fatal;
@@ -2103,6 +2152,10 @@ fn handle_remote_message(
         }
         RemoteMessage::ScrollbackResponse(response) => {
             client.complete_scrollback(response);
+            RemoteConnectionDisposition::Continue
+        }
+        RemoteMessage::DeliveryAccepted(accepted) => {
+            client.complete_delivery(accepted.delivery_id);
             RemoteConnectionDisposition::Continue
         }
         RemoteMessage::Error(error) if error.fatal => RemoteConnectionDisposition::Fatal,

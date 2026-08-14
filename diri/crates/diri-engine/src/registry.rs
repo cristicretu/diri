@@ -85,6 +85,7 @@ pub enum RegistryRunError {
     OutcomeUncertain(String),
     InvalidRequestId,
     RequestConflict(String),
+    ReplayCapacity,
     Io(std::io::Error),
 }
 
@@ -96,6 +97,7 @@ impl From<RunError> for RegistryRunError {
             RunError::AlreadyTerminal { current } => Self::AlreadyTerminal { current },
             RunError::InvalidRequestId => Self::InvalidRequestId,
             RunError::RequestConflict { request_id } => Self::RequestConflict(request_id),
+            RunError::ReplayCapacity => Self::ReplayCapacity,
         }
     }
 }
@@ -122,6 +124,9 @@ impl std::fmt::Display for RegistryRunError {
             Self::RequestConflict(request_id) => write!(
                 formatter,
                 "request id {request_id:?} was already used with a different operation payload"
+            ),
+            Self::ReplayCapacity => formatter.write_str(
+                "request replay capacity is occupied by active operations; retry after one resolves",
             ),
             Self::Io(error) => error.fmt(formatter),
         }
@@ -618,6 +623,7 @@ impl Registry {
         else {
             return;
         };
+        let receipt_changed = self.reconcile_delivery_receipt(id, &view, completion_seq);
         let changed = self.records.get_mut(id).is_some_and(|record| {
             let changed = self.orchestration.observe(
                 record,
@@ -631,11 +637,46 @@ impl Registry {
             }
             changed
         });
-        if changed {
+        if changed || receipt_changed {
             self.dirty = true;
             self.bump_record_version(id);
             self.state_changes.notify();
         }
+    }
+
+    fn reconcile_delivery_receipt(
+        &mut self,
+        id: &str,
+        view: &SessionView,
+        completion_seq: u64,
+    ) -> bool {
+        let Some(operation_id) = self
+            .orchestration
+            .uncertain_operation_id(id)
+            .map(str::to_owned)
+        else {
+            return false;
+        };
+        if !self
+            .sessions
+            .get(id)
+            .is_some_and(|session| session.accepted_delivery(&operation_id))
+        {
+            return false;
+        }
+        self.records.get_mut(id).is_some_and(|record| {
+            let changed = self.orchestration.confirm_uncertain_delivery(
+                record,
+                &view.status,
+                view.needs_input.as_ref(),
+                completion_seq,
+                view.tail_offset,
+            );
+            if changed {
+                apply_run_transition_metadata(record);
+            }
+            changed
+        })
     }
 
     fn sync_orchestration_for(&mut self, id: &str) {
@@ -646,6 +687,12 @@ impl Registry {
         else {
             return;
         };
+        let receipt_changed = self.reconcile_delivery_receipt(id, &view, completion_seq);
+        if receipt_changed {
+            self.dirty = true;
+            self.bump_record_version(id);
+            self.state_changes.notify();
+        }
         let orchestration_before = self.orchestration.clone();
         let run_before = self.records.get(id).and_then(|record| record.run.clone());
         let dirty_before = self.dirty;
@@ -687,36 +734,55 @@ impl Registry {
                 self.dirty = dirty_before;
                 return;
             }
+            let orchestration_intent = self.orchestration.clone();
+            let run_intent = self.records.get(id).and_then(|record| record.run.clone());
             let result = self
                 .sessions
                 .get(id)
                 .expect("session remained live")
-                .send_text(&delivery.text, delivery.submit);
+                .send_text_receipted(
+                    &delivery.text,
+                    delivery.submit,
+                    delivery.operation_id.as_deref(),
+                );
             let run_id = self
                 .records
                 .get(id)
                 .and_then(|record| record.run.as_ref().map(|run| run.id));
             let blocker = view.needs_input.clone();
-            self.orchestration.finish_dispatch(
-                id,
-                run_id,
-                delivery.submit,
-                blocker,
-                view.tail_offset,
-            );
-            if result.is_err()
-                && let Some(record) = self.records.get_mut(id)
-                && let Some(run) = record.run.as_mut()
-            {
-                run.state = diri_proto::AgentRunState::Failed;
-                run.finished_at = Some(DateMillis::from(std::time::SystemTime::now()));
-                run.terminal_outcome = Some("delivery_failed".into());
-                self.orchestration.remember_terminal(id, run.clone());
-                apply_run_transition_metadata(record);
-                run_changed = true;
+            let delivered = result.is_ok();
+            match result {
+                Ok(()) => self.orchestration.finish_dispatch(
+                    id,
+                    run_id,
+                    delivery.submit,
+                    blocker,
+                    view.tail_offset,
+                ),
+                Err(error) => {
+                    if let Some(record) = self.records.get_mut(id) {
+                        let _ = self
+                            .orchestration
+                            .mark_dispatch_uncertain(record, error.to_string());
+                        apply_run_transition_metadata(record);
+                        run_changed = true;
+                    }
+                }
             }
             self.dirty = true;
-            let _ = self.persist_now();
+            if self.persist_now().is_err() && delivered {
+                self.orchestration = orchestration_intent;
+                if let Some(record) = self.records.get_mut(id) {
+                    record.run = run_intent;
+                    let _ = self.orchestration.mark_dispatch_uncertain(
+                        record,
+                        "failed to commit queued delivery outcome".into(),
+                    );
+                    apply_run_transition_metadata(record);
+                    run_changed = true;
+                }
+                self.dirty = true;
+            }
             self.state_changes.notify();
         }
         if run_changed {
@@ -738,6 +804,19 @@ impl Registry {
         let fingerprint = request_id
             .as_ref()
             .map(|_| request_fingerprint(&(id, &text, submit, expected_run_id, allow_needs_input)));
+        let replay = self.orchestration.lookup_replay(
+            id,
+            ReplayOperation::Delivery,
+            request_id.as_deref(),
+            fingerprint.as_deref(),
+        )?;
+        if matches!(replay, Some(ReplayOutcome::OutcomeUncertain { .. }))
+            && self.sessions.contains_key(id)
+        {
+            // A response-loss retry is also a reconciliation opportunity: a
+            // surviving Holder may now prove the original Enter was accepted.
+            self.sync_run_state_for(id);
+        }
         match self.orchestration.lookup_replay(
             id,
             ReplayOperation::Delivery,
@@ -783,6 +862,7 @@ impl Registry {
                 },
             )?
         };
+        let mut intent_snapshot = None;
         if !plan.queued {
             // All agent deliveries use the same two-phase outbox as queued
             // turns. Persist before the PTY write; a restart can then expose
@@ -804,37 +884,21 @@ impl Registry {
                 }
                 return Err(RegistryRunError::Io(error));
             }
+            intent_snapshot = Some((
+                self.orchestration.clone(),
+                self.records.get(id).and_then(|record| record.run.clone()),
+            ));
             if let Err(error) = self
                 .sessions
                 .get(id)
                 .expect("checked above")
-                .send_text(&text, submit)
+                .send_text_receipted(&text, submit, plan.operation_id.as_deref())
             {
-                if let Some(record) = self.records.get_mut(id)
-                    && let Some(run) = record.run.as_mut()
-                {
-                    run.state = diri_proto::AgentRunState::Failed;
-                    run.finished_at = Some(DateMillis::from(std::time::SystemTime::now()));
-                    run.terminal_outcome = Some("delivery_failed".into());
-                    self.orchestration.remember_terminal(id, run.clone());
+                if let Some(record) = self.records.get_mut(id) {
+                    self.orchestration
+                        .mark_dispatch_uncertain(record, error.to_string())?;
                     apply_run_transition_metadata(record);
                 }
-                self.orchestration.finish_dispatch(
-                    id,
-                    plan.run.as_ref().map(|run| run.id),
-                    false,
-                    None,
-                    view.tail_offset,
-                );
-                self.orchestration.remember_replay(
-                    id,
-                    ReplayOperation::Delivery,
-                    request_id.as_deref(),
-                    fingerprint.as_deref(),
-                    ReplayOutcome::OutcomeUncertain {
-                        detail: error.to_string(),
-                    },
-                )?;
                 self.dirty = true;
                 let _ = self.persist_now();
                 return Err(RegistryRunError::OutcomeUncertain(error.to_string()));
@@ -880,6 +944,19 @@ impl Registry {
                 }
                 return Err(RegistryRunError::Io(error));
             }
+            // Disk still contains the pre-side-effect intent. Mirror that
+            // exact state in memory, then expose one uncertain result instead
+            // of replaying a success that would disappear on restart.
+            let (orchestration_intent, run_intent) =
+                intent_snapshot.expect("immediate delivery retained its durable intent");
+            self.orchestration = orchestration_intent;
+            if let Some(record) = self.records.get_mut(id) {
+                record.run = run_intent;
+                self.orchestration
+                    .mark_dispatch_uncertain(record, error.to_string())?;
+                apply_run_transition_metadata(record);
+            }
+            self.dirty = true;
             return Err(RegistryRunError::OutcomeUncertain(error.to_string()));
         }
         Ok((plan.queued, plan.run))
@@ -937,6 +1014,11 @@ impl Registry {
             Some(_) => unreachable!("operation-scoped replay variant"),
             None => {}
         }
+        self.orchestration.ensure_replay_capacity(
+            reporter,
+            ReplayOperation::Report,
+            request_id.as_deref(),
+        )?;
 
         let record = self
             .records
@@ -966,6 +1048,7 @@ impl Registry {
             internal_fingerprint.as_deref(),
         )? {
             Some(ReplayOutcome::Delivery { queued, run }) => {
+                let before_report_replay = self.orchestration.clone();
                 self.orchestration.remember_replay(
                     reporter,
                     ReplayOperation::Report,
@@ -978,7 +1061,11 @@ impl Registry {
                     },
                 )?;
                 self.dirty = true;
-                self.persist_now().map_err(RegistryRunError::Io)?;
+                if let Err(error) = self.persist_now() {
+                    self.orchestration = before_report_replay;
+                    self.dirty = true;
+                    return Err(RegistryRunError::Io(error));
+                }
                 return Ok((parent, queued, run));
             }
             Some(ReplayOutcome::OutcomeUncertain { detail }) => {
@@ -998,6 +1085,7 @@ impl Registry {
         let (queued, run) =
             self.send_run_text(&parent, text, submit, None, false, internal_request_id)?;
         self.sync_orchestration_for(reporter);
+        let before_report_replay = self.orchestration.clone();
         self.orchestration.remember_replay(
             reporter,
             ReplayOperation::Report,
@@ -1010,7 +1098,11 @@ impl Registry {
             },
         )?;
         self.dirty = true;
-        self.persist_now().map_err(RegistryRunError::Io)?;
+        if let Err(error) = self.persist_now() {
+            self.orchestration = before_report_replay;
+            self.dirty = true;
+            return Err(RegistryRunError::Io(error));
+        }
         Ok((parent, queued, run))
     }
 
@@ -1041,11 +1133,25 @@ impl Registry {
         let run_before = self.records.get(id).and_then(|record| record.run.clone());
         let dirty_before = self.dirty;
         let version_before = self.record_versions.get(id).copied();
+        let (view, completion_seq) = self
+            .sessions
+            .get(id)
+            .map(|session| (session.view(), session.turn_completion_seq()))
+            .ok_or_else(|| RegistryRunError::NotFound(id.to_owned()))?;
         {
             let record = self
                 .records
                 .get_mut(id)
                 .ok_or_else(|| RegistryRunError::NotFound(id.to_owned()))?;
+            if self.orchestration.observe(
+                record,
+                &view.status,
+                view.needs_input.as_ref(),
+                completion_seq,
+                view.tail_offset,
+            ) {
+                apply_run_transition_metadata(record);
+            }
             self.orchestration.prepare_interrupt(
                 record,
                 expected_run_id,
@@ -1070,35 +1176,31 @@ impl Registry {
             }
             return Err(RegistryRunError::Io(error));
         }
+        let orchestration_intent = self.orchestration.clone();
+        let run_intent = self.records.get(id).and_then(|record| record.run.clone());
         let write_result = self
             .sessions
             .get(id)
             .ok_or_else(|| RegistryRunError::NotFound(id.to_owned()))?
             .write_input(&[0x03]);
+        if let Err(error) = write_result {
+            let record = self
+                .records
+                .get_mut(id)
+                .ok_or_else(|| RegistryRunError::NotFound(id.to_owned()))?;
+            self.orchestration
+                .mark_interrupt_uncertain(record, error.to_string())?;
+            apply_run_transition_metadata(record);
+            self.dirty = true;
+            let _ = self.persist_now();
+            return Err(RegistryRunError::OutcomeUncertain(error.to_string()));
+        }
         let record = self
             .records
             .get_mut(id)
             .ok_or_else(|| RegistryRunError::NotFound(id.to_owned()))?;
         let run = self.orchestration.finish_interrupt(record);
         record.updated_at = DateMillis::from(std::time::SystemTime::now());
-        if let Err(error) = write_result {
-            if let Some(run) = record.run.as_mut() {
-                run.terminal_outcome = Some("interrupt_outcome_uncertain".into());
-                self.orchestration.remember_terminal(id, run.clone());
-            }
-            self.orchestration.remember_replay(
-                id,
-                ReplayOperation::Interrupt,
-                request_id.as_deref(),
-                fingerprint.as_deref(),
-                ReplayOutcome::OutcomeUncertain {
-                    detail: error.to_string(),
-                },
-            )?;
-            self.dirty = true;
-            let _ = self.persist_now();
-            return Err(RegistryRunError::OutcomeUncertain(error.to_string()));
-        }
         self.orchestration.remember_replay(
             id,
             ReplayOperation::Interrupt,
@@ -1110,6 +1212,14 @@ impl Registry {
         self.bump_record_version(id);
         self.state_changes.notify();
         if let Err(error) = self.persist_now() {
+            self.orchestration = orchestration_intent;
+            if let Some(record) = self.records.get_mut(id) {
+                record.run = run_intent;
+                self.orchestration
+                    .mark_interrupt_uncertain(record, error.to_string())?;
+                apply_run_transition_metadata(record);
+            }
+            self.dirty = true;
             return Err(RegistryRunError::OutcomeUncertain(error.to_string()));
         }
         Ok(run)

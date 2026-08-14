@@ -2999,6 +2999,10 @@ fn run_control_error(error: crate::registry::RegistryRunError) -> ControlError {
             "request_conflict",
             format!("request id {request_id:?} was reused with different input"),
         ),
+        E::ReplayCapacity => ControlError::new(
+            "request_capacity",
+            "active idempotent requests occupy the bounded replay journal",
+        ),
         E::Io(error) => ControlError::internal(error.to_string()),
     }
 }

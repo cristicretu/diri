@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use diri_proto::frames::{Frame, FrameType, MAX_FRAME_BYTES};
 use diri_proto::remote_pty::{
-    ControlGranted, ControlRevoked, FullSnapshot, GridDelta, Hello, HelloAck, LaunchRequest,
-    LaunchResult, PHASE_ONE_HOLDER_CAPABILITIES, ProcessExit, RemoteCodec, RemoteError,
+    ControlGranted, ControlRevoked, DeliveryAccepted, FullSnapshot, GridDelta, Hello, HelloAck,
+    LaunchRequest, LaunchResult, ProcessExit, RemoteCapability, RemoteCodec, RemoteError,
     RemoteMessage, RemoteProcessState, ScrollbackResponse, validate_terminal_dimensions,
 };
 use diri_pty::{Exit, ExitWatcher, Pty, PtySpec, PtyStream};
@@ -37,8 +37,17 @@ const MAX_PENDING_INPUT_BYTES: usize = 1 << 20;
 const REPLAY_BUDGET_BYTES: usize = 4 << 20;
 const PERSIST_OFFSET_INTERVAL: u64 = 1 << 20;
 
-pub const PHASE_ONE_CAPABILITIES: &[diri_proto::remote_pty::RemoteCapability] =
-    PHASE_ONE_HOLDER_CAPABILITIES;
+const DELIVERY_RECEIPT_LIMIT: usize = 64;
+
+pub const PHASE_ONE_CAPABILITIES: &[RemoteCapability] = &[
+    RemoteCapability::FullSnapshot,
+    RemoteCapability::IncrementalGrid,
+    RemoteCapability::ProcessExit,
+    RemoteCapability::Signal,
+    RemoteCapability::ControllerLease,
+    RemoteCapability::Scrollback,
+    RemoteCapability::DeliveryReceipts,
+];
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -850,6 +859,42 @@ impl Holder {
                     result,
                 }))
             }
+            RemoteMessage::DeliveryInput(delivery) => {
+                if self
+                    .state
+                    .accepted_delivery_ids
+                    .iter()
+                    .any(|accepted| accepted == &delivery.delivery_id)
+                {
+                    return connection.queue(RemoteMessage::DeliveryAccepted(DeliveryAccepted {
+                        delivery_id: delivery.delivery_id,
+                    }));
+                }
+                self.write_input(&delivery.data)?;
+                if !self.pending_input.is_empty() {
+                    // The nonblocking PTY has accepted this only into Holder
+                    // memory. Do not publish durable provenance until every
+                    // byte actually crossed into the PTY; a later output edge
+                    // may still reconcile the resulting uncertain delivery.
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "delivery input is still pending before the PTY",
+                    ));
+                }
+                self.state
+                    .accepted_delivery_ids
+                    .push(delivery.delivery_id.clone());
+                if self.state.accepted_delivery_ids.len() > DELIVERY_RECEIPT_LIMIT {
+                    self.state.accepted_delivery_ids.remove(0);
+                }
+                // Receipt state must survive both an Engine restart and a
+                // Holder supervisor restart before the acknowledgement is
+                // put on the wire.
+                write_state(&self.paths.state, &self.state)?;
+                connection.queue(RemoteMessage::DeliveryAccepted(DeliveryAccepted {
+                    delivery_id: delivery.delivery_id,
+                }))
+            }
             RemoteMessage::ReleaseControl(release) => {
                 if release.controller_epoch != epoch {
                     return Err(io::Error::new(
@@ -915,6 +960,7 @@ impl Holder {
             process_state: self.state.process_state.clone(),
             output_offset: self.state.output_offset,
             snapshot_sequence: self.state.snapshot_sequence,
+            accepted_delivery_ids: self.state.accepted_delivery_ids.clone(),
         }))?;
         self.queue_replay(connection, hello.last_acknowledged_output_offset)?;
         self.state.snapshot_sequence = self.state.snapshot_sequence.saturating_add(1);

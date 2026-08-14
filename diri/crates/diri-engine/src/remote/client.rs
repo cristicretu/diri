@@ -1,17 +1,18 @@
 //! One Engine-side controller for one remote Holder.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::process::{Child, ChildStdin, ChildStdout};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use diri_proto::frames::Frame;
 use diri_proto::remote_pty::{
-    Hello, HelloAck, PHASE_ONE_HOLDER_CAPABILITIES, ProtocolVersion, RemoteCodec, RemoteMessage,
-    RemoteRole, ScrollbackRequest, ScrollbackResponse, SessionInspection, SessionSelector,
-    SessionToken, Signal, validate_terminal_dimensions,
+    DeliveryInput, Hello, HelloAck, PHASE_ONE_HOLDER_CAPABILITIES, ProtocolVersion, RemoteCodec,
+    RemoteMessage, RemoteRole, ScrollbackRequest, ScrollbackResponse, SessionInspection,
+    SessionSelector, SessionToken, Signal, validate_terminal_dimensions,
 };
 
 use super::binding::RemoteBindingStore;
@@ -29,6 +30,7 @@ struct WriterState {
     controller_epoch: Option<u64>,
     queued_input: Vec<u8>,
     queued_resize: Option<(u16, u16)>,
+    delivery_receipts: bool,
 }
 
 /// The pump owns SSH stdout. Interactive callers share this small writer
@@ -45,6 +47,8 @@ pub struct RemoteSessionClient {
     persisted_output_offset: AtomicU64,
     next_request_id: AtomicU64,
     scrollback_requests: Mutex<HashMap<u64, mpsc::Sender<diri_proto::ReadScrollbackCellsResult>>>,
+    delivery_receipts: Mutex<HashSet<String>>,
+    delivery_changed: Condvar,
 }
 
 impl RemoteSessionClient {
@@ -72,11 +76,14 @@ impl RemoteSessionClient {
                 controller_epoch: None,
                 queued_input: Vec::new(),
                 queued_resize: None,
+                delivery_receipts: false,
             }),
             observed_output_offset: AtomicU64::new(initial_output_offset),
             persisted_output_offset: AtomicU64::new(initial_output_offset),
             next_request_id: AtomicU64::new(1),
             scrollback_requests: Mutex::new(HashMap::new()),
+            delivery_receipts: Mutex::new(HashSet::new()),
+            delivery_changed: Condvar::new(),
         }
     }
 
@@ -106,15 +113,27 @@ impl RemoteSessionClient {
         terminate_current(&mut writer);
         writer.generation = writer.generation.saturating_add(1);
         writer.controller_epoch = None;
+        writer.delivery_receipts = false;
         writer.child = Some(channel.child);
         writer.input = Some(channel.input);
         Ok((writer.generation, channel.output))
     }
 
-    pub fn accept_hello(&self, generation: u64, epoch: u64) -> io::Result<()> {
+    pub fn accept_hello(
+        &self,
+        generation: u64,
+        epoch: u64,
+        accepted_delivery_ids: &[String],
+        delivery_receipts: bool,
+    ) -> io::Result<()> {
         let mut writer = self.writer.lock().expect("remote writer");
         require_generation(&writer, generation)?;
         writer.controller_epoch = Some(epoch);
+        writer.delivery_receipts = delivery_receipts;
+        drop(writer);
+        let mut receipts = self.delivery_receipts.lock().expect("delivery receipts");
+        receipts.extend(accepted_delivery_ids.iter().cloned());
+        self.delivery_changed.notify_all();
         Ok(())
     }
 
@@ -169,6 +188,78 @@ impl RemoteSessionClient {
 
     pub fn write_mouse(&self, bytes: &[u8]) -> io::Result<()> {
         self.write_terminal(bytes, true)
+    }
+
+    pub fn write_delivery(&self, bytes: &[u8], delivery_id: &str) -> io::Result<()> {
+        if self.accepted_delivery(delivery_id) {
+            return Ok(());
+        }
+        {
+            let mut writer = self.writer.lock().expect("remote writer");
+            if !writer.delivery_receipts {
+                // Capability absence is an authoritative old-peer answer: no
+                // receipted operation was sent, so the legacy terminal frame
+                // is a safe compatibility fallback.
+                return write_message(&mut writer, &RemoteMessage::Terminal(Frame::input(bytes)));
+            }
+            if writer.controller_epoch.is_none() || writer.input.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "remote controller is reconnecting",
+                ));
+            }
+            write_message(
+                &mut writer,
+                &RemoteMessage::DeliveryInput(DeliveryInput {
+                    delivery_id: delivery_id.to_owned(),
+                    data: bytes.to_vec(),
+                }),
+            )?;
+        }
+        let receipts = self.delivery_receipts.lock().expect("delivery receipts");
+        let (receipts, timeout) = self
+            .delivery_changed
+            .wait_timeout_while(receipts, Duration::from_secs(5), |receipts| {
+                !receipts.contains(delivery_id)
+            })
+            .expect("delivery receipts");
+        if receipts.contains(delivery_id) {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                if timeout.timed_out() {
+                    io::ErrorKind::TimedOut
+                } else {
+                    io::ErrorKind::BrokenPipe
+                },
+                "remote delivery acknowledgement was not observed",
+            ))
+        }
+    }
+
+    pub fn complete_delivery(&self, delivery_id: String) {
+        self.delivery_receipts
+            .lock()
+            .expect("delivery receipts")
+            .insert(delivery_id);
+        self.delivery_changed.notify_all();
+    }
+
+    pub fn accepted_delivery(&self, delivery_id: &str) -> bool {
+        if self
+            .delivery_receipts
+            .lock()
+            .expect("delivery receipts")
+            .contains(delivery_id)
+        {
+            return true;
+        }
+        self.inspect().is_ok_and(|inspection| {
+            inspection
+                .accepted_delivery_ids
+                .iter()
+                .any(|accepted| accepted == delivery_id)
+        })
     }
 
     /// Routes wheel intent to the Holder that owns the authoritative parser.

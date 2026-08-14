@@ -56,6 +56,32 @@ impl HolderClient {
         self.write_legacy(data)
     }
 
+    /// Writes one lifecycle submission idempotently. This intentionally uses
+    /// the request lane instead of the legacy binary stream so the Holder can
+    /// retain the operation id before acknowledging it.
+    pub fn write_receipted(&self, data: &[u8], delivery_id: &str) -> HolderResult<()> {
+        let mut request = HolderRequest::op(HolderOperation::WriteReceipt);
+        request.data = Some(base64::engine::general_purpose::STANDARD.encode(data));
+        request.delivery_id = Some(delivery_id.to_owned());
+        match self.request(&request) {
+            Ok(_) => Ok(()),
+            // An explicit rejection proves an older live Holder did not
+            // perform the unknown additive operation, so its acknowledged
+            // legacy write is a safe compatibility fallback. Transport loss
+            // never falls back because the new operation may have landed.
+            Err(HolderError::Rejected(_)) => self.write(data),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn accepted_delivery(&self, delivery_id: &str) -> HolderResult<bool> {
+        Ok(self
+            .stat()?
+            .accepted_delivery_ids
+            .iter()
+            .any(|accepted| accepted == delivery_id))
+    }
+
     fn write_legacy(&self, data: &[u8]) -> HolderResult<()> {
         let mut request = HolderRequest::op(HolderOperation::Write);
         request.data = Some(base64::engine::general_purpose::STANDARD.encode(data));
