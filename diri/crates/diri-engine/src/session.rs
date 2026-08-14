@@ -1451,6 +1451,15 @@ impl Session {
         }
     }
 
+    /// `Some(false)` is an authoritative remote compatibility answer. Local
+    /// and direct transports retain their existing delivery guarantees.
+    pub fn remote_delivery_receipts_supported(&self) -> Option<bool> {
+        match &self.transport {
+            Transport::Remote(client) => Some(client.delivery_receipts_supported()),
+            Transport::Direct(_) | Transport::Held(_) => None,
+        }
+    }
+
     fn write_delivery_input(&self, bytes: &[u8], operation_id: &str) -> std::io::Result<()> {
         self.shared.note_hot();
         self.shared.grid_wake.prioritize_interactive_changes();

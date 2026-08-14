@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::detect::ManifestEngine;
 use crate::holder::{HolderClient, HolderManagerPaths, HolderPaths};
 use crate::orchestration::{
-    DeliveryRequest, Orchestration, ReplayOperation, ReplayOutcome, RunError, StateChanges,
-    WaitDecision, request_fingerprint,
+    DeliveryRequest, Orchestration, RawSubmissionDecision, ReplayOperation, ReplayOutcome,
+    RunError, StateChanges, WaitDecision, request_fingerprint,
 };
 use crate::session::{HolderConfig, RemoteAdoptSpec, Session, SessionSpec, SessionView};
 
@@ -674,7 +674,9 @@ impl Registry {
             .get(id)
             .is_some_and(|session| session.uncertain_delivery(&operation_id))
         {
-            return false;
+            return self
+                .orchestration
+                .mark_delivery_explicitly_uncertain(id, &operation_id);
         }
         if !self
             .sessions
@@ -970,6 +972,16 @@ impl Registry {
             Some(_) => unreachable!("operation-scoped replay variant"),
             None => {}
         }
+        if submit
+            && self
+                .sessions
+                .get(id)
+                .is_some_and(|session| session.remote_delivery_receipts_supported() == Some(false))
+        {
+            return Err(RegistryRunError::OutcomeUncertain(
+                "remote Holder cannot acknowledge run delivery (protocol 1.6 required)".into(),
+            ));
+        }
         self.ensure_run(id)?;
         self.sync_orchestration_for(id);
         let (view, completion_seq) = self
@@ -1086,6 +1098,87 @@ impl Registry {
             .ok_or_else(|| RegistryRunError::NotFound(id.to_owned()))?
             .send_text(&text, submit)
             .map_err(RegistryRunError::Io)
+    }
+
+    /// Raw input seam for attached terminals. A standalone Enter into an
+    /// agent session claims its run generation durably while the Registry
+    /// lock still excludes run.send, before the PTY can accept the byte.
+    pub fn write_attached_input(&mut self, id: &str, bytes: &[u8]) -> Result<(), RegistryRunError> {
+        let is_agent = self
+            .records
+            .get(id)
+            .is_some_and(|record| record.kind != diri_proto::AgentKind::SHELL);
+        if !is_agent || !is_attached_submit(bytes) {
+            return self
+                .sessions
+                .get(id)
+                .ok_or_else(|| RegistryRunError::NotFound(id.to_owned()))?
+                .write_input(bytes)
+                .map_err(RegistryRunError::Io);
+        }
+
+        self.ensure_run(id)?;
+        let (view, completion_seq) = self
+            .sessions
+            .get(id)
+            .map(|session| (session.view(), session.turn_completion_seq()))
+            .ok_or_else(|| RegistryRunError::NotFound(id.to_owned()))?;
+        let transaction_before = self.run_transaction_snapshot(id);
+        let RawSubmissionDecision {
+            changed,
+            claimed,
+            blocked,
+        } = {
+            let record = self
+                .records
+                .get_mut(id)
+                .expect("ensure_run validated the record");
+            self.orchestration.claim_raw_submission(
+                record,
+                &view.status,
+                view.needs_input.as_ref(),
+                completion_seq,
+                view.tail_offset,
+            )
+        };
+        if changed {
+            if let Some(record) = self.records.get_mut(id) {
+                apply_run_transition_metadata(record);
+            }
+            self.dirty = true;
+            self.bump_record_version(id);
+            if let Err(error) = self.persist_intent_now() {
+                self.restore_run_transaction(id, transaction_before);
+                return Err(RegistryRunError::Io(error));
+            }
+            self.state_changes.notify();
+        }
+        if blocked {
+            return Err(RegistryRunError::OutcomeUncertain(
+                "attached submission cannot bypass unresolved lifecycle work".into(),
+            ));
+        }
+
+        if let Err(error) = self
+            .sessions
+            .get(id)
+            .expect("session remained live while Registry is locked")
+            .write_input(bytes)
+        {
+            if claimed {
+                if let Some(record) = self.records.get_mut(id) {
+                    self.orchestration.mark_raw_submission_uncertain(record);
+                    apply_run_transition_metadata(record);
+                }
+                self.dirty = true;
+                self.bump_record_version(id);
+                let _ = self.persist_intent_now();
+                self.state_changes.notify();
+                return Err(RegistryRunError::OutcomeUncertain(error.to_string()));
+            }
+            return Err(RegistryRunError::Io(error));
+        }
+        Ok(())
     }
 
     pub fn report_to_parent(
@@ -2110,6 +2203,10 @@ fn is_generic_terminal_title(title: &str, record: &SessionRecord) -> bool {
         )
 }
 
+fn is_attached_submit(bytes: &[u8]) -> bool {
+    matches!(bytes, b"\r" | b"\n" | b"\r\n")
+}
+
 fn not_found(id: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::NotFound, format!("no session {id}"))
 }
@@ -2289,6 +2386,71 @@ mod tests {
             working.tail_offset,
         ));
         assert_eq!(registry.records["s_agent"].run.as_ref().unwrap().id, 2);
+    }
+
+    #[test]
+    fn attached_enter_claim_is_durable_before_the_status_transition() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state_file = temp.path().join("state.json");
+        let mut registry = Registry::new(engine(), &state_file);
+        let mut agent = record("s_agent");
+        agent.kind = AgentKind::CODEX;
+        agent.status = SessionStatus::Idle;
+        agent.run = Some(AgentRun {
+            id: 1,
+            state: AgentRunState::Completed,
+            started_at: DateMillis(1.0),
+            finished_at: Some(DateMillis(2.0)),
+            terminal_outcome: Some("completed".into()),
+        });
+        registry.records.insert("s_agent".into(), agent.clone());
+        registry
+            .orchestration
+            .register(&agent, 0, &SessionStatus::Idle);
+        let idle = view("s_agent", SessionStatus::Idle, 10);
+        assert_eq!(
+            registry.orchestration.claim_raw_submission(
+                registry.records.get_mut("s_agent").unwrap(),
+                &idle.status,
+                None,
+                0,
+                idle.tail_offset,
+            ),
+            RawSubmissionDecision {
+                changed: true,
+                claimed: true,
+                blocked: false,
+            }
+        );
+        apply_run_transition_metadata(registry.records.get_mut("s_agent").unwrap());
+        registry.dirty = true;
+        registry.persist_intent_now().expect("persist raw claim");
+
+        let mut restored = Registry::new(engine(), &state_file);
+        restored.load().expect("reload raw claim");
+        let error = restored
+            .prepare_delivery_transaction(
+                "s_agent",
+                &idle,
+                0,
+                "must be stale".into(),
+                true,
+                Some(1),
+                true,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RegistryRunError::Stale {
+                expected: 1,
+                current: 2
+            }
+        ));
+        assert_eq!(restored.records["s_agent"].run.as_ref().unwrap().id, 2);
+        assert!(is_attached_submit(b"\r"));
+        assert!(!is_attached_submit(b"pasted\ntext"));
     }
 
     #[test]

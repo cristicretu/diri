@@ -140,6 +140,14 @@ struct AwaitingWork {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct ActiveReplayIdentity {
+    run_id: u64,
+    request_id: String,
+    fingerprint: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct UncertainDelivery {
     run_id: u64,
     prepared_output_offset: u64,
@@ -153,6 +161,10 @@ struct UncertainDelivery {
     request_fingerprint: Option<String>,
     #[serde(default)]
     queued: bool,
+    /// A durable Holder tombstone is stronger than heuristic PTY activity:
+    /// once observed, only an exact accepted receipt may resolve this send.
+    #[serde(default)]
+    explicitly_uncertain: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -217,6 +229,13 @@ pub(crate) struct DeliveryPlan {
     pub operation_id: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RawSubmissionDecision {
+    pub changed: bool,
+    pub claimed: bool,
+    pub blocked: bool,
+}
+
 pub(crate) struct DeliveryRequest<'a> {
     pub status: &'a SessionStatus,
     pub needs_input: Option<&'a NeedsInputDetail>,
@@ -252,6 +271,11 @@ pub(crate) struct Orchestration {
     pending: HashMap<String, VecDeque<PendingDelivery>>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     awaiting_work: HashMap<String, AwaitingWork>,
+    /// Successful request ids stay replayable for as long as their accepted
+    /// run can still produce another blocker. Retiring the dispatch guard must
+    /// not make a lost-response retry eligible for journal eviction.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    active_replays: HashMap<String, Vec<ActiveReplayIdentity>>,
     /// Dispatch is a two-phase outbox. It is persisted before touching the
     /// PTY. A crash in the tiny send/commit window is surfaced as uncertain,
     /// never silently replayed into an agent composer.
@@ -283,6 +307,7 @@ impl Orchestration {
     pub fn is_empty(&self) -> bool {
         self.pending.is_empty()
             && self.awaiting_work.is_empty()
+            && self.active_replays.is_empty()
             && self.dispatching.is_empty()
             && self.uncertain_deliveries.is_empty()
             && self.interrupting.is_empty()
@@ -320,6 +345,7 @@ impl Orchestration {
         self.completion_baselines.remove(id);
         self.pending.remove(id);
         self.awaiting_work.remove(id);
+        self.active_replays.remove(id);
         self.dispatching.remove(id);
         self.uncertain_deliveries.remove(id);
         self.interrupting.remove(id);
@@ -360,6 +386,7 @@ impl Orchestration {
                         request_id: intent.request_id.clone(),
                         request_fingerprint: intent.request_fingerprint.clone(),
                         queued: intent.queued,
+                        explicitly_uncertain: false,
                     },
                 );
                 if let (Some(request_id), Some(fingerprint)) =
@@ -451,6 +478,7 @@ impl Orchestration {
         if current_run.state.is_terminal()
             && let Some(uncertain) = uncertain
             && current_run.id == uncertain.run_id
+            && !uncertain.explicitly_uncertain
         {
             let output_advanced = output_offset > uncertain.prepared_output_offset;
             let blocker_changed = needs_input.map(BlockerIdentity::from).as_ref()
@@ -472,9 +500,11 @@ impl Orchestration {
                 self.uncertain_deliveries.remove(&id);
                 self.adoption_pending.remove(&id);
                 self.completion_baselines.insert(id.clone(), completion_seq);
-                if let (Some(request_id), Some(fingerprint)) =
-                    (uncertain.request_id, uncertain.request_fingerprint)
-                {
+                if let (Some(request_id), Some(fingerprint)) = (
+                    uncertain.request_id.clone(),
+                    uncertain.request_fingerprint.clone(),
+                ) {
+                    self.pin_active_replay(&id, accepted_run.id, &request_id, &fingerprint);
                     let _ = self.remember_replay_unchecked(
                         &id,
                         ReplayEntry {
@@ -490,6 +520,14 @@ impl Orchestration {
                 }
                 return true;
             }
+        }
+        if current_run.state.is_terminal()
+            && self
+                .uncertain_deliveries
+                .get(&id)
+                .is_some_and(|uncertain| uncertain.run_id == current_run.id)
+        {
+            return false;
         }
 
         // A raw terminal submission (the app's attached PTY path) is still a
@@ -603,6 +641,112 @@ impl Orchestration {
             }
             self.remember_terminal(&id, run.clone());
         }
+        true
+    }
+
+    /// Claims an attached terminal's raw Enter before the PTY side effect.
+    /// This closes the interval where the process has accepted a new turn but
+    /// the status reducer still reports the preceding terminal generation.
+    pub fn claim_raw_submission(
+        &mut self,
+        record: &mut SessionRecord,
+        status: &SessionStatus,
+        needs_input: Option<&NeedsInputDetail>,
+        completion_seq: u64,
+        output_offset: u64,
+    ) -> RawSubmissionDecision {
+        if matches!(status, SessionStatus::Exited(_)) {
+            return RawSubmissionDecision {
+                changed: false,
+                claimed: false,
+                blocked: true,
+            };
+        }
+        let observed = self.observe(record, status, needs_input, completion_seq, output_offset);
+        let id = record.id.0.clone();
+        if self.pending.get(&id).is_some_and(|queue| !queue.is_empty())
+            || self.dispatching.contains_key(&id)
+            || self.uncertain_deliveries.contains_key(&id)
+            || self.interrupting.contains_key(&id)
+        {
+            return RawSubmissionDecision {
+                changed: observed,
+                claimed: false,
+                blocked: true,
+            };
+        }
+        let next_run_id = self.next_run_id(record);
+        let Some(current) = record.run.as_ref() else {
+            return RawSubmissionDecision {
+                changed: observed,
+                claimed: false,
+                blocked: false,
+            };
+        };
+        let (run_id, previous) = match current.state {
+            AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Aborted
+                if matches!(status, SessionStatus::Idle) =>
+            {
+                (next_run_id, Some(current.clone()))
+            }
+            AgentRunState::NeedsInput if !self.awaiting_work.contains_key(&id) => {
+                (current.id, None)
+            }
+            AgentRunState::Starting if matches!(status, SessionStatus::Idle) => (current.id, None),
+            AgentRunState::Starting
+            | AgentRunState::Running
+            | AgentRunState::NeedsInput
+            | AgentRunState::Completed
+            | AgentRunState::Failed
+            | AgentRunState::Aborted => {
+                return RawSubmissionDecision {
+                    changed: observed,
+                    claimed: false,
+                    blocked: false,
+                };
+            }
+        };
+        if let Some(previous) = previous {
+            self.remember_terminal(&id, previous);
+            record.run = Some(AgentRun {
+                id: run_id,
+                state: AgentRunState::Running,
+                started_at: now(),
+                finished_at: None,
+                terminal_outcome: None,
+            });
+        } else if let Some(run) = record.run.as_mut() {
+            run.state = AgentRunState::Running;
+        }
+        self.awaiting_work.insert(
+            id.clone(),
+            AwaitingWork {
+                run_id,
+                accepted_output_offset: output_offset,
+                answered_blocker: needs_input.map(BlockerIdentity::from),
+            },
+        );
+        self.adoption_pending.remove(&id);
+        self.completion_baselines.insert(id, completion_seq);
+        RawSubmissionDecision {
+            changed: true,
+            claimed: true,
+            blocked: false,
+        }
+    }
+
+    /// A raw Enter failed after its durable generation claim. The underlying
+    /// write may have been partial, so neither rollback nor retry is safe.
+    pub fn mark_raw_submission_uncertain(&mut self, record: &mut SessionRecord) -> bool {
+        let id = record.id.0.clone();
+        let Some(run) = record.run.as_mut().filter(|run| !run.state.is_terminal()) else {
+            return false;
+        };
+        run.state = AgentRunState::Failed;
+        run.finished_at = Some(now());
+        run.terminal_outcome = Some("delivery_outcome_uncertain".into());
+        self.awaiting_work.remove(&id);
+        self.remember_terminal(&id, run.clone());
         true
     }
 
@@ -766,6 +910,41 @@ impl Orchestration {
                     intent.request_fingerprint.as_ref(),
                 )
             })
+            || entry.operation == ReplayOperation::Delivery
+                && self.active_replays.get(scope).is_some_and(|identities| {
+                    identities.iter().any(|identity| {
+                        identity.request_id == entry.request_id
+                            && identity.fingerprint == entry.fingerprint
+                    })
+                })
+    }
+
+    fn pin_active_replay(&mut self, id: &str, run_id: u64, request_id: &str, fingerprint: &str) {
+        let identities = self.active_replays.entry(id.to_owned()).or_default();
+        if identities.iter().any(|identity| {
+            identity.run_id == run_id
+                && identity.request_id == request_id
+                && identity.fingerprint == fingerprint
+        }) {
+            return;
+        }
+        identities.push(ActiveReplayIdentity {
+            run_id,
+            request_id: request_id.to_owned(),
+            fingerprint: fingerprint.to_owned(),
+        });
+    }
+
+    fn clear_active_replays(&mut self, id: &str, run_id: u64) {
+        let remove_scope = if let Some(identities) = self.active_replays.get_mut(id) {
+            identities.retain(|identity| identity.run_id != run_id);
+            identities.is_empty()
+        } else {
+            false
+        };
+        if remove_scope {
+            self.active_replays.remove(id);
+        }
     }
 
     pub fn remember_current_terminal(&mut self, record: &SessionRecord) {
@@ -778,6 +957,7 @@ impl Orchestration {
         if !run.state.is_terminal() {
             return;
         }
+        self.clear_active_replays(id, run.id);
         let history = self.terminal_runs.entry(id.to_owned()).or_default();
         if let Some(existing) = history.iter_mut().find(|existing| existing.id == run.id) {
             *existing = run;
@@ -1044,8 +1224,16 @@ impl Orchestration {
         answered_blocker: Option<NeedsInputDetail>,
         accepted_output_offset: u64,
     ) {
-        self.dispatching.remove(id);
+        let intent = self.dispatching.remove(id);
         if submit {
+            if let Some(intent) = intent.as_ref()
+                && let (Some(request_id), Some(fingerprint)) = (
+                    intent.request_id.as_deref(),
+                    intent.request_fingerprint.as_deref(),
+                )
+            {
+                self.pin_active_replay(id, run_id.unwrap_or(0), request_id, fingerprint);
+            }
             self.awaiting_work.insert(
                 id.to_owned(),
                 AwaitingWork {
@@ -1087,6 +1275,7 @@ impl Orchestration {
                 request_id: intent.request_id.clone(),
                 request_fingerprint: intent.request_fingerprint.clone(),
                 queued: intent.queued,
+                explicitly_uncertain: false,
             },
         );
         if let (Some(request_id), Some(fingerprint)) =
@@ -1109,6 +1298,19 @@ impl Orchestration {
         self.uncertain_deliveries
             .get(id)
             .and_then(|delivery| delivery.operation_id.as_deref())
+    }
+
+    /// Records the Holder's explicit two-phase tombstone. Generic output or
+    /// status activity can no longer infer acceptance for this operation.
+    pub fn mark_delivery_explicitly_uncertain(&mut self, id: &str, operation_id: &str) -> bool {
+        let Some(delivery) = self.uncertain_deliveries.get_mut(id) else {
+            return false;
+        };
+        if delivery.operation_id.as_deref() != Some(operation_id) || delivery.explicitly_uncertain {
+            return false;
+        }
+        delivery.explicitly_uncertain = true;
+        true
     }
 
     /// Reconciles an uncertain pre-send tombstone with the Holder's durable
@@ -1154,6 +1356,12 @@ impl Orchestration {
         if accepted_run.state.is_terminal() {
             self.remember_terminal(&id, accepted_run.clone());
         } else {
+            if let (Some(request_id), Some(fingerprint)) = (
+                uncertain.request_id.as_deref(),
+                uncertain.request_fingerprint.as_deref(),
+            ) {
+                self.pin_active_replay(&id, accepted_run.id, request_id, fingerprint);
+            }
             self.awaiting_work.insert(
                 id.clone(),
                 AwaitingWork {
@@ -1936,6 +2144,108 @@ mod tests {
     }
 
     #[test]
+    fn explicit_uncertain_receipt_suppresses_all_activity_inference_after_restart() {
+        let mut lifecycle = Orchestration::default();
+        let mut record = record();
+        lifecycle.register(&record, 0, &SessionStatus::Idle);
+        lifecycle
+            .prepare_delivery(
+                &mut record,
+                DeliveryRequest {
+                    status: &SessionStatus::Idle,
+                    needs_input: None,
+                    completion_seq: 0,
+                    output_offset: 10,
+                    expected_run_id: Some(1),
+                    text: "maybe accepted".into(),
+                    submit: true,
+                    allow_needs_input: true,
+                    request_id: Some("uncertain-1"),
+                    request_fingerprint: Some("uncertain-fingerprint"),
+                },
+            )
+            .unwrap();
+        lifecycle
+            .mark_dispatch_uncertain(&mut record, "connection lost".into())
+            .unwrap();
+        let operation_id = lifecycle
+            .uncertain_operation_id("child")
+            .unwrap()
+            .to_owned();
+        assert!(lifecycle.mark_delivery_explicitly_uncertain("child", &operation_id));
+
+        let mut lifecycle: Orchestration =
+            serde_json::from_value(serde_json::to_value(&lifecycle).unwrap()).unwrap();
+        lifecycle.register_adopted(&record, 0, &SessionStatus::Idle);
+        assert!(!lifecycle.observe(&mut record, &SessionStatus::Working, None, 0, 20));
+        let run = record.run.as_ref().unwrap();
+        assert_eq!(run.id, 1, "activity must not allocate a raw successor");
+        assert_eq!(run.state, AgentRunState::Failed);
+        assert_eq!(
+            run.terminal_outcome.as_deref(),
+            Some("delivery_outcome_uncertain")
+        );
+        assert_eq!(
+            lifecycle.uncertain_operation_id("child"),
+            Some(operation_id.as_str())
+        );
+        assert_eq!(
+            lifecycle.claim_raw_submission(&mut record, &SessionStatus::Working, None, 0, 20),
+            RawSubmissionDecision {
+                changed: false,
+                claimed: false,
+                blocked: true,
+            },
+            "attached Enter must not bypass the unresolved tombstone"
+        );
+    }
+
+    #[test]
+    fn attached_enter_claims_the_successor_before_status_changes() {
+        let mut lifecycle = Orchestration::default();
+        let mut record = record();
+        record.run.as_mut().unwrap().state = AgentRunState::Completed;
+        lifecycle.register(&record, 0, &SessionStatus::Idle);
+
+        assert_eq!(
+            lifecycle.claim_raw_submission(&mut record, &SessionStatus::Idle, None, 0, 10),
+            RawSubmissionDecision {
+                changed: true,
+                claimed: true,
+                blocked: false,
+            }
+        );
+        let claimed = record.run.as_ref().unwrap();
+        assert_eq!(claimed.id, 2);
+        assert_eq!(claimed.state, AgentRunState::Running);
+
+        let error = lifecycle
+            .prepare_delivery(
+                &mut record,
+                DeliveryRequest {
+                    status: &SessionStatus::Idle,
+                    needs_input: None,
+                    completion_seq: 0,
+                    output_offset: 10,
+                    expected_run_id: Some(1),
+                    text: "cannot cross the attached Enter".into(),
+                    submit: true,
+                    allow_needs_input: true,
+                    request_id: None,
+                    request_fingerprint: None,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            RunError::Stale {
+                expected: 1,
+                current: 2
+            }
+        );
+    }
+
+    #[test]
     fn expected_generation_is_checked_after_the_fresh_raw_turn_snapshot() {
         let mut lifecycle = Orchestration::default();
         let mut record = record();
@@ -2158,6 +2468,101 @@ mod tests {
                 )
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn accepted_request_replay_stays_pinned_until_its_run_is_terminal() {
+        let mut lifecycle = Orchestration::default();
+        let mut record = record();
+        lifecycle.register(&record, 0, &SessionStatus::Idle);
+        let plan = lifecycle
+            .prepare_delivery(
+                &mut record,
+                DeliveryRequest {
+                    status: &SessionStatus::Idle,
+                    needs_input: None,
+                    completion_seq: 0,
+                    output_offset: 0,
+                    expected_run_id: Some(1),
+                    text: "accepted".into(),
+                    submit: true,
+                    allow_needs_input: true,
+                    request_id: Some("accepted-1"),
+                    request_fingerprint: Some("accepted-fingerprint"),
+                },
+            )
+            .unwrap();
+        lifecycle.finish_dispatch("child", Some(1), true, None, 0);
+        lifecycle
+            .remember_replay(
+                "child",
+                ReplayOperation::Delivery,
+                Some("accepted-1"),
+                Some("accepted-fingerprint"),
+                ReplayOutcome::Delivery {
+                    queued: false,
+                    run: plan.run,
+                },
+            )
+            .unwrap();
+        lifecycle.observe(&mut record, &SessionStatus::Working, None, 0, 1);
+
+        for index in 0..REQUEST_REPLAY_LIMIT {
+            let request_id = format!("filler-{index}");
+            lifecycle
+                .remember_replay(
+                    "child",
+                    ReplayOperation::Delivery,
+                    Some(&request_id),
+                    Some("filler-fingerprint"),
+                    ReplayOutcome::Delivery {
+                        queued: false,
+                        run: None,
+                    },
+                )
+                .unwrap();
+        }
+        let mut lifecycle: Orchestration =
+            serde_json::from_value(serde_json::to_value(&lifecycle).unwrap()).unwrap();
+        lifecycle.register_adopted(&record, 0, &SessionStatus::Working);
+        assert!(
+            lifecycle
+                .lookup_replay(
+                    "child",
+                    ReplayOperation::Delivery,
+                    Some("accepted-1"),
+                    Some("accepted-fingerprint")
+                )
+                .unwrap()
+                .is_some(),
+            "a lost response must remain replayable throughout active work"
+        );
+
+        assert!(lifecycle.observe(&mut record, &SessionStatus::Idle, None, 1, 2));
+        lifecycle
+            .remember_replay(
+                "child",
+                ReplayOperation::Delivery,
+                Some("after-terminal"),
+                Some("after-terminal-fingerprint"),
+                ReplayOutcome::Delivery {
+                    queued: false,
+                    run: None,
+                },
+            )
+            .unwrap();
+        assert!(
+            lifecycle
+                .lookup_replay(
+                    "child",
+                    ReplayOperation::Delivery,
+                    Some("accepted-1"),
+                    Some("accepted-fingerprint")
+                )
+                .unwrap()
+                .is_none(),
+            "terminal resolution releases replay provenance for eviction"
         );
     }
 

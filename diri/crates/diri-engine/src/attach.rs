@@ -135,25 +135,33 @@ impl AttachHub {
             // the race where the governor froze it mid-keystroke.
             let _ = guard.wake_session(session_id);
         }
-        let Some(session) = guard.get(session_id) else {
+        if guard.get(session_id).is_none() {
             return true; // session ended; swallow input quietly, as Swift does
-        };
+        }
         match frame.frame_type {
             FrameType::Input => {
-                let _ = session.write_input(&frame.payload);
+                let _ = guard.write_attached_input(session_id, &frame.payload);
             }
             FrameType::Mouse => {
-                let _ = session.write_mouse(&frame.payload);
+                let _ = guard
+                    .get(session_id)
+                    .expect("session checked above")
+                    .write_mouse(&frame.payload);
             }
             FrameType::Resize => {
                 if let Some((cols, rows)) = frame.resize_payload() {
-                    let _ = session.resize(cols.max(2), rows.max(2));
+                    let _ = guard
+                        .get(session_id)
+                        .expect("session checked above")
+                        .resize(cols.max(2), rows.max(2));
                 }
             }
             FrameType::Scroll => {
                 if let Some((direction, lines, col, row)) = frame.scroll_payload() {
-                    let _ =
-                        session.scroll(direction == 0, lines as usize, col as usize, row as usize);
+                    let _ = guard
+                        .get(session_id)
+                        .expect("session checked above")
+                        .scroll(direction == 0, lines as usize, col as usize, row as usize);
                 }
             }
             FrameType::Ping => {

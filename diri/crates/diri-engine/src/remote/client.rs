@@ -251,25 +251,14 @@ impl RemoteSessionClient {
         }
         {
             let mut writer = self.writer.lock().expect("remote writer");
-            if !writer.delivery_receipts {
-                // Capability absence is an authoritative old-peer answer: no
-                // receipted operation was sent, so the legacy terminal frame
-                // is a safe compatibility fallback.
-                return write_message(&mut writer, &RemoteMessage::Terminal(Frame::input(bytes)));
-            }
+            let message = receipted_delivery_message(writer.delivery_receipts, bytes, delivery_id)?;
             if writer.controller_epoch.is_none() || writer.input.is_none() {
                 return Err(io::Error::new(
                     io::ErrorKind::NotConnected,
                     "remote controller is reconnecting",
                 ));
             }
-            write_message(
-                &mut writer,
-                &RemoteMessage::DeliveryInput(DeliveryInput {
-                    delivery_id: delivery_id.to_owned(),
-                    data: bytes.to_vec(),
-                }),
-            )?;
+            write_message(&mut writer, &message)?;
         }
         let outcomes = self.delivery_outcomes.lock().expect("delivery outcomes");
         let (outcomes, timeout) = self
@@ -329,6 +318,10 @@ impl RemoteSessionClient {
                 .iter()
                 .any(|accepted| accepted == delivery_id)
         })
+    }
+
+    pub fn delivery_receipts_supported(&self) -> bool {
+        self.writer.lock().expect("remote writer").delivery_receipts
     }
 
     pub fn uncertain_delivery(&self, delivery_id: &str) -> bool {
@@ -584,6 +577,23 @@ fn delivery_receipts_negotiated(acknowledgement: &HelloAck) -> bool {
             .contains(&RemoteCapability::DeliveryReceipts)
 }
 
+fn receipted_delivery_message(
+    delivery_receipts: bool,
+    bytes: &[u8],
+    delivery_id: &str,
+) -> io::Result<RemoteMessage> {
+    if !delivery_receipts {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "remote Holder does not support receipted delivery (protocol 1.6 required)",
+        ));
+    }
+    Ok(RemoteMessage::DeliveryInput(DeliveryInput {
+        delivery_id: delivery_id.to_owned(),
+        data: bytes.to_vec(),
+    }))
+}
+
 fn write_message(writer: &mut WriterState, message: &RemoteMessage) -> io::Result<()> {
     let encoded = RemoteCodec::encode(message).map_err(io::Error::other)?;
     let input = writer
@@ -690,10 +700,21 @@ mod tests {
             uncertain_delivery_ids: vec!["also-false".into()],
         };
         assert!(!delivery_receipts_negotiated(&acknowledgement));
+        let error = receipted_delivery_message(
+            delivery_receipts_negotiated(&acknowledgement),
+            b"\r",
+            "must-not-send",
+        )
+        .expect_err("an old peer must not receive an unreceipted fallback");
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
 
         let mut current = acknowledgement;
         current.protocol.minor = DELIVERY_RECEIPT_PROTOCOL_MINOR;
         assert!(delivery_receipts_negotiated(&current));
+        assert!(matches!(
+            receipted_delivery_message(true, b"\r", "accepted"),
+            Ok(RemoteMessage::DeliveryInput(_))
+        ));
         current.capabilities.clear();
         assert!(!delivery_receipts_negotiated(&current));
     }
