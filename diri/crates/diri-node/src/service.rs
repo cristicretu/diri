@@ -6,7 +6,7 @@ use diri_proto::{
     BlobPutParams, BlobReadParams, CheckpointIdParams, CheckpointManifestParams,
     CheckpointPrepareParams, EmptyParams, LoginInputParams, LoginSessionParams, MoveAbortParams,
     MoveCommitParams, NodeCapability, NodeHelloResult, NodeMethod, NodeStatusResult,
-    ProviderCallParams, UsageQueryParams, UsageRecordParams,
+    PortableConfigApplyParams, ProviderCallParams, UsageQueryParams, UsageRecordParams,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -66,6 +66,7 @@ impl NodeService {
                 NodeCapability::FLEET_USAGE.into(),
                 NodeCapability::CHECKPOINTS.into(),
                 NodeCapability::MOVE_LEASES.into(),
+                NodeCapability::PORTABLE_CONFIG.into(),
             ],
         }
     }
@@ -139,6 +140,28 @@ impl NodeService {
                 let params: LoginSessionParams = decode(params)?;
                 self.providers.lock().await.cancel_login(params).await?;
                 encode(json!({"ok": true}))
+            }
+            NodeMethod::ACCOUNT_PORTABLE_CONFIG_EXPORT => {
+                let params: AccountProfileParams = decode(params)?;
+                let accounts = self.accounts.lock().await;
+                let profile = accounts.profile(&params.profile_id)?;
+                encode(crate::portable::capture(
+                    profile,
+                    &accounts.config_home(profile),
+                )?)
+            }
+            NodeMethod::ACCOUNT_PORTABLE_CONFIG_APPLY => {
+                let params: PortableConfigApplyParams = decode(params)?;
+                let profile_id = params.bundle.profile_id.clone();
+                let result = {
+                    let accounts = self.accounts.lock().await;
+                    let profile = accounts.profile(&profile_id)?;
+                    crate::portable::apply(profile, &accounts.config_home(profile), params.bundle)?
+                };
+                if !result.installed.is_empty() {
+                    self.providers.lock().await.reset_profile(&profile_id);
+                }
+                encode(result)
             }
             NodeMethod::PROVIDER_CALL => {
                 let params: ProviderCallParams = decode(params)?;

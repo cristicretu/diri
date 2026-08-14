@@ -12,8 +12,9 @@ use diri_proto::{
     CheckpointManifestParams, CheckpointPrepareParams, CheckpointStageResult, HostEntry,
     InstallationStatus, LoginChallenge, LoginInputParams, LoginSessionParams, MoveAbortParams,
     MoveCommitParams, MoveRecord, NodeHelloParams, NodeHelloResult, NodeMethod, NodeStatusResult,
-    ProviderCallParams, ProviderCallResult, ProviderKind, SessionHandoffResult, TransferMode,
-    UsageEvent, UsageQueryParams, UsageQueryResult, UsageRecordParams,
+    PortableConfigApplyParams, PortableConfigApplyResult, PortableConfigBundle, ProviderCallParams,
+    ProviderCallResult, ProviderKind, SessionHandoffResult, TransferMode, UsageEvent,
+    UsageQueryParams, UsageQueryResult, UsageRecordParams,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -166,6 +167,47 @@ impl NodeClient {
         Ok(())
     }
 
+    pub async fn export_portable_config(
+        &self,
+        profile_id: impl Into<String>,
+    ) -> Result<PortableConfigBundle, ClientError> {
+        self.typed(
+            NodeMethod::ACCOUNT_PORTABLE_CONFIG_EXPORT,
+            &AccountProfileParams {
+                profile_id: profile_id.into(),
+            },
+        )
+        .await
+    }
+
+    pub async fn apply_portable_config(
+        &self,
+        bundle: PortableConfigBundle,
+    ) -> Result<PortableConfigApplyResult, ClientError> {
+        self.typed(
+            NodeMethod::ACCOUNT_PORTABLE_CONFIG_APPLY,
+            &PortableConfigApplyParams { bundle },
+        )
+        .await
+    }
+
+    /// Sync only portable provider settings. The source and target account
+    /// profiles must already exist; login remains a per-node action.
+    pub async fn sync_portable_config(
+        &self,
+        target: &NodeClient,
+        profile_id: &str,
+    ) -> Result<PortableConfigApplyResult, ClientError> {
+        let (source, destination) = tokio::try_join!(self.hello(), target.hello())?;
+        if !supports_portable_config(&source) || !supports_portable_config(&destination) {
+            return Err(ClientError::protocol(
+                "both nodes must support portable-config.v1",
+            ));
+        }
+        let bundle = self.export_portable_config(profile_id).await?;
+        target.apply_portable_config(bundle).await
+    }
+
     pub async fn provider_call(
         &self,
         params: ProviderCallParams,
@@ -209,14 +251,31 @@ impl NodeClient {
     ) -> Result<SessionHandoffResult, ClientError> {
         let provider = params.provider;
         let profile_id = params.profile_id.clone();
-        let target_hello = target.hello().await?;
-        let installation = target.account_status(&profile_id).await?;
-        if installation.status != InstallationStatus::Ready {
+        let (source_hello, target_hello) = tokio::try_join!(self.hello(), target.hello())?;
+        let (source_installation, target_installation) = tokio::try_join!(
+            self.account_status(&profile_id),
+            target.account_status(&profile_id)
+        )?;
+        validate_account_continuity(
+            provider,
+            &source_installation,
+            &target_installation,
+            &source_hello.display_name,
+            &target_hello.display_name,
+        )?;
+        if target_installation.status != InstallationStatus::Ready {
             return Err(ClientError::protocol(format!(
                 "account profile `{profile_id}` is not signed in on {}",
                 target_hello.display_name
             )));
         }
+        let portable_config =
+            if supports_portable_config(&source_hello) && supports_portable_config(&target_hello) {
+                let bundle = self.export_portable_config(&profile_id).await?;
+                Some(target.apply_portable_config(bundle).await?)
+            } else {
+                None
+            };
         let checkpoint = self.prepare_checkpoint(params).await?;
         if checkpoint.provider_session_id.is_none() {
             return Err(ClientError::protocol(
@@ -275,6 +334,7 @@ impl NodeClient {
             Ok::<SessionHandoffResult, ClientError>(SessionHandoffResult {
                 checkpoint: checkpoint.clone(),
                 staged,
+                portable_config,
                 provider_result,
                 target_commit,
                 source_commit,
@@ -479,6 +539,46 @@ impl NodeClient {
     }
 }
 
+fn supports_portable_config(hello: &NodeHelloResult) -> bool {
+    hello
+        .capabilities
+        .iter()
+        .any(|capability| capability == diri_proto::NodeCapability::PORTABLE_CONFIG)
+}
+
+fn validate_account_continuity(
+    provider: ProviderKind,
+    source: &AccountInstallation,
+    target: &AccountInstallation,
+    source_name: &str,
+    target_name: &str,
+) -> Result<(), ClientError> {
+    if source.provider != provider || target.provider != provider {
+        return Err(ClientError::protocol(
+            "source and target profiles must use the handoff provider",
+        ));
+    }
+    if source.status != InstallationStatus::Ready {
+        return Err(ClientError::protocol(format!(
+            "account profile `{}` is not signed in on {source_name}",
+            source.profile_id
+        )));
+    }
+    if let (Some(source_identity), Some(target_identity)) =
+        (source.identity.as_deref(), target.identity.as_deref())
+        && target.status == InstallationStatus::Ready
+        && !source_identity.trim().is_empty()
+        && !target_identity.trim().is_empty()
+        && !source_identity.eq_ignore_ascii_case(target_identity)
+    {
+        return Err(ClientError::protocol(format!(
+            "account profile `{}` resolves to different identities on {source_name} and {target_name}",
+            source.profile_id
+        )));
+    }
+    Ok(())
+}
+
 async fn read_response<R: AsyncBufReadExt + Unpin>(
     reader: &mut R,
     expected_id: u64,
@@ -578,6 +678,20 @@ fn random_lease_id() -> Result<String, ClientError> {
 mod tests {
     use super::*;
 
+    fn installation(identity: &str) -> AccountInstallation {
+        AccountInstallation {
+            profile_id: "work".into(),
+            provider: ProviderKind::Codex,
+            node_id: "node".into(),
+            status: InstallationStatus::Ready,
+            config_home: "/tmp/codex-work".into(),
+            identity: Some(identity.into()),
+            plan: None,
+            last_error: None,
+            checked_at: None,
+        }
+    }
+
     #[test]
     fn token_files_accept_plain_or_explicit_json_but_not_short_values() {
         let token = "a".repeat(64);
@@ -634,5 +748,27 @@ mod tests {
             "100.64.0.2:7337"
         );
         assert!(endpoint_address("https://example.com").is_err());
+    }
+
+    #[test]
+    fn handoff_rejects_a_profile_that_resolves_to_another_identity() {
+        let source = installation("person@example.com");
+        let target = installation("someone-else@example.com");
+        let error =
+            validate_account_continuity(ProviderKind::Codex, &source, &target, "Local", "Forge")
+                .expect_err("identity mismatch");
+        assert!(error.to_string().contains("different identities"));
+    }
+
+    #[test]
+    fn handoff_identity_comparison_is_case_insensitive() {
+        validate_account_continuity(
+            ProviderKind::Codex,
+            &installation("Person@Example.com"),
+            &installation("person@example.com"),
+            "Local",
+            "Forge",
+        )
+        .expect("same identity");
     }
 }
