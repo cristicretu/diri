@@ -43,6 +43,7 @@ impl SidebarPreviewFixture {
                 list: SessionListResult {
                     sessions: Vec::new(),
                     projects: Vec::new(),
+                    event_seq: None,
                 },
                 selected_session_id: None,
                 prefs: Prefs::default(),
@@ -385,6 +386,7 @@ tokio::spawn(async move { clone_repository(request).await });
             list: SessionListResult {
                 sessions,
                 projects: vec![dirijor, anara, settings],
+                event_seq: None,
             },
             selected_session_id: Some(codex.id),
             prefs,

@@ -21,9 +21,9 @@ use diri_proto::JsonValue;
 use serde_json::json;
 
 /// The synthetic hole marker. Its seq is 0 — outside the published seq space,
-/// which starts at 1 — so a consumer tracking `lastSeq` for gapless resume
-/// can ignore it without special-casing.
-pub const EVENTS_DROPPED: &str = "events.dropped";
+/// which starts at 1 — so it never advances `lastSeq`. Projection consumers
+/// still must special-case its name and rebuild from an authoritative snapshot.
+pub const EVENTS_DROPPED: &str = diri_proto::EventName::EVENTS_DROPPED;
 
 /// One published event, as a subscriber receives it.
 #[derive(Clone, Debug)]

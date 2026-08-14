@@ -2,6 +2,7 @@
 
 mod prefs;
 mod projection;
+mod publication;
 mod residency;
 
 use std::collections::{HashMap, HashSet};
@@ -20,6 +21,8 @@ use diri_proto::{
 };
 use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::task::JoinHandle;
+
+use self::publication::{EventAdmission, PublicationMailbox, ResyncWatermark};
 
 use crate::notifications::{
     PendingAttention, SendTextCommand, StatusTransition, attention_signal,
@@ -65,18 +68,6 @@ enum StoreEventChange {
     None,
     Resources,
     Model,
-}
-
-impl StoreEventChange {
-    fn merge(self, other: Self) -> Self {
-        if self == Self::Model || other == Self::Model {
-            Self::Model
-        } else if self == Self::Resources || other == Self::Resources {
-            Self::Resources
-        } else {
-            Self::None
-        }
-    }
 }
 
 fn event_publication_policy(change: StoreEventChange, active: bool) -> (bool, bool) {
@@ -1181,6 +1172,17 @@ impl SessionStore {
         match event.name.as_str() {
             EventName::SESSION_UPDATED => {
                 if let Ok(session) = serde_json::from_value::<SessionRecord>(event.params) {
+                    // A full gap-recovery snapshot may race a watcher event
+                    // that cloned an older record immediately before the
+                    // snapshot. Never let that delayed event roll the model
+                    // backward while the next watcher cadence catches up.
+                    if self
+                        .sessions
+                        .get(&session.id)
+                        .is_some_and(|existing| existing.updated_at.0 > session.updated_at.0)
+                    {
+                        return StoreEventChange::None;
+                    }
                     if self
                         .sessions
                         .get(&session.id)
@@ -2384,6 +2386,43 @@ pub struct StoreRuntime {
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
+/// Replaces an incremental projection after either daemon-side or client-side
+/// backpressure reports a hole. This deliberately retries until it has an
+/// authoritative snapshot: applying the tail after a failed resync can look
+/// healthy while leaving one dropped final mutation stale forever.
+async fn recover_store_snapshot(
+    client: &DaemonClient,
+    store: &RwLock<SessionStore>,
+    publications: &PublicationMailbox,
+    watermark: &mut ResyncWatermark,
+) {
+    let mut delay = Duration::from_millis(50);
+    loop {
+        // Older daemons do not stamp snapshots. Capturing the receive
+        // watermark before issuing the request is conservative: it may replay
+        // a harmless duplicate, but never skips an event received after the
+        // daemon took its snapshot.
+        let received_through = client.last_seq();
+        match client.sessions().await {
+            Ok(list) => {
+                let covered_through = list.event_seq.unwrap_or(received_through);
+                store
+                    .write()
+                    .expect("session store lock poisoned")
+                    .hydrate(list);
+                watermark.advance_to(covered_through);
+                publications.submit(StoreEventChange::Model);
+                return;
+            }
+            Err(_) => {
+                client.retry_now();
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(2));
+            }
+        }
+    }
+}
+
 impl StoreRuntime {
     pub fn start(client: Arc<DaemonClient>, prefs_path: impl Into<PathBuf>) -> io::Result<Self> {
         let (store, effects) = SessionStore::load(prefs_path)?;
@@ -2438,19 +2477,17 @@ impl StoreRuntime {
         let (action_tx, mut action_rx) = mpsc::unbounded_channel::<SendTextCommand>();
         let mut tasks = Vec::new();
 
-        let (event_publish_tx, mut event_publish_rx) = mpsc::channel::<StoreEventChange>(128);
+        let event_publications = Arc::new(PublicationMailbox::default());
+        let publish_mailbox = Arc::clone(&event_publications);
         let publish_store = Arc::clone(&store);
         let publish_changes = change_tx.clone();
         let publish_snapshots = snapshot_tx.clone();
         tasks.push(tokio::spawn(async move {
-            while let Some(mut change) = event_publish_rx.recv().await {
+            loop {
                 // Apply every daemon event immediately, but collapse bursts
                 // into one UI/menu publication per display interval. Terminal
                 // grid chunks use their own direct path and are unaffected.
-                tokio::time::sleep(UI_PUBLISH_INTERVAL).await;
-                while let Ok(next) = event_publish_rx.try_recv() {
-                    change = change.merge(next);
-                }
+                let change = publish_mailbox.next().await;
                 let (active, snapshot) = {
                     let store = publish_store.read().expect("session store lock poisoned");
                     (store.app_is_active, store.snapshot())
@@ -2469,20 +2506,42 @@ impl StoreRuntime {
         }));
 
         let mut events = client.events();
+        let event_client = Arc::clone(&client);
         let event_store = Arc::clone(&store);
         tasks.push(tokio::spawn(async move {
+            let mut watermark = ResyncWatermark::default();
             loop {
                 match events.recv().await {
                     Ok(event) => {
+                        match watermark.admit(&event.name, event.seq) {
+                            EventAdmission::Resync => {
+                                recover_store_snapshot(
+                                    &event_client,
+                                    &event_store,
+                                    &event_publications,
+                                    &mut watermark,
+                                )
+                                .await;
+                                continue;
+                            }
+                            EventAdmission::SkipCovered => continue,
+                            EventAdmission::Apply => {}
+                        }
                         let changed = event_store
                             .write()
                             .expect("session store lock poisoned")
                             .handle_event_change(event);
-                        if changed != StoreEventChange::None {
-                            let _ = event_publish_tx.try_send(changed);
-                        }
+                        event_publications.submit(changed);
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        recover_store_snapshot(
+                            &event_client,
+                            &event_store,
+                            &event_publications,
+                            &mut watermark,
+                        )
+                        .await;
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }

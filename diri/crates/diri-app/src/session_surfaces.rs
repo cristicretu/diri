@@ -1560,6 +1560,7 @@ mod tests {
                     pinned_order: None,
                     host: None,
                 }],
+                event_seq: None,
             });
         runtime
             .store

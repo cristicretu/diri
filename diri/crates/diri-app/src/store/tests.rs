@@ -1,11 +1,15 @@
 use std::collections::HashSet;
+#[cfg(unix)]
+use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::net::UnixListener;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use diri_proto::{
     AgentDescriptor, AgentKind, AgentReadinessItem, AgentReadinessResult, AttentionLevel,
-    DateMillis, ExitInfo, ExitReason, Project, ProjectId, Resumability, SessionId,
-    SessionListResult, SessionRecord, SessionStatus, TitleSource,
+    ControlMessage, DateMillis, ExitInfo, ExitReason, Method, Project, ProjectId, Resumability,
+    SessionId, SessionListResult, SessionRecord, SessionStatus, TitleSource,
 };
 use tempfile::tempdir;
 use tokio::sync::mpsc;
@@ -78,7 +82,11 @@ fn hydrated(
     prefs: Prefs,
 ) -> (SessionStore, mpsc::UnboundedReceiver<StoreEffect>) {
     let (mut store, effects) = SessionStore::headless(prefs);
-    store.hydrate(SessionListResult { sessions, projects });
+    store.hydrate(SessionListResult {
+        sessions,
+        projects,
+        event_seq: None,
+    });
     (store, effects)
 }
 
@@ -1196,6 +1204,7 @@ fn a_closing_row_leaves_at_once_and_ignores_further_clicks() {
     store.hydrate(SessionListResult {
         sessions: vec![session("one", "p", 2.0), session("two", "p", 1.0)],
         projects: vec![project("p", "P")],
+        event_seq: None,
     });
     assert_eq!(store.ordered_sessions().len(), 2);
 }
@@ -1438,6 +1447,7 @@ fn selected_session_persists_across_store_reloads() {
     store.hydrate(SessionListResult {
         sessions: vec![session("one", "a", 2.0), session("two", "a", 1.0)],
         projects: vec![project("a", "A")],
+        event_seq: None,
     });
     store.select(id("two"));
     drop(store);
@@ -1446,6 +1456,7 @@ fn selected_session_persists_across_store_reloads() {
     restored.hydrate(SessionListResult {
         sessions: vec![session("one", "a", 2.0), session("two", "a", 1.0)],
         projects: vec![project("a", "A")],
+        event_seq: None,
     });
     assert_eq!(restored.selected_session_id(), Some(&id("two")));
 }
@@ -1512,6 +1523,136 @@ fn identical_or_unrelated_daemon_events_do_not_publish_ui_changes() {
         seq: 3,
         params: serde_json::to_value(changed).unwrap(),
     }));
+}
+
+#[test]
+fn delayed_pre_snapshot_update_cannot_roll_the_store_backward() {
+    let mut authoritative = session("one", "p", 1.0);
+    authoritative.title = "Authoritative".to_owned();
+    authoritative.updated_at = DateMillis(20.0);
+    let (mut store, _) = hydrated(
+        vec![authoritative],
+        vec![project("p", "Project")],
+        Prefs::default(),
+    );
+
+    let mut delayed = session("one", "p", 1.0);
+    delayed.title = "Delayed watcher clone".to_owned();
+    delayed.updated_at = DateMillis(10.0);
+    assert!(!store.handle_event(EventEnvelope {
+        name: diri_proto::EventName::SESSION_UPDATED.to_owned(),
+        seq: 41,
+        params: serde_json::to_value(delayed).unwrap(),
+    }));
+    assert_eq!(store.sessions[&id("one")].title, "Authoritative");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn daemon_drop_marker_rehydrates_the_runtime_without_another_model_event() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("engine.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut list_requests = 0;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            let ControlMessage::Request { id, method, .. } = serde_json::from_str(&line).unwrap()
+            else {
+                continue;
+            };
+            let result = match method.as_str() {
+                Method::HELLO => serde_json::json!({
+                    "proto": diri_proto::WIRE_VERSION,
+                    "build": "store-gap-fixture",
+                    "pid": std::process::id(),
+                    "engineKind": diri_proto::RUST_ENGINE_KIND,
+                }),
+                Method::EVENTS_SUBSCRIBE => serde_json::json!({ "subscribed": true }),
+                Method::AGENT_READINESS => serde_json::json!({
+                    "host": null,
+                    "scannedAt": null,
+                    "agents": [],
+                }),
+                Method::SESSION_LIST | Method::STATE_SNAPSHOT => {
+                    list_requests += 1;
+                    let mut record = session("one", "p", 1.0);
+                    record.title = if list_requests == 1 {
+                        "Before gap".to_owned()
+                    } else {
+                        "Recovered final state".to_owned()
+                    };
+                    serde_json::to_value(SessionListResult {
+                        sessions: vec![record],
+                        projects: vec![project("p", "Project")],
+                        event_seq: Some(if list_requests == 1 { 3 } else { 9 }),
+                    })
+                    .unwrap()
+                }
+                _ => serde_json::json!({}),
+            };
+            let response = ControlMessage::Response {
+                id,
+                result: Ok(result),
+            };
+            serde_json::to_writer(&mut writer, &response).unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer.flush().unwrap();
+
+            if method == Method::SESSION_LIST && list_requests == 1 {
+                // Let the connection task apply the first response, then
+                // report a daemon-side hole with no following model event.
+                std::thread::sleep(Duration::from_millis(50));
+                serde_json::to_writer(
+                    &mut writer,
+                    &ControlMessage::Event {
+                        name: diri_proto::EventName::EVENTS_DROPPED.to_owned(),
+                        seq: 0,
+                        params: serde_json::json!({
+                            "dropped": 6,
+                            "fromSeq": 4,
+                            "toSeq": 9,
+                        }),
+                    },
+                )
+                .unwrap();
+                writer.write_all(b"\n").unwrap();
+                writer.flush().unwrap();
+            }
+        }
+        list_requests
+    });
+
+    let client = Arc::new(diri_client::DaemonClient::with_socket_path(socket));
+    let (store, effects) = SessionStore::headless(Prefs::default());
+    let runtime = super::StoreRuntime::start_with_store(Arc::clone(&client), store, effects);
+    let mut snapshots = runtime.snapshots();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if snapshots
+                .borrow_and_update()
+                .sessions
+                .iter()
+                .any(|record| record.title == "Recovered final state")
+            {
+                break;
+            }
+            snapshots.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("drop marker should trigger an authoritative snapshot");
+
+    runtime.shutdown().await;
+    drop(runtime);
+    drop(client);
+    assert!(server.join().unwrap() >= 2);
 }
 
 #[test]

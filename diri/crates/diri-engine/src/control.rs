@@ -1681,6 +1681,7 @@ impl ControlServer {
         serde_json::to_value(json!({
             "sessions": registry.records(),
             "projects": registry.projects_raw(),
+            "eventSeq": self.events.current_seq(),
         }))
         .map_err(|error| ControlError::internal(error.to_string()))
     }
@@ -3880,12 +3881,17 @@ mod tests {
         // must be present, as the Swift daemon answers.
         let temp = tempfile::tempdir().expect("temp");
         let server = server(temp.path());
+        server
+            .events
+            .publish("test.snapshot-boundary", json!({}), None);
         let result = ok_of(call(&server, "session.list", None));
         assert!(result["sessions"].is_array());
         assert!(result["projects"].is_array());
+        assert_eq!(result["eventSeq"], 1);
         // state.snapshot is the same view under another name.
         let snapshot = ok_of(call(&server, "state.snapshot", None));
         assert!(snapshot["sessions"].is_array());
+        assert_eq!(snapshot["eventSeq"], 1);
     }
 
     #[test]
