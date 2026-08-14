@@ -4,6 +4,8 @@ use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixListener;
 use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
 
 use diri_proto::{
@@ -12,14 +14,14 @@ use diri_proto::{
     SessionId, SessionListResult, SessionRecord, SessionStatus, TitleSource,
 };
 use tempfile::tempdir;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc, watch};
 
-use crate::notifications::NotificationSound;
+use crate::notifications::{NotificationSound, StatusTransition};
 
 use super::{
-    ClickModifiers, EventEnvelope, InspectorTab, Prefs, SessionStore, SidebarProjection,
-    StoreEffect, StoreEventChange, TerminalResidency, WindowMode, WindowPlacement,
-    event_publication_policy,
+    ActionSequence, ClickModifiers, EffectClass, EventEnvelope, InspectorTab, Prefs, SessionStore,
+    SidebarProjection, StoreEffect, StoreEventChange, TerminalResidency, WindowMode,
+    WindowPlacement, event_publication_policy,
 };
 use crate::switcher::{OverviewFilter, OverviewLane, SwitcherKey};
 
@@ -96,6 +98,260 @@ fn drain(effects: &mut mpsc::UnboundedReceiver<StoreEffect>) -> Vec<StoreEffect>
         drained.push(effect);
     }
     drained
+}
+
+#[test]
+fn effect_classes_keep_local_work_and_queries_off_the_mutation_lane() {
+    assert_eq!(StoreEffect::UiChanged.execution_class(), EffectClass::Local);
+    assert_eq!(
+        StoreEffect::LocateRepo {
+            generation: 1,
+            key: "local".to_owned(),
+            host: None,
+            session_id: id("one"),
+        }
+        .execution_class(),
+        EffectClass::Concurrent
+    );
+    assert_eq!(
+        StoreEffect::Remove(id("one")).execution_class(),
+        EffectClass::OrderedMutation
+    );
+    assert_eq!(
+        StoreEffect::MarkSeen(id("one")).execution_class(),
+        EffectClass::Concurrent
+    );
+}
+
+#[test]
+fn an_older_concurrent_action_cannot_overwrite_the_newest_completion() {
+    let sequence = ActionSequence::default();
+    let older = sequence.issue();
+    let newest = sequence.issue();
+    assert!(!sequence.is_current(older));
+    assert!(sequence.is_current(newest));
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn local_publication_bypasses_a_held_ordered_daemon_mutation() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("effect-lanes.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let (request_tx, request_rx) = std_mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std_mpsc::sync_channel(1);
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            let ControlMessage::Request { id, method, .. } = serde_json::from_str(&line).unwrap()
+            else {
+                continue;
+            };
+            if method == Method::SESSION_ARCHIVE {
+                request_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }
+            let result = if method == Method::HELLO {
+                serde_json::json!({
+                    "proto": diri_proto::WIRE_VERSION,
+                    "build": "effect-lane-fixture",
+                    "pid": std::process::id(),
+                    "engineKind": diri_proto::RUST_ENGINE_KIND,
+                })
+            } else {
+                serde_json::json!({})
+            };
+            serde_json::to_writer(
+                &mut writer,
+                &ControlMessage::Response {
+                    id,
+                    result: Ok(result),
+                },
+            )
+            .unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer.flush().unwrap();
+        }
+    });
+
+    let client = Arc::new(diri_client::DaemonClient::with_socket_path(socket));
+    client.connect();
+    client
+        .wait_until_connected(Duration::from_secs(2))
+        .await
+        .unwrap();
+    let (store, _unused_effects) = SessionStore::headless(Prefs::default());
+    let store = Arc::new(std::sync::RwLock::new(store));
+    let (effects_tx, effects_rx) = mpsc::unbounded_channel();
+    let (detach_tx, _) = broadcast::channel(1);
+    let (change_tx, mut changes) = broadcast::channel(4);
+    let (status_tx, _) = broadcast::channel::<StatusTransition>(1);
+    let initial = store.read().unwrap().snapshot();
+    let (snapshot_tx, _) = watch::channel(initial);
+    let worker = tokio::spawn(super::run_effects(
+        effects_rx,
+        Arc::clone(&client),
+        store,
+        detach_tx,
+        change_tx,
+        snapshot_tx,
+        status_tx,
+    ));
+
+    effects_tx.send(StoreEffect::Archive(id("one"))).unwrap();
+    request_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("ordered request reached fixture");
+    effects_tx.send(StoreEffect::UiChanged).unwrap();
+    tokio::time::timeout(Duration::from_millis(250), changes.recv())
+        .await
+        .expect("local publication must bypass held mutation")
+        .expect("change stream");
+
+    release_tx.send(()).unwrap();
+    drop(effects_tx);
+    worker.await.unwrap();
+    client.shutdown().await;
+    drop(client);
+    server.join().unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_effects_have_a_fixed_in_flight_ceiling() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("bounded-effect-lanes.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let admitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let server_admitted = Arc::clone(&admitted);
+    let server_release = Arc::clone(&release);
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let writer = Arc::new(std::sync::Mutex::new(stream.try_clone().unwrap()));
+        let mut reader = BufReader::new(stream);
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            let ControlMessage::Request { id, method, .. } = serde_json::from_str(&line).unwrap()
+            else {
+                continue;
+            };
+            if method == Method::SESSION_MARK_SEEN {
+                server_admitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let writer = Arc::clone(&writer);
+                let release = Arc::clone(&server_release);
+                std::thread::spawn(move || {
+                    let (lock, ready) = &*release;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = ready.wait(released).unwrap();
+                    }
+                    let mut writer = writer.lock().unwrap();
+                    serde_json::to_writer(
+                        &mut *writer,
+                        &ControlMessage::Response {
+                            id,
+                            result: Ok(serde_json::json!({})),
+                        },
+                    )
+                    .unwrap();
+                    writer.write_all(b"\n").unwrap();
+                    writer.flush().unwrap();
+                });
+                continue;
+            }
+            let result = if method == Method::HELLO {
+                serde_json::json!({
+                    "proto": diri_proto::WIRE_VERSION,
+                    "build": "bounded-effect-lane-fixture",
+                    "pid": std::process::id(),
+                    "engineKind": diri_proto::RUST_ENGINE_KIND,
+                })
+            } else {
+                serde_json::json!({})
+            };
+            let mut writer = writer.lock().unwrap();
+            serde_json::to_writer(
+                &mut *writer,
+                &ControlMessage::Response {
+                    id,
+                    result: Ok(result),
+                },
+            )
+            .unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer.flush().unwrap();
+        }
+    });
+
+    let client = Arc::new(diri_client::DaemonClient::with_socket_path(socket));
+    client.connect();
+    client
+        .wait_until_connected(Duration::from_secs(2))
+        .await
+        .unwrap();
+    let (store, _unused_effects) = SessionStore::headless(Prefs::default());
+    let store = Arc::new(std::sync::RwLock::new(store));
+    let (effects_tx, effects_rx) = mpsc::unbounded_channel();
+    let (detach_tx, _) = broadcast::channel(1);
+    let (change_tx, mut changes) = broadcast::channel(4);
+    let (status_tx, _) = broadcast::channel::<StatusTransition>(1);
+    let initial = store.read().unwrap().snapshot();
+    let (snapshot_tx, _) = watch::channel(initial);
+    let worker = tokio::spawn(super::run_effects(
+        effects_rx,
+        Arc::clone(&client),
+        store,
+        detach_tx,
+        change_tx,
+        snapshot_tx,
+        status_tx,
+    ));
+
+    for index in 0..(super::CONCURRENT_EFFECT_WORKERS * 4) {
+        effects_tx
+            .send(StoreEffect::MarkSeen(id(&format!("session-{index}"))))
+            .unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while admitted.load(std::sync::atomic::Ordering::SeqCst) < super::CONCURRENT_EFFECT_WORKERS
+        && Instant::now() < deadline
+    {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        admitted.load(std::sync::atomic::Ordering::SeqCst),
+        super::CONCURRENT_EFFECT_WORKERS
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        admitted.load(std::sync::atomic::Ordering::SeqCst),
+        super::CONCURRENT_EFFECT_WORKERS,
+        "queued lookups must not become additional in-flight tasks"
+    );
+    effects_tx.send(StoreEffect::UiChanged).unwrap();
+    tokio::time::timeout(Duration::from_millis(250), changes.recv())
+        .await
+        .expect("local publication bypasses saturated lookup lanes")
+        .expect("change stream");
+
+    let (released, ready) = &*release;
+    *released.lock().unwrap() = true;
+    ready.notify_all();
+    drop(effects_tx);
+    worker.await.unwrap();
+    client.shutdown().await;
+    drop(client);
+    server.join().unwrap();
 }
 
 #[test]
@@ -2496,6 +2752,7 @@ fn repo_targeting_tracks_the_selected_session_and_dedupes_requests() {
     assert_eq!(
         drain(&mut effects),
         vec![StoreEffect::LocateRepo {
+            generation: 1,
             key: "local".into(),
             host: None,
             session_id: id("one"),
@@ -2504,7 +2761,8 @@ fn repo_targeting_tracks_the_selected_session_and_dedupes_requests() {
     assert_eq!(store.repo_target(None), Some(&super::RepoTarget::Pending));
 
     // The async answer lands under the same key.
-    store.set_repo_target(
+    store.finish_repo_target(
+        1,
         "local".into(),
         super::RepoTarget::Resolved("/work/p".into()),
     );
@@ -2516,6 +2774,15 @@ fn repo_targeting_tracks_the_selected_session_and_dedupes_requests() {
     // Selection changes the repo reference, not the remembered destination.
     store.select(id("two"));
     assert_eq!(store.begin_repo_targeting().as_deref(), Some("forge"));
+    assert_eq!(store.repo_target(None), None);
+
+    // A response already in flight for the previous selected session cannot
+    // repopulate the freshly cleared target map.
+    store.finish_repo_target(
+        1,
+        "local".into(),
+        super::RepoTarget::Resolved("/work/old-session".into()),
+    );
     assert_eq!(store.repo_target(None), None);
 }
 

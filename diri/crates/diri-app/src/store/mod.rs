@@ -8,6 +8,7 @@ mod residency;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -124,6 +125,7 @@ pub enum StoreEffect {
     /// `host.locate_repo` — resolve the reference session's repo on a host;
     /// the answer lands back in the store as a `RepoTarget`.
     LocateRepo {
+        generation: u64,
         key: String,
         host: Option<String>,
         session_id: SessionId,
@@ -147,6 +149,54 @@ pub enum StoreEffect {
     DetachAttachment(SessionId),
     /// T15 consumes this without involving daemon lifecycle operations.
     StatusTransition(StatusTransition),
+}
+
+/// Scheduling is a semantic property of an effect, not an incidental choice
+/// at each match arm. Local publication must never sit behind network I/O;
+/// independently keyed operations may overlap; every other authoritative
+/// mutation retains one ordered lane so user intent reaches the daemon in
+/// issue order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EffectClass {
+    Local,
+    Concurrent,
+    OrderedMutation,
+}
+
+/// Slow, independent lookups may overlap without turning a disconnected host
+/// into an unbounded task factory. Eight lanes cover the launcher's local and
+/// remote targets while keeping spawned work and control-socket pressure
+/// finite; excess intent remains as cheap queue entries owned by this runtime.
+const CONCURRENT_EFFECT_WORKERS: usize = 8;
+
+impl StoreEffect {
+    const fn execution_class(&self) -> EffectClass {
+        match self {
+            Self::UiChanged
+            | Self::PublishSnapshot
+            | Self::RetryConnection
+            | Self::DetachAttachment(_)
+            | Self::StatusTransition(_) => EffectClass::Local,
+            Self::LocateRepo { .. }
+            | Self::ListDirectories { .. }
+            | Self::RefreshAgents { .. }
+            | Self::ConfigureAgent(_)
+            | Self::MarkSeen(_)
+            | Self::SyncPrefs { .. } => EffectClass::Concurrent,
+            Self::Remove(_)
+            | Self::Resume { .. }
+            | Self::Archive(_)
+            | Self::Unarchive(_)
+            | Self::Rename { .. }
+            | Self::Spawn(_)
+            | Self::SpawnAuxiliary(_)
+            | Self::Migrate { .. }
+            | Self::ReparentWorktree(_)
+            | Self::ReopenLast
+            | Self::SetActive(_)
+            | Self::ConfigureGovernor(_) => EffectClass::OrderedMutation,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -299,6 +349,8 @@ pub struct SessionStore {
     syncing_prefs: HashSet<String>,
     /// Popover repo resolution: host key → state (see `RepoTarget`).
     repo_targets: HashMap<String, RepoTarget>,
+    /// Invalidates answers launched for a previous popover/reference session.
+    repo_target_generation: u64,
     /// The session whose repo the popover preserves (selected at open time).
     repo_target_session: Option<SessionId>,
     directory_request_seq: u64,
@@ -379,6 +431,7 @@ impl SessionStore {
                 migrating: HashSet::new(),
                 syncing_prefs: HashSet::new(),
                 repo_targets: HashMap::new(),
+                repo_target_generation: 0,
                 repo_target_session: None,
                 directory_request_seq: 0,
                 directory_listing: None,
@@ -686,6 +739,7 @@ impl SessionStore {
     /// against the currently selected session, while the target defaults to
     /// the configured shortcut destination.
     pub fn begin_repo_targeting(&mut self) -> Option<String> {
+        self.repo_target_generation = self.repo_target_generation.wrapping_add(1);
         self.repo_targets.clear();
         self.repo_target_session = self.selected_session_id.clone();
         self.prefs
@@ -707,6 +761,7 @@ impl SessionStore {
         }
         self.repo_targets.insert(key.clone(), RepoTarget::Pending);
         self.emit(StoreEffect::LocateRepo {
+            generation: self.repo_target_generation,
             key,
             host,
             session_id,
@@ -764,8 +819,10 @@ impl SessionStore {
         };
     }
 
-    pub fn set_repo_target(&mut self, key: String, target: RepoTarget) {
-        self.repo_targets.insert(key, target);
+    fn finish_repo_target(&mut self, generation: u64, key: String, target: RepoTarget) {
+        if generation == self.repo_target_generation {
+            self.repo_targets.insert(key, target);
+        }
     }
 
     pub fn preferences(&self) -> &Prefs {
@@ -2828,7 +2885,99 @@ async fn run_effects(
     snapshot_tx: tokio::sync::watch::Sender<StoreSnapshot>,
     status_tx: broadcast::Sender<StatusTransition>,
 ) {
-    while let Some(effect) = effects.recv().await {
+    let executor = EffectExecutor {
+        client,
+        store,
+        detach_tx,
+        change_tx,
+        snapshot_tx,
+        status_tx,
+        action_sequence: ActionSequence::default(),
+    };
+    let (ordered_tx, mut ordered_rx) = mpsc::unbounded_channel();
+    let (concurrent_tx, concurrent_rx) = mpsc::unbounded_channel();
+    let concurrent_rx = Arc::new(tokio::sync::Mutex::new(concurrent_rx));
+    let ordered_executor = executor.clone();
+    let mut workers = tokio::task::JoinSet::new();
+    workers.spawn(async move {
+        while let Some((effect, action_ticket)) = ordered_rx.recv().await {
+            ordered_executor.execute(effect, action_ticket).await;
+        }
+    });
+    for _ in 0..CONCURRENT_EFFECT_WORKERS {
+        let concurrent_executor = executor.clone();
+        let concurrent_rx = Arc::clone(&concurrent_rx);
+        workers.spawn(async move {
+            loop {
+                let next = concurrent_rx.lock().await.recv().await;
+                let Some((effect, action_ticket)) = next else {
+                    break;
+                };
+                concurrent_executor.execute(effect, action_ticket).await;
+            }
+        });
+    }
+
+    loop {
+        tokio::select! {
+            effect = effects.recv() => {
+                let Some(effect) = effect else {
+                    break;
+                };
+                let action_ticket = executor.issue_action_ticket(&effect);
+                match effect.execution_class() {
+                    EffectClass::Local => executor.execute(effect, action_ticket).await,
+                    EffectClass::Concurrent => {
+                        if let Err(error) = concurrent_tx.send((effect, action_ticket)) {
+                            let (effect, action_ticket) = error.0;
+                            executor.execute(effect, action_ticket).await;
+                        }
+                    }
+                    EffectClass::OrderedMutation => {
+                        if let Err(error) = ordered_tx.send((effect, action_ticket)) {
+                            // A worker panic must not silently discard the
+                            // mutation that exposed it. Preserve intent on the
+                            // dispatcher task while the runtime is still live.
+                            let (effect, action_ticket) = error.0;
+                            executor.execute(effect, action_ticket).await;
+                        }
+                    }
+                }
+            }
+            completed = workers.join_next(), if !workers.is_empty() => {
+                let _ = completed;
+            }
+        }
+    }
+
+    drop(ordered_tx);
+    drop(concurrent_tx);
+    while workers.join_next().await.is_some() {}
+}
+
+#[derive(Clone)]
+struct EffectExecutor {
+    client: Arc<DaemonClient>,
+    store: Arc<RwLock<SessionStore>>,
+    detach_tx: broadcast::Sender<SessionId>,
+    change_tx: broadcast::Sender<()>,
+    snapshot_tx: tokio::sync::watch::Sender<StoreSnapshot>,
+    status_tx: broadcast::Sender<StatusTransition>,
+    action_sequence: ActionSequence,
+}
+
+impl EffectExecutor {
+    fn issue_action_ticket(&self, effect: &StoreEffect) -> Option<u64> {
+        action_context(effect).map(|_| self.action_sequence.issue())
+    }
+
+    async fn execute(&self, effect: StoreEffect, action_ticket: Option<u64>) {
+        let client = &self.client;
+        let store = &self.store;
+        let detach_tx = &self.detach_tx;
+        let change_tx = &self.change_tx;
+        let snapshot_tx = &self.snapshot_tx;
+        let status_tx = &self.status_tx;
         let action_context = action_context(&effect);
         let force_snapshot = matches!(
             &effect,
@@ -2923,6 +3072,7 @@ async fn run_effects(
                 result.map(|_| ())
             }
             StoreEffect::LocateRepo {
+                generation,
                 key,
                 host,
                 session_id,
@@ -2947,7 +3097,7 @@ async fn run_effects(
                 store
                     .write()
                     .expect("session store lock poisoned")
-                    .set_repo_target(key, target);
+                    .finish_repo_target(generation, key, target);
                 Ok(())
             }
             StoreEffect::ListDirectories {
@@ -2955,75 +3105,59 @@ async fn run_effects(
                 host,
                 path,
             } => {
-                let client = Arc::clone(&client);
-                let store = Arc::clone(&store);
-                let change_tx = change_tx.clone();
-                tokio::spawn(async move {
-                    let result = client
-                        .list_directories(host, path)
-                        .await
-                        .map_err(|error| error.to_string());
-                    store
-                        .write()
-                        .expect("session store lock poisoned")
-                        .finish_directory_listing(request_id, result);
-                    let _ = change_tx.send(());
-                });
+                let result = client
+                    .list_directories(host, path)
+                    .await
+                    .map_err(|error| error.to_string());
+                store
+                    .write()
+                    .expect("session store lock poisoned")
+                    .finish_directory_listing(request_id, result);
                 Ok(())
             }
             StoreEffect::RefreshAgents { host, force } => {
-                let client = Arc::clone(&client);
-                let store = Arc::clone(&store);
-                let change_tx = change_tx.clone();
-                tokio::spawn(async move {
-                    let result = client
-                        .agent_readiness(diri_proto::AgentReadinessParams {
-                            host: host.clone(),
-                            force_refresh: force,
-                        })
-                        .await;
-                    let mut locked = store.write().expect("session store lock poisoned");
-                    let key = agent_target_key(host.as_deref());
-                    // Retire the requested key, not the one the response names:
-                    // a daemon too old for per-host params echoes no host, and
-                    // keying off the response would leave this target loading
-                    // (and every further request suppressed) forever.
-                    locked.finish_agent_catalog_request(&key);
-                    match result {
-                        Ok(catalog) => {
-                            locked.agent_catalog_errors.remove(&key);
-                            locked.set_agent_catalog(catalog);
-                        }
-                        Err(error) => {
-                            locked.agent_catalog_errors.insert(key, error.to_string());
-                        }
+                let result = client
+                    .agent_readiness(diri_proto::AgentReadinessParams {
+                        host: host.clone(),
+                        force_refresh: force,
+                    })
+                    .await;
+                let mut locked = store.write().expect("session store lock poisoned");
+                let key = agent_target_key(host.as_deref());
+                // Retire the requested key, not the one the response names:
+                // a daemon too old for per-host params echoes no host, and
+                // keying off the response would leave this target loading
+                // (and every further request suppressed) forever.
+                locked.finish_agent_catalog_request(&key);
+                match result {
+                    Ok(catalog) => {
+                        locked.agent_catalog_errors.remove(&key);
+                        locked.set_agent_catalog(catalog);
                     }
-                    let _ = change_tx.send(());
-                });
+                    Err(error) => {
+                        locked.agent_catalog_errors.insert(key, error.to_string());
+                    }
+                }
+                drop(locked);
                 Ok(())
             }
             StoreEffect::ConfigureAgent(params) => {
-                let client = Arc::clone(&client);
-                let store = Arc::clone(&store);
-                let change_tx = change_tx.clone();
-                tokio::spawn(async move {
-                    let host = params.host.clone();
-                    let result = client.configure_agent(params).await;
-                    let mut locked = store.write().expect("session store lock poisoned");
-                    let key = agent_target_key(host.as_deref());
-                    // Requested key, not response key — see RefreshAgents.
-                    locked.finish_agent_catalog_request(&key);
-                    match result {
-                        Ok(catalog) => {
-                            locked.agent_catalog_errors.remove(&key);
-                            locked.set_agent_catalog(catalog);
-                        }
-                        Err(error) => {
-                            locked.agent_catalog_errors.insert(key, error.to_string());
-                        }
+                let host = params.host.clone();
+                let result = client.configure_agent(params).await;
+                let mut locked = store.write().expect("session store lock poisoned");
+                let key = agent_target_key(host.as_deref());
+                // Requested key, not response key — see RefreshAgents.
+                locked.finish_agent_catalog_request(&key);
+                match result {
+                    Ok(catalog) => {
+                        locked.agent_catalog_errors.remove(&key);
+                        locked.set_agent_catalog(catalog);
                     }
-                    let _ = change_tx.send(());
-                });
+                    Err(error) => {
+                        locked.agent_catalog_errors.insert(key, error.to_string());
+                    }
+                }
+                drop(locked);
                 Ok(())
             }
             StoreEffect::ReopenLast => match client.reopen_last().await {
@@ -3048,7 +3182,9 @@ async fn run_effects(
             }
         };
         let mut store = store.write().expect("session store lock poisoned");
-        if let Some(context) = action_context {
+        if let Some(context) = action_context
+            && action_ticket.is_some_and(|ticket| self.action_sequence.is_current(ticket))
+        {
             store.last_action_failure = match &result {
                 Ok(()) => None,
                 Err(error) => Some(ActionFailure {
@@ -3068,6 +3204,24 @@ async fn run_effects(
         if active {
             let _ = change_tx.send(());
         }
+    }
+}
+
+/// Completion order can differ from intent order for explicitly concurrent
+/// effects. Only the newest user-visible action may replace the shared failure
+/// surface; an older success must never erase a newer error.
+#[derive(Clone, Debug, Default)]
+struct ActionSequence {
+    latest: Arc<AtomicU64>,
+}
+
+impl ActionSequence {
+    fn issue(&self) -> u64 {
+        self.latest.fetch_add(1, Ordering::AcqRel).wrapping_add(1)
+    }
+
+    fn is_current(&self, ticket: u64) -> bool {
+        self.latest.load(Ordering::Acquire) == ticket
     }
 }
 
