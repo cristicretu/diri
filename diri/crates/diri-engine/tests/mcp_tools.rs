@@ -125,7 +125,9 @@ fn output_contains(registry: &Arc<Mutex<Registry>>, id: &str, needle: &str) -> b
 fn stale_public_mutations_durably_commit_a_raw_successor_before_rejecting() {
     for interrupt in [false, true] {
         let temp = tempfile::tempdir().expect("temp");
-        let state_file = temp.path().join("state.json");
+        let blocked_parent = temp.path().join("blocked-state-parent");
+        std::fs::write(&blocked_parent, b"not a directory").expect("blocking file");
+        let state_file = blocked_parent.join("state.json");
         let logs = temp.path().join("logs");
         let id = if interrupt { "interrupt" } else { "send" };
         let mut registry = Registry::new(engine(), &state_file);
@@ -158,6 +160,20 @@ fn stale_public_mutations_durably_commit_a_raw_successor_before_rejecting() {
             .get(id)
             .expect("live child")
             .claude_hook(ClaudeHook::UserPromptSubmit, false);
+        let first_error = if interrupt {
+            registry.interrupt_run(id, Some(1), None).unwrap_err()
+        } else {
+            registry
+                .send_run_text(id, "stale".into(), true, Some(1), true, None)
+                .unwrap_err()
+        };
+        assert!(
+            matches!(first_error, RegistryRunError::Io(_)),
+            "the first lifecycle write must fail before stale is returned: {first_error}"
+        );
+
+        std::fs::remove_file(&blocked_parent).expect("remove blocking file");
+        std::fs::create_dir(&blocked_parent).expect("restore state directory");
         let error = if interrupt {
             registry.interrupt_run(id, Some(1), None).unwrap_err()
         } else {

@@ -4,7 +4,7 @@
 //! It also owns the additive `{ version, projects, sessions }` persistence
 //! envelope. Unknown project fields survive a read/write cycle.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -69,6 +69,10 @@ pub struct Registry {
     /// Mutations to run metadata do not necessarily change terminal status.
     /// This parallel version keeps lifecycle-only updates event-visible.
     record_versions: HashMap<String, u64>,
+    /// Live observations that changed a run but have not yet reached the
+    /// atomic state snapshot. This survives a failed write in memory so a
+    /// retry cannot mistake an already-consumed edge for durable state.
+    pending_lifecycle_persistence: HashSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -193,6 +197,7 @@ impl Registry {
             orchestration: Orchestration::default(),
             state_changes: StateChanges::default(),
             record_versions: HashMap::new(),
+            pending_lifecycle_persistence: HashSet::new(),
         }
     }
 
@@ -217,6 +222,7 @@ impl Registry {
                 } = state;
                 self.projects = projects;
                 self.orchestration = orchestration;
+                self.pending_lifecycle_persistence.clear();
                 let project_roots = self
                     .projects
                     .iter()
@@ -329,7 +335,15 @@ impl Registry {
         // Rename is atomic, so a crash mid-write cannot truncate the real file.
         std::fs::rename(&temp, &self.state_file)?;
         self.dirty = false;
+        self.pending_lifecycle_persistence.clear();
         self.last_persist = Some(std::time::Instant::now());
+        Ok(())
+    }
+
+    fn persist_lifecycle_observation_for(&mut self, id: &str) -> std::io::Result<()> {
+        if self.pending_lifecycle_persistence.contains(id) {
+            self.persist_intent_now()?;
+        }
         Ok(())
     }
 
@@ -615,15 +629,15 @@ impl Registry {
     /// Reconciles the current run without releasing its queued successor.
     /// Reports validate against this state so the report that closes run N is
     /// not made stale merely by starting acknowledged run N+1 first.
-    fn sync_run_state_for(&mut self, id: &str) -> bool {
+    fn sync_run_state_for(&mut self, id: &str) {
         let Some((view, completion_seq)) = self
             .sessions
             .get(id)
             .map(|session| (session.view(), session.turn_completion_seq()))
         else {
-            return false;
+            return;
         };
-        self.observe_run_state_for_view(id, &view, completion_seq)
+        self.observe_run_state_for_view(id, &view, completion_seq);
     }
 
     /// Every authoritative status fold first consumes Holder receipt
@@ -662,6 +676,7 @@ impl Registry {
         });
         if run_changed || receipt_changed {
             self.dirty = true;
+            self.pending_lifecycle_persistence.insert(id.to_owned());
             self.bump_record_version(id);
             self.state_changes.notify();
         }
@@ -732,21 +747,21 @@ impl Registry {
         })
     }
 
-    fn sync_orchestration_for(&mut self, id: &str) -> bool {
+    fn sync_orchestration_for(&mut self, id: &str) {
         let Some((view, completion_seq)) = self
             .sessions
             .get(id)
             .map(|session| (session.view(), session.turn_completion_seq()))
         else {
-            return false;
+            return;
         };
-        let observation_changed = self.observe_run_state_for_view(id, &view, completion_seq);
+        self.observe_run_state_for_view(id, &view, completion_seq);
         let orchestration_before = self.orchestration.clone();
         let run_before = self.records.get(id).and_then(|record| record.run.clone());
         let dirty_before = self.dirty;
         let (delivery, mut run_changed) = {
             let Some(record) = self.records.get_mut(id) else {
-                return observation_changed;
+                return;
             };
             let previous_run = record.run.clone();
             let delivery = self.orchestration.begin_ready(
@@ -773,7 +788,7 @@ impl Registry {
                     record.run = run_before;
                 }
                 self.dirty = dirty_before;
-                return observation_changed;
+                return;
             }
             let orchestration_intent = self.orchestration.clone();
             let run_intent = self.records.get(id).and_then(|record| record.run.clone());
@@ -829,7 +844,6 @@ impl Registry {
         if run_changed {
             self.bump_record_version(id);
         }
-        observation_changed || run_changed
     }
 
     fn run_transaction_snapshot(&self, id: &str) -> RunTransactionSnapshot {
@@ -876,9 +890,9 @@ impl Registry {
         request_fingerprint: Option<&str>,
     ) -> Result<(crate::orchestration::DeliveryPlan, RunTransactionSnapshot), RegistryRunError>
     {
-        if self.observe_run_state_for_view(id, view, completion_seq) {
-            self.persist_intent_now().map_err(RegistryRunError::Io)?;
-        }
+        self.observe_run_state_for_view(id, view, completion_seq);
+        self.persist_lifecycle_observation_for(id)
+            .map_err(RegistryRunError::Io)?;
         let snapshot = self.run_transaction_snapshot(id);
         let result = self
             .records
@@ -927,9 +941,9 @@ impl Registry {
         request_id: Option<&str>,
         request_fingerprint: Option<&str>,
     ) -> Result<RunTransactionSnapshot, RegistryRunError> {
-        if self.observe_run_state_for_view(id, view, completion_seq) {
-            self.persist_intent_now().map_err(RegistryRunError::Io)?;
-        }
+        self.observe_run_state_for_view(id, view, completion_seq);
+        self.persist_lifecycle_observation_for(id)
+            .map_err(RegistryRunError::Io)?;
         let snapshot = self.run_transaction_snapshot(id);
         let result = self
             .records
@@ -975,9 +989,9 @@ impl Registry {
         {
             // A response-loss retry is also a reconciliation opportunity: a
             // surviving Holder may now prove the original Enter was accepted.
-            if self.sync_run_state_for(id) {
-                self.persist_intent_now().map_err(RegistryRunError::Io)?;
-            }
+            self.sync_run_state_for(id);
+            self.persist_lifecycle_observation_for(id)
+                .map_err(RegistryRunError::Io)?;
         }
         match self.orchestration.lookup_replay(
             id,
@@ -1003,13 +1017,12 @@ impl Registry {
             ));
         }
         self.ensure_run(id)?;
-        if self.sync_orchestration_for(id) {
-            // This is the first fold that can discover a raw successor. Land
-            // it before expected-generation validation is allowed to reject
-            // the request; the transaction's second fold is intentionally
-            // idempotent and cannot carry this durability obligation.
-            self.persist_intent_now().map_err(RegistryRunError::Io)?;
-        }
+        self.sync_orchestration_for(id);
+        // This may be a retry after the first write failed. Consult the
+        // durable-observation watermark even when this sync did not create a
+        // transition: the raw successor edge has already been consumed.
+        self.persist_lifecycle_observation_for(id)
+            .map_err(RegistryRunError::Io)?;
         let (view, completion_seq) = self
             .sessions
             .get(id)
@@ -1149,7 +1162,7 @@ impl Registry {
             .get(id)
             .map(|session| (session.view(), session.turn_completion_seq()))
             .ok_or_else(|| RegistryRunError::NotFound(id.to_owned()))?;
-        let observation_changed = self.observe_run_state_for_view(id, &view, completion_seq);
+        self.observe_run_state_for_view(id, &view, completion_seq);
         let transaction_before = self.run_transaction_snapshot(id);
         let RawSubmissionDecision {
             changed,
@@ -1176,9 +1189,11 @@ impl Registry {
             self.bump_record_version(id);
             self.state_changes.notify();
         }
-        if (changed || observation_changed)
-            && let Err(error) = self.persist_intent_now()
-        {
+        if changed && let Err(error) = self.persist_intent_now() {
+            self.restore_run_transaction(id, transaction_before);
+            return Err(RegistryRunError::Io(error));
+        }
+        if let Err(error) = self.persist_lifecycle_observation_for(id) {
             self.restore_run_transaction(id, transaction_before);
             return Err(RegistryRunError::Io(error));
         }
@@ -1299,9 +1314,9 @@ impl Registry {
             None => {}
         }
 
-        if self.sync_run_state_for(reporter) {
-            self.persist_intent_now().map_err(RegistryRunError::Io)?;
-        }
+        self.sync_run_state_for(reporter);
+        self.persist_lifecycle_observation_for(reporter)
+            .map_err(RegistryRunError::Io)?;
         let record = self
             .records
             .get(reporter)
@@ -1354,9 +1369,9 @@ impl Registry {
             Some(_) => unreachable!("operation-scoped replay variant"),
             None => {}
         }
-        if self.sync_orchestration_for(id) {
-            self.persist_intent_now().map_err(RegistryRunError::Io)?;
-        }
+        self.sync_orchestration_for(id);
+        self.persist_lifecycle_observation_for(id)
+            .map_err(RegistryRunError::Io)?;
         let (view, completion_seq) = self
             .sessions
             .get(id)
