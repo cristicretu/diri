@@ -1470,6 +1470,7 @@ fn synthetic_events_upsert_project_and_remove_with_neighbor_focus() {
     );
     store.select(id("one"));
     store.handle_event(EventEnvelope {
+        generation: 1,
         name: diri_proto::EventName::SESSION_UPDATED.to_owned(),
         seq: 1,
         params: serde_json::to_value(session("three", "p", 0.0)).unwrap(),
@@ -1478,6 +1479,7 @@ fn synthetic_events_upsert_project_and_remove_with_neighbor_focus() {
 
     let updated_project = project("p", "Renamed");
     store.handle_event(EventEnvelope {
+        generation: 1,
         name: diri_proto::EventName::PROJECT_UPDATED.to_owned(),
         seq: 2,
         params: serde_json::to_value(updated_project).unwrap(),
@@ -1488,6 +1490,7 @@ fn synthetic_events_upsert_project_and_remove_with_neighbor_focus() {
     );
 
     store.handle_event(EventEnvelope {
+        generation: 1,
         name: diri_proto::EventName::SESSION_REMOVED.to_owned(),
         seq: 3,
         params: serde_json::json!({"id": "one"}),
@@ -1506,11 +1509,13 @@ fn identical_or_unrelated_daemon_events_do_not_publish_ui_changes() {
     );
 
     assert!(!store.handle_event(EventEnvelope {
+        generation: 1,
         name: diri_proto::EventName::SESSION_UPDATED.to_owned(),
         seq: 1,
         params: serde_json::to_value(existing.clone()).unwrap(),
     }));
     assert!(!store.handle_event(EventEnvelope {
+        generation: 1,
         name: "terminal.grid".to_owned(),
         seq: 2,
         params: serde_json::json!({}),
@@ -1519,32 +1524,11 @@ fn identical_or_unrelated_daemon_events_do_not_publish_ui_changes() {
     let mut changed = existing;
     changed.title = "Renamed".to_owned();
     assert!(store.handle_event(EventEnvelope {
+        generation: 1,
         name: diri_proto::EventName::SESSION_UPDATED.to_owned(),
         seq: 3,
         params: serde_json::to_value(changed).unwrap(),
     }));
-}
-
-#[test]
-fn delayed_pre_snapshot_update_cannot_roll_the_store_backward() {
-    let mut authoritative = session("one", "p", 1.0);
-    authoritative.title = "Authoritative".to_owned();
-    authoritative.updated_at = DateMillis(20.0);
-    let (mut store, _) = hydrated(
-        vec![authoritative],
-        vec![project("p", "Project")],
-        Prefs::default(),
-    );
-
-    let mut delayed = session("one", "p", 1.0);
-    delayed.title = "Delayed watcher clone".to_owned();
-    delayed.updated_at = DateMillis(10.0);
-    assert!(!store.handle_event(EventEnvelope {
-        name: diri_proto::EventName::SESSION_UPDATED.to_owned(),
-        seq: 41,
-        params: serde_json::to_value(delayed).unwrap(),
-    }));
-    assert_eq!(store.sessions[&id("one")].title, "Authoritative");
 }
 
 #[cfg(unix)]
@@ -1655,6 +1639,344 @@ async fn daemon_drop_marker_rehydrates_the_runtime_without_another_model_event()
     assert!(server.join().unwrap() >= 2);
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn post_snapshot_event_written_before_response_survives_connection_hydration() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("engine.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            let ControlMessage::Request { id, method, .. } = serde_json::from_str(&line).unwrap()
+            else {
+                continue;
+            };
+            let result = match method.as_str() {
+                Method::HELLO => serde_json::json!({
+                    "proto": diri_proto::WIRE_VERSION,
+                    "build": "snapshot-order-fixture",
+                    "pid": std::process::id(),
+                    "engineKind": diri_proto::RUST_ENGINE_KIND,
+                    "eventIncarnation": "snapshot-order",
+                }),
+                Method::EVENTS_SUBSCRIBE => serde_json::json!({ "subscribed": true }),
+                Method::AGENT_READINESS => serde_json::json!({
+                    "host": null,
+                    "scannedAt": null,
+                    "agents": [],
+                }),
+                Method::SESSION_LIST => {
+                    let mut old = session("one", "p", 1.0);
+                    old.title = "Snapshot state".to_owned();
+                    old.updated_at = DateMillis(10.0);
+                    let mut new = old.clone();
+                    new.title = "Post-snapshot event".to_owned();
+                    new.updated_at = DateMillis(20.0);
+                    serde_json::to_writer(
+                        &mut writer,
+                        &ControlMessage::Event {
+                            name: diri_proto::EventName::SESSION_UPDATED.to_owned(),
+                            seq: 11,
+                            params: serde_json::to_value(new).unwrap(),
+                        },
+                    )
+                    .unwrap();
+                    writer.write_all(b"\n").unwrap();
+                    writer.flush().unwrap();
+                    // The event is necessarily routed before the response;
+                    // the Store must keep it queued behind this snapshot.
+                    std::thread::sleep(Duration::from_millis(75));
+                    serde_json::to_value(SessionListResult {
+                        sessions: vec![old],
+                        projects: vec![project("p", "Project")],
+                        event_seq: Some(10),
+                    })
+                    .unwrap()
+                }
+                _ => serde_json::json!({}),
+            };
+            let response = ControlMessage::Response {
+                id,
+                result: Ok(result),
+            };
+            serde_json::to_writer(&mut writer, &response).unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer.flush().unwrap();
+        }
+    });
+
+    let client = Arc::new(diri_client::DaemonClient::with_socket_path(socket));
+    let (store, effects) = SessionStore::headless(Prefs::default());
+    let runtime = super::StoreRuntime::start_with_store(Arc::clone(&client), store, effects);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if runtime
+                .store
+                .read()
+                .unwrap()
+                .sessions()
+                .get(&id("one"))
+                .is_some_and(|record| record.title == "Post-snapshot event")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("post-snapshot event should win");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        runtime.store.read().unwrap().sessions()[&id("one")].title,
+        "Post-snapshot event"
+    );
+
+    runtime.shutdown().await;
+    drop(runtime);
+    drop(client);
+    server.join().unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn restarted_daemon_with_lower_sequence_installs_a_new_event_incarnation() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("engine.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = std::thread::spawn(move || {
+        let mut second_since_seq = None;
+        for connection_index in 0..2 {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                let ControlMessage::Request { id, method, params } =
+                    serde_json::from_str(&line).unwrap()
+                else {
+                    continue;
+                };
+                if connection_index == 1 && method == Method::EVENTS_SUBSCRIBE {
+                    second_since_seq = params
+                        .as_ref()
+                        .and_then(|value| value.get("sinceSeq"))
+                        .and_then(serde_json::Value::as_u64);
+                }
+                let result = match method.as_str() {
+                    Method::HELLO => serde_json::json!({
+                        "proto": diri_proto::WIRE_VERSION,
+                        "build": "restart-sequence-fixture",
+                        "pid": std::process::id(),
+                        "engineKind": diri_proto::RUST_ENGINE_KIND,
+                        "eventIncarnation": if connection_index == 0 { "first" } else { "second" },
+                    }),
+                    Method::EVENTS_SUBSCRIBE => serde_json::json!({ "subscribed": true }),
+                    Method::AGENT_READINESS => serde_json::json!({
+                        "host": null,
+                        "scannedAt": null,
+                        "agents": [],
+                    }),
+                    Method::SESSION_LIST => {
+                        let mut snapshot = session("one", "p", 1.0);
+                        let (event_seq, event_title) = if connection_index == 0 {
+                            snapshot.title = "First daemon".to_owned();
+                            (500, "First daemon")
+                        } else {
+                            snapshot.title = "Restart snapshot".to_owned();
+                            (2, "Lower sequence applied")
+                        };
+                        let mut event = snapshot.clone();
+                        event.title = event_title.to_owned();
+                        serde_json::to_writer(
+                            &mut writer,
+                            &ControlMessage::Event {
+                                name: diri_proto::EventName::SESSION_UPDATED.to_owned(),
+                                seq: if connection_index == 0 { 500 } else { 3 },
+                                params: serde_json::to_value(event).unwrap(),
+                            },
+                        )
+                        .unwrap();
+                        writer.write_all(b"\n").unwrap();
+                        writer.flush().unwrap();
+                        serde_json::to_value(SessionListResult {
+                            sessions: vec![snapshot],
+                            projects: vec![project("p", "Project")],
+                            event_seq: Some(event_seq),
+                        })
+                        .unwrap()
+                    }
+                    _ => serde_json::json!({}),
+                };
+                serde_json::to_writer(
+                    &mut writer,
+                    &ControlMessage::Response {
+                        id,
+                        result: Ok(result),
+                    },
+                )
+                .unwrap();
+                writer.write_all(b"\n").unwrap();
+                writer.flush().unwrap();
+
+                if connection_index == 0 && method == Method::GOVERNOR_CONFIGURE {
+                    break;
+                }
+            }
+        }
+        second_since_seq
+    });
+
+    let client = Arc::new(diri_client::DaemonClient::with_socket_path(socket));
+    let (store, effects) = SessionStore::headless(Prefs::default());
+    let runtime = super::StoreRuntime::start_with_store(Arc::clone(&client), store, effects);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if runtime
+                .store
+                .read()
+                .unwrap()
+                .sessions()
+                .get(&id("one"))
+                .is_some_and(|record| record.title == "Lower sequence applied")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("new daemon's low sequence event should apply");
+    assert_eq!(client.last_seq(), 3);
+
+    runtime.shutdown().await;
+    drop(runtime);
+    drop(client);
+    assert_eq!(
+        server.join().unwrap(),
+        None,
+        "a new daemon incarnation must subscribe without the old seq 500"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn replay_before_connected_coalesces_with_connection_hydration() {
+    let directory = tempdir().unwrap();
+    let socket = directory.path().join("engine.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut list_requests = 0;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            let ControlMessage::Request { id, method, .. } = serde_json::from_str(&line).unwrap()
+            else {
+                continue;
+            };
+            if method == Method::EVENTS_SUBSCRIBE {
+                let mut replay = session("one", "p", 1.0);
+                replay.title = "Pre-connected replay".to_owned();
+                serde_json::to_writer(
+                    &mut writer,
+                    &ControlMessage::Event {
+                        name: diri_proto::EventName::SESSION_UPDATED.to_owned(),
+                        seq: 1,
+                        params: serde_json::to_value(replay).unwrap(),
+                    },
+                )
+                .unwrap();
+                writer.write_all(b"\n").unwrap();
+                writer.flush().unwrap();
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let result = match method.as_str() {
+                Method::HELLO => serde_json::json!({
+                    "proto": diri_proto::WIRE_VERSION,
+                    "build": "pre-connected-replay-fixture",
+                    "pid": std::process::id(),
+                    "engineKind": diri_proto::RUST_ENGINE_KIND,
+                    "eventIncarnation": "pre-connected-replay",
+                }),
+                Method::EVENTS_SUBSCRIBE => serde_json::json!({ "subscribed": true }),
+                Method::AGENT_READINESS => serde_json::json!({
+                    "host": null,
+                    "scannedAt": null,
+                    "agents": [],
+                }),
+                Method::SESSION_LIST => {
+                    list_requests += 1;
+                    let mut record = session("one", "p", 1.0);
+                    record.title = "Pre-connected replay".to_owned();
+                    serde_json::to_value(SessionListResult {
+                        sessions: vec![record],
+                        projects: vec![project("p", "Project")],
+                        event_seq: Some(1),
+                    })
+                    .unwrap()
+                }
+                _ => serde_json::json!({}),
+            };
+            serde_json::to_writer(
+                &mut writer,
+                &ControlMessage::Response {
+                    id,
+                    result: Ok(result),
+                },
+            )
+            .unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer.flush().unwrap();
+        }
+        list_requests
+    });
+
+    let client = Arc::new(diri_client::DaemonClient::with_socket_path(socket));
+    let (store, effects) = SessionStore::headless(Prefs::default());
+    let runtime = super::StoreRuntime::start_with_store(Arc::clone(&client), store, effects);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if runtime
+                .store
+                .read()
+                .unwrap()
+                .sessions()
+                .get(&id("one"))
+                .is_some_and(|record| record.title == "Pre-connected replay")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("pre-connected replay should hydrate");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    runtime.shutdown().await;
+    drop(runtime);
+    drop(client);
+    assert_eq!(
+        server.join().unwrap(),
+        1,
+        "Connected hydration should coalesce with the replay-triggered barrier"
+    );
+}
+
 #[test]
 fn compact_resource_events_patch_only_resource_fields() {
     let existing = session("one", "p", 1.0);
@@ -1666,6 +1988,7 @@ fn compact_resource_events_patch_only_resource_fields() {
     );
 
     assert!(store.handle_event(EventEnvelope {
+        generation: 1,
         name: diri_proto::EventName::SESSION_RESOURCES.to_owned(),
         seq: 1,
         params: serde_json::json!({"id":"one","memoryBytes":42000000}),

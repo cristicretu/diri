@@ -719,6 +719,7 @@ impl ControlServer {
             "engineKind": diri_proto::RUST_ENGINE_KIND,
             "pid": std::process::id() as i32,
             "executableHash": process_executable_hash(),
+            "eventIncarnation": self.events.incarnation(),
         }))
     }
 
@@ -1677,6 +1678,9 @@ impl ControlServer {
     /// `session.list` and `state.snapshot` are the same view: every record
     /// plus the project list, exactly as the Swift daemon answers them.
     fn session_list(&self) -> Result<JsonValue, ControlError> {
+        // Every registry-derived publisher takes Registry then EventBus in
+        // this order. Holding Registry across current_seq closes the snapshot
+        // boundary: no covered mutation can receive a later sequence.
         let registry = self.registry.lock().map_err(poisoned)?;
         serde_json::to_value(json!({
             "sessions": registry.records(),
@@ -2660,7 +2664,7 @@ impl ControlServer {
     }
 
     /// Publishes `session.updated` with the session's current record.
-    fn publish_updated(&self, registry: &Registry, id: &str) {
+    fn publish_updated(&self, registry: &std::sync::MutexGuard<'_, Registry>, id: &str) {
         if let Some(record) = registry
             .records()
             .into_iter()
@@ -3558,6 +3562,18 @@ mod tests {
             Some(64),
             "the app needs a stable content identity for upgrade coordination"
         );
+        assert!(
+            result["eventIncarnation"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "event resume needs a collision-proof daemon incarnation: {result}"
+        );
+        let again = ok_of(call(
+            &server,
+            "hello",
+            Some(json!({ "proto": WIRE_VERSION, "build": "test-client" })),
+        ));
+        assert_eq!(again["eventIncarnation"], result["eventIncarnation"]);
     }
 
     #[test]
@@ -3892,6 +3908,100 @@ mod tests {
         let snapshot = ok_of(call(&server, "state.snapshot", None));
         assert!(snapshot["sessions"].is_array());
         assert_eq!(snapshot["eventSeq"], 1);
+    }
+
+    #[test]
+    fn watcher_clone_is_published_before_a_racing_archive_and_snapshot_boundary() {
+        use std::collections::HashMap;
+        use std::sync::TryLockError;
+
+        let temp = tempfile::tempdir().expect("temp");
+        let engine = engine();
+        let registry = Arc::new(Mutex::new(Registry::new(
+            Arc::clone(&engine),
+            temp.path().join("state.json"),
+        )));
+        registry
+            .lock()
+            .expect("registry")
+            .spawn(
+                crate::session::SessionSpec {
+                    id: "s_ordered".into(),
+                    pty: crate::pty::PtySpec::new(
+                        vec!["/bin/sh".into(), "-c".into(), "read line".into()],
+                        "/tmp",
+                    ),
+                    manifest_id: "shell".into(),
+                    authority: crate::session::authority_for("shell", &engine),
+                    logs_dir: temp.path().join("logs"),
+                    holder: None,
+                    remote: None,
+                    defer_launch: false,
+                },
+                test_record("s_ordered"),
+            )
+            .expect("spawn test session");
+        let server = Arc::new(ControlServer::new(
+            Arc::clone(&registry),
+            temp.path().join("daemon.sock"),
+        ));
+        let stream = server.events.subscribe(None, crate::events::Filter::all());
+
+        let (start_archive, begin_archive) = std::sync::mpsc::sync_channel(0);
+        let (interleaved_tx, interleaved_rx) = std::sync::mpsc::sync_channel(0);
+        let archive_registry = Arc::clone(&registry);
+        let archive_events = server.events.clone();
+        let archive = std::thread::spawn(move || {
+            begin_archive.recv().expect("start archive");
+            match archive_registry.try_lock() {
+                Ok(mut guard) => {
+                    guard.archive("s_ordered").expect("archive");
+                    let record = guard.record("s_ordered").expect("record").clone();
+                    archive_events.publish_encoded(
+                        diri_proto::EventName::SESSION_UPDATED,
+                        &record,
+                        Some("s_ordered"),
+                    );
+                    interleaved_tx.send(true).expect("interleaved result");
+                }
+                Err(TryLockError::WouldBlock) => {
+                    interleaved_tx.send(false).expect("blocked result");
+                    let mut guard = archive_registry.lock().expect("registry");
+                    guard.archive("s_ordered").expect("archive");
+                    let record = guard.record("s_ordered").expect("record").clone();
+                    archive_events.publish_encoded(
+                        diri_proto::EventName::SESSION_UPDATED,
+                        &record,
+                        Some("s_ordered"),
+                    );
+                }
+                Err(TryLockError::Poisoned(_)) => panic!("registry poisoned"),
+            }
+        });
+
+        let mut published = HashMap::new();
+        assert!(crate::events::publish_registry_changes_once_with_hook(
+            &registry,
+            &server.events,
+            &mut published,
+            || {
+                start_archive.send(()).expect("start archive");
+                assert!(
+                    !interleaved_rx.recv().expect("interleave result"),
+                    "archive acquired the registry between watcher clone and publication"
+                );
+            },
+        ));
+        archive.join().expect("archive thread");
+
+        let watcher = stream.recv(Duration::from_secs(1)).expect("watcher event");
+        let archived = stream.recv(Duration::from_secs(1)).expect("archive event");
+        assert!(watcher.params.get("archivedAt").is_none());
+        assert!(archived.params.get("archivedAt").is_some());
+        assert!(watcher.seq < archived.seq);
+        let snapshot = ok_of(call(&server, Method::SESSION_LIST, None));
+        assert_eq!(snapshot["eventSeq"], archived.seq);
+        assert!(snapshot["sessions"][0].get("archivedAt").is_some());
     }
 
     #[test]

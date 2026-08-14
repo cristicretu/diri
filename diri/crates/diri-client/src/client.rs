@@ -97,6 +97,8 @@ pub(crate) struct ClientCore {
     want_events: AtomicBool,
     events_subscribed: AtomicBool,
     last_seq: AtomicU64,
+    event_incarnation: StdMutex<Option<String>>,
+    event_generation: AtomicU64,
     shutdown_tx: watch::Sender<bool>,
     retry_tx: watch::Sender<u64>,
 }
@@ -246,7 +248,13 @@ impl ClientCore {
             }
             ControlMessage::Event { name, seq, params } => {
                 self.last_seq.fetch_max(seq, Ordering::AcqRel);
-                let _ = self.event_tx.send(EventEnvelope { name, seq, params });
+                let generation = self.event_generation.load(Ordering::Acquire);
+                let _ = self.event_tx.send(EventEnvelope {
+                    generation,
+                    name,
+                    seq,
+                    params,
+                });
             }
             ControlMessage::Request { .. } => {}
         }
@@ -261,6 +269,30 @@ impl ClientCore {
 
     fn set_state(&self, state: ConnectionState) {
         self.state_tx.send_replace(state);
+    }
+
+    /// Starts one client-side delivery generation and resets replay state when
+    /// Hello identifies a new daemon EventBus incarnation.
+    fn begin_event_connection(&self, hello: &HelloResult) -> u64 {
+        let mut previous = self
+            .event_incarnation
+            .lock()
+            .expect("event incarnation mutex poisoned");
+        match &hello.event_incarnation {
+            Some(incarnation) if previous.as_deref() == Some(incarnation) => {}
+            Some(incarnation) => {
+                self.last_seq.store(0, Ordering::Release);
+                *previous = Some(incarnation.clone());
+            }
+            None => {
+                // A legacy Hello has no collision-proof process incarnation.
+                // Reset on every connection; the mandatory Connected snapshot
+                // makes replay from zero conservative and PID reuse safe.
+                self.last_seq.store(0, Ordering::Release);
+                *previous = None;
+            }
+        }
+        self.event_generation.fetch_add(1, Ordering::AcqRel) + 1
     }
 }
 
@@ -314,6 +346,8 @@ impl DaemonClient {
                 want_events: AtomicBool::new(false),
                 events_subscribed: AtomicBool::new(false),
                 last_seq: AtomicU64::new(0),
+                event_incarnation: StdMutex::new(None),
+                event_generation: AtomicU64::new(0),
                 shutdown_tx,
                 retry_tx,
             }),
@@ -393,6 +427,11 @@ impl DaemonClient {
         self.core.last_seq.load(Ordering::Acquire)
     }
 
+    /// Monotonic client-side connection generation stamped onto events.
+    pub fn event_generation(&self) -> u64 {
+        self.core.event_generation.load(Ordering::Acquire)
+    }
+
     pub async fn wait_until_connected(
         &self,
         timeout: Duration,
@@ -400,8 +439,8 @@ impl DaemonClient {
         let mut states = self.connection_state();
         let wait = async {
             loop {
-                if let ConnectionState::Connected(hello) = &*states.borrow_and_update() {
-                    return Ok(hello.clone());
+                if let ConnectionState::Connected { identity, .. } = &*states.borrow_and_update() {
+                    return Ok(identity.clone());
                 }
                 states
                     .changed()
@@ -845,7 +884,7 @@ impl Drop for DaemonClient {
 
 impl ConnectionState {
     fn is_connected(&self) -> bool {
-        matches!(self, Self::Connected(_))
+        matches!(self, Self::Connected { .. })
     }
 }
 
@@ -937,6 +976,7 @@ async fn run_once(core: Arc<ClientCore>, shutdown: &mut watch::Receiver<bool>) -
         };
     }
 
+    let event_generation = core.begin_event_connection(&hello);
     if core.want_events.load(Ordering::Acquire) {
         let subscribed = tokio::select! {
             result = core.subscribe_to_events() => result.map(|_| ()),
@@ -950,7 +990,10 @@ async fn run_once(core: Arc<ClientCore>, shutdown: &mut watch::Receiver<bool>) -
             };
         }
     }
-    core.set_state(ConnectionState::Connected(hello));
+    core.set_state(ConnectionState::Connected {
+        identity: hello,
+        event_generation,
+    });
 
     loop {
         tokio::select! {
@@ -988,6 +1031,61 @@ mod tests {
     use std::error::Error;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn event_hello(incarnation: Option<&str>) -> HelloResult {
+        HelloResult {
+            proto: diri_proto::control::WIRE_VERSION,
+            build: "test-engine".to_owned(),
+            pid: 42,
+            engine_kind: Some(diri_proto::RUST_ENGINE_KIND.to_owned()),
+            executable_hash: None,
+            event_incarnation: incarnation.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn event_resume_sequence_is_scoped_to_the_daemon_incarnation() {
+        let client = DaemonClient::with_socket_path("/nonexistent/diri-test.sock");
+        assert_eq!(
+            client
+                .core
+                .begin_event_connection(&event_hello(Some("first"))),
+            1
+        );
+        client.core.last_seq.store(500, Ordering::Release);
+
+        assert_eq!(
+            client
+                .core
+                .begin_event_connection(&event_hello(Some("first"))),
+            2
+        );
+        assert_eq!(
+            client.last_seq(),
+            500,
+            "same daemon retains replay progress"
+        );
+
+        assert_eq!(
+            client
+                .core
+                .begin_event_connection(&event_hello(Some("second"))),
+            3
+        );
+        assert_eq!(
+            client.last_seq(),
+            0,
+            "restarted daemon owns a lower seq space"
+        );
+
+        client.core.last_seq.store(20, Ordering::Release);
+        client.core.begin_event_connection(&event_hello(None));
+        assert_eq!(
+            client.last_seq(),
+            0,
+            "legacy reconnect always resets safely"
+        );
+    }
 
     #[tokio::test]
     async fn retry_now_wakes_the_lifecycle_signal_without_spawning_a_daemon() {

@@ -346,20 +346,23 @@ fn sweep(
             .iter()
             .filter_map(|url| cache.get(url).cloned())
             .collect();
-        let record = {
+        {
             let Ok(mut guard) = registry.lock() else {
                 return IDLE_RECONCILE_INTERVAL;
             };
             let changed = guard.apply_pull_request_statuses(&id, statuses);
             if changed {
                 let _ = guard.persist();
-                guard.records().into_iter().find(|record| record.id.0 == id)
-            } else {
-                None
+                // Assign the event sequence before releasing Registry; this
+                // matches the session.list snapshot boundary lock order.
+                if let Some(record) = guard.records().into_iter().find(|record| record.id.0 == id) {
+                    events.publish_encoded(
+                        diri_proto::EventName::SESSION_UPDATED,
+                        &record,
+                        Some(&id),
+                    );
+                }
             }
-        };
-        if let Some(record) = record {
-            events.publish_encoded(diri_proto::EventName::SESSION_UPDATED, &record, Some(&id));
         }
     }
 

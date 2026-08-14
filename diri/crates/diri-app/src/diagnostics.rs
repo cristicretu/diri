@@ -275,6 +275,7 @@ mod tests {
             pid: 42,
             engine_kind: Some(RUST_ENGINE_KIND.to_owned()),
             executable_hash: Some("private-full-executable-hash".to_owned()),
+            event_incarnation: Some("private-event-incarnation".to_owned()),
         };
         let active = HashSet::from(["forge".to_owned()]);
         let report = DiagnosticsReport::generate(DiagnosticsInput {

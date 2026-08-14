@@ -52,24 +52,37 @@ impl PublicationMailbox {
 /// Filters replay already covered by an authoritative `session.list`
 /// snapshot. Events beyond the watermark remain ordered and are applied.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct ResyncWatermark(u64);
+pub(super) struct ResyncWatermark {
+    generation: u64,
+    sequence: u64,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum EventAdmission {
     Apply,
     SkipCovered,
-    Resync,
+    ResyncGap,
+    ResyncConnection,
 }
 
 impl ResyncWatermark {
-    pub(super) fn advance_to(&mut self, sequence: u64) {
-        self.0 = self.0.max(sequence);
+    pub(super) fn covers_generation(self, generation: u64) -> bool {
+        self.generation >= generation
     }
 
-    pub(super) fn admit(self, name: &str, sequence: u64) -> EventAdmission {
-        if name == EventName::EVENTS_DROPPED {
-            EventAdmission::Resync
-        } else if sequence <= self.0 {
+    pub(super) fn install(&mut self, generation: u64, sequence: u64) {
+        self.generation = generation;
+        self.sequence = sequence;
+    }
+
+    pub(super) fn admit(self, generation: u64, name: &str, sequence: u64) -> EventAdmission {
+        if generation < self.generation {
+            EventAdmission::SkipCovered
+        } else if generation > self.generation {
+            EventAdmission::ResyncConnection
+        } else if name == EventName::EVENTS_DROPPED {
+            EventAdmission::ResyncGap
+        } else if sequence <= self.sequence {
             EventAdmission::SkipCovered
         } else {
             EventAdmission::Apply
@@ -112,34 +125,39 @@ mod tests {
     #[test]
     fn a_resync_watermark_drops_only_snapshot_covered_replay() {
         let mut watermark = ResyncWatermark::default();
-        watermark.advance_to(41);
+        watermark.install(3, 41);
         assert_eq!(
-            watermark.admit(EventName::SESSION_UPDATED, 40),
+            watermark.admit(3, EventName::SESSION_UPDATED, 40),
             EventAdmission::SkipCovered
         );
         assert_eq!(
-            watermark.admit(EventName::SESSION_UPDATED, 41),
+            watermark.admit(3, EventName::SESSION_UPDATED, 41),
             EventAdmission::SkipCovered
         );
         assert_eq!(
-            watermark.admit(EventName::SESSION_UPDATED, 42),
+            watermark.admit(3, EventName::SESSION_UPDATED, 42),
             EventAdmission::Apply
         );
-        watermark.advance_to(10);
+        watermark.install(4, 10);
         assert_eq!(
-            watermark.admit(EventName::SESSION_UPDATED, 42),
+            watermark.admit(4, EventName::SESSION_UPDATED, 11),
             EventAdmission::Apply,
-            "watermarks never move backward"
+            "a new connection generation installs its own lower sequence"
+        );
+        assert_eq!(
+            watermark.admit(3, EventName::SESSION_UPDATED, 500),
+            EventAdmission::SkipCovered,
+            "queued events from the retired connection stay retired"
         );
     }
 
     #[test]
     fn daemon_drop_markers_force_resync_even_with_the_out_of_band_zero_sequence() {
         let mut watermark = ResyncWatermark::default();
-        watermark.advance_to(500);
+        watermark.install(1, 500);
         assert_eq!(
-            watermark.admit(EventName::EVENTS_DROPPED, 0),
-            EventAdmission::Resync
+            watermark.admit(1, EventName::EVENTS_DROPPED, 0),
+            EventAdmission::ResyncGap
         );
     }
 }
