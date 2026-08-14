@@ -79,6 +79,14 @@ struct RunTransactionSnapshot {
     version: Option<u64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DeliveryReceiptEvidence {
+    None,
+    Authoritative(String),
+    Accepted(String),
+    Uncertain(String),
+}
+
 /// How long consecutive persists coalesce. Matches the Swift daemon's
 /// `PersistenceStore` debounce.
 const PERSIST_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
@@ -335,23 +343,7 @@ impl Registry {
             .map(|(id, session)| (id.clone(), session.view(), session.turn_completion_seq()))
             .collect::<Vec<_>>();
         for (id, view, completion_seq) in live {
-            if let Some(record) = self.records.get_mut(&id) {
-                let previous = record.run.clone();
-                let changed = self.orchestration.observe(
-                    record,
-                    &view.status,
-                    view.needs_input.as_ref(),
-                    completion_seq,
-                    view.tail_offset,
-                );
-                if changed {
-                    apply_run_transition_metadata(record);
-                    if previous != record.run {
-                        let version = self.record_versions.entry(id).or_default();
-                        *version = version.saturating_add(1);
-                    }
-                }
-            }
+            self.observe_run_state_for_view(&id, &view, completion_seq);
         }
         let mut records: Vec<SessionRecord> = self.records.values().cloned().collect();
         for record in &mut records {
@@ -631,8 +623,31 @@ impl Registry {
         else {
             return;
         };
-        let receipt_changed = self.reconcile_delivery_receipt(id, &view, completion_seq);
-        let changed = self.records.get_mut(id).is_some_and(|record| {
+        self.observe_run_state_for_view(id, &view, completion_seq);
+    }
+
+    /// Every authoritative status fold first consumes Holder receipt
+    /// evidence. This ordering makes an explicit uncertainty tombstone
+    /// stronger than generic output activity at every Registry seam.
+    fn observe_run_state_for_view(
+        &mut self,
+        id: &str,
+        view: &SessionView,
+        completion_seq: u64,
+    ) -> bool {
+        let evidence = self.delivery_receipt_evidence(id);
+        self.observe_run_state_with_receipt(id, view, completion_seq, evidence)
+    }
+
+    fn observe_run_state_with_receipt(
+        &mut self,
+        id: &str,
+        view: &SessionView,
+        completion_seq: u64,
+        evidence: DeliveryReceiptEvidence,
+    ) -> bool {
+        let receipt_changed = self.reconcile_delivery_receipt(id, view, completion_seq, evidence);
+        let run_changed = self.records.get_mut(id).is_some_and(|record| {
             let changed = self.orchestration.observe(
                 record,
                 &view.status,
@@ -645,10 +660,36 @@ impl Registry {
             }
             changed
         });
-        if changed || receipt_changed {
+        if run_changed || receipt_changed {
             self.dirty = true;
             self.bump_record_version(id);
             self.state_changes.notify();
+        }
+        run_changed || receipt_changed
+    }
+
+    fn delivery_receipt_evidence(&self, id: &str) -> DeliveryReceiptEvidence {
+        let Some(operation_id) = self
+            .orchestration
+            .uncertain_operation_id(id)
+            .map(str::to_owned)
+        else {
+            return DeliveryReceiptEvidence::None;
+        };
+        let Some(session) = self.sessions.get(id) else {
+            return DeliveryReceiptEvidence::None;
+        };
+        if session.uncertain_delivery(&operation_id) {
+            DeliveryReceiptEvidence::Uncertain(operation_id)
+        } else if session.accepted_delivery(&operation_id) {
+            DeliveryReceiptEvidence::Accepted(operation_id)
+        } else if session.remote_delivery_receipts_supported().is_some() {
+            // A remote transport can reconnect or publish a HelloAck outcome
+            // immediately after this snapshot. Never race that exact evidence
+            // with heuristic output reconciliation.
+            DeliveryReceiptEvidence::Authoritative(operation_id)
+        } else {
+            DeliveryReceiptEvidence::None
         }
     }
 
@@ -657,32 +698,23 @@ impl Registry {
         id: &str,
         view: &SessionView,
         completion_seq: u64,
+        evidence: DeliveryReceiptEvidence,
     ) -> bool {
-        let Some(operation_id) = self
-            .orchestration
-            .uncertain_operation_id(id)
-            .map(str::to_owned)
-        else {
-            return false;
-        };
         // A replacement remote Holder can prove only that the predecessor
         // prepared this operation before its PTY side effect. Preserve the
         // failed tombstone forever; in particular, output activity must not
         // promote an explicitly uncertain restart window to accepted.
-        if self
-            .sessions
-            .get(id)
-            .is_some_and(|session| session.uncertain_delivery(&operation_id))
+        if let DeliveryReceiptEvidence::Authoritative(operation_id)
+        | DeliveryReceiptEvidence::Uncertain(operation_id) = &evidence
         {
             return self
                 .orchestration
-                .mark_delivery_explicitly_uncertain(id, &operation_id);
+                .mark_delivery_explicitly_uncertain(id, operation_id);
         }
-        if !self
-            .sessions
-            .get(id)
-            .is_some_and(|session| session.accepted_delivery(&operation_id))
-        {
+        let DeliveryReceiptEvidence::Accepted(operation_id) = evidence else {
+            return false;
+        };
+        if self.orchestration.uncertain_operation_id(id) != Some(operation_id.as_str()) {
             return false;
         }
         self.records.get_mut(id).is_some_and(|record| {
@@ -708,12 +740,7 @@ impl Registry {
         else {
             return;
         };
-        let receipt_changed = self.reconcile_delivery_receipt(id, &view, completion_seq);
-        if receipt_changed {
-            self.dirty = true;
-            self.bump_record_version(id);
-            self.state_changes.notify();
-        }
+        self.observe_run_state_for_view(id, &view, completion_seq);
         let orchestration_before = self.orchestration.clone();
         let run_before = self.records.get(id).and_then(|record| record.run.clone());
         let dirty_before = self.dirty;
@@ -722,17 +749,6 @@ impl Registry {
                 return;
             };
             let previous_run = record.run.clone();
-            let changed = self.orchestration.observe(
-                record,
-                &view.status,
-                view.needs_input.as_ref(),
-                completion_seq,
-                view.tail_offset,
-            );
-            if changed {
-                apply_run_transition_metadata(record);
-                self.dirty = true;
-            }
             let delivery = self.orchestration.begin_ready(
                 record,
                 &view.status,
@@ -740,7 +756,11 @@ impl Registry {
                 completion_seq,
                 view.tail_offset,
             );
-            (delivery, previous_run != record.run)
+            let run_changed = previous_run != record.run;
+            if run_changed {
+                apply_run_transition_metadata(record);
+            }
+            (delivery, run_changed)
         };
         if let Some(delivery) = delivery {
             // Persist the outbox's dispatch phase before touching the PTY. If
@@ -855,6 +875,9 @@ impl Registry {
         request_fingerprint: Option<&str>,
     ) -> Result<(crate::orchestration::DeliveryPlan, RunTransactionSnapshot), RegistryRunError>
     {
+        if self.observe_run_state_for_view(id, view, completion_seq) {
+            self.persist_intent_now().map_err(RegistryRunError::Io)?;
+        }
         let snapshot = self.run_transaction_snapshot(id);
         let result = self
             .records
@@ -903,21 +926,15 @@ impl Registry {
         request_id: Option<&str>,
         request_fingerprint: Option<&str>,
     ) -> Result<RunTransactionSnapshot, RegistryRunError> {
+        if self.observe_run_state_for_view(id, view, completion_seq) {
+            self.persist_intent_now().map_err(RegistryRunError::Io)?;
+        }
         let snapshot = self.run_transaction_snapshot(id);
         let result = self
             .records
             .get_mut(id)
             .ok_or_else(|| RegistryRunError::NotFound(id.to_owned()))
             .and_then(|record| {
-                if self.orchestration.observe(
-                    record,
-                    &view.status,
-                    view.needs_input.as_ref(),
-                    completion_seq,
-                    view.tail_offset,
-                ) {
-                    apply_run_transition_metadata(record);
-                }
                 self.orchestration
                     .prepare_interrupt(record, expected_run_id, request_id, request_fingerprint)
                     .map(drop)
@@ -1123,6 +1140,7 @@ impl Registry {
             .get(id)
             .map(|session| (session.view(), session.turn_completion_seq()))
             .ok_or_else(|| RegistryRunError::NotFound(id.to_owned()))?;
+        let observation_changed = self.observe_run_state_for_view(id, &view, completion_seq);
         let transaction_before = self.run_transaction_snapshot(id);
         let RawSubmissionDecision {
             changed,
@@ -1147,11 +1165,13 @@ impl Registry {
             }
             self.dirty = true;
             self.bump_record_version(id);
-            if let Err(error) = self.persist_intent_now() {
-                self.restore_run_transaction(id, transaction_before);
-                return Err(RegistryRunError::Io(error));
-            }
             self.state_changes.notify();
+        }
+        if (changed || observation_changed)
+            && let Err(error) = self.persist_intent_now()
+        {
+            self.restore_run_transaction(id, transaction_before);
+            return Err(RegistryRunError::Io(error));
         }
         if blocked {
             return Err(RegistryRunError::OutcomeUncertain(
@@ -1485,36 +1505,23 @@ impl Registry {
             .collect::<Vec<_>>();
         let mut title_changed = false;
         for (id, session_version, view) in changed_views {
-            let mut lifecycle_changed = false;
+            let completion_seq = self
+                .sessions
+                .get(&id)
+                .map_or(0, Session::turn_completion_seq);
+            let lifecycle_changed = self.observe_run_state_for_view(&id, &view, completion_seq);
             if let Some(record) = self.records.get_mut(&id) {
                 let previous_title = (record.title.clone(), record.title_source);
                 fold_session_view(record, &view);
-                let completion_seq = self
-                    .sessions
-                    .get(&id)
-                    .map_or(0, Session::turn_completion_seq);
-                let run_changed = self.orchestration.observe(
-                    record,
-                    &view.status,
-                    view.needs_input.as_ref(),
-                    completion_seq,
-                    view.tail_offset,
-                );
-                lifecycle_changed = run_changed;
                 let record_title_changed =
                     previous_title != (record.title.clone(), record.title_source);
-                if run_changed {
-                    apply_run_transition_metadata(record);
-                } else if record_title_changed {
+                if record_title_changed && !lifecycle_changed {
                     record.updated_at = DateMillis::from(std::time::SystemTime::now());
                 }
-                if record_title_changed || run_changed {
+                if record_title_changed || lifecycle_changed {
                     title_changed = true;
                 }
                 changed.push((id.clone(), record.clone()));
-            }
-            if lifecycle_changed {
-                self.bump_record_version(&id);
             }
             published.insert(
                 id.clone(),
@@ -2297,9 +2304,10 @@ mod tests {
     }
 
     #[test]
-    fn stale_delivery_rolls_back_a_fresh_raw_successor_for_the_event_sync() {
+    fn stale_delivery_commits_a_fresh_raw_successor_before_returning() {
         let temp = tempfile::tempdir().expect("temp");
-        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let state_file = temp.path().join("state.json");
+        let mut registry = Registry::new(engine(), &state_file);
         let mut agent = record("s_agent");
         agent.kind = AgentKind::CODEX;
         agent.status = SessionStatus::Idle;
@@ -2336,21 +2344,26 @@ mod tests {
                 current: 2
             }
         ));
-        assert_eq!(registry.records["s_agent"].run.as_ref().unwrap().id, 1);
-        assert!(registry.orchestration.observe(
+        assert_eq!(registry.records["s_agent"].run.as_ref().unwrap().id, 2);
+        assert!(!registry.orchestration.observe(
             registry.records.get_mut("s_agent").unwrap(),
             &working.status,
             None,
             0,
             working.tail_offset,
         ));
-        assert_eq!(registry.records["s_agent"].run.as_ref().unwrap().id, 2);
+        assert!(!registry.dirty);
+        assert!(registry.record_versions["s_agent"] > 0);
+        let mut restored = Registry::new(engine(), &state_file);
+        restored.load().expect("reload committed observation");
+        assert_eq!(restored.records["s_agent"].run.as_ref().unwrap().id, 2);
     }
 
     #[test]
-    fn stale_interrupt_rolls_back_a_fresh_raw_successor_for_the_event_sync() {
+    fn stale_interrupt_commits_a_fresh_raw_successor_before_returning() {
         let temp = tempfile::tempdir().expect("temp");
-        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let state_file = temp.path().join("state.json");
+        let mut registry = Registry::new(engine(), &state_file);
         let mut agent = record("s_agent");
         agent.kind = AgentKind::CODEX;
         agent.status = SessionStatus::Idle;
@@ -2377,15 +2390,19 @@ mod tests {
                 current: 2
             }
         ));
-        assert_eq!(registry.records["s_agent"].run.as_ref().unwrap().id, 1);
-        assert!(registry.orchestration.observe(
+        assert_eq!(registry.records["s_agent"].run.as_ref().unwrap().id, 2);
+        assert!(!registry.orchestration.observe(
             registry.records.get_mut("s_agent").unwrap(),
             &working.status,
             None,
             0,
             working.tail_offset,
         ));
-        assert_eq!(registry.records["s_agent"].run.as_ref().unwrap().id, 2);
+        assert!(!registry.dirty);
+        assert!(registry.record_versions["s_agent"] > 0);
+        let mut restored = Registry::new(engine(), &state_file);
+        restored.load().expect("reload committed observation");
+        assert_eq!(restored.records["s_agent"].run.as_ref().unwrap().id, 2);
     }
 
     #[test]
@@ -2451,6 +2468,80 @@ mod tests {
         assert_eq!(restored.records["s_agent"].run.as_ref().unwrap().id, 2);
         assert!(is_attached_submit(b"\r"));
         assert!(!is_attached_submit(b"pasted\ntext"));
+    }
+
+    #[test]
+    fn holder_uncertainty_is_folded_before_concurrent_working_activity() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state_file = temp.path().join("state.json");
+        let mut registry = Registry::new(engine(), &state_file);
+        let mut agent = record("s_agent");
+        agent.kind = AgentKind::CODEX;
+        agent.status = SessionStatus::Idle;
+        agent.run = Some(AgentRun::starting(1, DateMillis(1.0)));
+        registry.records.insert("s_agent".into(), agent.clone());
+        registry
+            .orchestration
+            .register(&agent, 0, &SessionStatus::Idle);
+        registry
+            .orchestration
+            .prepare_delivery(
+                registry.records.get_mut("s_agent").unwrap(),
+                DeliveryRequest {
+                    status: &SessionStatus::Idle,
+                    needs_input: None,
+                    completion_seq: 0,
+                    output_offset: 10,
+                    expected_run_id: Some(1),
+                    text: "receipt race".into(),
+                    submit: true,
+                    allow_needs_input: true,
+                    request_id: Some("receipt-race"),
+                    request_fingerprint: Some("receipt-fingerprint"),
+                },
+            )
+            .unwrap();
+        registry
+            .orchestration
+            .mark_dispatch_uncertain(
+                registry.records.get_mut("s_agent").unwrap(),
+                "response lost".into(),
+            )
+            .unwrap();
+        let operation_id = registry
+            .orchestration
+            .uncertain_operation_id("s_agent")
+            .unwrap()
+            .to_owned();
+        let working = view("s_agent", SessionStatus::Working, 20);
+
+        assert!(registry.observe_run_state_with_receipt(
+            "s_agent",
+            &working,
+            0,
+            DeliveryReceiptEvidence::Uncertain(operation_id.clone()),
+        ));
+        let run = registry.records["s_agent"].run.as_ref().unwrap();
+        assert_eq!(run.id, 1);
+        assert_eq!(run.state, AgentRunState::Failed);
+        assert_eq!(
+            registry.orchestration.uncertain_operation_id("s_agent"),
+            Some(operation_id.as_str())
+        );
+        assert!(registry.dirty);
+        assert!(registry.record_versions["s_agent"] > 0);
+        registry.persist_intent_now().expect("persist tombstone");
+
+        let mut restored = Registry::new(engine(), &state_file);
+        restored.load().expect("reload tombstone");
+        assert_eq!(
+            restored.records["s_agent"].run.as_ref().unwrap().state,
+            AgentRunState::Failed
+        );
+        assert_eq!(
+            restored.orchestration.uncertain_operation_id("s_agent"),
+            Some(operation_id.as_str())
+        );
     }
 
     #[test]

@@ -171,9 +171,6 @@ impl RemoteSessionClient {
         let delivery_receipts = delivery_receipts_negotiated(acknowledgement);
         let mut writer = self.writer.lock().expect("remote writer");
         require_generation(&writer, generation)?;
-        writer.controller_epoch = Some(acknowledgement.controller_epoch);
-        writer.delivery_receipts = delivery_receipts;
-        drop(writer);
         if delivery_receipts {
             let mut outcomes = self.delivery_outcomes.lock().expect("delivery outcomes");
             for delivery_id in &acknowledgement.uncertain_delivery_ids {
@@ -182,6 +179,14 @@ impl RemoteSessionClient {
             for delivery_id in &acknowledgement.accepted_delivery_ids {
                 outcomes.record(delivery_id.clone(), DeliveryOutcome::Accepted);
             }
+        }
+        // Publish the capability only after the corresponding receipt sets
+        // are visible. Receipt-first Registry observation can then never see
+        // a capable generation without its HelloAck tombstones.
+        writer.controller_epoch = Some(acknowledgement.controller_epoch);
+        writer.delivery_receipts = delivery_receipts;
+        drop(writer);
+        if delivery_receipts {
             self.delivery_changed.notify_all();
         }
         Ok(())
@@ -241,6 +246,21 @@ impl RemoteSessionClient {
     }
 
     pub fn write_delivery(&self, bytes: &[u8], delivery_id: &str) -> io::Result<()> {
+        self.write_receipted_sequence(&[], bytes, delivery_id)
+    }
+
+    /// Sends the prompt bytes and their receipted Enter on one controller
+    /// generation. Prompt bytes never enter the generic reconnect queue.
+    pub fn write_delivery_submission(&self, prompt: &[u8], delivery_id: &str) -> io::Result<()> {
+        self.write_receipted_sequence(prompt, b"\r", delivery_id)
+    }
+
+    fn write_receipted_sequence(
+        &self,
+        prompt: &[u8],
+        submit: &[u8],
+        delivery_id: &str,
+    ) -> io::Result<()> {
         if self.accepted_delivery(delivery_id) {
             return Ok(());
         }
@@ -251,14 +271,30 @@ impl RemoteSessionClient {
         }
         {
             let mut writer = self.writer.lock().expect("remote writer");
-            let message = receipted_delivery_message(writer.delivery_receipts, bytes, delivery_id)?;
+            let message =
+                receipted_delivery_message(writer.delivery_receipts, submit, delivery_id)?;
             if writer.controller_epoch.is_none() || writer.input.is_none() {
                 return Err(io::Error::new(
                     io::ErrorKind::NotConnected,
                     "remote controller is reconnecting",
                 ));
             }
-            write_message(&mut writer, &message)?;
+            if !prompt.is_empty() {
+                if let Err(error) = write_message(
+                    &mut writer,
+                    &RemoteMessage::Terminal(Frame::input(prompt.to_vec())),
+                ) {
+                    terminate_current(&mut writer);
+                    writer.controller_epoch = None;
+                    return Err(error);
+                }
+                std::thread::sleep(Duration::from_millis(30));
+            }
+            if let Err(error) = write_message(&mut writer, &message) {
+                terminate_current(&mut writer);
+                writer.controller_epoch = None;
+                return Err(error);
+            }
         }
         let outcomes = self.delivery_outcomes.lock().expect("delivery outcomes");
         let (outcomes, timeout) = self
@@ -717,6 +753,30 @@ mod tests {
         ));
         current.capabilities.clear();
         assert!(!delivery_receipts_negotiated(&current));
+    }
+
+    #[test]
+    fn capability_flip_is_rejected_before_any_prompt_frame_can_be_written() {
+        let preflight_supported = true;
+        assert!(preflight_supported);
+
+        // The controller reconnects to an older Holder after Registry's
+        // preflight but before the send obtains WriterState. Production builds
+        // the receipted Enter while holding that writer lock and only then
+        // writes the prompt frame, so this error precedes every raw byte.
+        let actual_generation_supports_receipts = false;
+        let mut prompt_written = false;
+        let result = (|| -> io::Result<()> {
+            let _message = receipted_delivery_message(
+                actual_generation_supports_receipts,
+                b"\r",
+                "generation-flipped",
+            )?;
+            prompt_written = true;
+            Ok(())
+        })();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Unsupported);
+        assert!(!prompt_written);
     }
 
     #[test]

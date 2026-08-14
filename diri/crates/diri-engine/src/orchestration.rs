@@ -665,6 +665,7 @@ impl Orchestration {
         let observed = self.observe(record, status, needs_input, completion_seq, output_offset);
         let id = record.id.0.clone();
         if self.pending.get(&id).is_some_and(|queue| !queue.is_empty())
+            || self.awaiting_work.contains_key(&id)
             || self.dispatching.contains_key(&id)
             || self.uncertain_deliveries.contains_key(&id)
             || self.interrupting.contains_key(&id)
@@ -693,16 +694,18 @@ impl Orchestration {
                 (current.id, None)
             }
             AgentRunState::Starting if matches!(status, SessionStatus::Idle) => (current.id, None),
-            AgentRunState::Starting
-            | AgentRunState::Running
-            | AgentRunState::NeedsInput
-            | AgentRunState::Completed
-            | AgentRunState::Failed
-            | AgentRunState::Aborted => {
+            AgentRunState::Starting | AgentRunState::Running | AgentRunState::NeedsInput => {
                 return RawSubmissionDecision {
                     changed: observed,
                     claimed: false,
                     blocked: false,
+                };
+            }
+            AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Aborted => {
+                return RawSubmissionDecision {
+                    changed: observed,
+                    claimed: false,
+                    blocked: true,
                 };
             }
         };
@@ -2218,6 +2221,15 @@ mod tests {
         let claimed = record.run.as_ref().unwrap();
         assert_eq!(claimed.id, 2);
         assert_eq!(claimed.state, AgentRunState::Running);
+        assert_eq!(
+            lifecycle.claim_raw_submission(&mut record, &SessionStatus::Idle, None, 0, 10),
+            RawSubmissionDecision {
+                changed: false,
+                claimed: false,
+                blocked: true,
+            },
+            "a second Enter before the first status edge must be rejected"
+        );
 
         let error = lifecycle
             .prepare_delivery(
@@ -2243,6 +2255,25 @@ mod tests {
                 current: 2
             }
         );
+    }
+
+    #[test]
+    fn attached_enter_fails_closed_for_a_terminal_non_idle_snapshot() {
+        let mut lifecycle = Orchestration::default();
+        let mut record = record();
+        record.run.as_mut().unwrap().state = AgentRunState::Completed;
+        lifecycle.register(&record, 0, &SessionStatus::Unknown);
+
+        assert_eq!(
+            lifecycle.claim_raw_submission(&mut record, &SessionStatus::Unknown, None, 0, 10),
+            RawSubmissionDecision {
+                changed: false,
+                claimed: false,
+                blocked: true,
+            }
+        );
+        assert_eq!(record.run.as_ref().unwrap().id, 1);
+        assert_eq!(record.run.as_ref().unwrap().state, AgentRunState::Completed);
     }
 
     #[test]

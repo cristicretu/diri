@@ -1428,6 +1428,18 @@ impl Session {
         if !submit {
             return self.write_input(text.as_bytes());
         }
+        if let (Some(operation_id), Transport::Remote(client)) = (operation_id, &self.transport) {
+            self.capture_prompt_title(text);
+            let framed = self.framed_paste_text(text);
+            self.shared.note_hot();
+            self.shared.grid_wake.prioritize_interactive_changes();
+            self.observe_prompt_input(framed.as_bytes());
+            self.observe_prompt_input(b"\r");
+            client.write_delivery_submission(framed.as_bytes(), operation_id)?;
+            self.feed_signal(StatusSignal::UserKeystroke);
+            self.feed_signal(StatusSignal::UserKeystroke);
+            return Ok(());
+        }
         self.paste_text(text)?;
         std::thread::sleep(Duration::from_millis(30));
         let Some(operation_id) = operation_id else {
@@ -1486,12 +1498,16 @@ impl Session {
     /// idempotent, which matters because the injector may retype.
     pub fn paste_text(&self, text: &str) -> std::io::Result<()> {
         self.capture_prompt_title(text);
-        let framed = if self.bracketed_paste() {
+        let framed = self.framed_paste_text(text);
+        self.write_input(framed.as_bytes())
+    }
+
+    fn framed_paste_text(&self, text: &str) -> String {
+        if self.bracketed_paste() {
             format!("\x1b[200~{text}\x1b[201~")
         } else {
             text.to_owned()
-        };
-        self.write_input(framed.as_bytes())
+        }
     }
 
     /// The Enter that submits whatever is in the composer.
