@@ -247,13 +247,17 @@ impl Sidebar {
         };
         sidebar.ui.preview_account = preview;
         // Preview-only hook so headless screenshots can verify popover layout.
-        if preview
-            && std::env::var("DIRIJOR_SIDEBAR_POPOVER").is_ok_and(|value| value == "new-agent")
-        {
-            sidebar.ui.popover = Some(Popover::NewAgent {
-                directory: None,
-                host: None,
-            });
+        if preview {
+            match std::env::var("DIRIJOR_SIDEBAR_POPOVER").as_deref() {
+                Ok("new-agent") => {
+                    sidebar.ui.popover = Some(Popover::NewAgent {
+                        directory: None,
+                        host: None,
+                    });
+                }
+                Ok("account") => sidebar.ui.popover = Some(Popover::Account),
+                _ => {}
+            }
         }
         sidebar
     }
@@ -2240,6 +2244,7 @@ impl Sidebar {
 
     fn account_footer(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
         let hovered = self.ui.hovered_control == Some("account");
+        let account_label = local_account_label(self.preview);
         let cost = if self.preview {
             Some(PREVIEW_USAGE)
         } else {
@@ -2258,12 +2263,12 @@ impl Sidebar {
             .child(
                 div()
                     .id("account")
-                    .px(px(Space::ROW_H))
-                    .h(px(Metrics::ROW_HEIGHT))
+                    .px(px(8.0))
+                    .h(px(36.0))
                     .flex()
                     .items_center()
-                    .gap(px(8.0))
-                    .rounded(px(Radius::ROW))
+                    .gap(px(9.0))
+                    .rounded(px(10.0))
                     .bg(Fill::hover(colors, hovered))
                     .cursor_pointer()
                     .on_hover(cx.listener(|this, is_hovered: &bool, _, cx| {
@@ -2271,17 +2276,14 @@ impl Sidebar {
                         cx.notify();
                     }))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.ui.popover = Some(Popover::Account);
+                        this.ui.popover = if this.ui.popover == Some(Popover::Account) {
+                            None
+                        } else {
+                            Some(Popover::Account)
+                        };
                         cx.notify();
                     }))
-                    .child(
-                        div()
-                            .w(px(16.0))
-                            .text_center()
-                            .text_size(px(13.0))
-                            .text_color(colors.secondary)
-                            .child(sf_symbol("person.crop.circle", 12.5, colors.secondary)),
-                    )
+                    .child(account_avatar(&account_label, 22.0, colors))
                     .child(
                         div()
                             .min_w(px(0.0))
@@ -2291,11 +2293,7 @@ impl Sidebar {
                             .text_ellipsis()
                             .text_size(px(Typo::ROW.size))
                             .text_color(colors.text(diri_ui::TextTone::Label))
-                            .child(if self.preview {
-                                "preview@dirijor.local"
-                            } else {
-                                "Local agents"
-                            }),
+                            .child(account_label),
                     )
                     .when_some(cost, |row, cost| {
                         row.child(
@@ -3168,7 +3166,7 @@ impl Sidebar {
             .id("account-version")
             .mx(px(6.0))
             .px(px(8.0))
-            .h(px(28.0))
+            .h(px(30.0))
             .flex()
             .items_center()
             .justify_between()
@@ -3180,6 +3178,19 @@ impl Sidebar {
             } else {
                 colors.primary
             })
+            .child(
+                div()
+                    .w(px(16.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(sf_symbol(
+                        "arrow.triangle.2.circlepath",
+                        11.0,
+                        colors.secondary,
+                    )),
+            )
             .child(
                 div()
                     .min_w(px(0.0))
@@ -3220,18 +3231,48 @@ impl Sidebar {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let mut usage = div()
-            .flex()
-            .flex_col()
-            .child(section_label("Usage", colors));
+        /* ─────────────────────────────────────────────────────────
+         * ACCOUNT MENU STORYBOARD
+         *
+         *    0ms   footer remains in place; menu mounts above it
+         *  160ms   shared floating surface settles to full opacity
+         *
+         * The shared FloatingSurface owns the entry timing. Rows never
+         * animate independently: this is a frequent, keyboard-adjacent menu.
+         * ───────────────────────────────────────────────────────── */
+        let account_label = local_account_label(self.preview);
+        let mut usage = div().flex().flex_col().py(px(3.0));
         if self.preview {
             usage = usage
-                .child(usage_row("Session", "resets in 2h 14m", "$2.31", colors))
-                .child(usage_row("Today", "1.8M tokens", "$4.82", colors))
-                .child(usage_row("This month", "", "$86.40", colors));
+                .child(usage_menu_row(
+                    "account-usage-session",
+                    "clock",
+                    "Session",
+                    "resets in 2h 14m",
+                    "$2.31",
+                    colors,
+                ))
+                .child(usage_menu_row(
+                    "account-usage-today",
+                    "chart.bar.xaxis",
+                    "Today",
+                    "1.8M tokens",
+                    "$4.82",
+                    colors,
+                ))
+                .child(usage_menu_row(
+                    "account-usage-month",
+                    "calendar",
+                    "This month",
+                    "",
+                    "$86.40",
+                    colors,
+                ));
         } else if let Some(snapshot) = self.usage {
             usage = usage
-                .child(usage_row(
+                .child(usage_menu_row(
+                    "account-usage-session",
+                    "clock",
                     "Session",
                     snapshot
                         .session_remaining_seconds
@@ -3244,7 +3285,9 @@ impl Sidebar {
                         .unwrap_or_else(|| "—".into()),
                     colors,
                 ))
-                .child(usage_row(
+                .child(usage_menu_row(
+                    "account-usage-today",
+                    "chart.bar.xaxis",
                     "Today",
                     &format!(
                         "{} tokens",
@@ -3253,7 +3296,9 @@ impl Sidebar {
                     &UsageFormat::money(snapshot.today().cost),
                     colors,
                 ))
-                .child(usage_row(
+                .child(usage_menu_row(
+                    "account-usage-month",
+                    "calendar",
                     "This month",
                     "",
                     &UsageFormat::money(snapshot.month().cost),
@@ -3262,22 +3307,69 @@ impl Sidebar {
         } else {
             usage = usage.child(
                 div()
-                    .px(px(14.0))
-                    .py(px(6.0))
+                    .id("account-usage-measuring")
+                    .mx(px(6.0))
+                    .px(px(8.0))
+                    .h(px(30.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
                     .text_size(px(Typo::ROW.size))
                     .text_color(colors.tertiary)
+                    .child(sf_symbol("chart.bar.xaxis", 11.0, colors.tertiary))
                     .child("Measuring…"),
             );
         }
         let content = div()
+            .id("account-menu")
+            .debug_selector(|| "account-menu".into())
             .flex()
             .flex_col()
+            .child(
+                div()
+                    .mx(px(6.0))
+                    .px(px(8.0))
+                    .h(px(40.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(9.0))
+                    .child(account_avatar(&account_label, 24.0, colors))
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .whitespace_nowrap()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .text_size(px(Typo::ROW.size))
+                                    .text_color(colors.primary)
+                                    .child(account_label),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(Typo::META.size))
+                                    .text_color(colors.tertiary)
+                                    .child("Local agents"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .px(px(5.0))
+                            .py(px(2.0))
+                            .rounded(px(Radius::CHIP))
+                            .bg(colors.primary.alpha(0.06))
+                            .text_size(px(Typo::META.size))
+                            .text_color(colors.secondary)
+                            .child("This Mac"),
+                    ),
+            )
+            .child(menu_divider(colors))
             .child(usage)
-            .child(div().mt(px(8.0)).h(px(1.0)).bg(colors.primary.alpha(0.06)))
-            .child(section_label("Version", colors))
-            .child(self.update_menu_row(colors, cx))
-            .child(div().mt(px(8.0)).h(px(1.0)).bg(colors.primary.alpha(0.06)))
-            .child(section_label("Remote", colors))
+            .child(menu_divider(colors))
             .child(
                 div()
                     .id("quick-add-remote-host")
@@ -3307,52 +3399,49 @@ impl Sidebar {
                         cx.notify();
                     })),
             )
-            .child(div().mt(px(8.0)).h(px(1.0)).bg(colors.primary.alpha(0.06)))
-            .child(section_label("Account", colors))
             .child(
                 div()
-                    .id("account-active")
+                    .id("account-settings")
+                    .debug_selector(|| "account-settings".into())
                     .mx(px(6.0))
                     .px(px(8.0))
-                    .h(px(28.0))
+                    .h(px(30.0))
                     .flex()
                     .items_center()
                     .gap(px(8.0))
                     .rounded(px(Radius::ROW))
-                    .text_size(px(Typo::ROW.size))
-                    .text_color(colors.primary)
-                    .child(sf_symbol_weighted(
-                        "checkmark",
-                        10.0,
-                        SymbolWeight::Semibold,
-                        colors.secondary,
-                    ))
-                    .child(if self.preview {
-                        "preview@dirijor.local"
-                    } else {
-                        "Local agents"
-                    }),
-            )
-            .child(
-                div()
-                    .id("dismiss-account")
-                    .mx(px(6.0))
-                    .my(px(6.0))
-                    .px(px(8.0))
-                    .h(px(28.0))
-                    .flex()
-                    .items_center()
-                    .rounded(px(Radius::ROW))
                     .cursor_pointer()
                     .hover(move |element| element.bg(colors.primary.alpha(0.06)))
                     .text_size(px(Typo::ROW.size))
-                    .text_color(colors.secondary)
-                    .child("Done")
-                    .on_click(cx.listener(|this, _, _, cx| {
+                    .text_color(colors.primary)
+                    .child(
+                        div()
+                            .w(px(16.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(sf_symbol("gearshape", 11.0, colors.secondary)),
+                    )
+                    .child(div().flex_1().child("Settings"))
+                    .child(
+                        div()
+                            .text_size(px(Typo::META.size))
+                            .text_color(colors.tertiary)
+                            .child(
+                                crate::commands::command(CommandId::OpenSettings)
+                                    .shortcut_label()
+                                    .unwrap_or_default(),
+                            ),
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| {
                         this.ui.popover = None;
+                        window.dispatch_action(Box::new(OpenSettings), cx);
                         cx.notify();
                     })),
-            );
+            )
+            .child(self.update_menu_row(colors, cx))
+            .child(div().h(px(3.0)));
         self.popover_shell_above_footer(content, colors, window, cx)
     }
 
@@ -4811,39 +4900,98 @@ fn count_label(verb: &str, count: usize) -> String {
     }
 }
 
-fn section_label(label: &'static str, colors: SemanticColors) -> AnyElement {
+fn local_account_label(preview: bool) -> String {
+    if preview {
+        return "cretu".to_owned();
+    }
+
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .ok()
+        .map(|label| label.trim().to_owned())
+        .filter(|label| !label.is_empty())
+        .unwrap_or_else(|| "Local agents".to_owned())
+}
+
+fn account_avatar(label: &str, size: f32, colors: SemanticColors) -> AnyElement {
+    let initial = label
+        .chars()
+        .find(|character| character.is_alphanumeric())
+        .map(|character| character.to_uppercase().collect::<String>())
+        .unwrap_or_else(|| "D".to_owned());
+
     div()
-        .px(px(14.0))
-        .pt(px(10.0))
-        .pb(px(3.0))
-        .text_size(px(Typo::SECTION_HEADER.size))
-        .font_weight(Typo::SECTION_HEADER.weight)
-        .text_color(colors.tertiary)
-        .child(label)
+        .flex_none()
+        .size(px(size))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .bg(Palette::CLAY.alpha(0.88))
+        .text_size(px(Typo::META.size))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(colors.background.alpha(0.92))
+        .child(initial)
         .into_any_element()
 }
 
-fn usage_row(label: &str, detail: &str, value: &str, colors: SemanticColors) -> AnyElement {
+fn usage_menu_row(
+    id: &'static str,
+    icon: &'static str,
+    label: &str,
+    detail: &str,
+    value: &str,
+    colors: SemanticColors,
+) -> AnyElement {
     div()
-        .px(px(14.0))
-        .h(px(24.0))
+        .id(id)
+        .debug_selector(move || id.into())
+        .mx(px(6.0))
+        .px(px(8.0))
+        .h(px(30.0))
         .flex()
         .items_center()
         .gap(px(8.0))
-        .text_size(px(Typo::ROW.size))
-        .text_color(colors.text(diri_ui::TextTone::Label))
-        .child(label.to_owned())
-        .child(div().flex_1())
-        .when(!detail.is_empty(), |row| {
-            row.child(
-                div()
-                    .text_size(px(Typo::META.size))
-                    .text_color(colors.tertiary)
-                    .child(detail.to_owned()),
-            )
-        })
+        .rounded(px(Radius::ROW))
         .child(
             div()
+                .w(px(16.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(sf_symbol(icon, 11.0, colors.secondary)),
+        )
+        .child(
+            div()
+                .min_w(px(0.0))
+                .flex_1()
+                .flex()
+                .items_baseline()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(Typo::ROW.size))
+                        .text_color(colors.text(diri_ui::TextTone::Label))
+                        .child(label.to_owned()),
+                )
+                .when(!detail.is_empty(), |row| {
+                    row.child(
+                        div()
+                            .min_w(px(0.0))
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_size(px(Typo::META.size))
+                            .text_color(colors.tertiary)
+                            .child(detail.to_owned()),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .flex_none()
                 .font_family(crate::fonts::mono_family())
                 .text_size(px(Typo::META_MONO.size))
                 .text_color(colors.secondary)
@@ -5101,6 +5249,11 @@ fn compact_duration(seconds: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    use std::path::PathBuf;
+
+    #[cfg(target_os = "macos")]
+    use gpui::{HeadlessAppContext, size};
     use gpui::{Modifiers, TestAppContext, VisualTestContext};
 
     use super::*;
@@ -5479,7 +5632,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn account_popover_exposes_the_remote_host_shortcut(cx: &mut TestAppContext) {
+    fn account_popover_exposes_usage_and_account_shortcuts(cx: &mut TestAppContext) {
         let (_view, cx) = cx.add_window_view(|_, cx| {
             let sidebar = cx.new(|cx| {
                 let mut sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
@@ -5489,7 +5642,54 @@ mod tests {
             SidebarPopoverHarness { sidebar }
         });
 
+        assert!(cx.debug_bounds("account-menu").is_some());
+        assert!(cx.debug_bounds("account-usage-session").is_some());
+        assert!(cx.debug_bounds("account-usage-today").is_some());
+        assert!(cx.debug_bounds("account-usage-month").is_some());
         assert!(cx.debug_bounds("quick-add-remote-host").is_some());
+        assert!(cx.debug_bounds("account-settings").is_some());
+    }
+
+    /// Produces a deterministic image for design review without reading live
+    /// account data or requiring Screen Recording permission.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes the deterministic account-menu screenshot artifact"]
+    fn render_account_menu_preview_screenshot() {
+        let output = std::env::var_os("DIRI_VISUAL_OUTPUT")
+            .map(PathBuf::from)
+            .expect("set DIRI_VISUAL_OUTPUT to the target PNG path");
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| crate::fonts::init(cx));
+
+        let window = cx
+            .open_window(size(px(300.0), px(720.0)), |_, cx| {
+                let sidebar = cx.new(|cx| {
+                    let mut sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                    sidebar.ui.popover = Some(Popover::Account);
+                    sidebar
+                });
+                cx.new(|_| SidebarPopoverHarness { sidebar })
+            })
+            .expect("open headless account-menu window");
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, _| window.refresh())
+            .expect("refresh account-menu window");
+        cx.run_until_parked();
+        let screenshot = cx
+            .capture_screenshot(window.into())
+            .expect("capture account-menu screenshot");
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent).expect("create screenshot directory");
+        }
+        screenshot
+            .save(output)
+            .expect("save account-menu screenshot");
     }
 
     #[gpui::test]
