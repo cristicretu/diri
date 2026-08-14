@@ -120,6 +120,19 @@ impl QueryEditor {
         self.replace_selection(&filtered)
     }
 
+    /// Insert app-generated context after normalizing platform newlines.
+    /// Unlike arbitrary clipboard input, a staged quote may intentionally
+    /// contain tabs (for example Python or Makefile indentation). C0 controls
+    /// other than LF/TAB remain forbidden at the editor boundary.
+    pub fn insert_context(&mut self, insertion: &str) -> bool {
+        let normalized = insertion.replace("\r\n", "\n").replace('\r', "\n");
+        let filtered: String = normalized
+            .chars()
+            .filter(|character| !character.is_control() || matches!(*character, '\n' | '\t'))
+            .collect();
+        self.replace_selection(&filtered)
+    }
+
     fn replace_selection(&mut self, filtered: &str) -> bool {
         if filtered.is_empty() && self.selection().is_none() {
             return false;

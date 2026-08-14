@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use diri_proto::{Project, ProjectId, SessionId, SessionRecord};
 
-use super::{Prefs, is_auxiliary_terminal};
+use super::{FleetPulse, Prefs, is_auxiliary_terminal};
 
 /// Rank given to an item the manual order has never seen. Reconciliation
 /// normally appends every live id (see [`super::SessionStore::reconcile_sidebar_order`]),
@@ -63,6 +63,9 @@ pub struct SidebarProjection {
     pub ordered_sessions: Vec<Arc<SessionRecord>>,
     /// Active then archived rows per project, regardless of what is collapsed.
     pub display_order: Vec<SessionId>,
+    /// Fleet-wide attention derived from every active row, including sessions
+    /// hidden behind a folded project or ancestor.
+    pub fleet_pulse: FleetPulse,
 }
 
 impl SidebarProjection {
@@ -195,10 +198,18 @@ pub(super) fn build_projection(
         })
         .collect();
 
+    let fleet_pulse = FleetPulse::derive(
+        result
+            .iter()
+            .flat_map(|group| group.active.iter().map(AsRef::as_ref)),
+        selected,
+    );
+
     SidebarProjection {
         projects: result,
         ordered_sessions,
         display_order,
+        fleet_pulse,
     }
 }
 

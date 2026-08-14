@@ -17,6 +17,7 @@ you are typing in a terminal.
 | ⌥⌘T | Option-Command-T | Start a plain shell session |
 | ⇧⌘N | Shift-Command-N | Start a Codex session |
 | ⌘R | Command-R | Rename the selected session in place |
+| ⌃⌘D | Control-Command-D | Mark the selected session as a handoff source; select a target and press again to review and send |
 | ⇧⌘W | Shift-Command-W | Archive the selected session |
 | ⌘W | Command-W | Close a focused auxiliary terminal; otherwise close the selected session, or the window when none is selected |
 | ⇧⌘T | Shift-Command-T | Reopen the most recently closed session |
@@ -88,6 +89,11 @@ Anything else edits the query through the [shared text keymap](#text-fields).
 
 When the agent or project picker is open it takes the arrows first: ↑ ↓ move the
 highlight, ↵ commits it, and Esc closes the picker without closing the launcher.
+
+A handoff opens in the same surface with the complete generated context editable.
+The source and target remain visible, remote targets carry a Remote badge, and
+nothing is sent until you activate **Send handoff** or press Return. Esc cancels
+without sending and restores any unfinished Command-N draft.
 
 ### Inside the overview
 

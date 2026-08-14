@@ -171,6 +171,17 @@ impl Registry {
         self.persist_now()
     }
 
+    /// Commits the latest state before the daemon acknowledges a shutdown.
+    ///
+    /// Shutdown is a durability boundary, not another debounced mutation: the
+    /// process may exit immediately after the acknowledgement, so neither the
+    /// background flusher nor [`Drop`] is guaranteed to run. Always write the
+    /// current snapshot synchronously, even when a recent persist would
+    /// normally be deferred.
+    pub fn persist_for_shutdown(&mut self) -> std::io::Result<()> {
+        self.persist_now()
+    }
+
     /// Writes out a deferred persist, if one is pending.
     pub fn flush_dirty(&mut self) -> std::io::Result<()> {
         if !self.dirty {
@@ -610,6 +621,49 @@ impl Registry {
     /// and Claude's generated `ai-title` when it becomes available. Returns
     /// whether anything changed.
     pub fn apply_hook_metadata(&mut self, id: &str, meta: &crate::hooks::HookMetadata) -> bool {
+        let Ok(home) = std::env::var("HOME") else {
+            return self.apply_hook_metadata_with_home(id, meta, None);
+        };
+        self.apply_hook_metadata_with_home(id, meta, Some(Path::new(&home)))
+    }
+
+    fn apply_hook_metadata_with_home(
+        &mut self,
+        id: &str,
+        meta: &crate::hooks::HookMetadata,
+        home: Option<&Path>,
+    ) -> bool {
+        let mut transcript = self.records.get(id).and_then(|record| {
+            if record.host.is_some() {
+                return None;
+            }
+            let home = home?;
+            let agent_id = meta
+                .agent_session_id
+                .as_deref()
+                .or(record.agent_session_id.as_deref())?;
+            let kind = record.effective_kind();
+            let validate = |candidate: &str| {
+                crate::history::validate_transcript_path(
+                    home,
+                    kind,
+                    agent_id,
+                    &record.cwd,
+                    Path::new(candidate),
+                )
+            };
+            meta.transcript_path
+                .as_deref()
+                .and_then(validate)
+                .or_else(|| record.transcript_path.as_deref().and_then(validate))
+                .or_else(|| {
+                    (kind.id() == diri_proto::AgentKind::CODEX_ID)
+                        .then(|| {
+                            crate::history::find_live_codex_transcript(home, agent_id, &record.cwd)
+                        })
+                        .flatten()
+                })
+        });
         let generated_title = self.records.get(id).and_then(|record| {
             let accepts_generated_title = record.kind == diri_proto::AgentKind::CLAUDE_CODE
                 && matches!(
@@ -617,13 +671,9 @@ impl Registry {
                     TitleSource::Placeholder | TitleSource::FirstPrompt | TitleSource::Unknown
                 );
             accepts_generated_title
-                .then(|| {
-                    meta.transcript_path
-                        .as_deref()
-                        .or(record.transcript_path.as_deref())
-                })
+                .then_some(transcript.as_mut())
                 .flatten()
-                .and_then(|path| crate::history::latest_claude_ai_title(Path::new(path)))
+                .and_then(|transcript| transcript.latest_claude_ai_title())
                 .and_then(|title| normalize_agent_title(&title))
         });
         let Some(record) = self.records.get_mut(id) else {
@@ -637,10 +687,11 @@ impl Registry {
             record.resumability = diri_proto::Resumability::Live;
             changed = true;
         }
-        if let Some(transcript) = &meta.transcript_path
-            && record.transcript_path.as_ref() != Some(transcript)
+        if let Some(transcript) =
+            transcript.map(|transcript| transcript.path().to_string_lossy().into_owned())
+            && record.transcript_path.as_ref() != Some(&transcript)
         {
-            record.transcript_path = Some(transcript.clone());
+            record.transcript_path = Some(transcript);
             changed = true;
         }
         if let Some(title) = &meta.first_prompt_title
@@ -823,6 +874,59 @@ impl Registry {
         record.title_source = TitleSource::UserRename;
         record.updated_at = DateMillis::from(std::time::SystemTime::now());
         Ok(())
+    }
+
+    /// Moves an ended resumable record to another checkout of the same
+    /// project and persists the change as one logical operation. Validation of
+    /// repository membership and target ownership lives in the control method.
+    ///
+    /// Persistence can fail after the in-memory edit (for example, when the
+    /// state directory becomes unavailable). Restore every touched field in
+    /// that case so callers never observe a failed request as a hidden move
+    /// that a later flush makes durable.
+    pub fn reparent_worktree(
+        &mut self,
+        id: &str,
+        cwd: String,
+        branch: Option<String>,
+    ) -> std::io::Result<SessionRecord> {
+        let was_dirty = self.dirty;
+        let previous = {
+            let record = self.records.get_mut(id).ok_or_else(|| not_found(id))?;
+            let previous = (
+                record.cwd.clone(),
+                record.worktree_path.clone(),
+                record.git_branch.clone(),
+                record.updated_at,
+            );
+            record.cwd.clone_from(&cwd);
+            record.worktree_path = Some(cwd);
+            record.git_branch = branch;
+            record.updated_at = DateMillis::from(std::time::SystemTime::now());
+            previous
+        };
+
+        // A confirmed move is user-visible identity metadata, not a sampled
+        // field that may wait for the normal debounce. Force the atomic write
+        // now so an `Ok` response means this exact checkout survived a crash.
+        if let Err(error) = self.persist_now() {
+            let record = self
+                .records
+                .get_mut(id)
+                .expect("record cannot disappear during a locked mutation");
+            record.cwd = previous.0;
+            record.worktree_path = previous.1;
+            record.git_branch = previous.2;
+            record.updated_at = previous.3;
+            self.dirty = was_dirty;
+            return Err(error);
+        }
+
+        Ok(self
+            .records
+            .get(id)
+            .expect("record cannot disappear during a locked mutation")
+            .clone())
     }
 
     pub fn mark_seen(&mut self, id: &str) -> std::io::Result<()> {
@@ -1017,6 +1121,7 @@ mod tests {
             git_branch: None,
             title: "test".into(),
             title_source: TitleSource::Placeholder,
+            originating_prompt: None,
             agent_session_id: None,
             transcript_path: None,
             status: SessionStatus::Starting,
@@ -1069,6 +1174,74 @@ mod tests {
         let mut reloaded = Registry::new(engine(), &state_file);
         assert_eq!(reloaded.load().expect("load"), 1);
         assert_eq!(reloaded.records()[0].id.0, "s_1");
+    }
+
+    #[test]
+    fn shutdown_persistence_commits_a_snapshot_deferred_by_the_debounce() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state_file = temp.path().join("state.json");
+        let mut registry = Registry::new(engine(), &state_file);
+
+        registry.insert_record(record("before"));
+        registry.persist().expect("initial persist");
+        registry.insert_record(record("latest"));
+        registry.persist().expect("debounced persist");
+
+        let deferred: PersistedState =
+            serde_json::from_slice(&std::fs::read(&state_file).expect("read deferred state"))
+                .expect("parse deferred state");
+        assert_eq!(
+            deferred.sessions.len(),
+            1,
+            "the second regular persist should still be waiting for the flusher"
+        );
+
+        registry
+            .persist_for_shutdown()
+            .expect("shutdown persistence");
+        let committed: PersistedState =
+            serde_json::from_slice(&std::fs::read(&state_file).expect("read committed state"))
+                .expect("parse committed state");
+        assert_eq!(
+            committed
+                .sessions
+                .iter()
+                .map(|record| record.id.0.as_str())
+                .collect::<Vec<_>>(),
+            ["before", "latest"]
+        );
+    }
+
+    #[test]
+    fn failed_worktree_persistence_rolls_back_every_metadata_field() {
+        let temp = tempfile::tempdir().expect("temp");
+        let blocked_parent = temp.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, b"file").expect("blocking file");
+        let mut registry = Registry::new(engine(), blocked_parent.join("state.json"));
+        let mut original = record("s_move");
+        original.cwd = "/repo/main".into();
+        original.worktree_path = Some("/repo/main".into());
+        original.git_branch = Some("main".into());
+        original.updated_at = DateMillis(42.0);
+        registry.records.insert("s_move".into(), original.clone());
+
+        let error = registry
+            .reparent_worktree("s_move", "/repo/feature".into(), Some("feature".into()))
+            .expect_err("unwritable state path must fail");
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotADirectory
+            ),
+            "unexpected error: {error}"
+        );
+
+        let current = registry.records.get("s_move").expect("record");
+        assert_eq!(current.cwd, original.cwd);
+        assert_eq!(current.worktree_path, original.worktree_path);
+        assert_eq!(current.git_branch, original.git_branch);
+        assert_eq!(current.updated_at, original.updated_at);
+        assert!(!registry.dirty, "failed edit must not be flushed later");
     }
 
     #[test]
@@ -1420,7 +1593,12 @@ mod tests {
     #[test]
     fn live_claude_metadata_promotes_the_generated_conversation_title() {
         let temp = tempfile::tempdir().expect("temp");
-        let transcript = temp.path().join("conversation.jsonl");
+        let agent_id = "0199f2c4-1a2b-4c3d-8e9f-000000000009";
+        let transcript = temp
+            .path()
+            .join(".claude/projects/-tmp")
+            .join(format!("{agent_id}.jsonl"));
+        std::fs::create_dir_all(transcript.parent().expect("parent")).expect("mkdir");
         std::fs::write(
             &transcript,
             "{\"type\":\"user\",\"message\":{\"content\":\"vague prompt\"}}\n\
@@ -1430,21 +1608,112 @@ mod tests {
         let mut registry = Registry::new(engine(), temp.path().join("state.json"));
         let mut session = record("claude");
         session.kind = AgentKind::CLAUDE_CODE;
+        session.agent_session_id = Some(agent_id.to_owned());
         session.title = "vague prompt".to_owned();
         session.title_source = TitleSource::FirstPrompt;
         registry.insert_record(session);
 
-        assert!(registry.apply_hook_metadata(
+        assert!(registry.apply_hook_metadata_with_home(
             "claude",
             &crate::hooks::HookMetadata {
                 transcript_path: Some(transcript.to_string_lossy().into_owned()),
                 ..crate::hooks::HookMetadata::default()
-            }
+            },
+            Some(temp.path()),
         ));
 
         let updated = registry.record("claude").expect("record");
         assert_eq!(updated.title, "Repair remote session recovery");
         assert_eq!(updated.title_source, TitleSource::AgentProvided);
+    }
+
+    #[test]
+    fn first_codex_notify_associates_the_matching_live_rollout() {
+        let temp = tempfile::tempdir().expect("temp");
+        let transcript = temp
+            .path()
+            .join(".codex/sessions/2026/08/13/rollout-now-thread-9.jsonl");
+        std::fs::create_dir_all(transcript.parent().expect("parent")).expect("mkdir");
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-9\",\"cwd\":\"/tmp\"}}\n",
+        )
+        .expect("write transcript");
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let mut session = record("codex");
+        session.kind = AgentKind::CODEX;
+        registry.insert_record(session);
+
+        assert!(registry.apply_hook_metadata_with_home(
+            "codex",
+            &crate::hooks::HookMetadata {
+                agent_session_id: Some("thread-9".to_owned()),
+                ..crate::hooks::HookMetadata::default()
+            },
+            Some(temp.path()),
+        ));
+        let updated = registry.record("codex").expect("record");
+        assert_eq!(updated.agent_session_id.as_deref(), Some("thread-9"));
+        assert_eq!(
+            updated.transcript_path.as_deref(),
+            Some(transcript.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn arbitrary_hook_transcript_paths_never_enter_the_record() {
+        let temp = tempfile::tempdir().expect("temp");
+        let outside = temp.path().join("outside.jsonl");
+        std::fs::write(&outside, "{}\n").expect("write");
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let mut session = record("claude");
+        session.kind = AgentKind::CLAUDE_CODE;
+        session.agent_session_id = Some("0199f2c4-1a2b-4c3d-8e9f-000000000009".to_owned());
+        registry.insert_record(session);
+
+        assert!(!registry.apply_hook_metadata_with_home(
+            "claude",
+            &crate::hooks::HookMetadata {
+                transcript_path: Some(outside.to_string_lossy().into_owned()),
+                ..crate::hooks::HookMetadata::default()
+            },
+            Some(temp.path()),
+        ));
+        assert!(
+            registry
+                .record("claude")
+                .expect("record")
+                .transcript_path
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn legacy_arbitrary_transcript_paths_never_feed_generated_titles() {
+        let temp = tempfile::tempdir().expect("temp");
+        let outside = temp.path().join("outside.jsonl");
+        std::fs::write(
+            &outside,
+            "{\"type\":\"ai-title\",\"aiTitle\":\"untrusted promoted title\"}\n",
+        )
+        .expect("write");
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let mut session = record("claude");
+        session.kind = AgentKind::CLAUDE_CODE;
+        session.agent_session_id = Some("0199f2c4-1a2b-4c3d-8e9f-000000000009".to_owned());
+        session.transcript_path = Some(outside.to_string_lossy().into_owned());
+        session.title = "safe existing title".to_owned();
+        session.title_source = TitleSource::FirstPrompt;
+        registry.insert_record(session);
+
+        assert!(!registry.apply_hook_metadata_with_home(
+            "claude",
+            &crate::hooks::HookMetadata::default(),
+            Some(temp.path()),
+        ));
+        let updated = registry.record("claude").expect("record");
+        assert_eq!(updated.title, "safe existing title");
+        assert_eq!(updated.title_source, TitleSource::FirstPrompt);
     }
 
     #[test]

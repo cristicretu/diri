@@ -125,6 +125,15 @@ const OUTPUT_BATCH_CEILING: Duration = Duration::from_millis(8);
 /// that continuously adds content still publishes at up to 120 Hz.
 const OUTPUT_REPAINT_CEILING: Duration = Duration::from_millis(16);
 
+/// An entirely blank intermediate frame gets a little more grace than a
+/// partial repaint. A loaded machine can deschedule a TUI between its clear
+/// and redraw writes for longer than one display frame; publishing that state
+/// is the most visible possible flash. Keep enough headroom beyond a typical
+/// 30 ms scheduler pause for the resumed process to issue its redraw; a
+/// program that intentionally clears and stops still appears within the
+/// sub-100 ms perceptual-continuity bound.
+const OUTPUT_BLANK_REPAINT_CEILING: Duration = Duration::from_millis(80);
+
 /// Byte ceiling on one batch, matching `alacritty_terminal`'s
 /// `MAX_LOCKED_READ`. A child that writes faster than it can be parsed must
 /// not starve the grid indefinitely.
@@ -2405,15 +2414,18 @@ fn feed_output_batch(
             // still running and its status still matters.
             let _ = log.append(&buffer[..count]);
         }
-        let mid_repaint = {
+        let (mid_repaint, blank_repaint) = {
             let mut screen = shared.screen.lock().expect("screen");
             let before = *filled_before.get_or_insert_with(|| screen.filled_cells());
             screen.feed(&buffer[..count]);
-            screen.filled_cells() < before
+            let after = screen.filled_cells();
+            (after < before, after == 0 && before != 0)
         };
         total += count;
 
-        let deadline = if mid_repaint {
+        let deadline = if blank_repaint {
+            started_at + OUTPUT_BLANK_REPAINT_CEILING
+        } else if mid_repaint {
             repaint_deadline
         } else {
             batch_deadline
@@ -2427,7 +2439,12 @@ fn feed_output_batch(
         // have not arrived is reserved for a screen that currently holds less
         // than it did when the batch opened, which is a repaint caught between
         // its erase and its redraw. An echo, which only adds, never waits.
-        let settle = if mid_repaint {
+        let settle = if blank_repaint {
+            // A full erase is the most destructive intermediate frame. Give
+            // its redraw the entire bounded grace period instead of falling
+            // through the ordinary 16 ms partial-repaint settle window.
+            remaining
+        } else if mid_repaint {
             OUTPUT_SETTLE
         } else {
             Duration::ZERO

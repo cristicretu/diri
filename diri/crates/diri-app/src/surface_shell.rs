@@ -5,10 +5,12 @@ use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::delegation::worktree_move_proposal;
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::query_label;
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
 use crate::settings::{HostDraft, SettingsTab, theme};
+use crate::sidebar::DraggedSidebarItem;
 use crate::store::{Prefs, SessionStore, StoreRuntime};
 use crate::updates::{UpdateCommand, UpdateHandle, UpdatePhase};
 use crate::worktrees::WorktreesSheet;
@@ -451,6 +453,12 @@ impl UtilitySurfaces {
     }
 
     pub(crate) fn open_worktrees(&mut self, cx: &mut Context<Self>) {
+        self.prefs = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .clone();
         self.surface = Surface::Worktrees;
         self.refresh_worktrees(cx);
     }
@@ -536,6 +544,18 @@ impl UtilitySurfaces {
             });
         })
         .detach();
+    }
+
+    fn confirm_worktree_move(&mut self, cx: &mut Context<Self>) {
+        let Some(params) = self.worktrees.confirm_move() else {
+            return;
+        };
+        self.store
+            .read()
+            .expect("session store lock poisoned")
+            .reparent_worktree(params);
+        self.activity = "Moving session to worktree…".to_owned();
+        cx.notify();
     }
 
     fn persist_prefs(&mut self) {
@@ -986,6 +1006,8 @@ impl UtilitySurfaces {
     fn close_surface(&mut self, cx: &mut Context<Self>) {
         if self.worktrees.pending_cleanup.is_some() {
             self.worktrees.cancel_cleanup();
+        } else if self.worktrees.pending_move.is_some() || self.worktrees.move_refusal.is_some() {
+            self.worktrees.cancel_move();
         } else {
             self.surface = Surface::None;
             self.settings_menu = None;
@@ -1068,7 +1090,14 @@ impl UtilitySurfaces {
             return;
         }
         let key = &event.keystroke;
-        if key.key == "escape" && self.surface == Surface::Settings && self.settings_menu.is_some()
+        if key.key == "escape"
+            && (self.worktrees.pending_move.is_some() || self.worktrees.move_refusal.is_some())
+        {
+            self.worktrees.cancel_move();
+            cx.notify();
+        } else if key.key == "escape"
+            && self.surface == Surface::Settings
+            && self.settings_menu.is_some()
         {
             self.settings_menu = None;
             cx.notify();
@@ -1241,12 +1270,16 @@ impl UtilitySurfaces {
 
     fn render_worktrees(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.colors();
+        let entity = cx.entity();
         let cards = self
             .worktrees
             .entries
             .iter()
             .map(|entry| {
                 let path = entry.path.clone();
+                let drop_entry = entry.clone();
+                let hover_entry = entry.clone();
+                let hover_entity = entity.clone();
                 let branch = entry
                     .branch
                     .clone()
@@ -1265,6 +1298,58 @@ impl UtilitySurfaces {
                         colors.primary.alpha(0.06)
                     })
                     .bg(Fill::subtle(colors))
+                    .drag_over::<DraggedSidebarItem>(move |card, dragged, _, cx| {
+                        let Some(source_id) = dragged.session_id() else {
+                            return card;
+                        };
+                        let valid = {
+                            let this = hover_entity.read(cx);
+                            let store = this.store.read().expect("session store lock poisoned");
+                            store.sessions().get(source_id).is_some_and(|source| {
+                                worktree_move_proposal(
+                                    source,
+                                    store.projects().get(&source.project_id),
+                                    &hover_entry,
+                                )
+                                .is_ok()
+                            })
+                        };
+                        if valid {
+                            card.border_1()
+                                .border_color(Palette::CLAY.alpha(0.72))
+                                .bg(Palette::CLAY.alpha(0.14))
+                                .cursor(CursorStyle::DragCopy)
+                        } else {
+                            card.border_1()
+                                .border_color(Ink::DANGER.alpha(0.56))
+                                .bg(Ink::DANGER.alpha(0.08))
+                                .cursor(CursorStyle::OperationNotAllowed)
+                        }
+                    })
+                    .on_drop(
+                        cx.listener(move |this, dragged: &DraggedSidebarItem, _, cx| {
+                            if let Some(source_id) = dragged.session_id() {
+                                let result = {
+                                    let store =
+                                        this.store.read().expect("session store lock poisoned");
+                                    store.sessions().get(source_id).map_or_else(
+                                        || Err("The dragged session no longer exists.".to_owned()),
+                                        |source| {
+                                            worktree_move_proposal(
+                                                source,
+                                                store.projects().get(&source.project_id),
+                                                &drop_entry,
+                                            )
+                                            .map_err(|refusal| refusal.0)
+                                        },
+                                    )
+                                };
+                                this.worktrees.propose_move(result);
+                            }
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
                     .flex()
                     .flex_col()
                     .gap(px(8.0))
@@ -1323,6 +1408,8 @@ impl UtilitySurfaces {
             })
             .collect::<Vec<_>>();
         let pending = self.worktrees.pending_cleanup.clone();
+        let pending_move = self.worktrees.pending_move.clone();
+        let move_refusal = self.worktrees.move_refusal.clone();
         FloatingSurface::new(
             self.colors(),
             div()
@@ -1455,6 +1542,124 @@ impl UtilitySurfaces {
                                         this.confirm_cleanup(cx);
                                     })),
                             )),
+                    )
+                })
+                .when_some(pending_move, |sheet, proposal| {
+                    let branch = proposal.branch.as_deref().unwrap_or("detached");
+                    sheet.child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .occlude()
+                            .bg(rgba(0x00000088))
+                            .flex()
+                            .items_end()
+                            .justify_center()
+                            .pb(px(18.0))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.worktrees.cancel_move();
+                                    cx.notify();
+                                    cx.stop_propagation();
+                                }),
+                            )
+                            .child(FloatingSurface::new(
+                                self.colors(),
+                                div()
+                                    .w(px(560.0))
+                                    .p(px(16.0))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(12.0))
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(4.0))
+                                            .child(
+                                                div()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .child("Move session to this worktree?"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.0))
+                                                    .text_color(colors.secondary)
+                                                    .child(format!(
+                                                        "{} → {branch} · {}",
+                                                        proposal.source_title,
+                                                        proposal.worktree_path
+                                                    )),
+                                            ),
+                                    )
+                                    .child(surface_button(
+                                        "Cancel",
+                                        "cancel-worktree-move",
+                                        colors,
+                                        cx,
+                                        |this, cx| {
+                                            this.worktrees.cancel_move();
+                                            cx.notify();
+                                        },
+                                    ))
+                                    .child(surface_button(
+                                        "Move Session",
+                                        "confirm-worktree-move",
+                                        colors,
+                                        cx,
+                                        |this, cx| this.confirm_worktree_move(cx),
+                                    )),
+                            )),
+                    )
+                })
+                .when_some(move_refusal, |sheet, reason| {
+                    sheet.child(
+                        div()
+                            .absolute()
+                            .left(px(16.0))
+                            .right(px(16.0))
+                            .bottom(px(16.0))
+                            .p(px(11.0))
+                            .rounded(px(Radius::ROW))
+                            .bg(colors.floating_surface())
+                            .border_1()
+                            .border_color(Ink::DANGER.alpha(0.36))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(sf_symbol(
+                                "exclamationmark.triangle.fill",
+                                12.0,
+                                Ink::DANGER,
+                            ))
+                            .child(
+                                div()
+                                    .min_w(px(0.0))
+                                    .flex_1()
+                                    .text_size(px(11.0))
+                                    .text_color(colors.secondary)
+                                    .child(reason),
+                            )
+                            .child(
+                                div()
+                                    .id("dismiss-worktree-refusal")
+                                    .size(px(20.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.worktrees.cancel_move();
+                                        cx.notify();
+                                    }))
+                                    .child(sf_symbol("xmark", 9.0, colors.tertiary)),
+                            ),
                     )
                 }),
         )
@@ -3647,6 +3852,12 @@ impl Focusable for UtilitySurfaces {
 
 impl Render for UtilitySurfaces {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Worktree delegation starts in the sidebar, so that one surface
+        // deliberately leaves the visible sidebar interactive. The shaded
+        // workspace and sheet remain modal once the pointer crosses the seam.
+        let leave_sidebar_exposed =
+            self.surface == Surface::Worktrees && self.prefs.sidebar_visible;
+        let sidebar_width = self.prefs.sidebar_width;
         let overlay = match self.surface {
             Surface::None => None,
             Surface::History => Some(self.render_history(cx).into_any_element()),
@@ -3688,7 +3899,14 @@ impl Render for UtilitySurfaces {
             root.inset_0().child(
                 div()
                     .absolute()
-                    .inset_0()
+                    .when(leave_sidebar_exposed, |backdrop| {
+                        backdrop
+                            .top(px(0.0))
+                            .right(px(0.0))
+                            .bottom(px(0.0))
+                            .left(px(sidebar_width))
+                    })
+                    .when(!leave_sidebar_exposed, |backdrop| backdrop.inset_0())
                     .debug_selector(|| "surface-backdrop".into())
                     // The modal backdrop dismisses the topmost surface while
                     // still protecting terminal selection and scrollback.

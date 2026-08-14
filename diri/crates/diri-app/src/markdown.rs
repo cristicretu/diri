@@ -4,6 +4,8 @@
 //! hostile-input limits, and link activation policy stay inside this module;
 //! no renderer needs to interpret source text or decide whether a URL is safe.
 
+use std::ops::Range;
+
 const MAX_SOURCE_BYTES: usize = 256 * 1024;
 const MAX_BLOCKS: usize = 8_192;
 const MAX_LIST_ITEMS: usize = 4_096;
@@ -61,6 +63,59 @@ pub struct InlineStyle {
     pub italic: bool,
     pub code: bool,
     pub strikethrough: bool,
+}
+
+/// Natural transcript/Markdown selection: a whole turn by default, with an
+/// optional UTF-8 byte range when a richer text surface can provide one.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TurnSelection {
+    turn: Option<usize>,
+    text_range: Option<Range<usize>>,
+}
+
+impl TurnSelection {
+    pub fn select_turn(&mut self, turn: usize) {
+        self.turn = Some(turn);
+        self.text_range = None;
+    }
+
+    pub fn select_text(&mut self, turn: usize, range: Range<usize>, text: &str) {
+        let start = floor_char_boundary(text, range.start.min(text.len()));
+        let end = ceil_char_boundary(text, range.end.min(text.len()));
+        self.turn = Some(turn);
+        self.text_range = (start < end).then_some(start..end);
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    #[must_use]
+    pub fn selected_text<'a>(&self, turns: &'a [String]) -> Option<&'a str> {
+        let text = turns.get(self.turn?)?;
+        self.text_range
+            .as_ref()
+            .map_or(Some(text.as_str()), |range| text.get(range.clone()))
+    }
+
+    #[must_use]
+    pub fn turn(&self) -> Option<usize> {
+        self.turn
+    }
+}
+
+fn floor_char_boundary(text: &str, mut offset: usize) -> usize {
+    while !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
+}
+
+fn ceil_char_boundary(text: &str, mut offset: usize) -> usize {
+    while offset < text.len() && !text.is_char_boundary(offset) {
+        offset += 1;
+    }
+    offset
 }
 
 impl MarkdownDocument {
@@ -1101,5 +1156,21 @@ mod tests {
             paragraph(&document, 0).plain_text(),
             "Unclosed **bold and [link](missing plus *escaped stars*."
         );
+    }
+
+    #[test]
+    fn turn_selection_defaults_to_a_whole_turn_and_supports_utf8_ranges() {
+        let turns = vec!["first turn".to_owned(), "修复 this turn".to_owned()];
+        let mut selection = TurnSelection::default();
+        selection.select_turn(1);
+        assert_eq!(selection.selected_text(&turns), Some("修复 this turn"));
+
+        // Deliberately land inside the first scalar; selection expands to
+        // valid boundaries rather than producing malformed UTF-8.
+        selection.select_text(1, 1..5, &turns[1]);
+        assert_eq!(selection.selected_text(&turns), Some("修复"));
+        assert_eq!(selection.turn(), Some(1));
+        selection.clear();
+        assert_eq!(selection.selected_text(&turns), None);
     }
 }

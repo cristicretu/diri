@@ -2,24 +2,26 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use diri_proto::{AgentKind, SessionId};
-use diri_ui::{FloatingSurface, Ink, Radius, SemanticColors, Typo};
+use diri_proto::{AgentKind, SessionId, SessionRecord, SessionStatus};
+use diri_ui::{FloatingSurface, Ink, Metrics, Radius, SemanticColors, Typo};
 use gpui::{
-    AnyElement, App, Context, CursorStyle, DragMoveEvent, Entity, FocusHandle, Focusable,
-    FontWeight, KeyContext, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton, Render,
-    StyleRefinement, Subscription, Task, Window, deferred, div, prelude::*, px, rgba,
+    Animation, AnimationExt, AnyElement, App, Context, CursorStyle, DragMoveEvent, Entity,
+    FocusHandle, Focusable, FontWeight, KeyContext, KeyDownEvent, KeyUpEvent,
+    ModifiersChangedEvent, MouseButton, Render, StyleRefinement, Subscription, Task, Window,
+    deferred, div, ease_out_quint, prelude::*, px, rgba,
 };
 
 use crate::AppServices;
 use crate::commands::{
     self, APP_CONTEXT, ArchiveSelectedSession, CheckForUpdates, CloseSession, CommandId,
-    FocusSidebar, MoveSelectedSessionDown, MoveSelectedSessionUp, NewCodexSession,
-    NewDefaultSession, NewTerminal, OpenLauncher, OpenSettings, OpenWorktrees,
-    RenameSelectedSession, ReopenSession, SESSION_NAVIGATION_CONTEXT, SelectLastSession,
-    SelectNextAttentionSession, SelectNextSession, SelectPreviousSession, SelectSession1,
-    SelectSession2, SelectSession3, SelectSession4, SelectSession5, SelectSession6, SelectSession7,
-    SelectSession8, ToggleAuxiliaryTerminal, ToggleCommandPalette, ToggleHistory, ToggleInspector,
-    ToggleOverview, ToggleQuickOpen, ToggleSidebar,
+    DelegateSelectedSession, FocusSidebar, MoveSelectedSessionDown, MoveSelectedSessionUp,
+    NewCodexSession, NewDefaultSession, NewTerminal, OpenLauncher, OpenSettings, OpenWorktrees,
+    QuoteSelection, QuoteSelectionToSession, RenameSelectedSession, ReopenSession,
+    SESSION_NAVIGATION_CONTEXT, SelectLastSession, SelectNextAttentionSession, SelectNextSession,
+    SelectPreviousSession, SelectSession1, SelectSession2, SelectSession3, SelectSession4,
+    SelectSession5, SelectSession6, SelectSession7, SelectSession8, ToggleAuxiliaryTerminal,
+    ToggleCommandPalette, ToggleHistory, ToggleInspector, ToggleOverview, ToggleQuickOpen,
+    ToggleSidebar,
 };
 use crate::external_drop::ExternalDropAction;
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
@@ -27,6 +29,7 @@ use crate::inspector::{InspectorEvent, WorkbenchInspector};
 use crate::launcher::{LauncherEvent, LauncherOverlay};
 use crate::navigation::NavigationOverlay;
 use crate::notifications::{InAppBanner, NotificationSound};
+use crate::quote::Quote;
 use crate::recovery::{RecoveryAction, RecoveryKind, RecoveryNotice};
 use crate::seam::{SeamSlide, toggle_has_settled};
 use crate::session_surfaces::SessionSurfaces;
@@ -76,6 +79,22 @@ impl Render for DraggedInspectorEdge {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         gpui::Empty
     }
+}
+
+#[derive(Clone, Debug)]
+struct QuoteTargetPicker {
+    quote: Quote,
+    targets: Vec<SessionRecord>,
+    highlighted: usize,
+    return_surface: QuoteSurface,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum QuoteSurface {
+    #[default]
+    PrimaryTerminal,
+    AuxiliaryTerminal,
+    Inspector,
 }
 
 /// Advances one panel's seam by a frame and returns the width to paint,
@@ -141,6 +160,8 @@ pub struct RootView {
     window_bounds_save: Option<Task<()>>,
     status_banner: Option<InAppBanner>,
     status_banner_generation: u64,
+    quote_target_picker: Option<QuoteTargetPicker>,
+    last_quote_surface: QuoteSurface,
     sound_gate: SoundGate,
     preview: bool,
     preview_scenario: PreviewScenario,
@@ -224,6 +245,11 @@ impl RootView {
             .detach();
         }
         cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
+            if let SidebarEvent::HandoffProposed(proposal) = event {
+                this.launcher.update(cx, |launcher, cx| {
+                    launcher.open_handoff(proposal.clone(), window, cx);
+                });
+            }
             if let SidebarEvent::ExternalDrop(plan) = event
                 && let Some(action) = &plan.action
             {
@@ -239,7 +265,7 @@ impl RootView {
                         insertion,
                     } => {
                         this.launcher.update(cx, |launcher, cx| {
-                            launcher.open_for_session(
+                            launcher.open_local_paths_for_session(
                                 session_id.clone(),
                                 insertion,
                                 notice,
@@ -576,6 +602,8 @@ impl RootView {
             window_bounds_save: None,
             status_banner: None,
             status_banner_generation: 0,
+            quote_target_picker: None,
+            last_quote_surface: QuoteSurface::default(),
             sound_gate: SoundGate::default(),
             preview,
             preview_scenario,
@@ -640,11 +668,296 @@ impl RootView {
         crate::app_theme::colors(&store.preferences().terminal_theme)
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn show_quote_feedback(
+        &mut self,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.status_banner_generation = self.status_banner_generation.wrapping_add(1);
+        let generation = self.status_banner_generation;
+        self.status_banner = Some(InAppBanner {
+            title: title.into(),
+            body: body.into(),
+        });
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(4)).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.status_banner_generation == generation {
+                    this.status_banner = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn focused_quote_surface(&self, window: &Window, cx: &App) -> Option<QuoteSurface> {
+        if let Some(auxiliary) = &self.auxiliary_terminal
+            && auxiliary.read(cx).is_focused(window)
+        {
+            return Some(QuoteSurface::AuxiliaryTerminal);
+        }
+        if let Some(inspector) = &self.inspector
+            && inspector.read(cx).is_focused(window)
+        {
+            return Some(QuoteSurface::Inspector);
+        }
+        if let Some(terminal) = &self.terminal
+            && terminal.read(cx).is_focused(window)
+        {
+            return Some(QuoteSurface::PrimaryTerminal);
+        }
+        None
+    }
+
+    fn quote_from_surface(&self, surface: QuoteSurface, cx: &App) -> Option<Quote> {
+        match surface {
+            QuoteSurface::PrimaryTerminal => self
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.read(cx).quote_selection()),
+            QuoteSurface::AuxiliaryTerminal => self
+                .auxiliary_terminal
+                .as_ref()
+                .and_then(|terminal| terminal.read(cx).quote_selection()),
+            QuoteSurface::Inspector => self
+                .inspector
+                .as_ref()
+                .and_then(|inspector| inspector.read(cx).quote_selection()),
+        }
+    }
+
+    fn remember_quote_surface(&mut self, window: &Window, cx: &App) {
+        if let Some(surface) = self.focused_quote_surface(window, cx) {
+            self.last_quote_surface = surface;
+        }
+    }
+
+    fn restore_quote_focus(
+        &self,
+        surface: QuoteSurface,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let handle = match surface {
+            QuoteSurface::PrimaryTerminal => self
+                .terminal
+                .as_ref()
+                .map(|terminal| terminal.read(cx).quote_focus_handle()),
+            QuoteSurface::AuxiliaryTerminal => self
+                .auxiliary_terminal
+                .as_ref()
+                .map(|terminal| terminal.read(cx).quote_focus_handle()),
+            QuoteSurface::Inspector => self
+                .inspector
+                .as_ref()
+                .map(|inspector| inspector.read(cx).focus_handle(cx)),
+        };
+        if let Some(handle) = handle {
+            window.focus(&handle, cx);
+        }
+    }
+
+    fn selected_quote(&self, window: &Window, cx: &App) -> Option<Quote> {
+        if let Some(surface) = self.focused_quote_surface(window, cx) {
+            return self.quote_from_surface(surface, cx);
+        }
+        // Palette execution temporarily owns focus. Preserve the visible
+        // source surface rather than making Quote Selection palette-only fail.
+        self.quote_from_surface(self.last_quote_surface, cx)
+            .or_else(|| {
+                self.terminal
+                    .as_ref()
+                    .and_then(|terminal| terminal.read(cx).quote_selection())
+            })
+    }
+
+    fn quote_targets(&self) -> Vec<SessionRecord> {
+        self.services
+            .store
+            .store
+            .write()
+            .expect("session store lock poisoned")
+            .ordered_sessions()
+            .into_iter()
+            .filter(is_quote_target)
+            .collect()
+    }
+
+    fn quote_selection(&mut self, pick_target: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(quote) = self.selected_quote(window, cx) else {
+            self.show_quote_feedback(
+                "Nothing selected",
+                "Select terminal text, a diff hunk or line range, or a Markdown turn first.",
+                cx,
+            );
+            return;
+        };
+        if pick_target {
+            let return_surface = self
+                .focused_quote_surface(window, cx)
+                .unwrap_or(self.last_quote_surface);
+            let targets = self.quote_targets();
+            if targets.is_empty() {
+                self.show_quote_feedback(
+                    "No target session",
+                    "Start an agent to stage this quote.",
+                    cx,
+                );
+                return;
+            }
+            let active = self
+                .services
+                .store
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .selected_session_id()
+                .cloned();
+            let highlighted = active
+                .as_ref()
+                .and_then(|id| targets.iter().position(|session| &session.id == id))
+                .unwrap_or(0);
+            self.sidebar.update(cx, |sidebar, cx| sidebar.reveal(cx));
+            self.quote_target_picker = Some(QuoteTargetPicker {
+                quote,
+                targets,
+                highlighted,
+                return_surface,
+            });
+            window.focus(&self.focus, cx);
+            cx.notify();
+            return;
+        }
+        let target = self
+            .services
+            .store
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .selected_session_id()
+            .cloned();
+        let Some(target) = target else {
+            self.show_quote_feedback(
+                "No active session",
+                "Select an agent to receive the quote.",
+                cx,
+            );
+            return;
+        };
+        if !self
+            .quote_targets()
+            .iter()
+            .any(|session| session.id == target)
+        {
+            self.show_quote_feedback(
+                "Active session unavailable",
+                "Choose a running or sleeping agent—not a shell—as the quote target.",
+                cx,
+            );
+            return;
+        }
+        self.open_quote_draft(target, quote, window, cx);
+    }
+
+    fn open_quote_draft(
+        &mut self,
+        target: SessionId,
+        quote: Quote,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target_record = self
+            .services
+            .store
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .sessions()
+            .get(&target)
+            .cloned();
+        let Some(target_record) = target_record else {
+            self.show_quote_feedback("Target unavailable", "That session no longer exists.", cx);
+            return;
+        };
+        if !is_quote_target(&target_record) {
+            self.show_quote_feedback(
+                "Target unavailable",
+                "Quotes can be staged only in an agent draft, not a shell.",
+                cx,
+            );
+            return;
+        }
+        let text = quote.framed();
+        self.launcher.update(cx, |launcher, cx| {
+            launcher.open_for_session(target, &text, None, window, cx);
+        });
+        // Mount the app-owned composer before focusing its insertion caret.
+        // This changes no sidebar/session selection and does not touch the PTY.
+        let launcher = self.launcher.clone();
+        cx.defer_in(window, move |_, window, cx| {
+            launcher.update(cx, |launcher, cx| launcher.focus(window, cx));
+        });
+    }
+
+    fn activate_quote_target(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(picker) = self.quote_target_picker.take() else {
+            return;
+        };
+        // Resolve against the snapshot shown to the user. A concurrent store
+        // reorder must never redirect a click to a different session.
+        let Some(target) = quote_target_id(&picker.targets, index) else {
+            self.show_quote_feedback("Target unavailable", "Choose another session.", cx);
+            return;
+        };
+        self.open_quote_draft(target, picker.quote, window, cx);
+    }
+
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quote_target_picker.is_some() {
+            let target_count = self
+                .quote_target_picker
+                .as_ref()
+                .map_or(0, |picker| picker.targets.len());
+            match event.keystroke.key.as_str() {
+                "escape" => {
+                    if let Some(picker) = self.quote_target_picker.take() {
+                        self.restore_quote_focus(picker.return_surface, window, cx);
+                    }
+                    cx.notify();
+                }
+                "up" if target_count > 0 => {
+                    let picker = self.quote_target_picker.as_mut().expect("picker exists");
+                    picker.highlighted = picker
+                        .highlighted
+                        .checked_sub(1)
+                        .unwrap_or(target_count - 1);
+                    cx.notify();
+                }
+                "down" if target_count > 0 => {
+                    let picker = self.quote_target_picker.as_mut().expect("picker exists");
+                    picker.highlighted = (picker.highlighted + 1) % target_count;
+                    cx.notify();
+                }
+                "enter" if target_count > 0 => {
+                    let highlighted = self
+                        .quote_target_picker
+                        .as_ref()
+                        .expect("picker exists")
+                        .highlighted;
+                    self.activate_quote_target(highlighted, window, cx);
+                }
+                _ => {}
+            }
+            cx.stop_propagation();
+            return;
+        }
         // The sidebar is a real keyboard surface. Let its bubble handler own
         // navigation and rename input instead of mirroring the same keystroke
         // into the live terminal during root capture.
-        if self.sidebar.read(cx).is_focused(_window) {
+        if self.sidebar.read(cx).is_focused(window) {
             return;
         }
         if self.launcher.read(cx).is_open() {
@@ -653,7 +966,7 @@ impl RootView {
                 commands::matches_keystroke(CommandId::FocusSidebar, &event.keystroke);
             if !focus_sidebar {
                 self.launcher.update(cx, |launcher, cx| {
-                    launcher.handle_key_down(event, _window, cx);
+                    launcher.handle_key_down(event, window, cx);
                 });
             }
             if !reopen && !focus_sidebar {
@@ -675,7 +988,7 @@ impl RootView {
             .any(|command| commands::matches_keystroke(command, &event.keystroke));
             if !global_overlay_command {
                 surfaces.update(cx, |surfaces, cx| {
-                    surfaces.key_down(event, _window, cx);
+                    surfaces.key_down(event, window, cx);
                 });
                 cx.stop_propagation();
                 return;
@@ -683,7 +996,7 @@ impl RootView {
         }
         if let Some(surfaces) = &self.session_surfaces {
             surfaces.update(cx, |surfaces, cx| {
-                surfaces.handle_key_down(event, _window, cx);
+                surfaces.handle_key_down(event, window, cx);
             });
         }
     }
@@ -710,6 +1023,7 @@ impl RootView {
                 }
             }
             CommandId::ToggleCommandPalette => {
+                self.remember_quote_surface(window, cx);
                 if let Some(navigation) = &self.navigation {
                     navigation.update(cx, |navigation, cx| {
                         navigation.toggle_command_palette(&ToggleCommandPalette, window, cx);
@@ -767,6 +1081,8 @@ impl RootView {
             CommandId::ToggleAuxiliaryTerminal => {
                 self.open_auxiliary_terminal(window, cx);
             }
+            CommandId::QuoteSelection => self.quote_selection(false, window, cx),
+            CommandId::QuoteSelectionToSession => self.quote_selection(true, window, cx),
             CommandId::ArchiveSelectedSession => {
                 self.sidebar
                     .update(cx, |sidebar, cx| sidebar.archive_selected(cx));
@@ -774,6 +1090,14 @@ impl RootView {
             CommandId::RenameSelectedSession => {
                 self.sidebar
                     .update(cx, |sidebar, cx| sidebar.rename_selected(window, cx));
+            }
+            CommandId::DelegateSelectedSession => {
+                let handled = self
+                    .sidebar
+                    .update(cx, |sidebar, cx| sidebar.mark_or_delegate_selected(cx));
+                if !handled {
+                    cx.propagate();
+                }
             }
             CommandId::SelectNextAttentionSession => {
                 self.sidebar
@@ -1837,6 +2161,219 @@ impl RootView {
         )
     }
 
+    fn quote_target_picker(
+        &self,
+        colors: SemanticColors,
+        sidebar_width: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let picker = self.quote_target_picker.as_ref()?;
+        let targets = picker.targets.clone();
+        let active = self
+            .services
+            .store
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .selected_session_id()
+            .cloned();
+        let mut rows = div().py(px(4.0)).flex().flex_col().gap(px(1.0));
+        for (index, session) in targets.into_iter().enumerate() {
+            let highlighted = index == picker.highlighted;
+            let is_active = active.as_ref() == Some(&session.id);
+            let detail = if session.hibernation.is_some() {
+                "Sleeping · stages without waking"
+            } else if is_active {
+                "Active session"
+            } else {
+                "Keeps current session active"
+            };
+            rows = rows.child(
+                div()
+                    .id(("quote-target", index))
+                    .debug_selector(move || format!("QUOTE_TARGET_{index}"))
+                    .min_h(px(46.0))
+                    .mx(px(4.0))
+                    .px(px(8.0))
+                    .py(px(6.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .rounded(px(Radius::ROW))
+                    .bg(if highlighted {
+                        rgba(0x5b8fd12f)
+                    } else {
+                        colors.primary.alpha(0.0)
+                    })
+                    .border_1()
+                    .border_color(if highlighted {
+                        rgba(0x8bb9e878)
+                    } else {
+                        colors.primary.alpha(0.0)
+                    })
+                    .cursor_pointer()
+                    .hover(move |row| row.bg(colors.primary.alpha(0.075)))
+                    .child(
+                        div()
+                            .size(px(26.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(colors.primary.alpha(0.055))
+                            .child(sf_symbol("terminal", 11.0, colors.secondary)),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(Typo::ROW.size))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(colors.primary)
+                                    .child(session.title),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(Typo::META.size))
+                                    .text_color(colors.tertiary)
+                                    .child(detail),
+                            ),
+                    )
+                    .when(highlighted, |row| {
+                        row.child(sf_symbol("return", 9.5, colors.secondary))
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.activate_quote_target(index, window, cx);
+                        cx.stop_propagation();
+                    })),
+            );
+        }
+
+        let panel = div()
+            .id("quote-target-picker")
+            .debug_selector(|| "QUOTE_TARGET_PICKER".to_owned())
+            .absolute()
+            .top(px(Metrics::TITLE_BAR + 6.0))
+            .left(px(7.0))
+            .w(px((sidebar_width - 14.0).max(220.0)))
+            .max_h(px(460.0))
+            .flex()
+            .flex_col()
+            .rounded(px(Radius::PANEL))
+            .overflow_hidden()
+            .bg(colors.floating_surface())
+            .border_1()
+            .border_color(colors.floating_stroke())
+            .shadow_lg()
+            .occlude()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .h(px(43.0))
+                    .px(px(11.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(7.0))
+                    .border_b_1()
+                    .border_color(colors.primary.alpha(0.07))
+                    .child(sf_symbol("text.quote", 11.5, rgba(0x8bb9e8ff)))
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.0))
+                            .child(
+                                div()
+                                    .text_size(px(Typo::ROW.size))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(colors.primary)
+                                    .child("Quote into…"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(Typo::META.size))
+                                    .text_color(colors.tertiary)
+                                    .child("↑↓ choose · Return stage · Esc cancel"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("quote-target-close")
+                            .size(px(21.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(Radius::CHIP))
+                            .cursor_pointer()
+                            .hover(move |button| button.bg(colors.primary.alpha(0.07)))
+                            .child(sf_symbol("xmark", 9.0, colors.tertiary))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if let Some(picker) = this.quote_target_picker.take() {
+                                    this.restore_quote_focus(picker.return_surface, window, cx);
+                                }
+                                cx.notify();
+                                cx.stop_propagation();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .id("quote-target-scroll")
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .child(rows),
+            );
+        let panel = if cx.reduce_motion() {
+            panel.into_any_element()
+        } else {
+            panel
+                .with_animation(
+                    "quote-target-picker-enter",
+                    Animation::new(Duration::from_millis(150)).with_easing(ease_out_quint()),
+                    |panel, delta| {
+                        panel
+                            .top(px(Metrics::TITLE_BAR + (1.0 - delta) * 6.0 + 6.0))
+                            .opacity(0.72 + delta * 0.28)
+                    },
+                )
+                .into_any_element()
+        };
+
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left_0()
+                .w(px(sidebar_width.max(234.0)))
+                .bg(colors.background.alpha(0.20))
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        if let Some(picker) = this.quote_target_picker.take() {
+                            this.restore_quote_focus(picker.return_surface, window, cx);
+                        }
+                        cx.notify();
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(panel)
+                .into_any_element(),
+        )
+    }
+
     fn status_banner(&self, colors: SemanticColors, cx: &mut Context<Self>) -> Option<AnyElement> {
         let banner = self.status_banner.as_ref()?;
         Some(
@@ -2141,12 +2678,25 @@ impl Render for RootView {
                     this.run_command(CommandId::ToggleAuxiliaryTerminal, window, cx);
                 }),
             )
+            .on_action(cx.listener(|this, _: &QuoteSelection, window, cx| {
+                this.run_command(CommandId::QuoteSelection, window, cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &QuoteSelectionToSession, window, cx| {
+                    this.run_command(CommandId::QuoteSelectionToSession, window, cx);
+                }),
+            )
             .on_action(cx.listener(|this, _: &ArchiveSelectedSession, window, cx| {
                 this.run_command(CommandId::ArchiveSelectedSession, window, cx);
             }))
             .on_action(cx.listener(|this, _: &RenameSelectedSession, window, cx| {
                 this.run_command(CommandId::RenameSelectedSession, window, cx);
             }))
+            .on_action(
+                cx.listener(|this, _: &DelegateSelectedSession, window, cx| {
+                    this.run_command(CommandId::DelegateSelectedSession, window, cx);
+                }),
+            )
             .on_action(
                 cx.listener(|this, _: &SelectNextAttentionSession, window, cx| {
                     this.run_command(CommandId::SelectNextAttentionSession, window, cx);
@@ -2292,6 +2842,9 @@ impl Render for RootView {
         if let Some(navigation) = &self.navigation {
             root = root.child(cached_window_overlay(navigation.clone()));
         }
+        if let Some(picker) = self.quote_target_picker(colors, sidebar_width, cx) {
+            root = root.child(deferred(picker));
+        }
         if let Some(status) = self.status_banner(colors, cx) {
             root = root.child(status);
         }
@@ -2315,6 +2868,20 @@ fn bounded_notice_body(body: &str) -> String {
         .filter(|character| !character.is_control())
         .take(240)
         .collect()
+}
+
+fn quote_target_id(targets: &[SessionRecord], index: usize) -> Option<SessionId> {
+    targets.get(index).map(|session| session.id.clone())
+}
+
+fn is_quote_target(session: &SessionRecord) -> bool {
+    !session.is_archived()
+        && !matches!(session.status, SessionStatus::Exited(_))
+        // Shell and generic sessions are raw terminals. A local agent draft
+        // is safe precisely because its eventual send is an explicit prompt;
+        // offering that affordance for a shell would turn prompt-shaped quote
+        // data into an executable command when the user confirms it.
+        && !session.effective_kind().is_terminal()
 }
 
 fn dev_build_marker(label: &str, colors: SemanticColors, top: f32) -> AnyElement {
@@ -2401,4 +2968,56 @@ fn preview_hint(system_image: &str, label: &str, colors: SemanticColors) -> AnyE
                 .child(label.to_owned()),
         )
         .into_any_element()
+}
+
+#[cfg(test)]
+mod quote_target_tests {
+    use super::*;
+    use crate::sidebar::{PreviewScenario, SidebarPreviewFixture};
+
+    #[test]
+    fn picker_resolves_the_chosen_target_without_changing_the_active_id() {
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let sessions = fixture.list.sessions;
+        assert!(sessions.len() >= 2);
+        let active = sessions[0].id.clone();
+        let chosen = quote_target_id(&sessions, 1).expect("second target");
+        assert_eq!(chosen, sessions[1].id);
+        assert_eq!(
+            active, sessions[0].id,
+            "target lookup has no navigation side effect"
+        );
+    }
+
+    #[test]
+    fn quote_targets_exclude_shells_generic_terminals_archived_and_exited_sessions() {
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let template = fixture.list.sessions[0].clone();
+        let mut agent = template.clone();
+        agent.kind = AgentKind::CODEX;
+        agent.foreground_agent = None;
+        agent.archived_at = None;
+        agent.status = SessionStatus::Idle;
+        assert!(is_quote_target(&agent));
+
+        let mut shell = agent.clone();
+        shell.kind = AgentKind::SHELL;
+        assert!(!is_quote_target(&shell));
+
+        let mut generic = agent.clone();
+        generic.kind = AgentKind::generic("custom-command");
+        assert!(!is_quote_target(&generic));
+
+        let mut archived = agent.clone();
+        archived.archived_at = Some(diri_proto::DateMillis(1.0));
+        assert!(!is_quote_target(&archived));
+
+        let mut exited = agent;
+        exited.status = SessionStatus::Exited(diri_proto::ExitInfo {
+            reason: diri_proto::ExitReason::Exited,
+            code: Some(0),
+            signal: None,
+        });
+        assert!(!is_quote_target(&exited));
+    }
 }

@@ -133,6 +133,23 @@ impl TerminalSelection {
         Some(SelectionRange { start, end })
     }
 
+    /// Whether a full-row content repaint would replace any selected cell.
+    ///
+    /// Selection endpoints are exclusive, so an endpoint at column zero does
+    /// not make that final row overlap. Keeping that distinction prevents a
+    /// repaint immediately below a selection from dismissing it.
+    #[must_use]
+    pub(crate) fn overlaps_row(&self, absolute_row: i64, cols: usize) -> bool {
+        let Some(range) = self.range() else {
+            return false;
+        };
+        if absolute_row < range.start.row || absolute_row > range.end.row {
+            return false;
+        }
+        let (start, end) = columns_for_row(range, absolute_row, cols);
+        start < end
+    }
+
     #[must_use]
     pub fn visible_spans(
         &self,
@@ -308,5 +325,16 @@ mod tests {
         selection.select_word(&viewport, &buffer, 0, 6);
 
         assert_eq!(selection.selected_text(&viewport, &buffer), "two_three");
+    }
+
+    #[test]
+    fn row_overlap_respects_the_exclusive_endpoint() {
+        let viewport = ScrollbackViewport::default();
+        let mut selection = TerminalSelection::default();
+        selection.set_from_window(&viewport, 2, 0, 0, 2);
+
+        assert!(selection.overlaps_row(0, 8));
+        assert!(selection.overlaps_row(1, 8));
+        assert!(!selection.overlaps_row(2, 8));
     }
 }

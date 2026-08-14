@@ -17,13 +17,13 @@ use objc2_app_kit::{
     NSApplication, NSApplicationActivationOptions, NSAutoresizingMaskOptions, NSBackingStoreType,
     NSBox, NSBoxType, NSButton, NSCellImagePosition, NSColor, NSEvent, NSEventMask,
     NSEventModifierFlags, NSFocusRingType, NSFont, NSFontWeightMedium, NSFontWeightRegular,
-    NSFontWeightSemibold, NSImage, NSImageAlignment, NSImageScaling, NSImageSymbolConfiguration,
-    NSImageView, NSLineBreakMode, NSPanel, NSPopUpMenuWindowLevel, NSRunningApplication,
-    NSScrollView, NSStatusBar, NSStatusBarButton, NSStatusItem, NSTextAlignment, NSTextField,
-    NSTrackingArea, NSTrackingAreaOptions, NSVariableStatusItemLength, NSView,
-    NSViewBoundsDidChangeNotification, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
-    NSVisualEffectState, NSVisualEffectView, NSWindowAnimationBehavior, NSWindowCollectionBehavior,
-    NSWindowStyleMask, NSWorkspace, NSWorkspaceDidActivateApplicationNotification,
+    NSGradient, NSImage, NSImageAlignment, NSImageScaling, NSImageSymbolConfiguration, NSImageView,
+    NSLineBreakMode, NSPanel, NSPopUpMenuWindowLevel, NSRunningApplication, NSScrollView,
+    NSStatusBar, NSStatusBarButton, NSStatusItem, NSTextAlignment, NSTextField, NSTrackingArea,
+    NSTrackingAreaOptions, NSVariableStatusItemLength, NSView, NSViewBoundsDidChangeNotification,
+    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
+    NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
+    NSWorkspaceDidActivateApplicationNotification,
 };
 use objc2_foundation::{
     MainThreadMarker, NSNotification, NSNotificationCenter, NSObject, NSObjectProtocol, NSPoint,
@@ -40,8 +40,14 @@ use crate::menu_inbox::{InboxModel, InboxRow, InboxSessionRow, TrailingStatus, b
 use crate::store::{SessionStore, SpawnOptions};
 
 const POPUP_WIDTH: f64 = 300.0;
-const HEADER_HEIGHT: f64 = 42.0;
+/// One bar, at the bottom. A header and a footer bracketing eleven 28pt rows
+/// spent 84pt of a 300pt panel on chrome and made the list look like a middle.
 const FOOTER_HEIGHT: f64 = 42.0;
+/// Height of the gradient that fades the list into the panel at each end, so a
+/// scrolled row leaves by dissolving rather than by being sliced off.
+const FADE_HEIGHT: f64 = 20.0;
+/// Chin controls are 28pt centred in the bar.
+const CHIN_CONTROL_Y: f64 = (FOOTER_HEIGHT - 28.0) / 2.0;
 const PROJECT_HEIGHT: f64 = 28.0;
 const ROW_HEIGHT: f64 = 28.0;
 const BODY_PADDING: f64 = 4.0;
@@ -66,10 +72,11 @@ const GLYPH_SIZE: f64 = 16.0;
 /// Kept short so the wide mark matches other ~16pt menu-bar icons optically.
 const DIRI_LOGO_HEIGHT: f64 = 11.0;
 const DIRI_LOGO_WIDTH: f64 = DIRI_LOGO_HEIGHT * (59.5 / 42.5);
-/// Optical width of the "diri" wordmark at 13pt Semibold.
-const DIRI_TITLE_WIDTH: f64 = 28.0;
-/// Symmetric pad around logo + title (same inset on both sides).
-const BRAND_HIT_WIDTH: f64 = ROW_PAD + DIRI_LOGO_WIDTH + ROW_GAP + DIRI_TITLE_WIDTH + ROW_PAD;
+/// Symmetric pad around the mark.
+const BRAND_HIT_WIDTH: f64 = ROW_PAD + DIRI_LOGO_WIDTH + ROW_PAD;
+/// Chin, left to right: brand, settings … Quit, New Agent.
+const SETTINGS_X: f64 = ROW_INSET + BRAND_HIT_WIDTH + ROW_GAP;
+const QUIT_X: f64 = POPUP_WIDTH - ROW_INSET - NEW_AGENT_WIDTH - ROW_GAP - QUIT_WIDTH;
 const FOLDER_BADGE: f64 = 18.0;
 /// `diri_ui::IconSize::COMPACT`: every sidebar glyph authored at 8-11pt
 /// actually renders in a 14pt box.
@@ -148,14 +155,14 @@ pub struct NativeMenuBar {
     panel: Retained<MenuBarPanel>,
     surface: Retained<NSVisualEffectView>,
     brand_hit: Retained<MenuBarBrandHit>,
-    header_icon: Retained<NSImageView>,
-    title_label: Retained<NSTextField>,
+    brand_mark: Retained<NSImageView>,
     new_agent_chrome: Retained<MenuBarHoverChrome>,
     settings_chrome: Retained<MenuBarHoverChrome>,
     quit_chrome: Retained<MenuBarHoverChrome>,
     backdrop: Retained<NSBox>,
-    header_divider: Retained<NSBox>,
     footer_divider: Retained<NSBox>,
+    top_fade: Retained<MenuBarFade>,
+    bottom_fade: Retained<MenuBarFade>,
     scroll: Retained<NSScrollView>,
     body: Retained<NSView>,
     target: Retained<MenuBarTarget>,
@@ -254,13 +261,6 @@ impl NativeMenuBar {
         panel.setAppearance(theme.appearance().as_deref());
         panel.setContentView(Some(&surface));
 
-        let header_divider = separator(
-            rect(ROW_INSET, 0.0, POPUP_WIDTH - ROW_INSET * 2.0, 1.0),
-            &theme,
-            mtm,
-        );
-        surface.addSubview(&header_divider);
-
         let body = NSView::initWithFrame(
             NSView::alloc(mtm),
             rect(0.0, 0.0, POPUP_WIDTH, EMPTY_BODY_HEIGHT),
@@ -281,6 +281,11 @@ impl NativeMenuBar {
         );
         surface.addSubview(&scroll);
 
+        let top_fade = MenuBarFade::new(mtm, FadeEdge::Top, &theme.surface);
+        let bottom_fade = MenuBarFade::new(mtm, FadeEdge::Bottom, &theme.surface);
+        surface.addSubview(&top_fade);
+        surface.addSubview(&bottom_fade);
+
         // `updateTrackingAreas` is supposed to run as the visible rect moves,
         // but hover correctness should not rest on that: watch the clip view
         // directly so every scroll re-derives hover from the pointer.
@@ -288,12 +293,22 @@ impl NativeMenuBar {
         clip.setPostsBoundsChangedNotifications(true);
         let scroll_observer = {
             let body = body.clone();
+            let clip_for_fades = clip.clone();
+            let document = body.clone();
+            let top = top_fade.clone();
+            let bottom = bottom_fade.clone();
             let handler = RcBlock::new(move |_notification: NonNull<NSNotification>| {
                 for child in body.subviews().iter() {
                     if let Some(row) = child.downcast_ref::<MenuBarHoverRow>() {
                         row.sync_hover_to_pointer();
                     }
                 }
+                let doc_height = document.frame().size.height;
+                let clip_height = clip_for_fades.bounds().size.height;
+                let top_y = (doc_height - clip_height).max(0.0);
+                let y = clip_for_fades.bounds().origin.y;
+                top.setHidden(y >= top_y - 0.5);
+                bottom.setHidden(y <= 0.5);
             });
             // SAFETY: retained below and removed in `Drop for NativeMenuBar`.
             unsafe {
@@ -315,18 +330,18 @@ impl NativeMenuBar {
 
         let target = MenuBarTarget::new(mtm, panel.clone(), button.clone(), Arc::clone(&store));
 
-        // Header brand sits on the row content column so the mark lines up
-        // with the project badges below it.
+        // Everything lives in the chin now, so the brand is the mark alone —
+        // the wordmark cost more width than identity here is worth.
         let brand_hit = MenuBarBrandHit::new(
             mtm,
-            rect(ROW_INSET, 0.0, BRAND_HIT_WIDTH, 28.0),
+            rect(ROW_INSET, CHIN_CONTROL_Y, BRAND_HIT_WIDTH, 28.0),
             target.clone(),
             &theme.primary,
         );
         // One rasterization, shared by the status item and the panel header:
         // same fixed vector at the same fixed size, only the tint differs.
         let logo = brand_raster::template_diri_logo_ns_image(DIRI_LOGO_HEIGHT as f32);
-        let header_icon = {
+        let brand_mark = {
             let view = if let Some(image) = &logo {
                 NSImageView::imageViewWithImage(image, mtm)
             } else {
@@ -351,28 +366,14 @@ impl NativeMenuBar {
             view.setContentTintColor(Some(&theme.secondary));
             view
         };
-        brand_hit.addSubview(&header_icon);
-        let title_label = label(
-            "diri",
-            13.0,
-            FontStyle::Semibold,
-            &theme.primary,
-            rect(
-                ROW_PAD + DIRI_LOGO_WIDTH + ROW_GAP - TEXT_INSET,
-                7.0,
-                DIRI_TITLE_WIDTH,
-                16.0,
-            ),
-            mtm,
-        );
-        brand_hit.addSubview(&title_label);
+        brand_hit.addSubview(&brand_mark);
         surface.addSubview(&brand_hit);
 
         let new_agent_chrome = MenuBarHoverChrome::new(
             mtm,
             rect(
                 POPUP_WIDTH - ROW_INSET - NEW_AGENT_WIDTH,
-                0.0,
+                CHIN_CONTROL_Y,
                 NEW_AGENT_WIDTH,
                 28.0,
             ),
@@ -387,7 +388,7 @@ impl NativeMenuBar {
                 mtm,
             )
         };
-        // Match session/project title weight so the header action does not look oversized.
+        // Match session/project title weight so the action does not look oversized.
         style_plain_button(&new_agent_button, false, &theme);
         new_agent_button.setImage(Some(&symbol_image("plus", "plus.circle")));
         new_agent_button.setImagePosition(NSCellImagePosition::ImageLeading);
@@ -397,7 +398,7 @@ impl NativeMenuBar {
 
         let settings_chrome = MenuBarHoverChrome::new(
             mtm,
-            rect(ROW_INSET, 7.0, SETTINGS_HIT, 28.0),
+            rect(SETTINGS_X, CHIN_CONTROL_Y, SETTINGS_HIT, 28.0),
             6.0,
             &theme.primary,
         );
@@ -423,7 +424,7 @@ impl NativeMenuBar {
 
         let quit_chrome = MenuBarHoverChrome::new(
             mtm,
-            rect(POPUP_WIDTH - ROW_INSET - QUIT_WIDTH, 7.0, QUIT_WIDTH, 28.0),
+            rect(QUIT_X, CHIN_CONTROL_Y, QUIT_WIDTH, 28.0),
             6.0,
             &theme.primary,
         );
@@ -457,14 +458,14 @@ impl NativeMenuBar {
             panel,
             surface,
             brand_hit,
-            header_icon,
-            title_label,
+            brand_mark,
             new_agent_chrome,
             settings_chrome,
             quit_chrome,
             backdrop,
-            header_divider,
             footer_divider,
+            top_fade,
+            bottom_fade,
             scroll,
             body,
             target,
@@ -485,13 +486,13 @@ impl NativeMenuBar {
             return;
         }
         self.theme = MenuTheme::new(theme_id.to_owned(), app_theme::sidebar_colors(theme_id));
-        self.header_icon
+        self.brand_mark
             .setContentTintColor(Some(&self.theme.secondary));
-        self.title_label.setTextColor(Some(&self.theme.primary));
         self.backdrop.setFillColor(&self.theme.surface);
         self.panel.setAppearance(self.theme.appearance().as_deref());
-        self.header_divider.setFillColor(&self.theme.separator);
         self.footer_divider.setFillColor(&self.theme.separator);
+        self.top_fade.set_color(&self.theme.surface);
+        self.bottom_fade.set_color(&self.theme.surface);
         self.last_attention = None;
         self.needs_full_repaint = true;
     }
@@ -553,7 +554,7 @@ impl NativeMenuBar {
 
         let content_height = content_height_for(model);
         let body_height = content_height.min(MAX_BODY_HEIGHT);
-        let height = HEADER_HEIGHT + body_height + FOOTER_HEIGHT;
+        let height = body_height + FOOTER_HEIGHT;
 
         // Resizing grows the panel downward from its origin; pin the top-left so
         // it stays hung off the status item as rows come and go. `refresh` only
@@ -566,43 +567,32 @@ impl NativeMenuBar {
         self.panel.setFrameTopLeftPoint(old_top_left);
         self.surface.setFrame(rect(0.0, 0.0, POPUP_WIDTH, height));
 
-        let header_y = FOOTER_HEIGHT + body_height;
-        let header_control_y = header_y + (HEADER_HEIGHT - 28.0) / 2.0;
+        self.scroll
+            .setFrame(rect(0.0, FOOTER_HEIGHT, POPUP_WIDTH, body_height));
+        self.top_fade.setFrame(rect(
+            0.0,
+            FOOTER_HEIGHT + body_height - FADE_HEIGHT,
+            POPUP_WIDTH,
+            FADE_HEIGHT,
+        ));
+        self.bottom_fade
+            .setFrame(rect(0.0, FOOTER_HEIGHT, POPUP_WIDTH, FADE_HEIGHT));
         self.brand_hit
-            .setFrame(rect(ROW_INSET, header_control_y, BRAND_HIT_WIDTH, 28.0));
-        // Shared midY with icon; NSTextField draws slightly high, so nudge +1.
-        self.header_icon.setFrame(rect(
+            .setFrame(rect(ROW_INSET, CHIN_CONTROL_Y, BRAND_HIT_WIDTH, 28.0));
+        self.brand_mark.setFrame(rect(
             ROW_PAD,
             (28.0 - DIRI_LOGO_HEIGHT) / 2.0,
             DIRI_LOGO_WIDTH,
             DIRI_LOGO_HEIGHT,
         ));
-        self.title_label.setFrame(rect(
-            ROW_PAD + DIRI_LOGO_WIDTH + ROW_GAP - TEXT_INSET,
-            7.0,
-            DIRI_TITLE_WIDTH,
-            16.0,
-        ));
+        self.settings_chrome
+            .setFrame(rect(SETTINGS_X, CHIN_CONTROL_Y, SETTINGS_HIT, 28.0));
+        self.quit_chrome
+            .setFrame(rect(QUIT_X, CHIN_CONTROL_Y, QUIT_WIDTH, 28.0));
         self.new_agent_chrome.setFrame(rect(
             POPUP_WIDTH - ROW_INSET - NEW_AGENT_WIDTH,
-            header_control_y,
+            CHIN_CONTROL_Y,
             NEW_AGENT_WIDTH,
-            28.0,
-        ));
-        self.header_divider.setFrame(rect(
-            ROW_INSET,
-            header_y,
-            POPUP_WIDTH - ROW_INSET * 2.0,
-            1.0,
-        ));
-        self.scroll
-            .setFrame(rect(0.0, FOOTER_HEIGHT, POPUP_WIDTH, body_height));
-        self.settings_chrome
-            .setFrame(rect(ROW_INSET, 7.0, SETTINGS_HIT, 28.0));
-        self.quit_chrome.setFrame(rect(
-            POPUP_WIDTH - ROW_INSET - QUIT_WIDTH,
-            7.0,
-            QUIT_WIDTH,
             28.0,
         ));
 
@@ -646,7 +636,7 @@ impl NativeMenuBar {
             AttentionLevel::Working => self.theme.primary_alpha(0.82),
             _ => Retained::clone(&self.theme.primary),
         });
-        self.header_icon.setContentTintColor(Some(&header_tint));
+        self.brand_mark.setContentTintColor(Some(&header_tint));
     }
 
     fn rebuild_body(
@@ -739,6 +729,18 @@ impl NativeMenuBar {
         )
     }
 
+    /// Show each fade only when there is something hidden behind it: a list
+    /// short enough to fit needs no dissolve at either end.
+    fn sync_fades(&self) {
+        let clip = self.scroll.contentView();
+        let doc_height = self.body.frame().size.height;
+        let clip_height = clip.bounds().size.height;
+        let top_y = (doc_height - clip_height).max(0.0);
+        let y = clip.bounds().origin.y;
+        self.top_fade.setHidden(y >= top_y - 0.5);
+        self.bottom_fade.setHidden(y <= 0.5);
+    }
+
     /// `None` pins to the top (the panel just opened); otherwise re-apply the
     /// captured distance, clamped to whatever the rebuilt list can now show.
     fn restore_scroll(&self, from_top: Option<f64>) {
@@ -750,6 +752,7 @@ impl NativeMenuBar {
         );
         clip.scrollToPoint(NSPoint::new(0.0, y));
         self.scroll.reflectScrolledClipView(&clip);
+        self.sync_fades();
     }
 
     fn add_project_header(
@@ -1223,16 +1226,12 @@ fn rgba_ns(r: f32, g: f32, b: f32, a: f32) -> Retained<NSColor> {
 enum FontStyle {
     Regular,
     Medium,
-    Semibold,
 }
 
 fn system_font(size: f64, style: FontStyle) -> Retained<NSFont> {
     match style {
         FontStyle::Regular => NSFont::systemFontOfSize(size),
         FontStyle::Medium => NSFont::systemFontOfSize_weight(size, unsafe { NSFontWeightMedium }),
-        FontStyle::Semibold => {
-            NSFont::systemFontOfSize_weight(size, unsafe { NSFontWeightSemibold })
-        }
     }
 }
 
@@ -1408,6 +1407,74 @@ enum MenuShortcut {
     SpawnDefault,
     SpawnShell,
     SpawnCodex,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FadeEdge {
+    Top,
+    Bottom,
+}
+
+struct MenuBarFadeIvars {
+    edge: FadeEdge,
+    color: RefCell<Retained<NSColor>>,
+}
+
+define_class!(
+    // SAFETY: NSView requires MainThreadOnly; this class does not implement Drop.
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "DiriMenuBarFade"]
+    #[ivars = MenuBarFadeIvars]
+    struct MenuBarFade;
+
+    impl MenuBarFade {
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {
+            let ivars = self.ivars();
+            let color = ivars.color.borrow();
+            let clear = color.colorWithAlphaComponent(0.0);
+            // Opaque against the bar, clear against the list, so a row leaves by
+            // dissolving into the panel instead of being cut off mid-glyph.
+            let (start, end) = match ivars.edge {
+                FadeEdge::Top => (clear, Retained::clone(&color)),
+                FadeEdge::Bottom => (Retained::clone(&color), clear),
+            };
+            let Some(gradient) =
+                NSGradient::initWithStartingColor_endingColor(NSGradient::alloc(), &start, &end)
+            else {
+                return;
+            };
+            // 90° draws bottom-to-top in this non-flipped view.
+            gradient.drawInRect_angle(self.bounds(), 90.0);
+        }
+
+        /// Purely decorative: clicks belong to the row underneath.
+        #[unsafe(method(hitTest:))]
+        fn hit_test(&self, _point: NSPoint) -> *mut NSView {
+            std::ptr::null_mut()
+        }
+    }
+);
+
+impl MenuBarFade {
+    fn new(mtm: MainThreadMarker, edge: FadeEdge, color: &NSColor) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(MenuBarFadeIvars {
+            edge,
+            color: RefCell::new(color.retain()),
+        });
+        // SAFETY: designated NSView initializer.
+        let this: Retained<Self> = unsafe {
+            msg_send![super(this), initWithFrame: rect(0.0, 0.0, POPUP_WIDTH, FADE_HEIGHT)]
+        };
+        this.setHidden(true);
+        this
+    }
+
+    fn set_color(&self, color: &NSColor) {
+        self.ivars().color.replace(color.retain());
+        self.setNeedsDisplay(true);
+    }
 }
 
 struct MenuBarHoverChromeIvars {
@@ -1760,6 +1827,21 @@ define_class!(
 
         #[unsafe(method(mouseEntered:))]
         fn mouse_entered(&self, _event: &NSEvent) {
+            // Clearing siblings here is what makes "at most one row is filled"
+            // an invariant instead of a consequence of AppKit pairing every
+            // enter with an exit — which it does not do while the list scrolls
+            // under a stationary pointer. Re-deriving from the pointer on scroll
+            // was not enough on its own; this holds even if that never runs.
+            // SAFETY: read-only walk of the row's siblings on the main thread.
+            if let Some(parent) = unsafe { self.superview() } {
+                for sibling in parent.subviews().iter() {
+                    if let Some(row) = sibling.downcast_ref::<MenuBarHoverRow>()
+                        && !std::ptr::eq(row, self)
+                    {
+                        row.set_hovered(false);
+                    }
+                }
+            }
             self.set_hovered(true);
         }
 

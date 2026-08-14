@@ -592,6 +592,7 @@ mod tests {
             git_branch: None,
             title: value.to_owned(),
             title_source: TitleSource::UserRename,
+            originating_prompt: None,
             agent_session_id: None,
             transcript_path: None,
             status,

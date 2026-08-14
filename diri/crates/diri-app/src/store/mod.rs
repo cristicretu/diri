@@ -1,5 +1,6 @@
 //! Headless application state and the thin asynchronous daemon adapter.
 
+mod fleet_pulse;
 mod prefs;
 mod projection;
 mod residency;
@@ -31,6 +32,7 @@ use crate::switcher::{
     SessionSwitcherState, SwitcherKey, SwitcherOutcome,
 };
 
+pub use fleet_pulse::{FleetPulse, FleetPulseState};
 pub use prefs::{InspectorTab, Prefs, WindowMode, WindowPlacement};
 pub use projection::{SidebarProject, SidebarProjection, SidebarRow};
 pub use residency::{ResidencyUpdate, TerminalResidency};
@@ -122,6 +124,9 @@ pub enum StoreEffect {
         id: SessionId,
         target_host: Option<String>,
     },
+    /// Confirmation of a worktree proposal. The Engine revalidates the
+    /// repository, lifecycle, and target ownership before persisting it.
+    ReparentWorktree(diri_proto::SessionReparentWorktreeParams),
     /// `host.sync_prefs` — push agent preferences to a remote host.
     SyncPrefs {
         host: String,
@@ -1117,6 +1122,11 @@ impl SessionStore {
             .collect()
     }
 
+    /// Revision-cached attention queue shared by every fleet-level surface.
+    pub fn fleet_pulse(&mut self) -> FleetPulse {
+        self.sidebar_projection().fleet_pulse.clone()
+    }
+
     pub fn selected_session(&self) -> Option<&SessionRecord> {
         self.selected_session_id
             .as_ref()
@@ -2041,6 +2051,10 @@ impl SessionStore {
         }));
     }
 
+    pub fn reparent_worktree(&self, params: diri_proto::SessionReparentWorktreeParams) {
+        self.emit(StoreEffect::ReparentWorktree(params));
+    }
+
     /// Fallback cwd for spawning LOCALLY while a REMOTE session is active:
     /// its remote cwd is useless as a local path, so prefer the first project
     /// root that exists on this machine, then home.
@@ -2377,14 +2391,39 @@ pub struct StoreRuntime {
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClientStartup {
+    Immediate,
+    Deferred,
+}
+
 impl StoreRuntime {
     pub fn start(client: Arc<DaemonClient>, prefs_path: impl Into<PathBuf>) -> io::Result<Self> {
         let (store, effects) = SessionStore::load(prefs_path)?;
-        Ok(Self::start_with_store(client, store, effects))
+        Ok(Self::start_with_store(
+            client,
+            store,
+            effects,
+            ClientStartup::Immediate,
+        ))
     }
 
     pub fn start_default(client: Arc<DaemonClient>) -> io::Result<Self> {
         Self::start(client, Prefs::path())
+    }
+
+    /// Builds the UI-facing store bridge without opening the daemon socket.
+    /// Process startup uses this while it verifies or refreshes the bundled
+    /// Engine off the GPUI thread; the supervisor starts the client exactly
+    /// once after that authoritative decision finishes.
+    pub(crate) fn start_default_deferred(client: Arc<DaemonClient>) -> io::Result<Self> {
+        let (store, effects) = SessionStore::load(Prefs::path())?;
+        Ok(Self::start_with_store(
+            client,
+            store,
+            effects,
+            ClientStartup::Deferred,
+        ))
     }
 
     /// A task-free runtime for deterministic previews. The preview sidebar
@@ -2418,6 +2457,7 @@ impl StoreRuntime {
         client: Arc<DaemonClient>,
         store: SessionStore,
         effects: mpsc::UnboundedReceiver<StoreEffect>,
+        client_startup: ClientStartup,
     ) -> Self {
         let store = Arc::new(RwLock::new(store));
         let (detach_tx, _) = broadcast::channel(16);
@@ -2487,8 +2527,21 @@ impl StoreRuntime {
         let state_snapshots = snapshot_tx.clone();
         let mut states = client.connection_state();
         tasks.push(tokio::spawn(async move {
+            let mut waiting_for_deferred_start = client_startup == ClientStartup::Deferred;
             loop {
                 let state = states.borrow_and_update().clone();
+                // A deferred client intentionally retains its constructor's
+                // initial Disconnected state while Engine supervision runs.
+                // Keep the visible shell in Connecting until `client.connect`
+                // publishes the real first attempt; otherwise first paint
+                // flashes a false "unreachable" recovery notice.
+                if waiting_for_deferred_start && matches!(state, ConnectionState::Disconnected(_)) {
+                    if states.changed().await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                waiting_for_deferred_start = false;
                 match state {
                     ConnectionState::Connecting => {
                         state_store
@@ -2608,7 +2661,9 @@ impl StoreRuntime {
             }
         }));
 
-        client.connect();
+        if client_startup == ClientStartup::Immediate {
+            client.connect();
+        }
         Self {
             store,
             client,
@@ -2794,6 +2849,16 @@ async fn run_effects(
                 }
                 outcome
             }
+            StoreEffect::ReparentWorktree(params) => match client.reparent_worktree(params).await {
+                Ok(record) => {
+                    store
+                        .write()
+                        .expect("session store lock poisoned")
+                        .upsert_session(record);
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            },
             StoreEffect::SyncPrefs { host, host_name } => {
                 let result = client.sync_prefs(&host).await;
                 store
@@ -2982,6 +3047,7 @@ fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
         StoreEffect::Spawn(_) => ("Create session failed", None),
         StoreEffect::SpawnAuxiliary(_) => ("Open terminal failed", None),
         StoreEffect::Migrate { .. } => ("Move session failed", None),
+        StoreEffect::ReparentWorktree(_) => ("Move session to worktree failed", None),
         StoreEffect::SyncPrefs { host, host_name } => (
             "Sync preferences failed",
             Some(RetryAction::SyncPrefs {

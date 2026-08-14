@@ -43,6 +43,7 @@ fn record(id: &str, parent: Option<&str>) -> SessionRecord {
         git_branch: None,
         title: format!("test {id}"),
         title_source: TitleSource::Placeholder,
+        originating_prompt: None,
         agent_session_id: None,
         transcript_path: None,
         status: SessionStatus::Starting,

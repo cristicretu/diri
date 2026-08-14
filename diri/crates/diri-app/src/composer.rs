@@ -141,7 +141,8 @@ impl PromptComposer {
     /// Append staged context without replacing a draft the user already
     /// wrote. A new block starts on its own line unless the draft already
     /// ends in whitespace, keeping quoted paths visually separate while
-    /// preserving every byte of the existing text.
+    /// preserving the existing text and the staged block's semantic
+    /// whitespace.
     pub fn append_context(&mut self, context: &str) {
         if context.is_empty() {
             return;
@@ -154,9 +155,11 @@ impl PromptComposer {
                 .next_back()
                 .is_some_and(char::is_whitespace)
         {
-            self.insert_multiline("\n");
+            self.editor.insert_context("\n");
         }
-        self.insert_multiline(context);
+        self.editor.insert_context(context);
+        self.goal_column = None;
+        self.reveal_caret = true;
     }
 
     pub fn editor_mut(&mut self) -> &mut QueryEditor {
@@ -474,5 +477,12 @@ mod tests {
         composer.insert_multiline("Look here: ");
         composer.append_context("'/tmp/example.rs'");
         assert_eq!(composer.text(), "Look here: '/tmp/example.rs'");
+    }
+
+    #[test]
+    fn staged_context_preserves_tabs_and_normalizes_crlf() {
+        let mut composer = PromptComposer::default();
+        composer.append_context("first\r\n\tindented\rnext");
+        assert_eq!(composer.text(), "first\n\tindented\nnext");
     }
 }

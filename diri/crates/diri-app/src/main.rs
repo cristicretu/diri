@@ -7,6 +7,7 @@ mod commands;
 mod composer;
 #[cfg(unix)]
 mod daemon_launch;
+mod delegation;
 mod dev_build;
 mod diagnostics;
 pub mod diff;
@@ -28,6 +29,7 @@ pub mod palette;
 mod platform;
 pub mod query_editor;
 pub mod quick_open;
+pub mod quote;
 mod recovery;
 pub mod review_prompt;
 pub mod root;
@@ -40,6 +42,7 @@ mod status_debug;
 mod surface_shell;
 pub mod switcher;
 pub mod terminal_pane;
+pub mod transcript;
 pub mod updates;
 pub mod usage;
 mod workbench;
@@ -147,8 +150,12 @@ pub(crate) struct AppServices {
     pub(crate) store: Arc<StoreRuntime>,
     pub(crate) usage_tx: tokio::sync::watch::Sender<UsageSnapshot>,
     pub(crate) updates: UpdateHandle,
-    pub(crate) tokio: Arc<Runtime>,
     pub(crate) dev_build: Option<DevBuildIdentity>,
+    #[cfg(unix)]
+    daemon_startup: Option<daemon_launch::DeferredDaemonStartup>,
+    // Declared last so every service and its owned startup handle drops before
+    // the executor during early unwinding as well as ordinary app shutdown.
+    pub(crate) tokio: Arc<Runtime>,
 }
 
 fn main() {
@@ -184,25 +191,26 @@ fn main() {
             .expect("failed to start diri async runtime"),
     );
 
-    // diri is self-contained: if no daemon socket is live, launch the daemon
-    // bundled in Contents/Resources/bin, then let DaemonClient's reconnect loop
-    // pick it up. A Rust Engine whose executable hash differs from the
-    // bundled one is gracefully replaced so app and remote Helper catalogs
-    // advance together; Holder-owned sessions survive and are adopted.
+    // Plan app-owned Engine supervision now, but do not probe the socket or
+    // hash the bundled executable on GPUI's first-paint path. The one-shot plan
+    // is consumed only after the first window has been opened below.
     #[cfg(unix)]
-    if !preview {
-        let home = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("/nonexistent"));
-        let socket_path = diri_proto::paths::DirijorPaths::socket(home);
-        daemon_launch::ensure_daemon_running(&socket_path);
-    }
+    let daemon_startup = (!preview)
+        .then(daemon_launch::DeferredDaemonStartup::for_process)
+        .flatten();
+    #[cfg(unix)]
+    let defer_client_start = daemon_startup.is_some();
+    #[cfg(not(unix))]
+    let defer_client_start = false;
 
     let client = Arc::new(DaemonClient::new());
     let store_runtime = {
         let _guard = tokio.enter();
         Arc::new(if preview {
             StoreRuntime::inert()
+        } else if defer_client_start {
+            StoreRuntime::start_default_deferred(Arc::clone(&client))
+                .expect("failed to load diri state")
         } else {
             StoreRuntime::start_default(Arc::clone(&client)).expect("failed to load diri state")
         })
@@ -324,8 +332,10 @@ fn main() {
         store: store_runtime,
         usage_tx,
         updates,
-        tokio,
         dev_build,
+        #[cfg(unix)]
+        daemon_startup,
+        tokio,
     });
 
     let app = application().with_assets(diri_ui::IconAssets);
@@ -345,15 +355,32 @@ fn main() {
         diri_ui::set_mark_rasterizer(macos::brand_raster::raster_mark);
         commands::bind_default_keys(cx);
         install_app_menus(cx);
-        let quit_store = Arc::clone(&services.store);
+        let quit_services = Arc::clone(&services);
         let quit_updates = services.updates.clone();
         let release_owned_daemon =
             !preview && std::env::var_os(diri_proto::paths::ENV_SOCKET).is_none();
         cx.on_app_quit(move |_| {
-            let quit_store = Arc::clone(&quit_store);
+            let quit_services = Arc::clone(&quit_services);
             let quit_updates = quit_updates.clone();
+            // This runs while GPUI is constructing the quit future, before its
+            // 200 ms grace period begins. The coordinator never transfers its
+            // sole task handle into that cancellable future: pending startup
+            // and idle release remain owned by runtime blocking workers.
+            #[cfg(unix)]
+            let startup_owns_release =
+                quit_services
+                    .daemon_startup
+                    .as_ref()
+                    .is_some_and(|startup| {
+                        startup
+                            .request_shutdown(&quit_services.tokio, quit_services.store.client());
+                        true
+                    });
+            #[cfg(not(unix))]
+            let startup_owns_release = false;
             async move {
-                if let Err(error) = quit_store
+                if let Err(error) = quit_services
+                    .store
                     .store
                     .write()
                     .expect("session store lock poisoned")
@@ -366,16 +393,26 @@ fn main() {
                 // exit and deliberately does not reopen an app the user quit.
                 quit_updates.install_on_quit();
                 if release_owned_daemon
-                    && let Err(error) = quit_store.client().shutdown_daemon_if_idle().await
+                    && !startup_owns_release
+                    && let Err(error) = quit_services.store.client().shutdown_daemon_if_idle().await
                 {
                     eprintln!("diri: could not release the idle Engine while quitting: {error}");
                 }
-                quit_store.shutdown().await;
+                quit_services.store.shutdown().await;
             }
         })
         .detach();
-        open_main_window(cx, services, preview, scenario);
+        open_main_window(cx, Arc::clone(&services), preview, scenario);
         cx.activate(true);
+        // `open_main_window` must stay before this call. The supervisor can
+        // spend up to five seconds probing and retiring an outdated Engine;
+        // it runs on Tokio's blocking pool and releases the reconnect loop
+        // only after replacement is complete, so the UI cannot race a daemon
+        // that is about to shut down.
+        #[cfg(unix)]
+        if let Some(startup) = services.daemon_startup.as_ref() {
+            startup.after_window_open(&services.tokio, Arc::clone(services.store.client()));
+        }
         if smoke_test {
             cx.spawn(async move |cx| {
                 cx.background_executor()
