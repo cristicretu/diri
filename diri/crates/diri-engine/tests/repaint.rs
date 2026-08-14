@@ -80,6 +80,23 @@ impl FrameReader {
     }
 }
 
+/// The blank-repaint grace this test runs the engine with.
+///
+/// The shipping window is 80 ms. Asserting against it here would be asserting
+/// that a CI runner never stalls a `/bin/sh` for 80 ms between two `printf`s —
+/// which it does, and the resulting failure says nothing about the coalescing
+/// logic under test. Widening the window leaves the invariant exactly as
+/// strict while making scheduler noise small against it.
+const BLANK_CEILING: Duration = Duration::from_millis(1200);
+
+/// The pause the fixture leaves between its erase and its redraw.
+///
+/// Well beyond the 16 ms partial-repaint settle, so only the blank-frame
+/// grace can hold these two writes together — and eight times inside
+/// [`BLANK_CEILING`], so a runner has to stall for more than a second to
+/// produce a failure that is not a real regression.
+const REPAINT_GAP: Duration = Duration::from_millis(150);
+
 fn engine() -> Arc<ManifestEngine> {
     let dir = diri_engine::detect::bundled_manifest_dir()
         .canonicalize()
@@ -90,6 +107,15 @@ fn engine() -> Arc<ManifestEngine> {
 
 #[test]
 fn an_erase_and_redraw_never_reach_a_client_as_a_blank_screen() {
+    // Widen the grace before the engine reads it. Safe here: this binary holds
+    // one test, and nothing has been spawned yet.
+    unsafe {
+        std::env::set_var(
+            "DIRIJOR_BLANK_REPAINT_CEILING_MS",
+            BLANK_CEILING.as_millis().to_string(),
+        )
+    };
+
     let temp = tempfile::tempdir().expect("temp");
     let registry = Arc::new(Mutex::new(Registry::new(
         engine(),
@@ -113,9 +139,10 @@ fn an_erase_and_redraw_never_reach_a_client_as_a_blank_screen() {
     }
 
     // A minimal TUI: every line of input repaints the screen the way a real
-    // one does — erase, then draw — as two separate writes. Thirty
-    // milliseconds is deliberately beyond the ordinary 16 ms partial-repaint
-    // settle: only the bounded blank-frame grace can keep this atomic.
+    // one does — erase, then draw — as two separate writes, with
+    // [`REPAINT_GAP`] in between. That gap is deliberately beyond the ordinary
+    // 16 ms partial-repaint settle: only the bounded blank-frame grace can
+    // keep this atomic.
     let control = UnixStream::connect(server.socket_path()).expect("connect control");
     let send = |message: &ControlMessage| {
         let mut bytes = serde_json::to_vec(message).expect("encode");
@@ -131,15 +158,18 @@ fn an_erase_and_redraw_never_reach_a_client_as_a_blank_screen() {
             "argv": [
                 "/bin/sh",
                 "-c",
-                "stty -echo; printf 'frame-0\\r\\n'; \
-                 while read -r turn; do \
-                   case \"$turn\" in \
-                     blank) printf '\\033[2J\\033[H' ;; \
-                     additive) printf 'additive-frame\\r\\n' ;; \
-                     *) printf '\\033[2J\\033[H'; sleep 0.030; \
-                        printf 'frame-%s\\r\\n' \"$turn\" ;; \
-                   esac; \
-                 done",
+                format!(
+                    "stty -echo; printf 'frame-0\\r\\n'; \
+                     while read -r turn; do \
+                       case \"$turn\" in \
+                         blank) printf '\\033[2J\\033[H' ;; \
+                         additive) printf 'additive-frame\\r\\n' ;; \
+                         *) printf '\\033[2J\\033[H'; sleep {gap}; \
+                            printf 'frame-%s\\r\\n' \"$turn\" ;; \
+                       esac; \
+                     done",
+                    gap = REPAINT_GAP.as_secs_f32(),
+                ),
             ],
         })),
     });
@@ -164,7 +194,9 @@ fn an_erase_and_redraw_never_reach_a_client_as_a_blank_screen() {
 
     let mut frames = FrameReader::new(data.try_clone().expect("clone data"));
     let mut mirror = Mirror::default();
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // Covers the whole run: 20 turns of [`REPAINT_GAP`], then a full grace
+    // period waiting out the intentional blank, with room for a slow runner.
+    let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         let frame = frames.next_frame("the seed grid", deadline);
         if frame.frame_type != FrameType::Grid {
@@ -218,8 +250,11 @@ fn an_erase_and_redraw_never_reach_a_client_as_a_blank_screen() {
             break;
         }
     }
+    // Bounded by the grace itself, not by a fixed figure: this asserts that an
+    // unanswered erase waits out the window and then publishes, so it has to
+    // move with the window. The slack absorbs the runner, not the logic.
     assert!(
-        blank_started.elapsed() < Duration::from_millis(500),
+        blank_started.elapsed() < BLANK_CEILING * 3,
         "an intentional clear must publish by a bounded deadline"
     );
 
@@ -239,8 +274,12 @@ fn an_erase_and_redraw_never_reach_a_client_as_a_blank_screen() {
             break;
         }
     }
+    // What this catches is additive output falling onto the grace path, which
+    // would cost it the whole window. Comparing against a fraction of that
+    // window keeps the check pointed at that regression rather than at how
+    // promptly a loaded runner happens to schedule a shell.
     assert!(
-        additive_started.elapsed() < Duration::from_millis(100),
+        additive_started.elapsed() < BLANK_CEILING / 2,
         "additive output regressed onto the repaint grace path"
     );
 

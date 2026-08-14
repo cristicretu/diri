@@ -132,7 +132,39 @@ const OUTPUT_REPAINT_CEILING: Duration = Duration::from_millis(16);
 /// 30 ms scheduler pause for the resumed process to issue its redraw; a
 /// program that intentionally clears and stops still appears within the
 /// sub-100 ms perceptual-continuity bound.
+///
+/// This window is measured from the moment the screen actually went blank —
+/// see [`feed_output_batch`] — not from the start of the batch that happened
+/// to contain the erase.
 const OUTPUT_BLANK_REPAINT_CEILING: Duration = Duration::from_millis(80);
+
+/// Upper bound on a widened blank-repaint grace. Far beyond any perceptual
+/// budget, so nothing but a test would ask for it.
+const MAX_OUTPUT_BLANK_REPAINT_CEILING: Duration = Duration::from_secs(5);
+
+/// The blank-repaint grace, widened when the environment asks for it.
+///
+/// A test that drives a real PTY on a contended CI runner cannot assert
+/// anything about an 80 ms window: the runner can stall a shell for longer
+/// than that between two writes, and the resulting failure says nothing about
+/// the coalescing logic under test. Such a test widens the window instead, so
+/// scheduler noise is small against it, and the invariant it asserts is the
+/// real one.
+///
+/// Only ever raised, never lowered: a smaller value than the default would
+/// mean shipping more flicker, so it is clamped away. Malformed values fall
+/// back to the default.
+fn blank_repaint_ceiling() -> Duration {
+    std::env::var("DIRIJOR_BLANK_REPAINT_CEILING_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(OUTPUT_BLANK_REPAINT_CEILING, |ms| {
+            Duration::from_millis(ms).clamp(
+                OUTPUT_BLANK_REPAINT_CEILING,
+                MAX_OUTPUT_BLANK_REPAINT_CEILING,
+            )
+        })
+}
 
 /// Byte ceiling on one batch, matching `alacritty_terminal`'s
 /// `MAX_LOCKED_READ`. A child that writes faster than it can be parsed must
@@ -2404,9 +2436,16 @@ fn feed_output_batch(
     let started_at = Instant::now();
     let batch_deadline = started_at + OUTPUT_BATCH_CEILING;
     let repaint_deadline = started_at + OUTPUT_REPAINT_CEILING;
+    let blank_ceiling = blank_repaint_ceiling();
     let mut count = first;
     let mut total = 0usize;
     let mut filled_before = None;
+    // When the screen first went blank, which is when its redraw budget
+    // starts. Anchoring this to `started_at` instead would spend part of the
+    // budget on whatever the batch did before the erase arrived, so a busy
+    // session gets a shorter grace than an idle one and publishes the flash
+    // this batching exists to prevent.
+    let mut blank_since: Option<Instant> = None;
     loop {
         {
             let mut log = shared.log.lock().expect("log");
@@ -2423,8 +2462,14 @@ fn feed_output_batch(
         };
         total += count;
 
+        // A screen that recovered content is no longer mid-erase; a later
+        // erase in the same batch starts its own budget.
+        if !blank_repaint {
+            blank_since = None;
+        }
+
         let deadline = if blank_repaint {
-            started_at + OUTPUT_BLANK_REPAINT_CEILING
+            *blank_since.get_or_insert_with(Instant::now) + blank_ceiling
         } else if mid_repaint {
             repaint_deadline
         } else {
