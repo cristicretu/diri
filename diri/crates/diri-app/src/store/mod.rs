@@ -5,9 +5,11 @@ mod projection;
 mod publication;
 mod residency;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -138,10 +140,14 @@ pub enum StoreEffect {
         path: String,
     },
     RefreshAgents {
+        generation: u64,
         host: Option<String>,
         force: bool,
     },
-    ConfigureAgent(diri_proto::AgentConfigureParams),
+    ConfigureAgent {
+        generation: u64,
+        params: diri_proto::AgentConfigureParams,
+    },
     ReopenLast,
     SetActive(bool),
     ConfigureGovernor(GovernorConfigureParams),
@@ -149,6 +155,9 @@ pub enum StoreEffect {
     DetachAttachment(SessionId),
     /// T15 consumes this without involving daemon lifecycle operations.
     StatusTransition(StatusTransition),
+    /// Deterministic supervision seam; never exists in production builds.
+    #[cfg(test)]
+    TestPanicOnce(u64),
 }
 
 /// Scheduling is a semantic property of an effect, not an incidental choice
@@ -166,8 +175,13 @@ enum EffectClass {
 /// Slow, independent lookups may overlap without turning a disconnected host
 /// into an unbounded task factory. Eight lanes cover the launcher's local and
 /// remote targets while keeping spawned work and control-socket pressure
-/// finite; excess intent remains as cheap queue entries owned by this runtime.
+/// finite. Ingress is deliberately larger than either execution lane: normal
+/// UI bursts fit, while pathological lossless mutation floods fail visibly
+/// instead of consuming memory without bound.
 const CONCURRENT_EFFECT_WORKERS: usize = 8;
+const CONCURRENT_EFFECT_BACKLOG: usize = 64;
+const ORDERED_EFFECT_BACKLOG: usize = 64;
+const EFFECT_INGRESS_BACKLOG: usize = 256;
 
 impl StoreEffect {
     const fn execution_class(&self) -> EffectClass {
@@ -180,9 +194,10 @@ impl StoreEffect {
             Self::LocateRepo { .. }
             | Self::ListDirectories { .. }
             | Self::RefreshAgents { .. }
-            | Self::ConfigureAgent(_)
             | Self::MarkSeen(_)
             | Self::SyncPrefs { .. } => EffectClass::Concurrent,
+            #[cfg(test)]
+            Self::TestPanicOnce(_) => EffectClass::Concurrent,
             Self::Remove(_)
             | Self::Resume { .. }
             | Self::Archive(_)
@@ -192,10 +207,266 @@ impl StoreEffect {
             | Self::SpawnAuxiliary(_)
             | Self::Migrate { .. }
             | Self::ReparentWorktree(_)
+            | Self::ConfigureAgent { .. }
             | Self::ReopenLast
             | Self::SetActive(_)
             | Self::ConfigureGovernor(_) => EffectClass::OrderedMutation,
         }
+    }
+}
+
+#[derive(Debug)]
+struct EmittedEffect {
+    sequence: u64,
+    effect: StoreEffect,
+    action_ticket: Option<u64>,
+}
+
+struct StoreEffectSender {
+    sequence: Arc<AtomicU64>,
+    action_sequence: ActionSequence,
+    local: Arc<EffectIngressMailbox>,
+    scheduled: Arc<EffectIngressMailbox>,
+}
+
+/// The store keeps local publication on a physically separate ingress lane.
+/// That is the only way bounded backpressure on lossless daemon mutations can
+/// never hold a later view invalidation hostage.
+pub struct StoreEffectReceiver {
+    action_sequence: ActionSequence,
+    local: Arc<EffectIngressMailbox>,
+    scheduled: Arc<EffectIngressMailbox>,
+}
+
+fn store_effect_channel() -> (StoreEffectSender, StoreEffectReceiver) {
+    let local = Arc::new(EffectIngressMailbox::new(EFFECT_INGRESS_BACKLOG));
+    let scheduled = Arc::new(EffectIngressMailbox::new(EFFECT_INGRESS_BACKLOG));
+    let action_sequence = ActionSequence::default();
+    (
+        StoreEffectSender {
+            sequence: Arc::new(AtomicU64::new(0)),
+            action_sequence: action_sequence.clone(),
+            local: Arc::clone(&local),
+            scheduled: Arc::clone(&scheduled),
+        },
+        StoreEffectReceiver {
+            action_sequence,
+            local,
+            scheduled,
+        },
+    )
+}
+
+impl Drop for StoreEffectSender {
+    fn drop(&mut self) {
+        self.local.close();
+        self.scheduled.close();
+    }
+}
+
+enum EffectAdmission {
+    Accepted { replaced: Option<StoreEffect> },
+    Full(StoreEffect),
+}
+
+#[cfg(test)]
+impl EffectAdmission {
+    fn unwrap(self) {
+        assert!(
+            matches!(self, Self::Accepted { .. }),
+            "effect admission failed"
+        );
+    }
+}
+
+impl StoreEffectSender {
+    fn send(&self, effect: StoreEffect) -> EffectAdmission {
+        let sequence = self
+            .sequence
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let action_ticket = action_context(&effect).map(|_| self.action_sequence.issue());
+        let target = match effect.execution_class() {
+            EffectClass::Local => &self.local,
+            EffectClass::Concurrent | EffectClass::OrderedMutation => &self.scheduled,
+        };
+        target.try_submit(EmittedEffect {
+            sequence,
+            effect,
+            action_ticket,
+        })
+    }
+}
+
+impl StoreEffectReceiver {
+    pub fn try_recv(&mut self) -> Result<StoreEffect, mpsc::error::TryRecvError> {
+        let next = match (self.local.front_sequence(), self.scheduled.front_sequence()) {
+            (Some(local), Some(scheduled)) if local <= scheduled => self.local.try_pop(),
+            (Some(_), Some(_)) => self.scheduled.try_pop(),
+            (Some(_), None) => self.local.try_pop(),
+            (None, Some(_)) => self.scheduled.try_pop(),
+            (None, None) => None,
+        };
+        if let Some(effect) = next {
+            return Ok(effect.effect);
+        }
+        if self.local.is_closed_and_empty() && self.scheduled.is_closed_and_empty() {
+            Err(mpsc::error::TryRecvError::Disconnected)
+        } else {
+            Err(mpsc::error::TryRecvError::Empty)
+        }
+    }
+
+    fn into_parts(
+        self,
+    ) -> (
+        ActionSequence,
+        Arc<EffectIngressMailbox>,
+        Arc<EffectIngressMailbox>,
+    ) {
+        (self.action_sequence, self.local, self.scheduled)
+    }
+}
+
+#[derive(Debug, Default)]
+struct EffectIngressState {
+    pending: VecDeque<EmittedEffect>,
+    closed: bool,
+}
+
+/// Fixed synchronous admission queue. Store mutations emit while holding the
+/// model's write lock, so waiting for capacity here could deadlock a worker
+/// that needs that lock to finish. Replaceable intents coalesce; lossless
+/// intents receive an immediate, visible refusal at the SessionStore seam.
+#[derive(Debug)]
+struct EffectIngressMailbox {
+    capacity: usize,
+    state: Mutex<EffectIngressState>,
+    ready: Notify,
+}
+
+impl EffectIngressMailbox {
+    fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "effect ingress capacity must be positive");
+        Self {
+            capacity,
+            state: Mutex::new(EffectIngressState::default()),
+            ready: Notify::new(),
+        }
+    }
+
+    fn try_submit(&self, emitted: EmittedEffect) -> EffectAdmission {
+        let key = effect_coalescing_key(&emitted.effect);
+        let mut state = self.state.lock().expect("effect ingress mailbox poisoned");
+        if let Some(key) = key
+            && let Some(index) = state.pending.iter().position(|candidate| {
+                effect_coalescing_key(&candidate.effect).as_ref() == Some(&key)
+            })
+        {
+            let replaced = state
+                .pending
+                .remove(index)
+                .expect("coalesced ingress index");
+            // The replacement carries a new intent timestamp. Put it at the
+            // tail so it cannot jump ahead of a lossless mutation that the
+            // user issued between the old and new lookup.
+            state.pending.push_back(emitted);
+            drop(state);
+            self.ready.notify_one();
+            return EffectAdmission::Accepted {
+                replaced: Some(replaced.effect),
+            };
+        }
+        if state.closed || state.pending.len() >= self.capacity {
+            return EffectAdmission::Full(emitted.effect);
+        }
+        state.pending.push_back(emitted);
+        drop(state);
+        self.ready.notify_one();
+        EffectAdmission::Accepted { replaced: None }
+    }
+
+    fn try_pop(&self) -> Option<EmittedEffect> {
+        self.state
+            .lock()
+            .expect("effect ingress mailbox poisoned")
+            .pending
+            .pop_front()
+    }
+
+    fn front_sequence(&self) -> Option<u64> {
+        self.state
+            .lock()
+            .expect("effect ingress mailbox poisoned")
+            .pending
+            .front()
+            .map(|effect| effect.sequence)
+    }
+
+    async fn next(&self) -> Option<EmittedEffect> {
+        loop {
+            let ready = self.ready.notified();
+            {
+                let mut state = self.state.lock().expect("effect ingress mailbox poisoned");
+                if let Some(effect) = state.pending.pop_front() {
+                    return Some(effect);
+                }
+                if state.closed {
+                    return None;
+                }
+            }
+            ready.await;
+        }
+    }
+
+    fn close(&self) {
+        self.state
+            .lock()
+            .expect("effect ingress mailbox poisoned")
+            .closed = true;
+        self.ready.notify_waiters();
+    }
+
+    fn is_closed_and_empty(&self) -> bool {
+        let state = self.state.lock().expect("effect ingress mailbox poisoned");
+        state.closed && state.pending.is_empty()
+    }
+
+    #[cfg(test)]
+    fn pending_len(&self) -> usize {
+        self.state
+            .lock()
+            .expect("effect ingress mailbox poisoned")
+            .pending
+            .len()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum EffectCoalescingKey {
+    UiChanged,
+    PublishSnapshot,
+    RetryConnection,
+    Detach(SessionId),
+    MarkSeen(SessionId),
+    Repo(String),
+    Directory,
+    Catalog(String),
+}
+
+fn effect_coalescing_key(effect: &StoreEffect) -> Option<EffectCoalescingKey> {
+    match effect {
+        StoreEffect::UiChanged => Some(EffectCoalescingKey::UiChanged),
+        StoreEffect::PublishSnapshot => Some(EffectCoalescingKey::PublishSnapshot),
+        StoreEffect::RetryConnection => Some(EffectCoalescingKey::RetryConnection),
+        StoreEffect::DetachAttachment(id) => Some(EffectCoalescingKey::Detach(id.clone())),
+        StoreEffect::MarkSeen(id) => Some(EffectCoalescingKey::MarkSeen(id.clone())),
+        StoreEffect::LocateRepo { key, .. } => Some(EffectCoalescingKey::Repo(key.clone())),
+        StoreEffect::ListDirectories { .. } => Some(EffectCoalescingKey::Directory),
+        StoreEffect::RefreshAgents { host, .. } => Some(EffectCoalescingKey::Catalog(
+            agent_target_key(host.as_deref()),
+        )),
+        _ => None,
     }
 }
 
@@ -385,6 +656,9 @@ pub struct SessionStore {
     /// rescan is allowed to overlap a scan that has not answered, and the
     /// spinner has to stay up until the last of them replies.
     agent_catalog_scans: HashMap<String, u32>,
+    /// Newest request issued for each target. Completion may update visible
+    /// catalog/error state only when it carries this exact generation.
+    agent_catalog_generations: HashMap<String, u64>,
     agent_catalog_errors: HashMap<String, String>,
     /// Attention states serving out their settle window, newest arming wins.
     /// Drained by the settle task in `StoreHandle`, which is what turns one of
@@ -393,17 +667,15 @@ pub struct SessionStore {
     /// Wakes the settle task when a window is armed early enough to beat the
     /// one it is currently sleeping on.
     attention_wake: Arc<Notify>,
-    effects: mpsc::UnboundedSender<StoreEffect>,
+    effects: StoreEffectSender,
 }
 
 impl SessionStore {
-    pub fn headless(prefs: Prefs) -> (Self, mpsc::UnboundedReceiver<StoreEffect>) {
+    pub fn headless(prefs: Prefs) -> (Self, StoreEffectReceiver) {
         Self::with_path(prefs, None)
     }
 
-    pub fn load(
-        path: impl Into<PathBuf>,
-    ) -> io::Result<(Self, mpsc::UnboundedReceiver<StoreEffect>)> {
+    pub fn load(path: impl Into<PathBuf>) -> io::Result<(Self, StoreEffectReceiver)> {
         let path = path.into();
         let prefs = Prefs::load(&path)?;
         let (mut store, receiver) = Self::with_path(prefs, Some(path));
@@ -411,11 +683,8 @@ impl SessionStore {
         Ok((store, receiver))
     }
 
-    fn with_path(
-        prefs: Prefs,
-        prefs_path: Option<PathBuf>,
-    ) -> (Self, mpsc::UnboundedReceiver<StoreEffect>) {
-        let (effects, receiver) = mpsc::unbounded_channel();
+    fn with_path(prefs: Prefs, prefs_path: Option<PathBuf>) -> (Self, StoreEffectReceiver) {
+        let (effects, receiver) = store_effect_channel();
         let selected_session_id = prefs.last_selected_session.clone();
         (
             Self {
@@ -453,6 +722,7 @@ impl SessionStore {
                 hosts: Vec::new(),
                 agents: HashMap::new(),
                 agent_catalog_scans: HashMap::new(),
+                agent_catalog_generations: HashMap::new(),
                 agent_catalog_errors: HashMap::new(),
                 attention_settle: HashMap::new(),
                 attention_wake: Arc::new(Notify::new()),
@@ -519,8 +789,12 @@ impl SessionStore {
         if outstanding >= if force { MAX_AGENT_CATALOG_SCANS } else { 1 } {
             return;
         }
-        self.agent_catalog_scans.insert(key, outstanding + 1);
-        self.emit(StoreEffect::RefreshAgents { host, force });
+        let generation = self.begin_agent_catalog_request(&key, outstanding);
+        self.emit(StoreEffect::RefreshAgents {
+            generation,
+            host,
+            force,
+        });
     }
 
     pub fn configure_agent(&mut self, params: diri_proto::AgentConfigureParams) {
@@ -529,21 +803,37 @@ impl SessionStore {
         // toggle flipped during a slow remote scan silently reverts.
         let key = agent_target_key(params.host.as_deref());
         let outstanding = self.agent_catalog_scans.get(&key).copied().unwrap_or(0);
-        self.agent_catalog_scans.insert(key, outstanding + 1);
-        self.emit(StoreEffect::ConfigureAgent(params));
+        let generation = self.begin_agent_catalog_request(&key, outstanding);
+        self.emit(StoreEffect::ConfigureAgent { generation, params });
+    }
+
+    fn begin_agent_catalog_request(&mut self, key: &str, outstanding: u32) -> u64 {
+        self.agent_catalog_scans
+            .insert(key.to_owned(), outstanding.saturating_add(1));
+        let generation = self
+            .agent_catalog_generations
+            .entry(key.to_owned())
+            .or_default();
+        *generation = generation.wrapping_add(1);
+        *generation
     }
 
     /// Retires one outstanding scan. The catalog stops reading as loading only
     /// once every request for the target has answered, so an early reply from
     /// a rescue rescan does not hide the one still running.
-    fn finish_agent_catalog_request(&mut self, key: &str) {
+    fn retire_agent_catalog_request(&mut self, key: &str) {
         let Some(outstanding) = self.agent_catalog_scans.get_mut(key) else {
             return;
         };
-        *outstanding -= 1;
+        *outstanding = outstanding.saturating_sub(1);
         if *outstanding == 0 {
             self.agent_catalog_scans.remove(key);
         }
+    }
+
+    fn finish_agent_catalog_request(&mut self, key: &str, generation: u64) -> bool {
+        self.retire_agent_catalog_request(key);
+        self.agent_catalog_generations.get(key).copied() == Some(generation)
     }
 
     pub fn agent_catalog_is_loading(&self, host: Option<&str>) -> bool {
@@ -627,7 +917,7 @@ impl SessionStore {
         }
     }
 
-    pub fn load_default() -> io::Result<(Self, mpsc::UnboundedReceiver<StoreEffect>)> {
+    pub fn load_default() -> io::Result<(Self, StoreEffectReceiver)> {
         Self::load(Prefs::path())
     }
 
@@ -863,7 +1153,7 @@ impl SessionStore {
         self.emit(retry.effect());
     }
 
-    pub fn retry_connection(&self) {
+    pub fn retry_connection(&mut self) {
         self.emit(StoreEffect::RetryConnection);
     }
 
@@ -1821,6 +2111,10 @@ impl SessionStore {
         );
         let mut unique = HashSet::new();
         ids.retain(|id| unique.insert(id.clone()));
+        let ids: Vec<_> = ids
+            .into_iter()
+            .filter(|id| self.emit(StoreEffect::Remove(id.clone())))
+            .collect();
         let excluded: HashSet<_> = ids.iter().cloned().collect();
         if self
             .selected_session_id
@@ -1836,7 +2130,6 @@ impl SessionStore {
             }
             // Hide now; `session.removed` (or a resync) settles the record.
             self.closing.insert(id.clone());
-            self.emit(StoreEffect::Remove(id));
         }
         self.invalidate_projection();
         self.reconcile_navigation();
@@ -1850,6 +2143,10 @@ impl SessionStore {
                     .get(id)
                     .is_some_and(|session| !session.is_archived())
             })
+            .collect();
+        let targets: Vec<_> = targets
+            .into_iter()
+            .filter(|id| self.emit(StoreEffect::Archive(id.clone())))
             .collect();
         let excluded: HashSet<_> = targets.iter().cloned().collect();
         if self
@@ -1867,7 +2164,6 @@ impl SessionStore {
             if self.terminal_residency.remove(&id) {
                 self.emit(StoreEffect::DetachAttachment(id.clone()));
             }
-            self.emit(StoreEffect::Archive(id));
         }
         self.invalidate_projection();
     }
@@ -1875,24 +2171,27 @@ impl SessionStore {
     pub fn revive_sessions(&mut self, ids: Vec<SessionId>) {
         let mut revived = Vec::new();
         for id in ids {
-            let Some(session) = self.sessions.get_mut(&id) else {
+            let Some(session) = self.sessions.get(&id) else {
                 continue;
             };
-            let session = Arc::make_mut(session);
             if !session.is_archived() {
                 continue;
             }
-            session.archived_at = None;
             let resumable = session.resumability == Resumability::Resumable;
-            revived.push(id.clone());
-            self.emit(if resumable {
+            let accepted = self.emit(if resumable {
                 StoreEffect::Resume {
-                    id,
+                    id: id.clone(),
                     automatic: false,
                 }
             } else {
-                StoreEffect::Unarchive(id)
+                StoreEffect::Unarchive(id.clone())
             });
+            if accepted {
+                if let Some(session) = self.sessions.get_mut(&id) {
+                    Arc::make_mut(session).archived_at = None;
+                }
+                revived.push(id);
+            }
         }
         self.invalidate_projection();
         if let Some(first) = revived.first().cloned() {
@@ -1925,7 +2224,7 @@ impl SessionStore {
         self.auto_resuming.remove(id);
     }
 
-    pub fn resume(&self, id: SessionId) {
+    pub fn resume(&mut self, id: SessionId) {
         self.emit(StoreEffect::Resume {
             id,
             automatic: false,
@@ -1962,16 +2261,21 @@ impl SessionStore {
 
     pub fn rename(&mut self, id: SessionId, title: impl Into<String>) {
         let title = title.into();
+        if !self.emit(StoreEffect::Rename {
+            id: id.clone(),
+            title: title.clone(),
+        }) {
+            return;
+        }
         if let Some(session) = self.sessions.get_mut(&id) {
             let session = Arc::make_mut(session);
             session.title.clone_from(&title);
             session.title_source = diri_proto::TitleSource::UserRename;
             self.invalidate_projection();
         }
-        self.emit(StoreEffect::Rename { id, title });
     }
 
-    pub fn reopen_last(&self) {
+    pub fn reopen_last(&mut self) {
         self.emit(StoreEffect::ReopenLast);
     }
 
@@ -2092,7 +2396,7 @@ impl SessionStore {
         }));
     }
 
-    pub fn reparent_worktree(&self, params: diri_proto::SessionReparentWorktreeParams) {
+    pub fn reparent_worktree(&mut self, params: diri_proto::SessionReparentWorktreeParams) {
         self.emit(StoreEffect::ReparentWorktree(params));
     }
 
@@ -2349,8 +2653,77 @@ impl SessionStore {
         self.cached_menu_projection = None;
     }
 
-    fn emit(&self, effect: StoreEffect) {
-        let _ = self.effects.send(effect);
+    fn emit(&mut self, effect: StoreEffect) -> bool {
+        match self.effects.send(effect) {
+            EffectAdmission::Accepted { replaced } => {
+                if let Some(StoreEffect::RefreshAgents { host, .. }) = replaced {
+                    self.retire_agent_catalog_request(&agent_target_key(host.as_deref()));
+                }
+                true
+            }
+            EffectAdmission::Full(effect) => {
+                self.refuse_effect(effect);
+                false
+            }
+        }
+    }
+
+    fn refuse_effect(&mut self, effect: StoreEffect) {
+        let context = action_context(&effect);
+        let title = context
+            .as_ref()
+            .map_or("Diri is busy", |context| context.title)
+            .to_owned();
+        let retry = context.and_then(|context| context.retry);
+
+        // Roll back explicit in-flight markers so rejected intent never leaves
+        // the UI claiming that daemon work is underway. Other optimistic
+        // model changes are reconciled by the next authoritative event/resync.
+        match &effect {
+            StoreEffect::Remove(id) => {
+                self.closing.remove(id);
+            }
+            StoreEffect::Resume {
+                id,
+                automatic: true,
+            } => {
+                self.finish_auto_resume(id);
+            }
+            StoreEffect::Migrate { id, .. } => {
+                self.finish_migration(id);
+            }
+            StoreEffect::SyncPrefs { host, .. } => {
+                self.finish_prefs_sync(host);
+            }
+            StoreEffect::LocateRepo {
+                generation, key, ..
+            } if *generation == self.repo_target_generation => {
+                self.repo_targets.insert(key.clone(), RepoTarget::NoOrigin);
+            }
+            StoreEffect::ListDirectories { request_id, .. } => {
+                self.finish_directory_listing(
+                    *request_id,
+                    Err("Diri is busy; try this folder again.".to_owned()),
+                );
+            }
+            StoreEffect::RefreshAgents { host, .. } => {
+                self.retire_agent_catalog_request(&agent_target_key(host.as_deref()));
+            }
+            StoreEffect::ConfigureAgent { params, .. } => {
+                self.retire_agent_catalog_request(&agent_target_key(params.host.as_deref()));
+            }
+            StoreEffect::SetActive(active) => {
+                self.app_is_active = !active;
+            }
+            _ => {}
+        }
+
+        self.last_action_failure = Some(ActionFailure {
+            title,
+            detail: "The background action queue is full. This action was not started; wait for current work to finish, then try again.".to_owned(),
+            retrying: false,
+            retry,
+        });
     }
 }
 
@@ -2521,7 +2894,7 @@ impl StoreRuntime {
     fn start_with_store(
         client: Arc<DaemonClient>,
         store: SessionStore,
-        effects: mpsc::UnboundedReceiver<StoreEffect>,
+        effects: StoreEffectReceiver,
     ) -> Self {
         let store = Arc::new(RwLock::new(store));
         let (detach_tx, _) = broadcast::channel(16);
@@ -2877,7 +3250,7 @@ async fn run_attention_settle(
 }
 
 async fn run_effects(
-    mut effects: mpsc::UnboundedReceiver<StoreEffect>,
+    effects: StoreEffectReceiver,
     client: Arc<DaemonClient>,
     store: Arc<RwLock<SessionStore>>,
     detach_tx: broadcast::Sender<SessionId>,
@@ -2885,6 +3258,7 @@ async fn run_effects(
     snapshot_tx: tokio::sync::watch::Sender<StoreSnapshot>,
     status_tx: broadcast::Sender<StatusTransition>,
 ) {
+    let (action_sequence, local_rx, scheduled_rx) = effects.into_parts();
     let executor = EffectExecutor {
         client,
         store,
@@ -2892,67 +3266,254 @@ async fn run_effects(
         change_tx,
         snapshot_tx,
         status_tx,
-        action_sequence: ActionSequence::default(),
+        action_sequence,
     };
-    let (ordered_tx, mut ordered_rx) = mpsc::unbounded_channel();
-    let (concurrent_tx, concurrent_rx) = mpsc::unbounded_channel();
-    let concurrent_rx = Arc::new(tokio::sync::Mutex::new(concurrent_rx));
+    let (ordered_tx, mut ordered_rx) = mpsc::channel(ORDERED_EFFECT_BACKLOG);
+    let concurrent = Arc::new(ConcurrentEffectMailbox::new(CONCURRENT_EFFECT_BACKLOG));
+    let local_executor = executor.clone();
     let ordered_executor = executor.clone();
     let mut workers = tokio::task::JoinSet::new();
     workers.spawn(async move {
+        while let Some(emitted) = local_rx.next().await {
+            execute_supervised(&local_executor, emitted.effect, emitted.action_ticket).await;
+        }
+    });
+    workers.spawn(async move {
         while let Some((effect, action_ticket)) = ordered_rx.recv().await {
-            ordered_executor.execute(effect, action_ticket).await;
+            execute_supervised(&ordered_executor, effect, action_ticket).await;
         }
     });
     for _ in 0..CONCURRENT_EFFECT_WORKERS {
         let concurrent_executor = executor.clone();
-        let concurrent_rx = Arc::clone(&concurrent_rx);
+        let concurrent = Arc::clone(&concurrent);
         workers.spawn(async move {
-            loop {
-                let next = concurrent_rx.lock().await.recv().await;
-                let Some((effect, action_ticket)) = next else {
-                    break;
-                };
-                concurrent_executor.execute(effect, action_ticket).await;
+            while let Some(queued) = concurrent.next().await {
+                execute_supervised(&concurrent_executor, queued.effect, queued.action_ticket).await;
+                concurrent.finish(&queued.key);
             }
         });
     }
 
-    loop {
-        tokio::select! {
-            effect = effects.recv() => {
-                let Some(effect) = effect else {
-                    break;
-                };
-                let action_ticket = executor.issue_action_ticket(&effect);
-                match effect.execution_class() {
-                    EffectClass::Local => executor.execute(effect, action_ticket).await,
-                    EffectClass::Concurrent => {
-                        if let Err(error) = concurrent_tx.send((effect, action_ticket)) {
-                            let (effect, action_ticket) = error.0;
-                            executor.execute(effect, action_ticket).await;
-                        }
-                    }
-                    EffectClass::OrderedMutation => {
-                        if let Err(error) = ordered_tx.send((effect, action_ticket)) {
-                            // A worker panic must not silently discard the
-                            // mutation that exposed it. Preserve intent on the
-                            // dispatcher task while the runtime is still live.
-                            let (effect, action_ticket) = error.0;
-                            executor.execute(effect, action_ticket).await;
-                        }
-                    }
+    while let Some(emitted) = scheduled_rx.next().await {
+        let effect = emitted.effect;
+        let action_ticket = emitted.action_ticket;
+        match effect.execution_class() {
+            EffectClass::Local => {
+                debug_assert!(false, "local effects use their dedicated ingress lane");
+                execute_supervised(&executor, effect, action_ticket).await;
+            }
+            EffectClass::Concurrent => {
+                if let Some(replaced) = concurrent.submit(effect, action_ticket).await {
+                    executor.retire_superseded(&replaced);
                 }
             }
-            completed = workers.join_next(), if !workers.is_empty() => {
-                let _ = completed;
+            EffectClass::OrderedMutation => {
+                if let Err(error) = ordered_tx.send((effect, action_ticket)).await {
+                    let (effect, action_ticket) = error.0;
+                    execute_supervised(&executor, effect, action_ticket).await;
+                }
             }
         }
     }
 
     drop(ordered_tx);
-    drop(concurrent_tx);
+    concurrent.close();
     while workers.join_next().await.is_some() {}
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum ConcurrentEffectKey {
+    MarkSeen(SessionId),
+    Repo(String),
+    Directory,
+    Catalog(String),
+    Prefs(String),
+    #[cfg(test)]
+    Panic(u64),
+}
+
+#[derive(Clone, Debug)]
+struct QueuedConcurrentEffect {
+    key: ConcurrentEffectKey,
+    effect: StoreEffect,
+    action_ticket: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct ConcurrentEffectState {
+    pending: VecDeque<QueuedConcurrentEffect>,
+    active: HashSet<ConcurrentEffectKey>,
+    closed: bool,
+}
+
+#[derive(Debug)]
+struct ConcurrentEffectMailbox {
+    capacity: usize,
+    state: Mutex<ConcurrentEffectState>,
+    ready: Notify,
+    capacity_available: Notify,
+}
+
+impl ConcurrentEffectMailbox {
+    fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "concurrent effect capacity must be positive");
+        Self {
+            capacity,
+            state: Mutex::new(ConcurrentEffectState::default()),
+            ready: Notify::new(),
+            capacity_available: Notify::new(),
+        }
+    }
+
+    async fn submit(&self, effect: StoreEffect, action_ticket: Option<u64>) -> Option<StoreEffect> {
+        let key = concurrent_effect_key(&effect);
+        let mut queued = Some(QueuedConcurrentEffect {
+            key: key.clone(),
+            effect,
+            action_ticket,
+        });
+        loop {
+            let capacity_available = self.capacity_available.notified();
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("concurrent effect mailbox poisoned");
+                if effect_coalesces(&queued.as_ref().expect("queued effect").effect)
+                    && let Some(index) = state.pending.iter().position(|item| item.key == key)
+                {
+                    let replacement = queued.take().expect("queued effect");
+                    let replaced = state
+                        .pending
+                        .remove(index)
+                        .expect("coalesced pending index");
+                    state.pending.push_back(replacement);
+                    self.ready.notify_one();
+                    return Some(replaced.effect);
+                }
+                if state.pending.len() < self.capacity {
+                    state
+                        .pending
+                        .push_back(queued.take().expect("queued effect"));
+                    self.ready.notify_one();
+                    return None;
+                }
+            }
+            capacity_available.await;
+        }
+    }
+
+    async fn next(&self) -> Option<QueuedConcurrentEffect> {
+        loop {
+            let ready = self.ready.notified();
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("concurrent effect mailbox poisoned");
+                if let Some(index) = state
+                    .pending
+                    .iter()
+                    .position(|item| !state.active.contains(&item.key))
+                {
+                    let queued = state.pending.remove(index).expect("pending index");
+                    state.active.insert(queued.key.clone());
+                    self.capacity_available.notify_one();
+                    return Some(queued);
+                }
+                if state.closed && state.pending.is_empty() {
+                    return None;
+                }
+            }
+            ready.await;
+        }
+    }
+
+    fn finish(&self, key: &ConcurrentEffectKey) {
+        self.state
+            .lock()
+            .expect("concurrent effect mailbox poisoned")
+            .active
+            .remove(key);
+        self.ready.notify_waiters();
+        self.capacity_available.notify_waiters();
+    }
+
+    fn close(&self) {
+        self.state
+            .lock()
+            .expect("concurrent effect mailbox poisoned")
+            .closed = true;
+        self.ready.notify_waiters();
+        self.capacity_available.notify_waiters();
+    }
+
+    #[cfg(test)]
+    fn pending_len(&self) -> usize {
+        self.state
+            .lock()
+            .expect("concurrent effect mailbox poisoned")
+            .pending
+            .len()
+    }
+}
+
+fn concurrent_effect_key(effect: &StoreEffect) -> ConcurrentEffectKey {
+    match effect {
+        StoreEffect::MarkSeen(id) => ConcurrentEffectKey::MarkSeen(id.clone()),
+        StoreEffect::LocateRepo { key, .. } => ConcurrentEffectKey::Repo(key.clone()),
+        StoreEffect::ListDirectories { .. } => ConcurrentEffectKey::Directory,
+        StoreEffect::RefreshAgents { host, .. } => {
+            ConcurrentEffectKey::Catalog(agent_target_key(host.as_deref()))
+        }
+        StoreEffect::SyncPrefs { host, .. } => ConcurrentEffectKey::Prefs(host.clone()),
+        #[cfg(test)]
+        StoreEffect::TestPanicOnce(id) => ConcurrentEffectKey::Panic(*id),
+        _ => unreachable!("only concurrent effects enter the keyed mailbox"),
+    }
+}
+
+fn effect_coalesces(effect: &StoreEffect) -> bool {
+    matches!(
+        effect,
+        StoreEffect::MarkSeen(_)
+            | StoreEffect::LocateRepo { .. }
+            | StoreEffect::ListDirectories { .. }
+            | StoreEffect::RefreshAgents { .. }
+    )
+}
+
+async fn execute_supervised(
+    executor: &EffectExecutor,
+    effect: StoreEffect,
+    action_ticket: Option<u64>,
+) {
+    let failed_effect = effect.clone();
+    let task_executor = executor.clone();
+    let mut task = tokio::spawn(async move {
+        task_executor.execute(effect, action_ticket).await;
+    });
+    // Dropping a Tokio JoinHandle detaches it. Tie the child to the owning
+    // runtime instead, so StoreRuntime::shutdown cannot leave daemon calls
+    // running after all of its workers have been aborted.
+    let _abort_on_drop = AbortOnDrop(task.abort_handle());
+    if let Err(error) = (&mut task).await
+        && error.is_panic()
+    {
+        // Never retry an authoritative mutation generically: the panic may
+        // have happened after the daemon committed it, and replaying could
+        // duplicate a spawn or migration. Record the uncertain outcome and
+        // keep this fixed worker alive for later effects.
+        executor.record_panicked_effect(&failed_effect, action_ticket, &error);
+    }
+}
+
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 #[derive(Clone)]
@@ -2967,8 +3528,59 @@ struct EffectExecutor {
 }
 
 impl EffectExecutor {
-    fn issue_action_ticket(&self, effect: &StoreEffect) -> Option<u64> {
-        action_context(effect).map(|_| self.action_sequence.issue())
+    fn retire_superseded(&self, effect: &StoreEffect) {
+        if let StoreEffect::RefreshAgents { host, .. } = effect {
+            self.store
+                .write()
+                .expect("session store lock poisoned")
+                .retire_agent_catalog_request(&agent_target_key(host.as_deref()));
+        }
+    }
+
+    fn record_panicked_effect(
+        &self,
+        effect: &StoreEffect,
+        action_ticket: Option<u64>,
+        error: &tokio::task::JoinError,
+    ) {
+        let mut store = self.store.write().expect("session store lock poisoned");
+        match effect {
+            StoreEffect::Remove(id) => {
+                store.closing.remove(id);
+            }
+            StoreEffect::Resume {
+                id,
+                automatic: true,
+            } => store.finish_auto_resume(id),
+            StoreEffect::Migrate { id, .. } => store.finish_migration(id),
+            StoreEffect::SyncPrefs { host, .. } => store.finish_prefs_sync(host),
+            StoreEffect::RefreshAgents { host, .. } => {
+                store.retire_agent_catalog_request(&agent_target_key(host.as_deref()));
+            }
+            StoreEffect::ConfigureAgent { params, .. } => {
+                store.retire_agent_catalog_request(&agent_target_key(params.host.as_deref()));
+            }
+            _ => {}
+        }
+        if action_ticket.is_none_or(|ticket| self.action_sequence.is_current(ticket)) {
+            let title = action_context(effect)
+                .map_or("Background action outcome is uncertain", |context| {
+                    context.title
+                });
+            store.last_action_failure = Some(ActionFailure {
+                title: title.to_owned(),
+                detail: format!(
+                    "A background worker stopped unexpectedly ({error}). The action was not retried because it may already have completed; refresh before trying again."
+                ),
+                retrying: false,
+                retry: None,
+            });
+        }
+        let active = store.app_is_active;
+        drop(store);
+        if active {
+            let _ = self.change_tx.send(());
+        }
     }
 
     async fn execute(&self, effect: StoreEffect, action_ticket: Option<u64>) {
@@ -3115,7 +3727,11 @@ impl EffectExecutor {
                     .finish_directory_listing(request_id, result);
                 Ok(())
             }
-            StoreEffect::RefreshAgents { host, force } => {
+            StoreEffect::RefreshAgents {
+                generation,
+                host,
+                force,
+            } => {
                 let result = client
                     .agent_readiness(diri_proto::AgentReadinessParams {
                         host: host.clone(),
@@ -3128,8 +3744,9 @@ impl EffectExecutor {
                 // a daemon too old for per-host params echoes no host, and
                 // keying off the response would leave this target loading
                 // (and every further request suppressed) forever.
-                locked.finish_agent_catalog_request(&key);
+                let current = locked.finish_agent_catalog_request(&key, generation);
                 match result {
+                    _ if !current => {}
                     Ok(catalog) => {
                         locked.agent_catalog_errors.remove(&key);
                         locked.set_agent_catalog(catalog);
@@ -3141,14 +3758,15 @@ impl EffectExecutor {
                 drop(locked);
                 Ok(())
             }
-            StoreEffect::ConfigureAgent(params) => {
+            StoreEffect::ConfigureAgent { generation, params } => {
                 let host = params.host.clone();
                 let result = client.configure_agent(params).await;
                 let mut locked = store.write().expect("session store lock poisoned");
                 let key = agent_target_key(host.as_deref());
                 // Requested key, not response key — see RefreshAgents.
-                locked.finish_agent_catalog_request(&key);
+                let current = locked.finish_agent_catalog_request(&key, generation);
                 match result {
+                    _ if !current => {}
                     Ok(catalog) => {
                         locked.agent_catalog_errors.remove(&key);
                         locked.set_agent_catalog(catalog);
@@ -3178,6 +3796,11 @@ impl EffectExecutor {
             }
             StoreEffect::StatusTransition(transition) => {
                 let _ = status_tx.send(transition);
+                Ok(())
+            }
+            #[cfg(test)]
+            StoreEffect::TestPanicOnce(id) => {
+                run_effect_panic_probe(id);
                 Ok(())
             }
         };
@@ -3270,12 +3893,70 @@ fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
         | StoreEffect::ConfigureGovernor(_)
         | StoreEffect::DetachAttachment(_)
         | StoreEffect::StatusTransition(_) => return None,
+        #[cfg(test)]
+        StoreEffect::TestPanicOnce(_) => return None,
         // Catalog failures land in `agent_catalog_errors`, which the Agents
         // settings page and launch surfaces render in place — a toast on top
         // would double-report every unreachable host.
-        StoreEffect::RefreshAgents { .. } | StoreEffect::ConfigureAgent(_) => return None,
+        StoreEffect::RefreshAgents { .. } | StoreEffect::ConfigureAgent { .. } => return None,
     };
     Some(ActionContext { title, retry })
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct EffectPanicProbe {
+    armed: HashSet<u64>,
+    completed: HashSet<u64>,
+    runs: HashMap<u64, u32>,
+}
+
+#[cfg(test)]
+fn effect_panic_probes() -> &'static Mutex<EffectPanicProbe> {
+    static PROBES: OnceLock<Mutex<EffectPanicProbe>> = OnceLock::new();
+    PROBES.get_or_init(|| Mutex::new(EffectPanicProbe::default()))
+}
+
+#[cfg(test)]
+fn arm_effect_panic_probe(id: u64) {
+    effect_panic_probes()
+        .lock()
+        .expect("effect panic probe poisoned")
+        .armed
+        .insert(id);
+}
+
+#[cfg(test)]
+fn effect_panic_probe_completed(id: u64) -> bool {
+    effect_panic_probes()
+        .lock()
+        .expect("effect panic probe poisoned")
+        .completed
+        .contains(&id)
+}
+
+#[cfg(test)]
+fn effect_panic_probe_runs(id: u64) -> u32 {
+    effect_panic_probes()
+        .lock()
+        .expect("effect panic probe poisoned")
+        .runs
+        .get(&id)
+        .copied()
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn run_effect_panic_probe(id: u64) {
+    let mut probes = effect_panic_probes()
+        .lock()
+        .expect("effect panic probe poisoned");
+    *probes.runs.entry(id).or_default() += 1;
+    if probes.armed.remove(&id) {
+        drop(probes);
+        panic!("deterministic store-effect panic probe {id}");
+    }
+    probes.completed.insert(id);
 }
 
 pub fn prefs_path_in_home(home: &Path) -> PathBuf {
