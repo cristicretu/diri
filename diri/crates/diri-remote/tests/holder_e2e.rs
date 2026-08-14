@@ -208,6 +208,7 @@ fn message_kinds(messages: &[RemoteMessage]) -> String {
             RemoteMessage::ScrollbackResponse(_) => "ScrollbackResponse",
             RemoteMessage::DeliveryInput(_) => "DeliveryInput",
             RemoteMessage::DeliveryAccepted(_) => "DeliveryAccepted",
+            RemoteMessage::DeliveryUncertain(_) => "DeliveryUncertain",
             RemoteMessage::Error(_) => "Error",
         })
         .collect::<Vec<_>>()
@@ -456,6 +457,97 @@ fn delivery_receipt_survives_controller_response_loss_and_reconnect() {
         expected_incarnation: Some(launch.session_incarnation),
     };
     let _: SessionInspection = run_json("kill", &state_dir, Some(&selector));
+}
+
+#[test]
+fn replacement_holder_rejects_a_durable_pre_side_effect_tombstone() {
+    use diri_proto::remote_pty::DeliveryInput;
+
+    let temporary = tempfile::tempdir().expect("temp");
+    let state_dir = temporary.path().join("state");
+    let request = LaunchRequest {
+        session_id: "delivery-uncertain-e2e".into(),
+        session_token: token(),
+        argv: vec!["/bin/cat".into()],
+        cwd: "/".into(),
+        environment: vec![diri_proto::remote_pty::EnvironmentVariable {
+            name: "TERM".into(),
+            value: "xterm-256color".into(),
+        }],
+        cols: 80,
+        rows: 24,
+        persistence: PersistenceCapability::NonPersistent,
+    };
+    let first: LaunchResult = run_json("launch", &state_dir, Some(&request));
+    let _: SessionInspection = run_json(
+        "kill",
+        &state_dir,
+        Some(&SessionSelector {
+            session_id: first.session_id.clone(),
+            session_token: token(),
+            expected_incarnation: Some(first.session_incarnation),
+        }),
+    );
+
+    // Model a crash after the write-ahead state commit but before the Holder
+    // could durably commit its PTY outcome.
+    let state_path = state_dir.join("sessions/delivery-uncertain-e2e/session.json");
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).expect("old state")).expect("JSON");
+    state["pendingDeliveryIds"] = serde_json::json!(["delivery-uncertain"]);
+    std::fs::write(&state_path, serde_json::to_vec(&state).expect("encode")).expect("inject");
+
+    let second: LaunchResult = run_json("launch", &state_dir, Some(&request));
+    let mut attach = Attach::open(&state_dir, hello(&second, None, "uncertain-client"));
+    let handshake = attach.receive_until(Duration::from_secs(2), |message| {
+        matches!(message, RemoteMessage::ControlGranted(_))
+    });
+    let acknowledgement = handshake
+        .iter()
+        .find_map(|message| match message {
+            RemoteMessage::HelloAck(acknowledgement) => Some(acknowledgement),
+            _ => None,
+        })
+        .expect("HelloAck");
+    assert_eq!(
+        acknowledgement.uncertain_delivery_ids,
+        ["delivery-uncertain"]
+    );
+
+    attach.send(RemoteMessage::DeliveryInput(DeliveryInput {
+        delivery_id: "delivery-uncertain".into(),
+        data: b"must not land\n".to_vec(),
+    }));
+    attach.receive_until(Duration::from_secs(2), |message| {
+        matches!(
+            message,
+            RemoteMessage::DeliveryUncertain(uncertain)
+                if uncertain.delivery_id == "delivery-uncertain"
+        )
+    });
+
+    attach.send(RemoteMessage::DeliveryInput(DeliveryInput {
+        delivery_id: "delivery-probe".into(),
+        data: b"probe\n".to_vec(),
+    }));
+    let output = attach.receive_until(Duration::from_secs(2), |message| {
+        message_contains(message, "probe")
+    });
+    assert!(
+        !output
+            .iter()
+            .any(|message| message_contains(message, "must not land"))
+    );
+
+    let _: SessionInspection = run_json(
+        "kill",
+        &state_dir,
+        Some(&SessionSelector {
+            session_id: second.session_id,
+            session_token: token(),
+            expected_incarnation: Some(second.session_incarnation),
+        }),
+    );
 }
 
 #[test]

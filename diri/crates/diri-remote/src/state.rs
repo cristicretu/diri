@@ -34,6 +34,11 @@ pub struct SessionState {
     pub created_at_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accepted_delivery_ids: Vec<String>,
+    /// Operations durably prepared before a PTY side effect whose final
+    /// outcome was not durably committed. These tombstones survive Holder
+    /// replacement and may never be replayed automatically.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_delivery_ids: Vec<String>,
 }
 
 impl SessionState {
@@ -53,6 +58,7 @@ impl SessionState {
             persistence: request.persistence,
             created_at_unix_ms: unix_millis(),
             accepted_delivery_ids: Vec::new(),
+            pending_delivery_ids: Vec::new(),
         }
     }
 
@@ -71,6 +77,7 @@ impl SessionState {
             controller_epoch: self.controller_epoch,
             persistence: self.persistence,
             accepted_delivery_ids: self.accepted_delivery_ids.clone(),
+            uncertain_delivery_ids: self.pending_delivery_ids.clone(),
         }
     }
 }

@@ -93,6 +93,11 @@ pub struct HolderStat {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub accepted_delivery_ids: Vec<String>,
+    /// Explicit negotiation bit for the additive receipt operation. Older
+    /// Swift/Rust Holders omit it and decode to false, allowing the client to
+    /// choose the legacy write before attempting any side effect.
+    #[serde(rename = "deliveryReceipts", default)]
+    pub delivery_receipts: bool,
 }
 
 /// How the held child ended.
@@ -433,12 +438,14 @@ mod tests {
         .expect("full stat");
         assert_eq!(full.child_pid, 123);
         assert_eq!(full.epoch_offset, Some(1024));
+        assert!(!full.delivery_receipts);
 
         // …and with them omitted, as a pre-epoch holder would send.
         let sparse: HolderStat =
             serde_json::from_str(r#"{"childPID":9,"alive":false,"logOffset":0}"#).expect("sparse");
         assert_eq!(sparse.foreground_pid, None);
         assert_eq!(sparse.epoch_offset, None);
+        assert!(!sparse.delivery_receipts);
     }
 
     #[test]

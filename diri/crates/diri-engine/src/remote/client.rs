@@ -1,6 +1,6 @@
 //! One Engine-side controller for one remote Holder.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
 use std::process::{Child, ChildStdin, ChildStdout};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,9 +10,10 @@ use std::time::Duration;
 
 use diri_proto::frames::Frame;
 use diri_proto::remote_pty::{
-    DeliveryInput, Hello, HelloAck, PHASE_ONE_HOLDER_CAPABILITIES, ProtocolVersion, RemoteCodec,
-    RemoteMessage, RemoteRole, ScrollbackRequest, ScrollbackResponse, SessionInspection,
-    SessionSelector, SessionToken, Signal, validate_terminal_dimensions,
+    DELIVERY_RECEIPT_PROTOCOL_MINOR, DeliveryInput, Hello, HelloAck, PHASE_ONE_HOLDER_CAPABILITIES,
+    ProtocolVersion, RemoteCapability, RemoteCodec, RemoteMessage, RemoteRole, ScrollbackRequest,
+    ScrollbackResponse, SessionInspection, SessionSelector, SessionToken, Signal,
+    validate_terminal_dimensions,
 };
 
 use super::binding::RemoteBindingStore;
@@ -33,6 +34,53 @@ struct WriterState {
     delivery_receipts: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeliveryOutcome {
+    Accepted,
+    Uncertain,
+}
+
+#[derive(Debug, Default)]
+struct DeliveryOutcomes {
+    entries: VecDeque<(String, DeliveryOutcome)>,
+}
+
+impl DeliveryOutcomes {
+    fn get(&self, delivery_id: &str) -> Option<DeliveryOutcome> {
+        self.entries
+            .iter()
+            .find_map(|(candidate, outcome)| (candidate == delivery_id).then_some(*outcome))
+    }
+
+    fn contains(&self, delivery_id: &str) -> bool {
+        self.get(delivery_id).is_some()
+    }
+
+    fn record(&mut self, delivery_id: String, outcome: DeliveryOutcome) {
+        if let Some((_, existing)) = self
+            .entries
+            .iter_mut()
+            .find(|(candidate, _)| candidate == &delivery_id)
+        {
+            if *existing != DeliveryOutcome::Accepted {
+                *existing = outcome;
+            }
+            return;
+        }
+        if self.entries.len() >= 64 {
+            let Some(eviction) = self
+                .entries
+                .iter()
+                .position(|(_, outcome)| *outcome == DeliveryOutcome::Accepted)
+            else {
+                return;
+            };
+            self.entries.remove(eviction);
+        }
+        self.entries.push_back((delivery_id, outcome));
+    }
+}
+
 /// The pump owns SSH stdout. Interactive callers share this small writer
 /// state; no terminal/parser lock is on the input hot path.
 pub struct RemoteSessionClient {
@@ -47,7 +95,7 @@ pub struct RemoteSessionClient {
     persisted_output_offset: AtomicU64,
     next_request_id: AtomicU64,
     scrollback_requests: Mutex<HashMap<u64, mpsc::Sender<diri_proto::ReadScrollbackCellsResult>>>,
-    delivery_receipts: Mutex<HashSet<String>>,
+    delivery_outcomes: Mutex<DeliveryOutcomes>,
     delivery_changed: Condvar,
 }
 
@@ -82,7 +130,7 @@ impl RemoteSessionClient {
             persisted_output_offset: AtomicU64::new(initial_output_offset),
             next_request_id: AtomicU64::new(1),
             scrollback_requests: Mutex::new(HashMap::new()),
-            delivery_receipts: Mutex::new(HashSet::new()),
+            delivery_outcomes: Mutex::new(DeliveryOutcomes::default()),
             delivery_changed: Condvar::new(),
         }
     }
@@ -119,21 +167,23 @@ impl RemoteSessionClient {
         Ok((writer.generation, channel.output))
     }
 
-    pub fn accept_hello(
-        &self,
-        generation: u64,
-        epoch: u64,
-        accepted_delivery_ids: &[String],
-        delivery_receipts: bool,
-    ) -> io::Result<()> {
+    pub fn accept_hello(&self, generation: u64, acknowledgement: &HelloAck) -> io::Result<()> {
+        let delivery_receipts = delivery_receipts_negotiated(acknowledgement);
         let mut writer = self.writer.lock().expect("remote writer");
         require_generation(&writer, generation)?;
-        writer.controller_epoch = Some(epoch);
+        writer.controller_epoch = Some(acknowledgement.controller_epoch);
         writer.delivery_receipts = delivery_receipts;
         drop(writer);
-        let mut receipts = self.delivery_receipts.lock().expect("delivery receipts");
-        receipts.extend(accepted_delivery_ids.iter().cloned());
-        self.delivery_changed.notify_all();
+        if delivery_receipts {
+            let mut outcomes = self.delivery_outcomes.lock().expect("delivery outcomes");
+            for delivery_id in &acknowledgement.uncertain_delivery_ids {
+                outcomes.record(delivery_id.clone(), DeliveryOutcome::Uncertain);
+            }
+            for delivery_id in &acknowledgement.accepted_delivery_ids {
+                outcomes.record(delivery_id.clone(), DeliveryOutcome::Accepted);
+            }
+            self.delivery_changed.notify_all();
+        }
         Ok(())
     }
 
@@ -194,6 +244,11 @@ impl RemoteSessionClient {
         if self.accepted_delivery(delivery_id) {
             return Ok(());
         }
+        if self.uncertain_delivery(delivery_id) {
+            return Err(io::Error::other(
+                "remote Holder reports the delivery outcome is uncertain",
+            ));
+        }
         {
             let mut writer = self.writer.lock().expect("remote writer");
             if !writer.delivery_receipts {
@@ -216,42 +271,56 @@ impl RemoteSessionClient {
                 }),
             )?;
         }
-        let receipts = self.delivery_receipts.lock().expect("delivery receipts");
-        let (receipts, timeout) = self
+        let outcomes = self.delivery_outcomes.lock().expect("delivery outcomes");
+        let (outcomes, timeout) = self
             .delivery_changed
-            .wait_timeout_while(receipts, Duration::from_secs(5), |receipts| {
-                !receipts.contains(delivery_id)
+            .wait_timeout_while(outcomes, Duration::from_secs(5), |outcomes| {
+                !outcomes.contains(delivery_id)
             })
-            .expect("delivery receipts");
-        if receipts.contains(delivery_id) {
-            Ok(())
-        } else {
-            Err(io::Error::new(
+            .expect("delivery outcomes");
+        match outcomes.get(delivery_id) {
+            Some(DeliveryOutcome::Accepted) => Ok(()),
+            Some(DeliveryOutcome::Uncertain) => Err(io::Error::other(
+                "remote Holder reports the delivery outcome is uncertain",
+            )),
+            None => Err(io::Error::new(
                 if timeout.timed_out() {
                     io::ErrorKind::TimedOut
                 } else {
                     io::ErrorKind::BrokenPipe
                 },
                 "remote delivery acknowledgement was not observed",
-            ))
+            )),
         }
     }
 
     pub fn complete_delivery(&self, delivery_id: String) {
-        self.delivery_receipts
+        self.delivery_outcomes
             .lock()
-            .expect("delivery receipts")
-            .insert(delivery_id);
+            .expect("delivery outcomes")
+            .record(delivery_id, DeliveryOutcome::Accepted);
+        self.delivery_changed.notify_all();
+    }
+
+    pub fn mark_delivery_uncertain(&self, delivery_id: String) {
+        self.delivery_outcomes
+            .lock()
+            .expect("delivery outcomes")
+            .record(delivery_id, DeliveryOutcome::Uncertain);
         self.delivery_changed.notify_all();
     }
 
     pub fn accepted_delivery(&self, delivery_id: &str) -> bool {
-        if self
-            .delivery_receipts
-            .lock()
-            .expect("delivery receipts")
-            .contains(delivery_id)
-        {
+        if !self.writer.lock().expect("remote writer").delivery_receipts {
+            return false;
+        }
+        if matches!(
+            self.delivery_outcomes
+                .lock()
+                .expect("delivery outcomes")
+                .get(delivery_id),
+            Some(DeliveryOutcome::Accepted)
+        ) {
             return true;
         }
         self.inspect().is_ok_and(|inspection| {
@@ -259,6 +328,27 @@ impl RemoteSessionClient {
                 .accepted_delivery_ids
                 .iter()
                 .any(|accepted| accepted == delivery_id)
+        })
+    }
+
+    pub fn uncertain_delivery(&self, delivery_id: &str) -> bool {
+        if !self.writer.lock().expect("remote writer").delivery_receipts {
+            return false;
+        }
+        if matches!(
+            self.delivery_outcomes
+                .lock()
+                .expect("delivery outcomes")
+                .get(delivery_id),
+            Some(DeliveryOutcome::Uncertain)
+        ) {
+            return true;
+        }
+        self.inspect().is_ok_and(|inspection| {
+            inspection
+                .uncertain_delivery_ids
+                .iter()
+                .any(|uncertain| uncertain == delivery_id)
         })
     }
 
@@ -486,6 +576,14 @@ impl RemoteSessionClient {
     }
 }
 
+fn delivery_receipts_negotiated(acknowledgement: &HelloAck) -> bool {
+    acknowledgement.protocol.major == ProtocolVersion::CURRENT.major
+        && acknowledgement.protocol.minor >= DELIVERY_RECEIPT_PROTOCOL_MINOR
+        && acknowledgement
+            .capabilities
+            .contains(&RemoteCapability::DeliveryReceipts)
+}
+
 fn write_message(writer: &mut WriterState, message: &RemoteMessage) -> io::Result<()> {
     let encoded = RemoteCodec::encode(message).map_err(io::Error::other)?;
     let input = writer
@@ -556,6 +654,7 @@ impl Drop for RemoteSessionClient {
 #[cfg(test)]
 mod tests {
     use diri_proto::frames::FrameType;
+    use diri_proto::remote_pty::RemoteProcessState;
 
     use super::*;
 
@@ -574,5 +673,43 @@ mod tests {
             terminal_input_frame(ProtocolVersion::CURRENT, b"key", false).frame_type,
             FrameType::Input
         );
+    }
+
+    #[test]
+    fn protocol_1_5_cannot_activate_delivery_receipts_with_a_false_capability() {
+        let acknowledgement = HelloAck {
+            protocol: ProtocolVersion { major: 1, minor: 5 },
+            holder_build_id: "holder".into(),
+            session_incarnation: "incarnation".into(),
+            capabilities: vec![RemoteCapability::DeliveryReceipts],
+            controller_epoch: 1,
+            process_state: RemoteProcessState::Running { pid: 1 },
+            output_offset: 0,
+            snapshot_sequence: 0,
+            accepted_delivery_ids: vec!["false-positive".into()],
+            uncertain_delivery_ids: vec!["also-false".into()],
+        };
+        assert!(!delivery_receipts_negotiated(&acknowledgement));
+
+        let mut current = acknowledgement;
+        current.protocol.minor = DELIVERY_RECEIPT_PROTOCOL_MINOR;
+        assert!(delivery_receipts_negotiated(&current));
+        current.capabilities.clear();
+        assert!(!delivery_receipts_negotiated(&current));
+    }
+
+    #[test]
+    fn bounded_delivery_outcomes_never_evict_an_uncertain_tombstone() {
+        let mut outcomes = DeliveryOutcomes::default();
+        outcomes.record("uncertain".into(), DeliveryOutcome::Uncertain);
+        for index in 0..100 {
+            outcomes.record(format!("accepted-{index}"), DeliveryOutcome::Accepted);
+        }
+        assert_eq!(outcomes.entries.len(), 64);
+        assert_eq!(outcomes.get("uncertain"), Some(DeliveryOutcome::Uncertain));
+
+        outcomes.record("uncertain".into(), DeliveryOutcome::Accepted);
+        outcomes.record("uncertain".into(), DeliveryOutcome::Uncertain);
+        assert_eq!(outcomes.get("uncertain"), Some(DeliveryOutcome::Accepted));
     }
 }

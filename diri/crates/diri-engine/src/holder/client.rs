@@ -60,18 +60,16 @@ impl HolderClient {
     /// the request lane instead of the legacy binary stream so the Holder can
     /// retain the operation id before acknowledging it.
     pub fn write_receipted(&self, data: &[u8], delivery_id: &str) -> HolderResult<()> {
+        if !self.stat()?.delivery_receipts {
+            // Capability absence is observed before the receipted operation,
+            // so an old Holder's acknowledged legacy write cannot duplicate
+            // a partially successful new operation.
+            return self.write(data);
+        }
         let mut request = HolderRequest::op(HolderOperation::WriteReceipt);
         request.data = Some(base64::engine::general_purpose::STANDARD.encode(data));
         request.delivery_id = Some(delivery_id.to_owned());
-        match self.request(&request) {
-            Ok(_) => Ok(()),
-            // An explicit rejection proves an older live Holder did not
-            // perform the unknown additive operation, so its acknowledged
-            // legacy write is a safe compatibility fallback. Transport loss
-            // never falls back because the new operation may have landed.
-            Err(HolderError::Rejected(_)) => self.write(data),
-            Err(error) => Err(error),
-        }
+        self.request(&request).map(drop)
     }
 
     pub fn accepted_delivery(&self, delivery_id: &str) -> HolderResult<bool> {

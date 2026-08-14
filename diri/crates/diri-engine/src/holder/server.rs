@@ -563,6 +563,7 @@ fn current_stat(shared: &Shared) -> HolderStat {
             .iter()
             .cloned()
             .collect(),
+        delivery_receipts: true,
     }
 }
 

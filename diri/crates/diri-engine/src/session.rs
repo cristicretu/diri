@@ -1444,6 +1444,13 @@ impl Session {
         }
     }
 
+    pub fn uncertain_delivery(&self, operation_id: &str) -> bool {
+        match &self.transport {
+            Transport::Remote(client) => client.uncertain_delivery(operation_id),
+            Transport::Direct(_) | Transport::Held(_) => false,
+        }
+    }
+
     fn write_delivery_input(&self, bytes: &[u8], operation_id: &str) -> std::io::Result<()> {
         self.shared.note_hot();
         self.shared.grid_wake.prioritize_interactive_changes();
@@ -2071,16 +2078,7 @@ fn handle_remote_message(
         RemoteMessage::HelloAck(acknowledgement) => {
             if *hello_accepted
                 || client.validate_hello(&acknowledgement).is_err()
-                || client
-                    .accept_hello(
-                        generation,
-                        acknowledgement.controller_epoch,
-                        &acknowledgement.accepted_delivery_ids,
-                        acknowledgement
-                            .capabilities
-                            .contains(&diri_proto::remote_pty::RemoteCapability::DeliveryReceipts),
-                    )
-                    .is_err()
+                || client.accept_hello(generation, &acknowledgement).is_err()
             {
                 return RemoteConnectionDisposition::Fatal;
             }
@@ -2156,6 +2154,10 @@ fn handle_remote_message(
         }
         RemoteMessage::DeliveryAccepted(accepted) => {
             client.complete_delivery(accepted.delivery_id);
+            RemoteConnectionDisposition::Continue
+        }
+        RemoteMessage::DeliveryUncertain(uncertain) => {
+            client.mark_delivery_uncertain(uncertain.delivery_id);
             RemoteConnectionDisposition::Continue
         }
         RemoteMessage::Error(error) if error.fatal => RemoteConnectionDisposition::Fatal,

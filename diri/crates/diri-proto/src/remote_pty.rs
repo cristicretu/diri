@@ -18,8 +18,12 @@ use crate::grid::{GridCodecError, GridUpdate};
 use crate::terminal::MouseModes;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 5;
+// Protocol 1.5 is independently assigned to negotiated application-cursor
+// input. Delivery receipts therefore occupy 1.6 when the two additive
+// branches are combined; capability negotiation remains the runtime gate.
+pub const PROTOCOL_MINOR: u16 = 6;
 pub const MOUSE_INPUT_PROTOCOL_MINOR: u16 = 4;
+pub const DELIVERY_RECEIPT_PROTOCOL_MINOR: u16 = 6;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_ARGUMENTS: usize = 512;
 pub const MAX_ENVIRONMENT_VARIABLES: usize = 4096;
@@ -50,6 +54,7 @@ const KIND_SCROLLBACK_REQUEST: u8 = 43;
 const KIND_SCROLLBACK_RESPONSE: u8 = 44;
 const KIND_DELIVERY_INPUT: u8 = 45;
 const KIND_DELIVERY_ACCEPTED: u8 = 46;
+const KIND_DELIVERY_UNCERTAIN: u8 = 47;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -259,6 +264,8 @@ pub struct HelloAck {
     pub snapshot_sequence: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accepted_delivery_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uncertain_delivery_ids: Vec<String>,
 }
 
 impl HelloAck {
@@ -633,6 +640,8 @@ pub struct SessionInspection {
     pub persistence: PersistenceCapability,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accepted_delivery_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uncertain_delivery_ids: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -764,6 +773,14 @@ pub struct DeliveryAccepted {
     pub delivery_id: String,
 }
 
+/// A prior Holder durably prepared this operation but did not durably record
+/// its PTY outcome. The controller must never retry its bytes automatically.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryUncertain {
+    pub delivery_id: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RemoteMessage {
     Terminal(Frame),
@@ -781,6 +798,7 @@ pub enum RemoteMessage {
     ScrollbackResponse(ScrollbackResponse),
     DeliveryInput(DeliveryInput),
     DeliveryAccepted(DeliveryAccepted),
+    DeliveryUncertain(DeliveryUncertain),
     Error(RemoteError),
 }
 
@@ -973,6 +991,10 @@ impl RemoteCodec {
             RemoteMessage::DeliveryAccepted(value) => {
                 validate_identifier("delivery id", &value.delivery_id)?;
                 append_json(KIND_DELIVERY_ACCEPTED, value, output, start)
+            }
+            RemoteMessage::DeliveryUncertain(value) => {
+                validate_identifier("delivery id", &value.delivery_id)?;
+                append_json(KIND_DELIVERY_UNCERTAIN, value, output, start)
             }
             RemoteMessage::Error(value) => append_json(KIND_ERROR, value, output, start),
         })();
@@ -1183,6 +1205,11 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
             validate_identifier("delivery id", &value.delivery_id)?;
             Ok(RemoteMessage::DeliveryAccepted(value))
         }
+        KIND_DELIVERY_UNCERTAIN => {
+            let value: DeliveryUncertain = decode_json(kind, payload)?;
+            validate_identifier("delivery id", &value.delivery_id)?;
+            Ok(RemoteMessage::DeliveryUncertain(value))
+        }
         KIND_ERROR => Ok(RemoteMessage::Error(decode_json(kind, payload)?)),
         _ => Err(RemoteCodecError::UnknownMessageType(kind)),
     }
@@ -1190,7 +1217,7 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
 
 fn validate_kind(kind: u8) -> Result<(), RemoteCodecError> {
     if (1..=FrameType::Mouse as u8).contains(&kind)
-        || (KIND_HELLO..=KIND_DELIVERY_ACCEPTED).contains(&kind)
+        || (KIND_HELLO..=KIND_DELIVERY_UNCERTAIN).contains(&kind)
     {
         Ok(())
     } else {
@@ -1363,7 +1390,10 @@ mod tests {
         let accepted = RemoteMessage::DeliveryAccepted(DeliveryAccepted {
             delivery_id: "run-7-abcdef".into(),
         });
-        for message in [input, accepted] {
+        let uncertain = RemoteMessage::DeliveryUncertain(DeliveryUncertain {
+            delivery_id: "run-7-abcdef".into(),
+        });
+        for message in [input, accepted, uncertain] {
             let encoded = RemoteCodec::encode(&message).expect("encode");
             assert!(encoded[0] > KIND_SCROLLBACK_RESPONSE);
             assert_eq!(

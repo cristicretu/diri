@@ -71,6 +71,14 @@ pub struct Registry {
     record_versions: HashMap<String, u64>,
 }
 
+#[derive(Clone, Debug)]
+struct RunTransactionSnapshot {
+    orchestration: Orchestration,
+    record: Option<SessionRecord>,
+    dirty: bool,
+    version: Option<u64>,
+}
+
 /// How long consecutive persists coalesce. Matches the Swift daemon's
 /// `PersistenceStore` debounce.
 const PERSIST_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
@@ -657,6 +665,17 @@ impl Registry {
         else {
             return false;
         };
+        // A replacement remote Holder can prove only that the predecessor
+        // prepared this operation before its PTY side effect. Preserve the
+        // failed tombstone forever; in particular, output activity must not
+        // promote an explicitly uncertain restart window to accepted.
+        if self
+            .sessions
+            .get(id)
+            .is_some_and(|session| session.uncertain_delivery(&operation_id))
+        {
+            return false;
+        }
         if !self
             .sessions
             .get(id)
@@ -790,6 +809,127 @@ impl Registry {
         }
     }
 
+    fn run_transaction_snapshot(&self, id: &str) -> RunTransactionSnapshot {
+        RunTransactionSnapshot {
+            orchestration: self.orchestration.clone(),
+            record: self.records.get(id).cloned(),
+            dirty: self.dirty,
+            version: self.record_versions.get(id).copied(),
+        }
+    }
+
+    fn restore_run_transaction(&mut self, id: &str, snapshot: RunTransactionSnapshot) {
+        self.orchestration = snapshot.orchestration;
+        match snapshot.record {
+            Some(record) => {
+                self.records.insert(id.to_owned(), record);
+            }
+            None => {
+                self.records.remove(id);
+            }
+        }
+        self.dirty = snapshot.dirty;
+        match snapshot.version {
+            Some(version) => {
+                self.record_versions.insert(id.to_owned(), version);
+            }
+            None => {
+                self.record_versions.remove(id);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_delivery_transaction(
+        &mut self,
+        id: &str,
+        view: &SessionView,
+        completion_seq: u64,
+        text: String,
+        submit: bool,
+        expected_run_id: Option<u64>,
+        allow_needs_input: bool,
+        request_id: Option<&str>,
+        request_fingerprint: Option<&str>,
+    ) -> Result<(crate::orchestration::DeliveryPlan, RunTransactionSnapshot), RegistryRunError>
+    {
+        let snapshot = self.run_transaction_snapshot(id);
+        let result = self
+            .records
+            .get_mut(id)
+            .ok_or_else(|| RegistryRunError::NotFound(id.to_owned()))
+            .and_then(|record| {
+                let previous_run = record.run.clone();
+                let result = self
+                    .orchestration
+                    .prepare_delivery(
+                        record,
+                        DeliveryRequest {
+                            status: &view.status,
+                            needs_input: view.needs_input.as_ref(),
+                            completion_seq,
+                            output_offset: view.tail_offset,
+                            expected_run_id,
+                            text,
+                            submit,
+                            allow_needs_input,
+                            request_id,
+                            request_fingerprint,
+                        },
+                    )
+                    .map_err(RegistryRunError::from);
+                if result.is_ok() && record.run != previous_run {
+                    apply_run_transition_metadata(record);
+                }
+                result
+            });
+        match result {
+            Ok(plan) => Ok((plan, snapshot)),
+            Err(error) => {
+                self.restore_run_transaction(id, snapshot);
+                Err(error)
+            }
+        }
+    }
+
+    fn prepare_interrupt_transaction(
+        &mut self,
+        id: &str,
+        view: &SessionView,
+        completion_seq: u64,
+        expected_run_id: Option<u64>,
+        request_id: Option<&str>,
+        request_fingerprint: Option<&str>,
+    ) -> Result<RunTransactionSnapshot, RegistryRunError> {
+        let snapshot = self.run_transaction_snapshot(id);
+        let result = self
+            .records
+            .get_mut(id)
+            .ok_or_else(|| RegistryRunError::NotFound(id.to_owned()))
+            .and_then(|record| {
+                if self.orchestration.observe(
+                    record,
+                    &view.status,
+                    view.needs_input.as_ref(),
+                    completion_seq,
+                    view.tail_offset,
+                ) {
+                    apply_run_transition_metadata(record);
+                }
+                self.orchestration
+                    .prepare_interrupt(record, expected_run_id, request_id, request_fingerprint)
+                    .map(drop)
+                    .map_err(RegistryRunError::from)
+            });
+        match result {
+            Ok(()) => Ok(snapshot),
+            Err(error) => {
+                self.restore_run_transaction(id, snapshot);
+                Err(error)
+            }
+        }
+    }
+
     /// Sends now only at a manifest-derived safe input state; otherwise keeps
     /// the message FIFO inside the Engine across MCP process reconnects.
     pub fn send_run_text(
@@ -837,31 +977,17 @@ impl Registry {
             .get(id)
             .map(|session| (session.view(), session.turn_completion_seq()))
             .ok_or_else(|| RegistryRunError::NotFound(id.to_owned()))?;
-        let orchestration_before = self.orchestration.clone();
-        let run_before = self.records.get(id).and_then(|record| record.run.clone());
-        let dirty_before = self.dirty;
-        let version_before = self.record_versions.get(id).copied();
-        let plan = {
-            let record = self
-                .records
-                .get_mut(id)
-                .ok_or_else(|| RegistryRunError::NotFound(id.to_owned()))?;
-            self.orchestration.prepare_delivery(
-                record,
-                DeliveryRequest {
-                    status: &view.status,
-                    needs_input: view.needs_input.as_ref(),
-                    completion_seq,
-                    output_offset: view.tail_offset,
-                    expected_run_id,
-                    text: text.clone(),
-                    submit,
-                    allow_needs_input,
-                    request_id: request_id.as_deref(),
-                    request_fingerprint: fingerprint.as_deref(),
-                },
-            )?
-        };
+        let (plan, transaction_before) = self.prepare_delivery_transaction(
+            id,
+            &view,
+            completion_seq,
+            text.clone(),
+            submit,
+            expected_run_id,
+            allow_needs_input,
+            request_id.as_deref(),
+            fingerprint.as_deref(),
+        )?;
         let mut intent_snapshot = None;
         if !plan.queued {
             // All agent deliveries use the same two-phase outbox as queued
@@ -869,19 +995,7 @@ impl Registry {
             // uncertainty but can never silently forget or duplicate it.
             self.dirty = true;
             if let Err(error) = self.persist_intent_now() {
-                self.orchestration = orchestration_before;
-                if let Some(record) = self.records.get_mut(id) {
-                    record.run = run_before;
-                }
-                self.dirty = dirty_before;
-                match version_before {
-                    Some(version) => {
-                        self.record_versions.insert(id.to_owned(), version);
-                    }
-                    None => {
-                        self.record_versions.remove(id);
-                    }
-                }
+                self.restore_run_transaction(id, transaction_before);
                 return Err(RegistryRunError::Io(error));
             }
             intent_snapshot = Some((
@@ -929,19 +1043,7 @@ impl Registry {
         // an MCP process or daemon restart.
         if let Err(error) = self.persist_intent_now() {
             if plan.queued {
-                self.orchestration = orchestration_before;
-                if let Some(record) = self.records.get_mut(id) {
-                    record.run = run_before;
-                }
-                self.dirty = dirty_before;
-                match version_before {
-                    Some(version) => {
-                        self.record_versions.insert(id.to_owned(), version);
-                    }
-                    None => {
-                        self.record_versions.remove(id);
-                    }
-                }
+                self.restore_run_transaction(id, transaction_before);
                 return Err(RegistryRunError::Io(error));
             }
             // Disk still contains the pre-side-effect intent. Mirror that
@@ -1129,51 +1231,22 @@ impl Registry {
             None => {}
         }
         self.sync_orchestration_for(id);
-        let orchestration_before = self.orchestration.clone();
-        let run_before = self.records.get(id).and_then(|record| record.run.clone());
-        let dirty_before = self.dirty;
-        let version_before = self.record_versions.get(id).copied();
         let (view, completion_seq) = self
             .sessions
             .get(id)
             .map(|session| (session.view(), session.turn_completion_seq()))
             .ok_or_else(|| RegistryRunError::NotFound(id.to_owned()))?;
-        {
-            let record = self
-                .records
-                .get_mut(id)
-                .ok_or_else(|| RegistryRunError::NotFound(id.to_owned()))?;
-            if self.orchestration.observe(
-                record,
-                &view.status,
-                view.needs_input.as_ref(),
-                completion_seq,
-                view.tail_offset,
-            ) {
-                apply_run_transition_metadata(record);
-            }
-            self.orchestration.prepare_interrupt(
-                record,
-                expected_run_id,
-                request_id.as_deref(),
-                fingerprint.as_deref(),
-            )?;
-        }
+        let transaction_before = self.prepare_interrupt_transaction(
+            id,
+            &view,
+            completion_seq,
+            expected_run_id,
+            request_id.as_deref(),
+            fingerprint.as_deref(),
+        )?;
         self.dirty = true;
         if let Err(error) = self.persist_intent_now() {
-            self.orchestration = orchestration_before;
-            if let Some(record) = self.records.get_mut(id) {
-                record.run = run_before;
-            }
-            self.dirty = dirty_before;
-            match version_before {
-                Some(version) => {
-                    self.record_versions.insert(id.to_owned(), version);
-                }
-                None => {
-                    self.record_versions.remove(id);
-                }
-            }
+            self.restore_run_transaction(id, transaction_before);
             return Err(RegistryRunError::Io(error));
         }
         let orchestration_intent = self.orchestration.clone();
@@ -2111,6 +2184,180 @@ mod tests {
             .expect("manifests");
         let (engine, _) = ManifestEngine::load_dir(&dir).expect("load");
         Arc::new(engine)
+    }
+
+    fn view(id: &str, status: SessionStatus, tail_offset: u64) -> SessionView {
+        SessionView {
+            id: id.into(),
+            status,
+            status_evidence: None,
+            needs_input: None,
+            title: None,
+            title_source: None,
+            tail_offset,
+            exited: false,
+        }
+    }
+
+    #[test]
+    fn stale_delivery_rolls_back_a_fresh_raw_successor_for_the_event_sync() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let mut agent = record("s_agent");
+        agent.kind = AgentKind::CODEX;
+        agent.status = SessionStatus::Idle;
+        agent.run = Some(AgentRun {
+            id: 1,
+            state: AgentRunState::Completed,
+            started_at: DateMillis(1.0),
+            finished_at: Some(DateMillis(2.0)),
+            terminal_outcome: Some("completed".into()),
+        });
+        registry.records.insert("s_agent".into(), agent.clone());
+        registry
+            .orchestration
+            .register(&agent, 0, &SessionStatus::Idle);
+        let working = view("s_agent", SessionStatus::Working, 10);
+
+        let error = registry
+            .prepare_delivery_transaction(
+                "s_agent",
+                &working,
+                0,
+                "stale".into(),
+                true,
+                Some(1),
+                true,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RegistryRunError::Stale {
+                expected: 1,
+                current: 2
+            }
+        ));
+        assert_eq!(registry.records["s_agent"].run.as_ref().unwrap().id, 1);
+        assert!(registry.orchestration.observe(
+            registry.records.get_mut("s_agent").unwrap(),
+            &working.status,
+            None,
+            0,
+            working.tail_offset,
+        ));
+        assert_eq!(registry.records["s_agent"].run.as_ref().unwrap().id, 2);
+    }
+
+    #[test]
+    fn stale_interrupt_rolls_back_a_fresh_raw_successor_for_the_event_sync() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let mut agent = record("s_agent");
+        agent.kind = AgentKind::CODEX;
+        agent.status = SessionStatus::Idle;
+        agent.run = Some(AgentRun {
+            id: 1,
+            state: AgentRunState::Completed,
+            started_at: DateMillis(1.0),
+            finished_at: Some(DateMillis(2.0)),
+            terminal_outcome: Some("completed".into()),
+        });
+        registry.records.insert("s_agent".into(), agent.clone());
+        registry
+            .orchestration
+            .register(&agent, 0, &SessionStatus::Idle);
+        let working = view("s_agent", SessionStatus::Working, 10);
+
+        let error = registry
+            .prepare_interrupt_transaction("s_agent", &working, 0, Some(1), None, None)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RegistryRunError::Stale {
+                expected: 1,
+                current: 2
+            }
+        ));
+        assert_eq!(registry.records["s_agent"].run.as_ref().unwrap().id, 1);
+        assert!(registry.orchestration.observe(
+            registry.records.get_mut("s_agent").unwrap(),
+            &working.status,
+            None,
+            0,
+            working.tail_offset,
+        ));
+        assert_eq!(registry.records["s_agent"].run.as_ref().unwrap().id, 2);
+    }
+
+    #[test]
+    fn failed_report_replay_commit_keeps_only_the_durable_parent_evidence() {
+        let temp = tempfile::tempdir().expect("temp");
+        let blocked_parent = temp.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, b"file").expect("blocking file");
+        let mut registry = Registry::new(engine(), blocked_parent.join("state.json"));
+        let mut reporter = record("reporter");
+        reporter.kind = AgentKind::CODEX;
+        reporter.parent = Some(SessionId::new("parent"));
+        registry.records.insert("reporter".into(), reporter);
+
+        let request_id = "report-1";
+        let text = "finished";
+        let internal_request_id =
+            format!("report:{}", request_fingerprint(&("reporter", request_id)));
+        let internal_fingerprint =
+            request_fingerprint(&("parent", text, true, Option::<u64>::None, false));
+        registry
+            .orchestration
+            .remember_replay(
+                "parent",
+                ReplayOperation::Delivery,
+                Some(&internal_request_id),
+                Some(&internal_fingerprint),
+                ReplayOutcome::Delivery {
+                    queued: true,
+                    run: Some(AgentRun::starting(2, DateMillis(3.0))),
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            registry.report_to_parent(
+                "reporter",
+                text.into(),
+                true,
+                Some(1),
+                Some(request_id.into())
+            ),
+            Err(RegistryRunError::Io(_))
+        ));
+        let outer_fingerprint = request_fingerprint(&("reporter", text, true, Some(1_u64)));
+        assert!(
+            registry
+                .orchestration
+                .lookup_replay(
+                    "reporter",
+                    ReplayOperation::Report,
+                    Some(request_id),
+                    Some(&outer_fingerprint)
+                )
+                .unwrap()
+                .is_none(),
+            "an uncommitted success must not replay in this process"
+        );
+        assert!(matches!(
+            registry
+                .orchestration
+                .lookup_replay(
+                    "parent",
+                    ReplayOperation::Delivery,
+                    Some(&internal_request_id),
+                    Some(&internal_fingerprint)
+                )
+                .unwrap(),
+            Some(ReplayOutcome::Delivery { queued: true, .. })
+        ));
     }
 
     #[test]
