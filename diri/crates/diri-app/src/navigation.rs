@@ -1279,9 +1279,14 @@ const fn command_row_child_index(
         child += 1;
     }
     if row >= session_count {
-        if show_quick_section && quick_count > 0 {
-            child += 1;
-        } else if !show_quick_section && action_count > 0 {
+        // Whichever section comes first below the chats contributes a header:
+        // the quick actions when they are shown, the command list otherwise.
+        let leading_count = if show_quick_section {
+            quick_count
+        } else {
+            action_count
+        };
+        if leading_count > 0 {
             child += 1;
         }
         if show_quick_section && row >= session_count + quick_count && action_count > quick_count {

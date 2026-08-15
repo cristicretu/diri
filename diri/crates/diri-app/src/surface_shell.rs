@@ -9,7 +9,7 @@ use crate::delegation::worktree_move_proposal;
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::query_label;
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
-use crate::settings::{HostDraft, SettingsTab, theme};
+use crate::settings::{HostDraft, SettingsNav, SettingsTab, theme};
 use crate::sidebar::DraggedSidebarItem;
 use crate::store::{Prefs, SessionStore, StoreRuntime};
 use crate::updates::{UpdateCommand, UpdateHandle, UpdatePhase};
@@ -33,9 +33,6 @@ use crate::commands::{
     ToggleHistory, UTILITY_CONTEXT,
 };
 const SETTINGS_CONTENT_MAX_WIDTH: f32 = 760.0;
-/// Settings is its own destination with a stable navigation measure. It must
-/// not inherit a workspace sidebar width the user enlarged for long sessions.
-const SETTINGS_RAIL_WIDTH: f32 = 248.0;
 const SETTINGS_TRANSITION_DURATION: Duration = Duration::from_millis(190);
 const SETTINGS_SECTION_GAP: f32 = 16.0;
 const SETTINGS_ROW_HEIGHT: f32 = 50.0;
@@ -1071,6 +1068,52 @@ impl UtilitySurfaces {
             .collect()
     }
 
+    pub(crate) fn is_settings_open(&self) -> bool {
+        self.surface == Surface::Settings
+    }
+
+    /// What the app sidebar paints while settings owns the workbench. `None`
+    /// puts the sidebar back on sessions.
+    pub(crate) fn settings_nav(&self) -> Option<SettingsNav> {
+        (self.surface == Surface::Settings).then(|| SettingsNav {
+            tabs: self.visible_settings_tabs(),
+            active: self.settings_tab,
+            search: self.settings_search.clone(),
+            search_active: self.settings_search_active,
+        })
+    }
+
+    /// The sidebar rendered the navigation, so it is the sidebar that reports
+    /// a click on it. Every other entry point into a page goes through the
+    /// same method.
+    pub(crate) fn open_settings_tab(&mut self, tab: SettingsTab, cx: &mut Context<Self>) {
+        if self.surface != Surface::Settings {
+            return;
+        }
+        self.select_settings_tab(tab, cx);
+    }
+
+    /// Clicking the sidebar's search field types into settings, so keyboard
+    /// focus has to come back across with it.
+    pub(crate) fn focus_settings_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.surface != Surface::Settings {
+            return;
+        }
+        self.settings_search_active = true;
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn clear_settings_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.surface != Surface::Settings {
+            return;
+        }
+        self.settings_search.clear();
+        self.settings_search_active = true;
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
     fn select_settings_tab(&mut self, tab: SettingsTab, cx: &mut Context<Self>) {
         if self.settings_tab != tab {
             self.settings_scroll.set_offset(point(px(0.0), px(0.0)));
@@ -1767,240 +1810,24 @@ impl UtilitySurfaces {
         /* ─────────────────────────────────────────────────────────
          * SETTINGS SHELL STORYBOARD
          *
-         *    0ms   workbench is replaced in place; rail begins 8px left
-         *   70ms   settings rail is legible; canvas follows from 12px right
-         *  190ms   both surfaces settle at their final positions and opacity
+         *    0ms   the workbench is replaced in place; the app sidebar swaps
+         *          its own body over to settings navigation
+         *   70ms   the page follows the navigation in, from 12px right
+         *  190ms   both surfaces settle at their final position and opacity
          *
-         * Navigation stays spatially anchored to the old sidebar. Reduced
-         * motion mounts the final layout immediately.
+         * Navigation is deliberately absent here: it is the window sidebar,
+         * which this surface is inset against, so settings never paints a
+         * second rail beside the app's own. Reduced motion mounts the final
+         * layout immediately.
          * ───────────────────────────────────────────────────────── */
         let colors = self.settings_colors();
-        let visible_tabs = self.visible_settings_tabs();
-        let mut tabs = div().flex().flex_col();
-        let mut personal_started = false;
-        let mut system_started = false;
-        for tab in visible_tabs.iter().copied() {
-            let personal = matches!(
-                tab,
-                SettingsTab::General | SettingsTab::Agents | SettingsTab::Terminal
-            );
-            if personal && !personal_started {
-                tabs = tabs.child(settings_nav_section_header("Personal", 8.0, colors));
-                personal_started = true;
-            } else if !personal && !system_started {
-                tabs = tabs.child(settings_nav_section_header(
-                    "System",
-                    if personal_started { 14.0 } else { 8.0 },
-                    colors,
-                ));
-                system_started = true;
-            }
-            let selected = tab == self.settings_tab;
-            tabs = tabs.child(
-                div()
-                    .id(SharedString::from(format!("settings-{}", tab.label())))
-                    .debug_selector(move || format!("SETTINGS_TAB_{}", tab.label()))
-                    .h(px(30.0))
-                    .px(px(8.0))
-                    .rounded(px(Radius::ROW))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .bg(Fill::selected(colors, selected))
-                    .text_color(if selected {
-                        colors.primary
-                    } else {
-                        colors.secondary
-                    })
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(Fill::hover(colors, true)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_settings_tab(tab, cx);
-                    }))
-                    .child(
-                        div()
-                            .w(px(16.0))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(sf_symbol(
-                                tab.icon(),
-                                12.0,
-                                if selected {
-                                    colors.primary
-                                } else {
-                                    colors.tertiary
-                                },
-                            )),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(Typo::ROW.size))
-                            .font_weight(if selected {
-                                FontWeight::MEDIUM
-                            } else {
-                                FontWeight::NORMAL
-                            })
-                            .child(tab.label()),
-                    ),
-            );
-        }
-        if visible_tabs.is_empty() {
-            tabs = tabs.child(
-                div()
-                    .px(px(10.0))
-                    .pt(px(14.0))
-                    .text_size(px(Typo::META.size))
-                    .text_color(colors.tertiary)
-                    .child("No settings found"),
-            );
-        }
-        let search_content = if self.settings_search_active {
-            query_label(&self.settings_search)
-        } else if self.settings_search.is_empty() {
-            div()
-                .text_color(colors.tertiary)
-                .child("Search settings…")
-                .into_any_element()
-        } else {
-            div()
-                .text_color(colors.primary)
-                .child(self.settings_search.text().to_owned())
-                .into_any_element()
-        };
-        let search = div()
-            .id("settings-search")
-            .debug_selector(|| "settings-search".into())
-            .h(px(32.0))
-            .mx(px(4.0))
-            .mt(px(8.0))
-            .px(px(9.0))
-            .rounded(px(16.0))
-            .border_1()
-            .border_color(colors.primary.alpha(if self.settings_search_active {
-                0.22
-            } else {
-                0.11
-            }))
-            .bg(colors.primary.alpha(0.025))
-            .flex()
-            .items_center()
-            .gap(px(7.0))
-            .cursor(CursorStyle::IBeam)
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.settings_search_active = true;
-                this.focus.focus(window, cx);
-                cx.notify();
-            }))
-            .child(sf_symbol("magnifyingglass", 12.0, colors.tertiary))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .text_size(px(Typo::ROW.size))
-                    .child(search_content),
-            )
-            .when(!self.settings_search.is_empty(), |search| {
-                search.child(
-                    div()
-                        .id("clear-settings-search")
-                        .debug_selector(|| "clear-settings-search".into())
-                        .size(px(18.0))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_full()
-                        .cursor_pointer()
-                        .hover(move |style| style.bg(Fill::subtle(colors)))
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.settings_search.clear();
-                            this.settings_search_active = true;
-                            cx.notify();
-                        }))
-                        .child(sf_symbol("xmark", 8.0, colors.tertiary)),
-                )
-            });
+        let generation = self.settings_transition_generation;
         let pane = match self.settings_tab {
             SettingsTab::General => self.general_settings(cx).into_any_element(),
             SettingsTab::Agents => self.agents_settings(cx).into_any_element(),
             SettingsTab::Terminal => self.terminal_settings(cx).into_any_element(),
             SettingsTab::Resources => self.resource_settings(cx).into_any_element(),
             SettingsTab::Remote => self.remote_settings(cx).into_any_element(),
-        };
-        let generation = self.settings_transition_generation;
-        let rail = div()
-            .id("settings-rail")
-            .debug_selector(|| "settings-rail".into())
-            .relative()
-            .w(px(SETTINGS_RAIL_WIDTH))
-            .h_full()
-            .bg(colors.sidebar_surface())
-            .border_r_1()
-            .border_color(colors.primary.alpha(0.07))
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .pt(px(6.0))
-                    .child(
-                        div()
-                            .id("close-settings")
-                            .debug_selector(|| "close-settings".into())
-                            .h(px(30.0))
-                            .mx(px(12.0))
-                            .px(px(8.0))
-                            .rounded(px(Radius::ROW))
-                            .flex()
-                            .items_center()
-                            .gap(px(7.0))
-                            .cursor_pointer()
-                            .hover(move |style| style.bg(Fill::subtle(colors)))
-                            .on_click(cx.listener(|this, _, _, cx| this.close_surface(cx)))
-                            .child(sf_symbol("chevron.left", 9.5, colors.tertiary))
-                            .child(
-                                div()
-                                    .text_size(px(Typo::META.size))
-                                    .text_color(colors.secondary)
-                                    .child("Back to app"),
-                            ),
-                    )
-                    .child(search),
-            )
-            .child(
-                div()
-                    .id("settings-nav-scroll")
-                    .px(px(4.0))
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_y_scroll()
-                    .child(tabs),
-            )
-            .child(
-                div()
-                    .px(px(Metrics::TOOLBAR_EDGE_INSET))
-                    .pb(px(12.0))
-                    .text_size(px(Typo::META.size))
-                    .text_color(colors.tertiary)
-                    .child(format!("diri {}", crate::updates::CURRENT_VERSION)),
-            );
-        let rail = if cx.reduce_motion() {
-            rail.into_any_element()
-        } else {
-            rail.with_animation(
-                SharedString::from(format!("settings-rail-enter-{generation}")),
-                Animation::new(SETTINGS_TRANSITION_DURATION).with_easing(ease_out_quint()),
-                |rail, delta| {
-                    rail.left(px((1.0 - delta) * -8.0))
-                        .opacity(0.72 + 0.28 * delta)
-                },
-            )
-            .into_any_element()
         };
         let pane = div()
             .id("settings-pane")
@@ -2041,8 +1868,9 @@ impl UtilitySurfaces {
             .overflow_hidden()
             .bg(colors.background)
             .flex()
-            // Settings owns the whole workbench. Clicking inside still closes
-            // any open select before the clicked control handles its action.
+            // Settings owns the workbench beside the sidebar. Clicking inside
+            // still closes any open select before the clicked control handles
+            // its action.
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -2052,7 +1880,6 @@ impl UtilitySurfaces {
                     cx.stop_propagation();
                 }),
             )
-            .child(rail)
             .child(pane)
     }
 
@@ -4537,22 +4364,6 @@ fn settings_tab_matches(tab: SettingsTab, query: &str) -> bool {
         .all(|word| searchable.contains(word))
 }
 
-fn settings_nav_section_header(
-    title: &'static str,
-    top_padding: f32,
-    colors: SemanticColors,
-) -> AnyElement {
-    div()
-        .px(px(8.0))
-        .pt(px(top_padding))
-        .pb(px(5.0))
-        .text_size(px(Typo::SECTION_HEADER.size))
-        .font_weight(Typo::SECTION_HEADER.weight)
-        .text_color(colors.tertiary)
-        .child(title)
-        .into_any_element()
-}
-
 fn settings_page(
     title: &'static str,
     content: impl IntoElement,
@@ -4935,8 +4746,9 @@ mod tests {
             .expect("save diagnostics screenshot");
     }
 
-    /// Renders the full settings workbench after its entrance transition, so
-    /// layout and visual hierarchy can be reviewed without live user state.
+    /// Renders the full settings destination -- navigation in the app sidebar,
+    /// page beside it -- after its entrance transition, so layout and visual
+    /// hierarchy can be reviewed without live user state.
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "writes the deterministic settings-shell screenshot artifact"]
@@ -4950,32 +4762,30 @@ mod tests {
             Arc::new(diri_ui::IconAssets),
             gpui_platform::current_headless_renderer,
         );
-        cx.update(|cx| crate::fonts::init(cx));
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            // Entrance animations run on the wall clock, which a headless
+            // capture does not advance. Reduced motion mounts the settled
+            // layout, which is the only thing a still image can show anyway.
+            cx.set_reduce_motion(true);
+        });
 
-        let runtime = Arc::new(StoreRuntime::inert());
-        let tokio = Arc::new(
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("test runtime"),
-        );
-        let updates = crate::updates::inert();
         let window = cx
             .open_window(size(px(1200.0), px(800.0)), move |window, cx| {
-                let surfaces = cx.new(|cx| {
-                    let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
-                    surfaces.open_settings(cx);
-                    // Exercise the user-reported state: Remote selected after
-                    // the workspace sidebar had previously been widened.
-                    surfaces.settings_tab = SettingsTab::Remote;
-                    surfaces.prefs.sidebar_width = 400.0;
-                    surfaces
+                // Exercise the user-reported state: Remote selected, from a
+                // sidebar the user had previously widened.
+                let harness =
+                    cx.new(|cx| SettingsWorkbenchHarness::open_at(SettingsTab::Remote, window, cx));
+                harness.update(cx, |harness, cx| {
+                    harness
+                        .sidebar
+                        .update(cx, |sidebar, cx| sidebar.set_width(320.0, cx));
                 });
-                cx.new(|_| CachedOverlayHarness { surfaces })
+                harness
             })
             .expect("open headless settings window");
         cx.run_until_parked();
-        cx.advance_clock(SETTINGS_TRANSITION_DURATION + Duration::from_millis(10));
+        cx.advance_clock(SETTINGS_TRANSITION_DURATION + Duration::from_millis(300));
         cx.update_window(window.into(), |_, window, _| window.refresh())
             .expect("refresh settings window");
         cx.run_until_parked();
@@ -5047,6 +4857,115 @@ mod tests {
 
     struct CachedSettingsModalHarness {
         surfaces: Entity<UtilitySurfaces>,
+    }
+
+    /// Settings as the window actually composes it: the app sidebar paints the
+    /// navigation, and the page is laid out beside it rather than over it.
+    struct SettingsWorkbenchHarness {
+        sidebar: Entity<crate::sidebar::Sidebar>,
+        surfaces: Entity<UtilitySurfaces>,
+        _subscriptions: [gpui::Subscription; 2],
+    }
+
+    impl SettingsWorkbenchHarness {
+        fn open(window: &mut Window, cx: &mut Context<Self>) -> Self {
+            Self::open_at(SettingsTab::General, window, cx)
+        }
+
+        fn open_at(tab: SettingsTab, window: &mut Window, cx: &mut Context<Self>) -> Self {
+            let runtime = Arc::new(StoreRuntime::inert());
+            let tokio = Arc::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime"),
+            );
+            let sidebar = cx.new(|cx| {
+                crate::sidebar::Sidebar::new(
+                    Some(Arc::clone(&runtime)),
+                    false,
+                    crate::sidebar::PreviewScenario::Typical,
+                    cx,
+                )
+            });
+            let surfaces = cx.new(|cx| {
+                let mut surfaces = UtilitySurfaces::new(
+                    Arc::clone(&runtime),
+                    tokio,
+                    crate::updates::inert(),
+                    window,
+                    cx,
+                );
+                surfaces.open_settings(cx);
+                surfaces.settings_tab = tab;
+                surfaces
+            });
+            // RootView re-renders on the sidebar's own events; this harness
+            // only needs to notice its measure change.
+            cx.observe(&sidebar, |_, _, cx| cx.notify()).detach();
+            let subscriptions = crate::root::wire_settings_navigation(
+                sidebar.clone(),
+                surfaces.clone(),
+                window,
+                cx,
+            );
+            // The mirror runs on notifies; settings was already open before
+            // anything was watching it.
+            let nav = surfaces.read(cx).settings_nav();
+            sidebar.update(cx, |sidebar, cx| sidebar.set_settings_nav(nav, cx));
+            Self {
+                sidebar,
+                surfaces,
+                _subscriptions: subscriptions,
+            }
+        }
+
+        fn sidebar_width(&self, cx: &App) -> f32 {
+            let sidebar = self.sidebar.read(cx);
+            if sidebar.is_visible() {
+                sidebar.width()
+            } else {
+                0.0
+            }
+        }
+    }
+
+    impl Render for SettingsWorkbenchHarness {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let seam = self.sidebar_width(cx);
+            div()
+                .size_full()
+                .flex()
+                .child(
+                    div().flex_none().w(px(seam)).h_full().child(
+                        self.sidebar
+                            .clone()
+                            .cached(StyleRefinement::default().size_full()),
+                    ),
+                )
+                .child(
+                    self.surfaces.clone().cached(
+                        StyleRefinement::default()
+                            .absolute()
+                            .inset_0()
+                            .left(px(seam)),
+                    ),
+                )
+        }
+    }
+
+    fn open_settings_workbench(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<SettingsWorkbenchHarness>,
+        &mut gpui::VisualTestContext,
+    ) {
+        let (harness, cx) = cx.add_window_view(SettingsWorkbenchHarness::open);
+        cx.simulate_resize(size(px(1200.0), px(800.0)));
+        cx.executor()
+            .advance_clock(SETTINGS_TRANSITION_DURATION + Duration::from_millis(300));
+        cx.run_until_parked();
+        (harness, cx)
     }
 
     struct SettingRowHarness;
@@ -5476,82 +5395,83 @@ mod tests {
     }
 
     #[gpui::test]
-    fn settings_shell_keeps_the_sidebar_rail_in_the_cached_wrapper(cx: &mut TestAppContext) {
-        let runtime = Arc::new(StoreRuntime::inert());
-        let tokio = Arc::new(
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("test runtime"),
-        );
-        let updates = crate::updates::inert();
-        let (_, cx) = cx.add_window_view(move |window, cx| {
-            let surfaces = cx.new(|cx| {
-                let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
-                surfaces.open_settings(cx);
-                surfaces
-            });
-            CachedOverlayHarness { surfaces }
-        });
+    fn settings_navigates_from_the_app_sidebar_rather_than_a_second_rail(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
 
-        let viewport = size(px(1200.0), px(800.0));
-        cx.simulate_resize(viewport);
-
-        let backdrop = cx
-            .debug_bounds("surface-backdrop")
-            .expect("settings backdrop should render");
-        assert_eq!(backdrop.size, viewport);
-
+        let sidebar = cx
+            .debug_bounds("sidebar")
+            .expect("the app sidebar should stay mounted while settings is open");
+        let navigation = cx
+            .debug_bounds("sidebar-settings")
+            .expect("settings navigation should render inside the app sidebar");
         let shell = cx
             .debug_bounds("settings-shell")
             .expect("settings shell should render");
-        let rail = cx
-            .debug_bounds("settings-rail")
-            .expect("settings rail should render");
-        let pane = cx
-            .debug_bounds("settings-pane")
-            .expect("settings pane should render");
-        assert_eq!(shell.size, viewport);
-        assert_eq!(rail.size.width, px(248.0));
-        assert!(rail.left() >= shell.left() - px(8.0));
-        assert!(rail.left() <= shell.left());
-        assert!(pane.left() >= rail.right());
-        assert!(pane.left() <= rail.right() + px(20.0));
-        assert_eq!(rail.top(), px(Metrics::TITLE_BAR));
+        assert!(
+            cx.debug_bounds("settings-rail").is_none(),
+            "settings should navigate from the app sidebar, not a rail of its own"
+        );
+        assert_eq!(navigation.left(), sidebar.left());
+        assert_eq!(navigation.size.width, sidebar.size.width);
+        assert_eq!(
+            shell.left(),
+            sidebar.right(),
+            "the settings page should begin where the sidebar ends"
+        );
+        assert_eq!(shell.right(), px(1200.0));
+        assert!(cx.debug_bounds("SETTINGS_TAB_General").is_some());
+        harness.read_with(cx, |harness, cx| {
+            assert!(harness.sidebar.read(cx).shows_settings());
+        });
     }
 
     #[gpui::test]
-    fn settings_content_close_control_dismisses_the_surface(cx: &mut TestAppContext) {
-        let runtime = Arc::new(StoreRuntime::inert());
-        let tokio = Arc::new(
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("test runtime"),
+    fn opening_settings_swaps_the_sidebar_body_and_leaves_its_frame_alone(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+
+        let in_settings = cx.debug_bounds("sidebar").expect("sidebar");
+        assert!(
+            cx.debug_bounds("new-agent").is_none(),
+            "the session body should give way to navigation"
         );
-        let updates = crate::updates::inert();
-        let (view, cx) = cx.add_window_view(move |window, cx| {
-            let surfaces = cx.new(|cx| {
-                let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
-                surfaces.open_settings(cx);
-                surfaces
-            });
-            SettingsModalHarness {
-                surfaces,
-                background_events: Arc::new(AtomicUsize::new(0)),
-            }
+
+        surfaces.update(cx, |surfaces, cx| surfaces.dismiss(cx));
+        cx.executor()
+            .advance_clock(SETTINGS_TRANSITION_DURATION + Duration::from_millis(300));
+        cx.run_until_parked();
+
+        let in_sessions = cx.debug_bounds("sidebar").expect("sidebar");
+        assert_eq!(
+            in_settings, in_sessions,
+            "the panel itself should hold still while its body swaps"
+        );
+        assert!(
+            cx.debug_bounds("sidebar-settings").is_none(),
+            "leaving settings should return the sidebar to sessions"
+        );
+        assert!(cx.debug_bounds("new-agent").is_some());
+    }
+
+    #[gpui::test]
+    fn the_sidebar_back_control_dismisses_settings(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update_in(cx, |surfaces, window, cx| {
+            surfaces.focus.focus(window, cx);
         });
 
-        let surfaces = view.read_with(cx, |harness, _| harness.surfaces.clone());
-        let close = cx
+        let back = cx
             .debug_bounds("close-settings")
-            .expect("settings close control should render");
-        cx.simulate_click(close.center(), Modifiers::default());
+            .expect("the sidebar should offer the way back out of settings");
+        cx.simulate_click(back.center(), Modifiers::default());
+        cx.run_until_parked();
 
         assert_eq!(
             surfaces.read_with(cx, |surfaces, _| surfaces.surface),
             Surface::None
         );
+        assert!(!harness.read_with(cx, |harness, cx| harness.sidebar.read(cx).shows_settings()));
     }
 
     #[gpui::test]
@@ -5591,33 +5511,28 @@ mod tests {
     }
 
     #[gpui::test]
-    fn settings_rail_does_not_inherit_a_resized_workspace_sidebar(cx: &mut TestAppContext) {
-        let runtime = Arc::new(StoreRuntime::inert());
-        let tokio = Arc::new(
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("test runtime"),
-        );
-        let updates = crate::updates::inert();
-        let (_, cx) = cx.add_window_view(move |window, cx| {
-            let surfaces = cx.new(|cx| {
-                let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
-                surfaces.open_settings(cx);
-                surfaces.prefs.sidebar_width = 400.0;
-                surfaces
-            });
-            CachedOverlayHarness { surfaces }
-        });
-        cx.simulate_resize(size(px(1200.0), px(800.0)));
+    fn settings_navigation_takes_the_workspace_sidebar_measure(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let sidebar = harness.read_with(cx, |harness, _| harness.sidebar.clone());
 
-        let rail = cx
-            .debug_bounds("settings-rail")
-            .expect("settings rail should render");
+        sidebar.update(cx, |sidebar, cx| sidebar.set_width(320.0, cx));
+        cx.run_until_parked();
+
+        let navigation = cx
+            .debug_bounds("sidebar-settings")
+            .expect("settings navigation should render inside the app sidebar");
+        let shell = cx
+            .debug_bounds("settings-shell")
+            .expect("settings shell should render");
         assert_eq!(
-            rail.size.width,
-            px(248.0),
-            "settings navigation should keep its own stable measure"
+            navigation.size.width,
+            px(320.0),
+            "navigation shares the sidebar the user sized, rather than a measure of its own"
+        );
+        assert_eq!(
+            shell.left(),
+            px(320.0),
+            "the page stays against the sidebar as the seam is dragged"
         );
     }
 
@@ -5630,39 +5545,20 @@ mod tests {
     }
 
     #[gpui::test]
-    fn settings_search_filters_and_opens_the_first_result(cx: &mut TestAppContext) {
-        let runtime = Arc::new(StoreRuntime::inert());
-        let tokio = Arc::new(
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("test runtime"),
-        );
-        let updates = crate::updates::inert();
-        let (view, cx) = cx.add_window_view(move |window, cx| {
-            let surfaces = cx.new(|cx| {
-                let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
-                surfaces.open_settings(cx);
-                surfaces
-            });
-            SettingsModalHarness {
-                surfaces,
-                background_events: Arc::new(AtomicUsize::new(0)),
-            }
-        });
-        cx.executor()
-            .advance_clock(SETTINGS_TRANSITION_DURATION + Duration::from_millis(10));
-        cx.run_until_parked();
+    fn the_sidebar_search_field_filters_settings_and_opens_the_first_result(
+        cx: &mut TestAppContext,
+    ) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
 
         let search = cx
             .debug_bounds("settings-search")
-            .expect("settings search should render");
+            .expect("settings search should render in the sidebar");
         cx.simulate_click(search.center(), Modifiers::default());
         cx.simulate_input("ssh");
 
         assert!(cx.debug_bounds("SETTINGS_TAB_Remote").is_some());
         assert!(cx.debug_bounds("SETTINGS_TAB_General").is_none());
-        let surfaces = view.read_with(cx, |harness, _| harness.surfaces.clone());
         surfaces.read_with(cx, |surfaces, _| {
             assert_eq!(surfaces.settings_search.text(), "ssh");
             assert!(surfaces.settings_search_active);
@@ -5677,34 +5573,19 @@ mod tests {
     }
 
     #[gpui::test]
-    fn changing_settings_tabs_resets_the_shared_pane_scroll(cx: &mut TestAppContext) {
-        let runtime = Arc::new(StoreRuntime::inert());
-        let tokio = Arc::new(
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("test runtime"),
-        );
-        let updates = crate::updates::inert();
-        let (view, cx) = cx.add_window_view(move |window, cx| {
-            let surfaces = cx.new(|cx| {
-                let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
-                surfaces.open_settings(cx);
-                surfaces
-            });
-            SettingsModalHarness {
-                surfaces,
-                background_events: Arc::new(AtomicUsize::new(0)),
-            }
-        });
-        cx.simulate_resize(size(px(900.0), px(520.0)));
-        cx.executor()
-            .advance_clock(SETTINGS_TRANSITION_DURATION + Duration::from_millis(10));
-        cx.run_until_parked();
+    fn choosing_a_page_in_the_sidebar_resets_the_shared_pane_scroll(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
 
         let pane = cx
             .debug_bounds("settings-pane")
             .expect("settings pane should render");
+        // Read the row before scrolling: a cached view that is reused rather
+        // than re-rendered leaves no debug bounds behind, and the sidebar has
+        // no reason to re-render while the page scrolls.
+        let remote = cx
+            .debug_bounds("SETTINGS_TAB_Remote")
+            .expect("the Remote page should be listed in the sidebar");
         for _ in 0..8 {
             cx.simulate_event(ScrollWheelEvent {
                 position: pane.center(),
@@ -5713,16 +5594,18 @@ mod tests {
             });
         }
 
-        let remote = cx
-            .debug_bounds("SETTINGS_TAB_Remote")
-            .expect("Remote tab should render");
         cx.simulate_click(remote.center(), Modifiers::default());
+        cx.run_until_parked();
 
-        let surfaces = view.read_with(cx, |harness, _| harness.surfaces.clone());
         surfaces.read_with(cx, |surfaces, _| {
             assert_eq!(surfaces.settings_tab, SettingsTab::Remote);
             assert_eq!(surfaces.settings_scroll.offset(), point(px(0.0), px(0.0)));
         });
+        assert_eq!(
+            harness.read_with(cx, |harness, cx| harness.sidebar.read(cx).settings_page()),
+            Some(SettingsTab::Remote),
+            "the sidebar should show the page the click opened as current"
+        );
 
         let pane = cx
             .debug_bounds("settings-pane")
@@ -5732,7 +5615,7 @@ mod tests {
             .expect("Remote page content should render");
         assert!(
             copy.bottom() > pane.top() && copy.top() < pane.bottom(),
-            "switching tabs left the Remote page scrolled out of view: {copy:?} vs {pane:?}"
+            "switching pages left the Remote page scrolled out of view: {copy:?} vs {pane:?}"
         );
     }
 }

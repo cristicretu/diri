@@ -47,6 +47,54 @@ pub(crate) fn cached_window_overlay<T: Render>(view: Entity<T>) -> impl IntoElem
     view.cached(StyleRefinement::default().absolute().inset_0())
 }
 
+/// Joins the two halves of the settings destination: the surface owns the
+/// state and paints the page, the sidebar paints the navigation beside it.
+///
+/// The mirror is one-directional -- the surface's state projects into the
+/// sidebar, and the sidebar reports clicks back -- so the list and the page
+/// cannot drift into disagreeing about the selected page or the search text.
+/// RootView wires this for the window; tests wire the same two entities.
+pub(crate) fn wire_settings_navigation<V: 'static>(
+    sidebar: Entity<Sidebar>,
+    surfaces: Entity<UtilitySurfaces>,
+    window: &mut Window,
+    cx: &mut Context<V>,
+) -> [Subscription; 2] {
+    let mirror = {
+        let sidebar = sidebar.clone();
+        cx.observe(&surfaces, move |_, surfaces, cx| {
+            let nav = surfaces.read(cx).settings_nav();
+            sidebar.update(cx, |sidebar, cx| sidebar.set_settings_nav(nav, cx));
+            cx.notify();
+        })
+    };
+    let clicks = cx.subscribe_in(
+        &sidebar,
+        window,
+        move |_, _, event, window, cx| match event {
+            SidebarEvent::SettingsTabSelected(tab) => {
+                let tab = *tab;
+                surfaces.update(cx, |surfaces, cx| surfaces.open_settings_tab(tab, cx));
+            }
+            SidebarEvent::SettingsSearchFocused => {
+                surfaces.update(cx, |surfaces, cx| {
+                    surfaces.focus_settings_search(window, cx)
+                });
+            }
+            SidebarEvent::SettingsSearchCleared => {
+                surfaces.update(cx, |surfaces, cx| {
+                    surfaces.clear_settings_search(window, cx)
+                });
+            }
+            SidebarEvent::SettingsDismissed => {
+                surfaces.update(cx, |surfaces, cx| surfaces.dismiss(cx));
+            }
+            _ => {}
+        },
+    );
+    [mirror, clicks]
+}
+
 #[cfg(target_os = "macos")]
 use crate::macos::{menu_bar::NativeMenuBar, notifier::NativeNotifier};
 
@@ -163,6 +211,9 @@ pub struct RootView {
     quote_target_picker: Option<QuoteTargetPicker>,
     last_quote_surface: QuoteSurface,
     sound_gate: SoundGate,
+    /// Set when opening settings had to reveal a hidden sidebar to put its
+    /// navigation somewhere, so closing settings can hide it again.
+    sidebar_revealed_for_settings: bool,
     preview: bool,
     preview_scenario: PreviewScenario,
     #[cfg(target_os = "macos")]
@@ -320,10 +371,39 @@ impl RootView {
             }
             if matches!(event, SidebarEvent::VisibilityChanged) {
                 this.begin_sidebar_slide(cx);
+                // Settings navigation lives in the sidebar, so hiding the
+                // sidebar is also the way out of settings.
+                if !this.sidebar.read(cx).is_visible()
+                    && let Some(surfaces) = &this.utility_surfaces
+                    && surfaces.read(cx).is_settings_open()
+                {
+                    this.sidebar_revealed_for_settings = false;
+                    surfaces.update(cx, |surfaces, cx| surfaces.dismiss(cx));
+                }
             }
             cx.notify();
         })
         .detach();
+        if let Some(surfaces) = &utility_surfaces {
+            // Settings navigation is painted by the sidebar, so a settings
+            // that opened onto a hidden sidebar has to bring it back -- and
+            // give it up again on the way out.
+            cx.observe(surfaces, |this, surfaces, cx| {
+                let open = surfaces.read(cx).is_settings_open();
+                if open && !this.sidebar.read(cx).is_visible() {
+                    this.sidebar_revealed_for_settings = true;
+                    this.sidebar.update(cx, |sidebar, cx| sidebar.reveal(cx));
+                } else if !open && std::mem::take(&mut this.sidebar_revealed_for_settings) {
+                    this.sidebar.update(cx, |sidebar, cx| sidebar.conceal(cx));
+                }
+            })
+            .detach();
+            for subscription in
+                wire_settings_navigation(sidebar.clone(), surfaces.clone(), window, cx)
+            {
+                subscription.detach();
+            }
+        }
         cx.subscribe_in(
             &launcher,
             window,
@@ -605,6 +685,7 @@ impl RootView {
             quote_target_picker: None,
             last_quote_surface: QuoteSurface::default(),
             sound_gate: SoundGate::default(),
+            sidebar_revealed_for_settings: false,
             preview,
             preview_scenario,
             #[cfg(target_os = "macos")]
@@ -2837,7 +2918,16 @@ impl Render for RootView {
             root = root.child(cached_window_overlay(surfaces.clone()));
         }
         if let Some(surfaces) = &self.utility_surfaces {
-            root = root.child(cached_window_overlay(surfaces.clone()));
+            // Settings is not a sheet floating over the workbench: it replaces
+            // it, and the sidebar it navigates from stays put beside it. Laying
+            // it out against the live seam -- rather than a width settings
+            // snapshotted for itself -- keeps the two edges together while the
+            // sidebar slides or is dragged wider.
+            let mut placement = StyleRefinement::default().absolute().inset_0();
+            if surfaces.read(cx).is_settings_open() {
+                placement = placement.left(px(seam));
+            }
+            root = root.child(surfaces.clone().cached(placement));
         }
         if let Some(navigation) = &self.navigation {
             root = root.child(cached_window_overlay(navigation.clone()));

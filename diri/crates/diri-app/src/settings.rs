@@ -6,7 +6,38 @@
 use diri_proto::{HostEntry, HostNodeConfig};
 use diri_term::theme::TermTheme;
 
+use crate::query_editor::QueryEditor;
 use crate::store::Prefs;
+
+/// The two groups the navigation list is split into.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsSection {
+    Personal,
+    System,
+}
+
+impl SettingsSection {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Personal => "Personal",
+            Self::System => "System",
+        }
+    }
+}
+
+/// Everything the window sidebar needs to paint settings navigation.
+///
+/// Settings state itself stays in `UtilitySurfaces`, which owns the page the
+/// navigation drives. The sidebar renders this projection rather than keeping
+/// a second copy, so the list and the page can never disagree about which tab
+/// is selected or what the search field says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SettingsNav {
+    pub tabs: Vec<SettingsTab>,
+    pub active: SettingsTab,
+    pub search: QueryEditor,
+    pub search_active: bool,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SettingsTab {
@@ -44,6 +75,15 @@ impl SettingsTab {
             Self::Terminal => "Appearance and text size",
             Self::Resources => "Idle sessions and memory",
             Self::Remote => "SSH execution hosts",
+        }
+    }
+
+    /// Personal pages change how diri behaves for this user; System pages
+    /// describe the machines and resources sessions run on.
+    pub const fn section(self) -> SettingsSection {
+        match self {
+            Self::General | Self::Agents | Self::Terminal => SettingsSection::Personal,
+            Self::Resources | Self::Remote => SettingsSection::System,
         }
     }
 

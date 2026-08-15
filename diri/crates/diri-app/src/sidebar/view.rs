@@ -30,6 +30,7 @@ use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::query_label;
 use crate::query_editor::{self, ClipboardEdit, Edit};
 use crate::seam::toggle_has_settled;
+use crate::settings::{SettingsNav, SettingsSection, SettingsTab};
 use crate::store::{
     ClickModifiers, DirectoryListingState, SessionStore, SpawnOptions, StoreEffect, StoreRuntime,
 };
@@ -42,6 +43,49 @@ use super::{
 };
 
 const PREVIEW_USAGE: f64 = 4.82;
+
+/// How far a swapped-in body travels before it settles, and how long the
+/// whole swap takes. The travel is deliberately short: the sidebar itself
+/// never moves, so this reads as its contents changing, not the panel.
+const BODY_SWAP_TRAVEL: f32 = 14.0;
+const BODY_SWAP_DURATION: Duration = Duration::from_millis(260);
+/// How much later each row starts than the one above it, as a fraction of the
+/// transition. Capped below so a long list still finishes on time.
+const BODY_SWAP_STAGGER: f32 = 0.055;
+const BODY_SWAP_STAGGER_CEILING: f32 = 0.55;
+
+/// How far into its own arrival the row `step` beats down the body is, at
+/// `delta` of the shared transition. Every row settles by the end of the
+/// transition however deep it sits, so the list arrives as one motion rather
+/// than trailing a straggler.
+fn body_swap_progress(delta: f32, step: usize) -> f32 {
+    let start = (step as f32 * BODY_SWAP_STAGGER).min(BODY_SWAP_STAGGER_CEILING);
+    let local = ((delta.clamp(0.0, 1.0) - start) / (1.0 - start)).clamp(0.0, 1.0);
+    Motion::SETTLE.settle(local)
+}
+
+/// Fades and slides one row of a swapped-in sidebar body into place, `step`
+/// beats behind the top of that body.
+fn slide_in<E>(element: E, key: String, step: usize, reduce_motion: bool) -> AnyElement
+where
+    E: IntoElement + Styled + 'static,
+{
+    if reduce_motion {
+        return element.into_any_element();
+    }
+    element
+        .with_animation(
+            SharedString::from(key),
+            Animation::new(BODY_SWAP_DURATION),
+            move |element, delta| {
+                let settled = body_swap_progress(delta, step);
+                element
+                    .left(px((1.0 - settled) * BODY_SWAP_TRAVEL))
+                    .opacity(settled)
+            },
+        )
+        .into_any_element()
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FocusRow {
@@ -90,6 +134,17 @@ pub(crate) enum SidebarEvent {
     /// A row-to-row drop or its keyboard equivalent produced an editable
     /// handoff. Root owns the composer destination and opens it for review.
     HandoffProposed(HandoffProposal),
+    /// Settings navigation is painted here but owned by the settings surface,
+    /// so a click on a page has to travel back out to it.
+    SettingsTabSelected(SettingsTab),
+    /// The settings search field was clicked. Keyboard focus belongs to the
+    /// settings surface, which reads the keys the field then shows.
+    SettingsSearchFocused,
+    SettingsSearchCleared,
+    /// The back control in the title bar. Settings is dismissed directly
+    /// rather than by re-dispatching the toggle, so the way out does not
+    /// depend on where keyboard focus happens to be.
+    SettingsDismissed,
 }
 
 #[derive(Clone)]
@@ -158,6 +213,13 @@ pub struct Sidebar {
     /// drops. It remains until dismissed or replaced by the next drop so an
     /// error can never disappear between mouse-up and the next frame.
     external_drop_feedback: Option<String>,
+    /// Settings navigation, mirrored from the settings surface while it owns
+    /// the workbench. `Some` swaps this panel's body from sessions to pages;
+    /// the sidebar itself -- its measure, its chrome, its footer -- stays put.
+    settings_nav: Option<SettingsNav>,
+    /// Bumped whenever the body swaps between sessions and settings, so the
+    /// slide restarts on each swap instead of replaying a finished animation.
+    body_generation: u64,
 }
 
 /// The sidebar state that asked for a native folder pick, captured when the
@@ -244,6 +306,8 @@ impl Sidebar {
             preview,
             directory_picker_open: false,
             external_drop_feedback: None,
+            settings_nav: None,
+            body_generation: 0,
         };
         sidebar.ui.preview_account = preview;
         // Preview-only hook so headless screenshots can verify popover layout.
@@ -392,6 +456,52 @@ impl Sidebar {
         }
         cx.emit(SidebarEvent::VisibilityChanged);
         cx.notify();
+    }
+
+    /// Hides the sidebar without the toggle's debounce, for the callers that
+    /// revealed it themselves and are now putting it back.
+    pub fn conceal(&mut self, cx: &mut Context<Self>) {
+        if !self.ui.visible {
+            return;
+        }
+        self.ui.visible = false;
+        if let Err(error) = self
+            .store
+            .write()
+            .expect("session store lock poisoned")
+            .update_preferences(|prefs| prefs.sidebar_visible = false)
+        {
+            eprintln!("diri: could not remember sidebar visibility: {error}");
+        }
+        cx.emit(SidebarEvent::VisibilityChanged);
+        cx.emit(SidebarEvent::FocusTerminal);
+        cx.notify();
+    }
+
+    /// Mirrors the settings surface's navigation into this panel. Passing
+    /// `None` returns the body to the session list.
+    pub fn set_settings_nav(&mut self, nav: Option<SettingsNav>, cx: &mut Context<Self>) {
+        if self.settings_nav == nav {
+            return;
+        }
+        if self.settings_nav.is_some() != nav.is_some() {
+            self.body_generation = self.body_generation.wrapping_add(1);
+            // A popover anchored to a session row has nothing to point at once
+            // the rows are gone.
+            self.ui.popover = None;
+            self.ui.hover_card = None;
+        }
+        self.settings_nav = nav;
+        cx.notify();
+    }
+
+    pub fn shows_settings(&self) -> bool {
+        self.settings_nav.is_some()
+    }
+
+    /// The page the mirrored navigation is showing as current, if any.
+    pub fn settings_page(&self) -> Option<SettingsTab> {
+        self.settings_nav.as_ref().map(|nav| nav.active)
     }
 
     pub fn show_new_agent(&mut self, cx: &mut Context<Self>) {
@@ -854,6 +964,7 @@ impl Sidebar {
         };
         div()
             .id("new-agent")
+            .debug_selector(|| "new-agent".into())
             .mx(px(Space::INSET))
             .mb(px(4.0))
             .px(px(Space::ROW_H))
@@ -920,8 +1031,16 @@ impl Sidebar {
     }
 
     fn top_bar(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        let in_settings = self.settings_nav.is_some();
         let settings_hover = self.ui.hovered_control == Some("settings");
         let toggle_hover = self.ui.hovered_control == Some("sidebar-toggle");
+        // The same control, the same place: it opens settings, and while
+        // settings is open it is the way back out of it.
+        let (settings_id, settings_symbol) = if in_settings {
+            ("close-settings", "chevron.left")
+        } else {
+            ("settings", "gearshape")
+        };
         div()
             .h(px(Metrics::TITLE_BAR))
             .flex_none()
@@ -931,13 +1050,17 @@ impl Sidebar {
             .pr(px(Metrics::TOOLBAR_EDGE_INSET))
             .gap(px(Metrics::TOOLBAR_COMPACT_GAP))
             .child(icon_button(
-                "settings",
-                "gearshape",
+                settings_id,
+                settings_symbol,
                 settings_hover,
                 colors,
-                cx.listener(|this, _, window, cx| {
+                cx.listener(move |this, _, window, cx| {
                     this.ui.popover = None;
-                    window.dispatch_action(Box::new(OpenSettings), cx);
+                    if in_settings {
+                        cx.emit(SidebarEvent::SettingsDismissed);
+                    } else {
+                        window.dispatch_action(Box::new(OpenSettings), cx);
+                    }
                 }),
                 cx.listener(|this, hovered: &bool, _, cx| {
                     this.ui.hovered_control = hovered.then_some("settings");
@@ -956,6 +1079,234 @@ impl Sidebar {
                 }),
             ))
             .into_any_element()
+    }
+
+    /* ─────────────────────────────────────────────────────────
+     * SIDEBAR BODY SWAP STORYBOARD
+     *
+     *    0ms   the panel keeps its chrome -- title bar, measure, footer --
+     *          and the new body starts 14px inboard and transparent
+     *   40ms   the search field has landed; the first page follows it
+     *  260ms   the last page settles, alongside the settings canvas
+     *
+     * The rows run on the shared `SETTLE` spring, each one a beat behind the
+     * row above, so navigation reads as content sliding out from inside the
+     * sidebar rather than one surface being swapped for another.
+     * ───────────────────────────────────────────────────────── */
+    fn settings_body(
+        &self,
+        nav: &SettingsNav,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let reduce_motion = cx.reduce_motion();
+        let generation = self.body_generation;
+        let mut step = 0;
+        let search = self.settings_search_field(nav, colors, cx);
+        let mut pages = div().flex().flex_col();
+        let mut section: Option<SettingsSection> = None;
+        for tab in nav.tabs.iter().copied() {
+            if section != Some(tab.section()) {
+                let first = section.is_none();
+                section = Some(tab.section());
+                step += 1;
+                pages = pages.child(slide_in(
+                    div()
+                        .relative()
+                        .px(px(Space::ROW_H))
+                        .pt(px(if first { 6.0 } else { 14.0 }))
+                        .pb(px(5.0))
+                        .text_size(px(Typo::SECTION_HEADER.size))
+                        .font_weight(Typo::SECTION_HEADER.weight)
+                        .text_color(colors.tertiary)
+                        .child(tab.section().label()),
+                    format!("settings-section-{generation}-{step}"),
+                    step,
+                    reduce_motion,
+                ));
+            }
+            step += 1;
+            pages = pages.child(slide_in(
+                self.settings_page_row(tab, tab == nav.active, colors, cx),
+                format!("settings-page-{generation}-{step}"),
+                step,
+                reduce_motion,
+            ));
+        }
+        if nav.tabs.is_empty() {
+            pages = pages.child(
+                div()
+                    .px(px(10.0))
+                    .pt(px(14.0))
+                    .text_size(px(Typo::META.size))
+                    .text_color(colors.tertiary)
+                    .child("No settings found"),
+            );
+        }
+        div()
+            .id("sidebar-settings")
+            .debug_selector(|| "sidebar-settings".into())
+            .flex_1()
+            .min_h(px(0.0))
+            .flex()
+            .flex_col()
+            .child(slide_in(
+                search,
+                format!("settings-search-{generation}"),
+                0,
+                reduce_motion,
+            ))
+            .child(
+                div()
+                    .id("settings-nav-scroll")
+                    .px(px(Space::INSET))
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .child(pages),
+            )
+            .child(
+                div()
+                    .px(px(Metrics::TOOLBAR_EDGE_INSET))
+                    .pb(px(6.0))
+                    .text_size(px(Typo::META.size))
+                    .text_color(colors.tertiary)
+                    .child(format!("diri {}", crate::updates::CURRENT_VERSION)),
+            )
+            .into_any_element()
+    }
+
+    fn settings_page_row(
+        &self,
+        tab: SettingsTab,
+        selected: bool,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(SharedString::from(format!("settings-{}", tab.label())))
+            .debug_selector(move || format!("SETTINGS_TAB_{}", tab.label()))
+            .relative()
+            .h(px(30.0))
+            .px(px(Space::ROW_H))
+            .rounded(px(Radius::ROW))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .bg(Fill::selected(colors, selected))
+            .text_color(if selected {
+                colors.primary
+            } else {
+                colors.secondary
+            })
+            .cursor_pointer()
+            .hover(move |style| style.bg(Fill::hover(colors, true)))
+            .on_click(cx.listener(move |_, _, _, cx| {
+                cx.emit(SidebarEvent::SettingsTabSelected(tab));
+            }))
+            .child(
+                div()
+                    .w(px(16.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(sf_symbol(
+                        tab.icon(),
+                        12.0,
+                        if selected {
+                            colors.primary
+                        } else {
+                            colors.tertiary
+                        },
+                    )),
+            )
+            .child(
+                div()
+                    .text_size(px(Typo::ROW.size))
+                    .font_weight(if selected {
+                        FontWeight::MEDIUM
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .child(tab.label()),
+            )
+    }
+
+    fn settings_search_field(
+        &self,
+        nav: &SettingsNav,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let content = if nav.search_active {
+            query_label(&nav.search)
+        } else if nav.search.is_empty() {
+            div()
+                .text_color(colors.tertiary)
+                .child("Search settings…")
+                .into_any_element()
+        } else {
+            div()
+                .text_color(colors.primary)
+                .child(nav.search.text().to_owned())
+                .into_any_element()
+        };
+        div()
+            .id("settings-search")
+            .debug_selector(|| "settings-search".into())
+            .relative()
+            .h(px(32.0))
+            .mx(px(Space::INSET))
+            .mt(px(2.0))
+            .mb(px(6.0))
+            .px(px(9.0))
+            .rounded(px(16.0))
+            .border_1()
+            .border_color(
+                colors
+                    .primary
+                    .alpha(if nav.search_active { 0.22 } else { 0.11 }),
+            )
+            .bg(colors.primary.alpha(0.025))
+            .flex()
+            .items_center()
+            .gap(px(7.0))
+            .cursor(CursorStyle::IBeam)
+            .on_click(cx.listener(|_, _, _, cx| {
+                cx.emit(SidebarEvent::SettingsSearchFocused);
+            }))
+            .child(sf_symbol("magnifyingglass", 12.0, colors.tertiary))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_size(px(Typo::ROW.size))
+                    .child(content),
+            )
+            .when(!nav.search.is_empty(), |search| {
+                search.child(
+                    div()
+                        .id("clear-settings-search")
+                        .debug_selector(|| "clear-settings-search".into())
+                        .size(px(18.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(Fill::subtle(colors)))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(|_, _, _, cx| {
+                            cx.emit(SidebarEvent::SettingsSearchCleared);
+                        }))
+                        .child(sf_symbol("xmark", 8.0, colors.tertiary)),
+                )
+            })
     }
 
     fn external_drop(
@@ -4589,68 +4940,75 @@ impl Render for Sidebar {
             }
         }
         retain_live_glyphs(&mut self.glyphs, &projection.display_order);
-        let mut list = div()
-            .id("sidebar-list")
-            .track_scroll(&self.list_scroll)
-            .flex_1()
-            .min_h(px(0.0))
-            .overflow_y_scroll()
-            .px(px(Space::INSET))
-            .pt(px(2.0))
-            .pb(px(Metrics::ROW_HEIGHT + 17.0))
-            .flex()
-            .flex_col()
-            .gap(px(2.0))
-            .drag_over::<DraggedSidebarItem>(|element, dragged, _, _| {
-                if dragged.session_id().is_some() {
-                    element
-                        .bg(Palette::CLAY.alpha(0.055))
-                        .cursor(CursorStyle::DragCopy)
-                } else {
-                    element
-                }
-            })
-            .on_drop(cx.listener(|this, dragged: &DraggedSidebarItem, _, cx| {
-                if let Some(source_id) = dragged.session_id() {
-                    let proposal = {
-                        let store = this.store.read().expect("session store lock poisoned");
-                        store.sessions().get(source_id).map_or_else(
-                            || {
-                                Err(crate::delegation::DelegationRefusal(
-                                    "The dragged session no longer exists.".to_owned(),
-                                ))
-                            },
-                            |source| {
-                                store.projects().get(&source.project_id).map_or_else(
-                                    || {
-                                        Err(crate::delegation::DelegationRefusal(
-                                            "The session's project no longer exists.".to_owned(),
-                                        ))
-                                    },
-                                    |project| sibling_proposal(source, project),
-                                )
-                            },
-                        )
-                    };
-                    match proposal {
-                        Ok(proposal) => {
-                            this.ui.pending_sibling = Some(proposal);
-                            this.ui.delegation_notice = None;
-                        }
-                        Err(refusal) => this.ui.delegation_notice = Some(refusal.0),
+        // The session list is the sidebar's most expensive frame work,
+        // and settings has no use for it.
+        let list = self.settings_nav.is_none().then(|| {
+            let mut list = div()
+                .id("sidebar-list")
+                .track_scroll(&self.list_scroll)
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_y_scroll()
+                .px(px(Space::INSET))
+                .pt(px(2.0))
+                .pb(px(Metrics::ROW_HEIGHT + 17.0))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .drag_over::<DraggedSidebarItem>(|element, dragged, _, _| {
+                    if dragged.session_id().is_some() {
+                        element
+                            .bg(Palette::CLAY.alpha(0.055))
+                            .cursor(CursorStyle::DragCopy)
+                    } else {
+                        element
                     }
-                }
-                this.finish_drag();
-                cx.stop_propagation();
-                cx.notify();
-            }));
-        for group in &projection.projects {
-            list = list.child(self.project_section(group, colors, window, cx));
-        }
-        list = list.child(self.empty_space_drop_target(cx));
+                })
+                .on_drop(cx.listener(|this, dragged: &DraggedSidebarItem, _, cx| {
+                    if let Some(source_id) = dragged.session_id() {
+                        let proposal = {
+                            let store = this.store.read().expect("session store lock poisoned");
+                            store.sessions().get(source_id).map_or_else(
+                                || {
+                                    Err(crate::delegation::DelegationRefusal(
+                                        "The dragged session no longer exists.".to_owned(),
+                                    ))
+                                },
+                                |source| {
+                                    store.projects().get(&source.project_id).map_or_else(
+                                        || {
+                                            Err(crate::delegation::DelegationRefusal(
+                                                "The session's project no longer exists."
+                                                    .to_owned(),
+                                            ))
+                                        },
+                                        |project| sibling_proposal(source, project),
+                                    )
+                                },
+                            )
+                        };
+                        match proposal {
+                            Ok(proposal) => {
+                                this.ui.pending_sibling = Some(proposal);
+                                this.ui.delegation_notice = None;
+                            }
+                            Err(refusal) => this.ui.delegation_notice = Some(refusal.0),
+                        }
+                    }
+                    this.finish_drag();
+                    cx.stop_propagation();
+                    cx.notify();
+                }));
+            for group in &projection.projects {
+                list = list.child(self.project_section(group, colors, window, cx));
+            }
+            list = list.child(self.empty_space_drop_target(cx));
+            list
+        });
 
         let mut root = div()
             .id("sidebar")
+            .debug_selector(|| "sidebar".into())
             .relative()
             .size_full()
             .flex()
@@ -4668,23 +5026,41 @@ impl Render for Sidebar {
                     }
                 }),
             )
-            .child(self.top_bar(colors, cx))
-            .child(self.new_agent_row(colors, cx));
-        if projection.projects.is_empty() {
-            root = root.child(self.empty_state(colors, cx));
+            .child(self.top_bar(colors, cx));
+        if let Some(nav) = self.settings_nav.clone() {
+            root = root.child(self.settings_body(&nav, colors, cx));
         } else {
-            // Rows dissolve into the chrome at both ends of the scroll instead
-            // of being sliced off by the container edge.
-            root = root.child(
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .flex()
-                    .flex_col()
-                    .child(list)
-                    .children(self.scroll_fades(colors)),
-            );
+            let mut body = div()
+                .relative()
+                .flex_1()
+                .min_h(px(0.0))
+                .flex()
+                .flex_col()
+                .child(self.new_agent_row(colors, cx));
+            if projection.projects.is_empty() {
+                body = body.child(self.empty_state(colors, cx));
+            } else {
+                // Rows dissolve into the chrome at both ends of the scroll
+                // instead of being sliced off by the container edge.
+                body = body.child(
+                    div()
+                        .relative()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .flex()
+                        .flex_col()
+                        .children(list)
+                        .children(self.scroll_fades(colors)),
+                );
+            }
+            // The first paint of the window is not a swap, so the sessions
+            // body only travels when it is coming back from settings.
+            root = root.child(slide_in(
+                body,
+                format!("sidebar-sessions-{}", self.body_generation),
+                0,
+                cx.reduce_motion() || self.body_generation == 0,
+            ));
         }
         if let Some(feedback) = self.external_drop_feedback(colors, cx) {
             root = root.child(feedback);
@@ -4715,6 +5091,7 @@ fn icon_button(
 ) -> AnyElement {
     div()
         .id(id)
+        .debug_selector(move || id.into())
         .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
         .flex()
         .items_center()
@@ -5273,6 +5650,27 @@ mod tests {
                 .size_full()
                 .child(div().h_full().w(px(248.0)).child(self.sidebar.clone()))
         }
+    }
+
+    #[test]
+    fn the_body_swap_staggers_rows_but_lands_them_together() {
+        // Nothing is visible before the transition starts, and every row --
+        // however deep in the list -- is fully settled when it ends. A row
+        // that finished late would leave the panel visibly assembling itself
+        // after the page beside it had already arrived.
+        for step in 0..12 {
+            assert_eq!(body_swap_progress(0.0, step), 0.0);
+            assert_eq!(body_swap_progress(1.0, step), 1.0);
+        }
+        // Deeper rows trail the ones above them rather than moving as a block.
+        let head = body_swap_progress(0.3, 0);
+        let middle = body_swap_progress(0.3, 3);
+        let tail = body_swap_progress(0.3, 6);
+        assert!(head > middle, "{head} vs {middle}");
+        assert!(middle > tail, "{middle} vs {tail}");
+        // The stagger is capped, so an arbitrarily long list cannot push a row
+        // past the point where it has no time left to travel.
+        assert!(body_swap_progress(0.8, 200) > 0.0);
     }
 
     #[test]

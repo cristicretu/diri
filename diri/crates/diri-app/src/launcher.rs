@@ -3685,6 +3685,8 @@ mod tests {
             updates: crate::updates::inert(),
             tokio,
             dev_build: None,
+            #[cfg(unix)]
+            daemon_startup: None,
         })
     }
 
@@ -3778,6 +3780,8 @@ mod tests {
             updates: crate::updates::inert(),
             tokio,
             dev_build: None,
+            #[cfg(unix)]
+            daemon_startup: None,
         });
         let (launcher, cx) =
             cx.add_window_view(move |_window, cx| LauncherOverlay::new(services, true, cx));
@@ -4320,6 +4324,8 @@ mod tests {
             updates: crate::updates::inert(),
             tokio,
             dev_build: None,
+            #[cfg(unix)]
+            daemon_startup: None,
         });
         let window = cx
             .open_window(gpui::size(px(760.0), px(560.0)), move |window, cx| {
