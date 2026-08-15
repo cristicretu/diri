@@ -831,7 +831,15 @@ impl ControlServer {
             None if !argv.is_empty() => {
                 let mut spec = crate::pty::PtySpec::new(argv.clone(), &cwd_path);
                 spec.env = inherited;
-                spec.env.retain(|(key, _)| key != "NO_COLOR");
+                // GUI apps launched by launchd commonly inherit no terminal
+                // environment. A binary-free descriptor is still attached to
+                // Diri's colour-capable PTY, so assert the same capabilities
+                // as manifest-backed Agents instead of leaving tools such as
+                // `clear` unable to operate.
+                spec.env
+                    .retain(|(key, _)| !matches!(key.as_str(), "NO_COLOR" | "TERM" | "COLORTERM"));
+                spec.env.push(("TERM".into(), "xterm-256color".into()));
+                spec.env.push(("COLORTERM".into(), "truecolor".into()));
                 spec
             }
             None => {

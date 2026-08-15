@@ -245,6 +245,124 @@ fn spawning_a_shell_over_the_socket_produces_a_watched_session() {
     accepting.join().expect("server thread");
 }
 
+#[test]
+fn shell_started_without_an_inherited_term_can_clear() {
+    const CHILD_MARKER: &str = "DIRI_TERM_REPRO_CHILD";
+    if std::env::var_os(CHILD_MARKER).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "shell_started_without_an_inherited_term_can_clear",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1")
+            .env_remove("TERM")
+            .output()
+            .expect("run isolated child test");
+        assert!(
+            output.status.success(),
+            "isolated shell test failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+
+    assert!(
+        std::env::var_os("TERM").is_none(),
+        "the isolated repro must start without TERM"
+    );
+
+    let temp = tempfile::tempdir().expect("temp");
+    let registry = Registry::new(engine(), temp.path().join("state.json"));
+    let registry = Arc::new(Mutex::new(registry));
+    let server = ControlServer::new(Arc::clone(&registry), temp.path().join("daemon.sock"))
+        .with_logs_dir(temp.path().join("logs"));
+    let listener = server.bind().expect("bind");
+
+    let server = Arc::new(server);
+    let accepting = {
+        let server = Arc::clone(&server);
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let _ = server.serve(stream);
+        })
+    };
+
+    let client_handle = UnixStream::connect(server.socket_path()).expect("connect");
+    let mut client = client_handle.try_clone().expect("clone for writing");
+    let mut reader = BufReader::new(client_handle.try_clone().expect("clone for reading"));
+    let mut request = |message: ControlMessage| {
+        let mut bytes = serde_json::to_vec(&message).expect("encode");
+        bytes.push(b'\n');
+        client.write_all(&bytes).expect("write");
+        client.flush().expect("flush");
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read a reply");
+        serde_json::from_str::<ControlMessage>(&line).expect("decode")
+    };
+
+    let spawned = request(ControlMessage::Request {
+        id: 1,
+        method: "session.spawn".into(),
+        params: Some(json!({
+            "kind": { "shell": {} },
+            "cwd": temp.path(),
+            "argv": [
+                "/bin/sh",
+                "-c",
+                "/usr/bin/clear 2>&1; printf '__clear_done__\\n'; sleep 30",
+            ],
+        })),
+    });
+    let id = match spawned {
+        ControlMessage::Response {
+            result: Ok(result), ..
+        } => result["id"].as_str().expect("a session id").to_string(),
+        other => panic!("spawn failed: {other:?}"),
+    };
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut screen = String::new();
+    while std::time::Instant::now() < deadline && !screen.contains("__clear_done__") {
+        if let ControlMessage::Response {
+            result: Ok(result), ..
+        } = request(ControlMessage::Request {
+            id: 2,
+            method: "session.read_screen".into(),
+            params: Some(json!({ "sessionID": id })),
+        }) {
+            screen = result["text"].as_str().unwrap_or_default().to_owned();
+        }
+        if !screen.contains("__clear_done__") {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    let killed = request(ControlMessage::Request {
+        id: 3,
+        method: "session.kill".into(),
+        params: Some(json!({ "sessionID": id })),
+    });
+    assert!(matches!(
+        killed,
+        ControlMessage::Response { result: Ok(_), .. }
+    ));
+    client_handle
+        .shutdown(std::net::Shutdown::Write)
+        .expect("half-close");
+    accepting.join().expect("server thread");
+
+    assert!(
+        screen.contains("__clear_done__"),
+        "clear command never completed: {screen:?}"
+    );
+    assert!(
+        !screen.contains("TERM environment variable not set"),
+        "new Terminal inherited no TERM: {screen:?}"
+    );
+}
+
 /// Subscribing turns the connection into an event sink: a mutation made on a
 /// SECOND connection arrives as an event frame on the first, and
 /// `events.wait` long-polls a live status transition to completion.
