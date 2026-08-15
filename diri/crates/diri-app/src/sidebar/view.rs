@@ -1441,7 +1441,7 @@ impl Sidebar {
             host_label.as_deref(),
             hibernated,
             row.pinned,
-            !hovered && selected && shortcut.is_some(),
+            !hovered && focused && shortcut.is_some(),
         );
         let title_marquee_id = format!("session-title-marquee:{}", id.0);
         let fill = if selected {
@@ -1570,6 +1570,10 @@ impl Sidebar {
                 1.0
             })
             .cursor_pointer()
+            // This row lives inside the sidebar's tracked focus target. Keep a
+            // plain pointer press from entering keyboard-navigation mode; the
+            // click still selects the session and hands focus to its terminal.
+            .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
             .on_hover(cx.listener(move |this, is_hovered: &bool, window, cx| {
                 this.ui.hovered_session = is_hovered.then(|| hover_id.clone());
                 this.schedule_hover_card(hover_id.clone(), *is_hovered, window, cx);
@@ -1805,14 +1809,14 @@ impl Sidebar {
                         })),
                 )
             })
-            // The hint and the ✕ share the trailing edge and never both apply:
-            // hovering a row is the moment you want to close it, not the
-            // moment you need to be told how to reach it from the keyboard.
+            // The hint belongs to the keyboard cursor. Pointer selection keeps
+            // the trailing edge quiet (or shows the hover-only close control).
             .when_some(
-                (!hovered && selected).then_some(shortcut).flatten(),
+                (!hovered && focused).then_some(shortcut).flatten(),
                 |element, index| {
                     element.child(
                         div()
+                            .debug_selector(|| "selected-session-shortcut".to_owned())
                             .flex_none()
                             .text_size(px(Typo::META.size))
                             .text_color(colors.tertiary)
@@ -2071,6 +2075,7 @@ impl Sidebar {
                     cx.notify();
                 }
             }))
+            .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
             .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
                 let modifiers = event.modifiers();
                 this.ui.focus_cursor = Some(row_session.id.clone());
@@ -5399,6 +5404,49 @@ mod tests {
         assert_eq!(
             sidebar.read_with(cx, |sidebar, _| sidebar.ui.popover.clone()),
             None
+        );
+    }
+
+    #[gpui::test]
+    fn pointer_selection_does_not_enter_keyboard_navigation(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        let target = SessionId::new("preview-claude");
+        let row = sidebar
+            .read_with(cx, |sidebar, _| {
+                sidebar.row_bounds.borrow().get(&target).copied()
+            })
+            .expect("preview session row should render");
+
+        cx.simulate_click(row.center(), Modifiers::default());
+        cx.simulate_mouse_move(point(px(500.0), px(320.0)), None, Modifiers::default());
+
+        sidebar.update_in(cx, |sidebar, window, _| {
+            assert!(
+                !sidebar.is_focused(window),
+                "a pointer click must not enter sidebar keyboard-navigation mode"
+            );
+            assert_eq!(
+                sidebar
+                    .store
+                    .read()
+                    .expect("session store lock poisoned")
+                    .selected_session_id(),
+                Some(&target)
+            );
+        });
+        assert!(
+            cx.debug_bounds("selected-session-shortcut").is_none(),
+            "a pointer-selected row must not show a keyboard shortcut cue"
+        );
+
+        sidebar.update_in(cx, |sidebar, window, cx| sidebar.focus(window, cx));
+        assert!(
+            cx.debug_bounds("selected-session-shortcut").is_some(),
+            "keyboard navigation should reveal the focused row shortcut cue"
         );
     }
 
