@@ -1,12 +1,14 @@
 name: CodeQL
 
+# Weekly, not per pull request. The Rust analysis runs without a build and is
+# not a required check, so every pull request was paying two and a half minutes
+# for a result that gated nothing. A finding that lands within a week of the
+# commit is caught early enough for a repo this size; run it on demand with
+# workflow_dispatch when a change warrants a closer look.
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   schedule:
     - cron: "23 4 * * 1"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -18,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Initialize CodeQL
         uses: github/codeql-action/init@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
         with:
