@@ -34,6 +34,8 @@ const DIFF_COALESCE: Duration = Duration::from_millis(8);
 const INTERACTIVE_GRID_BUDGET: u8 = 2;
 const MAX_OUTBOUND_BYTES: usize = 20 << 20;
 const MAX_PENDING_INPUT_BYTES: usize = 1 << 20;
+/// How much raw output may accumulate before it is framed for the client.
+const OUTPUT_FRAME_BYTES: usize = 64 << 10;
 const REPLAY_BUDGET_BYTES: usize = 4 << 20;
 const PERSIST_OFFSET_INTERVAL: u64 = 1 << 20;
 
@@ -408,6 +410,9 @@ struct Holder {
     pending_connection: Option<Connection>,
     pending_input: PendingBytes,
     dirty_since: Option<Instant>,
+    /// Raw output waiting to be framed, and the offset it starts at.
+    pending_output: Vec<u8>,
+    pending_output_offset: u64,
     interactive_grid_budget: u8,
     last_persisted_offset: u64,
 }
@@ -481,6 +486,8 @@ impl Holder {
             pending_connection: None,
             pending_input: PendingBytes::default(),
             dirty_since: None,
+            pending_output: Vec::with_capacity(OUTPUT_FRAME_BYTES),
+            pending_output_offset: 0,
             interactive_grid_budget: 0,
             last_persisted_offset: 0,
         })
@@ -613,6 +620,8 @@ impl Holder {
             if self.dirty_since.is_some_and(|since| {
                 self.interactive_grid_budget > 0 || since.elapsed() >= DIFF_COALESCE
             }) {
+                // Held output goes out with the diff it belongs to.
+                self.flush_output()?;
                 self.emit_grid_delta()?;
             }
         }
@@ -629,6 +638,25 @@ impl Holder {
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    /// Frames whatever output has accumulated.
+    ///
+    /// Called when it reaches a frame's worth and when the coalescing interval
+    /// expires, so held bytes are never delayed longer than a grid diff would
+    /// have been. The buffer's allocation is kept for the next batch.
+    fn flush_output(&mut self) -> io::Result<()> {
+        if self.pending_output.is_empty() {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut self.pending_output);
+        let result = self.queue(RemoteMessage::Terminal(Frame::output(
+            self.pending_output_offset,
+            &pending,
+        )));
+        self.pending_output = pending;
+        self.pending_output.clear();
+        result
     }
 
     fn drain_pty(&mut self) -> io::Result<()> {
@@ -660,7 +688,20 @@ impl Holder {
                         .as_ref()
                         .is_some_and(|connection| connection.epoch.is_some())
                     {
-                        self.queue(RemoteMessage::Terminal(Frame::output(offset, bytes)))?;
+                        // Held rather than framed here. A PTY hands over about
+                        // a kilobyte per read, and a frame each meant ten
+                        // thousand of them for eleven megabytes — a header, a
+                        // queue entry and a share of a write syscall apiece, on
+                        // both ends. The loop flushes these on the same
+                        // interval it already paces grid diffs by, so nothing
+                        // waits longer than a frame.
+                        if self.pending_output.is_empty() {
+                            self.pending_output_offset = offset;
+                        }
+                        self.pending_output.extend_from_slice(bytes);
+                        if self.pending_output.len() >= OUTPUT_FRAME_BYTES {
+                            self.flush_output()?;
+                        }
                     }
                     if self
                         .state
