@@ -11,9 +11,11 @@ use diri_proto::ControlError;
 pub mod binding;
 pub mod bootstrap;
 pub mod client;
+mod effect;
 pub mod executor;
 pub mod manager;
 pub mod ssh;
+pub(crate) mod stream;
 
 pub const TRANSPORT_UNAVAILABLE_CODE: &str = "remote_transport_unavailable";
 

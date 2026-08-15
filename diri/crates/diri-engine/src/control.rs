@@ -1784,7 +1784,6 @@ impl ControlServer {
         registry
             .remove(&p.session_id.0, &self.logs_dir)
             .map_err(io_control_error)?;
-        let _ = registry.persist();
         if let Some(store) = &self.remote_bindings {
             let _ = store.remove(&p.session_id.0);
         }
@@ -1831,7 +1830,6 @@ impl ControlServer {
         registry
             .archive(&p.session_id.0)
             .map_err(io_control_error)?;
-        let _ = registry.persist();
         self.publish_updated(&registry, &p.session_id.0);
         Ok(json!({}))
     }
@@ -1842,7 +1840,6 @@ impl ControlServer {
         registry
             .unarchive(&p.session_id.0)
             .map_err(io_control_error)?;
-        let _ = registry.persist();
         self.publish_updated(&registry, &p.session_id.0);
         Ok(json!({}))
     }
@@ -2808,6 +2805,7 @@ pub(crate) fn new_record(id: &str, kind: &str, cwd: &str) -> diri_proto::Session
         status_evidence: None,
         needs_input: None,
         resumability: Resumability::Live,
+        capabilities: None,
         parent: None,
         created_at: now,
         updated_at: now,
@@ -3434,6 +3432,7 @@ mod tests {
             status_evidence: None,
             needs_input: None,
             resumability: Resumability::NotResumable,
+            capabilities: None,
             parent: None,
             created_at: DateMillis(0.0),
             updated_at: DateMillis(0.0),

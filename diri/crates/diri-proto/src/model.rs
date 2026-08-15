@@ -693,6 +693,21 @@ pub struct PortInfo {
     pub process_name: String,
 }
 
+/// Verbs the authoritative Engine has resolved for one concrete session.
+///
+/// Clients consume this value instead of re-parsing commands or hard-coding
+/// Agent names. The field on [`SessionRecord`] is optional so an older Engine
+/// still degrades to the established resumability behavior.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCapabilities {
+    pub resume: bool,
+    pub archive: bool,
+    pub send_text: bool,
+    pub quick_approve: bool,
+    pub reliable_completion: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRecord {
@@ -724,6 +739,8 @@ pub struct SessionRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub needs_input: Option<NeedsInputDetail>,
     pub resumability: Resumability,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<SessionCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent: Option<SessionId>,
     pub created_at: DateMillis,
@@ -764,6 +781,14 @@ impl SessionRecord {
 
     pub fn is_archived(&self) -> bool {
         self.archived_at.is_some()
+    }
+
+    /// Mixed-version-safe answer used by every Resume surface.
+    pub fn can_resume(&self) -> bool {
+        self.capabilities
+            .map_or(self.resumability == Resumability::Resumable, |value| {
+                value.resume
+            })
     }
 
     pub fn attention(&self) -> AttentionLevel {

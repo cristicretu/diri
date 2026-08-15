@@ -15,6 +15,7 @@ use diri_proto::remote_pty::{
 };
 
 use super::binding::RemoteBindingStore;
+use super::effect::{EffectOutcome, EffectWriteError, write_at_most_once};
 use super::manager::{InstalledHelper, RemoteManager};
 
 const MAX_QUEUED_INPUT: usize = 1024 * 1024;
@@ -158,7 +159,15 @@ impl RemoteSessionClient {
         }
         if !writer.queued_input.is_empty() {
             let bytes = std::mem::take(&mut writer.queued_input);
-            write_message(&mut writer, &RemoteMessage::Terminal(Frame::input(bytes)))?;
+            if let Err(error) = write_effect_message(
+                &mut writer,
+                &RemoteMessage::Terminal(Frame::input(bytes.clone())),
+            ) {
+                if error.outcome() == EffectOutcome::NotApplied {
+                    writer.queued_input = bytes;
+                }
+                return Err(error.into());
+            }
         }
         Ok(())
     }
@@ -205,12 +214,17 @@ impl RemoteSessionClient {
             return queue_input(&mut writer, bytes);
         }
         let frame = terminal_input_frame(self.helper.protocol, bytes, mouse);
-        if let Err(error) = write_message(&mut writer, &RemoteMessage::Terminal(frame)) {
-            queue_input(&mut writer, bytes)?;
+        if let Err(error) = write_effect_message(&mut writer, &RemoteMessage::Terminal(frame)) {
+            let outcome = error.outcome();
+            let queue_result =
+                (outcome == EffectOutcome::NotApplied).then(|| queue_input(&mut writer, bytes));
             terminate_current(&mut writer);
             writer.controller_epoch = None;
-            let _ = error;
-            return Ok(());
+            return if outcome == EffectOutcome::NotApplied {
+                queue_result.expect("not-applied writes retain input")
+            } else {
+                Err(error.into())
+            };
         }
         Ok(())
     }
@@ -244,13 +258,14 @@ impl RemoteSessionClient {
                 "remote controller is reconnecting",
             )
         })?;
-        write_message(
+        write_effect_message(
             &mut writer,
             &RemoteMessage::Signal(Signal {
                 controller_epoch: epoch,
                 signal,
             }),
         )
+        .map_err(Into::into)
     }
 
     pub fn kill(&self) -> io::Result<()> {
@@ -403,6 +418,21 @@ fn write_message(writer: &mut WriterState, message: &RemoteMessage) -> io::Resul
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "SSH channel is closed"))?;
     input.write_all(&encoded)?;
     input.flush()
+}
+
+fn write_effect_message(
+    writer: &mut WriterState,
+    message: &RemoteMessage,
+) -> Result<(), EffectWriteError> {
+    let encoded = RemoteCodec::encode(message)
+        .map_err(|error| EffectWriteError::not_applied(io::Error::other(error)))?;
+    let input = writer.input.as_mut().ok_or_else(|| {
+        EffectWriteError::not_applied(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "SSH channel is closed",
+        ))
+    })?;
+    write_at_most_once(input, &encoded)
 }
 
 fn terminal_input_frame(protocol: ProtocolVersion, bytes: &[u8], mouse: bool) -> Frame {

@@ -496,6 +496,7 @@ fn session(
         status_evidence: None,
         needs_input: None,
         resumability,
+        capabilities: None,
         parent: None,
         created_at: DateMillis(created),
         updated_at: DateMillis(created),

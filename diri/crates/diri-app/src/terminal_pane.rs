@@ -2820,7 +2820,7 @@ impl TerminalPane {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = session.id.clone();
-        let resumable = session.resumability == Resumability::Resumable;
+        let resumable = session.can_resume();
         let mut pill = div()
             .id("exit-pill")
             .rounded(px(999.0))
@@ -3034,7 +3034,7 @@ impl TerminalPane {
     ) -> AnyElement {
         let id = session.id.clone();
         let content = centered_message("", &exit_description(session), colors);
-        if session.resumability == Resumability::Resumable {
+        if session.can_resume() {
             content
                 .child(primary_button(
                     "resume-conversation",

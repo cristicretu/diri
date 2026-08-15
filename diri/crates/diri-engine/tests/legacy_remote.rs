@@ -57,6 +57,7 @@ fn record(id: &str, host: Option<&str>, agent_session_id: Option<&str>) -> Sessi
         status_evidence: None,
         needs_input: None,
         resumability: Resumability::Live,
+        capabilities: None,
         parent: None,
         created_at: DateMillis(0.0),
         updated_at: DateMillis(0.0),

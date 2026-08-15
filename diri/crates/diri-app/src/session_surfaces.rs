@@ -1526,6 +1526,7 @@ mod tests {
             status_evidence: None,
             needs_input: None,
             resumability: Resumability::Live,
+            capabilities: None,
             parent: None,
             created_at: DateMillis(index as f64),
             updated_at: DateMillis(index as f64),

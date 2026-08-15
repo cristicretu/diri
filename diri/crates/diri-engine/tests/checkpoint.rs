@@ -75,6 +75,7 @@ fn record(id: &str) -> diri_proto::SessionRecord {
         status_evidence: None,
         needs_input: None,
         resumability: Resumability::NotResumable,
+        capabilities: None,
         parent: None,
         created_at: DateMillis(0.0),
         updated_at: DateMillis(0.0),

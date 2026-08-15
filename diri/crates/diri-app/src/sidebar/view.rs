@@ -3987,7 +3987,7 @@ impl Sidebar {
                 .child(copy_session_id_row(id, colors, cx));
         } else {
             let running = !matches!(session.status, diri_proto::SessionStatus::Exited(_));
-            if !running && session.resumability == diri_proto::Resumability::Resumable {
+            if !running && session.can_resume() {
                 content = content.child(menu_row(
                     "Resume",
                     colors,

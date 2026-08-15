@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::detect::ManifestEngine;
 use crate::holder::{HolderClient, HolderManagerPaths, HolderPaths};
+use crate::lifecycle::{LifecycleAction, LifecyclePlan};
 use crate::session::{HolderConfig, RemoteAdoptSpec, Session, SessionSpec, SessionView};
+use crate::state_file::JsonStateFile;
 
 /// The versioned on-disk snapshot.
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -45,7 +47,7 @@ pub struct Registry {
     projects: Vec<serde_json::Value>,
     /// Sessions the user closed, newest last — the "reopen closed tab" stack.
     recently_closed: Vec<SessionRecord>,
-    state_file: PathBuf,
+    state_file: JsonStateFile,
     /// Trailing-edge persistence: a mutation inside the debounce window marks
     /// dirty instead of rewriting the whole file (mark-seen fires on every
     /// tab switch), and the flusher or the next persist call writes it out.
@@ -93,7 +95,7 @@ impl Registry {
             records: HashMap::new(),
             projects: Vec::new(),
             recently_closed: Vec::new(),
-            state_file: state_file.into(),
+            state_file: JsonStateFile::new(state_file),
             dirty: false,
             last_persist: None,
         }
@@ -105,12 +107,23 @@ impl Registry {
     /// ignored: treating it as a fresh install would make the next write
     /// overwrite every session record the user had.
     pub fn load(&mut self) -> std::io::Result<usize> {
-        let bytes = match std::fs::read(&self.state_file) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        let document = match self.state_file.read() {
+            Ok(Some(document)) => document,
+            Ok(None) => return Ok(0),
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                let quarantine = self.state_file.path().with_extension("json.corrupt");
+                let _ = std::fs::rename(self.state_file.path(), &quarantine);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "state file did not parse ({error}); quarantined at {}",
+                        quarantine.display()
+                    ),
+                ));
+            }
             Err(error) => return Err(error),
         };
-        match serde_json::from_slice::<PersistedState>(&bytes) {
+        match serde_json::from_value::<PersistedState>(serde_json::Value::Object(document)) {
             Ok(state) => {
                 self.projects = state.projects;
                 let project_roots = self
@@ -143,8 +156,8 @@ impl Registry {
                 Ok(self.records.len())
             }
             Err(error) => {
-                let quarantine = self.state_file.with_extension("json.corrupt");
-                let _ = std::fs::rename(&self.state_file, &quarantine);
+                let quarantine = self.state_file.path().with_extension("json.corrupt");
+                let _ = std::fs::rename(self.state_file.path(), &quarantine);
                 Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
@@ -193,14 +206,19 @@ impl Registry {
     /// Writes the current state atomically, unconditionally.
     fn persist_now(&mut self) -> std::io::Result<()> {
         let state = PersistedState::current(self.records_for_persistence(), self.projects.clone());
-        let bytes = serde_json::to_vec(&state)?;
-        let temp = self.state_file.with_extension("json.tmp");
-        if let Some(parent) = self.state_file.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&temp, &bytes)?;
-        // Rename is atomic, so a crash mid-write cannot truncate the real file.
-        std::fs::rename(&temp, &self.state_file)?;
+        let known = serde_json::to_value(state)?;
+        let known = known
+            .as_object()
+            .expect("PersistedState serializes as an object");
+        self.state_file.update(|document| {
+            for key in ["version", "projects", "sessions"] {
+                document.insert(
+                    key.to_owned(),
+                    known.get(key).cloned().expect("known persistence key"),
+                );
+            }
+            Ok(())
+        })?;
         self.dirty = false;
         self.last_persist = Some(std::time::Instant::now());
         Ok(())
@@ -209,9 +227,7 @@ impl Registry {
     fn records_for_persistence(&self) -> Vec<SessionRecord> {
         let mut records: Vec<SessionRecord> = self.records.values().cloned().collect();
         for record in &mut records {
-            if let Some(session) = self.sessions.get(&record.id.0) {
-                fold_session_status(record, &session.view());
-            }
+            self.fold_live(record);
         }
         records.sort_by(|a, b| a.id.0.cmp(&b.id.0));
         records
@@ -425,34 +441,7 @@ impl Registry {
         if let Some(session) = self.sessions.get(&record.id.0) {
             fold_session_view(record, &session.view());
         }
-        // `Live` only records that the agent named its conversation while it
-        // was running. Once the session is gone the question every Resume
-        // affordance asks is a different one — can that conversation be
-        // re-entered — so answer it here rather than leaving a stale `Live`
-        // that reads as "not resumable" to each of them.
-        if matches!(record.status, SessionStatus::Exited(_))
-            && record.resumability == diri_proto::Resumability::Live
-        {
-            record.resumability = if self.can_reenter(record) {
-                diri_proto::Resumability::Resumable
-            } else {
-                diri_proto::Resumability::NotResumable
-            };
-        }
-    }
-
-    /// Whether this record's agent can be relaunched back into its own
-    /// conversation — a known conversation id plus a manifest that declares
-    /// how to resume one.
-    fn can_reenter(&self, record: &SessionRecord) -> bool {
-        let Some(agent_session_id) = record.agent_session_id.as_deref() else {
-            return false;
-        };
-        self.engine
-            .manifest(record.kind.id())
-            .and_then(|manifest| manifest.agent.as_ref())
-            .and_then(|agent| agent.resume_args(Some(agent_session_id)))
-            .is_some()
+        fold_record_lifecycle(&self.engine, record);
     }
 
     /// Diffs live sessions' state versions against `published` (updating it in
@@ -474,22 +463,31 @@ impl Registry {
                 (published.get(id) != Some(&version)).then(|| (id.clone(), version, session.view()))
             })
             .collect::<Vec<_>>();
-        let mut title_changed = false;
+        let mut persistence_changed = false;
         for (id, version, view) in changed_views {
             published.insert(id.clone(), version);
             if let Some(record) = self.records.get_mut(&id) {
-                let previous_title = (record.title.clone(), record.title_source);
+                let previous_persisted = (
+                    record.title.clone(),
+                    record.title_source,
+                    record.last_turn_completed_at,
+                );
                 fold_session_view(record, &view);
-                let record_title_changed =
-                    previous_title != (record.title.clone(), record.title_source);
-                if record_title_changed {
+                fold_record_lifecycle(&self.engine, record);
+                let record_persistence_changed = previous_persisted
+                    != (
+                        record.title.clone(),
+                        record.title_source,
+                        record.last_turn_completed_at,
+                    );
+                if record_persistence_changed {
                     record.updated_at = DateMillis::from(std::time::SystemTime::now());
-                    title_changed = true;
+                    persistence_changed = true;
                 }
                 changed.push((id, record.clone()));
             }
         }
-        if title_changed {
+        if persistence_changed {
             self.dirty = true;
         }
         changed
@@ -533,18 +531,31 @@ impl Registry {
     /// Ends the session (if live), deletes its record AND its output log.
     /// This is the user closing a tab for good, not archiving.
     pub fn remove(&mut self, id: &str, logs_dir: &Path) -> std::io::Result<()> {
-        if self.sessions.contains_key(id) {
-            let _ = self.terminate(id, std::time::Duration::from_millis(500));
+        let record = self.records.get(id).cloned().ok_or_else(|| not_found(id))?;
+        let plan = LifecyclePlan::for_record(
+            &record,
+            LifecycleAction::Remove,
+            DateMillis::from(std::time::SystemTime::now()),
+        )?;
+        self.state_file.verify_editable()?;
+        if plan.terminate_live_session && self.sessions.contains_key(id) {
+            self.terminate(id, std::time::Duration::from_millis(500))?;
         }
-        let Some(record) = self.records.remove(id) else {
-            return Err(not_found(id));
-        };
-        self.recently_closed.push(record);
-        if self.recently_closed.len() > 10 {
-            self.recently_closed.remove(0);
+        self.records.remove(id);
+        if plan.retain_for_reopen {
+            self.recently_closed.push(record.clone());
+            if self.recently_closed.len() > 10 {
+                self.recently_closed.remove(0);
+            }
         }
-        self.sessions.remove(id);
-        let _ = std::fs::remove_file(logs_dir.join(format!("{id}.bin")));
+        if let Err(error) = self.persist_now() {
+            self.records.insert(id.to_owned(), record);
+            self.recently_closed.retain(|closed| closed.id.0 != id);
+            return Err(error);
+        }
+        if plan.delete_output_log {
+            let _ = std::fs::remove_file(logs_dir.join(format!("{id}.bin")));
+        }
         Ok(())
     }
 
@@ -938,32 +949,45 @@ impl Registry {
     /// Ends the session but keeps its record on the shelf: kill-tree,
     /// keep-record, stamp `archivedAt`.
     pub fn archive(&mut self, id: &str) -> std::io::Result<()> {
-        if !self.records.contains_key(id) {
-            return Err(not_found(id));
+        let original = self.records.get(id).cloned().ok_or_else(|| not_found(id))?;
+        let plan = LifecyclePlan::for_record(
+            &original,
+            LifecycleAction::Archive,
+            DateMillis::from(std::time::SystemTime::now()),
+        )?;
+        self.state_file.verify_editable()?;
+        if plan.terminate_live_session && self.sessions.contains_key(id) {
+            self.terminate(id, std::time::Duration::from_millis(500))?;
         }
-        if self.sessions.contains_key(id) {
-            let _ = self.terminate(id, std::time::Duration::from_millis(500));
+        self.records.insert(
+            id.to_owned(),
+            plan.replacement.expect("archive keeps the record"),
+        );
+        if let Err(error) = self.persist_now() {
+            self.records.insert(id.to_owned(), original);
+            return Err(error);
         }
-        let record = self.records.get_mut(id).expect("checked above");
-        record.archived_at = Some(DateMillis::from(std::time::SystemTime::now()));
-        if !matches!(record.status, SessionStatus::Exited(_)) {
-            record.status = SessionStatus::Exited(diri_proto::ExitInfo {
-                reason: diri_proto::ExitReason::Archived,
-                code: None,
-                signal: None,
-            });
-        }
-        record.needs_input = None;
         Ok(())
     }
 
     pub fn unarchive(&mut self, id: &str) -> std::io::Result<()> {
-        let record = self.records.get_mut(id).ok_or_else(|| not_found(id))?;
-        if record.archived_at.is_none() {
+        let original = self.records.get(id).cloned().ok_or_else(|| not_found(id))?;
+        if original.archived_at.is_none() {
             return Ok(());
         }
-        record.archived_at = None;
-        record.updated_at = DateMillis::from(std::time::SystemTime::now());
+        let plan = LifecyclePlan::for_record(
+            &original,
+            LifecycleAction::Restore,
+            DateMillis::from(std::time::SystemTime::now()),
+        )?;
+        self.records.insert(
+            id.to_owned(),
+            plan.replacement.expect("restore keeps the record"),
+        );
+        if let Err(error) = self.persist_now() {
+            self.records.insert(id.to_owned(), original);
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -990,7 +1014,7 @@ impl Registry {
     }
 
     pub fn state_file(&self) -> &Path {
-        &self.state_file
+        self.state_file.path()
     }
 }
 
@@ -1050,6 +1074,38 @@ fn fold_session_status(record: &mut SessionRecord, view: &SessionView) {
         .filter(|evidence| evidence.status == view.status)
         .cloned();
     record.needs_input.clone_from(&view.needs_input);
+    if view.last_turn_completed_at > record.last_turn_completed_at {
+        record.last_turn_completed_at = view.last_turn_completed_at;
+    }
+}
+
+/// Resolves status-dependent facts at the one seam shared by snapshots and
+/// incremental events, so clients never have to reconstruct Agent behavior.
+fn fold_record_lifecycle(engine: &ManifestEngine, record: &mut SessionRecord) {
+    // `Live` only records that the agent named its conversation while it was
+    // running. After exit, Resume needs the stronger answer: whether that
+    // conversation can actually be re-entered through its manifest.
+    if matches!(record.status, SessionStatus::Exited(_))
+        && record.resumability == diri_proto::Resumability::Live
+    {
+        record.resumability = if can_reenter(engine, record) {
+            diri_proto::Resumability::Resumable
+        } else {
+            diri_proto::Resumability::NotResumable
+        };
+    }
+    record.capabilities = Some(engine.session_capabilities(record));
+}
+
+fn can_reenter(engine: &ManifestEngine, record: &SessionRecord) -> bool {
+    let Some(agent_session_id) = record.agent_session_id.as_deref() else {
+        return false;
+    };
+    engine
+        .manifest(record.kind.id())
+        .and_then(|manifest| manifest.agent.as_ref())
+        .and_then(|agent| agent.resume_args(Some(agent_session_id)))
+        .is_some()
 }
 
 fn normalize_agent_title(title: &str) -> Option<String> {
@@ -1128,6 +1184,7 @@ mod tests {
             status_evidence: None,
             needs_input: None,
             resumability: Resumability::NotResumable,
+            capabilities: None,
             parent: None,
             created_at: DateMillis(0.0),
             updated_at: DateMillis(0.0),
@@ -1242,6 +1299,27 @@ mod tests {
         assert_eq!(current.git_branch, original.git_branch);
         assert_eq!(current.updated_at, original.updated_at);
         assert!(!registry.dirty, "failed edit must not be flushed later");
+    }
+
+    #[test]
+    fn destructive_lifecycle_edits_stop_before_unwritable_state() {
+        let temp = tempfile::tempdir().expect("temp");
+        let blocked_parent = temp.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, b"file").expect("blocking file");
+        let mut registry = Registry::new(engine(), blocked_parent.join("state.json"));
+        let original = record("guarded");
+        registry.insert_record(original.clone());
+
+        registry
+            .archive("guarded")
+            .expect_err("archive must not outrun persistence");
+        assert_eq!(registry.records.get("guarded"), Some(&original));
+
+        registry
+            .remove("guarded", temp.path())
+            .expect_err("remove must not outrun persistence");
+        assert_eq!(registry.records.get("guarded"), Some(&original));
+        assert!(registry.recently_closed.is_empty());
     }
 
     #[test]
@@ -1581,6 +1659,27 @@ mod tests {
     }
 
     #[test]
+    fn unknown_top_level_state_survives_a_registry_write() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state_file = temp.path().join("state.json");
+        std::fs::write(
+            &state_file,
+            br#"{"version":1,"projects":[],"sessions":[],"future":{"theme":"plum"}}"#,
+        )
+        .expect("write");
+
+        let mut registry = Registry::new(engine(), &state_file);
+        registry.load().expect("load");
+        registry.insert_record(record("new"));
+        registry.persist().expect("persist");
+
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_file).expect("read")).expect("parse");
+        assert_eq!(raw["future"], serde_json::json!({"theme": "plum"}));
+        assert_eq!(raw["sessions"][0]["id"], "new");
+    }
+
+    #[test]
     fn project_identity_includes_the_execution_host() {
         let local = session_project_id("/workspace/app", None);
         let forge = session_project_id("/workspace/app", Some("forge"));
@@ -1723,6 +1822,7 @@ mod tests {
             status: SessionStatus::Working,
             status_evidence: None,
             needs_input: None,
+            last_turn_completed_at: None,
             title: Some("Repair remote attach".to_owned()),
             title_source: Some(TitleSource::AgentProvided),
             tail_offset: 0,
@@ -1784,5 +1884,27 @@ mod tests {
         assert!(repair_persisted_agent_title(&mut decorated));
         assert_eq!(decorated.title, AgentKind::CLAUDE_CODE_ID);
         assert_eq!(decorated.title_source, TitleSource::Placeholder);
+    }
+
+    #[test]
+    fn completed_turn_time_folds_into_attention_state() {
+        let mut session = record("completed");
+        session.status = SessionStatus::Working;
+        let view = SessionView {
+            id: "completed".to_owned(),
+            status: SessionStatus::Idle,
+            status_evidence: None,
+            needs_input: None,
+            last_turn_completed_at: Some(DateMillis(2_000.0)),
+            title: None,
+            title_source: None,
+            tail_offset: 0,
+            exited: false,
+        };
+
+        fold_session_status(&mut session, &view);
+
+        assert_eq!(session.last_turn_completed_at, Some(DateMillis(2_000.0)));
+        assert_eq!(session.attention(), diri_proto::AttentionLevel::DoneUnseen);
     }
 }

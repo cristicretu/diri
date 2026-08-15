@@ -12,8 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use diri_proto::{
-    AgentKind, Project, ProjectId, Resumability, SessionId, SessionRecord, SessionStatus,
-    WorktreeOverviewEntry,
+    AgentKind, Project, ProjectId, SessionId, SessionRecord, SessionStatus, WorktreeOverviewEntry,
 };
 use serde_json::Value;
 
@@ -152,7 +151,7 @@ pub fn worktree_move_proposal(
             "Stop or archive the session before moving it to another worktree.".to_owned(),
         ));
     }
-    if source.resumability != Resumability::Resumable {
+    if !source.can_resume() {
         return Err(DelegationRefusal(
             "This session cannot resume after moving to another worktree.".to_owned(),
         ));
@@ -390,7 +389,9 @@ fn read_tail(path: &Path, cap: u64) -> std::io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use diri_proto::{DateMillis, ExitInfo, ExitReason, PullRequestStatus, TitleSource};
+    use diri_proto::{
+        DateMillis, ExitInfo, ExitReason, PullRequestStatus, Resumability, TitleSource,
+    };
 
     fn session(id: &str, parent: Option<&str>) -> SessionRecord {
         SessionRecord {
@@ -409,6 +410,7 @@ mod tests {
             status_evidence: None,
             needs_input: None,
             resumability: Resumability::Live,
+            capabilities: None,
             parent: parent.map(SessionId::new),
             created_at: DateMillis(1.0),
             updated_at: DateMillis(2.0),

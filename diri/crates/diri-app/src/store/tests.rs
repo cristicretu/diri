@@ -45,6 +45,7 @@ fn session(value: &str, project: &str, created: f64) -> SessionRecord {
         status_evidence: None,
         needs_input: None,
         resumability: Resumability::Live,
+        capabilities: None,
         parent: None,
         created_at: DateMillis(created),
         updated_at: DateMillis(created),

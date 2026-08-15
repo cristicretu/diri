@@ -16,7 +16,7 @@ use diri_proto::remote_pty::DirectoryListResult;
 use diri_proto::{
     AgentDescriptor, AgentKind, AgentReadinessResult, AttentionLevel, DateMillis, EventName,
     ExitReason, GovernorConfigureParams, HelloResult, HostEntry, HostsConfig, Project, ProjectId,
-    Resumability, SessionId, SessionListResult, SessionRecord, SessionSpawnParams, SessionStatus,
+    SessionId, SessionListResult, SessionRecord, SessionSpawnParams, SessionStatus,
 };
 use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -1287,7 +1287,7 @@ impl SessionStore {
                 SessionStatus::Exited(info)
                     if info.reason == ExitReason::Exited
                         && info.code == Some(0)
-                        && session.resumability != Resumability::Resumable
+                        && !session.can_resume()
             )
             && previous
                 .as_deref()
@@ -1843,7 +1843,7 @@ impl SessionStore {
                 continue;
             }
             session.archived_at = None;
-            let resumable = session.resumability == Resumability::Resumable;
+            let resumable = session.can_resume();
             revived.push(id.clone());
             self.emit(if resumable {
                 StoreEffect::Resume {
@@ -1864,7 +1864,7 @@ impl SessionStore {
         let eligible = self.selected_session_id.as_ref() == Some(id)
             && self.sessions.get(id).is_some_and(|session| {
                 !session.is_archived()
-                    && session.resumability == Resumability::Resumable
+                    && session.can_resume()
                     && matches!(
                         &session.status,
                         SessionStatus::Exited(info) if info.reason == ExitReason::DaemonRestart

@@ -607,6 +607,7 @@ mod tests {
                 occurred_at: DateMillis(1.0),
             }),
             resumability: Resumability::NotResumable,
+            capabilities: None,
             parent: None,
             created_at: DateMillis(1.0),
             updated_at: DateMillis(2.0),

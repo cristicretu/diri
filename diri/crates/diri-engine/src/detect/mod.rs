@@ -139,6 +139,34 @@ impl ManifestEngine {
         self.manifests.get(id)
     }
 
+    /// Resolves frontend verbs from the same manifest that owns launch and
+    /// status behavior. Unknown Agents get a conservative, lifecycle-only
+    /// answer rather than being guessed from their command text.
+    pub fn session_capabilities(
+        &self,
+        record: &diri_proto::SessionRecord,
+    ) -> diri_proto::SessionCapabilities {
+        self.manifest(record.effective_kind().id())
+            .and_then(|manifest| manifest.agent.as_ref())
+            .map_or_else(
+                || diri_proto::SessionCapabilities {
+                    resume: false,
+                    archive: !record.is_archived(),
+                    send_text: !record.is_archived()
+                        && !matches!(record.status, diri_proto::SessionStatus::Exited(_)),
+                    quick_approve: false,
+                    reliable_completion: false,
+                },
+                |agent| {
+                    agent.session_capabilities(
+                        record.resumability,
+                        &record.status,
+                        record.is_archived(),
+                    )
+                },
+            )
+    }
+
     pub fn ids(&self) -> Vec<&str> {
         self.manifests.keys().map(String::as_str).collect()
     }

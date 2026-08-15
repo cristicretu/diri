@@ -473,6 +473,55 @@ fn codex_turn_complete_then_a_tick_settles_to_idle() {
 }
 
 #[test]
+fn late_codex_output_rearms_working_without_completing_twice() {
+    let mut reducer = StatusReducer::new(Authority::ScreenPrimary, t0());
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::Working, 1)),
+        now,
+    );
+
+    let completed_at = now + Duration::from_millis(100);
+    reducer.reduce(StatusSignal::CodexTurnComplete, completed_at);
+    let settled = reducer.reduce(
+        StatusSignal::Tick,
+        completed_at + Duration::from_millis(100),
+    );
+    assert_eq!(settled.status_change, Some(SessionStatus::Idle));
+    assert!(settled.turn_completed);
+
+    let repaint = reducer.reduce(
+        StatusSignal::PtyOutputActivity,
+        completed_at + Duration::from_secs(4),
+    );
+    assert_eq!(
+        repaint.status_change, None,
+        "ordinary stop repaint is ignored"
+    );
+
+    let continuing = reducer.reduce(
+        StatusSignal::PtyOutputActivity,
+        completed_at + Duration::from_secs(6),
+    );
+    assert_eq!(continuing.status_change, Some(SessionStatus::Working));
+    assert!(!continuing.turn_completed);
+
+    reducer.reduce(
+        StatusSignal::CodexTurnComplete,
+        completed_at + Duration::from_secs(7),
+    );
+    let settled_again = reducer.reduce(
+        StatusSignal::Tick,
+        completed_at + Duration::from_secs(7) + Duration::from_millis(100),
+    );
+    assert_eq!(settled_again.status_change, Some(SessionStatus::Idle));
+    assert!(
+        !settled_again.turn_completed,
+        "rearming the same logical turn must not notify twice"
+    );
+}
+
+#[test]
 fn a_process_only_agent_goes_working_on_first_output_then_exits() {
     let mut reducer = StatusReducer::new(Authority::ProcessOnly, t0());
     let now = t0() + Duration::from_secs(1);

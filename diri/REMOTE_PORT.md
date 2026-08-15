@@ -437,6 +437,12 @@ continues parsing terminal state but does not construct or serialize diffs. If
 an attached client falls behind, stale updates are discarded and the connection
 is reseeded from a complete snapshot after reconnect.
 
+The Engine reconciles raw-output offsets before feeding any local observer:
+duplicates are skipped, overlaps feed only the unseen suffix, and a forward gap
+on the live stream forces reconnect. Bounded replay may contain a gap because
+the Holder follows it with an authoritative `FullSnapshot`; replay bytes are
+logged for continuity but never treated as a second live status observation.
+
 One owner/event loop handles PTY drain, terminal parsing, diff construction, and
 attach writes. The hot path does not put an `Arc<Mutex<Terminal>>` across tasks.
 Buffers are reused where practical, and idle Holders do not poll, heartbeat, or
@@ -471,6 +477,11 @@ Only the current epoch may send:
 - `Signal`;
 - `Scroll`;
 - session termination requests.
+
+Input and signals are at-most-once effects. If a write fails before accepting
+any frame byte, input may be retained for a later controller lease. A partial
+write or lost flush acknowledgement has an unknown outcome: the Engine surfaces
+the transport error and never queues or replays that effect.
 
 Stale epochs fail with a structured protocol error. Multiple read-only observers
 are a future enhancement and are not part of the completed baseline.

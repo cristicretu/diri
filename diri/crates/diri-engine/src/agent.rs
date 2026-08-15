@@ -135,6 +135,25 @@ pub struct AgentDescriptor {
 }
 
 impl AgentDescriptor {
+    /// Resolves the static manifest facts and the session's current lifecycle
+    /// into one wire value. This is the only place callers need to understand
+    /// which descriptor fields imply a supported verb.
+    pub fn session_capabilities(
+        &self,
+        resumability: diri_proto::Resumability,
+        status: &diri_proto::SessionStatus,
+        archived: bool,
+    ) -> diri_proto::SessionCapabilities {
+        let live = !archived && !matches!(status, diri_proto::SessionStatus::Exited(_));
+        diri_proto::SessionCapabilities {
+            resume: resumability == diri_proto::Resumability::Resumable,
+            archive: !archived,
+            send_text: live,
+            quick_approve: self.approve.is_some(),
+            reliable_completion: self.authority() != Authority::ProcessOnly,
+        }
+    }
+
     /// The reducer authority this agent declares, defaulting to the
     /// conservative one when a manifest does not say.
     pub fn authority(&self) -> Authority {
@@ -648,6 +667,28 @@ mod tests {
                 "{id} must resume"
             );
         }
+    }
+
+    #[test]
+    fn manifest_and_lifecycle_resolve_session_capabilities_once() {
+        let codex = descriptor("codex");
+        let exited = diri_proto::SessionStatus::Exited(diri_proto::ExitInfo {
+            reason: diri_proto::ExitReason::Exited,
+            code: Some(0),
+            signal: None,
+        });
+        let capabilities =
+            codex.session_capabilities(diri_proto::Resumability::Resumable, &exited, false);
+        assert!(capabilities.resume);
+        assert!(capabilities.archive);
+        assert!(!capabilities.send_text);
+        assert!(capabilities.quick_approve);
+        assert!(capabilities.reliable_completion);
+
+        let archived =
+            codex.session_capabilities(diri_proto::Resumability::Resumable, &exited, true);
+        assert!(archived.resume, "restore can re-enter the conversation");
+        assert!(!archived.archive);
     }
 
     #[test]

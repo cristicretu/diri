@@ -43,6 +43,7 @@ use crate::pty::{Exit, Pty, PtySpec};
 use crate::remote::binding::{RemoteBinding, RemoteBindingStore};
 use crate::remote::client::RemoteSessionClient;
 use crate::remote::manager::{InstalledHelper, RemoteManager};
+use crate::remote::stream::{OutputFrameAction, reconcile_output_frame};
 use crate::screen::HeadlessScreen;
 use crate::status::{Authority, ClaudeHook, ReducerOutcome, StatusReducer, StatusSignal};
 
@@ -188,6 +189,7 @@ pub struct SessionView {
     pub status: SessionStatus,
     pub status_evidence: Option<diri_proto::StatusEvidence>,
     pub needs_input: Option<NeedsInputDetail>,
+    pub last_turn_completed_at: Option<diri_proto::DateMillis>,
     pub title: Option<String>,
     pub title_source: Option<diri_proto::TitleSource>,
     pub tail_offset: u64,
@@ -252,6 +254,7 @@ struct Shared {
     id: String,
     status: Mutex<SessionStatus>,
     needs_input: Mutex<Option<NeedsInputDetail>>,
+    last_turn_completed_at: Mutex<Option<diri_proto::DateMillis>>,
     title: Mutex<Option<String>>,
     prompt_title: Mutex<Option<String>>,
     prompt_input: Mutex<PromptInputState>,
@@ -1101,6 +1104,11 @@ impl Session {
                 .evidence()
                 .cloned(),
             needs_input: self.shared.needs_input.lock().expect("needs input").clone(),
+            last_turn_completed_at: *self
+                .shared
+                .last_turn_completed_at
+                .lock()
+                .expect("last turn completed"),
             title,
             title_source,
             tail_offset: self.shared.log.lock().expect("log").tail_offset(),
@@ -1732,6 +1740,7 @@ fn new_shared(spec: &SessionSpec, log: OutputLog, engine: &ManifestEngine) -> Ar
         id: spec.id.clone(),
         status: Mutex::new(SessionStatus::Starting),
         needs_input: Mutex::new(None),
+        last_turn_completed_at: Mutex::new(None),
         title: Mutex::new(None),
         prompt_title: Mutex::new(None),
         prompt_input: Mutex::new(PromptInputState::default()),
@@ -1818,6 +1827,13 @@ fn apply(shared: &Shared, outcome: &ReducerOutcome) {
             *current = Some(detail.clone());
             changed = true;
         }
+    }
+    if outcome.turn_completed {
+        *shared
+            .last_turn_completed_at
+            .lock()
+            .expect("last turn completed") = Some(diri_proto::DateMillis::from(SystemTime::now()));
+        changed = true;
     }
     // The reducer already suppresses evidence with unchanged structured
     // meaning, so an emitted value always warrants a record/UI refresh.
@@ -2085,8 +2101,7 @@ fn handle_remote_message(
                 let Some((offset, bytes)) = frame.output_payload() else {
                     return RemoteConnectionDisposition::Fatal;
                 };
-                client.observe_output_offset(offset.saturating_add(bytes.len() as u64));
-                apply_remote_output(
+                match apply_remote_output(
                     shared,
                     engine,
                     manifest_id,
@@ -2094,8 +2109,13 @@ fn handle_remote_message(
                     offset,
                     bytes,
                     *replaying,
-                );
-                RemoteConnectionDisposition::Continue
+                ) {
+                    Some(next_offset) => {
+                        client.observe_output_offset(next_offset);
+                        RemoteConnectionDisposition::Continue
+                    }
+                    None => RemoteConnectionDisposition::Reconnect,
+                }
             }
             _ => RemoteConnectionDisposition::Fatal,
         },
@@ -2149,24 +2169,32 @@ fn apply_remote_output(
     offset: u64,
     bytes: &[u8],
     replaying: bool,
-) {
+) -> Option<u64> {
     let expected = shared.remote_output_offset.load(Ordering::SeqCst);
     let end = offset.saturating_add(bytes.len() as u64);
-    if end <= expected {
-        return;
-    }
-    let skip = expected.saturating_sub(offset).min(bytes.len() as u64) as usize;
-    let bytes = &bytes[skip..];
+    let bytes = match reconcile_output_frame(expected, offset, bytes.len()) {
+        OutputFrameAction::Feed => bytes,
+        OutputFrameAction::FeedSuffix { drop_leading } => &bytes[drop_leading..],
+        OutputFrameAction::Skip => return Some(expected),
+        // Replay is bounded by the Holder. If older bytes have already fallen
+        // out of that bound, the FullSnapshot queued after ReplayEnd is the
+        // authoritative recovery. A gap in the live stream instead means the
+        // connection must be reseeded before more output is consumed.
+        OutputFrameAction::Gap { .. } if replaying => bytes,
+        OutputFrameAction::Gap { .. } => return None,
+    };
     if bytes.is_empty() {
-        return;
+        return Some(expected);
     }
     shared.remote_output_offset.store(end, Ordering::SeqCst);
     let _ = shared.log.lock().expect("log").append(bytes);
-    let observation = {
-        let mut screen = shared.screen.lock().expect("screen");
-        screen.feed(bytes);
-        evaluate_if_screen_changed(shared, &mut screen, engine, manifest_id, last_eval_seq)
-    };
+    let observation = (!replaying)
+        .then(|| {
+            let mut screen = shared.screen.lock().expect("screen");
+            screen.feed(bytes);
+            evaluate_if_screen_changed(shared, &mut screen, engine, manifest_id, last_eval_seq)
+        })
+        .flatten();
     let now = SystemTime::now();
     let mut reducer = shared.reducer.lock().expect("reducer");
     if !replaying {
@@ -2178,6 +2206,7 @@ fn apply_remote_output(
         drop(reducer);
         apply(shared, &outcome);
     }
+    Some(end)
 }
 
 fn apply_remote_snapshot(

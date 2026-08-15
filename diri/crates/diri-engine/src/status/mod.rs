@@ -47,6 +47,12 @@ pub struct ReducerTiming {
     pub hook_authority_window: Duration,
     pub blocker_clear_scans: u32,
     pub staleness_timeout: Duration,
+    /// Ignore the terminal's ordinary repaint immediately after Codex reports
+    /// completion. Output after this grace means the turn was not actually
+    /// settled yet and re-arms working without completing the turn twice.
+    pub codex_stop_rearm_grace: Duration,
+    /// A late repaint should not resurrect an old, genuinely idle turn.
+    pub codex_stop_rearm_window: Duration,
 }
 
 impl Default for ReducerTiming {
@@ -59,6 +65,8 @@ impl Default for ReducerTiming {
             hook_authority_window: Duration::from_secs(7),
             blocker_clear_scans: 2,
             staleness_timeout: Duration::from_secs(60),
+            codex_stop_rearm_grace: Duration::from_secs(5),
+            codex_stop_rearm_window: Duration::from_secs(90),
         }
     }
 }
@@ -139,6 +147,9 @@ struct InternalState {
     idle_strong: bool,
     /// Fire `turn_completed` exactly once on the next committed working→idle.
     pending_turn_completed: bool,
+    /// The last strong Codex completion signal. Kept briefly so sufficiently
+    /// late PTY output can correct an optimistic idle decision.
+    last_codex_completion_at: Option<SystemTime>,
 
     // On-screen blocker tracking.
     screen_blocker_active: bool,
@@ -168,6 +179,7 @@ impl InternalState {
             idle_confirms: 0,
             idle_strong: false,
             pending_turn_completed: false,
+            last_codex_completion_at: None,
             screen_blocker_active: false,
             blocker_miss_scans: 0,
             screen_belief: None,
@@ -316,12 +328,20 @@ impl StatusReducer {
         match signal {
             StatusSignal::ProcessExit { .. } => {} // handled above
             StatusSignal::PtyOutputActivity => {
-                // Refreshes the recency of `working`; for full status models it
-                // never by itself means work is happening.
+                // PTY activity is normally recency-only for full status
+                // models. One exception matters: Codex can report completion
+                // before its terminal has truly settled. A repaint outside the
+                // short grace period re-arms working, but keeps the completed
+                // turn consumed so callers do not notify twice.
+                if self.status == SessionStatus::Idle && self.codex_output_rearms_working(now) {
+                    self.cancel_idle_candidacy();
+                    self.set_status(SessionStatus::Working, &mut outcome);
+                }
                 self.state.last_signal_at = now;
             }
             StatusSignal::UserKeystroke => {
                 self.state.last_signal_at = now;
+                self.state.last_codex_completion_at = None;
                 if matches!(self.status, SessionStatus::NeedsInput(_)) {
                     self.state.responding_since = Some(now);
                 }
@@ -331,6 +351,9 @@ impl StatusReducer {
             }
             StatusSignal::CodexTurnComplete => {
                 self.state.last_signal_at = now;
+                if self.status == SessionStatus::Working {
+                    self.state.last_codex_completion_at = Some(now);
+                }
                 self.handle_strong_idle(now, &mut outcome);
             }
             StatusSignal::Screen(observation) => self.handle_screen(observation, now, &mut outcome),
@@ -483,8 +506,21 @@ impl StatusReducer {
             self.state.blocker_miss_scans = 0;
         }
         self.state.turn_in_flight = true;
+        self.state.last_codex_completion_at = None;
         self.state.last_signal_at = now;
         self.set_status(SessionStatus::Working, outcome);
+    }
+
+    fn codex_output_rearms_working(&mut self, now: SystemTime) -> bool {
+        let Some(completed_at) = self.state.last_codex_completion_at else {
+            return false;
+        };
+        let elapsed = now.duration_since(completed_at).unwrap_or_default();
+        if elapsed > self.timing.codex_stop_rearm_window {
+            self.state.last_codex_completion_at = None;
+            return false;
+        }
+        elapsed >= self.timing.codex_stop_rearm_grace
     }
 
     /// A strong idle signal. Commits immediately when the screen already reads
