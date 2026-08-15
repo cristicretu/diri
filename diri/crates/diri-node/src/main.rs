@@ -7,7 +7,7 @@ use diri_client::{NodeClient, NodeClientConfig};
 use diri_node::{NodeConfig, NodePaths, NodeServer, NodeService};
 use diri_proto::{
     AccountLoginStartParams, AccountSetDefaultParams, AccountUpsertParams, CheckpointPrepareParams,
-    LoginMode, ProviderKind, TransferMode,
+    LoginMode, PortableConfigApplyResult, ProviderKind, TransferMode,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -96,9 +96,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             serve(paths, config, listen).await?;
         }
         "account" => {
-            reject_target_options(&target)?;
-            let client = management_client(&paths, listen, &remote, &home)?;
-            account_command(&arguments[1..], &client).await?;
+            let source = management_client(&paths, listen, &remote, &home)?;
+            if arguments
+                .get(1)
+                .is_some_and(|command| command == "sync-config")
+            {
+                let profile_id = required_flag(&arguments[2..], "--id")?;
+                let destination = target.client(&home)?;
+                let result = source
+                    .sync_portable_config(&destination, profile_id)
+                    .await?;
+                print_portable_config(&result);
+            } else {
+                reject_target_options(&target)?;
+                account_command(&arguments[1..], &source).await?;
+            }
         }
         "handoff" => {
             let source = management_client(&paths, listen, &remote, &home)?;
@@ -343,11 +355,50 @@ async fn handoff_command(
     );
     println!("Checkpoint: {}", result.checkpoint.checkpoint_id);
     println!("Workspace: {}", result.staged.quarantine_path);
+    if let Some(portable) = &result.portable_config {
+        print_portable_config(portable);
+    } else {
+        println!("Portable config: skipped (one node predates portable-config.v1)");
+    }
     println!(
         "Provider: {}",
         serde_json::to_string(&result.provider_result)?
     );
     Ok(())
+}
+
+fn print_portable_config(result: &PortableConfigApplyResult) {
+    println!(
+        "Portable config: {} installed, {} unchanged, {} conflicts, {} omitted",
+        result.installed.len(),
+        result.unchanged.len(),
+        result.conflicts.len(),
+        result.omitted.len()
+    );
+    for path in &result.installed {
+        println!("  installed: {}", terminal_text(path));
+    }
+    for path in &result.conflicts {
+        println!("  kept target conflict: {}", terminal_text(path));
+    }
+    for omission in &result.omitted {
+        println!(
+            "  omitted: {} ({})",
+            terminal_text(&omission.path),
+            terminal_text(&omission.reason)
+        );
+    }
+}
+
+fn terminal_text(value: &str) -> String {
+    value.chars().fold(String::new(), |mut output, character| {
+        if character.is_control() {
+            output.extend(character.escape_default());
+        } else {
+            output.push(character);
+        }
+        output
+    })
 }
 
 fn management_client(
@@ -431,6 +482,8 @@ Usage:
   diri-node account default --provider claude|codex --id ID
   diri-node account status --id ID
   diri-node account login --id ID [--mode device|browser|interactive]
+  diri-node account sync-config --id ID \
+    --target-endpoint tcp://HOST:PORT --target-token-file PATH [--target-node-id ID]
   diri-node handoff --provider claude|codex --profile ID --session ID \
     --provider-session ID --workspace PATH [--mode move|fork] \
     --target-endpoint tcp://HOST:PORT --target-token-file PATH [--target-node-id ID]

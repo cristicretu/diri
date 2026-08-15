@@ -8,6 +8,7 @@ pub mod accounts;
 pub mod checkpoint;
 pub mod config;
 pub mod error;
+pub mod portable;
 pub mod provider;
 pub mod server;
 pub mod service;

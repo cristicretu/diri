@@ -25,6 +25,8 @@ impl NodeMethod {
     pub const ACCOUNT_LOGIN_POLL: &'static str = "account.login.poll";
     pub const ACCOUNT_LOGIN_INPUT: &'static str = "account.login.input";
     pub const ACCOUNT_LOGIN_CANCEL: &'static str = "account.login.cancel";
+    pub const ACCOUNT_PORTABLE_CONFIG_EXPORT: &'static str = "account.portable-config.export";
+    pub const ACCOUNT_PORTABLE_CONFIG_APPLY: &'static str = "account.portable-config.apply";
     pub const PROVIDER_CALL: &'static str = "provider.call";
     pub const USAGE_RECORD: &'static str = "usage.record";
     pub const USAGE_QUERY: &'static str = "usage.query";
@@ -48,6 +50,7 @@ impl NodeCapability {
     pub const FLEET_USAGE: &'static str = "usage-ledger.v1";
     pub const CHECKPOINTS: &'static str = "checkpoints.v1";
     pub const MOVE_LEASES: &'static str = "move-leases.v1";
+    pub const PORTABLE_CONFIG: &'static str = "portable-config.v1";
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -187,6 +190,59 @@ pub struct AccountUpsertParams {
 #[serde(rename_all = "camelCase")]
 pub struct AccountProfileParams {
     pub profile_id: String,
+}
+
+/// A bounded snapshot of the settings that make one provider profile behave
+/// consistently across nodes. Provider authentication and MCP OAuth state are
+/// never part of this structure; known inline credential fields are reported
+/// as omissions.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortableConfigBundle {
+    pub version: u32,
+    pub provider: ProviderKind,
+    pub profile_id: String,
+    pub files: Vec<PortableConfigFile>,
+    #[serde(default)]
+    pub omitted: Vec<PortableConfigOmission>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortableConfigFile {
+    /// Provider-home-relative path from a fixed allowlist.
+    pub path: String,
+    pub sha256: String,
+    /// Portable config is deliberately text-only and bounded below the control
+    /// protocol's message limit.
+    pub content: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PortableConfigOmission {
+    pub path: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PortableConfigApplyParams {
+    pub bundle: PortableConfigBundle,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortableConfigApplyResult {
+    pub provider: ProviderKind,
+    pub profile_id: String,
+    /// New files or MCP server definitions installed on the target.
+    pub installed: Vec<String>,
+    /// Files or definitions already byte-identical on the target.
+    pub unchanged: Vec<String>,
+    /// Target values kept because source and target differ. Sync never
+    /// overwrites a conflict.
+    pub conflicts: Vec<String>,
+    #[serde(default)]
+    pub omitted: Vec<PortableConfigOmission>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -505,6 +561,9 @@ pub struct MoveRecord {
 pub struct SessionHandoffResult {
     pub checkpoint: CheckpointManifest,
     pub staged: CheckpointStageResult,
+    /// Absent when either side predates `portable-config.v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub portable_config: Option<PortableConfigApplyResult>,
     pub provider_result: JsonValue,
     pub target_commit: MoveRecord,
     pub source_commit: MoveRecord,

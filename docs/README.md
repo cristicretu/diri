@@ -7,7 +7,10 @@
 - [Security model](SECURITY-MODEL.md) — trust boundaries and safe-use guidance.
 - [Agent manifests](AGENT-MANIFESTS.md) — add an agent, author screen rules,
   capture safe fixtures, and validate both engines.
-- [Remote nodes](../diri/NODE.md) — run sessions over SSH and tmux.
+- [Remote nodes](../diri/NODE.md) — run sessions through bootstrapped Remote PTY
+  Holders or an enhanced first-party VPS node.
+- [Local ↔ VPS handoff](../diri/HANDOFF.md) — settings, MCP, authentication,
+  code, and Jujutsu design decisions.
 - [Packaging](../diri/PACKAGING.md) — build, signing, and notarization.
 - [Updates and releases](../diri/UPDATING.md) — updater design and release flow.
 - [Engine port history](../diri/PORT.md) — record of the completed Rust migration.

@@ -62,6 +62,13 @@ impl ProviderManager {
         self.logins.len()
     }
 
+    /// Drop a cached provider process after its declarative configuration
+    /// changes. Credentials remain in the profile home/keyring; the next call
+    /// starts a fresh adapter that reads the newly applied settings.
+    pub fn reset_profile(&mut self, profile_id: &str) {
+        self.codex.remove(profile_id);
+    }
+
     pub async fn status(
         &mut self,
         store: &AccountStore,
