@@ -22,13 +22,11 @@ use diri_engine::{Authority, ManifestEngine, PtySpec};
 /// Payload size. Big enough that per-read overhead shows up over process
 /// startup, small enough to stay quick in CI.
 const PAYLOAD_BYTES: usize = 8 << 20;
-/// Slowest acceptable drain.
+/// Slowest acceptable drain, checked when `DIRI_PERF_ASSERT` is set.
 ///
-/// Deliberately far below what the path achieves (~90-150 MB/s depending on
-/// how busy the machine is). This guards against the class of regression that
-/// made output cost grow with the size of a buffer — which measured ~12 MB/s —
-/// not against a few percent of tuning, and a tight bound would only flake on
-/// a loaded CI box.
+/// Deliberately far below what the path achieves (~90-150 MB/s). It guards the
+/// class of regression that made output cost grow with the size of a buffer —
+/// which measured ~12 MB/s — not a few percent of tuning.
 const FLOOR_MB_PER_SEC: f64 = 25.0;
 
 /// These tests time a pipeline, so they cannot share a machine with each
@@ -182,6 +180,17 @@ fn a_burst_of_output_drains_at_working_speed() {
     let mb = PAYLOAD_BYTES as f64 / (1 << 20) as f64;
     let rate = mb / (elapsed_ms / 1000.0);
     println!("drained {mb:.1} MB in {elapsed_ms:.1} ms = {rate:.1} MB/s");
+
+    // Measured everywhere, enforced only where the measurement means
+    // something. The shared CI runner builds the whole workspace and runs its
+    // test binaries concurrently on two cores: the same commit measured 109
+    // MB/s in the engine job and 8 MB/s in the workspace job, so no threshold
+    // there can tell a regression from a busy neighbour. The number still
+    // lands in the log, and `DIRI_PERF_ASSERT=1` turns it into a gate on a
+    // machine quiet enough to deserve one.
+    if std::env::var_os("DIRI_PERF_ASSERT").is_none() {
+        return;
+    }
     assert!(
         rate >= FLOOR_MB_PER_SEC,
         "drain fell to {rate:.1} MB/s, below the {FLOOR_MB_PER_SEC:.1} MB/s floor"

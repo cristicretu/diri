@@ -50,6 +50,20 @@ scroll regions with inserts and deletes, wide CJK, decomposed combining marks,
 erase-and-redraw churn, alternate-screen switching, synchronized updates
 (DECSET 2026), a build-log mix, and a captured DOOM-fire animation.
 
+## The drain regression test
+
+`crates/diri-engine/tests/throughput.rs` measures the same path from inside the
+engine and prints its rate on every CI run, but only fails below a floor when
+`DIRI_PERF_ASSERT=1` is set. The shared runner builds the whole workspace and
+runs its test binaries concurrently on two cores; one commit measured 109 MB/s
+in the engine job and 8 MB/s in the workspace job, so a threshold there would
+report contention as a regression. Run it on a quiet machine to use it as a
+gate:
+
+```sh
+DIRI_PERF_ASSERT=1 cargo test --release -p diri-engine --test throughput
+```
+
 ## Latency
 
 `dsr_latency.py` measures query round trip on an idle terminal.
