@@ -174,7 +174,12 @@ const OUTPUT_BATCH_BYTES: usize = 1 << 20;
 /// How much of a held session's log the follow pump reads per pass. A full
 /// read means more is already waiting, which is how that pump recognizes a
 /// repaint it has only half consumed.
-const LOG_READ_BUDGET: usize = 64 << 10;
+const LOG_READ_BUDGET: usize = 512 << 10;
+
+/// How often status detection may run while output is still backed up. Reading
+/// is what keeps the pump close behind the holder, and a screen that changed
+/// twice within one frame is not two observations worth having.
+const EVAL_INTERVAL: Duration = Duration::from_millis(16);
 
 /// What a session looks like from the outside.
 #[derive(Clone, Debug)]
@@ -2631,6 +2636,7 @@ fn pump_held(
     let mut checkpoint_dirty_at: Option<Instant> = None;
     let mut last_liveness = Instant::now();
     let mut last_eval_seq = 0u64;
+    let mut last_eval_at: Option<Instant> = None;
     let mut last_scan_at = None;
     let mut last_scan_seq = 0u64;
     let mut exit_status: Option<HolderExitStatus> = None;
@@ -2762,20 +2768,33 @@ fn pump_held(
 
         if !output.is_empty() {
             checkpoint_dirty_at = Some(Instant::now());
+            // Detection snapshots the whole screen and walks it with the
+            // manifest's patterns. That is cheap per screen and ruinous per
+            // read: a session streaming output produces thousands of reads a
+            // second, and paying for it on each one puts the pump behind the
+            // holder — which shows up as latency, because a query the child
+            // makes cannot be answered until the pump reaches it. While output
+            // is still backed up it runs on a timer, and the moment the pump
+            // catches up it runs again, so a settled screen is never stale.
+            let evaluate_now =
+                caught_up || last_eval_at.is_none_or(|at: Instant| at.elapsed() >= EVAL_INTERVAL);
             let (observation, replies) = {
                 let mut screen = shared.screen.lock().expect("screen");
                 screen.feed(&output);
                 let replies = screen.take_replies();
-                (
+                let observation = if evaluate_now {
+                    last_eval_at = Some(Instant::now());
                     evaluate_if_screen_changed(
                         &shared,
                         &mut screen,
                         &engine,
                         &manifest_id,
                         &mut last_eval_seq,
-                    ),
-                    replies,
-                )
+                    )
+                } else {
+                    None
+                };
+                (observation, replies)
             };
             // The child is blocked reading the answer to its query, so send it
             // through the holder's input path before publishing anything.

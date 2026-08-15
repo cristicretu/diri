@@ -39,7 +39,7 @@ const MAX_SIGNAL: i32 = 65;
 /// How many PTY chunks may be waiting to be written before the reader has to
 /// wait for the writer. At 64 KiB a chunk this absorbs a multi-megabyte stall
 /// without letting a wedged filesystem grow the queue without bound.
-const WRITE_QUEUE_DEPTH: usize = 256;
+const WRITE_QUEUE_DEPTH: usize = 16;
 
 /// How much queued output one disk write may carry. Larger writes cost the
 /// filesystem far less per byte than many small ones.
