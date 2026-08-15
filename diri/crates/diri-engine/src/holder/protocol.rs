@@ -83,6 +83,16 @@ pub struct HolderStat {
         skip_serializing_if = "Option::is_none"
     )]
     pub epoch_offset: Option<u64>,
+    /// Current DECCKM state parsed by this Holder from the complete output it
+    /// has owned, atomically paired with `logOffset`. Absent for an older
+    /// Holder or while that offset splits an unfinished control sequence; the
+    /// Engine then replays from a complete retained boundary.
+    #[serde(
+        rename = "applicationCursorKeys",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub application_cursor_keys: Option<bool>,
 }
 
 /// How the held child ended.
@@ -409,17 +419,19 @@ mod tests {
     fn a_swift_encoded_stat_decodes_with_optionals_present_or_absent() {
         // What Swift's JSONEncoder produces with every optional set…
         let full: HolderStat = serde_json::from_str(
-            r#"{"childPID":123,"alive":true,"logOffset":4096,"foregroundPID":456,"cols":120,"rows":32,"epochOffset":1024}"#,
+            r#"{"childPID":123,"alive":true,"logOffset":4096,"foregroundPID":456,"cols":120,"rows":32,"epochOffset":1024,"applicationCursorKeys":true}"#,
         )
         .expect("full stat");
         assert_eq!(full.child_pid, 123);
         assert_eq!(full.epoch_offset, Some(1024));
+        assert_eq!(full.application_cursor_keys, Some(true));
 
         // …and with them omitted, as a pre-epoch holder would send.
         let sparse: HolderStat =
             serde_json::from_str(r#"{"childPID":9,"alive":false,"logOffset":0}"#).expect("sparse");
         assert_eq!(sparse.foreground_pid, None);
         assert_eq!(sparse.epoch_offset, None);
+        assert_eq!(sparse.application_cursor_keys, None);
     }
 
     #[test]

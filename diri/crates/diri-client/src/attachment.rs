@@ -36,7 +36,14 @@ pub enum TerminalChunk {
     Modes {
         alt_screen: bool,
         bracketed_paste: bool,
+        /// `None` is a legacy/rotated session whose DECCKM state is not yet
+        /// authoritative. Ordinary input remains usable; the UI withholds
+        /// only unmodified cursor arrows until a later Modes update resolves it.
+        application_cursor_keys: Option<bool>,
         mouse: MouseModes,
+        /// Opaque daemon token returned only after the UI applies this mode
+        /// snapshot. `None` keeps historical daemon frames compatible.
+        acknowledgement: Option<u64>,
     },
     Pong,
 }
@@ -153,6 +160,13 @@ impl SessionAttachmentHandle {
         row: u16,
     ) -> Result<(), AttachmentClosed> {
         self.send(Frame::scroll(direction, lines, col, row))
+    }
+
+    /// Confirms that the UI has applied a terminal-mode snapshot. New daemons
+    /// use this to keep input behind same-socket replacement reseeds; older
+    /// daemons safely ignore client-to-daemon Modes frames.
+    pub fn acknowledge_modes(&self, token: u64) -> Result<(), AttachmentClosed> {
+        self.send(Frame::modes_ack(token))
     }
 
     pub fn close(&self) -> Result<(), AttachmentClosed> {
@@ -326,11 +340,15 @@ async fn process_incoming(
         }
         FrameType::Modes => {
             let (alt_screen, bracketed_paste, mouse) = frame.terminal_modes_payload().ok_or(())?;
+            let application_cursor_keys = frame.application_cursor_keys_state_payload().ok_or(())?;
+            let acknowledgement = frame.modes_token_payload();
             chunks
                 .send(TerminalChunk::Modes {
                     alt_screen,
                     bracketed_paste,
+                    application_cursor_keys,
                     mouse,
+                    acknowledgement,
                 })
                 .await
                 .map_err(|_| ())?;
@@ -394,7 +412,9 @@ mod tests {
             Some(TerminalChunk::Modes {
                 alt_screen: true,
                 bracketed_paste: true,
+                application_cursor_keys: None,
                 mouse,
+                acknowledgement: None,
             })
         );
     }
@@ -474,6 +494,34 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
         format!("diri-t4-test-{}-{nanos}", std::process::id())
+    }
+
+    #[tokio::test]
+    async fn application_cursor_mode_reaches_attachment_consumers() {
+        let (mut stream, _peer) = UnixStream::pair().expect("socket pair");
+        let (chunks, mut receiver) = tokio::sync::mpsc::channel(1);
+        let mouse = diri_proto::terminal::MouseModes::OFF;
+
+        super::process_incoming(
+            diri_proto::frames::Frame::modes(true, mouse)
+                .with_application_cursor_keys(true)
+                .with_modes_token(42),
+            &mut stream,
+            &chunks,
+        )
+        .await
+        .expect("mode frame");
+
+        assert_eq!(
+            receiver.recv().await,
+            Some(TerminalChunk::Modes {
+                alt_screen: true,
+                bracketed_paste: false,
+                application_cursor_keys: Some(true),
+                mouse,
+                acknowledgement: Some(42),
+            })
+        );
     }
 
     async fn cleanup_session(control: &mut TestControl, session_id: &SessionId) {

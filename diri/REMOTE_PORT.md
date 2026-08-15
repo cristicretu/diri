@@ -426,6 +426,25 @@ button or motion reports, while wheel intent remains encoded by that Holder's
 authoritative parser. Scrollback is bounded to 4 MiB and served on demand
 through `Scroll`. Raw output is bounded to 32 MiB.
 
+Protocol 1.5 adds the optional `application-cursor-keys` capability and two
+mode bits: bit 6 is the value and bit 7 says that value is known for this
+individual snapshot. Capability, minor version, and the per-frame known bit
+must all be present before an unset value bit can mean `false`; for a live
+protocol 1.4 Holder or a 1.5 Holder sampled between parser boundaries the state
+is `None`, never an invented terminal default. In the mixed-version case the
+Engine reconstructs DECCKM from the same ordered retained output it already
+feeds through its local emulator, then publishes the resolved state to desktop
+attachments. Cold adoption hydrates that emulator from locally retained
+OutputLog bytes before resuming at the persisted remote tail. If rotation
+removed the authoritative prefix and no retained transition resolves DECCKM,
+the state remains unknown: the Engine emits a desktop Modes seed with the
+additive value-known bit clear.
+
+The app becomes degraded Live, preserves the independently authoritative paste
+and mouse state, and accepts ordinary input while withholding only unmodified
+cursor arrows whose CSI/SS3 encoding depends on DECCKM. A later authoritative
+Holder report or terminal transition emits a known Modes update.
+
 The PTY reader must never block on a client. The Holder uses bounded queues. It
 coalesces background output for no more than 8 ms, while up to two grid
 publications after interactive input bypass that wait (one trailing publication
@@ -459,6 +478,35 @@ faster socket acknowledgement for slower end-to-grid delivery. The local
 daemon's held-output follower is raised only while the session is recently
 attached or receiving input, then returns to default QoS.
 
+Current local Holders also report their parser-owned DECCKM value in `stat`.
+The field is optional for live older Holders and while the sampled log tail is
+inside an unfinished control sequence; a boolean cannot replace the parser
+continuation after that offset. If both that field and the
+pre-rotation output prefix are unavailable, adoption keeps DECCKM unknown,
+does not write a v5 checkpoint with a guessed value, and uses the same degraded
+Live behavior as remote compatibility. Holder mode reports are paired with the
+reported log tail; if rotation passes that tail before replay, the Engine
+downgrades the stale report to unknown. The replay cursor remains live after
+that initial bind: any later readable-offset jump also downgrades provenance
+before the retained suffix is parsed, because the missing interval could hold
+a sticky toggle. The same rule applies when a remote Holder's bounded
+`ReplayBegin` advances beyond the Engine's acknowledged raw-output offset;
+protocol 1.4 snapshot data cannot make that skipped DECCKM interval known.
+Protocol 1.5 Holders likewise leave the snapshot field unset until their raw
+parser reaches a control-sequence boundary, so an `ESC` and its `[?1h` suffix
+are never separated by a boolean snapshot. The Engine also preserves its
+locally retained parser continuation when an earlier 1.5 peer supplies a
+boolean, so the following contiguous suffix remains effective.
+
+Desktop Modes frames carry an optional opaque acknowledgement token after the
+one-byte mode bitset. Current clients return it only after the UI has applied
+the snapshot. Once a peer demonstrates support, the Engine admits input only
+when both the acknowledged Session wake source and full mode snapshot still
+match the Registry. A same-socket respawn is therefore an ordered barrier:
+input encoded for the old child cannot reach the replacement before its known
+or explicitly unknown seed is applied. Older clients and daemons ignore the
+additive token and retain their previous best-effort behavior.
+
 ## Controller lease
 
 The completed baseline permits exactly one live attach/controller. A new attach
@@ -482,7 +530,10 @@ declares terminal, session management, environment capture, directory listing,
 batched executable discovery, persistence probing, and atomic activation as
 required capabilities. Protocol 1.4 additively preserves granular mouse
 tracking/encoding bits and the raw mouse-input frame while retaining the old
-any-mouse compatibility bit.
+any-mouse compatibility bit. Protocol 1.5 additively preserves DECCKM behind
+the optional `application-cursor-keys` capability. The capability is not in the
+required baseline: a new Engine can keep a live 1.4 Holder attached and treats
+its absent bit as unknown until retained-output reconstruction resolves it.
 
 The protocol includes:
 

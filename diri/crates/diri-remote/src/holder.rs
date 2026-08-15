@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use diri_proto::frames::{Frame, FrameType, MAX_FRAME_BYTES};
 use diri_proto::remote_pty::{
     ControlGranted, ControlRevoked, FullSnapshot, GridDelta, Hello, HelloAck, LaunchRequest,
-    LaunchResult, PHASE_ONE_HOLDER_CAPABILITIES, ProcessExit, RemoteCodec, RemoteError,
-    RemoteMessage, RemoteProcessState, ScrollbackResponse, validate_terminal_dimensions,
+    LaunchResult, ProcessExit, RemoteCodec, RemoteError, RemoteMessage, RemoteProcessState,
+    ScrollbackResponse, validate_terminal_dimensions,
 };
 use diri_pty::{Exit, ExitWatcher, Pty, PtySpec, PtyStream};
 use diri_terminal_state::HeadlessScreen;
@@ -38,7 +38,7 @@ const REPLAY_BUDGET_BYTES: usize = 4 << 20;
 const PERSIST_OFFSET_INTERVAL: u64 = 1 << 20;
 
 pub const PHASE_ONE_CAPABILITIES: &[diri_proto::remote_pty::RemoteCapability] =
-    PHASE_ONE_HOLDER_CAPABILITIES;
+    diri_proto::remote_pty::CURRENT_HOLDER_CAPABILITIES;
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1021,6 +1021,7 @@ impl Holder {
                 sequence: self.state.snapshot_sequence,
                 alt_screen: self.screen.is_alt_screen(),
                 bracketed_paste: self.screen.bracketed_paste(),
+                application_cursor_keys: self.screen.application_cursor_keys_at_parser_boundary(),
                 mouse: self.screen.mouse_modes(),
                 grid,
             }))?;
@@ -1029,6 +1030,7 @@ impl Holder {
                 sequence: self.state.snapshot_sequence,
                 alt_screen: self.screen.is_alt_screen(),
                 bracketed_paste: self.screen.bracketed_paste(),
+                application_cursor_keys: self.screen.application_cursor_keys_at_parser_boundary(),
                 mouse: self.screen.mouse_modes(),
                 grid,
             }))?;
@@ -1068,6 +1070,7 @@ impl Holder {
             sequence: self.state.snapshot_sequence,
             alt_screen: self.screen.is_alt_screen(),
             bracketed_paste: self.screen.bracketed_paste(),
+            application_cursor_keys: self.screen.application_cursor_keys_at_parser_boundary(),
             mouse: self.screen.mouse_modes(),
             grid: self.screen.full_snapshot(),
         }))
@@ -1303,6 +1306,36 @@ fn terminate_process_group(pid: u32) {
 mod tests {
     use super::*;
 
+    fn decode_current_snapshot(snapshot: FullSnapshot) -> FullSnapshot {
+        let acknowledgement = RemoteMessage::HelloAck(HelloAck {
+            protocol: diri_proto::remote_pty::ProtocolVersion::CURRENT,
+            holder_build_id: "holder-build".into(),
+            session_incarnation: "incarnation-1".into(),
+            capabilities: PHASE_ONE_CAPABILITIES.to_vec(),
+            controller_epoch: 1,
+            process_state: RemoteProcessState::Running { pid: 42 },
+            output_offset: 0,
+            snapshot_sequence: 0,
+        });
+        let mut codec = RemoteCodec::new();
+        let decoded_acknowledgement = codec
+            .feed(&RemoteCodec::encode(&acknowledgement).expect("encode HelloAck"))
+            .expect("decode HelloAck");
+        assert_eq!(decoded_acknowledgement, vec![acknowledgement]);
+        let decoded = codec
+            .feed(
+                &RemoteCodec::encode(&RemoteMessage::FullSnapshot(snapshot))
+                    .expect("encode snapshot"),
+            )
+            .expect("decode snapshot")
+            .pop()
+            .expect("snapshot message");
+        let RemoteMessage::FullSnapshot(snapshot) = decoded else {
+            panic!("full snapshot");
+        };
+        snapshot
+    }
+
     #[test]
     fn pending_bytes_compact_after_a_complete_write() {
         let mut pending = PendingBytes::default();
@@ -1329,5 +1362,34 @@ mod tests {
         let error = validate_live_build_id("different-build").expect_err("build mismatch");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("different-build"));
+    }
+
+    #[test]
+    fn split_cursor_csi_stays_unknown_on_the_negotiated_wire_until_ground() {
+        let mut screen = HeadlessScreen::new(8, 2);
+        screen.feed(b"\x1b[");
+        let partial = decode_current_snapshot(FullSnapshot {
+            sequence: 1,
+            alt_screen: screen.is_alt_screen(),
+            bracketed_paste: screen.bracketed_paste(),
+            application_cursor_keys: screen.application_cursor_keys_at_parser_boundary(),
+            mouse: screen.mouse_modes(),
+            grid: screen.full_snapshot(),
+        });
+        assert_eq!(
+            partial.application_cursor_keys, None,
+            "protocol negotiation cannot turn a mid-CSI sample into known-off"
+        );
+
+        screen.feed(b"?1h");
+        let complete = decode_current_snapshot(FullSnapshot {
+            sequence: 2,
+            alt_screen: screen.is_alt_screen(),
+            bracketed_paste: screen.bracketed_paste(),
+            application_cursor_keys: screen.application_cursor_keys_at_parser_boundary(),
+            mouse: screen.mouse_modes(),
+            grid: screen.full_snapshot(),
+        });
+        assert_eq!(complete.application_cursor_keys, Some(true));
     }
 }

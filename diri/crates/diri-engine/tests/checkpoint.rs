@@ -114,6 +114,18 @@ fn log_tail(logs: &Path, id: &str) -> u64 {
     log.tail_offset()
 }
 
+fn rewrite_checkpoint_as_v3(path: &Path) {
+    let mut dictionary = plist::Value::from_file(path)
+        .expect("read checkpoint")
+        .into_dictionary()
+        .expect("checkpoint dictionary");
+    dictionary.insert("version".into(), plist::Value::Integer(3.into()));
+    dictionary.remove("applicationCursorKeys");
+    plist::Value::Dictionary(dictionary)
+        .to_file_binary(path)
+        .expect("write v3 checkpoint");
+}
+
 /// A full-snapshot 80×24 grid whose first row spells `text` — content that
 /// exists nowhere in any log, so seeing it on screen proves the checkpoint
 /// (not a raw-tail replay) painted the emulator.
@@ -249,6 +261,7 @@ fn adoption_seeds_from_the_checkpoint_not_the_raw_tail() {
         marker_buffer: Vec::new(),
         alt_screen: false,
         bracketed_paste: false,
+        application_cursor_keys: false,
         mouse: MouseModes::OFF,
     }
     .write_atomically(&checkpoint_path(&logs, "s_ad"))
@@ -287,7 +300,7 @@ fn adoption_seeds_from_the_checkpoint_not_the_raw_tail() {
 }
 
 /// An unusable checkpoint (wrong geometry here) is a cache miss: adoption
-/// falls back to the bounded raw-tail replay and still shows the log.
+/// falls back to retained-prefix replay and still shows the log.
 #[test]
 fn a_stale_checkpoint_falls_back_to_tail_replay() {
     let root = holders_dir("fallback");
@@ -327,6 +340,7 @@ fn a_stale_checkpoint_falls_back_to_tail_replay() {
         marker_buffer: Vec::new(),
         alt_screen: false,
         bracketed_paste: false,
+        application_cursor_keys: false,
         mouse: MouseModes::OFF,
     }
     .write_atomically(&checkpoint_path(&logs, "s_fb"))
@@ -355,5 +369,94 @@ fn a_stale_checkpoint_falls_back_to_tail_replay() {
 
     registry
         .terminate("s_fb", Duration::from_secs(2))
+        .expect("terminate");
+}
+
+/// A v3 cache cannot say whether DECCKM was enabled. Its replacement replay
+/// must begin at the retained-log prefix, not the normal 256 KiB display tail:
+/// the mode transition can be old while the child remains quiet and alive.
+#[test]
+fn v3_migration_recovers_a_mode_transition_before_the_tail_budget() {
+    const AFTER_MODE_BYTES: usize = (256 << 10) + (64 << 10);
+
+    let root = holders_dir("v3-mode-prefix");
+    let logs = root.join("logs");
+    let holder = holder_config(&root);
+    let state_file = root.join("state.json");
+    let path = checkpoint_path(&logs, "s_v3_mode");
+
+    {
+        let mut registry = Registry::new(engine(), &state_file);
+        registry
+            .spawn(
+                shell_spec(
+                    "s_v3_mode",
+                    "stty raw -echo; printf 'RAW-READY'; exec cat",
+                    &logs,
+                    Some(holder.clone()),
+                ),
+                record("s_v3_mode"),
+            )
+            .expect("spawn");
+        wait_until("the raw reader to be ready", Duration::from_secs(5), || {
+            registry
+                .get("s_v3_mode")
+                .expect("session")
+                .screen_lines()
+                .join("\n")
+                .contains("RAW-READY")
+        });
+
+        let mut output = Vec::with_capacity(AFTER_MODE_BYTES + 8);
+        output.extend_from_slice(b"\x1b[?1h");
+        output.extend(std::iter::repeat_n(b'x', AFTER_MODE_BYTES));
+        output.push(b'\n');
+        registry
+            .get("s_v3_mode")
+            .expect("session")
+            .write_input(&output)
+            .expect("write retained output");
+
+        wait_until(
+            "output beyond the replay budget",
+            Duration::from_secs(10),
+            || log_tail(&logs, "s_v3_mode") >= output.len() as u64,
+        );
+        wait_until(
+            "a current checkpoint with DECCKM",
+            Duration::from_secs(15),
+            || {
+                ScreenCheckpoint::load(&path).is_some_and(|checkpoint| {
+                    checkpoint.application_cursor_keys
+                        && checkpoint.log_offset == log_tail(&logs, "s_v3_mode")
+                })
+            },
+        );
+        registry.persist().expect("persist");
+    }
+
+    rewrite_checkpoint_as_v3(&path);
+    assert!(
+        ScreenCheckpoint::load(&path).is_none(),
+        "v3 is a cache miss"
+    );
+
+    let mut registry = Registry::new(engine(), &state_file);
+    registry.load().expect("load");
+    assert_eq!(
+        registry.restore(&holder, &logs),
+        vec!["s_v3_mode".to_string()]
+    );
+    wait_until(
+        "migration checkpoint reconstructed from the retained prefix",
+        Duration::from_secs(15),
+        || {
+            ScreenCheckpoint::load(&path)
+                .is_some_and(|checkpoint| checkpoint.application_cursor_keys)
+        },
+    );
+
+    registry
+        .terminate("s_v3_mode", Duration::from_secs(2))
         .expect("terminate");
 }

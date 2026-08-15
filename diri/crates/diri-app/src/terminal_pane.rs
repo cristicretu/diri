@@ -365,8 +365,46 @@ fn bracketed_paste_after_attachment_state(current: bool, state: AttachmentState)
     }
 }
 
+/// Unknown prevents a dead attachment generation from leaking DECCKM into a
+/// replacement child without making the rest of the terminal unusable.
+fn application_cursor_after_attachment_state(
+    current: Option<bool>,
+    state: AttachmentState,
+) -> Option<bool> {
+    if state == AttachmentState::Live {
+        current
+    } else {
+        None
+    }
+}
+
 fn terminal_paste(text: &str, bracketed_paste: bool) -> Vec<u8> {
     paste(text, bracketed_paste)
+}
+
+fn terminal_input_modes(application_cursor_keys: Option<bool>) -> TermInputModes {
+    TermInputModes {
+        application_cursor_keys: application_cursor_keys.unwrap_or(false),
+        ..TermInputModes::default()
+    }
+}
+
+/// Only plain arrows change wire form under DECCKM. Modified arrows have an
+/// unambiguous CSI `1;modifier` encoding, while Home/End and every other key
+/// are independent in diri-term's encoder.
+fn key_requires_application_cursor_mode(event: &TermKeyEvent, modifiers: TermModifiers) -> bool {
+    !modifiers.shift
+        && !modifiers.ctrl
+        && !modifiers.alt
+        && matches!(
+            event.key,
+            TermKey::Named(
+                NamedKey::ArrowUp
+                    | NamedKey::ArrowDown
+                    | NamedKey::ArrowRight
+                    | NamedKey::ArrowLeft
+            )
+        )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -471,6 +509,10 @@ enum AttachmentCommand {
         col: u16,
         row: u16,
     },
+    /// GPUI has applied a Modes event, so encoding and routing input can no
+    /// longer race its seed or a same-socket replacement. The optional token
+    /// is absent when connected to a historical daemon.
+    ModesApplied(Option<u64>),
     Close,
 }
 
@@ -505,6 +547,12 @@ impl AttachmentControl {
             col,
             row,
         });
+    }
+
+    fn modes_applied(&self, acknowledgement: Option<u64>) {
+        let _ = self
+            .tx
+            .send(AttachmentCommand::ModesApplied(acknowledgement));
     }
 
     fn close(&self) {
@@ -640,6 +688,9 @@ struct ResidentTerminal {
     /// Last mode advertised by this attachment generation. Reset while the
     /// transport is not live so paste never trusts state from a dead child.
     bracketed_paste: bool,
+    /// Last DECCKM state advertised by this attachment generation. `None`
+    /// is an explicit degraded state: ordinary keys work, plain arrows wait.
+    application_cursor_keys: Option<bool>,
     find: Option<TerminalFindModel>,
     /// The editable text behind `find`'s query, so ⌘F gets the same caret,
     /// selection, and readline keys as the other query fields.
@@ -957,6 +1008,7 @@ impl TerminalPane {
                     attachment_generation: generation,
                     attachment_state: AttachmentState::Attaching,
                     bracketed_paste: false,
+                    application_cursor_keys: None,
                     find: None,
                     find_query: QueryEditor::default(),
                     last_size: (0, 0),
@@ -1115,6 +1167,10 @@ impl TerminalPane {
                 if let Some(resident) = self.residents.get_mut(&id) {
                     resident.bracketed_paste =
                         bracketed_paste_after_attachment_state(resident.bracketed_paste, state);
+                    resident.application_cursor_keys = application_cursor_after_attachment_state(
+                        resident.application_cursor_keys,
+                        state,
+                    );
                     if resident.attachment_state != state {
                         resident.pointer_owner = None;
                         resident.mouse_motion.reset();
@@ -1161,7 +1217,9 @@ impl TerminalPane {
                 TerminalChunk::Modes {
                     alt_screen,
                     bracketed_paste,
+                    application_cursor_keys,
                     mouse,
+                    acknowledgement,
                 },
             ) => {
                 if !self.attachment_is_current(&id, generation) {
@@ -1173,7 +1231,9 @@ impl TerminalPane {
                         resident.mouse_motion.reset();
                     }
                     resident.bracketed_paste = bracketed_paste;
+                    resident.application_cursor_keys = application_cursor_keys;
                     resident.element.set_modes(alt_screen, mouse);
+                    resident.attachment.modes_applied(acknowledgement);
                 }
                 if self.selected_id().as_ref() == Some(&id) {
                     cx.notify();
@@ -2011,7 +2071,20 @@ impl TerminalPane {
             alt: event.keystroke.modifiers.alt,
             cmd: event.keystroke.modifiers.platform,
         };
-        let bytes = encode_key(&term_event, modifiers, TermInputModes::default());
+        if resident.application_cursor_keys.is_none()
+            && key_requires_application_cursor_mode(&term_event, modifiers)
+        {
+            // Do not guess CSI versus SS3. The attachment is otherwise Live,
+            // so text, paste, Enter, modified arrows, and lifecycle controls
+            // continue to work while a legacy session is degraded.
+            cx.stop_propagation();
+            return;
+        }
+        let bytes = encode_key(
+            &term_event,
+            modifiers,
+            terminal_input_modes(resident.application_cursor_keys),
+        );
         if bytes.is_empty() {
             cx.propagate();
         } else {
@@ -3526,11 +3599,86 @@ fn spawn_attachment(
             if let Some((cols, rows)) = last_resize {
                 let _ = writer.resize(cols, rows);
             }
-            let _ = pane_tx.send(PaneEvent::AttachmentState(
-                id.clone(),
-                generation,
-                AttachmentState::Live,
-            ));
+
+            // A connected socket is not yet input-ready. Reattachment reset
+            // both sticky input modes above, and the authoritative Modes seed
+            // follows the initial grid on this stream. Forward seed chunks so
+            // the terminal can paint, but do not publish Live or send input
+            // until GPUI acknowledges that it applied the Modes event. This
+            // closes the smaller race between queueing the seed and encoding
+            // a key on the UI thread before that queue was drained.
+            let mut modes_seeded = false;
+            let seed_outcome = loop {
+                tokio::select! {
+                    chunk = attachment.chunks.recv() => {
+                        let Some(chunk) = chunk else { break None };
+                        let is_modes = matches!(chunk, TerminalChunk::Modes { .. });
+                        if pane_tx
+                            .send(PaneEvent::Chunk(id.clone(), generation, chunk))
+                            .is_err()
+                        {
+                            break Some(true);
+                        }
+                        if is_modes {
+                            modes_seeded = true;
+                        }
+                    }
+                    command = commands.recv() => {
+                        match command {
+                            Some(AttachmentCommand::Resize(cols, rows)) => {
+                                last_resize = Some((cols, rows));
+                                let _ = writer.resize(cols, rows);
+                            }
+                            Some(AttachmentCommand::Close) | None => break Some(true),
+                            Some(AttachmentCommand::ModesApplied(acknowledgement)) if modes_seeded => {
+                                if let Some(token) = acknowledgement {
+                                    let _ = writer.acknowledge_modes(token);
+                                }
+                                break Some(false);
+                            }
+                            Some(AttachmentCommand::ModesApplied(_)) => {}
+                            // Keystrokes, paste framing, pointer reports, and
+                            // wheel routing all depend on the fresh mode seed.
+                            // Input during this short attaching window is
+                            // deliberately rejected, as it already is during
+                            // reconnect backoff.
+                            Some(AttachmentCommand::Input(_))
+                            | Some(AttachmentCommand::Mouse(_))
+                            | Some(AttachmentCommand::Scroll { .. }) => {}
+                        }
+                    }
+                }
+            };
+            match seed_outcome {
+                Some(false) => {}
+                Some(true) => {
+                    attachment.close().await;
+                    return;
+                }
+                None => {
+                    attachment.close().await;
+                    let _ = pane_tx.send(PaneEvent::AttachmentState(
+                        id.clone(),
+                        generation,
+                        AttachmentState::Reconnecting,
+                    ));
+                    if wait_for_retry(&mut commands, &mut last_resize).await {
+                        return;
+                    }
+                    continue;
+                }
+            }
+            if pane_tx
+                .send(PaneEvent::AttachmentState(
+                    id.clone(),
+                    generation,
+                    AttachmentState::Live,
+                ))
+                .is_err()
+            {
+                attachment.close().await;
+                return;
+            }
 
             let should_close = loop {
                 tokio::select! {
@@ -3557,6 +3705,11 @@ fn spawn_attachment(
                             }
                             Some(AttachmentCommand::Scroll { direction, lines, col, row }) => {
                                 let _ = writer.scroll(direction, lines, col, row);
+                            }
+                            Some(AttachmentCommand::ModesApplied(acknowledgement)) => {
+                                if let Some(token) = acknowledgement {
+                                    let _ = writer.acknowledge_modes(token);
+                                }
                             }
                             Some(AttachmentCommand::Close) | None => break true,
                         }
@@ -3592,6 +3745,7 @@ async fn wait_for_retry(
             command = commands.recv() => match command {
                 Some(AttachmentCommand::Resize(cols, rows)) => *last_resize = Some((cols, rows)),
                 Some(AttachmentCommand::Close) | None => return true,
+                Some(AttachmentCommand::ModesApplied(_)) => {}
                 Some(AttachmentCommand::Input(_))
                 | Some(AttachmentCommand::Mouse(_))
                 | Some(AttachmentCommand::Scroll { .. }) => {}
@@ -3857,6 +4011,125 @@ mod tests {
     use gpui::{Image, ImageFormat, KeyDownEvent, Keystroke, Modifiers, TestAppContext, point};
 
     use super::*;
+
+    #[tokio::test]
+    async fn unknown_legacy_mode_becomes_degraded_live_and_accepts_ordinary_input() {
+        use diri_proto::frames::{Frame, FrameCodec, FrameType};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+        use tokio::sync::oneshot;
+        use tokio::time::{Duration, timeout};
+
+        let root = tempfile::tempdir().expect("temp");
+        let socket = root.path().join("attachment.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let (connected_tx, connected_rx) = oneshot::channel();
+        let (pre_seed_tx, pre_seed_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let (live_input_tx, live_input_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut attach_line = Vec::new();
+            BufReader::new(&mut stream)
+                .read_until(b'\n', &mut attach_line)
+                .await
+                .expect("attach line");
+            connected_tx.send(()).expect("connected signal");
+
+            let mut byte = [0_u8; 1];
+            let rejected = timeout(Duration::from_millis(150), stream.read(&mut byte))
+                .await
+                .is_err();
+            pre_seed_tx.send(rejected).expect("pre-seed result");
+
+            release_rx.await.expect("release modes");
+            // No bit-7 provenance marker: this is the explicit unknown seed
+            // sent for quiet rotated legacy sessions.
+            let modes =
+                Frame::modes_with_bracketed_paste(true, true, MouseModes::OFF).with_modes_token(77);
+            stream
+                .write_all(&FrameCodec::encode(&modes).expect("encode modes"))
+                .await
+                .expect("write modes");
+
+            let mut codec = FrameCodec::new();
+            let input = timeout(Duration::from_secs(2), async {
+                let mut saw_acknowledgement = false;
+                loop {
+                    let read = stream.read(&mut byte).await.expect("read input");
+                    assert_ne!(read, 0, "attachment closed before live input");
+                    for frame in codec.feed(&byte[..read]).expect("decode input") {
+                        if frame.frame_type == FrameType::Modes {
+                            assert_eq!(frame.modes_token_payload(), Some(77));
+                            saw_acknowledgement = true;
+                        }
+                        if frame.frame_type == FrameType::Input {
+                            assert!(
+                                saw_acknowledgement,
+                                "input preceded the UI's Modes acknowledgement"
+                            );
+                            return frame.payload;
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("live input timeout");
+            live_input_tx.send(input).expect("live input result");
+        });
+
+        let (pane_tx, mut pane_rx) = pane_event_channel();
+        let control = spawn_attachment(
+            &tokio::runtime::Handle::current(),
+            socket,
+            SessionId::new("mode-seed"),
+            1,
+            pane_tx,
+        );
+        connected_rx.await.expect("attachment connected");
+        control.input(b"before-modes".to_vec());
+        assert!(pre_seed_rx.await.expect("pre-seed observation"));
+
+        let mut batch = Vec::new();
+        assert!(pane_rx.recv_batch(&mut batch).await);
+        assert!(batch.iter().all(|event| !matches!(
+            event,
+            PaneEvent::AttachmentState(_, _, AttachmentState::Live)
+        )));
+
+        release_tx.send(()).expect("release");
+        let mut saw_modes = false;
+        loop {
+            batch.clear();
+            assert!(pane_rx.recv_batch(&mut batch).await);
+            for event in &batch {
+                match event {
+                    PaneEvent::Chunk(
+                        _,
+                        _,
+                        TerminalChunk::Modes {
+                            application_cursor_keys,
+                            acknowledgement,
+                            ..
+                        },
+                    ) => {
+                        assert_eq!(*application_cursor_keys, None);
+                        saw_modes = true;
+                        control.modes_applied(*acknowledgement);
+                    }
+                    PaneEvent::AttachmentState(_, _, AttachmentState::Live) => {
+                        assert!(saw_modes, "Modes must be queued before Live");
+                        control.input(b"after-modes".to_vec());
+                        assert_eq!(live_input_rx.await.expect("live input"), b"after-modes");
+                        control.close();
+                        server.await.expect("server");
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn pane_mailbox_retains_one_exact_final_grid_per_session() {
@@ -4604,6 +4877,17 @@ mod tests {
             old_generation,
             TerminalChunk::Grid(filled_grid('s')),
         );
+        let stale_modes = PaneEvent::Chunk(
+            reselected.id.clone(),
+            old_generation,
+            TerminalChunk::Modes {
+                alt_screen: false,
+                bracketed_paste: true,
+                application_cursor_keys: Some(true),
+                mouse: MouseModes::OFF,
+                acknowledgement: None,
+            },
+        );
 
         // Replace A's resident attachment, exactly as an A -> B -> A switch
         // does with the default residency of one.
@@ -4648,6 +4932,7 @@ mod tests {
         // must not repaint the new resident's buffer.
         pane.update_in(cx, |pane, window, cx| {
             pane.handle_pane_event(stale, window, cx);
+            pane.handle_pane_event(stale_modes, window, cx);
             let resident = pane
                 .residents
                 .get(&reselected.id)
@@ -4658,6 +4943,14 @@ mod tests {
                 buffer.cells[0].scalar,
                 u32::from('n'),
                 "a detached attachment repainted the newly selected terminal"
+            );
+            assert!(
+                !resident.bracketed_paste,
+                "a detached attachment leaked bracketed paste into the new generation"
+            );
+            assert!(
+                resident.application_cursor_keys.is_none(),
+                "a detached attachment leaked DECCKM into the new generation"
             );
         });
     }
@@ -4757,6 +5050,15 @@ mod tests {
             encode_key(&mapped, TermModifiers::default(), TermInputModes::default()),
             b"\x1b[A"
         );
+        assert_eq!(
+            encode_key(
+                &mapped,
+                TermModifiers::default(),
+                terminal_input_modes(Some(true))
+            ),
+            b"\x1bOA",
+            "DECCKM changes an unmodified arrow to its SS3 form"
+        );
 
         let command_backspace = KeyDownEvent {
             keystroke: Keystroke {
@@ -4782,6 +5084,47 @@ mod tests {
             ),
             [0x15]
         );
+    }
+
+    #[test]
+    fn reattachment_drops_stale_application_cursor_mode_until_fresh_modes_arrive() {
+        assert_eq!(
+            application_cursor_after_attachment_state(Some(true), AttachmentState::Live),
+            Some(true)
+        );
+        assert_eq!(
+            application_cursor_after_attachment_state(Some(true), AttachmentState::Reconnecting),
+            None
+        );
+        assert_eq!(
+            application_cursor_after_attachment_state(Some(true), AttachmentState::Attaching),
+            None
+        );
+    }
+
+    #[test]
+    fn unknown_cursor_mode_gates_only_plain_arrows() {
+        let plain = TermModifiers::default();
+        let shifted = TermModifiers {
+            shift: true,
+            ..TermModifiers::default()
+        };
+        assert!(key_requires_application_cursor_mode(
+            &TermKeyEvent::named(NamedKey::ArrowUp),
+            plain
+        ));
+        assert!(!key_requires_application_cursor_mode(
+            &TermKeyEvent::named(NamedKey::ArrowUp),
+            shifted
+        ));
+        assert!(!key_requires_application_cursor_mode(
+            &TermKeyEvent::named(NamedKey::Home),
+            plain
+        ));
+        assert!(!key_requires_application_cursor_mode(
+            &TermKeyEvent::character("x"),
+            plain
+        ));
     }
 
     #[test]

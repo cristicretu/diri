@@ -18,8 +18,9 @@ use crate::grid::{GridCodecError, GridUpdate};
 use crate::terminal::MouseModes;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 4;
+pub const PROTOCOL_MINOR: u16 = 5;
 pub const MOUSE_INPUT_PROTOCOL_MINOR: u16 = 4;
+pub const APPLICATION_CURSOR_PROTOCOL_MINOR: u16 = 5;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_ARGUMENTS: usize = 512;
 pub const MAX_ENVIRONMENT_VARIABLES: usize = 4096;
@@ -35,6 +36,12 @@ pub const MAX_EXECUTABLE_QUERIES: usize = 128;
 
 const HEADER_BYTES: usize = 5;
 const FULL_SNAPSHOT_FIXED_BYTES: usize = 9;
+/// DECCKM's value and provenance are separate on the wire. A Holder can be
+/// negotiated for protocol 1.5 while its parser is between `ESC` and the rest
+/// of a control sequence, so capability negotiation alone cannot make a zero
+/// value authoritative for every individual snapshot.
+const APPLICATION_CURSOR_VALUE_BIT: u8 = 1 << 6;
+const APPLICATION_CURSOR_KNOWN_BIT: u8 = 1 << 7;
 const KIND_HELLO: u8 = 32;
 const KIND_HELLO_ACK: u8 = 33;
 const KIND_FULL_SNAPSHOT: u8 = 34;
@@ -48,6 +55,22 @@ const KIND_ERROR: u8 = 41;
 const KIND_GRID_DELTA: u8 = 42;
 const KIND_SCROLLBACK_REQUEST: u8 = 43;
 const KIND_SCROLLBACK_RESPONSE: u8 = 44;
+
+const fn application_cursor_bits(value: Option<bool>) -> u8 {
+    match value {
+        Some(true) => APPLICATION_CURSOR_KNOWN_BIT | APPLICATION_CURSOR_VALUE_BIT,
+        Some(false) => APPLICATION_CURSOR_KNOWN_BIT,
+        None => 0,
+    }
+}
+
+const fn application_cursor_from_bits(bits: u8, negotiated: bool) -> Option<bool> {
+    if negotiated && bits & APPLICATION_CURSOR_KNOWN_BIT != 0 {
+        Some(bits & APPLICATION_CURSOR_VALUE_BIT != 0)
+    } else {
+        None
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -91,6 +114,9 @@ pub enum RemoteCapability {
     PersistenceProbe,
     /// Uploaded Helper can activate itself without replacing different bytes.
     AtomicActivation,
+    /// Full snapshots and grid deltas carry the child's DECCKM value plus a
+    /// per-frame marker proving that the producing parser was at a boundary.
+    ApplicationCursorKeys,
     AgentEvents,
     McpStdio,
     ResourceInspect,
@@ -119,6 +145,7 @@ impl RemoteCapability {
             Self::ExecutableDiscovery => "executable-discovery",
             Self::PersistenceProbe => "persistence-probe",
             Self::AtomicActivation => "atomic-activation",
+            Self::ApplicationCursorKeys => "application-cursor-keys",
             Self::AgentEvents => "agent-events",
             Self::McpStdio => "mcp-stdio",
             Self::ResourceInspect => "resource-inspect",
@@ -156,6 +183,38 @@ pub const PHASE_ONE_HELPER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::ExecutableDiscovery,
     RemoteCapability::PersistenceProbe,
     RemoteCapability::AtomicActivation,
+];
+
+/// Capabilities advertised by a current Holder. The protocol-1.5 cursor bit
+/// is optional from the Engine's point of view so it can reconnect to a live
+/// 1.4 Holder and reconstruct the unknown mode from retained output.
+pub const CURRENT_HOLDER_CAPABILITIES: &[RemoteCapability] = &[
+    RemoteCapability::FullSnapshot,
+    RemoteCapability::IncrementalGrid,
+    RemoteCapability::ProcessExit,
+    RemoteCapability::Signal,
+    RemoteCapability::ControllerLease,
+    RemoteCapability::Scrollback,
+    RemoteCapability::ApplicationCursorKeys,
+];
+
+/// Full command/capability surface advertised by a current Helper probe.
+/// Baseline validation continues to require only
+/// [`PHASE_ONE_HELPER_CAPABILITIES`] for mixed-version live sessions.
+pub const CURRENT_HELPER_CAPABILITIES: &[RemoteCapability] = &[
+    RemoteCapability::FullSnapshot,
+    RemoteCapability::IncrementalGrid,
+    RemoteCapability::ProcessExit,
+    RemoteCapability::Signal,
+    RemoteCapability::ControllerLease,
+    RemoteCapability::Scrollback,
+    RemoteCapability::SessionManagement,
+    RemoteCapability::EnvironmentCapture,
+    RemoteCapability::DirectoryList,
+    RemoteCapability::ExecutableDiscovery,
+    RemoteCapability::PersistenceProbe,
+    RemoteCapability::AtomicActivation,
+    RemoteCapability::ApplicationCursorKeys,
 ];
 
 /// Authentication bearer shared only by the local Engine and one Holder.
@@ -266,6 +325,11 @@ pub struct FullSnapshot {
     pub sequence: u64,
     pub alt_screen: bool,
     pub bracketed_paste: bool,
+    /// `None` means the negotiated Holder predates protocol 1.5, omitted the
+    /// capability, or sampled this frame between parser boundaries. The Engine
+    /// must reconstruct it from retained output; absence is never interpreted
+    /// as the terminal default.
+    pub application_cursor_keys: Option<bool>,
     pub mouse: MouseModes,
     pub grid: GridUpdate,
 }
@@ -275,6 +339,7 @@ pub struct GridDelta {
     pub sequence: u64,
     pub alt_screen: bool,
     pub bracketed_paste: bool,
+    pub application_cursor_keys: Option<bool>,
     pub mouse: MouseModes,
     pub grid: GridUpdate,
 }
@@ -821,6 +886,10 @@ impl From<GridCodecError> for RemoteCodecError {
 #[derive(Clone, Debug, Default)]
 pub struct RemoteCodec {
     buffer: Vec<u8>,
+    /// Learned from the HelloAck on this exact stream. Even after negotiation,
+    /// each snapshot must carry its own known bit; a zero value without it is
+    /// unknown, not `false`.
+    application_cursor_keys_known: bool,
 }
 
 impl RemoteCodec {
@@ -870,7 +939,8 @@ impl RemoteCodec {
                     // older peer remains compatible with this additive mode
                     // byte extension.
                     | (u8::from(value.mouse.is_reporting()) << 2)
-                    | (value.mouse.detail_bits() << 3);
+                    | (value.mouse.detail_bits() << 3)
+                    | application_cursor_bits(value.application_cursor_keys);
                 output.push(modes);
                 if !value.grid.is_full_snapshot {
                     return rollback(
@@ -891,7 +961,8 @@ impl RemoteCodec {
                 let modes = u8::from(value.alt_screen)
                     | (u8::from(value.bracketed_paste) << 1)
                     | (u8::from(value.mouse.is_reporting()) << 2)
-                    | (value.mouse.detail_bits() << 3);
+                    | (value.mouse.detail_bits() << 3)
+                    | application_cursor_bits(value.application_cursor_keys);
                 output.push(modes);
                 if value.grid.is_full_snapshot {
                     return rollback(
@@ -1005,10 +1076,20 @@ impl RemoteCodec {
             if self.buffer.len() < frame_end {
                 break;
             }
-            messages.push(decode_message(
+            let message = decode_message(
                 kind,
                 &self.buffer[consumed + HEADER_BYTES..frame_end],
-            )?);
+                self.application_cursor_keys_known,
+            )?;
+            if let RemoteMessage::HelloAck(acknowledgement) = &message {
+                self.application_cursor_keys_known = acknowledgement.protocol.major
+                    == PROTOCOL_MAJOR
+                    && acknowledgement.protocol.minor >= APPLICATION_CURSOR_PROTOCOL_MINOR
+                    && acknowledgement
+                        .capabilities
+                        .contains(&RemoteCapability::ApplicationCursorKeys);
+            }
+            messages.push(message);
             consumed = frame_end;
         }
 
@@ -1044,7 +1125,11 @@ fn decode_json<T: DeserializeOwned>(kind: u8, payload: &[u8]) -> Result<T, Remot
     })
 }
 
-fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodecError> {
+fn decode_message(
+    kind: u8,
+    payload: &[u8],
+    application_cursor_keys_known: bool,
+) -> Result<RemoteMessage, RemoteCodecError> {
     if kind <= FrameType::Mouse as u8 {
         return Ok(RemoteMessage::Terminal(Frame::new(
             FrameType::try_from(kind).map_err(|_| RemoteCodecError::UnknownMessageType(kind))?,
@@ -1082,6 +1167,10 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
                 sequence,
                 alt_screen: modes & 1 != 0,
                 bracketed_paste: modes & 2 != 0,
+                application_cursor_keys: application_cursor_from_bits(
+                    modes,
+                    application_cursor_keys_known,
+                ),
                 mouse: MouseModes::from_detail_bits(modes >> 3, modes & 4 != 0),
                 grid,
             }))
@@ -1106,6 +1195,10 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
                 sequence,
                 alt_screen: modes & 1 != 0,
                 bracketed_paste: modes & 2 != 0,
+                application_cursor_keys: application_cursor_from_bits(
+                    modes,
+                    application_cursor_keys_known,
+                ),
                 mouse: MouseModes::from_detail_bits(modes >> 3, modes & 4 != 0),
                 grid,
             }))
@@ -1267,6 +1360,7 @@ mod tests {
             sequence: 42,
             alt_screen: true,
             bracketed_paste: true,
+            application_cursor_keys: Some(true),
             mouse: MouseModes::new(
                 crate::terminal::MouseTrackingMode::ButtonMotion,
                 crate::terminal::MouseEncoding::Sgr,
@@ -1281,6 +1375,39 @@ mod tests {
                 changed_rows: vec![ChangedRow::new(0, vec![GridCell::BLANK; 2])],
             },
         }
+    }
+
+    fn hello_ack(protocol: ProtocolVersion, capabilities: Vec<RemoteCapability>) -> RemoteMessage {
+        RemoteMessage::HelloAck(HelloAck {
+            protocol,
+            holder_build_id: "holder-build".into(),
+            session_incarnation: "incarnation-1".into(),
+            capabilities,
+            controller_epoch: 1,
+            process_state: RemoteProcessState::Running { pid: 42 },
+            output_offset: 0,
+            snapshot_sequence: 0,
+        })
+    }
+
+    fn decode_after_ack(
+        message: &RemoteMessage,
+        protocol: ProtocolVersion,
+        capabilities: Vec<RemoteCapability>,
+    ) -> RemoteMessage {
+        let mut codec = RemoteCodec::new();
+        let acknowledgement = hello_ack(protocol, capabilities);
+        assert_eq!(
+            codec
+                .feed(&RemoteCodec::encode(&acknowledgement).expect("encode ack"))
+                .expect("decode ack"),
+            vec![acknowledgement]
+        );
+        codec
+            .feed(&RemoteCodec::encode(message).expect("encode message"))
+            .expect("decode message")
+            .pop()
+            .expect("message")
     }
 
     #[test]
@@ -1321,8 +1448,17 @@ mod tests {
         assert_eq!(encoded[0], KIND_FULL_SNAPSHOT);
         assert_ne!(encoded[13] & 0b100, 0, "historical any-mouse bit");
         assert_eq!(
-            RemoteCodec::new().feed(&encoded).expect("decode"),
-            vec![message]
+            encoded[13] & (APPLICATION_CURSOR_VALUE_BIT | APPLICATION_CURSOR_KNOWN_BIT | (1 << 5)),
+            APPLICATION_CURSOR_VALUE_BIT | APPLICATION_CURSOR_KNOWN_BIT | (1 << 5),
+            "SGR mouse bit 5, DECCKM value bit 6, and its known bit compose"
+        );
+        assert_eq!(
+            decode_after_ack(
+                &message,
+                ProtocolVersion::CURRENT,
+                CURRENT_HOLDER_CAPABILITIES.to_vec()
+            ),
+            message
         );
     }
 
@@ -1338,6 +1474,10 @@ mod tests {
             panic!("snapshot");
         };
         assert_eq!(decoded.mouse, MouseModes::UNKNOWN);
+        assert_eq!(
+            decoded.application_cursor_keys, None,
+            "without a 1.5 capability, DECCKM is unknown"
+        );
     }
 
     #[test]
@@ -1366,6 +1506,7 @@ mod tests {
             sequence: 43,
             alt_screen: true,
             bracketed_paste: true,
+            application_cursor_keys: Some(true),
             mouse: MouseModes::new(
                 crate::terminal::MouseTrackingMode::ButtonMotion,
                 crate::terminal::MouseEncoding::Sgr,
@@ -1375,9 +1516,114 @@ mod tests {
         let encoded = RemoteCodec::encode(&message).expect("encode");
         assert_eq!(encoded[0], KIND_GRID_DELTA);
         assert_eq!(
-            RemoteCodec::new().feed(&encoded).expect("decode"),
-            vec![message]
+            decode_after_ack(
+                &message,
+                ProtocolVersion::CURRENT,
+                CURRENT_HOLDER_CAPABILITIES.to_vec()
+            ),
+            message
         );
+    }
+
+    #[test]
+    fn application_cursor_snapshot_matrix_preserves_value_and_provenance() {
+        for value in [None, Some(false), Some(true)] {
+            let mut snapshot = snapshot();
+            snapshot.application_cursor_keys = value;
+            let message = RemoteMessage::FullSnapshot(snapshot);
+
+            let RemoteMessage::FullSnapshot(current) = decode_after_ack(
+                &message,
+                ProtocolVersion::CURRENT,
+                CURRENT_HOLDER_CAPABILITIES.to_vec(),
+            ) else {
+                panic!("snapshot");
+            };
+            assert_eq!(current.application_cursor_keys, value, "current {value:?}");
+
+            for (protocol, capabilities) in [
+                (
+                    ProtocolVersion { major: 1, minor: 4 },
+                    PHASE_ONE_HOLDER_CAPABILITIES.to_vec(),
+                ),
+                (
+                    ProtocolVersion { major: 1, minor: 4 },
+                    CURRENT_HOLDER_CAPABILITIES.to_vec(),
+                ),
+                (
+                    ProtocolVersion::CURRENT,
+                    PHASE_ONE_HOLDER_CAPABILITIES.to_vec(),
+                ),
+            ] {
+                let RemoteMessage::FullSnapshot(legacy) =
+                    decode_after_ack(&message, protocol, capabilities)
+                else {
+                    panic!("snapshot");
+                };
+                assert_eq!(
+                    legacy.application_cursor_keys, None,
+                    "unnegotiated {value:?} stays unknown"
+                );
+                assert_eq!(
+                    legacy.mouse,
+                    MouseModes::new(
+                        crate::terminal::MouseTrackingMode::ButtonMotion,
+                        crate::terminal::MouseEncoding::Sgr,
+                    ),
+                    "the additive known bit cannot leak into legacy mouse details"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn application_cursor_delta_matrix_preserves_value_and_provenance() {
+        for value in [None, Some(false), Some(true)] {
+            let mut grid = snapshot().grid;
+            grid.is_full_snapshot = false;
+            let message = RemoteMessage::GridDelta(GridDelta {
+                sequence: 43,
+                alt_screen: false,
+                bracketed_paste: true,
+                application_cursor_keys: value,
+                mouse: MouseModes::OFF,
+                grid,
+            });
+
+            let RemoteMessage::GridDelta(current) = decode_after_ack(
+                &message,
+                ProtocolVersion::CURRENT,
+                CURRENT_HOLDER_CAPABILITIES.to_vec(),
+            ) else {
+                panic!("delta");
+            };
+            assert_eq!(current.application_cursor_keys, value, "current {value:?}");
+
+            for (protocol, capabilities) in [
+                (
+                    ProtocolVersion { major: 1, minor: 4 },
+                    PHASE_ONE_HOLDER_CAPABILITIES.to_vec(),
+                ),
+                (
+                    ProtocolVersion { major: 1, minor: 4 },
+                    CURRENT_HOLDER_CAPABILITIES.to_vec(),
+                ),
+                (
+                    ProtocolVersion::CURRENT,
+                    PHASE_ONE_HOLDER_CAPABILITIES.to_vec(),
+                ),
+            ] {
+                let RemoteMessage::GridDelta(legacy) =
+                    decode_after_ack(&message, protocol, capabilities)
+                else {
+                    panic!("delta");
+                };
+                assert_eq!(
+                    legacy.application_cursor_keys, None,
+                    "unnegotiated {value:?} stays unknown"
+                );
+            }
+        }
     }
 
     #[test]

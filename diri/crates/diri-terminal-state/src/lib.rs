@@ -21,11 +21,203 @@ use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
+use alacritty_terminal::vte::ansi::{Handler, PrivateMode};
 use diri_proto::grid::{ChangedRow, GridCell, GridRowCodec, GridUpdate, TermColor, TermStyle};
 use diri_proto::terminal::{
     MouseEncoding, MouseModes, MouseTrackingMode, TerminalMouseEvent, TerminalMouseModifiers,
     encode_mouse_event,
 };
+
+/// Provenance-aware DECCKM state for streams that may begin after terminal
+/// output has already been discarded. `None` means no retained byte has yet
+/// established the sticky mode; it must never be collapsed to the emulator's
+/// construction default.
+#[derive(Default)]
+pub struct ApplicationCursorModeTracker {
+    processor: Processor,
+    state: ApplicationCursorModeState,
+    boundary: EscapeSequenceBoundary,
+}
+
+/// Conservative ECMA-48 parser-boundary shadow. A boolean terminal-mode
+/// snapshot is safe to bind to an output offset only at `Ground`; otherwise
+/// the bytes after that offset may complete a control sequence whose prefix
+/// existed before the snapshot.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum EscapeSequenceBoundary {
+    #[default]
+    Ground,
+    Escape,
+    EscapeIntermediate,
+    Csi,
+    Utf8 {
+        remaining: u8,
+    },
+    String {
+        bell_terminated: bool,
+    },
+}
+
+impl EscapeSequenceBoundary {
+    fn feed(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            *self = self.advance(byte);
+        }
+    }
+
+    fn advance(self, byte: u8) -> Self {
+        use EscapeSequenceBoundary::{Csi, Escape, EscapeIntermediate, Ground, String, Utf8};
+        // CAN/SUB cancel every control sequence; ESC begins a fresh one from
+        // every state. These are the ECMA-48 "anywhere" transitions.
+        if matches!(byte, 0x18 | 0x1a) {
+            return Ground;
+        }
+        if byte == 0x1b {
+            return Escape;
+        }
+        match self {
+            Ground => match byte {
+                0xc2..=0xdf => Utf8 { remaining: 1 },
+                0xe0..=0xef => Utf8 { remaining: 2 },
+                0xf0..=0xf4 => Utf8 { remaining: 3 },
+                _ => Ground,
+            },
+            Utf8 { remaining } => {
+                if matches!(byte, 0x80..=0xbf) {
+                    if remaining == 1 {
+                        Ground
+                    } else {
+                        Utf8 {
+                            remaining: remaining - 1,
+                        }
+                    }
+                } else {
+                    // VTE discards/replaces the incomplete scalar, then
+                    // processes this byte again from Ground.
+                    Ground.advance(byte)
+                }
+            }
+            Escape => match byte {
+                b'[' => Csi,
+                b']' => String {
+                    bell_terminated: true,
+                },
+                b'P' | b'X' | b'^' | b'_' => String {
+                    bell_terminated: false,
+                },
+                0x20..=0x2f => EscapeIntermediate,
+                0x30..=0x7e => Ground,
+                _ => Escape,
+            },
+            EscapeIntermediate => match byte {
+                0x20..=0x2f => EscapeIntermediate,
+                0x30..=0x7e => Ground,
+                _ => EscapeIntermediate,
+            },
+            Csi => match byte {
+                0x40..=0x7e => Ground,
+                _ => Csi,
+            },
+            String { bell_terminated } => {
+                if bell_terminated && byte == 0x07 {
+                    Ground
+                } else {
+                    String { bell_terminated }
+                }
+            }
+        }
+    }
+
+    const fn is_ground(self) -> bool {
+        matches!(self, Self::Ground)
+    }
+}
+
+#[derive(Default)]
+struct ApplicationCursorModeState {
+    value: Option<bool>,
+}
+
+impl Handler for ApplicationCursorModeState {
+    fn set_private_mode(&mut self, mode: PrivateMode) {
+        if mode.raw() == 1 {
+            self.value = Some(true);
+        }
+    }
+
+    fn unset_private_mode(&mut self, mode: PrivateMode) {
+        if mode.raw() == 1 {
+            self.value = Some(false);
+        }
+    }
+
+    fn reset_state(&mut self) {
+        self.value = Some(false);
+    }
+}
+
+impl ApplicationCursorModeTracker {
+    #[must_use]
+    pub fn known(value: bool) -> Self {
+        Self {
+            processor: Processor::new(),
+            state: ApplicationCursorModeState { value: Some(value) },
+            boundary: EscapeSequenceBoundary::Ground,
+        }
+    }
+
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self::default()
+    }
+
+    pub fn feed(&mut self, bytes: &[u8]) {
+        self.boundary.feed(bytes);
+        self.processor.advance(&mut self.state, bytes);
+    }
+
+    pub fn set_known(&mut self, value: bool) {
+        // Callers may bind a boolean only when the producing parser certified
+        // this offset as a boundary. Resetting here makes that guarantee
+        // explicit locally too: replay begins after the certified offset.
+        self.processor = Processor::new();
+        self.boundary = EscapeSequenceBoundary::Ground;
+        self.state.value = Some(value);
+    }
+
+    /// Updates the authoritative value without discarding a locally retained
+    /// parser continuation. Remote snapshots use this for compatibility with
+    /// peers that predate parser-boundary certification: a later contiguous
+    /// raw suffix must still be able to complete the sequence.
+    pub fn set_known_preserving_parser(&mut self, value: bool) {
+        self.state.value = Some(value);
+    }
+
+    pub fn set_unknown(&mut self) {
+        // Losing provenance also invalidates any partial escape sequence. A
+        // retained suffix must never complete a DECSET begun before a missing
+        // log interval.
+        self.processor = Processor::new();
+        self.boundary = EscapeSequenceBoundary::Ground;
+        self.state.value = None;
+    }
+
+    #[must_use]
+    pub const fn value(&self) -> Option<bool> {
+        self.state.value
+    }
+
+    /// A mode value and raw-output offset are authoritative together only
+    /// when no escape/control string is awaiting continuation.
+    #[must_use]
+    pub const fn value_at_parser_boundary(&self) -> Option<bool> {
+        if self.boundary.is_ground() {
+            self.state.value
+        } else {
+            None
+        }
+    }
+}
 
 /// Receiver-side authority for a remote terminal stream. A mirror accepts a
 /// full snapshot as a new baseline and then only contiguous sequenced diffs;
@@ -42,6 +234,7 @@ pub struct GridMirror {
     sequence: Option<u64>,
     alt_screen: bool,
     bracketed_paste: bool,
+    application_cursor_keys: bool,
     mouse: MouseModes,
 }
 
@@ -57,6 +250,7 @@ impl GridMirror {
         grid: &GridUpdate,
         alt_screen: bool,
         bracketed_paste: bool,
+        application_cursor_keys: bool,
         mouse: MouseModes,
     ) -> Result<(), MirrorError> {
         if !grid.is_full_snapshot {
@@ -68,6 +262,7 @@ impl GridMirror {
         self.sequence = Some(sequence);
         self.alt_screen = alt_screen;
         self.bracketed_paste = bracketed_paste;
+        self.application_cursor_keys = application_cursor_keys;
         self.mouse = mouse;
         Ok(())
     }
@@ -78,6 +273,7 @@ impl GridMirror {
         grid: &GridUpdate,
         alt_screen: bool,
         bracketed_paste: bool,
+        application_cursor_keys: bool,
         mouse: MouseModes,
     ) -> Result<(), MirrorError> {
         let Some(previous) = self.sequence else {
@@ -101,6 +297,7 @@ impl GridMirror {
         self.sequence = Some(sequence);
         self.alt_screen = alt_screen;
         self.bracketed_paste = bracketed_paste;
+        self.application_cursor_keys = application_cursor_keys;
         self.mouse = mouse;
         Ok(())
     }
@@ -134,8 +331,13 @@ impl GridMirror {
     }
 
     #[must_use]
-    pub const fn modes(&self) -> (bool, bool, MouseModes) {
-        (self.alt_screen, self.bracketed_paste, self.mouse)
+    pub const fn modes(&self) -> (bool, bool, bool, MouseModes) {
+        (
+            self.alt_screen,
+            self.bracketed_paste,
+            self.application_cursor_keys,
+            self.mouse,
+        )
     }
 
     #[must_use]
@@ -287,6 +489,7 @@ impl EventListener for Collector {
 pub struct HeadlessScreen {
     term: Term<Collector>,
     parser: Processor,
+    parser_boundary: EscapeSequenceBoundary,
     events: Receiver<Event>,
     geometry: Geometry,
 
@@ -334,6 +537,7 @@ impl HeadlessScreen {
         let mut screen = Self {
             term,
             parser: Processor::new(),
+            parser_boundary: EscapeSequenceBoundary::Ground,
             events,
             geometry,
             title: None,
@@ -361,6 +565,7 @@ impl HeadlessScreen {
     /// difference is multi-x on heavy output like build logs.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.scan_progress(bytes);
+        self.parser_boundary.feed(bytes);
         let title_before = self.title.clone();
         self.parser.advance(&mut self.term, bytes);
         self.settle(title_before);
@@ -485,6 +690,20 @@ impl HeadlessScreen {
         self.term
             .mode()
             .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE)
+    }
+
+    /// Whether the child enabled DEC private mode 1 (DECCKM), which changes
+    /// unmodified arrow keys from CSI sequences to SS3 sequences.
+    pub fn application_cursor_keys(&self) -> bool {
+        self.term.mode().contains(TermMode::APP_CURSOR)
+    }
+
+    /// Current DECCKM state only when the raw parser is at a boundary safe to
+    /// pair with an output offset or snapshot sequence.
+    pub fn application_cursor_keys_at_parser_boundary(&self) -> Option<bool> {
+        self.parser_boundary
+            .is_ground()
+            .then(|| self.application_cursor_keys())
     }
 
     /// The current grid geometry.
@@ -645,6 +864,7 @@ impl HeadlessScreen {
         update: &GridUpdate,
         alt_screen: bool,
         bracketed_paste: bool,
+        application_cursor_keys: bool,
         mouse: MouseModes,
     ) -> bool {
         let cols = self.geometry.cols;
@@ -658,6 +878,12 @@ impl HeadlessScreen {
         {
             return false;
         }
+
+        // A persisted v5 checkpoint is written only at a certified parser
+        // boundary. Restore that boundary explicitly so this method is also
+        // correct when reusing an existing screen in tests or embedders.
+        self.parser = Processor::new();
+        self.parser_boundary = EscapeSequenceBoundary::Ground;
 
         // Allocate scrollback in the emulator, then replace those rows with
         // the persisted cells. The visible grid is painted below; CSI 2 J
@@ -717,6 +943,11 @@ impl HeadlessScreen {
         if bracketed_paste {
             bytes.extend_from_slice(b"\x1b[?2004h");
         }
+        bytes.extend_from_slice(if application_cursor_keys {
+            b"\x1b[?1h"
+        } else {
+            b"\x1b[?1l"
+        });
         if let Some(mode) = mouse.tracking.dec_private_mode() {
             bytes.extend_from_slice(format!("\x1b[?{mode}h").as_bytes());
         }
@@ -1281,6 +1512,16 @@ mod tests {
     }
 
     #[test]
+    fn application_cursor_mode_is_detected() {
+        let mut screen = HeadlessScreen::new(80, 24);
+        assert!(!screen.application_cursor_keys());
+        screen.feed(b"\x1b[?1h");
+        assert!(screen.application_cursor_keys());
+        screen.feed(b"\x1b[?1l");
+        assert!(!screen.application_cursor_keys());
+    }
+
+    #[test]
     fn a_resize_reflows_to_the_new_width() {
         let mut screen = HeadlessScreen::new(80, 24);
         screen.feed(b"hello\r\n");
@@ -1291,7 +1532,7 @@ mod tests {
     #[test]
     fn a_restored_snapshot_reproduces_the_screen_and_modes() {
         let mut original = HeadlessScreen::new(40, 10);
-        original.feed(b"\x1b[?2004h\x1b[?1000h\x1b[?1006h");
+        original.feed(b"\x1b[?2004h\x1b[?1h\x1b[?1000h\x1b[?1006h");
         original.feed(b"\x1b[1;31mred alert\x1b[0m\r\nplain line\r\n");
         original.feed("wide: ▶ done\r\n".as_bytes());
         let snapshot = original.full_snapshot();
@@ -1303,12 +1544,17 @@ mod tests {
                 &snapshot,
                 false,
                 true,
+                true,
                 MouseModes::new(MouseTrackingMode::ButtonEvents, MouseEncoding::Sgr),
             ),
             "restorable"
         );
         assert_eq!(restored.lines(), original.lines());
         assert!(restored.bracketed_paste(), "bracketed paste mode carried");
+        assert!(
+            restored.application_cursor_keys(),
+            "application cursor mode carried"
+        );
         assert!(restored.mouse_reporting(), "mouse mode carried");
         assert!(!restored.is_alt_screen());
         assert_eq!(restored.cursor(), original.cursor());
@@ -1324,9 +1570,22 @@ mod tests {
 
         let mut smaller = HeadlessScreen::new(39, 10);
         assert!(
-            !smaller.restore(&[], &snapshot, false, false, MouseModes::OFF),
+            !smaller.restore(&[], &snapshot, false, false, false, MouseModes::OFF),
             "a checkpoint from another geometry is a cache miss"
         );
+    }
+
+    #[test]
+    fn restore_explicitly_clears_existing_application_cursor_mode() {
+        let mut source = HeadlessScreen::new(8, 2);
+        source.feed(b"plain");
+        let snapshot = source.full_snapshot();
+
+        let mut restored = HeadlessScreen::new(8, 2);
+        restored.feed(b"\x1b[?1h");
+        assert!(restored.application_cursor_keys());
+        assert!(restored.restore(&[], &snapshot, false, false, false, MouseModes::OFF));
+        assert!(!restored.application_cursor_keys());
     }
 
     /// The extracted crate forked before checkpoints carried scrollback, so
@@ -1342,7 +1601,7 @@ mod tests {
 
         let mut restored = HeadlessScreen::new(12, 2);
         assert!(
-            restored.restore(&history, &snapshot, false, false, MouseModes::OFF),
+            restored.restore(&history, &snapshot, false, false, false, MouseModes::OFF),
             "restorable"
         );
         assert_eq!(restored.scrollback(), original.scrollback());
@@ -1370,11 +1629,11 @@ mod tests {
         let snapshot = screen.full_snapshot();
         let mut mirror = GridMirror::new();
         mirror
-            .apply_snapshot(9, &snapshot, false, true, MouseModes::OFF)
+            .apply_snapshot(9, &snapshot, false, true, true, MouseModes::OFF)
             .expect("snapshot");
         assert_eq!(mirror.sequence(), Some(9));
         assert_eq!(mirror.size(), (8, 2));
-        assert_eq!(mirror.modes(), (false, true, MouseModes::OFF));
+        assert_eq!(mirror.modes(), (false, true, true, MouseModes::OFF));
 
         let mut delta_source = HeadlessScreen::new(8, 2);
         delta_source.feed(b"one");
@@ -1387,6 +1646,7 @@ mod tests {
                 &delta,
                 true,
                 false,
+                false,
                 MouseModes::new(MouseTrackingMode::AnyMotion, MouseEncoding::Sgr),
             )
             .expect("contiguous delta");
@@ -1395,11 +1655,12 @@ mod tests {
             (
                 true,
                 false,
+                false,
                 MouseModes::new(MouseTrackingMode::AnyMotion, MouseEncoding::Sgr)
             )
         );
         assert!(matches!(
-            mirror.apply_delta(12, &delta, false, false, MouseModes::OFF),
+            mirror.apply_delta(12, &delta, false, false, false, MouseModes::OFF),
             Err(MirrorError::SequenceGap {
                 expected: 11,
                 actual: 12
@@ -1433,5 +1694,64 @@ mod tests {
             MouseModes::new(MouseTrackingMode::Off, MouseEncoding::Sgr),
             "1006 is independent of tracking"
         );
+    }
+
+    #[test]
+    fn application_cursor_tracker_preserves_unknown_until_authoritative_output() {
+        let mut tracker = ApplicationCursorModeTracker::unknown();
+        tracker.feed(b"ordinary output\x1b[?2004h");
+        assert_eq!(tracker.value(), None);
+
+        tracker.feed(b"\x1b[?1;");
+        assert_eq!(tracker.value(), None, "split CSI is not guessed early");
+        tracker.feed(b"1000h");
+        assert_eq!(tracker.value(), Some(true));
+
+        tracker.set_unknown();
+        tracker.feed(b"\x1bc");
+        assert_eq!(tracker.value(), Some(false), "RIS is authoritative reset");
+    }
+
+    #[test]
+    fn cursor_authority_waits_for_split_control_sequence_boundary() {
+        let mut tracker = ApplicationCursorModeTracker::known(false);
+        tracker.feed(b"\x1b");
+        assert_eq!(tracker.value(), Some(false));
+        assert_eq!(
+            tracker.value_at_parser_boundary(),
+            None,
+            "a stat after ESC cannot bind its boolean to that offset"
+        );
+        tracker.feed(b"[?1h");
+        assert_eq!(tracker.value_at_parser_boundary(), Some(true));
+
+        let mut legacy_remote = ApplicationCursorModeTracker::known(false);
+        legacy_remote.feed(b"\x1b");
+        legacy_remote.set_known_preserving_parser(false);
+        legacy_remote.feed(b"[?1h");
+        assert_eq!(
+            legacy_remote.value_at_parser_boundary(),
+            Some(true),
+            "a legacy snapshot cannot discard locally retained continuation"
+        );
+
+        let mut screen = HeadlessScreen::new(80, 24);
+        screen.feed(b"\x1b[");
+        assert_eq!(screen.application_cursor_keys_at_parser_boundary(), None);
+        screen.feed(b"?1h");
+        assert_eq!(
+            screen.application_cursor_keys_at_parser_boundary(),
+            Some(true)
+        );
+
+        let mut unicode = ApplicationCursorModeTracker::known(false);
+        unicode.feed(&[0xf0, 0x9f]);
+        assert_eq!(
+            unicode.value_at_parser_boundary(),
+            None,
+            "a checkpoint must not split VTE's buffered UTF-8 scalar"
+        );
+        unicode.feed(&[0x98, 0x80]);
+        assert_eq!(unicode.value_at_parser_boundary(), Some(false));
     }
 }
