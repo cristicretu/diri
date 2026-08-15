@@ -15,7 +15,7 @@
 
 use std::sync::mpsc::{self, Receiver, SyncSender};
 
-use alacritty_terminal::event::{Event, EventListener};
+use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
@@ -309,6 +309,14 @@ pub struct HeadlessScreen {
     /// Trailing bytes of the previous chunk, so an OSC split across a read
     /// boundary is still recognized.
     progress_carry: Vec<u8>,
+    /// Answers the emulator owes the child: a cursor-position report, a device
+    /// attributes reply, and anything else generated in response to a query.
+    /// A program that asks and is never answered blocks until its own timeout,
+    /// or forever, so the pump must write these back to the PTY.
+    replies: Vec<u8>,
+    /// Whether the title moved since the last settle, tracked where it is
+    /// assigned so no per-chunk clone is needed to notice.
+    title_changed: bool,
 
     /// Diff baseline for [`grid_update`]: the cells last handed out, so the
     /// next call sends only changed rows.
@@ -346,6 +354,8 @@ impl HeadlessScreen {
             current_damage_rows: vec![false; geometry.rows],
             pending_damage_rows: vec![true; geometry.rows],
             progress_carry: Vec::new(),
+            replies: Vec::new(),
+            title_changed: false,
             last_cells: Vec::new(),
             last_grid_cols: 0,
             last_grid_rows: 0,
@@ -361,9 +371,8 @@ impl HeadlessScreen {
     /// difference is multi-x on heavy output like build logs.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.scan_progress(bytes);
-        let title_before = self.title.clone();
         self.parser.advance(&mut self.term, bytes);
-        self.settle(title_before);
+        self.settle();
     }
 
     /// Ends a synchronized update (DECSET 2026) whose deadline has passed.
@@ -384,9 +393,8 @@ impl HeadlessScreen {
         if std::time::Instant::now() < deadline {
             return false;
         }
-        let title_before = self.title.clone();
         self.parser.stop_sync(&mut self.term);
-        self.settle(title_before);
+        self.settle();
         true
     }
 
@@ -395,7 +403,7 @@ impl HeadlessScreen {
     /// Damage is preserved at row granularity for both status detection and
     /// the next wire diff. Cursor-only damage hashes at most the touched rows;
     /// a one-line echo never scans the rest of the viewport.
-    fn settle(&mut self, title_before: Option<String>) {
+    fn settle(&mut self) {
         self.drain_events();
         let rows = self.geometry.rows;
         self.current_damage_rows.resize(rows, false);
@@ -416,7 +424,9 @@ impl HeadlessScreen {
             }
         }
         self.term.reset_damage();
-        let mut content_changed = self.title != title_before;
+        // The title is compared where it is assigned, so settling costs no
+        // clone of it per chunk of output.
+        let mut content_changed = std::mem::take(&mut self.title_changed);
         if self.row_digests.len() != rows || self.row_filled_cells.len() != rows {
             self.rebuild_content_cache();
             content_changed = true;
@@ -454,13 +464,12 @@ impl HeadlessScreen {
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
-        let title_before = self.title.clone();
         self.geometry = Geometry {
             cols: cols.max(1),
             rows: rows.max(1),
         };
         self.term.resize(self.geometry);
-        self.settle(title_before);
+        self.settle();
     }
 
     pub fn content_seq(&self) -> u64 {
@@ -874,12 +883,42 @@ impl HeadlessScreen {
 
     fn drain_events(&mut self) {
         while let Ok(event) = self.events.try_recv() {
-            if let Event::Title(title) = event {
-                self.title = Some(title);
-            } else if matches!(event, Event::ResetTitle) {
-                self.title = None;
+            match event {
+                Event::Title(title) => {
+                    let title = Some(title);
+                    self.title_changed |= self.title != title;
+                    self.title = title;
+                }
+                Event::ResetTitle => {
+                    self.title_changed |= self.title.is_some();
+                    self.title = None;
+                }
+                // Replies to queries the child made — CSI 6n, device
+                // attributes, and so on. Collected here and written back by
+                // the pump, which owns the write side of the PTY.
+                Event::PtyWrite(text) => self.replies.extend_from_slice(text.as_bytes()),
+                Event::TextAreaSizeRequest(format) => {
+                    // Cell pixel size is a rendering concern the daemon does
+                    // not know; report the grid it does know. Callers use this
+                    // to size output, and cols/rows is the part they act on.
+                    let size = WindowSize {
+                        num_cols: self.geometry.cols as u16,
+                        num_lines: self.geometry.rows as u16,
+                        cell_width: 0,
+                        cell_height: 0,
+                    };
+                    self.replies.extend_from_slice(format(size).as_bytes());
+                }
+                _ => {}
             }
         }
+    }
+
+    /// Takes the answers owed to the child. The pump writes these to the PTY
+    /// after feeding a chunk; nothing else may consume them.
+    #[must_use]
+    pub fn take_replies(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.replies)
     }
 
     // (cell mapping lives at module level; see `wire_cell`)
@@ -924,14 +963,32 @@ impl HeadlessScreen {
     /// Agents use this to say "I am working, 40% through"; the emulator has no
     /// concept of it and would silently drop the sequence.
     fn scan_progress(&mut self, bytes: &[u8]) {
-        const PREFIX: &[u8] = b"\x1b]9;4;";
-        const MAX_INCOMPLETE_BYTES: usize = 64;
-        if self.progress_carry.is_empty() && !bytes.contains(&0x1b) {
+        if self.progress_carry.is_empty() {
+            if !bytes.contains(&0x1b) {
+                return;
+            }
+            // Scan the chunk where it lies. Joining it to an empty carry would
+            // copy every byte of every read, and reads that leave a carry
+            // behind are the rare case — the common one is output that merely
+            // contains color escapes.
+            if let Some(start) = self.scan_progress_within(bytes) {
+                self.progress_carry.extend_from_slice(&bytes[start..]);
+            }
             return;
         }
         let mut haystack = std::mem::take(&mut self.progress_carry);
         haystack.extend_from_slice(bytes);
+        if let Some(start) = self.scan_progress_within(&haystack) {
+            haystack.drain(..start);
+            self.progress_carry = haystack;
+        }
+    }
 
+    /// Scans one buffer for progress reports, returning where a carry for the
+    /// next chunk should begin if the buffer ends mid-sequence.
+    fn scan_progress_within(&mut self, haystack: &[u8]) -> Option<usize> {
+        const PREFIX: &[u8] = b"\x1b]9;4;";
+        const MAX_INCOMPLETE_BYTES: usize = 64;
         let mut search_from = 0;
         let mut incomplete = None;
         while let Some(found) = find(&haystack[search_from..], PREFIX) {
@@ -957,25 +1014,15 @@ impl HeadlessScreen {
         if let Some(start) = incomplete
             && haystack.len() - start <= MAX_INCOMPLETE_BYTES
         {
-            haystack.drain(..start);
-            self.progress_carry = haystack;
-            return;
+            return Some(start);
         }
         // A malformed unterminated OSC must not turn the scanner into an
         // unbounded copy of the PTY stream. Fall through and retain only a
         // possible prefix suffix.
-
-        // Preserve only a suffix that could be the beginning of PREFIX. Plain
-        // terminal output retains no carry and therefore allocates nothing on
-        // the next read.
-        let carry_start = (1..PREFIX.len())
+        (1..PREFIX.len())
             .rev()
             .find(|length| haystack.ends_with(&PREFIX[..*length]))
-            .map(|length| haystack.len() - length);
-        if let Some(start) = carry_start {
-            haystack.drain(..start);
-            self.progress_carry = haystack;
-        }
+            .map(|length| haystack.len() - length)
     }
 }
 

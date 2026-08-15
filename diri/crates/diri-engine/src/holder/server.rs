@@ -36,6 +36,15 @@ const MAX_SIGNAL: i32 = 32;
 #[cfg(not(target_os = "macos"))]
 const MAX_SIGNAL: i32 = 65;
 
+/// How many PTY chunks may be waiting to be written before the reader has to
+/// wait for the writer. At 64 KiB a chunk this absorbs a multi-megabyte stall
+/// without letting a wedged filesystem grow the queue without bound.
+const WRITE_QUEUE_DEPTH: usize = 256;
+
+/// How much queued output one disk write may carry. Larger writes cost the
+/// filesystem far less per byte than many small ones.
+const WRITE_BATCH_BYTES: usize = 1 << 20;
+
 pub struct HolderServer;
 
 struct Shared {
@@ -202,35 +211,109 @@ fn open_log(spec: &HolderLaunchSpec) -> HolderResult<OutputLog> {
 /// The loop polls with a timeout rather than blocking so it also notices
 /// `finished` — after the exit marker is written, nothing more may be
 /// appended, or straggling grandchild output would land beyond the marker.
-fn pump_pty(shared: &Shared, reader: &mut crate::pty::PtyStream) {
+fn pump_pty(shared: &Arc<Shared>, reader: &mut crate::pty::PtyStream) {
+    // The log is also the transport: the daemon reads this session's output by
+    // tailing the spill file. Appending on this thread therefore made draining
+    // the PTY wait on the filesystem — under a burst of output the pump sat in
+    // `write` for most of its wall time while the child blocked on a full PTY
+    // buffer. Handing chunks to a writer decouples the two: the queue absorbs a
+    // filesystem stall (a truncation rewrite, most of all) without ever
+    // stalling the reader.
+    //
+    // The channel is bounded, so a writer that genuinely cannot keep up applies
+    // backpressure rather than growing without limit. Ordering is preserved
+    // because exactly one thread writes.
+    let (send, receive) = std::sync::mpsc::sync_channel::<Vec<u8>>(WRITE_QUEUE_DEPTH);
+    let writer = {
+        let shared = Arc::clone(shared);
+        std::thread::Builder::new()
+            .name(format!("holder-log-{}", shared.spec.session_id))
+            .spawn(move || {
+                let mut batch: Vec<u8> = Vec::with_capacity(WRITE_BATCH_BYTES);
+                while let Ok(chunk) = receive.recv() {
+                    batch.clear();
+                    batch.extend_from_slice(&chunk);
+                    // Whatever else is already queued joins this write. One
+                    // large append costs far less than many small ones — a
+                    // syscall and a filesystem extent per chunk otherwise —
+                    // and nothing waits, so this adds no latency of its own.
+                    while batch.len() < WRITE_BATCH_BYTES {
+                        match receive.try_recv() {
+                            Ok(next) => batch.extend_from_slice(&next),
+                            Err(_) => break,
+                        }
+                    }
+                    // A failed disk write must not stop the session: the child
+                    // is still running and its status still matters.
+                    let _ = shared.log.lock().expect("log").append(&batch);
+                }
+            })
+            .ok()
+    };
+    // Without a writer thread the append happens inline, which is slower but
+    // always correct.
+    let mut queue = writer.is_some().then_some(send);
+
     let mut buffer = [0u8; 64 << 10];
     loop {
         if shared.finished.load(Ordering::SeqCst) {
-            return;
+            break;
         }
         match reader.wait_readable(Duration::from_millis(100)) {
             Ok(false) => continue,
             Ok(true) => {}
-            Err(_) => return,
+            Err(_) => break,
         }
+        // A PTY hands over about a kilobyte per read, so appending per read
+        // pays the log's per-chunk costs a thousand times for every megabyte.
+        // Bytes already queued in the kernel are folded into one append
+        // instead: the reads happen either way, and nothing waits on bytes
+        // that have not arrived, so this batches without adding latency.
+        let mut filled = 0;
+        let mut eof = false;
         loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => return, // EOF: every slave handle is gone
+            match reader.read(&mut buffer[filled..]) {
+                Ok(0) => {
+                    eof = true; // every slave handle is gone
+                    break;
+                }
                 Ok(count) => {
-                    // Bytes read are appended even if `finished` was just set:
-                    // the exit watcher joins this thread before writing the
-                    // marker, so nothing can land beyond it — but a byte
-                    // consumed from the kernel and then dropped would be lost.
-                    let _ = shared.log.lock().expect("log").append(&buffer[..count]);
-                    if shared.finished.load(Ordering::SeqCst) {
-                        return;
+                    filled += count;
+                    if filled == buffer.len() {
+                        break;
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => return,
+                Err(_) => {
+                    eof = true;
+                    break;
+                }
             }
         }
+        if filled > 0 {
+            // Bytes read are handed on even if `finished` was just set: the
+            // exit watcher joins this thread before writing the marker, so
+            // nothing can land beyond it — but a byte consumed from the kernel
+            // and then dropped would be lost.
+            match queue.as_ref() {
+                Some(queue) if queue.send(buffer[..filled].to_vec()).is_ok() => {}
+                _ => {
+                    let _ = shared.log.lock().expect("log").append(&buffer[..filled]);
+                }
+            }
+        }
+        if eof || shared.finished.load(Ordering::SeqCst) {
+            break;
+        }
+    }
+
+    // Every queued byte must reach the log before this thread is joined: the
+    // exit watcher writes the exit marker straight after the join, and a byte
+    // still in flight would land after it.
+    drop(queue.take());
+    if let Some(writer) = writer {
+        let _ = writer.join();
     }
 }
 

@@ -2354,16 +2354,29 @@ fn pump(
                 let closed = feed_output_batch(&shared, &mut reader, &mut buffer, n);
                 // One detection pass per batch, not per read: the reducer
                 // discards observations it has already judged anyway.
-                let observation = {
+                let (observation, replies) = {
                     let mut screen = shared.screen.lock().expect("screen");
-                    evaluate_if_screen_changed(
-                        &shared,
-                        &mut screen,
-                        &engine,
-                        &manifest_id,
-                        &mut last_eval_seq,
+                    let replies = screen.take_replies();
+                    (
+                        evaluate_if_screen_changed(
+                            &shared,
+                            &mut screen,
+                            &engine,
+                            &manifest_id,
+                            &mut last_eval_seq,
+                        ),
+                        replies,
                     )
                 };
+                // Answers to the child's queries go back before anything else
+                // is published: it is blocked reading them.
+                if !replies.is_empty() {
+                    use std::io::Write;
+                    if let Ok(mut writer) = pty.lock().expect("pty").writer() {
+                        let _ = writer.write_all(&replies);
+                        let _ = writer.flush();
+                    }
+                }
                 shared.grid_wake.notify();
 
                 let now = SystemTime::now();
@@ -2742,17 +2755,31 @@ fn pump_held(
 
         if !output.is_empty() {
             checkpoint_dirty_at = Some(Instant::now());
-            let observation = {
+            let (observation, replies) = {
                 let mut screen = shared.screen.lock().expect("screen");
                 screen.feed(&output);
-                evaluate_if_screen_changed(
-                    &shared,
-                    &mut screen,
-                    &engine,
-                    &manifest_id,
-                    &mut last_eval_seq,
+                let replies = screen.take_replies();
+                (
+                    evaluate_if_screen_changed(
+                        &shared,
+                        &mut screen,
+                        &engine,
+                        &manifest_id,
+                        &mut last_eval_seq,
+                    ),
+                    replies,
                 )
             };
+            // The child is blocked reading the answer to its query, so send it
+            // through the holder's input path before publishing anything.
+            //
+            // Never while replaying: those queries were asked by a program that
+            // has already moved on — often one that already exited — and the
+            // replies would arrive as unsolicited keystrokes. They are taken
+            // and dropped so a replayed query cannot leak into the live stream.
+            if !replies.is_empty() && !replaying {
+                let _ = client.write(&replies);
+            }
             let batch_started = *publish_pending.get_or_insert_with(Instant::now);
             if caught_up || batch_started.elapsed() >= OUTPUT_BATCH_CEILING {
                 publish_pending = None;
