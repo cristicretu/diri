@@ -91,6 +91,10 @@ fn spec(id: &str, script: &str, logs: &Path, holder: HolderConfig) -> SessionSpe
 #[test]
 fn a_cursor_position_query_gets_a_reply() {
     let _exclusive = exclusive();
+    // Asked immediately, before the pump has drained anything. A shell setting
+    // up its prompt does exactly this, and a reply suppressed as "replayed
+    // history" until the first empty read leaves it waiting on its own
+    // timeout — which is how this read on Linux and not on macOS.
     let root = work_dir("dsr");
     let logs = root.join("logs");
     let holder = HolderConfig {
@@ -104,7 +108,7 @@ fn a_cursor_position_query_gets_a_reply() {
     let script = "python3 -c \"import os,select,sys,termios,tty; \
          fd=os.open('/dev/tty',os.O_RDWR); old=termios.tcgetattr(fd); tty.setraw(fd); \
          os.write(fd,b'\\033[6n'); \
-         got=b'' if not select.select([fd],[],[],5.0)[0] else os.read(fd,32); \
+         got=b'' if not select.select([fd],[],[],20.0)[0] else os.read(fd,32); \
          termios.tcsetattr(fd,termios.TCSADRAIN,old); \
          print('ANSWER[%s]' % got.decode('latin1').lstrip('\\033'))\"";
     let session = Session::spawn(spec("s_dsr", script, &logs, holder), engine()).expect("spawn");

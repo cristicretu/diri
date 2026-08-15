@@ -2649,6 +2649,18 @@ fn pump_held(
     // Until the tail is first caught up, bytes are history, not activity:
     // they must render, but not flip a quiet adopted session to Working.
     let mut replaying = true;
+    // Everything already in the log when this pump attached. A query below it
+    // was asked before we were here and has either been answered or outlived
+    // its asker; a query above it came from the running child and is owed an
+    // answer, even if the pump has not finished draining the tail yet.
+    let replay_until = {
+        let mut log = shared.log.lock().expect("log");
+        // Refreshed first: the handle may predate output the holder has
+        // already written, and a stale tail here would answer queries that
+        // belong to a previous incarnation.
+        log.refresh_from_disk();
+        log.tail_offset()
+    };
 
     // Output arrives one of two ways. The log always holds every byte, and
     // tailing it is all an older holder supports — but the file is written
@@ -2868,8 +2880,8 @@ fn pump_held(
             // makes cannot be answered until the pump reaches it. While output
             // is still backed up it runs on a timer, and the moment the pump
             // catches up it runs again, so a settled screen is never stale.
-            let evaluate_now =
-                caught_up || last_eval_at.is_none_or(|at: Instant| at.elapsed() >= EVAL_INTERVAL);
+            let evaluate_now = last_eval_at.is_none_or(|at: Instant| at.elapsed() >= EVAL_INTERVAL);
+            eval_dirty = !evaluate_now;
             let (observation, replies) = {
                 let mut screen = shared.screen.lock().expect("screen");
                 screen.feed(&output);
@@ -2891,11 +2903,18 @@ fn pump_held(
             // The child is blocked reading the answer to its query, so send it
             // through the holder's input path before publishing anything.
             //
-            // Never while replaying: those queries were asked by a program that
-            // has already moved on — often one that already exited — and the
-            // replies would arrive as unsolicited keystrokes. They are taken
-            // and dropped so a replayed query cannot leak into the live stream.
-            if !replies.is_empty() && !replaying {
+            // Not for replayed history: those queries were asked by a program
+            // that has already moved on — often one that has exited — and the
+            // answers would arrive as unsolicited keystrokes. They are taken
+            // and dropped so a replayed query cannot leak into the live
+            // stream.
+            //
+            // The boundary is the log tail at attach, not whether the tail has
+            // been drained: a child that asks the moment it starts — which a
+            // shell setting up its prompt does — would otherwise be answered
+            // only if the pump happened to see an empty read first.
+            let historical = offset <= replay_until;
+            if !replies.is_empty() && !historical {
                 let _ = client.write(&replies);
             }
             let batch_started = *publish_pending.get_or_insert_with(Instant::now);
