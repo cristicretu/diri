@@ -141,7 +141,10 @@ pub fn execute<W: Write + Send>(
         )
         .and_then(|request| holder::launch(request, executable))
         .and_then(|result| write_json(stdout, &result)),
-        Invocation::Attach => bridge::run(stdin, &mut *stdout),
+        // Attach owns this process for its whole life and hands its input
+        // side to a detached thread, so it takes the real stdin rather than
+        // the injected reader the other subcommands are tested through.
+        Invocation::Attach => bridge::run(io::stdin(), &mut *stdout),
         Invocation::Inspect => read_selector(stdin)
             .and_then(|selector| inspect(&selector))
             .and_then(|inspection| write_json(stdout, &inspection)),
