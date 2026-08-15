@@ -73,10 +73,17 @@ remote_branch="${upstream#*/}"
 # or stops here. A non-fast-forward push below is the second race barrier.
 git -C "${tap_dir}" pull --ff-only --quiet "${remote}" "${remote_branch}"
 
-/usr/bin/sed -i '' -E \
+# Edited through a temporary file rather than `sed -i`, whose in-place syntax
+# differs between BSD and GNU: `-i ''` means an empty suffix on macOS and an
+# input filename everywhere else. Writing the result back with `cat` keeps the
+# original file's mode and inode.
+cask_edit="$(mktemp)"
+/usr/bin/sed -E \
     -e "s|^  version \".*\"$|  version \"${version}\"|" \
     -e "s|^  sha256 \".*\"$|  sha256 \"${local_sha}\"|" \
-    "${tap_dir}/${cask_relative}"
+    "${tap_dir}/${cask_relative}" >"${cask_edit}"
+cat "${cask_edit}" >"${tap_dir}/${cask_relative}"
+rm -f "${cask_edit}"
 
 if ! grep -q "^  version \"${version}\"$" "${tap_dir}/${cask_relative}" \
     || ! grep -q "^  sha256 \"${local_sha}\"$" "${tap_dir}/${cask_relative}"; then
