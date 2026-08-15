@@ -42,7 +42,13 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
                     "worktree": {"type": "boolean"},
                     "branch": {"type": "string"},
                     "prompt": {"type": "string"},
-                    "name": {"type": "string"}
+                    "name": {"type": "string"},
+                    "requestKey": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": "Stable caller-scoped key. Retry the same operation with the same key to receive its original result."
+                    }
                 },
                 "required": ["kind", "cwd"]
             }),
@@ -304,6 +310,10 @@ mod tests {
         assert_eq!(
             spawn.input_schema["properties"]["kind"]["enum"],
             json!(["opencode", "shell"])
+        );
+        assert_eq!(
+            spawn.input_schema["properties"]["requestKey"]["maxLength"],
+            128
         );
     }
 }

@@ -358,6 +358,10 @@ pub struct SessionSpawnParams {
     /// `cwd` / the host's defaultCwd when the repo isn't cloned there.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub same_repo_as: Option<SessionId>,
+    /// Optional caller-scoped idempotency key for mutating automation calls.
+    /// The Engine retains successful results; ordinary app spawns omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_key: Option<String>,
 }
 
 pub type SessionSpawnResult = SessionRecord;

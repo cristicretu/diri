@@ -4,6 +4,7 @@ pub mod control;
 pub mod frames;
 pub mod grid;
 pub mod hosts;
+pub mod mcp;
 pub mod methods;
 pub mod model;
 pub mod node;
@@ -13,6 +14,7 @@ pub mod terminal;
 
 pub use control::{ControlError, ControlMessage, JsonValue, WIRE_VERSION};
 pub use hosts::{HostEntry, HostNodeConfig, HostsConfig};
+pub use mcp::{McpToolError, McpToolErrorEnvelope};
 pub use methods::*;
 pub use model::*;
 pub use node::*;

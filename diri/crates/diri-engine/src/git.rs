@@ -283,6 +283,46 @@ pub fn remove_worktree(repo: &Path, worktree: &str, force: bool) -> std::io::Res
     Ok(())
 }
 
+/// Owns a newly-created linked worktree until a session record commits it.
+/// Any early return or unwind removes the checkout and branch-side metadata,
+/// so retryable launch failures cannot accumulate orphan worktrees.
+pub struct WorktreeRollback {
+    repo: PathBuf,
+    worktree: Option<String>,
+    created_branch: Option<String>,
+}
+
+impl WorktreeRollback {
+    #[must_use]
+    pub fn new(
+        repo: impl Into<PathBuf>,
+        worktree: Option<String>,
+        created_branch: Option<String>,
+    ) -> Self {
+        Self {
+            repo: repo.into(),
+            worktree,
+            created_branch,
+        }
+    }
+
+    pub fn disarm(&mut self) {
+        self.worktree = None;
+        self.created_branch = None;
+    }
+}
+
+impl Drop for WorktreeRollback {
+    fn drop(&mut self) {
+        if let Some(worktree) = self.worktree.as_deref()
+            && remove_worktree(&self.repo, worktree, true).is_ok()
+            && let Some(branch) = self.created_branch.as_deref()
+        {
+            let _ = run(&["branch", "-D", branch], &self.repo);
+        }
+    }
+}
+
 /// The response stays below the NDJSON ceiling after base64 encoding.
 const MAX_PATCH_BYTES: usize = 2 * 1024 * 1024;
 const MAX_DIFF_RESPONSE_BYTES: usize = MAX_PATCH_BYTES + 16 * 1024;
@@ -578,6 +618,66 @@ mod tests {
 
         remove_worktree(&repo, &created.path, true).expect("remove");
         assert_eq!(list_worktrees(&repo).expect("list").len(), 1);
+    }
+
+    #[test]
+    fn rollback_removes_the_created_worktree_and_branch_before_retry() {
+        let temp = tempfile::tempdir().expect("temp");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("/usr/bin/git")
+                .args(args)
+                .current_dir(&repo)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", temp.path())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .expect("run git");
+            assert!(output.status.success(), "git {args:?}");
+        };
+        git(&["init", "--quiet", "--initial-branch=main"]);
+        std::fs::write(repo.join("f.txt"), b"x").expect("write");
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "init",
+        ]);
+
+        let created = create_worktree(&repo, Some("test/rollback"), None).expect("create");
+        let path = created.path.clone();
+        let branch = created.branch.clone().expect("created branch");
+        drop(WorktreeRollback::new(
+            &repo,
+            Some(path.clone()),
+            Some(branch.clone()),
+        ));
+
+        assert!(!Path::new(&path).exists());
+        assert_eq!(list_worktrees(&repo).expect("list").len(), 1);
+        let branch_ref = format!("refs/heads/{branch}");
+        let branch_exists = std::process::Command::new("/usr/bin/git")
+            .args(["show-ref", "--verify", "--quiet", &branch_ref])
+            .current_dir(&repo)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", temp.path())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .expect("probe branch")
+            .success();
+        assert!(!branch_exists, "rollback must remove its created branch");
+
+        let retried = create_worktree(&repo, Some("test/rollback"), None).expect("retry");
+        remove_worktree(&repo, &retried.path, true).expect("cleanup retry");
+        run(&["branch", "-D", "test/rollback"], &repo).expect("cleanup branch");
     }
 
     #[test]

@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use diri_proto::{
-    AgentKind, AgentReadinessResult, Method, ReadScreenResult, SessionId, SessionListResult,
-    SessionRecord, SessionSpawnParams, SessionStatus,
+    AgentKind, AgentReadinessResult, McpToolErrorEnvelope, Method, ReadScreenResult, SessionId,
+    SessionListResult, SessionRecord, SessionSpawnParams, SessionStatus,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
@@ -65,7 +65,7 @@ impl Bridge {
     }
 
     pub fn call(&self, tool: &str, arguments: &Value) -> Result<Value, String> {
-        match tool {
+        let result = match tool {
             "spawn_agent" => self.spawn_agent(arguments),
             "list_agents" => self.list_agents(),
             "get_status" => self.get_status(arguments),
@@ -85,7 +85,8 @@ impl Bridge {
             "summarize_children" => self.summarize_children(arguments),
             "report_to_parent" => self.report_to_parent(arguments),
             other => Err(format!("unknown tool: {other}")),
-        }
+        };
+        result.map_err(|message| McpToolErrorEnvelope::normalize_text(&message))
     }
 
     pub fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
@@ -112,10 +113,14 @@ impl Bridge {
 
     fn spawn_agent(&self, arguments: &Value) -> Result<Value, String> {
         let requested = required_string(arguments, "kind")?;
+        // Presence is significant for a safety feature: malformed keys must
+        // never degrade into the historical non-idempotent path.
+        let request_key = request_key(arguments)?;
         let readiness: AgentReadinessResult =
             self.request_typed(Method::AGENT_READINESS, json!({}), DEFAULT_TIMEOUT)?;
         let kind = resolve_agent_kind(&readiness, &requested);
 
+        let has_request_key = request_key.is_some();
         let params = SessionSpawnParams {
             kind,
             cwd: required_string(arguments, "cwd")?,
@@ -128,9 +133,22 @@ impl Bridge {
             initial_rows: None,
             host: optional_string(arguments, "host"),
             same_repo_as: None,
+            request_key,
         };
         let params = serde_json::to_value(params).map_err(|error| error.to_string())?;
-        self.request(Method::SESSION_SPAWN, params, SPAWN_TIMEOUT)
+        self.spawn_request(params, has_request_key)
+    }
+
+    /// Keeps transport guidance honest about whether a mutation could have
+    /// committed. A connect failure proves nothing was sent. Once a spawn is
+    /// written, only a requestKey makes an uncertain transport failure safe
+    /// to retry automatically.
+    fn spawn_request(&self, params: Value, has_request_key: bool) -> Result<Value, String> {
+        let mut client = ControlClient::connect(&self.socket_path, SPAWN_TIMEOUT)
+            .map_err(render_pre_send_failure)?;
+        client
+            .request(Method::SESSION_SPAWN, params)
+            .map_err(|error| render_spawn_failure(error, has_request_key))
     }
 
     fn list_agents(&self) -> Result<Value, String> {
@@ -576,10 +594,93 @@ impl Bridge {
 }
 
 fn render_failure(error: ControlFailure) -> String {
-    match error {
-        ControlFailure::Io(error) => format!("daemon socket: {error}"),
-        other => other.to_string(),
+    let failure = match error {
+        ControlFailure::Daemon(error) => daemon_tool_error(error),
+        ControlFailure::Io(error) => McpToolErrorEnvelope::new(
+            "daemon_unavailable",
+            format!("Diri's Engine is unavailable: {error}"),
+            "Wait briefly for Diri's Engine to start, then retry the same requestKey.",
+            true,
+            None,
+        ),
+        ControlFailure::Timeout => McpToolErrorEnvelope::new(
+            "daemon_timeout",
+            "Diri's Engine did not answer before the tool deadline.",
+            "Inspect list_agents before retrying a mutation; if it did not happen, retry with the same requestKey.",
+            true,
+            Some("list_agents"),
+        ),
+        ControlFailure::Protocol(message) => McpToolErrorEnvelope::new(
+            "daemon_protocol_error",
+            message,
+            "Reconnect to Diri's Engine and retry the same requestKey once.",
+            true,
+            None,
+        ),
+    };
+    failure.to_text()
+}
+
+fn render_pre_send_failure(error: ControlFailure) -> String {
+    let failure = match error {
+        ControlFailure::Daemon(error) => daemon_tool_error(error),
+        ControlFailure::Io(error) => McpToolErrorEnvelope::new(
+            "daemon_unavailable",
+            format!("Diri's Engine is unavailable: {error}"),
+            "No mutation request was sent. Wait briefly for Diri's Engine to start, then retry.",
+            true,
+            None,
+        ),
+        ControlFailure::Timeout => McpToolErrorEnvelope::new(
+            "daemon_timeout",
+            "Diri's Engine was unavailable before the spawn request could be sent.",
+            "No mutation request was sent. Wait briefly, then retry.",
+            true,
+            None,
+        ),
+        ControlFailure::Protocol(message) => McpToolErrorEnvelope::new(
+            "daemon_protocol_error",
+            message,
+            "No mutation request was sent. Reconnect to Diri's Engine, then retry once.",
+            true,
+            None,
+        ),
+    };
+    failure.to_text()
+}
+
+fn render_spawn_failure(error: ControlFailure, has_request_key: bool) -> String {
+    if has_request_key || matches!(&error, ControlFailure::Daemon(_)) {
+        return render_failure(error);
     }
+
+    let (code, message) = match error {
+        ControlFailure::Io(error) => (
+            "spawn_outcome_uncertain",
+            format!("The Engine connection failed after the spawn request was sent: {error}"),
+        ),
+        ControlFailure::Timeout => (
+            "spawn_outcome_uncertain",
+            "Diri's Engine did not answer after the spawn request was sent.".to_owned(),
+        ),
+        ControlFailure::Protocol(message) => (
+            "spawn_outcome_uncertain",
+            format!("The Engine returned an invalid response after the spawn request: {message}"),
+        ),
+        ControlFailure::Daemon(_) => unreachable!("daemon failures return above"),
+    };
+    McpToolErrorEnvelope::new(
+        code,
+        message,
+        "Do not repeat this unkeyed spawn automatically. Inspect list_agents and list_worktrees to determine whether it committed.",
+        false,
+        Some("list_agents"),
+    )
+    .to_text()
+}
+
+fn daemon_tool_error(error: diri_proto::ControlError) -> McpToolErrorEnvelope {
+    McpToolErrorEnvelope::from_control(error)
 }
 
 fn required_string(arguments: &Value, key: &str) -> Result<String, String> {
@@ -597,6 +698,31 @@ fn optional_string(arguments: &Value, key: &str) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
+}
+
+fn request_key(arguments: &Value) -> Result<Option<String>, String> {
+    let Some(value) = arguments.get("requestKey") else {
+        return Ok(None);
+    };
+    let Some(value) = value.as_str() else {
+        return Err(
+            McpToolErrorEnvelope::from_control(diri_proto::ControlError::bad_request(
+                "requestKey must be a string containing 1 to 128 bytes",
+            ))
+            .with_details(json!({"argument": "requestKey", "expected": "non-empty string"}))
+            .to_text(),
+        );
+    };
+    if value.trim().is_empty() || value.len() > 128 {
+        return Err(
+            McpToolErrorEnvelope::from_control(diri_proto::ControlError::bad_request(
+                "requestKey must be a string containing 1 to 128 bytes",
+            ))
+            .with_details(json!({"argument": "requestKey", "minBytes": 1, "maxBytes": 128}))
+            .to_text(),
+        );
+    }
+    Ok(Some(value.to_owned()))
 }
 
 fn optional_bool(arguments: &Value, key: &str) -> Option<bool> {
@@ -990,5 +1116,130 @@ mod tests {
         let generic = resolve_agent_kind(&readiness, "htop");
         assert_eq!(generic.id(), AgentKind::GENERIC_ID);
         assert_eq!(generic.command(), Some("htop"));
+    }
+
+    #[test]
+    fn daemon_failures_have_stable_recovery_contracts() {
+        let cases = [
+            (
+                diri_proto::ControlError::bad_request("cwd \"/gone\" is not a directory"),
+                "cwd_not_found",
+                false,
+            ),
+            (
+                diri_proto::ControlError::unauthorized(),
+                "authorization_denied",
+                false,
+            ),
+            (
+                diri_proto::ControlError::not_found("session s_gone"),
+                "resource_not_found",
+                false,
+            ),
+            (
+                diri_proto::ControlError::new("idempotency_conflict", "different arguments"),
+                "idempotency_conflict",
+                false,
+            ),
+            (
+                diri_proto::ControlError::internal("worker stopped"),
+                "internal",
+                true,
+            ),
+        ];
+        for (failure, expected_code, retryable) in cases {
+            let envelope = daemon_tool_error(failure);
+            assert_eq!(envelope.error.code, expected_code);
+            assert_eq!(envelope.error.retryable, retryable);
+            assert!(!envelope.error.model_guidance.is_empty());
+            serde_json::from_str::<Value>(&envelope.to_text()).expect("valid JSON");
+        }
+
+        let timeout = render_failure(ControlFailure::Timeout);
+        let timeout: McpToolErrorEnvelope = serde_json::from_str(&timeout).expect("timeout JSON");
+        assert_eq!(timeout.error.code, "daemon_timeout");
+        assert!(timeout.error.retryable);
+    }
+
+    #[test]
+    fn spawn_transport_guidance_distinguishes_keyed_unkeyed_and_unsent_requests() {
+        let keyed = render_spawn_failure(ControlFailure::Timeout, true);
+        let keyed: McpToolErrorEnvelope = serde_json::from_str(&keyed).expect("keyed JSON");
+        assert_eq!(keyed.error.code, "daemon_timeout");
+        assert!(keyed.error.retryable);
+        assert!(keyed.error.model_guidance.contains("same requestKey"));
+
+        for failure in [
+            ControlFailure::Timeout,
+            ControlFailure::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "reset after send",
+            )),
+            ControlFailure::Protocol("truncated response".into()),
+        ] {
+            let unkeyed = render_spawn_failure(failure, false);
+            let unkeyed: McpToolErrorEnvelope =
+                serde_json::from_str(&unkeyed).expect("unkeyed JSON");
+            assert_eq!(unkeyed.error.code, "spawn_outcome_uncertain");
+            assert!(!unkeyed.error.retryable);
+            assert!(unkeyed.error.model_guidance.contains("Do not repeat"));
+            assert_eq!(unkeyed.error.suggested_tool.as_deref(), Some("list_agents"));
+        }
+
+        let unsent = render_pre_send_failure(ControlFailure::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no socket",
+        )));
+        let unsent: McpToolErrorEnvelope = serde_json::from_str(&unsent).expect("unsent JSON");
+        assert!(unsent.error.retryable);
+        assert!(
+            unsent
+                .error
+                .model_guidance
+                .contains("No mutation request was sent")
+        );
+    }
+
+    #[test]
+    fn malformed_request_keys_never_fall_back_to_unkeyed_spawns() {
+        assert_eq!(request_key(&json!({})).expect("absent key"), None);
+        assert_eq!(
+            request_key(&json!({"requestKey": "turn-1/child"})).expect("valid key"),
+            Some("turn-1/child".into())
+        );
+
+        for arguments in [
+            json!({"requestKey": ""}),
+            json!({"requestKey": "   "}),
+            json!({"requestKey": 42}),
+            json!({"requestKey": null}),
+            json!({"requestKey": "x".repeat(129)}),
+        ] {
+            let error = request_key(&arguments).expect_err("malformed key");
+            let envelope: McpToolErrorEnvelope =
+                serde_json::from_str(&error).expect("typed error JSON");
+            assert_eq!(envelope.error.code, "invalid_arguments");
+            assert!(!envelope.error.retryable);
+        }
+    }
+
+    #[test]
+    fn real_bridge_prose_paths_normalize_to_stable_codes() {
+        let missing = find_session(&[], "s_gone").expect_err("missing session");
+        let missing: McpToolErrorEnvelope =
+            serde_json::from_str(&McpToolErrorEnvelope::normalize_text(&missing))
+                .expect("typed missing-session error");
+        assert_eq!(missing.error.code, "session_not_found");
+
+        for policy_error in [
+            "release_agent cannot terminate its caller",
+            "release_agent cannot terminate the session waiting on this result",
+        ] {
+            let envelope: McpToolErrorEnvelope =
+                serde_json::from_str(&McpToolErrorEnvelope::normalize_text(policy_error))
+                    .expect("typed authorization error");
+            assert_eq!(envelope.error.code, "authorization_denied");
+            assert!(!envelope.error.retryable);
+        }
     }
 }

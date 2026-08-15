@@ -58,7 +58,13 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
                     "cwd": { "type": "string", "description": "Working directory (a repo path when worktree is true)." },
                     "worktree": { "type": "boolean", "description": "Create a fresh git worktree off cwd and run there (local spawns only)." },
                     "prompt": { "type": "string", "description": "Initial prompt to send once the agent is ready." },
-                    "name": { "type": "string", "description": "Session title." }
+                    "name": { "type": "string", "description": "Session title." },
+                    "requestKey": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": "Stable caller-scoped key. Retry the same operation with the same key to receive its original result."
+                    }
                 },
                 "required": ["kind", "cwd"]
             }),

@@ -1078,6 +1078,7 @@ mod tests {
                     initial_rows: Some(24),
                     host: None,
                     same_repo_as: None,
+                    request_key: None,
                 })
                 .await?;
 

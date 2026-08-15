@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::detect::ManifestEngine;
 use crate::holder::{HolderClient, HolderManagerPaths, HolderPaths};
+use crate::idempotency::MutationLedger;
 use crate::session::{HolderConfig, RemoteAdoptSpec, Session, SessionSpec, SessionView};
 
 /// The versioned on-disk snapshot.
@@ -51,6 +52,9 @@ pub struct Registry {
     /// tab switch), and the flusher or the next persist call writes it out.
     dirty: bool,
     last_persist: Option<std::time::Instant>,
+    /// Successful caller-scoped mutation results outlive disposable MCP stdio
+    /// processes, but remain bounded to this Registry's daemon lifetime.
+    spawn_requests: Arc<MutationLedger>,
 }
 
 /// How long consecutive persists coalesce. Matches the Swift daemon's
@@ -96,6 +100,7 @@ impl Registry {
             state_file: state_file.into(),
             dirty: false,
             last_persist: None,
+            spawn_requests: Arc::new(MutationLedger::default()),
         }
     }
 
@@ -222,6 +227,7 @@ impl Registry {
     ///
     /// [`spawn`]: Registry::spawn
     pub fn insert_record(&mut self, record: SessionRecord) {
+        self.spawn_requests.activate_caller(&record.id.0);
         self.records.insert(record.id.0.clone(), record);
     }
 
@@ -229,6 +235,7 @@ impl Registry {
     pub fn spawn(&mut self, spec: SessionSpec, record: SessionRecord) -> std::io::Result<String> {
         let id = spec.id.clone();
         let session = Session::spawn(spec, Arc::clone(&self.engine))?;
+        self.spawn_requests.activate_caller(&id);
         self.records.insert(id.clone(), record);
         self.sessions.insert(id.clone(), session);
         Ok(id)
@@ -389,6 +396,10 @@ impl Registry {
         Arc::clone(&self.engine)
     }
 
+    pub(crate) fn spawn_requests(&self) -> Arc<MutationLedger> {
+        Arc::clone(&self.spawn_requests)
+    }
+
     pub fn get(&self, id: &str) -> Option<&Session> {
         self.sessions.get(id)
     }
@@ -528,6 +539,7 @@ impl Registry {
     pub fn forget(&mut self, id: &str) {
         self.sessions.remove(id);
         self.records.remove(id);
+        self.spawn_requests.forget_caller(id);
     }
 
     /// Ends the session (if live), deletes its record AND its output log.
@@ -544,6 +556,7 @@ impl Registry {
             self.recently_closed.remove(0);
         }
         self.sessions.remove(id);
+        self.spawn_requests.forget_caller(id);
         let _ = std::fs::remove_file(logs_dir.join(format!("{id}.bin")));
         Ok(())
     }
@@ -556,6 +569,7 @@ impl Registry {
             if record.host.is_none() && !Path::new(&record.cwd).exists() {
                 continue; // the folder is gone; try the next candidate
             }
+            self.spawn_requests.activate_caller(&record.id.0);
             self.records.insert(record.id.0.clone(), record.clone());
             return Some(record);
         }

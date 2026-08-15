@@ -319,6 +319,27 @@ fn spawn_params_host_field_is_wire_compatible() {
 }
 
 #[test]
+fn spawn_request_key_is_additive_and_uses_mcp_spelling() {
+    let legacy: diri_proto::SessionSpawnParams =
+        serde_json::from_value(json!({"kind": {"shell": {}}, "cwd": "/tmp"})).unwrap();
+    assert_eq!(legacy.request_key, None);
+    assert!(
+        serde_json::to_value(&legacy)
+            .unwrap()
+            .get("requestKey")
+            .is_none()
+    );
+
+    let keyed = diri_proto::SessionSpawnParams {
+        request_key: Some("turn-42/spawn-reviewer".into()),
+        ..legacy
+    };
+    let encoded = serde_json::to_value(&keyed).unwrap();
+    assert_eq!(encoded["requestKey"], "turn-42/spawn-reviewer");
+    typed_round_trip(&keyed);
+}
+
+#[test]
 fn migration_and_host_methods_use_the_swift_wire_names() {
     // session.migrate: sessionID spelling, targetHost skip-if-none.
     let to_local = diri_proto::SessionMigrateParams {

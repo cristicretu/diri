@@ -485,6 +485,7 @@ mod tests {
             initial_rows: None,
             host: None,
             same_repo_as: None,
+            request_key: None,
         };
         let session: SessionRecord = control.request(Method::SESSION_SPAWN, &spawn).await?;
         let session_id = session.id;

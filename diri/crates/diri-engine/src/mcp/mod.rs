@@ -17,6 +17,7 @@ mod tools;
 pub use host::RegistryHost;
 pub use tools::{ToolDefinition, tool_definitions, tool_definitions_for};
 
+use diri_proto::McpToolErrorEnvelope;
 use serde_json::{Value, json};
 
 pub const SERVER_NAME: &str = "dirijor";
@@ -137,7 +138,7 @@ fn render(value: &Value) -> String {
 
 fn tool_error(message: &str) -> Value {
     json!({
-        "content": [{ "type": "text", "text": message }],
+        "content": [{ "type": "text", "text": McpToolErrorEnvelope::normalize_text(message) }],
         "isError": true,
     })
 }
@@ -296,10 +297,15 @@ mod tests {
 
         assert_eq!(response["result"]["isError"], true);
         assert!(response["error"].is_null(), "not a transport error");
-        assert_eq!(
-            response["result"]["content"][0]["text"],
-            "no session s_missing"
-        );
+        let failure: Value = serde_json::from_str(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .expect("typed failure text"),
+        )
+        .expect("valid JSON");
+        assert_eq!(failure["error"]["code"], "session_not_found");
+        assert_eq!(failure["error"]["retryable"], false);
+        assert_eq!(failure["error"]["suggestedTool"], "list_agents");
     }
 
     #[test]
