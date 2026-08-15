@@ -69,6 +69,28 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  ios:
+    name: iPhone app
+    runs-on: macos-15
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ios
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The Xcode project is generated from project.yml and never committed, so
+      # a stale checked-in pbxproj cannot drift from the source list.
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate project
+        run: xcodegen generate
+      # Simulator only: this runner has no signing identity, and the target
+      # sets CODE_SIGNING_ALLOWED=NO to match.
+      - name: Test
+        run: |
+          xcodebuild -project DiriPhone.xcodeproj -scheme DiriPhone \
+            -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
+
   lints:
     name: Lints
     runs-on: ubuntu-22.04

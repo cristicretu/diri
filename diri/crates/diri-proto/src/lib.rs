@@ -6,6 +6,7 @@ pub mod grid;
 pub mod hosts;
 pub mod methods;
 pub mod model;
+pub mod net;
 pub mod node;
 pub mod paths;
 pub mod recovery;
