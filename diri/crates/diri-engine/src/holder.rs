@@ -31,6 +31,19 @@ pub mod server;
 mod fanout;
 
 pub use client::{HolderClient, HolderManagerClient, HolderOutputStream};
+
+/// Delays for polling something that is about to become ready.
+///
+/// A holder answers within a couple of milliseconds, so asking again on a
+/// fixed 20 ms cadence spent most of a session's startup asleep. These start
+/// almost immediately and settle into the same slow cadence, which keeps the
+/// patience of a long wait without charging it to the common case.
+pub(crate) fn readiness_delays() -> impl Iterator<Item = std::time::Duration> {
+    use std::time::Duration;
+    std::iter::successors(Some(Duration::from_micros(200)), |delay| {
+        Some((*delay * 2).min(Duration::from_millis(20)))
+    })
+}
 pub use launcher::HolderLauncher;
 pub use paths::{HolderManagerPaths, HolderPaths};
 pub use protocol::{

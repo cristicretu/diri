@@ -8,7 +8,6 @@
 use std::fs::OpenOptions;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use super::client::{HolderClient, HolderManagerClient};
 use super::paths::{HolderManagerPaths, HolderPaths};
@@ -17,7 +16,6 @@ use super::{HolderError, HolderResult};
 
 /// How long to wait for a freshly spawned manager: 250 × 20ms = 5s.
 const READINESS_ATTEMPTS: u32 = 250;
-const READINESS_INTERVAL: Duration = Duration::from_millis(20);
 
 pub struct HolderLauncher;
 
@@ -47,13 +45,15 @@ impl HolderLauncher {
         let manager = HolderManagerClient::new(manager_paths.socket());
         if !manager.is_alive() {
             spawn_manager(executable_path, &manager_paths.directory)?;
-            let ready = (0..READINESS_ATTEMPTS).any(|_| {
-                if manager.is_alive() {
-                    return true;
-                }
-                std::thread::sleep(READINESS_INTERVAL);
-                false
-            });
+            let ready = super::readiness_delays()
+                .take(READINESS_ATTEMPTS as usize)
+                .any(|delay| {
+                    if manager.is_alive() {
+                        return true;
+                    }
+                    std::thread::sleep(delay);
+                    false
+                });
             if !ready {
                 return Err(HolderError::Launch(
                     "shared holder manager did not become ready".into(),
@@ -72,11 +72,11 @@ impl HolderLauncher {
                     return Err(error);
                 }
                 spawn_manager(executable_path, &manager_paths.directory)?;
-                for _ in 0..READINESS_ATTEMPTS {
+                for delay in super::readiness_delays().take(READINESS_ATTEMPTS as usize) {
                     if let Ok(pid) = manager.launch(spec) {
                         return Ok(pid);
                     }
-                    std::thread::sleep(READINESS_INTERVAL);
+                    std::thread::sleep(delay);
                 }
                 Err(HolderError::Launch(
                     "shared holder manager did not accept launch".into(),

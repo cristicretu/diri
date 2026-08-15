@@ -1788,7 +1788,7 @@ fn wait_for_holder(
     session_id: &str,
     pre_spawn_tail: u64,
 ) -> Result<u64, crate::holder::HolderError> {
-    for _ in 0..250 {
+    for delay in crate::holder::readiness_delays().take(300) {
         if let Ok(stat) = client.stat() {
             return Ok(stat.epoch_offset.unwrap_or(pre_spawn_tail));
         }
@@ -1798,7 +1798,7 @@ fn wait_for_holder(
                 return Ok(pre_spawn_tail);
             }
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(delay);
     }
     Err(crate::holder::HolderError::Launch(
         "holder did not become ready".into(),
