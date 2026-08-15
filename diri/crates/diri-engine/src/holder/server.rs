@@ -7,6 +7,7 @@
 //! that wasn't running at the time still learns how the child died — then
 //! removes its control files and stops serving.
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::path::Path;
@@ -22,9 +23,10 @@ use crate::pty::{Pty, PtySpec};
 use super::client::HolderClient;
 use super::process_tree;
 use super::protocol::{
-    HOLDER_STREAM_ACK, HOLDER_STREAM_INPUT, HOLDER_STREAM_MAX_PAYLOAD, HOLDER_STREAM_RESIZE,
-    HOLDER_STREAM_VERSION, HolderExitMarker, HolderExitReason, HolderExitStatus, HolderLaunchSpec,
-    HolderOperation, HolderRequest, HolderResponse, HolderStat,
+    HOLDER_DELIVERY_RECEIPT_LIMIT, HOLDER_STREAM_ACK, HOLDER_STREAM_INPUT,
+    HOLDER_STREAM_MAX_PAYLOAD, HOLDER_STREAM_RESIZE, HOLDER_STREAM_VERSION, HolderExitMarker,
+    HolderExitReason, HolderExitStatus, HolderLaunchSpec, HolderOperation, HolderRequest,
+    HolderResponse, HolderStat,
 };
 use super::socket;
 use super::{HolderError, HolderResult};
@@ -62,6 +64,7 @@ struct Shared {
     /// Weak handles let the exit path interrupt blocking input reads without
     /// making idle Holder streams wake on a timer.
     input_streams: Mutex<Vec<Weak<std::os::unix::net::UnixStream>>>,
+    accepted_deliveries: Mutex<VecDeque<String>>,
 }
 
 impl HolderServer {
@@ -133,6 +136,7 @@ impl HolderServer {
             finished: AtomicBool::new(false),
             listen_fd: AtomicI32::new(listen_fd),
             input_streams: Mutex::new(Vec::new()),
+            accepted_deliveries: Mutex::new(VecDeque::new()),
             spec,
         });
 
@@ -414,6 +418,47 @@ fn handle(shared: &Shared, request: &HolderRequest) -> HolderResult<HolderRespon
             Ok(HolderResponse::success())
         }
 
+        HolderOperation::WriteReceipt => {
+            let delivery_id = request.delivery_id.as_deref().ok_or_else(|| {
+                HolderError::InvalidRequest("write-receipt requires deliveryID".into())
+            })?;
+            if delivery_id.is_empty() || delivery_id.len() > 256 {
+                return Err(HolderError::InvalidRequest(
+                    "deliveryID must contain 1 through 256 bytes".into(),
+                ));
+            }
+            if shared
+                .accepted_deliveries
+                .lock()
+                .expect("accepted deliveries")
+                .iter()
+                .any(|accepted| accepted == delivery_id)
+            {
+                return Ok(HolderResponse::success());
+            }
+            let data = request
+                .data
+                .as_deref()
+                .and_then(|encoded| {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(encoded)
+                        .ok()
+                })
+                .ok_or_else(|| {
+                    HolderError::InvalidRequest("write-receipt requires base64 data".into())
+                })?;
+            write_pty(shared, &data)?;
+            let mut accepted = shared
+                .accepted_deliveries
+                .lock()
+                .expect("accepted deliveries");
+            accepted.push_back(delivery_id.to_owned());
+            while accepted.len() > HOLDER_DELIVERY_RECEIPT_LIMIT {
+                accepted.pop_front();
+            }
+            Ok(HolderResponse::success())
+        }
+
         HolderOperation::Resize => {
             let (Some(cols), Some(rows)) = (request.cols, request.rows) else {
                 return Err(HolderError::InvalidRequest(
@@ -594,6 +639,14 @@ fn current_stat(shared: &Shared) -> HolderStat {
         cols: size.map(|(cols, _)| cols),
         rows: size.map(|(_, rows)| rows),
         epoch_offset: Some(shared.epoch_offset),
+        accepted_delivery_ids: shared
+            .accepted_deliveries
+            .lock()
+            .expect("accepted deliveries")
+            .iter()
+            .cloned()
+            .collect(),
+        delivery_receipts: true,
     }
 }
 

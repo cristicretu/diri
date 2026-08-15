@@ -11,9 +11,10 @@ use std::time::{Duration, Instant};
 
 use diri_proto::frames::{Frame, FrameType, MAX_FRAME_BYTES};
 use diri_proto::remote_pty::{
-    ControlGranted, ControlRevoked, FullSnapshot, GridDelta, Hello, HelloAck, LaunchRequest,
-    LaunchResult, PHASE_ONE_HOLDER_CAPABILITIES, ProcessExit, RemoteCodec, RemoteError,
-    RemoteMessage, RemoteProcessState, ScrollbackResponse, validate_terminal_dimensions,
+    ControlGranted, ControlRevoked, DeliveryAccepted, DeliveryUncertain, FullSnapshot, GridDelta,
+    Hello, HelloAck, LaunchRequest, LaunchResult, ProcessExit, RemoteCapability, RemoteCodec,
+    RemoteError, RemoteMessage, RemoteProcessState, ScrollbackResponse,
+    validate_terminal_dimensions,
 };
 use diri_pty::{Exit, ExitWatcher, Pty, PtySpec, PtyStream};
 use diri_terminal_state::HeadlessScreen;
@@ -37,8 +38,17 @@ const MAX_PENDING_INPUT_BYTES: usize = 1 << 20;
 const REPLAY_BUDGET_BYTES: usize = 4 << 20;
 const PERSIST_OFFSET_INTERVAL: u64 = 1 << 20;
 
-pub const PHASE_ONE_CAPABILITIES: &[diri_proto::remote_pty::RemoteCapability] =
-    PHASE_ONE_HOLDER_CAPABILITIES;
+const DELIVERY_RECEIPT_LIMIT: usize = 64;
+
+pub const PHASE_ONE_CAPABILITIES: &[RemoteCapability] = &[
+    RemoteCapability::FullSnapshot,
+    RemoteCapability::IncrementalGrid,
+    RemoteCapability::ProcessExit,
+    RemoteCapability::Signal,
+    RemoteCapability::ControllerLease,
+    RemoteCapability::Scrollback,
+    RemoteCapability::DeliveryReceipts,
+];
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -198,7 +208,6 @@ fn validate_live_build_id(holder_build_id: &str) -> io::Result<()> {
 fn reset_dead_session(paths: &SessionPaths) -> io::Result<()> {
     for path in [
         &paths.socket,
-        &paths.state,
         &paths.auth,
         &paths.output,
         &paths.diagnostics,
@@ -223,6 +232,20 @@ fn reset_dead_session(paths: &SessionPaths) -> io::Result<()> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
+    }
+    // Keep the bounded two-phase delivery ledger in the old state file. A
+    // replacement Holder adopts it before overwriting the rest of the stale
+    // process metadata, so an unresolved Enter can never become new input.
+    match fs::symlink_metadata(&paths.state) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "refusing to retain an unexpected session state path",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     Ok(())
 }
@@ -407,6 +430,9 @@ struct Holder {
     connection: Option<Connection>,
     pending_connection: Option<Connection>,
     pending_input: PendingBytes,
+    /// Submission ids are committed only after all earlier queued input and
+    /// their Enter bytes have crossed into the PTY, preserving stream order.
+    pending_delivery_receipts: Vec<String>,
     dirty_since: Option<Instant>,
     interactive_grid_budget: u8,
     last_persisted_offset: u64,
@@ -461,7 +487,15 @@ impl Holder {
             usize::from(start.request.rows),
         );
         let log = OutputLog::open(&paths.output)?;
+        let previous_delivery_ledger = read_state(&paths.state).ok().and_then(|state| {
+            (state.session_id == start.request.session_id)
+                .then_some((state.accepted_delivery_ids, state.pending_delivery_ids))
+        });
         let mut state = SessionState::new(&start.request, start.incarnation, process_pid);
+        if let Some((accepted, pending)) = previous_delivery_ledger {
+            state.accepted_delivery_ids = accepted;
+            state.pending_delivery_ids = pending;
+        }
         state.output_offset = log.tail_offset();
         write_state(&paths.state, &state)?;
 
@@ -480,6 +514,7 @@ impl Holder {
             connection: None,
             pending_connection: None,
             pending_input: PendingBytes::default(),
+            pending_delivery_receipts: Vec::new(),
             dirty_since: None,
             interactive_grid_budget: 0,
             last_persisted_offset: 0,
@@ -783,7 +818,10 @@ impl Holder {
         }
         match message {
             RemoteMessage::Terminal(frame) => match frame.frame_type {
-                FrameType::Input | FrameType::Mouse => self.write_input(&frame.payload),
+                FrameType::Input | FrameType::Mouse => {
+                    self.write_input(&frame.payload)?;
+                    self.commit_delivery_receipts(connection)
+                }
                 FrameType::Resize => {
                     let Some((cols, rows)) = frame.resize_payload() else {
                         return Err(io::Error::new(
@@ -820,7 +858,8 @@ impl Holder {
                         usize::from(col),
                         usize::from(row),
                     );
-                    self.write_input(&bytes)
+                    self.write_input(&bytes)?;
+                    self.commit_delivery_receipts(connection)
                 }
                 _ => Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -849,6 +888,62 @@ impl Holder {
                     request_id: request.request_id,
                     result,
                 }))
+            }
+            RemoteMessage::DeliveryInput(delivery) => {
+                if self
+                    .state
+                    .accepted_delivery_ids
+                    .iter()
+                    .any(|accepted| accepted == &delivery.delivery_id)
+                {
+                    return connection.queue(RemoteMessage::DeliveryAccepted(DeliveryAccepted {
+                        delivery_id: delivery.delivery_id,
+                    }));
+                }
+                if self
+                    .state
+                    .pending_delivery_ids
+                    .iter()
+                    .any(|pending| pending == &delivery.delivery_id)
+                    && !self
+                        .pending_delivery_receipts
+                        .iter()
+                        .any(|pending| pending == &delivery.delivery_id)
+                {
+                    return connection.queue(RemoteMessage::DeliveryUncertain(DeliveryUncertain {
+                        delivery_id: delivery.delivery_id,
+                    }));
+                }
+                if self
+                    .pending_delivery_receipts
+                    .iter()
+                    .any(|pending| pending == &delivery.delivery_id)
+                {
+                    // The original bytes are still ahead of this receipt in
+                    // the PTY queue. A retry must wait for that same landing,
+                    // never append a second copy.
+                    return self.commit_delivery_receipts(connection);
+                }
+                if self.pending_input.len().saturating_add(delivery.data.len())
+                    > MAX_PENDING_INPUT_BYTES
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "pending input queue is full",
+                    ));
+                }
+                prepare_delivery_receipt(
+                    &self.paths.state,
+                    &mut self.state,
+                    &delivery.delivery_id,
+                )?;
+                // Register the id before the nonblocking write. If the PTY
+                // accepts only a prefix and then errors, the remaining bytes
+                // and this id stay paired for a later flush/retry instead of
+                // allowing the controller to append a duplicate operation.
+                self.pending_delivery_receipts.push(delivery.delivery_id);
+                self.write_input(&delivery.data)?;
+                self.commit_delivery_receipts(connection)
             }
             RemoteMessage::ReleaseControl(release) => {
                 if release.controller_epoch != epoch {
@@ -915,6 +1010,8 @@ impl Holder {
             process_state: self.state.process_state.clone(),
             output_offset: self.state.output_offset,
             snapshot_sequence: self.state.snapshot_sequence,
+            accepted_delivery_ids: self.state.accepted_delivery_ids.clone(),
+            uncertain_delivery_ids: self.state.pending_delivery_ids.clone(),
         }))?;
         self.queue_replay(connection, hello.last_acknowledged_output_offset)?;
         self.state.snapshot_sequence = self.state.snapshot_sequence.saturating_add(1);
@@ -982,7 +1079,42 @@ impl Holder {
                 Err(error) => return Err(error),
             }
         }
+        if self.pending_delivery_receipts.is_empty() {
+            return Ok(());
+        }
+        let Some(mut connection) = self.connection.take() else {
+            // `read_connection` temporarily lends the live connection to the
+            // message handler. Leave receipts pending so that handler can
+            // persist them and queue acknowledgements on the same connection.
+            return Ok(());
+        };
+        let result = self.commit_delivery_receipts(&mut connection);
+        self.connection = Some(connection);
+        result
+    }
+
+    fn commit_delivery_receipts(&mut self, connection: &mut Connection) -> io::Result<()> {
+        if !self.pending_input.is_empty() || self.pending_delivery_receipts.is_empty() {
+            return Ok(());
+        }
+        let receipts = self.persist_pending_delivery_receipts()?;
+        for delivery_id in receipts {
+            connection.queue(RemoteMessage::DeliveryAccepted(DeliveryAccepted {
+                delivery_id,
+            }))?;
+        }
         Ok(())
+    }
+
+    fn persist_pending_delivery_receipts(&mut self) -> io::Result<Vec<String>> {
+        if !self.pending_input.is_empty() || self.pending_delivery_receipts.is_empty() {
+            return Ok(Vec::new());
+        }
+        persist_delivery_receipts(
+            &self.paths.state,
+            &mut self.state,
+            &mut self.pending_delivery_receipts,
+        )
     }
 
     fn flush_connection(&mut self) -> io::Result<()> {
@@ -1109,6 +1241,79 @@ impl Holder {
         write_state(&self.paths.state, &self.state)?;
         self.queue(RemoteMessage::ProcessExit(message))
     }
+}
+
+fn persist_delivery_receipts(
+    path: &std::path::Path,
+    state: &mut SessionState,
+    pending: &mut Vec<String>,
+) -> io::Result<Vec<String>> {
+    let receipts = pending.clone();
+    let mut next_state = state.clone();
+    for delivery_id in &receipts {
+        if !next_state
+            .accepted_delivery_ids
+            .iter()
+            .any(|accepted| accepted == delivery_id)
+        {
+            next_state.accepted_delivery_ids.push(delivery_id.clone());
+        }
+        next_state
+            .pending_delivery_ids
+            .retain(|pending| pending != delivery_id);
+    }
+    while next_state.accepted_delivery_ids.len() > DELIVERY_RECEIPT_LIMIT {
+        next_state.accepted_delivery_ids.remove(0);
+    }
+    // State reaches durable storage before any acknowledgement can leave
+    // this Holder. Preserve the pending ids and old in-memory state if
+    // persistence fails so a later flush retries the exact transaction.
+    write_state(path, &next_state)?;
+    *state = next_state;
+    pending.clear();
+    Ok(receipts)
+}
+
+fn prepare_delivery_receipt(
+    path: &std::path::Path,
+    state: &mut SessionState,
+    delivery_id: &str,
+) -> io::Result<()> {
+    if state
+        .pending_delivery_ids
+        .iter()
+        .any(|pending| pending == delivery_id)
+    {
+        return Ok(());
+    }
+    if state.pending_delivery_ids.len() >= DELIVERY_RECEIPT_LIMIT {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "unresolved delivery journal is full",
+        ));
+    }
+    let mut next_state = state.clone();
+    while next_state
+        .accepted_delivery_ids
+        .len()
+        .saturating_add(next_state.pending_delivery_ids.len())
+        >= DELIVERY_RECEIPT_LIMIT
+    {
+        if next_state.accepted_delivery_ids.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "delivery outcome journal is full",
+            ));
+        }
+        next_state.accepted_delivery_ids.remove(0);
+    }
+    next_state.pending_delivery_ids.push(delivery_id.to_owned());
+    // This is the write-ahead half of the Holder receipt protocol. It lands
+    // before any byte can reach the PTY; a crash after this point is exposed
+    // as outcome-uncertain instead of silently replayed.
+    write_state(path, &next_state)?;
+    *state = next_state;
+    Ok(())
 }
 
 fn resolve_remote_executable(
@@ -1301,7 +1506,29 @@ fn terminate_process_group(pid: u32) {
 
 #[cfg(test)]
 mod tests {
+    use diri_proto::remote_pty::PersistenceCapability;
+
     use super::*;
+
+    fn receipt_state() -> SessionState {
+        SessionState {
+            schema: 1,
+            session_id: "session".into(),
+            session_incarnation: "incarnation".into(),
+            holder_build_id: "holder".into(),
+            holder_pid: 1,
+            process_state: RemoteProcessState::Running { pid: 2 },
+            cols: 80,
+            rows: 24,
+            output_offset: 0,
+            snapshot_sequence: 0,
+            controller_epoch: 1,
+            persistence: PersistenceCapability::NonPersistent,
+            created_at_unix_ms: 1,
+            accepted_delivery_ids: vec!["older".into()],
+            pending_delivery_ids: Vec::new(),
+        }
+    }
 
     #[test]
     fn pending_bytes_compact_after_a_complete_write() {
@@ -1313,6 +1540,59 @@ mod tests {
         assert!(pending.is_empty());
         pending.push(b"two");
         assert_eq!(pending.remaining(), b"two");
+    }
+
+    #[test]
+    fn failed_receipt_persistence_keeps_fifo_ids_and_state_for_retry() {
+        let root = tempfile::tempdir().expect("temp");
+        let blocked_parent = root.path().join("not-a-directory");
+        fs::write(&blocked_parent, b"file").expect("blocking file");
+        let mut state = receipt_state();
+        let before = state.clone();
+        let mut pending = vec!["first".into(), "second".into()];
+
+        assert!(
+            persist_delivery_receipts(&blocked_parent.join("state.json"), &mut state, &mut pending)
+                .is_err()
+        );
+        assert_eq!(state, before);
+        assert_eq!(pending, ["first", "second"]);
+
+        let landed =
+            persist_delivery_receipts(&root.path().join("state.json"), &mut state, &mut pending)
+                .expect("retry");
+        assert_eq!(landed, ["first", "second"]);
+        assert!(pending.is_empty());
+        assert_eq!(state.accepted_delivery_ids, ["older", "first", "second"]);
+    }
+
+    #[test]
+    fn receipt_intent_is_durable_before_delivery_and_survives_a_failed_commit() {
+        let root = tempfile::tempdir().expect("temp");
+        let state_path = root.path().join("state.json");
+        let mut state = receipt_state();
+        prepare_delivery_receipt(&state_path, &mut state, "delivery-1").expect("prepare");
+        assert_eq!(
+            read_state(&state_path)
+                .expect("durable intent")
+                .pending_delivery_ids,
+            ["delivery-1"]
+        );
+
+        let blocked_parent = root.path().join("not-a-directory");
+        fs::write(&blocked_parent, b"file").expect("blocking file");
+        let mut pending = vec!["delivery-1".into()];
+        assert!(
+            persist_delivery_receipts(&blocked_parent.join("state.json"), &mut state, &mut pending)
+                .is_err()
+        );
+        assert_eq!(state.pending_delivery_ids, ["delivery-1"]);
+        assert_eq!(pending, ["delivery-1"]);
+
+        persist_delivery_receipts(&state_path, &mut state, &mut pending).expect("commit retry");
+        let durable = read_state(&state_path).expect("durable commit");
+        assert!(durable.pending_delivery_ids.is_empty());
+        assert_eq!(durable.accepted_delivery_ids, ["older", "delivery-1"]);
     }
 
     #[test]

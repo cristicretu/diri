@@ -599,6 +599,29 @@ impl DaemonClient {
         .await
     }
 
+    /// Run-aware MCP/orchestration write. Unlike raw desktop typing, this may
+    /// queue until the target composer is safe and can reject a stale run id.
+    pub async fn send_run_text(
+        &self,
+        params: SessionRunSendParams,
+    ) -> Result<SessionRunSendResult, ClientError> {
+        self.typed(Method::SESSION_RUN_SEND, &params).await
+    }
+
+    pub async fn interrupt_run(
+        &self,
+        params: SessionRunInterruptParams,
+    ) -> Result<SessionRunInterruptResult, ClientError> {
+        self.typed(Method::SESSION_RUN_INTERRUPT, &params).await
+    }
+
+    pub async fn report_run(
+        &self,
+        params: SessionRunReportParams,
+    ) -> Result<SessionRunReportResult, ClientError> {
+        self.typed(Method::SESSION_RUN_REPORT, &params).await
+    }
+
     pub async fn resize(
         &self,
         session_id: &SessionId,

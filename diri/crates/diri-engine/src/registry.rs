@@ -4,7 +4,7 @@
 //! It also owns the additive `{ version, projects, sessions }` persistence
 //! envelope. Unknown project fields survive a read/write cycle.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -13,6 +13,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::detect::ManifestEngine;
 use crate::holder::{HolderClient, HolderManagerPaths, HolderPaths};
+use crate::orchestration::{
+    DeliveryRequest, Orchestration, RawSubmissionDecision, ReplayOperation, ReplayOutcome,
+    RunError, StateChanges, WaitDecision, request_fingerprint,
+};
 use crate::session::{HolderConfig, RemoteAdoptSpec, Session, SessionSpec, SessionView};
 
 /// The versioned on-disk snapshot.
@@ -23,14 +27,23 @@ pub struct PersistedState {
     pub projects: Vec<serde_json::Value>,
     #[serde(default)]
     pub sessions: Vec<SessionRecord>,
+    /// Durable agent-turn outbox and acceptance guards. Older state files omit
+    /// it and migrate conservatively from their session records.
+    #[serde(default, skip_serializing_if = "Orchestration::is_empty")]
+    orchestration: Orchestration,
 }
 
 impl PersistedState {
-    fn current(sessions: Vec<SessionRecord>, projects: Vec<serde_json::Value>) -> Self {
+    fn current(
+        sessions: Vec<SessionRecord>,
+        projects: Vec<serde_json::Value>,
+        orchestration: Orchestration,
+    ) -> Self {
         Self {
             version: 1,
             projects,
             sessions,
+            orchestration,
         }
     }
 }
@@ -51,11 +64,96 @@ pub struct Registry {
     /// tab switch), and the flusher or the next persist call writes it out.
     dirty: bool,
     last_persist: Option<std::time::Instant>,
+    orchestration: Orchestration,
+    state_changes: StateChanges,
+    /// Mutations to run metadata do not necessarily change terminal status.
+    /// This parallel version keeps lifecycle-only updates event-visible.
+    record_versions: HashMap<String, u64>,
+    /// Live observations that changed a run but have not yet reached the
+    /// atomic state snapshot. This survives a failed write in memory so a
+    /// retry cannot mistake an already-consumed edge for durable state.
+    pending_lifecycle_persistence: HashSet<String>,
+}
+
+#[derive(Clone, Debug)]
+struct RunTransactionSnapshot {
+    orchestration: Orchestration,
+    record: Option<SessionRecord>,
+    dirty: bool,
+    version: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DeliveryReceiptEvidence {
+    None,
+    Authoritative(String),
+    Accepted(String),
+    Uncertain(String),
 }
 
 /// How long consecutive persists coalesce. Matches the Swift daemon's
 /// `PersistenceStore` debounce.
 const PERSIST_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
+
+#[derive(Debug)]
+pub enum RegistryRunError {
+    NotFound(String),
+    NoParent,
+    Stale { expected: u64, current: u64 },
+    Exited,
+    AlreadyTerminal { current: u64 },
+    OutcomeUncertain(String),
+    InvalidRequestId,
+    RequestConflict(String),
+    ReplayCapacity,
+    Io(std::io::Error),
+}
+
+impl From<RunError> for RegistryRunError {
+    fn from(error: RunError) -> Self {
+        match error {
+            RunError::Stale { expected, current } => Self::Stale { expected, current },
+            RunError::Exited => Self::Exited,
+            RunError::AlreadyTerminal { current } => Self::AlreadyTerminal { current },
+            RunError::InvalidRequestId => Self::InvalidRequestId,
+            RunError::RequestConflict { request_id } => Self::RequestConflict(request_id),
+            RunError::ReplayCapacity => Self::ReplayCapacity,
+        }
+    }
+}
+
+impl std::fmt::Display for RegistryRunError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound(id) => write!(formatter, "no live session {id}"),
+            Self::NoParent => formatter.write_str("this session has no parent"),
+            Self::Stale { expected, current } => write!(
+                formatter,
+                "run {expected} is stale; the current run is {current}"
+            ),
+            Self::Exited => formatter.write_str("the session process has exited"),
+            Self::AlreadyTerminal { current } => {
+                write!(formatter, "run {current} is already terminal")
+            }
+            Self::OutcomeUncertain(detail) => {
+                write!(formatter, "delivery outcome is uncertain: {detail}")
+            }
+            Self::InvalidRequestId => {
+                formatter.write_str("request id must be non-empty and no longer than 256 bytes")
+            }
+            Self::RequestConflict(request_id) => write!(
+                formatter,
+                "request id {request_id:?} was already used with a different operation payload"
+            ),
+            Self::ReplayCapacity => formatter.write_str(
+                "request replay capacity is occupied by active operations; retry after one resolves",
+            ),
+            Self::Io(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for RegistryRunError {}
 
 impl Drop for Registry {
     fn drop(&mut self) {
@@ -96,6 +194,10 @@ impl Registry {
             state_file: state_file.into(),
             dirty: false,
             last_persist: None,
+            orchestration: Orchestration::default(),
+            state_changes: StateChanges::default(),
+            record_versions: HashMap::new(),
+            pending_lifecycle_persistence: HashSet::new(),
         }
     }
 
@@ -112,7 +214,15 @@ impl Registry {
         };
         match serde_json::from_slice::<PersistedState>(&bytes) {
             Ok(state) => {
-                self.projects = state.projects;
+                let PersistedState {
+                    projects,
+                    sessions,
+                    orchestration,
+                    ..
+                } = state;
+                self.projects = projects;
+                self.orchestration = orchestration;
+                self.pending_lifecycle_persistence.clear();
                 let project_roots = self
                     .projects
                     .iter()
@@ -123,9 +233,10 @@ impl Registry {
                         ))
                     })
                     .collect::<HashMap<_, _>>();
-                let mut locations = Vec::with_capacity(state.sessions.len());
-                for mut record in state.sessions {
+                let mut locations = Vec::with_capacity(sessions.len());
+                for mut record in sessions {
                     repair_persisted_agent_title(&mut record);
+                    migrate_run_lifecycle(&mut record);
                     // Resolve the owning project before repairing its
                     // location namespace. In particular, a linked worktree's
                     // cwd is not its first-level project root.
@@ -137,8 +248,20 @@ impl Registry {
                     locations.push((project_root, record.host.clone()));
                     self.records.insert(record.id.0.clone(), record);
                 }
+                let terminal_records = self.records.values().cloned().collect::<Vec<_>>();
+                for record in &terminal_records {
+                    self.orchestration.remember_current_terminal(record);
+                }
+                let recovered = self.orchestration.recover_inflight(&mut self.records);
                 for (root, host) in locations {
                     self.ensure_session_project(&root, host.as_deref());
+                }
+                // Recovery changes externally visible run outcomes. Land it
+                // before serving state so another crash cannot resurrect the
+                // original in-flight marker or regenerate timestamps.
+                if recovered {
+                    self.dirty = true;
+                    self.persist_now()?;
                 }
                 Ok(self.records.len())
             }
@@ -192,7 +315,28 @@ impl Registry {
 
     /// Writes the current state atomically, unconditionally.
     fn persist_now(&mut self) -> std::io::Result<()> {
-        let state = PersistedState::current(self.records_for_persistence(), self.projects.clone());
+        let records = self.records_for_persistence();
+        self.write_state(records)
+    }
+
+    /// Persists an operation intent without running lifecycle reconciliation
+    /// inside the write. The intent and its exact pre-side-effect run snapshot
+    /// must reach disk together; folding another live observation here could
+    /// consume the marker before the PTY write or make rollback cross-session.
+    fn persist_intent_now(&mut self) -> std::io::Result<()> {
+        let mut records: Vec<SessionRecord> = self.records.values().cloned().collect();
+        for record in &mut records {
+            if let Some(session) = self.sessions.get(&record.id.0) {
+                fold_session_status(record, &session.view());
+            }
+        }
+        records.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+        self.write_state(records)
+    }
+
+    fn write_state(&mut self, records: Vec<SessionRecord>) -> std::io::Result<()> {
+        let state =
+            PersistedState::current(records, self.projects.clone(), self.orchestration.clone());
         let bytes = serde_json::to_vec(&state)?;
         let temp = self.state_file.with_extension("json.tmp");
         if let Some(parent) = self.state_file.parent() {
@@ -202,11 +346,30 @@ impl Registry {
         // Rename is atomic, so a crash mid-write cannot truncate the real file.
         std::fs::rename(&temp, &self.state_file)?;
         self.dirty = false;
+        self.pending_lifecycle_persistence.clear();
         self.last_persist = Some(std::time::Instant::now());
         Ok(())
     }
 
-    fn records_for_persistence(&self) -> Vec<SessionRecord> {
+    fn persist_lifecycle_observation_for(&mut self, id: &str) -> std::io::Result<()> {
+        if self.pending_lifecycle_persistence.contains(id) {
+            self.persist_intent_now()?;
+        }
+        Ok(())
+    }
+
+    fn records_for_persistence(&mut self) -> Vec<SessionRecord> {
+        // Fold completion edges synchronously before a durable shutdown write.
+        // The event watcher normally does this immediately, but durability
+        // must not depend on winning a scheduling race with that thread.
+        let live = self
+            .sessions
+            .iter()
+            .map(|(id, session)| (id.clone(), session.view(), session.turn_completion_seq()))
+            .collect::<Vec<_>>();
+        for (id, view, completion_seq) in live {
+            self.observe_run_state_for_view(&id, &view, completion_seq);
+        }
         let mut records: Vec<SessionRecord> = self.records.values().cloned().collect();
         for record in &mut records {
             if let Some(session) = self.sessions.get(&record.id.0) {
@@ -221,14 +384,24 @@ impl Registry {
     /// imports, and tests use this; live sessions come from [`spawn`].
     ///
     /// [`spawn`]: Registry::spawn
-    pub fn insert_record(&mut self, record: SessionRecord) {
+    pub fn insert_record(&mut self, mut record: SessionRecord) {
+        migrate_run_lifecycle(&mut record);
+        self.orchestration.remember_current_terminal(&record);
         self.records.insert(record.id.0.clone(), record);
     }
 
     /// Starts a session and takes ownership of it.
-    pub fn spawn(&mut self, spec: SessionSpec, record: SessionRecord) -> std::io::Result<String> {
+    pub fn spawn(
+        &mut self,
+        spec: SessionSpec,
+        mut record: SessionRecord,
+    ) -> std::io::Result<String> {
         let id = spec.id.clone();
+        migrate_run_lifecycle(&mut record);
         let session = Session::spawn(spec, Arc::clone(&self.engine))?;
+        session.bind_state_changes(self.state_changes.clone());
+        self.orchestration
+            .register(&record, session.turn_completion_seq(), &session.status());
         self.records.insert(id.clone(), record);
         self.sessions.insert(id.clone(), session);
         Ok(id)
@@ -254,6 +427,12 @@ impl Registry {
             Arc::clone(&self.engine),
             initial_status,
         )?;
+        session.bind_state_changes(self.state_changes.clone());
+        self.orchestration.register_adopted(
+            self.records.get(&id).expect("checked above"),
+            session.turn_completion_seq(),
+            &session.status(),
+        );
         self.sessions.insert(id.clone(), session);
         Ok(id)
     }
@@ -301,6 +480,7 @@ impl Registry {
             return;
         }
         for id in &orphaned {
+            let mut terminal = None;
             if let Some(record) = self.records.get_mut(id) {
                 record.status = SessionStatus::Exited(ExitInfo {
                     reason: ExitReason::DaemonRestart,
@@ -308,6 +488,18 @@ impl Registry {
                     signal: None,
                 });
                 record.needs_input = None;
+                if let Some(run) = record.run.as_mut()
+                    && !run.state.is_terminal()
+                {
+                    run.state = diri_proto::AgentRunState::Failed;
+                    run.finished_at = Some(DateMillis::from(std::time::SystemTime::now()));
+                    run.terminal_outcome = Some("daemon_restart".into());
+                    terminal = Some(run.clone());
+                    apply_run_transition_metadata(record);
+                }
+            }
+            if let Some(run) = terminal {
+                self.orchestration.remember_terminal(id, run);
             }
         }
         let _ = self.persist();
@@ -375,6 +567,12 @@ impl Registry {
                     if was_hibernated {
                         let _ = session.set_hibernated(true);
                     }
+                    session.bind_state_changes(self.state_changes.clone());
+                    self.orchestration.register_adopted(
+                        self.records.get(&session_id).expect("record exists"),
+                        session.turn_completion_seq(),
+                        &session.status(),
+                    );
                     self.sessions.insert(session_id.clone(), session);
                     adopted.push(session_id);
                 }
@@ -409,6 +607,874 @@ impl Registry {
         }
         records.sort_by(|a, b| a.id.0.cmp(&b.id.0));
         records
+    }
+
+    /// Shared edge-triggered wake source for event and embedded MCP waits.
+    pub fn state_changes(&self) -> StateChanges {
+        self.state_changes.clone()
+    }
+
+    /// Single run-aware wait decision used by every transport. Historical
+    /// terminal outcomes, queued futures, and dead sessions therefore cannot
+    /// diverge between control and embedded MCP.
+    pub(crate) fn wait_decision(
+        &self,
+        id: &str,
+        run_id: Option<u64>,
+        targets: &[String],
+    ) -> Option<WaitDecision> {
+        let mut record = self.records.get(id)?.clone();
+        self.fold_live(&mut record);
+        Some(self.orchestration.wait_decision(&record, run_id, targets))
+    }
+
+    /// Reconciles explicit run states and releases at most one queued message
+    /// for each session whose composer is now safe.
+    pub fn sync_orchestration(&mut self) {
+        let ids: Vec<String> = self.sessions.keys().cloned().collect();
+        for id in ids {
+            self.sync_orchestration_for(&id);
+        }
+    }
+
+    /// Reconciles the current run without releasing its queued successor.
+    /// Reports validate against this state so the report that closes run N is
+    /// not made stale merely by starting acknowledged run N+1 first.
+    fn sync_run_state_for(&mut self, id: &str) {
+        let Some((view, completion_seq)) = self
+            .sessions
+            .get(id)
+            .map(|session| (session.view(), session.turn_completion_seq()))
+        else {
+            return;
+        };
+        self.observe_run_state_for_view(id, &view, completion_seq);
+    }
+
+    /// Every authoritative status fold first consumes Holder receipt
+    /// evidence. This ordering makes an explicit uncertainty tombstone
+    /// stronger than generic output activity at every Registry seam.
+    fn observe_run_state_for_view(
+        &mut self,
+        id: &str,
+        view: &SessionView,
+        completion_seq: u64,
+    ) -> bool {
+        let evidence = self.delivery_receipt_evidence(id);
+        self.observe_run_state_with_receipt(id, view, completion_seq, evidence)
+    }
+
+    fn observe_run_state_with_receipt(
+        &mut self,
+        id: &str,
+        view: &SessionView,
+        completion_seq: u64,
+        evidence: DeliveryReceiptEvidence,
+    ) -> bool {
+        let receipt_changed = self.reconcile_delivery_receipt(id, view, completion_seq, evidence);
+        let run_changed = self.records.get_mut(id).is_some_and(|record| {
+            let changed = self.orchestration.observe(
+                record,
+                &view.status,
+                view.needs_input.as_ref(),
+                completion_seq,
+                view.tail_offset,
+            );
+            if changed {
+                apply_run_transition_metadata(record);
+            }
+            changed
+        });
+        if run_changed || receipt_changed {
+            self.dirty = true;
+            self.pending_lifecycle_persistence.insert(id.to_owned());
+            self.bump_record_version(id);
+            self.state_changes.notify();
+        }
+        run_changed || receipt_changed
+    }
+
+    fn delivery_receipt_evidence(&self, id: &str) -> DeliveryReceiptEvidence {
+        let Some(operation_id) = self
+            .orchestration
+            .uncertain_operation_id(id)
+            .map(str::to_owned)
+        else {
+            return DeliveryReceiptEvidence::None;
+        };
+        let Some(session) = self.sessions.get(id) else {
+            return DeliveryReceiptEvidence::None;
+        };
+        if session.uncertain_delivery(&operation_id) {
+            DeliveryReceiptEvidence::Uncertain(operation_id)
+        } else if session.accepted_delivery(&operation_id) {
+            DeliveryReceiptEvidence::Accepted(operation_id)
+        } else if session.remote_delivery_receipts_supported().is_some() {
+            // A remote transport can reconnect or publish a HelloAck outcome
+            // immediately after this snapshot. Never race that exact evidence
+            // with heuristic output reconciliation.
+            DeliveryReceiptEvidence::Authoritative(operation_id)
+        } else {
+            DeliveryReceiptEvidence::None
+        }
+    }
+
+    fn reconcile_delivery_receipt(
+        &mut self,
+        id: &str,
+        view: &SessionView,
+        completion_seq: u64,
+        evidence: DeliveryReceiptEvidence,
+    ) -> bool {
+        // A replacement remote Holder can prove only that the predecessor
+        // prepared this operation before its PTY side effect. Preserve the
+        // failed tombstone forever; in particular, output activity must not
+        // promote an explicitly uncertain restart window to accepted.
+        if let DeliveryReceiptEvidence::Authoritative(operation_id)
+        | DeliveryReceiptEvidence::Uncertain(operation_id) = &evidence
+        {
+            return self
+                .orchestration
+                .mark_delivery_explicitly_uncertain(id, operation_id);
+        }
+        let DeliveryReceiptEvidence::Accepted(operation_id) = evidence else {
+            return false;
+        };
+        if self.orchestration.uncertain_operation_id(id) != Some(operation_id.as_str()) {
+            return false;
+        }
+        self.records.get_mut(id).is_some_and(|record| {
+            let changed = self.orchestration.confirm_uncertain_delivery(
+                record,
+                &view.status,
+                view.needs_input.as_ref(),
+                completion_seq,
+                view.tail_offset,
+            );
+            if changed {
+                apply_run_transition_metadata(record);
+            }
+            changed
+        })
+    }
+
+    fn sync_orchestration_for(&mut self, id: &str) {
+        let Some((view, completion_seq)) = self
+            .sessions
+            .get(id)
+            .map(|session| (session.view(), session.turn_completion_seq()))
+        else {
+            return;
+        };
+        self.observe_run_state_for_view(id, &view, completion_seq);
+        let orchestration_before = self.orchestration.clone();
+        let run_before = self.records.get(id).and_then(|record| record.run.clone());
+        let dirty_before = self.dirty;
+        let (delivery, mut run_changed) = {
+            let Some(record) = self.records.get_mut(id) else {
+                return;
+            };
+            let previous_run = record.run.clone();
+            let delivery = self.orchestration.begin_ready(
+                record,
+                &view.status,
+                view.needs_input.as_ref(),
+                completion_seq,
+                view.tail_offset,
+            );
+            let run_changed = previous_run != record.run;
+            if run_changed {
+                apply_run_transition_metadata(record);
+            }
+            (delivery, run_changed)
+        };
+        if let Some(delivery) = delivery {
+            // Persist the outbox's dispatch phase before touching the PTY. If
+            // the process dies after this write, restart fails the run closed
+            // rather than silently replaying an acknowledged turn.
+            self.dirty = true;
+            if let Err(_error) = self.persist_intent_now() {
+                self.orchestration = orchestration_before;
+                if let Some(record) = self.records.get_mut(id) {
+                    record.run = run_before;
+                }
+                self.dirty = dirty_before;
+                return;
+            }
+            let orchestration_intent = self.orchestration.clone();
+            let run_intent = self.records.get(id).and_then(|record| record.run.clone());
+            let result = self
+                .sessions
+                .get(id)
+                .expect("session remained live")
+                .send_text_receipted(
+                    &delivery.text,
+                    delivery.submit,
+                    delivery.operation_id.as_deref(),
+                );
+            let run_id = self
+                .records
+                .get(id)
+                .and_then(|record| record.run.as_ref().map(|run| run.id));
+            let blocker = view.needs_input.clone();
+            let delivered = result.is_ok();
+            match result {
+                Ok(()) => self.orchestration.finish_dispatch(
+                    id,
+                    run_id,
+                    delivery.submit,
+                    blocker,
+                    view.tail_offset,
+                ),
+                Err(error) => {
+                    if let Some(record) = self.records.get_mut(id) {
+                        let _ = self
+                            .orchestration
+                            .mark_dispatch_uncertain(record, error.to_string());
+                        apply_run_transition_metadata(record);
+                        run_changed = true;
+                    }
+                }
+            }
+            self.dirty = true;
+            if self.persist_now().is_err() && delivered {
+                self.orchestration = orchestration_intent;
+                if let Some(record) = self.records.get_mut(id) {
+                    record.run = run_intent;
+                    let _ = self.orchestration.mark_dispatch_uncertain(
+                        record,
+                        "failed to commit queued delivery outcome".into(),
+                    );
+                    apply_run_transition_metadata(record);
+                    run_changed = true;
+                }
+                self.dirty = true;
+            }
+            self.state_changes.notify();
+        }
+        if run_changed {
+            self.bump_record_version(id);
+        }
+    }
+
+    fn run_transaction_snapshot(&self, id: &str) -> RunTransactionSnapshot {
+        RunTransactionSnapshot {
+            orchestration: self.orchestration.clone(),
+            record: self.records.get(id).cloned(),
+            dirty: self.dirty,
+            version: self.record_versions.get(id).copied(),
+        }
+    }
+
+    fn restore_run_transaction(&mut self, id: &str, snapshot: RunTransactionSnapshot) {
+        self.orchestration = snapshot.orchestration;
+        match snapshot.record {
+            Some(record) => {
+                self.records.insert(id.to_owned(), record);
+            }
+            None => {
+                self.records.remove(id);
+            }
+        }
+        self.dirty = snapshot.dirty;
+        match snapshot.version {
+            Some(version) => {
+                self.record_versions.insert(id.to_owned(), version);
+            }
+            None => {
+                self.record_versions.remove(id);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_delivery_transaction(
+        &mut self,
+        id: &str,
+        view: &SessionView,
+        completion_seq: u64,
+        text: String,
+        submit: bool,
+        expected_run_id: Option<u64>,
+        allow_needs_input: bool,
+        request_id: Option<&str>,
+        request_fingerprint: Option<&str>,
+    ) -> Result<(crate::orchestration::DeliveryPlan, RunTransactionSnapshot), RegistryRunError>
+    {
+        self.observe_run_state_for_view(id, view, completion_seq);
+        self.persist_lifecycle_observation_for(id)
+            .map_err(RegistryRunError::Io)?;
+        let snapshot = self.run_transaction_snapshot(id);
+        let result = self
+            .records
+            .get_mut(id)
+            .ok_or_else(|| RegistryRunError::NotFound(id.to_owned()))
+            .and_then(|record| {
+                let previous_run = record.run.clone();
+                let result = self
+                    .orchestration
+                    .prepare_delivery(
+                        record,
+                        DeliveryRequest {
+                            status: &view.status,
+                            needs_input: view.needs_input.as_ref(),
+                            completion_seq,
+                            output_offset: view.tail_offset,
+                            expected_run_id,
+                            text,
+                            submit,
+                            allow_needs_input,
+                            request_id,
+                            request_fingerprint,
+                        },
+                    )
+                    .map_err(RegistryRunError::from);
+                if result.is_ok() && record.run != previous_run {
+                    apply_run_transition_metadata(record);
+                }
+                result
+            });
+        match result {
+            Ok(plan) => Ok((plan, snapshot)),
+            Err(error) => {
+                self.restore_run_transaction(id, snapshot);
+                Err(error)
+            }
+        }
+    }
+
+    fn prepare_interrupt_transaction(
+        &mut self,
+        id: &str,
+        view: &SessionView,
+        completion_seq: u64,
+        expected_run_id: Option<u64>,
+        request_id: Option<&str>,
+        request_fingerprint: Option<&str>,
+    ) -> Result<RunTransactionSnapshot, RegistryRunError> {
+        self.observe_run_state_for_view(id, view, completion_seq);
+        self.persist_lifecycle_observation_for(id)
+            .map_err(RegistryRunError::Io)?;
+        let snapshot = self.run_transaction_snapshot(id);
+        let result = self
+            .records
+            .get_mut(id)
+            .ok_or_else(|| RegistryRunError::NotFound(id.to_owned()))
+            .and_then(|record| {
+                self.orchestration
+                    .prepare_interrupt(record, expected_run_id, request_id, request_fingerprint)
+                    .map(drop)
+                    .map_err(RegistryRunError::from)
+            });
+        match result {
+            Ok(()) => Ok(snapshot),
+            Err(error) => {
+                self.restore_run_transaction(id, snapshot);
+                Err(error)
+            }
+        }
+    }
+
+    /// Sends now only at a manifest-derived safe input state; otherwise keeps
+    /// the message FIFO inside the Engine across MCP process reconnects.
+    pub fn send_run_text(
+        &mut self,
+        id: &str,
+        text: String,
+        submit: bool,
+        expected_run_id: Option<u64>,
+        allow_needs_input: bool,
+        request_id: Option<String>,
+    ) -> Result<(bool, Option<diri_proto::AgentRun>), RegistryRunError> {
+        let fingerprint = request_id
+            .as_ref()
+            .map(|_| request_fingerprint(&(id, &text, submit, expected_run_id, allow_needs_input)));
+        let replay = self.orchestration.lookup_replay(
+            id,
+            ReplayOperation::Delivery,
+            request_id.as_deref(),
+            fingerprint.as_deref(),
+        )?;
+        if matches!(replay, Some(ReplayOutcome::OutcomeUncertain { .. }))
+            && self.sessions.contains_key(id)
+        {
+            // A response-loss retry is also a reconciliation opportunity: a
+            // surviving Holder may now prove the original Enter was accepted.
+            self.sync_run_state_for(id);
+            self.persist_lifecycle_observation_for(id)
+                .map_err(RegistryRunError::Io)?;
+        }
+        match self.orchestration.lookup_replay(
+            id,
+            ReplayOperation::Delivery,
+            request_id.as_deref(),
+            fingerprint.as_deref(),
+        )? {
+            Some(ReplayOutcome::Delivery { queued, run }) => return Ok((queued, run)),
+            Some(ReplayOutcome::OutcomeUncertain { detail }) => {
+                return Err(RegistryRunError::OutcomeUncertain(detail));
+            }
+            Some(_) => unreachable!("operation-scoped replay variant"),
+            None => {}
+        }
+        if submit
+            && self
+                .sessions
+                .get(id)
+                .is_some_and(|session| session.remote_delivery_receipts_supported() == Some(false))
+        {
+            return Err(RegistryRunError::OutcomeUncertain(
+                "remote Holder cannot acknowledge run delivery (protocol 1.6 required)".into(),
+            ));
+        }
+        self.ensure_run(id)?;
+        self.sync_orchestration_for(id);
+        // This may be a retry after the first write failed. Consult the
+        // durable-observation watermark even when this sync did not create a
+        // transition: the raw successor edge has already been consumed.
+        self.persist_lifecycle_observation_for(id)
+            .map_err(RegistryRunError::Io)?;
+        let (view, completion_seq) = self
+            .sessions
+            .get(id)
+            .map(|session| (session.view(), session.turn_completion_seq()))
+            .ok_or_else(|| RegistryRunError::NotFound(id.to_owned()))?;
+        let (plan, transaction_before) = self.prepare_delivery_transaction(
+            id,
+            &view,
+            completion_seq,
+            text.clone(),
+            submit,
+            expected_run_id,
+            allow_needs_input,
+            request_id.as_deref(),
+            fingerprint.as_deref(),
+        )?;
+        let mut intent_snapshot = None;
+        if !plan.queued {
+            // All agent deliveries use the same two-phase outbox as queued
+            // turns. Persist before the PTY write; a restart can then expose
+            // uncertainty but can never silently forget or duplicate it.
+            self.dirty = true;
+            if let Err(error) = self.persist_intent_now() {
+                self.restore_run_transaction(id, transaction_before);
+                return Err(RegistryRunError::Io(error));
+            }
+            intent_snapshot = Some((
+                self.orchestration.clone(),
+                self.records.get(id).and_then(|record| record.run.clone()),
+            ));
+            if let Err(error) = self
+                .sessions
+                .get(id)
+                .expect("checked above")
+                .send_text_receipted(&text, submit, plan.operation_id.as_deref())
+            {
+                if let Some(record) = self.records.get_mut(id) {
+                    self.orchestration
+                        .mark_dispatch_uncertain(record, error.to_string())?;
+                    apply_run_transition_metadata(record);
+                }
+                self.dirty = true;
+                let _ = self.persist_now();
+                return Err(RegistryRunError::OutcomeUncertain(error.to_string()));
+            }
+            self.orchestration.finish_dispatch(
+                id,
+                plan.run.as_ref().map(|run| run.id),
+                submit,
+                view.needs_input,
+                view.tail_offset,
+            );
+        }
+        self.orchestration.remember_replay(
+            id,
+            ReplayOperation::Delivery,
+            request_id.as_deref(),
+            fingerprint.as_deref(),
+            ReplayOutcome::Delivery {
+                queued: plan.queued,
+                run: plan.run.clone(),
+            },
+        )?;
+        self.dirty = true;
+        self.bump_record_version(id);
+        self.state_changes.notify();
+        // A queued acknowledgement is durable before it leaves the Engine.
+        // Immediate delivery is also landed so its acceptance guard survives
+        // an MCP process or daemon restart.
+        if let Err(error) = self.persist_intent_now() {
+            if plan.queued {
+                self.restore_run_transaction(id, transaction_before);
+                return Err(RegistryRunError::Io(error));
+            }
+            // Disk still contains the pre-side-effect intent. Mirror that
+            // exact state in memory, then expose one uncertain result instead
+            // of replaying a success that would disappear on restart.
+            let (orchestration_intent, run_intent) =
+                intent_snapshot.expect("immediate delivery retained its durable intent");
+            self.orchestration = orchestration_intent;
+            if let Some(record) = self.records.get_mut(id) {
+                record.run = run_intent;
+                self.orchestration
+                    .mark_dispatch_uncertain(record, error.to_string())?;
+                apply_run_transition_metadata(record);
+            }
+            self.dirty = true;
+            return Err(RegistryRunError::OutcomeUncertain(error.to_string()));
+        }
+        Ok((plan.queued, plan.run))
+    }
+
+    /// Compatibility input seam for existing app/CLI callers. Submitted
+    /// prompts into agent sessions enter the same durable run coordinator;
+    /// shell commands and unsubmitted composer edits retain raw PTY behavior.
+    pub fn send_user_text(
+        &mut self,
+        id: &str,
+        text: String,
+        submit: bool,
+    ) -> Result<(), RegistryRunError> {
+        let is_agent = self
+            .records
+            .get(id)
+            .is_some_and(|record| record.kind != diri_proto::AgentKind::SHELL);
+        if submit && is_agent {
+            let _ = self.send_run_text(id, text, true, None, true, None)?;
+            return Ok(());
+        }
+        self.sessions
+            .get(id)
+            .ok_or_else(|| RegistryRunError::NotFound(id.to_owned()))?
+            .send_text(&text, submit)
+            .map_err(RegistryRunError::Io)
+    }
+
+    /// Raw input seam for attached terminals. A standalone Enter into an
+    /// agent session claims its run generation durably while the Registry
+    /// lock still excludes run.send, before the PTY can accept the byte.
+    pub fn write_attached_input(&mut self, id: &str, bytes: &[u8]) -> Result<(), RegistryRunError> {
+        let is_agent = self
+            .records
+            .get(id)
+            .is_some_and(|record| record.kind != diri_proto::AgentKind::SHELL);
+        if !is_agent || !is_attached_submit(bytes) {
+            return self
+                .sessions
+                .get(id)
+                .ok_or_else(|| RegistryRunError::NotFound(id.to_owned()))?
+                .write_input(bytes)
+                .map_err(RegistryRunError::Io);
+        }
+
+        self.ensure_run(id)?;
+        let (view, completion_seq) = self
+            .sessions
+            .get(id)
+            .map(|session| (session.view(), session.turn_completion_seq()))
+            .ok_or_else(|| RegistryRunError::NotFound(id.to_owned()))?;
+        self.observe_run_state_for_view(id, &view, completion_seq);
+        let transaction_before = self.run_transaction_snapshot(id);
+        let RawSubmissionDecision {
+            changed,
+            claimed,
+            blocked,
+        } = {
+            let record = self
+                .records
+                .get_mut(id)
+                .expect("ensure_run validated the record");
+            self.orchestration.claim_raw_submission(
+                record,
+                &view.status,
+                view.needs_input.as_ref(),
+                completion_seq,
+                view.tail_offset,
+            )
+        };
+        if changed {
+            if let Some(record) = self.records.get_mut(id) {
+                apply_run_transition_metadata(record);
+            }
+            self.dirty = true;
+            self.bump_record_version(id);
+            self.state_changes.notify();
+        }
+        if changed && let Err(error) = self.persist_intent_now() {
+            self.restore_run_transaction(id, transaction_before);
+            return Err(RegistryRunError::Io(error));
+        }
+        if let Err(error) = self.persist_lifecycle_observation_for(id) {
+            self.restore_run_transaction(id, transaction_before);
+            return Err(RegistryRunError::Io(error));
+        }
+        if blocked {
+            return Err(RegistryRunError::OutcomeUncertain(
+                "attached submission cannot bypass unresolved lifecycle work".into(),
+            ));
+        }
+
+        if let Err(error) = self
+            .sessions
+            .get(id)
+            .expect("session remained live while Registry is locked")
+            .write_input(bytes)
+        {
+            if claimed {
+                if let Some(record) = self.records.get_mut(id) {
+                    self.orchestration.mark_raw_submission_uncertain(record);
+                    apply_run_transition_metadata(record);
+                }
+                self.dirty = true;
+                self.bump_record_version(id);
+                let _ = self.persist_intent_now();
+                self.state_changes.notify();
+                return Err(RegistryRunError::OutcomeUncertain(error.to_string()));
+            }
+            return Err(RegistryRunError::Io(error));
+        }
+        Ok(())
+    }
+
+    pub fn report_to_parent(
+        &mut self,
+        reporter: &str,
+        text: String,
+        submit: bool,
+        expected_run_id: Option<u64>,
+        request_id: Option<String>,
+    ) -> Result<(String, bool, Option<diri_proto::AgentRun>), RegistryRunError> {
+        let fingerprint = request_id
+            .as_ref()
+            .map(|_| request_fingerprint(&(reporter, &text, submit, expected_run_id)));
+        match self.orchestration.lookup_replay(
+            reporter,
+            ReplayOperation::Report,
+            request_id.as_deref(),
+            fingerprint.as_deref(),
+        )? {
+            Some(ReplayOutcome::Report {
+                parent,
+                queued,
+                run,
+            }) => return Ok((parent, queued, run)),
+            Some(ReplayOutcome::OutcomeUncertain { detail }) => {
+                return Err(RegistryRunError::OutcomeUncertain(detail));
+            }
+            Some(_) => unreachable!("operation-scoped replay variant"),
+            None => {}
+        }
+        self.orchestration.ensure_replay_capacity(
+            reporter,
+            ReplayOperation::Report,
+            request_id.as_deref(),
+        )?;
+
+        let record = self
+            .records
+            .get(reporter)
+            .ok_or_else(|| RegistryRunError::NotFound(reporter.to_owned()))?;
+        let parent = record
+            .parent
+            .as_ref()
+            .map(|parent| parent.0.clone())
+            .ok_or(RegistryRunError::NoParent)?;
+        let internal_request_id = request_id.as_ref().map(|request_id| {
+            format!(
+                "report:{}",
+                request_fingerprint(&(reporter, request_id.as_str()))
+            )
+        });
+        let internal_fingerprint = internal_request_id.as_ref().map(|_| {
+            request_fingerprint(&(parent.as_str(), &text, submit, Option::<u64>::None, false))
+        });
+        // If the parent delivery committed but the daemon died before the
+        // reporter replay record landed, the parent's internal replay is the
+        // atomic evidence needed to reconstruct the original response.
+        match self.orchestration.lookup_replay(
+            &parent,
+            ReplayOperation::Delivery,
+            internal_request_id.as_deref(),
+            internal_fingerprint.as_deref(),
+        )? {
+            Some(ReplayOutcome::Delivery { queued, run }) => {
+                let before_report_replay = self.orchestration.clone();
+                self.orchestration.remember_replay(
+                    reporter,
+                    ReplayOperation::Report,
+                    request_id.as_deref(),
+                    fingerprint.as_deref(),
+                    ReplayOutcome::Report {
+                        parent: parent.clone(),
+                        queued,
+                        run: run.clone(),
+                    },
+                )?;
+                self.dirty = true;
+                if let Err(error) = self.persist_now() {
+                    self.orchestration = before_report_replay;
+                    self.dirty = true;
+                    return Err(RegistryRunError::Io(error));
+                }
+                return Ok((parent, queued, run));
+            }
+            Some(ReplayOutcome::OutcomeUncertain { detail }) => {
+                return Err(RegistryRunError::OutcomeUncertain(detail));
+            }
+            Some(_) => unreachable!("operation-scoped replay variant"),
+            None => {}
+        }
+
+        self.sync_run_state_for(reporter);
+        self.persist_lifecycle_observation_for(reporter)
+            .map_err(RegistryRunError::Io)?;
+        let record = self
+            .records
+            .get(reporter)
+            .ok_or_else(|| RegistryRunError::NotFound(reporter.to_owned()))?;
+        Orchestration::validate_expected(record, expected_run_id)?;
+        self.ensure_run(&parent)?;
+        let (queued, run) =
+            self.send_run_text(&parent, text, submit, None, false, internal_request_id)?;
+        self.sync_orchestration_for(reporter);
+        let before_report_replay = self.orchestration.clone();
+        self.orchestration.remember_replay(
+            reporter,
+            ReplayOperation::Report,
+            request_id.as_deref(),
+            fingerprint.as_deref(),
+            ReplayOutcome::Report {
+                parent: parent.clone(),
+                queued,
+                run: run.clone(),
+            },
+        )?;
+        self.dirty = true;
+        if let Err(error) = self.persist_now() {
+            self.orchestration = before_report_replay;
+            self.dirty = true;
+            return Err(RegistryRunError::Io(error));
+        }
+        Ok((parent, queued, run))
+    }
+
+    pub fn interrupt_run(
+        &mut self,
+        id: &str,
+        expected_run_id: Option<u64>,
+        request_id: Option<String>,
+    ) -> Result<diri_proto::AgentRun, RegistryRunError> {
+        let fingerprint = request_id
+            .as_ref()
+            .map(|_| request_fingerprint(&(id, expected_run_id)));
+        match self.orchestration.lookup_replay(
+            id,
+            ReplayOperation::Interrupt,
+            request_id.as_deref(),
+            fingerprint.as_deref(),
+        )? {
+            Some(ReplayOutcome::Interrupt { run }) => return Ok(run),
+            Some(ReplayOutcome::OutcomeUncertain { detail }) => {
+                return Err(RegistryRunError::OutcomeUncertain(detail));
+            }
+            Some(_) => unreachable!("operation-scoped replay variant"),
+            None => {}
+        }
+        self.sync_orchestration_for(id);
+        self.persist_lifecycle_observation_for(id)
+            .map_err(RegistryRunError::Io)?;
+        let (view, completion_seq) = self
+            .sessions
+            .get(id)
+            .map(|session| (session.view(), session.turn_completion_seq()))
+            .ok_or_else(|| RegistryRunError::NotFound(id.to_owned()))?;
+        let transaction_before = self.prepare_interrupt_transaction(
+            id,
+            &view,
+            completion_seq,
+            expected_run_id,
+            request_id.as_deref(),
+            fingerprint.as_deref(),
+        )?;
+        self.dirty = true;
+        if let Err(error) = self.persist_intent_now() {
+            self.restore_run_transaction(id, transaction_before);
+            return Err(RegistryRunError::Io(error));
+        }
+        let orchestration_intent = self.orchestration.clone();
+        let run_intent = self.records.get(id).and_then(|record| record.run.clone());
+        let write_result = self
+            .sessions
+            .get(id)
+            .ok_or_else(|| RegistryRunError::NotFound(id.to_owned()))?
+            .write_input(&[0x03]);
+        if let Err(error) = write_result {
+            let record = self
+                .records
+                .get_mut(id)
+                .ok_or_else(|| RegistryRunError::NotFound(id.to_owned()))?;
+            self.orchestration
+                .mark_interrupt_uncertain(record, error.to_string())?;
+            apply_run_transition_metadata(record);
+            self.dirty = true;
+            let _ = self.persist_now();
+            return Err(RegistryRunError::OutcomeUncertain(error.to_string()));
+        }
+        let record = self
+            .records
+            .get_mut(id)
+            .ok_or_else(|| RegistryRunError::NotFound(id.to_owned()))?;
+        let run = self.orchestration.finish_interrupt(record);
+        record.updated_at = DateMillis::from(std::time::SystemTime::now());
+        self.orchestration.remember_replay(
+            id,
+            ReplayOperation::Interrupt,
+            request_id.as_deref(),
+            fingerprint.as_deref(),
+            ReplayOutcome::Interrupt { run: run.clone() },
+        )?;
+        self.dirty = true;
+        self.bump_record_version(id);
+        self.state_changes.notify();
+        if let Err(error) = self.persist_now() {
+            self.orchestration = orchestration_intent;
+            if let Some(record) = self.records.get_mut(id) {
+                record.run = run_intent;
+                self.orchestration
+                    .mark_interrupt_uncertain(record, error.to_string())?;
+                apply_run_transition_metadata(record);
+            }
+            self.dirty = true;
+            return Err(RegistryRunError::OutcomeUncertain(error.to_string()));
+        }
+        Ok(run)
+    }
+
+    /// Ensures any agent session observed through orchestration has a run,
+    /// including roots and records loaded from a pre-lifecycle state file.
+    fn ensure_run(&mut self, id: &str) -> Result<(), RegistryRunError> {
+        let changed = {
+            let record = self
+                .records
+                .get_mut(id)
+                .ok_or_else(|| RegistryRunError::NotFound(id.to_owned()))?;
+            if record.kind != diri_proto::AgentKind::SHELL && record.run.is_none() {
+                record.run = Some(run_from_legacy_record(record));
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            self.bump_record_version(id);
+            self.dirty = true;
+        }
+        Ok(())
+    }
+
+    fn bump_record_version(&mut self, id: &str) {
+        let version = self.record_versions.entry(id.to_owned()).or_default();
+        *version = version.saturating_add(1);
     }
 
     /// One record with live status folded in, without cloning the whole table.
@@ -462,7 +1528,7 @@ impl Registry {
     /// serialization.
     pub fn changed_since(
         &mut self,
-        published: &mut HashMap<String, u64>,
+        published: &mut HashMap<String, (u64, u64)>,
     ) -> Vec<(String, SessionRecord)> {
         published.retain(|id, _| self.sessions.contains_key(id));
         let mut changed = Vec::new();
@@ -470,24 +1536,39 @@ impl Registry {
             .sessions
             .iter()
             .filter_map(|(id, session)| {
-                let version = session.state_version();
-                (published.get(id) != Some(&version)).then(|| (id.clone(), version, session.view()))
+                let session_version = session.state_version();
+                let record_version = self.record_versions.get(id).copied().unwrap_or(0);
+                (published.get(id) != Some(&(session_version, record_version)))
+                    .then(|| (id.clone(), session_version, session.view()))
             })
             .collect::<Vec<_>>();
         let mut title_changed = false;
-        for (id, version, view) in changed_views {
-            published.insert(id.clone(), version);
+        for (id, session_version, view) in changed_views {
+            let completion_seq = self
+                .sessions
+                .get(&id)
+                .map_or(0, Session::turn_completion_seq);
+            let lifecycle_changed = self.observe_run_state_for_view(&id, &view, completion_seq);
             if let Some(record) = self.records.get_mut(&id) {
                 let previous_title = (record.title.clone(), record.title_source);
                 fold_session_view(record, &view);
                 let record_title_changed =
                     previous_title != (record.title.clone(), record.title_source);
-                if record_title_changed {
+                if record_title_changed && !lifecycle_changed {
                     record.updated_at = DateMillis::from(std::time::SystemTime::now());
+                }
+                if record_title_changed || lifecycle_changed {
                     title_changed = true;
                 }
-                changed.push((id, record.clone()));
+                changed.push((id.clone(), record.clone()));
             }
+            published.insert(
+                id.clone(),
+                (
+                    session_version,
+                    self.record_versions.get(&id).copied().unwrap_or(0),
+                ),
+            );
         }
         if title_changed {
             self.dirty = true;
@@ -504,9 +1585,11 @@ impl Registry {
         let Some(mut session) = self.sessions.remove(id) else {
             return Ok(None);
         };
+        let completion_seq = session.turn_completion_seq();
+        let output_offset = session.view().tail_offset;
         let exit = session.terminate(grace)?;
         if let Some(record) = self.records.get_mut(id) {
-            record.status = SessionStatus::Exited(diri_proto::ExitInfo {
+            let status = SessionStatus::Exited(diri_proto::ExitInfo {
                 reason: match exit {
                     crate::pty::Exit::Signal(_) => diri_proto::ExitReason::Signaled,
                     crate::pty::Exit::Code(_) => diri_proto::ExitReason::Exited,
@@ -520,7 +1603,14 @@ impl Registry {
                     crate::pty::Exit::Code(_) => None,
                 },
             });
+            record.status.clone_from(&status);
+            let _ =
+                self.orchestration
+                    .observe(record, &status, None, completion_seq, output_offset);
+            apply_run_transition_metadata(record);
+            record.updated_at = DateMillis::from(std::time::SystemTime::now());
         }
+        self.state_changes.notify();
         Ok(Some(exit))
     }
 
@@ -528,6 +1618,8 @@ impl Registry {
     pub fn forget(&mut self, id: &str) {
         self.sessions.remove(id);
         self.records.remove(id);
+        self.orchestration.forget(id);
+        self.record_versions.remove(id);
     }
 
     /// Ends the session (if live), deletes its record AND its output log.
@@ -544,6 +1636,8 @@ impl Registry {
             self.recently_closed.remove(0);
         }
         self.sessions.remove(id);
+        self.orchestration.forget(id);
+        self.record_versions.remove(id);
         let _ = std::fs::remove_file(logs_dir.join(format!("{id}.bin")));
         Ok(())
     }
@@ -556,6 +1650,7 @@ impl Registry {
             if record.host.is_none() && !Path::new(&record.cwd).exists() {
                 continue; // the folder is gone; try the next candidate
             }
+            self.orchestration.remember_current_terminal(&record);
             self.records.insert(record.id.0.clone(), record.clone());
             return Some(record);
         }
@@ -569,11 +1664,27 @@ impl Registry {
             return Err(not_found(&id));
         }
         let session = Session::spawn(spec, Arc::clone(&self.engine))?;
-        self.sessions.insert(id.clone(), session);
+        session.bind_state_changes(self.state_changes.clone());
+        if let Some(previous) = self.records.get(&id).cloned() {
+            self.orchestration.remember_current_terminal(&previous);
+        }
         let record = self.records.get_mut(&id).expect("checked above");
         record.status = SessionStatus::Starting;
         record.needs_input = None;
+        if let Some(run) = record.run.as_mut()
+            && run.state.is_terminal()
+        {
+            *run = diri_proto::AgentRun::starting(
+                run.id.saturating_add(1),
+                DateMillis::from(std::time::SystemTime::now()),
+            );
+        }
         record.updated_at = DateMillis::from(std::time::SystemTime::now());
+        self.orchestration
+            .register(record, session.turn_completion_seq(), &session.status());
+        self.sessions.insert(id.clone(), session);
+        self.bump_record_version(&id);
+        self.state_changes.notify();
         Ok(())
     }
 
@@ -1039,6 +2150,62 @@ fn repair_persisted_agent_title(record: &mut SessionRecord) -> bool {
     }
 }
 
+/// Additive migration for records created before explicit runs existed. Agent
+/// roots participate too: they are the usual destination for child reports,
+/// so leaving them untracked would bypass safe-composer/FIFO guarantees.
+fn migrate_run_lifecycle(record: &mut SessionRecord) {
+    if record.kind == diri_proto::AgentKind::SHELL || record.run.is_some() {
+        return;
+    }
+    use diri_proto::{AgentRun, AgentRunState};
+    let state = match &record.status {
+        SessionStatus::Working => AgentRunState::Running,
+        SessionStatus::NeedsInput(_) => AgentRunState::NeedsInput,
+        SessionStatus::Exited(_) => AgentRunState::Failed,
+        SessionStatus::Idle if record.last_turn_completed_at.is_some() => AgentRunState::Completed,
+        SessionStatus::Starting | SessionStatus::Idle | SessionStatus::Unknown => {
+            AgentRunState::Starting
+        }
+    };
+    let terminal = state.is_terminal();
+    record.run = Some(AgentRun {
+        id: 1,
+        state,
+        started_at: record.created_at,
+        finished_at: terminal.then_some(record.updated_at),
+        terminal_outcome: terminal.then(|| {
+            if matches!(state, AgentRunState::Completed) {
+                "completed"
+            } else {
+                "process_exited"
+            }
+            .into()
+        }),
+    });
+}
+
+fn run_from_legacy_record(record: &SessionRecord) -> diri_proto::AgentRun {
+    let mut migrated = record.clone();
+    migrate_run_lifecycle(&mut migrated);
+    migrated
+        .run
+        .unwrap_or_else(|| diri_proto::AgentRun::starting(1, record.created_at))
+}
+
+/// Every run transition updates the same metadata regardless of whether the
+/// event watcher, shutdown persistence, or an explicit control mutation saw
+/// it first.
+fn apply_run_transition_metadata(record: &mut SessionRecord) {
+    record.updated_at = DateMillis::from(std::time::SystemTime::now());
+    if record
+        .run
+        .as_ref()
+        .is_some_and(|run| run.state.is_terminal())
+    {
+        record.last_turn_completed_at = record.run.as_ref().and_then(|run| run.finished_at);
+    }
+}
+
 fn fold_session_status(record: &mut SessionRecord, view: &SessionView) {
     record.status.clone_from(&view.status);
     // Keep evidence only when it explains this exact canonical state. This is
@@ -1082,6 +2249,10 @@ fn is_generic_terminal_title(title: &str, record: &SessionRecord) -> bool {
         )
 }
 
+fn is_attached_submit(bytes: &[u8]) -> bool {
+    matches!(bytes, b"\r" | b"\n" | b"\r\n")
+}
+
 fn not_found(id: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::NotFound, format!("no session {id}"))
 }
@@ -1109,7 +2280,10 @@ pub(crate) fn session_project_id(root: &str, host: Option<&str>) -> diri_proto::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use diri_proto::{AgentKind, DateMillis, ProjectId, Resumability, SessionId, TitleSource};
+    use diri_proto::{
+        AgentKind, AgentRun, AgentRunState, DateMillis, ProjectId, Resumability, SessionId,
+        TitleSource,
+    };
 
     fn record(id: &str) -> SessionRecord {
         SessionRecord {
@@ -1143,6 +2317,7 @@ mod tests {
             pull_requests: None,
             listening_ports: None,
             foreground_agent: None,
+            run: None,
         }
     }
 
@@ -1154,13 +2329,344 @@ mod tests {
         Arc::new(engine)
     }
 
+    fn view(id: &str, status: SessionStatus, tail_offset: u64) -> SessionView {
+        SessionView {
+            id: id.into(),
+            status,
+            status_evidence: None,
+            needs_input: None,
+            title: None,
+            title_source: None,
+            tail_offset,
+            exited: false,
+        }
+    }
+
+    #[test]
+    fn stale_delivery_commits_a_fresh_raw_successor_before_returning() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state_file = temp.path().join("state.json");
+        let mut registry = Registry::new(engine(), &state_file);
+        let mut agent = record("s_agent");
+        agent.kind = AgentKind::CODEX;
+        agent.status = SessionStatus::Idle;
+        agent.run = Some(AgentRun {
+            id: 1,
+            state: AgentRunState::Completed,
+            started_at: DateMillis(1.0),
+            finished_at: Some(DateMillis(2.0)),
+            terminal_outcome: Some("completed".into()),
+        });
+        registry.records.insert("s_agent".into(), agent.clone());
+        registry
+            .orchestration
+            .register(&agent, 0, &SessionStatus::Idle);
+        let working = view("s_agent", SessionStatus::Working, 10);
+
+        let error = registry
+            .prepare_delivery_transaction(
+                "s_agent",
+                &working,
+                0,
+                "stale".into(),
+                true,
+                Some(1),
+                true,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RegistryRunError::Stale {
+                expected: 1,
+                current: 2
+            }
+        ));
+        assert_eq!(registry.records["s_agent"].run.as_ref().unwrap().id, 2);
+        assert!(!registry.orchestration.observe(
+            registry.records.get_mut("s_agent").unwrap(),
+            &working.status,
+            None,
+            0,
+            working.tail_offset,
+        ));
+        assert!(!registry.dirty);
+        assert!(registry.record_versions["s_agent"] > 0);
+        let mut restored = Registry::new(engine(), &state_file);
+        restored.load().expect("reload committed observation");
+        assert_eq!(restored.records["s_agent"].run.as_ref().unwrap().id, 2);
+    }
+
+    #[test]
+    fn stale_interrupt_commits_a_fresh_raw_successor_before_returning() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state_file = temp.path().join("state.json");
+        let mut registry = Registry::new(engine(), &state_file);
+        let mut agent = record("s_agent");
+        agent.kind = AgentKind::CODEX;
+        agent.status = SessionStatus::Idle;
+        agent.run = Some(AgentRun {
+            id: 1,
+            state: AgentRunState::Completed,
+            started_at: DateMillis(1.0),
+            finished_at: Some(DateMillis(2.0)),
+            terminal_outcome: Some("completed".into()),
+        });
+        registry.records.insert("s_agent".into(), agent.clone());
+        registry
+            .orchestration
+            .register(&agent, 0, &SessionStatus::Idle);
+        let working = view("s_agent", SessionStatus::Working, 10);
+
+        let error = registry
+            .prepare_interrupt_transaction("s_agent", &working, 0, Some(1), None, None)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RegistryRunError::Stale {
+                expected: 1,
+                current: 2
+            }
+        ));
+        assert_eq!(registry.records["s_agent"].run.as_ref().unwrap().id, 2);
+        assert!(!registry.orchestration.observe(
+            registry.records.get_mut("s_agent").unwrap(),
+            &working.status,
+            None,
+            0,
+            working.tail_offset,
+        ));
+        assert!(!registry.dirty);
+        assert!(registry.record_versions["s_agent"] > 0);
+        let mut restored = Registry::new(engine(), &state_file);
+        restored.load().expect("reload committed observation");
+        assert_eq!(restored.records["s_agent"].run.as_ref().unwrap().id, 2);
+    }
+
+    #[test]
+    fn attached_enter_claim_is_durable_before_the_status_transition() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state_file = temp.path().join("state.json");
+        let mut registry = Registry::new(engine(), &state_file);
+        let mut agent = record("s_agent");
+        agent.kind = AgentKind::CODEX;
+        agent.status = SessionStatus::Idle;
+        agent.run = Some(AgentRun {
+            id: 1,
+            state: AgentRunState::Completed,
+            started_at: DateMillis(1.0),
+            finished_at: Some(DateMillis(2.0)),
+            terminal_outcome: Some("completed".into()),
+        });
+        registry.records.insert("s_agent".into(), agent.clone());
+        registry
+            .orchestration
+            .register(&agent, 0, &SessionStatus::Idle);
+        let idle = view("s_agent", SessionStatus::Idle, 10);
+        assert_eq!(
+            registry.orchestration.claim_raw_submission(
+                registry.records.get_mut("s_agent").unwrap(),
+                &idle.status,
+                None,
+                0,
+                idle.tail_offset,
+            ),
+            RawSubmissionDecision {
+                changed: true,
+                claimed: true,
+                blocked: false,
+            }
+        );
+        apply_run_transition_metadata(registry.records.get_mut("s_agent").unwrap());
+        registry.dirty = true;
+        registry.persist_intent_now().expect("persist raw claim");
+
+        let mut restored = Registry::new(engine(), &state_file);
+        restored.load().expect("reload raw claim");
+        let error = restored
+            .prepare_delivery_transaction(
+                "s_agent",
+                &idle,
+                0,
+                "must be stale".into(),
+                true,
+                Some(1),
+                true,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RegistryRunError::Stale {
+                expected: 1,
+                current: 2
+            }
+        ));
+        assert_eq!(restored.records["s_agent"].run.as_ref().unwrap().id, 2);
+        assert!(is_attached_submit(b"\r"));
+        assert!(!is_attached_submit(b"pasted\ntext"));
+    }
+
+    #[test]
+    fn holder_uncertainty_is_folded_before_concurrent_working_activity() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state_file = temp.path().join("state.json");
+        let mut registry = Registry::new(engine(), &state_file);
+        let mut agent = record("s_agent");
+        agent.kind = AgentKind::CODEX;
+        agent.status = SessionStatus::Idle;
+        agent.run = Some(AgentRun::starting(1, DateMillis(1.0)));
+        registry.records.insert("s_agent".into(), agent.clone());
+        registry
+            .orchestration
+            .register(&agent, 0, &SessionStatus::Idle);
+        registry
+            .orchestration
+            .prepare_delivery(
+                registry.records.get_mut("s_agent").unwrap(),
+                DeliveryRequest {
+                    status: &SessionStatus::Idle,
+                    needs_input: None,
+                    completion_seq: 0,
+                    output_offset: 10,
+                    expected_run_id: Some(1),
+                    text: "receipt race".into(),
+                    submit: true,
+                    allow_needs_input: true,
+                    request_id: Some("receipt-race"),
+                    request_fingerprint: Some("receipt-fingerprint"),
+                },
+            )
+            .unwrap();
+        registry
+            .orchestration
+            .mark_dispatch_uncertain(
+                registry.records.get_mut("s_agent").unwrap(),
+                "response lost".into(),
+            )
+            .unwrap();
+        let operation_id = registry
+            .orchestration
+            .uncertain_operation_id("s_agent")
+            .unwrap()
+            .to_owned();
+        let working = view("s_agent", SessionStatus::Working, 20);
+
+        assert!(registry.observe_run_state_with_receipt(
+            "s_agent",
+            &working,
+            0,
+            DeliveryReceiptEvidence::Uncertain(operation_id.clone()),
+        ));
+        let run = registry.records["s_agent"].run.as_ref().unwrap();
+        assert_eq!(run.id, 1);
+        assert_eq!(run.state, AgentRunState::Failed);
+        assert_eq!(
+            registry.orchestration.uncertain_operation_id("s_agent"),
+            Some(operation_id.as_str())
+        );
+        assert!(registry.dirty);
+        assert!(registry.record_versions["s_agent"] > 0);
+        registry.persist_intent_now().expect("persist tombstone");
+
+        let mut restored = Registry::new(engine(), &state_file);
+        restored.load().expect("reload tombstone");
+        assert_eq!(
+            restored.records["s_agent"].run.as_ref().unwrap().state,
+            AgentRunState::Failed
+        );
+        assert_eq!(
+            restored.orchestration.uncertain_operation_id("s_agent"),
+            Some(operation_id.as_str())
+        );
+    }
+
+    #[test]
+    fn failed_report_replay_commit_keeps_only_the_durable_parent_evidence() {
+        let temp = tempfile::tempdir().expect("temp");
+        let blocked_parent = temp.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, b"file").expect("blocking file");
+        let mut registry = Registry::new(engine(), blocked_parent.join("state.json"));
+        let mut reporter = record("reporter");
+        reporter.kind = AgentKind::CODEX;
+        reporter.parent = Some(SessionId::new("parent"));
+        registry.records.insert("reporter".into(), reporter);
+
+        let request_id = "report-1";
+        let text = "finished";
+        let internal_request_id =
+            format!("report:{}", request_fingerprint(&("reporter", request_id)));
+        let internal_fingerprint =
+            request_fingerprint(&("parent", text, true, Option::<u64>::None, false));
+        registry
+            .orchestration
+            .remember_replay(
+                "parent",
+                ReplayOperation::Delivery,
+                Some(&internal_request_id),
+                Some(&internal_fingerprint),
+                ReplayOutcome::Delivery {
+                    queued: true,
+                    run: Some(AgentRun::starting(2, DateMillis(3.0))),
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            registry.report_to_parent(
+                "reporter",
+                text.into(),
+                true,
+                Some(1),
+                Some(request_id.into())
+            ),
+            Err(RegistryRunError::Io(_))
+        ));
+        let outer_fingerprint = request_fingerprint(&("reporter", text, true, Some(1_u64)));
+        assert!(
+            registry
+                .orchestration
+                .lookup_replay(
+                    "reporter",
+                    ReplayOperation::Report,
+                    Some(request_id),
+                    Some(&outer_fingerprint)
+                )
+                .unwrap()
+                .is_none(),
+            "an uncommitted success must not replay in this process"
+        );
+        assert!(matches!(
+            registry
+                .orchestration
+                .lookup_replay(
+                    "parent",
+                    ReplayOperation::Delivery,
+                    Some(&internal_request_id),
+                    Some(&internal_fingerprint)
+                )
+                .unwrap(),
+            Some(ReplayOutcome::Delivery { queued: true, .. })
+        ));
+    }
+
     #[test]
     fn state_round_trips_through_the_swift_file_shape() {
         let temp = tempfile::tempdir().expect("temp");
         let state_file = temp.path().join("state.json");
 
         let mut registry = Registry::new(engine(), &state_file);
-        registry.records.insert("s_1".into(), record("s_1"));
+        let mut original = record("s_1");
+        original.run = Some(AgentRun {
+            id: 9,
+            state: AgentRunState::NeedsInput,
+            started_at: DateMillis(10.0),
+            finished_at: None,
+            terminal_outcome: None,
+        });
+        registry.records.insert("s_1".into(), original);
         registry.persist().expect("persist");
 
         // The shape on disk is what the Swift daemon expects.
@@ -1173,7 +2679,146 @@ mod tests {
 
         let mut reloaded = Registry::new(engine(), &state_file);
         assert_eq!(reloaded.load().expect("load"), 1);
-        assert_eq!(reloaded.records()[0].id.0, "s_1");
+        let reloaded = reloaded.records().pop().expect("session");
+        assert_eq!(reloaded.id.0, "s_1");
+        assert_eq!(reloaded.run.expect("run").state, AgentRunState::NeedsInput);
+    }
+
+    #[test]
+    fn acknowledged_future_turns_survive_an_engine_restart() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state_file = temp.path().join("state.json");
+        let mut registry = Registry::new(engine(), &state_file);
+        let mut agent = record("s_agent");
+        agent.kind = AgentKind::CODEX;
+        agent.status = SessionStatus::Working;
+        agent.run = Some(AgentRun {
+            id: 1,
+            state: AgentRunState::Running,
+            started_at: DateMillis(1.0),
+            finished_at: None,
+            terminal_outcome: None,
+        });
+        registry.records.insert("s_agent".into(), agent.clone());
+        registry
+            .orchestration
+            .register(&agent, 0, &SessionStatus::Working);
+        let plan = registry
+            .orchestration
+            .prepare_delivery(
+                registry.records.get_mut("s_agent").unwrap(),
+                DeliveryRequest {
+                    status: &SessionStatus::Working,
+                    needs_input: None,
+                    completion_seq: 0,
+                    output_offset: 0,
+                    expected_run_id: Some(1),
+                    text: "survive restart".into(),
+                    submit: true,
+                    allow_needs_input: true,
+                    request_id: None,
+                    request_fingerprint: None,
+                },
+            )
+            .unwrap();
+        assert!(plan.queued);
+        assert_eq!(plan.run.as_ref().unwrap().id, 2);
+        registry.persist().expect("persist queue");
+
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_file).unwrap()).unwrap();
+        assert_eq!(
+            raw["orchestration"]["pending"]["s_agent"][0]["text"],
+            "survive restart"
+        );
+
+        let mut reloaded = Registry::new(engine(), &state_file);
+        reloaded.load().expect("reload");
+        let record = reloaded.records.get("s_agent").unwrap();
+        assert_eq!(reloaded.orchestration.latest_run_id(record), 2);
+        assert_eq!(record.run.as_ref().unwrap().id, 1);
+    }
+
+    #[test]
+    fn a_crash_during_dispatch_fails_closed_instead_of_replaying() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state_file = temp.path().join("state.json");
+        let mut registry = Registry::new(engine(), &state_file);
+        let mut agent = record("s_agent");
+        agent.kind = AgentKind::CODEX;
+        agent.status = SessionStatus::Idle;
+        agent.run = Some(AgentRun::starting(1, DateMillis(1.0)));
+        registry.records.insert("s_agent".into(), agent.clone());
+        registry
+            .orchestration
+            .register(&agent, 0, &SessionStatus::Idle);
+        let plan = registry
+            .orchestration
+            .prepare_delivery(
+                registry.records.get_mut("s_agent").unwrap(),
+                DeliveryRequest {
+                    status: &SessionStatus::Idle,
+                    needs_input: None,
+                    completion_seq: 0,
+                    output_offset: 0,
+                    expected_run_id: Some(1),
+                    text: "maybe sent".into(),
+                    submit: true,
+                    allow_needs_input: true,
+                    request_id: None,
+                    request_fingerprint: None,
+                },
+            )
+            .unwrap();
+        assert!(!plan.queued, "safe sends enter dispatch directly");
+        registry.persist().expect("persist dispatch");
+
+        let mut reloaded = Registry::new(engine(), &state_file);
+        reloaded.load().expect("reload");
+        let run = reloaded
+            .records
+            .get("s_agent")
+            .unwrap()
+            .run
+            .as_ref()
+            .unwrap();
+        assert_eq!(run.state, AgentRunState::Failed);
+        assert_eq!(
+            run.terminal_outcome.as_deref(),
+            Some("delivery_outcome_uncertain")
+        );
+        let first_finished_at = run.finished_at;
+        let recovered: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_file).unwrap()).unwrap();
+        assert!(recovered["orchestration"]["dispatching"].is_null());
+        assert!(recovered["orchestration"]["uncertainDeliveries"]["s_agent"].is_object());
+
+        let mut reloaded_again = Registry::new(engine(), &state_file);
+        reloaded_again.load().expect("second reload");
+        let second_finished_at = reloaded_again.records["s_agent"]
+            .run
+            .as_ref()
+            .unwrap()
+            .finished_at
+            .unwrap();
+        assert!(
+            (second_finished_at.0 - first_finished_at.unwrap().0).abs() < 0.001,
+            "recovery must be landed once rather than regenerated every restart"
+        );
+    }
+
+    #[test]
+    fn legacy_agent_records_gain_a_conservative_explicit_run() {
+        let mut child = record("legacy");
+        child.kind = AgentKind::CODEX;
+        child.parent = Some(SessionId::new("parent"));
+        child.status = SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Question);
+        migrate_run_lifecycle(&mut child);
+        assert_eq!(child.run.unwrap().state, AgentRunState::NeedsInput);
+
+        let mut shell = record("shell");
+        migrate_run_lifecycle(&mut shell);
+        assert!(shell.run.is_none(), "raw terminals have no agent turn");
     }
 
     #[test]
@@ -1254,7 +2899,8 @@ mod tests {
         let mut build = record("build");
         build.cwd = "/srv/app".into();
         build.host = Some("build".into());
-        let state = PersistedState::current(vec![forge, build], Vec::new());
+        let state =
+            PersistedState::current(vec![forge, build], Vec::new(), Orchestration::default());
         std::fs::write(&state_file, serde_json::to_vec(&state).expect("encode")).expect("write");
 
         let mut registry = Registry::new(engine(), &state_file);
@@ -1306,7 +2952,8 @@ mod tests {
         hashed.project_id = session_project_id(root, None);
         let expected = hashed.project_id.clone();
 
-        let state = PersistedState::current(vec![legacy, hashed], Vec::new());
+        let state =
+            PersistedState::current(vec![legacy, hashed], Vec::new(), Orchestration::default());
         std::fs::write(&state_file, serde_json::to_vec(&state).expect("encode")).expect("write");
 
         let mut registry = Registry::new(engine(), &state_file);
@@ -1344,6 +2991,7 @@ mod tests {
                 "root": project_root,
                 "name": "app"
             })],
+            Orchestration::default(),
         );
         std::fs::write(&state_file, serde_json::to_vec(&state).expect("encode")).expect("write");
 

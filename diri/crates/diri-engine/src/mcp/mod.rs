@@ -239,6 +239,7 @@ mod tests {
             "list_agents",
             "get_status",
             "send_prompt",
+            "interrupt_agent",
             "read_output",
             "release_agent",
             "create_worktree",

@@ -261,6 +261,12 @@ struct Shared {
     /// registry watcher compares this instead of cloning and JSON-serializing
     /// every record on every poll.
     state_version: AtomicU64,
+    /// Lossless turn-completion edge count. Status can move Working→Idle
+    /// between registry snapshots; the counter makes that edge observable.
+    turn_completion_seq: AtomicU64,
+    /// Registry-wide wake source used by event waiters. Kept optional because
+    /// a Session can be constructed directly in low-level tests.
+    state_changes: Mutex<Option<crate::orchestration::StateChanges>>,
     /// Seconds since UNIX_EPOCH of the last attach-pump poll or input write.
     /// Keeps interactive sessions on the fast quiet-tick.
     last_hot: AtomicU64,
@@ -293,6 +299,9 @@ struct RemoteGridState {
 impl Shared {
     fn bump_state_version(&self) {
         self.state_version.fetch_add(1, Ordering::SeqCst);
+        if let Some(changes) = self.state_changes.lock().expect("state changes").as_ref() {
+            changes.notify();
+        }
     }
 
     fn note_hot(&self) {
@@ -1109,6 +1118,14 @@ impl Session {
         self.shared.state_version.load(Ordering::SeqCst)
     }
 
+    pub fn turn_completion_seq(&self) -> u64 {
+        self.shared.turn_completion_seq.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn bind_state_changes(&self, changes: crate::orchestration::StateChanges) {
+        *self.shared.state_changes.lock().expect("state changes") = Some(changes);
+    }
+
     pub fn status(&self) -> SessionStatus {
         self.shared.status.lock().expect("status").clone()
     }
@@ -1441,6 +1458,76 @@ impl Session {
         self.submit_input()
     }
 
+    /// Lifecycle submission variant whose final Enter is acknowledged under
+    /// a stable operation id by transports that outlive this daemon.
+    pub fn send_text_receipted(
+        &self,
+        text: &str,
+        submit: bool,
+        operation_id: Option<&str>,
+    ) -> std::io::Result<()> {
+        if !submit {
+            return self.write_input(text.as_bytes());
+        }
+        if let (Some(operation_id), Transport::Remote(client)) = (operation_id, &self.transport) {
+            self.capture_prompt_title(text);
+            let framed = self.framed_paste_text(text);
+            self.shared.note_hot();
+            self.shared.grid_wake.prioritize_interactive_changes();
+            self.observe_prompt_input(framed.as_bytes());
+            self.observe_prompt_input(b"\r");
+            client.write_delivery_submission(framed.as_bytes(), operation_id)?;
+            self.feed_signal(StatusSignal::UserKeystroke);
+            self.feed_signal(StatusSignal::UserKeystroke);
+            return Ok(());
+        }
+        self.paste_text(text)?;
+        std::thread::sleep(Duration::from_millis(30));
+        let Some(operation_id) = operation_id else {
+            return self.submit_input();
+        };
+        self.write_delivery_input(b"\r", operation_id)
+    }
+
+    pub fn accepted_delivery(&self, operation_id: &str) -> bool {
+        match &self.transport {
+            Transport::Direct(_) => false,
+            Transport::Held(client) => client.accepted_delivery(operation_id).unwrap_or(false),
+            Transport::Remote(client) => client.accepted_delivery(operation_id),
+        }
+    }
+
+    pub fn uncertain_delivery(&self, operation_id: &str) -> bool {
+        match &self.transport {
+            Transport::Remote(client) => client.uncertain_delivery(operation_id),
+            Transport::Direct(_) | Transport::Held(_) => false,
+        }
+    }
+
+    /// `Some(false)` is an authoritative remote compatibility answer. Local
+    /// and direct transports retain their existing delivery guarantees.
+    pub fn remote_delivery_receipts_supported(&self) -> Option<bool> {
+        match &self.transport {
+            Transport::Remote(client) => Some(client.delivery_receipts_supported()),
+            Transport::Direct(_) | Transport::Held(_) => None,
+        }
+    }
+
+    fn write_delivery_input(&self, bytes: &[u8], operation_id: &str) -> std::io::Result<()> {
+        self.shared.note_hot();
+        self.shared.grid_wake.prioritize_interactive_changes();
+        self.observe_prompt_input(bytes);
+        match &self.transport {
+            Transport::Direct(_) => self.write_input(bytes),
+            Transport::Held(client) => client
+                .write_receipted(bytes, operation_id)
+                .map_err(holder_io_error),
+            Transport::Remote(client) => client.write_delivery(bytes, operation_id),
+        }?;
+        self.feed_signal(StatusSignal::UserKeystroke);
+        Ok(())
+    }
+
     /// Types `text` into the composer WITHOUT submitting it, framed as a
     /// bracketed paste when the child has that mode on. Separated from
     /// [`Self::send_text`] so a caller that cannot see the composer — the
@@ -1452,12 +1539,16 @@ impl Session {
     /// idempotent, which matters because the injector may retype.
     pub fn paste_text(&self, text: &str) -> std::io::Result<()> {
         self.capture_prompt_title(text);
-        let framed = if self.bracketed_paste() {
+        let framed = self.framed_paste_text(text);
+        self.write_input(framed.as_bytes())
+    }
+
+    fn framed_paste_text(&self, text: &str) -> String {
+        if self.bracketed_paste() {
             format!("\x1b[200~{text}\x1b[201~")
         } else {
             text.to_owned()
-        };
-        self.write_input(framed.as_bytes())
+        }
     }
 
     /// The Enter that submits whatever is in the composer.
@@ -1736,6 +1827,8 @@ fn new_shared(spec: &SessionSpec, log: OutputLog, engine: &ManifestEngine) -> Ar
         exited: AtomicBool::new(false),
         stop: AtomicBool::new(false),
         state_version: AtomicU64::new(0),
+        turn_completion_seq: AtomicU64::new(0),
+        state_changes: Mutex::new(None),
         last_hot: AtomicU64::new(unix_secs()),
         last_interaction: AtomicU64::new(0),
         artifacts: Mutex::new(Vec::new()),
@@ -1821,6 +1914,10 @@ fn apply(shared: &Shared, outcome: &ReducerOutcome) {
             *current = None;
             changed = true;
         }
+    }
+    if outcome.turn_completed {
+        shared.turn_completion_seq.fetch_add(1, Ordering::SeqCst);
+        changed = true;
     }
     if changed {
         shared.bump_state_version();
@@ -2047,9 +2144,7 @@ fn handle_remote_message(
         RemoteMessage::HelloAck(acknowledgement) => {
             if *hello_accepted
                 || client.validate_hello(&acknowledgement).is_err()
-                || client
-                    .accept_hello(generation, acknowledgement.controller_epoch)
-                    .is_err()
+                || client.accept_hello(generation, &acknowledgement).is_err()
             {
                 return RemoteConnectionDisposition::Fatal;
             }
@@ -2121,6 +2216,14 @@ fn handle_remote_message(
         }
         RemoteMessage::ScrollbackResponse(response) => {
             client.complete_scrollback(response);
+            RemoteConnectionDisposition::Continue
+        }
+        RemoteMessage::DeliveryAccepted(accepted) => {
+            client.complete_delivery(accepted.delivery_id);
+            RemoteConnectionDisposition::Continue
+        }
+        RemoteMessage::DeliveryUncertain(uncertain) => {
+            client.mark_delivery_uncertain(uncertain.delivery_id);
             RemoteConnectionDisposition::Continue
         }
         RemoteMessage::Error(error) if error.fatal => RemoteConnectionDisposition::Fatal,

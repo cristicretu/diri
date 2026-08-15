@@ -18,8 +18,12 @@ use crate::grid::{GridCodecError, GridUpdate};
 use crate::terminal::MouseModes;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 4;
+// Protocol 1.5 is independently assigned to negotiated application-cursor
+// input. Delivery receipts therefore occupy 1.6 when the two additive
+// branches are combined; capability negotiation remains the runtime gate.
+pub const PROTOCOL_MINOR: u16 = 6;
 pub const MOUSE_INPUT_PROTOCOL_MINOR: u16 = 4;
+pub const DELIVERY_RECEIPT_PROTOCOL_MINOR: u16 = 6;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_ARGUMENTS: usize = 512;
 pub const MAX_ENVIRONMENT_VARIABLES: usize = 4096;
@@ -48,6 +52,9 @@ const KIND_ERROR: u8 = 41;
 const KIND_GRID_DELTA: u8 = 42;
 const KIND_SCROLLBACK_REQUEST: u8 = 43;
 const KIND_SCROLLBACK_RESPONSE: u8 = 44;
+const KIND_DELIVERY_INPUT: u8 = 45;
+const KIND_DELIVERY_ACCEPTED: u8 = 46;
+const KIND_DELIVERY_UNCERTAIN: u8 = 47;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -97,6 +104,8 @@ pub enum RemoteCapability {
     PortForward,
     RebootRecovery,
     Migration,
+    /// Holder persists bounded idempotency receipts for lifecycle submits.
+    DeliveryReceipts,
     /// A capability introduced by a newer protocol minor. It is ignored
     /// unless the local side explicitly requires it.
     #[serde(other)]
@@ -125,6 +134,7 @@ impl RemoteCapability {
             Self::PortForward => "port-forward",
             Self::RebootRecovery => "reboot-recovery",
             Self::Migration => "migration",
+            Self::DeliveryReceipts => "delivery-receipts",
             Self::Unknown => "unknown",
         }
     }
@@ -252,6 +262,10 @@ pub struct HelloAck {
     pub process_state: RemoteProcessState,
     pub output_offset: u64,
     pub snapshot_sequence: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted_delivery_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uncertain_delivery_ids: Vec<String>,
 }
 
 impl HelloAck {
@@ -624,6 +638,10 @@ pub struct SessionInspection {
     pub snapshot_sequence: u64,
     pub controller_epoch: u64,
     pub persistence: PersistenceCapability,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted_delivery_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uncertain_delivery_ids: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -729,6 +747,40 @@ pub struct ScrollbackResponse {
     pub result: crate::ReadScrollbackCellsResult,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryInput {
+    pub delivery_id: String,
+    pub data: Vec<u8>,
+}
+
+impl DeliveryInput {
+    pub fn validate(&self) -> Result<(), RemoteCodecError> {
+        validate_identifier("delivery id", &self.delivery_id)?;
+        if self.data.len() > 64 {
+            return Err(RemoteCodecError::InvalidControlPayload {
+                kind: KIND_DELIVERY_INPUT,
+                detail: "delivery input exceeds 64 bytes".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryAccepted {
+    pub delivery_id: String,
+}
+
+/// A prior Holder durably prepared this operation but did not durably record
+/// its PTY outcome. The controller must never retry its bytes automatically.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryUncertain {
+    pub delivery_id: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RemoteMessage {
     Terminal(Frame),
@@ -744,6 +796,9 @@ pub enum RemoteMessage {
     ReleaseControl(ReleaseControl),
     ScrollbackRequest(ScrollbackRequest),
     ScrollbackResponse(ScrollbackResponse),
+    DeliveryInput(DeliveryInput),
+    DeliveryAccepted(DeliveryAccepted),
+    DeliveryUncertain(DeliveryUncertain),
     Error(RemoteError),
 }
 
@@ -928,6 +983,18 @@ impl RemoteCodec {
             }
             RemoteMessage::ScrollbackResponse(value) => {
                 append_json(KIND_SCROLLBACK_RESPONSE, value, output, start)
+            }
+            RemoteMessage::DeliveryInput(value) => {
+                value.validate()?;
+                append_json(KIND_DELIVERY_INPUT, value, output, start)
+            }
+            RemoteMessage::DeliveryAccepted(value) => {
+                validate_identifier("delivery id", &value.delivery_id)?;
+                append_json(KIND_DELIVERY_ACCEPTED, value, output, start)
+            }
+            RemoteMessage::DeliveryUncertain(value) => {
+                validate_identifier("delivery id", &value.delivery_id)?;
+                append_json(KIND_DELIVERY_UNCERTAIN, value, output, start)
             }
             RemoteMessage::Error(value) => append_json(KIND_ERROR, value, output, start),
         })();
@@ -1128,6 +1195,21 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
         KIND_SCROLLBACK_RESPONSE => Ok(RemoteMessage::ScrollbackResponse(decode_json(
             kind, payload,
         )?)),
+        KIND_DELIVERY_INPUT => {
+            let value: DeliveryInput = decode_json(kind, payload)?;
+            value.validate()?;
+            Ok(RemoteMessage::DeliveryInput(value))
+        }
+        KIND_DELIVERY_ACCEPTED => {
+            let value: DeliveryAccepted = decode_json(kind, payload)?;
+            validate_identifier("delivery id", &value.delivery_id)?;
+            Ok(RemoteMessage::DeliveryAccepted(value))
+        }
+        KIND_DELIVERY_UNCERTAIN => {
+            let value: DeliveryUncertain = decode_json(kind, payload)?;
+            validate_identifier("delivery id", &value.delivery_id)?;
+            Ok(RemoteMessage::DeliveryUncertain(value))
+        }
         KIND_ERROR => Ok(RemoteMessage::Error(decode_json(kind, payload)?)),
         _ => Err(RemoteCodecError::UnknownMessageType(kind)),
     }
@@ -1135,7 +1217,7 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
 
 fn validate_kind(kind: u8) -> Result<(), RemoteCodecError> {
     if (1..=FrameType::Mouse as u8).contains(&kind)
-        || (KIND_HELLO..=KIND_SCROLLBACK_RESPONSE).contains(&kind)
+        || (KIND_HELLO..=KIND_DELIVERY_UNCERTAIN).contains(&kind)
     {
         Ok(())
     } else {
@@ -1296,6 +1378,28 @@ mod tests {
 
             let decoded = RemoteCodec::new().feed(&encoded).expect("decode");
             assert_eq!(decoded, vec![message]);
+        }
+    }
+
+    #[test]
+    fn delivery_receipt_messages_round_trip_additively() {
+        let input = RemoteMessage::DeliveryInput(DeliveryInput {
+            delivery_id: "run-7-abcdef".into(),
+            data: b"\r".to_vec(),
+        });
+        let accepted = RemoteMessage::DeliveryAccepted(DeliveryAccepted {
+            delivery_id: "run-7-abcdef".into(),
+        });
+        let uncertain = RemoteMessage::DeliveryUncertain(DeliveryUncertain {
+            delivery_id: "run-7-abcdef".into(),
+        });
+        for message in [input, accepted, uncertain] {
+            let encoded = RemoteCodec::encode(&message).expect("encode");
+            assert!(encoded[0] > KIND_SCROLLBACK_RESPONSE);
+            assert_eq!(
+                RemoteCodec::new().feed(&encoded).expect("decode"),
+                [message]
+            );
         }
     }
 

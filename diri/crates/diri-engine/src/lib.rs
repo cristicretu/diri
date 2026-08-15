@@ -40,6 +40,7 @@ pub mod legacy_remote;
 pub mod log;
 pub mod mcp;
 pub mod migrate;
+pub mod orchestration;
 pub mod pr_monitor;
 pub mod pty;
 pub mod registry;
