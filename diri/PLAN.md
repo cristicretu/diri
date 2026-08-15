@@ -87,6 +87,8 @@ diri/
   crates/
     diri-proto/         # wire types: ControlMessage, Methods params/results, SessionRecord &
                         # friends, Frames codec, GridUpdate RLE codec, Paths. Pure, no IO. Heavily unit-tested.
+    diri-code-intelligence/ # bounded git-aware navigation and its compact MCP adapter,
+                           # shared by native UI and agent tools; no GPUI or daemon dependency.
     diri-client/        # tokio: DaemonClient (control), SessionAttachment (data channel),
                         # reconnect/backoff/heartbeat/event-resume. No gpui dependency.
     diri-term/          # the grid renderer: GridBuffer, TerminalElement (gpui), input encoding,
@@ -99,7 +101,7 @@ diri/
   scripts/              # build-app / package / notarize
 ```
 
-Dependency direction: `diri-app → {diri-ui, diri-term, diri-client} → diri-proto`. `diri-proto` and `diri-client` compile fast and are testable headless against a real daemon.
+Dependency direction: `diri-app → {diri-ui, diri-term, diri-client, diri-code-intelligence} → diri-proto`; Engine and MCP frontends also depend on the pure code-intelligence leaf. `diri-proto`, `diri-client`, and `diri-code-intelligence` compile fast and are testable headless.
 
 ---
 
@@ -231,3 +233,23 @@ Dependencies are noted; tasks with the same phase and no dep arrow are parallel.
 
 ## 11. Later (post-v1 backlog)
 Remote/TCP endpoint + token auth (iOS parity), port-forward channel UI, a Rust daemon (only if ever needed — would ship behind the same wire protocol), Linux/Windows builds, per-session split panes, GPU screenshot-based switcher previews, multi-desktop geometry roles.
+
+### Agent workspace intelligence experiment
+
+Diri exposes two deliberately small local-session tools from the same deep
+module that powers native file browsing:
+
+- `search_workspace` separates declaration-like definitions, honest literal
+  mentions (including comments/docs/strings), and fuzzy file paths. Results,
+  discovery, and indexed bytes are bounded and report incomplete corpus
+  coverage; ignored build and dependency directories stay out.
+- `read_source` returns a separately byte-bounded numbered model window with
+  explicit truncation metadata, reusing the viewer's race-resistant contained
+  file opening, binary/UTF-8, and size policy.
+
+This is the first falsifiable slice of issue #97, not a claim that a heuristic
+index replaces an LSP. Remote sessions degrade explicitly to their normal
+shell tools, and no agent depends on these capabilities to function. The next
+gate is a published same-model benchmark over merged repository tasks before
+adding callers, type hierarchy, history retrieval, or a generic verification
+runner.

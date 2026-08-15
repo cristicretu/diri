@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use diri_code_intelligence::{CodeIntelligenceCache, is_workspace_tool};
 use diri_proto::{
     AgentKind, AgentReadinessResult, Method, ReadScreenResult, SessionId, SessionListResult,
     SessionRecord, SessionSpawnParams, SessionStatus,
@@ -10,7 +12,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 
 use crate::control::{ControlClient, ControlFailure, default_socket_path};
-use crate::tools::{ToolDefinition, tool_definitions_for};
+use crate::tools::{ToolDefinition, tool_definitions_for_with_workspace};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(3);
 // The Engine may wait through a first-run trust/login wall before it can
@@ -24,6 +26,7 @@ const WRITE_POLICY: &str = "Reads are open across all sessions. Writes to your p
 pub struct Bridge {
     socket_path: PathBuf,
     caller: Option<String>,
+    workspace_cache: Arc<CodeIntelligenceCache>,
 }
 
 impl Default for Bridge {
@@ -40,6 +43,7 @@ impl Bridge {
         Self {
             socket_path,
             caller,
+            workspace_cache: Arc::new(CodeIntelligenceCache::default()),
         }
     }
 
@@ -61,7 +65,10 @@ impl Bridge {
         kinds.sort();
         kinds.dedup();
         kinds.push("shell".into());
-        Ok(tool_definitions_for(&kinds))
+        Ok(tool_definitions_for_with_workspace(
+            &kinds,
+            self.workspace_tools_available(),
+        ))
     }
 
     pub fn call(&self, tool: &str, arguments: &Value) -> Result<Value, String> {
@@ -73,6 +80,11 @@ impl Bridge {
             "wait_for_agent" => self.wait_for_agent(arguments),
             "read_output" => self.read_output(arguments),
             "get_artifacts" => self.get_artifacts(arguments),
+            tool if is_workspace_tool(tool) => {
+                let cwd = self.caller_workspace_cwd()?;
+                self.workspace_cache
+                    .call_workspace_tool(cwd, tool, arguments)
+            }
             "create_worktree" => self.create_worktree(arguments),
             "list_worktrees" => self.list_worktrees(arguments),
             "remove_worktree" => self.remove_worktree(arguments),
@@ -248,6 +260,32 @@ impl Bridge {
             "artifacts": artifacts,
             "listeningPorts": record.listening_ports,
         }))
+    }
+
+    fn workspace_tools_available(&self) -> bool {
+        let Some(caller) = self.caller.as_deref() else {
+            return false;
+        };
+        self.sessions()
+            .ok()
+            .and_then(|sessions| find_session(&sessions, caller).ok().cloned())
+            .is_some_and(|record| record.host.is_none())
+    }
+
+    fn caller_workspace_cwd(&self) -> Result<String, String> {
+        let caller = self.caller.as_deref().ok_or_else(|| {
+            "workspace tools are scoped to a Diri session and DIRIJOR_SESSION_ID is unset"
+                .to_owned()
+        })?;
+        let sessions = self.sessions()?;
+        let record = find_session(&sessions, caller)?;
+        if record.host.is_some() {
+            return Err(
+                "workspace tools currently require a local Diri session; use the remote agent's shell tools for this repository"
+                    .to_owned(),
+            );
+        }
+        Ok(record.cwd.clone())
     }
 
     fn create_worktree(&self, arguments: &Value) -> Result<Value, String> {

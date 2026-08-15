@@ -1541,6 +1541,7 @@ version = "0.5.1"
 dependencies = [
  "block2 0.6.2",
  "diri-client",
+ "diri-code-intelligence",
  "diri-proto",
  "diri-term",
  "diri-ui",
@@ -1580,11 +1581,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "diri-code-intelligence"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "diri-engine"
 version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
  "base64 0.23.1",
+ "diri-code-intelligence",
  "diri-proto",
  "diri-pty",
  "diri-terminal-state",
@@ -1693,6 +1704,7 @@ version = "0.1.0"
 name = "dirijor-mcp"
 version = "0.1.0"
 dependencies = [
+ "diri-code-intelligence",
  "diri-engine",
  "diri-proto",
  "libc",

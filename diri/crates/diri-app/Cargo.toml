@@ -30,6 +30,7 @@ background-app = false
 
 [dependencies]
 diri-client.workspace = true
+diri-code-intelligence.workspace = true
 diri-proto.workspace = true
 diri-term.workspace = true
 diri-ui.workspace = true

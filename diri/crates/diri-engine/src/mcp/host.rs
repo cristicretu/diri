@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use diri_code_intelligence::{CodeIntelligenceCache, is_workspace_tool};
 use diri_proto::{SessionId, SessionStatus};
 use serde_json::{Value, json};
 
@@ -31,6 +32,7 @@ pub struct RegistryHost {
     holder: Option<crate::session::HolderConfig>,
     /// The session calling these tools, when it identified itself.
     caller: Option<String>,
+    workspace_cache: CodeIntelligenceCache,
 }
 
 impl RegistryHost {
@@ -40,6 +42,7 @@ impl RegistryHost {
             logs_dir: logs_dir.into(),
             holder: None,
             caller: std::env::var(SESSION_ID_ENV).ok(),
+            workspace_cache: CodeIntelligenceCache::default(),
         }
     }
 
@@ -60,6 +63,36 @@ impl RegistryHost {
         self.registry
             .lock()
             .map_err(|_| "engine state is poisoned".to_string())
+    }
+
+    fn caller_workspace_cwd(&self) -> Result<String, String> {
+        let caller = self.caller.as_deref().ok_or_else(|| {
+            format!("workspace tools require an identified Diri session; {SESSION_ID_ENV} is unset")
+        })?;
+        let (cwd, remote) = {
+            let registry = self.registry()?;
+            let record = registry
+                .records()
+                .into_iter()
+                .find(|record| record.id.0 == caller)
+                .ok_or_else(|| format!("no session {caller}"))?;
+            (record.cwd, record.host.is_some())
+        };
+        if remote {
+            return Err(
+                "workspace tools currently require a local Diri session; use the remote agent's shell tools for this repository"
+                    .to_owned(),
+            );
+        }
+        Ok(cwd)
+    }
+
+    pub fn workspace_tools_available(&self) -> bool {
+        self.caller_workspace_cwd().is_ok()
+    }
+
+    pub fn tool_definitions(&self) -> Vec<super::ToolDefinition> {
+        super::tools::tool_definitions_with_workspace(self.workspace_tools_available())
     }
 }
 
@@ -169,6 +202,12 @@ impl ToolHost for RegistryHost {
                     "offset": offset,
                     "output": String::from_utf8_lossy(&bytes),
                 }))
+            }
+
+            tool if is_workspace_tool(tool) => {
+                let cwd = self.caller_workspace_cwd()?;
+                self.workspace_cache
+                    .call_workspace_tool(cwd, tool, arguments)
             }
 
             "release_agent" => {
