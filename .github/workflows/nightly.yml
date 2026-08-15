@@ -57,7 +57,7 @@ jobs:
         run: cargo build --workspace --release
 
   app-linux:
-    name: Release build and GUI smokes (Linux x86_64)
+    name: Full test suite, release build and GUI smokes (Linux x86_64)
     runs-on: ubuntu-22.04
     timeout-minutes: 75
     defaults:
@@ -93,6 +93,12 @@ jobs:
           restore-keys: |
             linux-app-cargo-${{ hashFiles('diri/Cargo.lock') }}-
             linux-app-cargo-
+      # The gate runs clippy on Linux, which type-checks every crate, and runs
+      # the PTY and engine suites natively on 24.04. What it does not do is
+      # execute the whole suite on Linux — that lives here, where a failure
+      # costs a morning rather than every reviewer's afternoon.
+      - name: Test complete Rust workspace natively
+        run: cargo test --locked --workspace -- --nocapture
       - name: Release build
         run: cargo build --locked --workspace --release
       - name: Smoke GUI under X11

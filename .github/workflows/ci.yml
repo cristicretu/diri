@@ -1,17 +1,20 @@
 name: CI
 
-# The pull-request gate has a ten-minute budget. Every job below is expected to
-# finish well inside it; the three of them run in parallel, so the number a
-# reviewer waits on is the slowest one, not the sum.
+# The pull-request gate has a five-minute budget. The three jobs run in
+# parallel, so the number a reviewer waits on is the slowest one:
 #
-#   Rust workspace              macos-15       ~8m
-#   Rust workspace (Linux)      ubuntu-22.04   ~6m
-#   Rust engine (Linux)         ubuntu-24.04   ~2m
+#   Rust workspace              macos-15       ~4m   tests
+#   Lints                       ubuntu-22.04   ~3m   fmt, clippy, scripts
+#   Rust engine (Linux x86_64)  ubuntu-24.04   ~2m   PTY and engine tests
+#
+# Two facts shape this. First, the macOS test step is compile-bound, not
+# test-bound: of its four minutes, three were spent compiling and one running.
+# Second, clippy compiles the same workspace to a different metadata hash, so
+# running it before the tests in one job paid that cost twice, serially.
 #
 # Anything that builds a release profile, packages an artifact, or measures a
-# latency belongs in nightly.yml instead. Those answer "can we ship this?", not
-# "is this change correct?", and they were costing every pull request roughly
-# forty minutes of runner time to answer a question nobody was asking yet.
+# latency belongs in nightly.yml. Those answer "can we ship this?", not "is
+# this change correct?".
 
 on:
   push:
@@ -21,12 +24,21 @@ on:
 permissions:
   contents: read
 
-# A new push supersedes the run it interrupts. macOS runners queue, so without
-# this a branch pushed three times in a row sits behind two runs whose results
-# nobody will read.
+# A new push supersedes the run it interrupts. macOS runners queue — a public
+# repo gets five concurrent — so without this a branch pushed three times in a
+# row sits behind two runs whose results nobody will read.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  # Test binaries are compiled once, run once, and thrown away, and full debug
+  # info is the most expensive artifact CI produces that nothing ever reads.
+  # line-tables-only still gives a panic a file and a line number, which is the
+  # only part of a backtrace anyone looks at in a CI log.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  CARGO_TERM_COLOR: always
 
 jobs:
   # Required check: "Rust workspace". Renaming this job dangles the branch
@@ -49,8 +61,51 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             diri/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('diri/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('diri/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-test-
+      # This job does one thing. Every second it spends on something other than
+      # compiling and running the tests is a second on the critical path of
+      # every pull request.
+      - name: Test
+        run: cargo test --workspace
+
+  lints:
+    name: Lints
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: diri
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The GUI crate links against these even when only checked, so the list
+      # stays whether or not a window is ever opened. weston, xvfb and the
+      # Vulkan drivers moved to nightly with the smoke tests that use them.
+      - name: Install GPUI build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential clang cmake libasound2-dev libfontconfig-dev \
+            libglib2.0-dev libssl-dev libstdc++-12-dev libwayland-dev \
+            libx11-xcb-dev libxkbcommon-x11-dev pkg-config
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            diri/target
+          key: linux-lint-cargo-${{ hashFiles('diri/Cargo.lock') }}
+          restore-keys: linux-lint-cargo-
+      # Lints are platform-independent, so they run on the cheap runner rather
+      # than lengthening the macOS job. Doing them here also keeps the Linux
+      # build honest: clippy type-checks the whole workspace, so a change that
+      # only fails to compile on Linux still fails this gate even though the
+      # full Linux test suite now runs nightly.
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Validate shell and release scripts
         run: |
           bash -n ../scripts/*.sh scripts/*.sh
@@ -59,65 +114,13 @@ jobs:
           bash scripts/test-publish-homebrew-cask.sh
       - name: Check dependency license policy
         run: python3 ../scripts/check-licenses.py
-      # Lints run here and only here. They were duplicated on the Linux job,
-      # which spent three minutes re-deriving a verdict this job had already
-      # reached on the same source.
-      - name: Format
-        run: cargo fmt --all -- --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Test
-        run: cargo test --workspace
-
-  app-linux:
-    name: Rust workspace (Linux x86_64)
-    runs-on: ubuntu-22.04
-    timeout-minutes: 25
-    defaults:
-      run:
-        working-directory: diri
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # The GUI crate links against these even when only its tests are built,
-      # so the list stays whether or not a window is ever opened. weston, xvfb
-      # and the Vulkan drivers moved to nightly with the smoke tests that use
-      # them.
-      - name: Install GPUI build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes \
-            build-essential clang cmake libasound2-dev libfontconfig-dev \
-            libglib2.0-dev libssl-dev libstdc++-12-dev libwayland-dev \
-            libx11-xcb-dev libxkbcommon-x11-dev pkg-config
-      - name: Report Linux environment
-        run: |
-          cat /etc/os-release
-          uname -a
-          rustc --version --verbose
-          ldd --version | head -1
-      - name: Cache cargo registry and target
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            diri/target
-          key: linux-app-cargo-${{ hashFiles('diri/Cargo.lock') }}-${{ github.event.pull_request.head.sha || github.sha }}
-          restore-keys: |
-            linux-app-cargo-${{ hashFiles('diri/Cargo.lock') }}-
-            linux-app-cargo-
-      # This job exists for the places Linux and macOS genuinely disagree —
-      # process groups, inherited descriptors, EIO at EOF — not to re-run the
-      # lints. Debug profile only; the release build and the GUI smokes it
-      # feeds are nightly work.
-      - name: Test complete Rust workspace natively
-        run: cargo test --locked --workspace -- --nocapture
 
   # Required check: "Rust engine (Linux x86_64)". Same warning as above about
   # renaming. Ubuntu 24.04 is the point of this job rather than an accident:
-  # it is the only newer-glibc coverage in the gate, and the PTY suite it runs
-  # exercises openpty/ioctl/SIGWINCH against real child processes. It needs no
-  # apt packages, so it costs about a minute.
+  # it is the only newer-glibc coverage in the gate, and it runs the suites
+  # where Linux and macOS genuinely disagree — process groups, inherited
+  # descriptors, EIO at EOF — against real child processes. It needs no apt
+  # packages, so it costs about two minutes.
   engine-linux:
     name: Rust engine (Linux x86_64)
     runs-on: ubuntu-24.04
@@ -132,6 +135,7 @@ jobs:
           cat /etc/os-release
           uname -a
           rustc --version --verbose
+          ldd --version | head -1
       - name: Cache cargo registry and target
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
