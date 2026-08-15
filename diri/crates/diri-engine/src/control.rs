@@ -3376,18 +3376,22 @@ fn screen_settled(registry: &Arc<Mutex<Registry>>, session_id: &str) -> bool {
 ///
 /// It has to be a WHOLE word, not a leading slice: composers soft-wrap, and
 /// wrapping happens at word boundaries, so any prefix of the prompt can be
-/// split across two screen lines while a single word survives intact. It also
-/// has to be absent from `before`, or a word the banner already displays
-/// would read as an echo the instant we looked. `None` when the prompt offers
-/// nothing that qualifies — a prompt made entirely of words already on
-/// screen, or of words too long to escape wrapping.
+/// split across two screen lines while a single word survives intact. Prefer
+/// the earliest line that offers a usable word because Codex collapses long
+/// pasted prompts to a leading summary; a probe from the middle can disappear
+/// even though the composer accepted the paste. The word also has to be absent
+/// from `before`, or a word the banner already displays would read as an echo
+/// the instant we looked. `None` when the prompt offers nothing that qualifies
+/// — a prompt made entirely of words already on screen, or of words too long
+/// to escape wrapping.
 fn verification_probe(prompt: &str, before: &str) -> Option<String> {
-    prompt
-        .split_whitespace()
-        .filter(|word| (MIN_PROBE_CHARS..=MAX_PROBE_CHARS).contains(&word.chars().count()))
-        .filter(|word| !before.contains(*word))
-        .max_by_key(|word| word.chars().count())
-        .map(str::to_owned)
+    prompt.lines().find_map(|line| {
+        line.split_whitespace()
+            .filter(|word| (MIN_PROBE_CHARS..=MAX_PROBE_CHARS).contains(&word.chars().count()))
+            .filter(|word| !before.contains(*word))
+            .max_by_key(|word| word.chars().count())
+            .map(str::to_owned)
+    })
 }
 
 /// Short words appear by coincidence; long ones are the ones a narrow

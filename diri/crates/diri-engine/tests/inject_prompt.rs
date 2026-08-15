@@ -303,3 +303,53 @@ fn a_prompt_swallowed_behind_a_repainting_banner_still_lands() {
 
     control.request("session.kill", json!({ "sessionID": id }));
 }
+
+/// Codex collapses long pasted prompts in its composer. The visible summary
+/// keeps the first line but can omit a probe chosen from the middle of the
+/// prompt. Once Enter submits that accepted paste, losing the middle probe
+/// from the viewport must not make the injector submit the prompt again.
+#[test]
+fn a_collapsed_long_prompt_is_submitted_once() {
+    let temp = tempfile::tempdir().expect("temp");
+    let server = start_server(temp.path());
+    let mut control = Control::connect(&server);
+
+    let prompt = "Verify PR 5669\nhidden-probe-1234567\nprint the final report";
+    let framed_len = prompt.len() + "\x1b[200~".len() + "\x1b[201~".len();
+    let script = format!(
+        r#"stty -echo -icanon min 1 time 0
+printf '\033[?2004hREADY'
+dd if=/dev/stdin of=/dev/null bs=1 count={framed_len} 2>/dev/null
+printf '\r\033[2KVerify PR 5669'
+dd if=/dev/stdin of=/dev/null bs=1 count=1 2>/dev/null
+printf '\r\033[2KSUBMISSIONS=1'
+dd if=/dev/stdin of=/dev/null bs=1 count=1 2>/dev/null
+dd if=/dev/stdin of=/dev/null bs=1 count={framed_len} 2>/dev/null
+printf '\r\033[2KVerify PR 5669'
+dd if=/dev/stdin of=/dev/null bs=1 count=1 2>/dev/null
+printf '\r\033[2KSUBMISSIONS=2 hidden-probe-1234567'
+while :; do sleep 1; done"#
+    );
+    let id = spawn(
+        &mut control,
+        // Simulate a raw-mode TUI that renders only the first line while a
+        // bracketed paste is in its composer. After submission it replaces
+        // that summary with a counter. The second submission exposes the
+        // hidden middle probe so the buggy retry loop terminates quickly.
+        &script,
+        "/bin/bash",
+        prompt,
+    );
+
+    let text = screen(&mut control, &id);
+    assert!(
+        text.contains("SUBMISSIONS=1"),
+        "an accepted collapsed prompt was submitted more than once: {text:?}"
+    );
+    assert!(
+        !text.contains("hidden-probe-1234567"),
+        "the injector retried until its off-screen probe appeared: {text:?}"
+    );
+
+    control.request("session.kill", json!({ "sessionID": id }));
+}
