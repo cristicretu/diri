@@ -4676,10 +4676,15 @@ mod tests {
     /// entity root is laid out independently of its content, so mount the
     /// surfaces the way the app does -- not bare -- and a root that cannot size
     /// itself fails here instead of on screen.
+    ///
+    /// Only the screenshot fixtures mount a surface this way now; the settings
+    /// tests compose it against a real sidebar, which is what the window does.
+    #[cfg(target_os = "macos")]
     struct CachedOverlayHarness {
         surfaces: Entity<UtilitySurfaces>,
     }
 
+    #[cfg(target_os = "macos")]
     impl Render for CachedOverlayHarness {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             div().size_full().child(

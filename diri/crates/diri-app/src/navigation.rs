@@ -1508,10 +1508,13 @@ mod tests {
     use gpui::HeadlessAppContext;
     use gpui::{Entity, ScrollDelta, ScrollWheelEvent, TestAppContext, point};
 
+    /// Mounted only by the screenshot fixture, which is macOS-only.
+    #[cfg(target_os = "macos")]
     struct CommandPalettePreviewHarness {
         overlay: Entity<NavigationOverlay>,
     }
 
+    #[cfg(target_os = "macos")]
     impl Render for CommandPalettePreviewHarness {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             div()
