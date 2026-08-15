@@ -182,6 +182,11 @@ const LOG_READ_BUDGET: usize = 512 << 10;
 /// twice within one frame is not two observations worth having.
 const EVAL_INTERVAL: Duration = Duration::from_millis(16);
 
+/// How far ahead of the pump a subscription may start and still be worth
+/// taking. Beyond this the file is followed instead, which costs latency for a
+/// moment rather than churning subscriptions that cannot be read yet.
+const LIVE_HANDOVER_GAP: u64 = 256 << 10;
+
 /// What a session looks like from the outside.
 #[derive(Clone, Debug)]
 pub struct SessionView {
@@ -2717,8 +2722,18 @@ fn pump_held(
         // a drained log keeps the handover to a few frames.
         if live.is_none() && drained {
             if let Ok(Some(stream)) = client.open_output_stream() {
+                // A drained log does not mean the holder is where the log
+                // ends: writes are queued, so it can be megabytes further on.
+                // Subscribing across that distance is the worst case — the
+                // holder fills a queue this loop cannot read until the file
+                // catches up, then drops it for being full, and both ends
+                // repeat. Take the subscription only when the gap is small
+                // enough to close immediately, and otherwise keep tailing and
+                // try again the next time the log runs dry.
                 live_from = stream.start_offset();
-                live = Some(stream);
+                if live_from.saturating_sub(offset) <= LIVE_HANDOVER_GAP {
+                    live = Some(stream);
+                }
             }
             drained = false;
         }

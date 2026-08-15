@@ -416,9 +416,17 @@ fn broadcast_output(shared: &Shared, frame: &Arc<[u8]>) {
     if fanout.subscribers.is_empty() {
         return;
     }
-    fanout
-        .subscribers
-        .retain(|subscriber| offer_frame(subscriber, offset, frame));
+    fanout.subscribers.retain(|subscriber| {
+        if offer_frame(subscriber, offset, frame) {
+            return true;
+        }
+        // Closing is what makes dropping visible. Letting the subscriber go
+        // only releases this end of the queue; its writer would keep waiting
+        // on the other, holding the socket open, and the daemon would wait for
+        // frames that are never coming instead of falling back to the log.
+        subscriber.frames.close();
+        false
+    });
 }
 
 /// Offers one frame to a subscriber, waiting only as long as
@@ -535,6 +543,15 @@ fn watch_exit(shared: &Shared, pump: std::thread::JoinHandle<()>) {
         let mut log = shared.log.lock().expect("log");
         let _ = log.append(&HolderExitMarker::encode(&exit));
         let _ = log.flush();
+    }
+
+    // The marker goes to the log, not the stream — it is not PTY output — so a
+    // subscriber would otherwise keep waiting for frames from a child that has
+    // already gone, and learn of the exit only when this process finally
+    // closed its socket. Ending the subscription sends it back to the log,
+    // where the marker is already durable.
+    for subscriber in shared.output.lock().expect("output").subscribers.drain(..) {
+        subscriber.frames.close();
     }
 
     let _ = std::fs::remove_file(&shared.spec.socket_path);
