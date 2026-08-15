@@ -122,11 +122,30 @@ struct ConnectView: View {
                 .font(Tokens.Typo.row)
                 .foregroundStyle(Tokens.Ink.secondary)
 
-            TextField("http://forge:7380/?token=…", text: $link, axis: .vertical)
-                .lineLimit(2 ... 5)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .font(Tokens.Typo.metaMono)
+            // The placeholder is a sibling rather than a `prompt:` or an
+            // overlay on the field. `prompt:`'s colour is ignored on iOS, and a
+            // URL-shaped placeholder then renders in the system link blue,
+            // which reads as a field that is already filled in.
+            ZStack(alignment: .leading) {
+                if link.isEmpty {
+                    Text("http://forge:7380/?token=…")
+                        .font(Tokens.Typo.metaMono)
+                        // This string is a URL, so SwiftUI data-detects it and
+                        // styles it as a link — and link styling takes its
+                        // colour from `tint`, not `foregroundStyle`. Setting
+                        // both is what actually makes it read as a placeholder
+                        // rather than as a field already filled in.
+                        .foregroundStyle(Color(white: 0.55))
+                        .tint(Color(white: 0.55))
+                        .allowsHitTesting(false)
+                }
+                TextField("", text: $link, axis: .vertical)
+                    .lineLimit(2 ... 5)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .foregroundStyle(Tokens.Ink.primary)
+                    .font(Tokens.Typo.metaMono)
+            }
                 .padding(12)
                 .background(
                     RoundedRectangle(cornerRadius: Tokens.Radius.card, style: .continuous)
