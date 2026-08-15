@@ -354,6 +354,17 @@ impl HolderExitMarker {
         marker
     }
 
+    /// Whether a chunk can go straight to the emulator.
+    ///
+    /// True when it holds no marker and does not end in something that could
+    /// become one, which is every chunk of ordinary output. The caller can
+    /// then feed the bytes where they lie instead of copying them through an
+    /// accumulator to have the same bytes handed back.
+    #[must_use]
+    pub fn absent_from(chunk: &[u8]) -> bool {
+        find(chunk, Self::PREFIX).is_none() && longest_suffix_of_prefix(chunk) == 0
+    }
+
     /// Pulls complete output and markers from a chunk accumulator. A possible
     /// split marker prefix stays buffered for the next append. Returns the
     /// displayable bytes and the last complete exit status found, if any.
@@ -394,9 +405,20 @@ impl HolderExitMarker {
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+    // Anchored on the first byte rather than comparing the whole needle at
+    // every offset. Every byte of every session's output passes through here,
+    // and a nineteen-byte window comparison per position was costing more than
+    // parsing the bytes did.
+    let (first, rest) = needle.split_first()?;
+    let mut offset = 0;
+    while let Some(hit) = haystack[offset..].iter().position(|byte| byte == first) {
+        let start = offset + hit;
+        if haystack[start + 1..].starts_with(rest) {
+            return Some(start);
+        }
+        offset = start + 1;
+    }
+    None
 }
 
 fn longest_suffix_of_prefix(data: &[u8]) -> usize {

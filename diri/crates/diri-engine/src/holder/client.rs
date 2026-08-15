@@ -202,24 +202,29 @@ impl HolderOutputStream {
     }
 
     /// Blocks up to `timeout` for the next frame, then folds in every frame
-    /// already waiting behind it, up to `budget` bytes.
+    /// already waiting behind it, into `run`, up to `budget` bytes.
     ///
-    /// Frames are PTY-sized, and the pump's per-pass work — locking the
-    /// screen, checking timers, publishing — is charged per call rather than
-    /// per byte. Handing back one large contiguous run instead of a dozen
-    /// small ones is worth several times the throughput, and costs nothing:
-    /// only frames that had already arrived are folded in.
-    pub fn next_run(
+    /// Frames are PTY-sized while the caller's per-pass work — locking the
+    /// screen, checking timers, publishing — is charged per call, so handing
+    /// back one large contiguous run instead of a dozen small ones is worth
+    /// several times the throughput. `run` is the caller's buffer and is
+    /// reused, because allocating one per frame and copying into it charged
+    /// every byte of output an allocation and a copy it did not need.
+    ///
+    /// Returns the offset the run begins at.
+    pub fn next_run_into(
         &mut self,
         timeout: Duration,
         budget: usize,
-    ) -> HolderResult<Option<(u64, Vec<u8>)>> {
-        let Some((offset, mut payload)) = self.next_frame(timeout)? else {
+        run: &mut Vec<u8>,
+    ) -> HolderResult<Option<u64>> {
+        run.clear();
+        let Some(offset) = self.read_frame_into(timeout, run)? else {
             return Ok(None);
         };
-        while payload.len() < budget {
-            match self.next_frame(Duration::ZERO) {
-                Ok(Some((_, mut more))) => payload.append(&mut more),
+        while run.len() < budget {
+            match self.read_frame_into(Duration::ZERO, run) {
+                Ok(Some(_)) => {}
                 Ok(None) => break,
                 // A frame that fails mid-run leaves the stream unusable, but
                 // what was already read is contiguous and safe to return; the
@@ -227,32 +232,48 @@ impl HolderOutputStream {
                 Err(_) => break,
             }
         }
-        Ok(Some((offset, payload)))
+        Ok(Some(offset))
     }
 
-    /// Blocks up to `timeout` for the next frame, returning its stream offset
-    /// and payload.
-    ///
-    /// `Ok(None)` means nothing arrived in time — the child is simply quiet.
-    /// `Err` means the stream is finished or broken, and the caller must go
-    /// back to the log, which has everything.
-    pub fn next_frame(&mut self, timeout: Duration) -> HolderResult<Option<(u64, Vec<u8>)>> {
+    /// Reads one frame onto the end of `run`, returning where it began.
+    fn read_frame_into(
+        &mut self,
+        timeout: Duration,
+        run: &mut Vec<u8>,
+    ) -> HolderResult<Option<u64>> {
         // A zero `SO_RCVTIMEO` means "no timeout", which would block forever;
         // the shortest expressible wait is what "poll" has to mean here.
         let timeout = timeout.max(Duration::from_nanos(1));
-        self.set_timeout(Some(timeout))?;
         let mut header = [0_u8; 12];
-        match self.stream.read_exact(&mut header) {
-            Ok(()) => {}
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                return Ok(None);
+        let mut filled = 0;
+        while filled < header.len() {
+            // The timeout applies only while waiting for a frame to begin.
+            // Once any byte of one has arrived the rest is awaited without a
+            // deadline: abandoning a frame halfway leaves those bytes consumed
+            // and the stream desynchronized, and the next read would take
+            // whatever followed for a header — a length that never arrives,
+            // and a read that blocks until the holder exits.
+            self.set_timeout(if filled == 0 { Some(timeout) } else { None })?;
+            match self.stream.read(&mut header[filled..]) {
+                Ok(0) => {
+                    return Err(HolderError::io(
+                        "read output stream",
+                        std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
+                    ));
+                }
+                Ok(read) => filled += read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error)
+                    if filled == 0
+                        && matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                {
+                    return Ok(None);
+                }
+                Err(error) => return Err(HolderError::io("read output stream", error)),
             }
-            Err(error) => return Err(HolderError::io("read output stream", error)),
         }
         let offset = u64::from_be_bytes(header[..8].try_into().expect("eight-byte offset"));
         let length = u32::from_be_bytes(header[8..].try_into().expect("four-byte length")) as usize;
@@ -264,11 +285,12 @@ impl HolderOutputStream {
         // The rest of a frame that has started must arrive: a timeout here
         // would strand half of it and desynchronize the stream.
         self.set_timeout(None)?;
-        let mut payload = vec![0_u8; length];
+        let from = run.len();
+        run.resize(from + length, 0);
         self.stream
-            .read_exact(&mut payload)
+            .read_exact(&mut run[from..])
             .map_err(|error| HolderError::io("read output frame", error))?;
-        Ok(Some((offset, payload)))
+        Ok(Some(offset))
     }
 }
 

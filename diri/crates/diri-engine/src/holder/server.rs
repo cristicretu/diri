@@ -211,6 +211,12 @@ impl HolderServer {
                 Ok(request) if request.op == HolderOperation::OutputStream => {
                     if request.stream_version != Some(HOLDER_OUTPUT_STREAM_VERSION) {
                         HolderResponse::failure("unsupported Holder output stream version")
+                    } else if shared.finished.load(Ordering::SeqCst) {
+                        // Nothing will ever be streamed again, and the log is
+                        // complete including the exit marker. Accepting here
+                        // would leave the subscriber waiting on a stream that
+                        // is over while the marker sat unread in the file.
+                        HolderResponse::failure("holder has finished")
                     } else {
                         // Registered under the same lock that hands out frames,
                         // so the offset quoted here is exactly where this
