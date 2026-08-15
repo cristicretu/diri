@@ -12,14 +12,16 @@ use serde_json::{Map, Value, json};
 use crate::control::{ControlClient, ControlFailure, default_socket_path};
 use crate::tools::{ToolDefinition, tool_definitions_for};
 
+mod policy;
+
+use policy::{McpPolicy, WRITE_POLICY, WriteAction};
+
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(3);
 // The Engine may wait through a first-run trust/login wall before it can
 // confirm an initial prompt. Keep the MCP request alive longer than the
 // Engine's bounded delivery window so callers receive its delivery result,
 // rather than a client-side timeout while the session continues in limbo.
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(300);
-const WRITE_POLICY: &str = "Reads are open across all sessions. Writes to your parent or direct children are delivered verbatim; writes to anyone else are attributed to you. You cannot send_prompt to yourself, and release_agent refuses to kill you or any ancestor.";
-
 #[derive(Clone, Debug)]
 pub struct Bridge {
     socket_path: PathBuf,
@@ -77,7 +79,7 @@ impl Bridge {
             "list_worktrees" => self.list_worktrees(arguments),
             "remove_worktree" => self.remove_worktree(arguments),
             "release_agent" => self.release_agent(arguments),
-            "test_run" => self.request("test.run", arguments.clone(), Duration::from_secs(180)),
+            "test_run" => self.test_run(arguments),
             "browser" => self.browser(arguments),
             "whoami" => self.whoami(),
             "list_children" => self.list_children(arguments),
@@ -105,12 +107,21 @@ impl Bridge {
     }
 
     fn sessions(&self) -> Result<Vec<SessionRecord>, String> {
-        let list: SessionListResult =
-            self.request_typed(Method::SESSION_LIST, json!({}), DEFAULT_TIMEOUT)?;
-        Ok(list.sessions)
+        Ok(self.snapshot()?.sessions)
+    }
+
+    fn snapshot(&self) -> Result<SessionListResult, String> {
+        self.request_typed(Method::SESSION_LIST, json!({}), DEFAULT_TIMEOUT)
     }
 
     fn spawn_agent(&self, arguments: &Value) -> Result<Value, String> {
+        let snapshot = self.snapshot()?;
+        McpPolicy::new(
+            &snapshot.sessions,
+            &snapshot.projects,
+            self.caller.as_deref(),
+        )?
+        .authorize(WriteAction::Spawn)?;
         let requested = required_string(arguments, "kind")?;
         let readiness: AgentReadinessResult =
             self.request_typed(Method::AGENT_READINESS, json!({}), DEFAULT_TIMEOUT)?;
@@ -150,15 +161,15 @@ impl Bridge {
         let id = required_string(arguments, "session_id")?;
         let text = required_string(arguments, "text")?;
         let submit = optional_bool(arguments, "submit").unwrap_or(true);
-        let sessions = self.sessions()?;
-        let lineage = Lineage::new(&sessions, self.caller.as_deref());
-        let relation = lineage.relation(&id);
-        if relation == Relation::Caller {
-            return Err(format!(
-                "send_prompt cannot target the calling session ({id}); answer normally instead"
-            ));
-        }
-        let delivered = lineage.frame(&text, relation);
+        let snapshot = self.snapshot()?;
+        let authorized = McpPolicy::new(
+            &snapshot.sessions,
+            &snapshot.projects,
+            self.caller.as_deref(),
+        )?
+        .authorize(WriteAction::SendPrompt { target: &id })?;
+        let relation = authorized.relation();
+        let delivered = authorized.frame(&text);
         self.request(
             Method::SESSION_SEND_TEXT,
             json!({"sessionID": id, "text": delivered, "submit": submit}),
@@ -251,10 +262,18 @@ impl Bridge {
     }
 
     fn create_worktree(&self, arguments: &Value) -> Result<Value, String> {
+        let repo = required_string(arguments, "repo")?;
+        let snapshot = self.snapshot()?;
+        McpPolicy::new(
+            &snapshot.sessions,
+            &snapshot.projects,
+            self.caller.as_deref(),
+        )?
+        .authorize(WriteAction::Worktree { repo: &repo })?;
         self.request(
             Method::WORKTREE_CREATE,
             json!({
-                "repoPath": required_string(arguments, "repo")?,
+                "repoPath": repo,
                 "branch": optional_string(arguments, "branch"),
                 "base": optional_string(arguments, "base"),
             }),
@@ -271,10 +290,18 @@ impl Bridge {
     }
 
     fn remove_worktree(&self, arguments: &Value) -> Result<Value, String> {
+        let repo = required_string(arguments, "repo")?;
+        let snapshot = self.snapshot()?;
+        McpPolicy::new(
+            &snapshot.sessions,
+            &snapshot.projects,
+            self.caller.as_deref(),
+        )?
+        .authorize(WriteAction::Worktree { repo: &repo })?;
         self.request(
             Method::WORKTREE_REMOVE,
             json!({
-                "repoPath": required_string(arguments, "repo")?,
+                "repoPath": repo,
                 "worktreePath": required_string(arguments, "path")?,
                 "force": optional_bool(arguments, "force").unwrap_or(false),
             }),
@@ -285,17 +312,13 @@ impl Bridge {
 
     fn release_agent(&self, arguments: &Value) -> Result<Value, String> {
         let id = required_string(arguments, "session_id")?;
-        let sessions = self.sessions()?;
-        let relation = Lineage::new(&sessions, self.caller.as_deref()).relation(&id);
-        match relation {
-            Relation::Caller => return Err("release_agent cannot terminate its caller".into()),
-            Relation::Parent | Relation::Ancestor => {
-                return Err(
-                    "release_agent cannot terminate the session waiting on this result".into(),
-                );
-            }
-            _ => {}
-        }
+        let snapshot = self.snapshot()?;
+        McpPolicy::new(
+            &snapshot.sessions,
+            &snapshot.projects,
+            self.caller.as_deref(),
+        )?
+        .authorize(WriteAction::Release { target: &id })?;
         self.request(
             Method::SESSION_KILL,
             json!({"sessionID": id}),
@@ -305,9 +328,14 @@ impl Bridge {
     }
 
     fn browser(&self, arguments: &Value) -> Result<Value, String> {
-        let caller = self.caller.as_ref().ok_or_else(|| {
-            "browser is scoped to a Diri session and DIRIJOR_SESSION_ID is unset".to_owned()
-        })?;
+        let snapshot = self.snapshot()?;
+        McpPolicy::new(
+            &snapshot.sessions,
+            &snapshot.projects,
+            self.caller.as_deref(),
+        )?
+        .authorize(WriteAction::Browser)?;
+        let caller = self.caller.as_ref().expect("policy requires a caller");
         required_string(arguments, "action")?;
         let mut params = arguments.as_object().cloned().unwrap_or_default();
         params.insert("sessionID".into(), json!(caller));
@@ -316,6 +344,17 @@ impl Bridge {
             Value::Object(params),
             Duration::from_secs(60),
         )
+    }
+
+    fn test_run(&self, arguments: &Value) -> Result<Value, String> {
+        let snapshot = self.snapshot()?;
+        McpPolicy::new(
+            &snapshot.sessions,
+            &snapshot.projects,
+            self.caller.as_deref(),
+        )?
+        .authorize(WriteAction::TestRun)?;
+        self.request("test.run", arguments.clone(), Duration::from_secs(180))
     }
 
     fn whoami(&self) -> Result<Value, String> {
@@ -507,8 +546,8 @@ impl Bridge {
 
     fn report_to_parent(&self, arguments: &Value) -> Result<Value, String> {
         let caller = self.require_caller()?.to_owned();
-        let sessions = self.sessions()?;
-        let lineage = Lineage::new(&sessions, Some(&caller));
+        let snapshot = self.snapshot()?;
+        let lineage = Lineage::new(&snapshot.sessions, Some(&caller));
         let record = lineage
             .record(&caller)
             .ok_or_else(|| format!("no session record for {caller}"))?;
@@ -517,9 +556,12 @@ impl Bridge {
             .as_ref()
             .map(|id| id.0.clone())
             .ok_or_else(|| "this session has no parent to report to".to_owned())?;
-        if lineage.record(&parent).is_none() {
-            return Err(format!("parent session {parent} is gone"));
-        }
+        McpPolicy::new(
+            &snapshot.sessions,
+            &snapshot.projects,
+            self.caller.as_deref(),
+        )?
+        .authorize(WriteAction::ReportToParent { target: &parent })?;
         let status = optional_string(arguments, "status").unwrap_or_else(|| "update".into());
         if !matches!(status.as_str(), "update" | "done" | "blocked" | "failed") {
             return Err(format!("invalid report status: {status}"));
@@ -847,22 +889,6 @@ impl<'a> Lineage<'a> {
         }
         Relation::Unrelated
     }
-
-    fn frame(&self, text: &str, relation: Relation) -> String {
-        let Some(caller) = self.caller else {
-            return text.to_owned();
-        };
-        if relation.delivers_verbatim() {
-            return text.to_owned();
-        }
-        let who = self.record(caller).map_or_else(
-            || format!("id:{caller}"),
-            |record| format!("id:{caller} ({})", record.title),
-        );
-        format!(
-            "[message from {who}, channel: dirijor — reply with send_prompt to that id]\n\n{text}"
-        )
-    }
 }
 
 fn child_subset<'a>(
@@ -939,7 +965,7 @@ mod tests {
     }
 
     #[test]
-    fn lineage_protects_and_attributes_cross_session_writes() {
+    fn lineage_classifies_session_relationships() {
         let records = vec![
             record("root", None),
             record("caller", Some("root")),
@@ -950,12 +976,6 @@ mod tests {
         assert_eq!(lineage.relation("root"), Relation::Parent);
         assert_eq!(lineage.relation("child"), Relation::Child);
         assert_eq!(lineage.relation("sibling"), Relation::Sibling);
-        assert_eq!(lineage.frame("hello", Relation::Child), "hello");
-        assert!(
-            lineage
-                .frame("hello", Relation::Sibling)
-                .starts_with("[message from id:caller")
-        );
     }
 
     #[test]

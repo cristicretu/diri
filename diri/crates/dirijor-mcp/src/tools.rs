@@ -59,7 +59,7 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
         ),
         ToolDefinition::new(
             "send_prompt",
-            "Type into another session and optionally press Enter. Messages outside the direct parent-child channel are attributed to their sender.",
+            "Type into an authorized session and optionally press Enter. Delegated agents may message their parent or direct children; root agents may coordinate their project. Cross-lineage messages are attributed to their sender.",
             json!({
                 "type": "object",
                 "properties": {
@@ -103,7 +103,7 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
         ),
         ToolDefinition::new(
             "create_worktree",
-            "Create a git worktree so parallel work does not collide in one checkout.",
+            "Create a git worktree in the calling session's project so parallel work does not collide in one checkout.",
             json!({
                 "type": "object",
                 "properties": {
@@ -121,7 +121,7 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
         ),
         ToolDefinition::new(
             "remove_worktree",
-            "Remove a git worktree from a repository.",
+            "Remove a git worktree from the calling session's project.",
             json!({
                 "type": "object",
                 "properties": {
@@ -134,7 +134,7 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
         ),
         ToolDefinition::new(
             "release_agent",
-            "Terminate an agent session. The caller, its parent, and its ancestors are protected from accidental release.",
+            "Terminate an authorized agent session. Delegated agents may release direct children; root agents may release sessions in their project. The caller and its ancestors are protected.",
             session_id_schema(),
         ),
         ToolDefinition::new(

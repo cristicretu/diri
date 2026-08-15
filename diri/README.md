@@ -44,6 +44,17 @@ dirijor session fork <session-id-or-title>
 Fork support is capability-driven: it is offered only when the selected agent
 manifest declares a native fork command.
 
+## MCP authorization
+
+The bundled MCP bridge evaluates every write against a fresh Engine snapshot.
+Reads remain fleet-wide, but writes require a live `DIRIJOR_SESSION_ID`: a
+root agent may coordinate sessions in its project, while a delegated agent may
+message its parent or direct children and may release only direct children.
+Worktree writes are limited to the calling session's project. Unhosted MCP
+processes and stale, archived, or exited callers fail closed; user automation
+outside a session should use the regular `dirijor session` and `dirijor
+worktree` commands instead.
+
 ## Install
 
 ```sh

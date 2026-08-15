@@ -10,6 +10,10 @@ use std::time::{Duration, Instant};
 use diri_engine::control::ControlServer;
 use diri_engine::detect::ManifestEngine;
 use diri_engine::registry::Registry;
+use diri_proto::{
+    AgentKind, DateMillis, Project, Resumability, SessionId, SessionRecord, SessionStatus,
+    TitleSource,
+};
 use dirijor_mcp::Bridge;
 use serde_json::json;
 
@@ -57,7 +61,7 @@ fn large_markdown_prompt() -> String {
     section.repeat(72)
 }
 
-fn start_server(temp: &Path, fixture: &Path) -> Arc<ControlServer> {
+fn start_server(temp: &Path, fixture: &Path, parent_cwd: &Path) -> Arc<ControlServer> {
     let manifests = temp.join("manifests");
     std::fs::create_dir_all(&manifests).expect("create manifests");
     std::fs::write(
@@ -79,10 +83,45 @@ fn start_server(temp: &Path, fixture: &Path) -> Arc<ControlServer> {
     let (engine, failures) = ManifestEngine::load_dir(&manifests).expect("load manifests");
     assert!(failures.is_empty(), "manifest failures: {failures:?}");
 
-    let registry = Arc::new(Mutex::new(Registry::new(
-        Arc::new(engine),
-        temp.join("state.json"),
-    )));
+    let mut registry = Registry::new(Arc::new(engine), temp.join("state.json"));
+    let project: Project =
+        serde_json::from_value(registry.add_project(parent_cwd.to_string_lossy().as_ref()))
+            .expect("parent project");
+    let now = DateMillis::from(std::time::SystemTime::now());
+    registry.insert_record(SessionRecord {
+        id: SessionId::new("s_parent"),
+        kind: AgentKind::CODEX,
+        cwd: parent_cwd.to_string_lossy().into_owned(),
+        project_id: project.id,
+        worktree_path: None,
+        git_branch: None,
+        title: "parent".into(),
+        title_source: TitleSource::Placeholder,
+        originating_prompt: None,
+        agent_session_id: None,
+        transcript_path: None,
+        status: SessionStatus::Idle,
+        status_evidence: None,
+        needs_input: None,
+        resumability: Resumability::Live,
+        capabilities: None,
+        parent: None,
+        created_at: now,
+        updated_at: now,
+        last_turn_completed_at: None,
+        last_seen_at: None,
+        pinned: false,
+        archived_at: None,
+        host: None,
+        remote_persistence: None,
+        hibernation: None,
+        memory_bytes: None,
+        artifacts: None,
+        pull_requests: None,
+        listening_ports: None,
+        foreground_agent: None,
+    });
+    let registry = Arc::new(Mutex::new(registry));
     let server = Arc::new(
         ControlServer::new(registry, temp.join("daemon.sock")).with_logs_dir(temp.join("logs")),
     );
@@ -177,7 +216,7 @@ fn spawn_agent_waits_for_a_large_multiline_prompt_in_a_new_worktree() {
     std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o700))
         .expect("make fixture executable");
 
-    let server = start_server(temp.path(), &fixture);
+    let server = start_server(temp.path(), &fixture, &repo);
     let bridge = Bridge::new(server.socket_path().to_path_buf(), Some("s_parent".into()));
     let started = Instant::now();
     let spawned = call_spawn_agent_through_mcp(

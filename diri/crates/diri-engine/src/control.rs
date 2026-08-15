@@ -3179,16 +3179,6 @@ fn prepare_agent_input(
     Ok(())
 }
 
-pub(crate) fn prepare_agent_input_for_spawn(
-    registry: &Arc<Mutex<Registry>>,
-    session_id: &str,
-    accept_claude_workspace: bool,
-    prompt: Option<&str>,
-) -> Result<(), String> {
-    prepare_agent_input(registry, session_id, accept_claude_workspace, prompt)
-        .map_err(|failure| failure.to_string())
-}
-
 #[derive(Clone, Copy, Debug)]
 enum InitialPromptFailure {
     SessionEnded,
