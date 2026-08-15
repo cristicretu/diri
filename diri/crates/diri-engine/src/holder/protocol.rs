@@ -45,6 +45,19 @@ pub const HOLDER_STREAM_RESIZE: u8 = 2;
 pub const HOLDER_STREAM_ACK: u8 = 0;
 pub const HOLDER_STREAM_MAX_PAYLOAD: usize = 1 << 20;
 
+/// One-way output protocol. After the NDJSON handshake the holder writes
+/// `[offset u64][length u32][payload]` frames until the child exits or the
+/// subscriber falls too far behind.
+///
+/// Frames are contiguous by construction, and each still carries its offset so
+/// the subscriber can check rather than trust: a mismatch means fall back to
+/// the log, which turns any race here into a resynchronization instead of a
+/// silently corrupted screen.
+pub const HOLDER_OUTPUT_STREAM_VERSION: u16 = 1;
+/// Largest single output frame. A PTY read cannot exceed the pump's buffer,
+/// so this only bounds what a subscriber must be willing to allocate.
+pub const HOLDER_OUTPUT_MAX_FRAME: usize = 1 << 20;
+
 /// A (pid, start time) pair. The start time is the identity check that makes
 /// signalling a recycled pid safe.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -110,6 +123,11 @@ pub enum HolderOperation {
     /// signal for a new daemon to keep using one-request NDJSON.
     #[serde(rename = "stream")]
     Stream,
+    /// Upgrade this connection to a one-way stream of PTY output. Older
+    /// holders reject the unknown operation, which is the signal for the
+    /// daemon to keep tailing the log file instead.
+    #[serde(rename = "output-stream")]
+    OutputStream,
     #[serde(rename = "write")]
     Write,
     #[serde(rename = "resize")]
@@ -170,9 +188,28 @@ pub struct HolderResponse {
     pub stat: Option<HolderStat>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tree: Option<Vec<HolderProcessSample>>,
+    /// Stream offset the first output frame will carry. Everything below it
+    /// belongs to the log, which the subscriber must finish reading first.
+    #[serde(
+        rename = "startOffset",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub start_offset: Option<u64>,
 }
 
 impl HolderResponse {
+    /// Accepts an output-stream upgrade, naming the offset the first frame
+    /// will carry.
+    pub fn output_stream(version: u16, start_offset: u64) -> Self {
+        Self {
+            ok: true,
+            stream_version: Some(version),
+            start_offset: Some(start_offset),
+            ..Self::success()
+        }
+    }
+
     pub fn success() -> Self {
         Self {
             ok: true,
@@ -180,6 +217,7 @@ impl HolderResponse {
             error: None,
             stat: None,
             tree: None,
+            start_offset: None,
         }
     }
 
@@ -204,6 +242,7 @@ impl HolderResponse {
             error: Some(message.into()),
             stat: None,
             tree: None,
+            start_offset: None,
         }
     }
 

@@ -22,9 +22,10 @@ use crate::pty::{Pty, PtySpec};
 use super::client::HolderClient;
 use super::process_tree;
 use super::protocol::{
-    HOLDER_STREAM_ACK, HOLDER_STREAM_INPUT, HOLDER_STREAM_MAX_PAYLOAD, HOLDER_STREAM_RESIZE,
-    HOLDER_STREAM_VERSION, HolderExitMarker, HolderExitReason, HolderExitStatus, HolderLaunchSpec,
-    HolderOperation, HolderRequest, HolderResponse, HolderStat,
+    HOLDER_OUTPUT_STREAM_VERSION, HOLDER_STREAM_ACK, HOLDER_STREAM_INPUT,
+    HOLDER_STREAM_MAX_PAYLOAD, HOLDER_STREAM_RESIZE, HOLDER_STREAM_VERSION, HolderExitMarker,
+    HolderExitReason, HolderExitStatus, HolderLaunchSpec, HolderOperation, HolderRequest,
+    HolderResponse, HolderStat,
 };
 use super::socket;
 use super::{HolderError, HolderResult};
@@ -39,11 +40,24 @@ const MAX_SIGNAL: i32 = 65;
 /// How many PTY chunks may be waiting to be written before the reader has to
 /// wait for the writer. At 64 KiB a chunk this absorbs a multi-megabyte stall
 /// without letting a wedged filesystem grow the queue without bound.
-const WRITE_QUEUE_DEPTH: usize = 16;
+const WRITE_QUEUE_DEPTH: usize = 256;
 
 /// How much queued output one disk write may carry. Larger writes cost the
 /// filesystem far less per byte than many small ones.
 const WRITE_BATCH_BYTES: usize = 1 << 20;
+
+/// How many chunks may be waiting for one output subscriber. This is what
+/// bounds how far output can run ahead of the screen rendering it, so it is
+/// deliberately short: a megabyte of slack, not sixteen.
+const OUTPUT_QUEUE_DEPTH: usize = 16;
+
+/// How long the pump waits for a full subscriber queue before giving up on
+/// that subscriber. Long enough to ride out a scheduling hiccup, short enough
+/// that a hung daemon cannot hold the PTY.
+const OUTPUT_SEND_PATIENCE: Duration = Duration::from_millis(50);
+
+/// Buffer for one subscriber's socket writes.
+const OUTPUT_WRITE_BUFFER: usize = 256 << 10;
 
 pub struct HolderServer;
 
@@ -62,6 +76,32 @@ struct Shared {
     /// Weak handles let the exit path interrupt blocking input reads without
     /// making idle Holder streams wake on a timer.
     input_streams: Mutex<Vec<Weak<std::os::unix::net::UnixStream>>>,
+    /// Daemons receiving output as it is read, rather than by tailing the log.
+    /// The log is still written, and is still what a subscriber falls back to;
+    /// this only removes the filesystem from the path a live screen waits on.
+    output: Mutex<OutputFanout>,
+}
+
+/// Subscribers, and where in the stream the next byte handed to them sits.
+///
+/// The offset is tracked here rather than read from the log because the log is
+/// written asynchronously: bytes already read from the PTY can still be in
+/// flight to it. A subscriber told to start at the log tail would receive its
+/// first frame from further along and take it for an earlier one, which is a
+/// gap the emulator has no way to notice.
+struct OutputFanout {
+    next_offset: u64,
+    subscribers: Vec<OutputSubscriber>,
+}
+
+/// One attached daemon's view of the output stream.
+///
+/// Delivery is bounded and off the pump's thread: a subscriber that keeps up
+/// costs the pump a channel send, and one that does not is dropped rather than
+/// allowed to stall the PTY. A dropped subscriber loses nothing, because every
+/// byte is in the log it will fall back to.
+struct OutputSubscriber {
+    frames: std::sync::mpsc::SyncSender<(u64, Arc<[u8]>)>,
 }
 
 impl HolderServer {
@@ -133,6 +173,11 @@ impl HolderServer {
             finished: AtomicBool::new(false),
             listen_fd: AtomicI32::new(listen_fd),
             input_streams: Mutex::new(Vec::new()),
+            output: Mutex::new(OutputFanout {
+                // Everything below this belongs to earlier incarnations.
+                next_offset: epoch_offset,
+                subscribers: Vec::new(),
+            }),
             spec,
         });
 
@@ -159,6 +204,32 @@ impl HolderServer {
             socket::accept_raw(listen_fd, || shared.finished.load(Ordering::SeqCst))?
         {
             let response = match socket::read_json_line::<HolderRequest>(&mut client) {
+                Ok(request) if request.op == HolderOperation::OutputStream => {
+                    if request.stream_version != Some(HOLDER_OUTPUT_STREAM_VERSION) {
+                        HolderResponse::failure("unsupported Holder output stream version")
+                    } else {
+                        // Registered under the same lock that hands out frames,
+                        // so the offset quoted here is exactly where this
+                        // subscriber's first frame will begin.
+                        let mut fanout = shared.output.lock().expect("output");
+                        let start_offset = fanout.next_offset;
+                        let response = HolderResponse::output_stream(
+                            HOLDER_OUTPUT_STREAM_VERSION,
+                            start_offset,
+                        );
+                        if socket::write_json_line(&mut client, &response).is_ok() {
+                            let (send, receive) = std::sync::mpsc::sync_channel::<(u64, Arc<[u8]>)>(
+                                OUTPUT_QUEUE_DEPTH,
+                            );
+                            fanout.subscribers.push(OutputSubscriber { frames: send });
+                            drop(fanout);
+                            let _ = std::thread::Builder::new()
+                                .name(format!("holder-output-{}", shared.spec.session_id))
+                                .spawn(move || serve_output_stream(client, receive));
+                        }
+                        continue;
+                    }
+                }
                 Ok(request) if request.op == HolderOperation::Stream => {
                     if request.stream_version != Some(HOLDER_STREAM_VERSION) {
                         HolderResponse::failure("unsupported Holder input stream version")
@@ -292,6 +363,11 @@ fn pump_pty(shared: &Arc<Shared>, reader: &mut crate::pty::PtyStream) {
             }
         }
         if filled > 0 {
+            // Subscribers first, then durability. A daemon rendering this
+            // session should not wait for a disk write to see the bytes, and
+            // this ordering is what decouples display latency from filesystem
+            // throughput.
+            broadcast_output(shared, &buffer[..filled]);
             // Bytes read are handed on even if `finished` was just set: the
             // exit watcher joins this thread before writing the marker, so
             // nothing can land beyond it — but a byte consumed from the kernel
@@ -315,6 +391,91 @@ fn pump_pty(shared: &Arc<Shared>, reader: &mut crate::pty::PtyStream) {
     if let Some(writer) = writer {
         let _ = writer.join();
     }
+}
+
+/// Hands one chunk of PTY output to every attached subscriber.
+///
+/// A subscriber that cannot accept within [`OUTPUT_SEND_PATIENCE`] is dropped.
+/// That bound is the whole point: waiting a little applies the backpressure a
+/// single-process terminal gets for free, so output cannot race arbitrarily far
+/// ahead of the screen that renders it — and giving up keeps a wedged or dead
+/// daemon from stalling the PTY. Anything a dropped subscriber misses is in the
+/// log, which is where it resumes.
+fn broadcast_output(shared: &Shared, data: &[u8]) {
+    let mut fanout = shared.output.lock().expect("output");
+    let offset = fanout.next_offset;
+    // Advanced whether or not anyone is listening: a subscriber that arrives
+    // later is told to start here, and must not be told an offset that skipped
+    // bytes already handed out.
+    fanout.next_offset += data.len() as u64;
+    if fanout.subscribers.is_empty() {
+        return;
+    }
+    let frame: Arc<[u8]> = Arc::from(data);
+    fanout
+        .subscribers
+        .retain(|subscriber| offer_frame(subscriber, offset, &frame));
+}
+
+/// Offers one frame to a subscriber, waiting only as long as
+/// [`OUTPUT_SEND_PATIENCE`] for room.
+///
+/// Returns false when the subscriber should be dropped: either it is gone, or
+/// it is far enough behind that continuing to wait would stall the PTY.
+fn offer_frame(subscriber: &OutputSubscriber, offset: u64, frame: &Arc<[u8]>) -> bool {
+    use std::sync::mpsc::TrySendError;
+    let deadline = std::time::Instant::now() + OUTPUT_SEND_PATIENCE;
+    let mut pending = (offset, Arc::clone(frame));
+    loop {
+        match subscriber.frames.try_send(pending) {
+            Ok(()) => return true,
+            Err(TrySendError::Disconnected(_)) => return false,
+            Err(TrySendError::Full(returned)) => {
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                pending = returned;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+/// Writes frames to one subscriber until it disappears or the channel closes.
+fn serve_output_stream(
+    stream: std::os::unix::net::UnixStream,
+    frames: std::sync::mpsc::Receiver<(u64, Arc<[u8]>)>,
+) {
+    let mut stream = std::io::BufWriter::with_capacity(OUTPUT_WRITE_BUFFER, stream);
+    let mut queued: Option<(u64, Arc<[u8]>)> = None;
+    loop {
+        let (offset, frame) = match queued.take() {
+            Some(frame) => frame,
+            None => match frames.recv() {
+                Ok(frame) => frame,
+                Err(_) => break,
+            },
+        };
+        let length = frame.len() as u32;
+        if stream.write_all(&offset.to_be_bytes()).is_err()
+            || stream.write_all(&length.to_be_bytes()).is_err()
+            || stream.write_all(&frame).is_err()
+        {
+            return;
+        }
+        // Flushed only once nothing else is waiting, so a burst coalesces into
+        // few writes while a lone chunk still leaves immediately. The frame
+        // taken here is carried to the next turn, never dropped.
+        match frames.try_recv() {
+            Ok(next) => queued = Some(next),
+            Err(_) => {
+                if stream.flush().is_err() {
+                    return;
+                }
+            }
+        }
+    }
+    let _ = stream.flush();
 }
 
 /// Reaps the child, then finishes the holder: final drain, exit marker,
@@ -397,9 +558,9 @@ fn watch_exit(shared: &Shared, pump: std::thread::JoinHandle<()>) {
 
 fn handle(shared: &Shared, request: &HolderRequest) -> HolderResult<HolderResponse> {
     match request.op {
-        HolderOperation::Stream => Err(HolderError::InvalidRequest(
-            "stream negotiation must be the first operation".into(),
-        )),
+        HolderOperation::Stream | HolderOperation::OutputStream => Err(
+            HolderError::InvalidRequest("stream negotiation must be the first operation".into()),
+        ),
         HolderOperation::Write => {
             let data = request
                 .data

@@ -9,13 +9,15 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use base64::Engine as _;
 
 use super::protocol::{
-    HOLDER_STREAM_ACK, HOLDER_STREAM_INPUT, HOLDER_STREAM_MAX_PAYLOAD, HOLDER_STREAM_RESIZE,
-    HOLDER_STREAM_VERSION, HolderLaunchSpec, HolderManagerRequest, HolderManagerResponse,
-    HolderOperation, HolderProcessSample, HolderRequest, HolderResponse, HolderStat,
+    HOLDER_OUTPUT_MAX_FRAME, HOLDER_OUTPUT_STREAM_VERSION, HOLDER_STREAM_ACK, HOLDER_STREAM_INPUT,
+    HOLDER_STREAM_MAX_PAYLOAD, HOLDER_STREAM_RESIZE, HOLDER_STREAM_VERSION, HolderLaunchSpec,
+    HolderManagerRequest, HolderManagerResponse, HolderOperation, HolderProcessSample,
+    HolderRequest, HolderResponse, HolderStat,
 };
 use super::socket;
 use super::{HolderError, HolderResult};
@@ -94,6 +96,31 @@ impl HolderClient {
     }
 
     /// Whether a live holder with a live child serves this socket.
+    /// Subscribes to PTY output as the holder reads it.
+    ///
+    /// Returns the stream and the offset its first frame will carry: bytes
+    /// below that belong to the log, and the caller must finish reading them
+    /// before consuming a frame, or the emulator would see a gap. `None` means
+    /// the holder predates the output stream, and tailing the log is the only
+    /// route.
+    pub fn open_output_stream(&self) -> HolderResult<Option<HolderOutputStream>> {
+        let mut stream = socket::connect(&self.socket_path)?;
+        let mut request = HolderRequest::op(HolderOperation::OutputStream);
+        request.stream_version = Some(HOLDER_OUTPUT_STREAM_VERSION);
+        socket::write_json_line(&mut stream, &request)?;
+        let response: HolderResponse = socket::read_json_line(&mut stream)?;
+        if !response.ok || response.stream_version != Some(HOLDER_OUTPUT_STREAM_VERSION) {
+            return Ok(None);
+        }
+        let Some(start_offset) = response.start_offset else {
+            return Ok(None);
+        };
+        Ok(Some(HolderOutputStream {
+            stream,
+            start_offset,
+        }))
+    }
+
     pub fn is_alive(&self) -> bool {
         self.stat().map(|stat| stat.alive).unwrap_or(false)
     }
@@ -137,6 +164,62 @@ impl HolderClient {
             InputTransport::Legacy => Ok(false),
             InputTransport::Unknown => unreachable!("negotiation resolved the transport"),
         }
+    }
+}
+
+/// A subscription to one holder's PTY output.
+pub struct HolderOutputStream {
+    stream: std::os::unix::net::UnixStream,
+    start_offset: u64,
+}
+
+impl HolderOutputStream {
+    /// Offset of the first byte this stream will deliver.
+    #[must_use]
+    pub fn start_offset(&self) -> u64 {
+        self.start_offset
+    }
+
+    /// Blocks up to `timeout` for the next frame, returning its stream offset
+    /// and payload.
+    ///
+    /// `Ok(None)` means nothing arrived in time — the child is simply quiet.
+    /// `Err` means the stream is finished or broken, and the caller must go
+    /// back to the log, which has everything.
+    pub fn next_frame(&mut self, timeout: Duration) -> HolderResult<Option<(u64, Vec<u8>)>> {
+        self.stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|error| HolderError::io("set output stream timeout", error))?;
+        let mut header = [0_u8; 12];
+        match self.stream.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(HolderError::io("read output stream", error)),
+        }
+        let offset = u64::from_be_bytes(header[..8].try_into().expect("eight-byte offset"));
+        let length = u32::from_be_bytes(header[8..].try_into().expect("four-byte length")) as usize;
+        if length > HOLDER_OUTPUT_MAX_FRAME {
+            return Err(HolderError::Rejected(format!(
+                "output frame is {length} bytes; maximum is {HOLDER_OUTPUT_MAX_FRAME}"
+            )));
+        }
+        // The rest of a frame that has started must arrive: a timeout here
+        // would strand half of it and desynchronize the stream.
+        self.stream
+            .set_read_timeout(None)
+            .map_err(|error| HolderError::io("set output stream timeout", error))?;
+        let mut payload = vec![0_u8; length];
+        self.stream
+            .read_exact(&mut payload)
+            .map_err(|error| HolderError::io("read output frame", error))?;
+        Ok(Some((offset, payload)))
     }
 }
 
@@ -217,6 +300,31 @@ impl HolderManagerClient {
     /// active. A refusal is safe and leaves its normal 30-second grace intact.
     pub fn shutdown_if_idle(&self) -> HolderResult<i32> {
         self.request(&HolderManagerRequest::shutdown_if_idle())
+    }
+
+    /// Subscribes to PTY output as the holder reads it.
+    ///
+    /// Returns the stream and the offset its first frame will carry: bytes
+    /// below that belong to the log, and the caller must finish reading them
+    /// before consuming a frame, or the emulator would see a gap. `None` means
+    /// the holder predates the output stream, and tailing the log is the only
+    /// route.
+    pub fn open_output_stream(&self) -> HolderResult<Option<HolderOutputStream>> {
+        let mut stream = socket::connect(&self.socket_path)?;
+        let mut request = HolderRequest::op(HolderOperation::OutputStream);
+        request.stream_version = Some(HOLDER_OUTPUT_STREAM_VERSION);
+        socket::write_json_line(&mut stream, &request)?;
+        let response: HolderResponse = socket::read_json_line(&mut stream)?;
+        if !response.ok || response.stream_version != Some(HOLDER_OUTPUT_STREAM_VERSION) {
+            return Ok(None);
+        }
+        let Some(start_offset) = response.start_offset else {
+            return Ok(None);
+        };
+        Ok(Some(HolderOutputStream {
+            stream,
+            start_offset,
+        }))
     }
 
     pub fn is_alive(&self) -> bool {

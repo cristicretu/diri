@@ -13,7 +13,7 @@
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use diri_engine::session::{HolderConfig, Session, SessionSpec};
@@ -25,6 +25,17 @@ const PAYLOAD_BYTES: usize = 8 << 20;
 /// Slowest acceptable drain. The path measured ~150 MB/s when this was written;
 /// the pre-fix implementation managed ~12 MB/s.
 const FLOOR_MB_PER_SEC: f64 = 40.0;
+
+/// These tests time a pipeline, so they cannot share a machine with each
+/// other: cargo runs tests in one binary concurrently, and a burst in the next
+/// test over is exactly the interference being measured.
+static EXCLUSIVE: Mutex<()> = Mutex::new(());
+
+fn exclusive() -> MutexGuard<'static, ()> {
+    EXCLUSIVE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn engine() -> Arc<ManifestEngine> {
     let dir = diri_engine::detect::bundled_manifest_dir()
@@ -74,6 +85,7 @@ fn spec(id: &str, script: &str, logs: &Path, holder: HolderConfig) -> SessionSpe
 /// blocked on a read until their own timeout fires — or forever.
 #[test]
 fn a_cursor_position_query_gets_a_reply() {
+    let _exclusive = exclusive();
     let root = work_dir("dsr");
     let logs = root.join("logs");
     let holder = HolderConfig {
@@ -122,6 +134,7 @@ fn a_cursor_position_query_gets_a_reply() {
 
 #[test]
 fn a_burst_of_output_drains_at_working_speed() {
+    let _exclusive = exclusive();
     let root = work_dir("burst");
     let logs = root.join("logs");
     let file = payload(&root);
@@ -164,4 +177,70 @@ fn a_burst_of_output_drains_at_working_speed() {
         rate >= FLOOR_MB_PER_SEC,
         "drain fell to {rate:.1} MB/s, below the {FLOOR_MB_PER_SEC:.1} MB/s floor"
     );
+}
+
+/// Output reaches the emulator exactly once, in order, however it travelled.
+///
+/// A held session is fed by two sources: frames the holder pushes as it reads,
+/// and the log the daemon tails when no subscription is up. A byte delivered
+/// twice, or skipped because each source assumed the other had it, would
+/// corrupt the screen rather than fail loudly — so this counts.
+///
+/// The child prints a numbered line per row of output. Whatever the transport
+/// did, the last lines on screen must be the last lines printed, consecutively.
+#[test]
+fn a_burst_reaches_the_screen_without_gaps_or_repeats() {
+    let _exclusive = exclusive();
+    const LINES: usize = 200_000;
+    let root = work_dir("continuity");
+    let logs = root.join("logs");
+    let holder = HolderConfig {
+        holders_dir: root.join("holders"),
+        executable: PathBuf::from(env!("CARGO_BIN_EXE_diri-holder")),
+    };
+
+    // seq is faster than a shell loop and its output is trivially checkable.
+    let script = format!("seq 1 {LINES}");
+    let session =
+        Session::spawn(spec("s_continuity", &script, &logs, holder), engine()).expect("spawn");
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !session.view().exited && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(session.view().exited, "seq never finished");
+    // The pump may still be draining the tail when the child exits.
+    let settled = Instant::now() + Duration::from_secs(10);
+    let mut numbers = Vec::new();
+    while Instant::now() < settled {
+        std::thread::sleep(Duration::from_millis(50));
+        numbers = session
+            .screen_lines()
+            .iter()
+            .filter_map(|line| line.trim().parse::<usize>().ok())
+            .collect();
+        if numbers.last() == Some(&LINES) {
+            break;
+        }
+    }
+
+    assert_eq!(
+        numbers.last(),
+        Some(&LINES),
+        "the last line printed should be the last line on screen, got {:?}",
+        numbers.last()
+    );
+    assert!(
+        numbers.len() > 4,
+        "expected the screen to hold several numbered lines, got {numbers:?}"
+    );
+    for pair in numbers.windows(2) {
+        assert_eq!(
+            pair[1],
+            pair[0] + 1,
+            "screen jumped from {} to {}: output was dropped or repeated",
+            pair[0],
+            pair[1]
+        );
+    }
 }

@@ -2637,6 +2637,9 @@ fn pump_held(
     let mut last_liveness = Instant::now();
     let mut last_eval_seq = 0u64;
     let mut last_eval_at: Option<Instant> = None;
+    // Set when a chunk was fed without detection running, so the settle below
+    // knows the screen still needs judging.
+    let mut eval_dirty = false;
     let mut last_scan_at = None;
     let mut last_scan_seq = 0u64;
     let mut exit_status: Option<HolderExitStatus> = None;
@@ -2647,24 +2650,110 @@ fn pump_held(
     // they must render, but not flip a quiet adopted session to Working.
     let mut replaying = true;
 
+    // Output arrives one of two ways. The log always holds every byte, and
+    // tailing it is all an older holder supports — but the file is written
+    // asynchronously, so a screen fed from it waits on the filesystem. A
+    // subscription delivers the same bytes as the holder reads them, with the
+    // log still underneath: the stream can end or be dropped at any moment,
+    // and the loop just goes back to reading the file from the offset it had
+    // reached.
+    let mut live: Option<crate::holder::HolderOutputStream> = None;
+    // Where the subscription's first frame sits. The holder is ahead of the
+    // log by whatever it has read but not yet written, so the file has to be
+    // followed up to this point before a frame can be consumed.
+    let mut live_from: u64 = 0;
+    // Set once the log has been read to its end, which is the only safe moment
+    // to subscribe.
+    let mut drained = false;
+
     while !shared.stop.load(Ordering::SeqCst) && exit_status.is_none() {
         scan_artifacts_if_due(&shared, &mut last_scan_at, &mut last_scan_seq);
-        let (start, chunk) = {
-            let mut log = shared.log.lock().expect("log");
-            log.refresh_from_disk();
-            log.read(offset, LOG_READ_BUDGET)
+        // Subscribe only from a standing start, with the log drained.
+        //
+        // A subscription taken while still catching up is worse than none: the
+        // holder begins filling a queue this loop is not yet reading, and once
+        // that queue is full the pump waits on it for every chunk. Waiting for
+        // a drained log keeps the handover to a few frames.
+        if live.is_none() && drained {
+            if let Ok(Some(stream)) = client.open_output_stream() {
+                live_from = stream.start_offset();
+                live = Some(stream);
+            }
+            drained = false;
+        }
+        // Frames only once the file has been followed up to where they begin.
+        let streaming = live.is_some() && offset >= live_from;
+        let (start, chunk) = match live.as_mut().filter(|_| streaming) {
+            Some(stream) => match stream.next_frame(shared.quiet_tick()) {
+                // Contiguous by construction, and checked anyway: a frame that
+                // does not start where the last one ended means something
+                // raced, and the log is the authority to fall back on rather
+                // than feed the emulator a gap it cannot detect.
+                Ok(Some((at, frame))) if at == offset => (offset, frame),
+                Ok(Some(_)) => {
+                    live = None;
+                    continue;
+                }
+                // Quiet: fall through to the timers below with nothing to feed.
+                Ok(None) => (offset, Vec::new()),
+                Err(_) => {
+                    // Dropped for falling behind, or the child is gone. The
+                    // log has every byte; resume from it at the same offset.
+                    live = None;
+                    continue;
+                }
+            },
+            None => {
+                let mut log = shared.log.lock().expect("log");
+                log.refresh_from_disk();
+                log.read(offset, LOG_READ_BUDGET)
+            }
         };
         // A full read means the tail is not caught up, so this pass may hold
         // half a repaint. Publishing it would flicker; fold the rest into the
         // same frame instead — bounded, so a holder streaming faster than we
         // parse still updates.
-        let caught_up = chunk.len() < LOG_READ_BUDGET;
+        // "Nothing more is waiting." A short log read means the file is
+        // drained; a live frame says nothing either way, since the holder may
+        // already have more, so only an empty poll settles the stream.
+        let caught_up = if streaming {
+            chunk.is_empty()
+        } else {
+            chunk.len() < LOG_READ_BUDGET
+        };
 
         if chunk.is_empty() {
             if publish_pending.take().is_some() {
                 shared.grid_wake.notify();
             }
+            // Output stopped with a screen detection has not judged yet: this
+            // is the settle, and it is what makes throttling safe.
+            if eval_dirty {
+                eval_dirty = false;
+                last_eval_at = Some(Instant::now());
+                let observation = {
+                    let mut screen = shared.screen.lock().expect("screen");
+                    evaluate_if_screen_changed(
+                        &shared,
+                        &mut screen,
+                        &engine,
+                        &manifest_id,
+                        &mut last_eval_seq,
+                    )
+                };
+                if let Some(observation) = observation {
+                    let outcome = shared
+                        .reducer
+                        .lock()
+                        .expect("reducer")
+                        .reduce(StatusSignal::Screen(observation), SystemTime::now());
+                    apply(&shared, &outcome);
+                }
+            }
             release_stalled_sync(&shared);
+            if live.is_none() && !replaying {
+                drained = true;
+            }
             if replaying {
                 replaying = false;
                 // The replay tail is drained: checkpoint immediately, as the
@@ -2698,6 +2787,9 @@ fn pump_held(
             // reducer timers and the liveness probe. Attached or Working
             // sessions keep the fast ceiling; idle background ones stretch it.
             let log_replaced = match watcher.as_mut() {
+                // A subscription already waited a tick for its frame; waiting
+                // again here would add one to every quiet pass.
+                _ if streaming => false,
                 Some(watcher) => watcher.wait(shared.quiet_tick()),
                 None => {
                     std::thread::sleep(shared.quiet_tick());

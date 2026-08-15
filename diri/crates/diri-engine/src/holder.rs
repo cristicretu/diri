@@ -28,7 +28,7 @@ mod socket;
 #[cfg(unix)]
 pub mod server;
 
-pub use client::{HolderClient, HolderManagerClient};
+pub use client::{HolderClient, HolderManagerClient, HolderOutputStream};
 pub use launcher::HolderLauncher;
 pub use paths::{HolderManagerPaths, HolderPaths};
 pub use protocol::{
