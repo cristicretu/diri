@@ -298,16 +298,7 @@ impl NodeClient {
                 self.transfer_blob(target, &digest).await?;
             }
             let staged = target.stage_checkpoint(&checkpoint.checkpoint_id).await?;
-            let provider_session_id = checkpoint
-                .provider_session_id
-                .as_deref()
-                .expect("checked above");
-            let (method, call_params) = provider_resume_call(
-                provider,
-                checkpoint.mode,
-                provider_session_id,
-                &staged.quarantine_path,
-            );
+            let (method, call_params) = provider_resume_call_for_handoff(&checkpoint, &staged)?;
             let provider_result = target
                 .provider_call(ProviderCallParams {
                     profile_id: profile_id.clone(),
@@ -662,6 +653,22 @@ fn provider_resume_call(
     (method, params)
 }
 
+fn provider_resume_call_for_handoff(
+    checkpoint: &CheckpointManifest,
+    staged: &CheckpointStageResult,
+) -> Result<(&'static str, Value), ClientError> {
+    let provider_session_id = checkpoint
+        .provider_session_id
+        .as_deref()
+        .ok_or_else(|| ClientError::protocol("checkpoint omitted provider session state"))?;
+    Ok(provider_resume_call(
+        checkpoint.provider,
+        checkpoint.mode,
+        provider_session_id,
+        &staged.quarantine_path,
+    ))
+}
+
 fn random_lease_id() -> Result<String, ClientError> {
     let mut bytes = [0_u8; 16];
     getrandom::fill(&mut bytes).map_err(ClientError::io)?;
@@ -722,23 +729,48 @@ mod tests {
     }
 
     #[test]
-    fn provider_handoff_uses_first_party_resume_shapes() {
-        let (codex, params) = provider_resume_call(
-            ProviderKind::Codex,
-            TransferMode::Move,
-            "thread-1",
-            "/tmp/staged",
-        );
+    fn provider_handoff_rebases_resume_cwd_onto_the_target_stage() {
+        let source_workspace = "/Users/alice/code/project";
+        let target_workspace = "/home/alice/.local/share/dirijor/node/restores/cp-1";
+        let checkpoint = CheckpointManifest {
+            version: 1,
+            checkpoint_id: "cp-1".into(),
+            source_node_id: "mac".into(),
+            session_id: "session-1".into(),
+            provider: ProviderKind::Codex,
+            profile_id: "work".into(),
+            workspace_root: source_workspace.into(),
+            provider_session_id: Some("thread-1".into()),
+            mode: TransferMode::Move,
+            created_at: 1,
+            files: Vec::new(),
+            provider_state: None,
+            excluded: Vec::new(),
+        };
+        let staged = CheckpointStageResult {
+            checkpoint_id: "cp-1".into(),
+            quarantine_path: target_workspace.into(),
+            ready: true,
+        };
+        let (codex, params) =
+            provider_resume_call_for_handoff(&checkpoint, &staged).expect("resume call");
         assert_eq!(codex, "thread/resume");
         assert_eq!(params["threadId"], "thread-1");
-        let (claude, params) = provider_resume_call(
-            ProviderKind::Claude,
-            TransferMode::Fork,
-            "session-1",
-            "/tmp/staged",
-        );
+        assert_eq!(params["cwd"], target_workspace);
+        assert_ne!(params["cwd"], source_workspace);
+
+        let checkpoint = CheckpointManifest {
+            provider: ProviderKind::Claude,
+            provider_session_id: Some("session-1".into()),
+            mode: TransferMode::Fork,
+            ..checkpoint
+        };
+        let (claude, params) =
+            provider_resume_call_for_handoff(&checkpoint, &staged).expect("fork call");
         assert_eq!(claude, "session/fork");
         assert_eq!(params["sessionId"], "session-1");
+        assert_eq!(params["cwd"], target_workspace);
+        assert_ne!(params["cwd"], source_workspace);
     }
 
     #[test]

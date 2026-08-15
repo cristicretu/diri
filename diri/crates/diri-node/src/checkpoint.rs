@@ -717,6 +717,8 @@ mod tests {
         let staged = store
             .stage(&manifest.checkpoint_id, &provider_home)
             .expect("stage");
+        assert_ne!(Path::new(&staged.quarantine_path), workspace);
+        assert!(Path::new(&staged.quarantine_path).starts_with(&paths.restores));
         assert!(
             Path::new(&staged.quarantine_path)
                 .join("README.md")

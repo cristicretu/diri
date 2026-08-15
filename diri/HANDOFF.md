@@ -38,6 +38,14 @@ conflict without being overwritten. Claude's mixed `.claude.json` receives a
 server-by-server merge, preserving its local OAuth and app state. The apply
 report is returned with the handoff and printed by the CLI.
 
+Paths are deliberately node-relative. Portable-config bundles contain only
+provider-home-relative allowlisted names; the source and target nodes resolve
+those names against their own profile homes. Likewise, the source workspace's
+absolute path is informational metadata only. The target stages files below its
+own node restore root and passes that target-local path to provider resume/fork.
+This allows paths such as `/Users/alice/code/project` and
+`/home/alice/.local/share/dirijor/node/restores/...` to differ safely.
+
 Portable-config installation is a separate, additive step and is not rolled
 back if a later workspace or conversation handoff step fails.
 
