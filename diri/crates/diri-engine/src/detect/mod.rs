@@ -151,6 +151,7 @@ impl ManifestEngine {
             .map_or_else(
                 || diri_proto::SessionCapabilities {
                     resume: false,
+                    fork: false,
                     archive: !record.is_archived(),
                     send_text: !record.is_archived()
                         && !matches!(record.status, diri_proto::SessionStatus::Exited(_)),
@@ -162,6 +163,7 @@ impl ManifestEngine {
                         record.resumability,
                         &record.status,
                         record.is_archived(),
+                        record.agent_session_id.as_deref(),
                     )
                 },
             )

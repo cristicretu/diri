@@ -127,6 +127,52 @@ pub fn parse_codex_notify(payload: &Value) -> Option<(StatusSignal, HookMetadata
     Some((StatusSignal::CodexTurnComplete, meta))
 }
 
+/// Rehydrates the privacy-filtered activity written by the hook CLI while the
+/// Engine was unavailable. The seed deliberately contains too little data to
+/// recreate prompt titles or command summaries; lifecycle and conversation
+/// identity are the durable contract.
+pub fn parse_activity_seed(
+    seed: &diri_proto::recovery::HookActivitySeed,
+) -> Option<(StatusSignal, HookMetadata)> {
+    if seed.version != diri_proto::recovery::HookActivitySeed::VERSION {
+        return None;
+    }
+    let now = std::time::UNIX_EPOCH
+        .checked_add(std::time::Duration::from_millis(seed.occurred_at_ms))
+        .unwrap_or(std::time::SystemTime::now());
+    let mut payload = serde_json::Map::new();
+    if let Some(value) = &seed.agent_session_id {
+        payload.insert(
+            if seed.kind == "codex-notify" {
+                "thread-id"
+            } else {
+                "session_id"
+            }
+            .into(),
+            Value::String(value.clone()),
+        );
+    }
+    for (key, value) in [
+        ("transcript_path", seed.transcript_path.as_ref()),
+        ("notification_type", seed.notification_type.as_ref()),
+        ("tool_name", seed.tool_name.as_ref()),
+    ] {
+        if let Some(value) = value {
+            payload.insert(key.into(), Value::String(value.clone()));
+        }
+    }
+    let payload = Value::Object(payload);
+    match seed.kind.as_str() {
+        "claude-hook" => parse_claude_hook(seed.event.as_deref()?, &payload, now),
+        "codex-notify" => {
+            let mut payload = payload.as_object().cloned().unwrap_or_default();
+            payload.insert("type".into(), Value::String("agent-turn-complete".into()));
+            parse_codex_notify(&Value::Object(payload))
+        }
+        _ => None,
+    }
+}
+
 fn needs_input_kind(notification_type: Option<&str>) -> Option<NeedsInputKind> {
     match notification_type {
         Some("permission_prompt") => Some(NeedsInputKind::Permission),
@@ -350,5 +396,30 @@ mod tests {
     fn other_codex_notifications_are_not_turn_completions() {
         let payload = json!({ "type": "something-else", "thread-id": "t-1" });
         assert!(parse_codex_notify(&payload).is_none());
+    }
+
+    #[test]
+    fn a_durable_seed_rehydrates_lifecycle_and_safe_identity() {
+        let seed = diri_proto::recovery::HookActivitySeed {
+            version: diri_proto::recovery::HookActivitySeed::VERSION,
+            kind: "claude-hook".into(),
+            event: Some("PermissionRequest".into()),
+            occurred_at_ms: 42,
+            agent_session_id: Some("conversation".into()),
+            transcript_path: Some("/tmp/transcript.jsonl".into()),
+            notification_type: None,
+            tool_name: Some("Bash".into()),
+        };
+        let (signal, metadata) = parse_activity_seed(&seed).expect("seed");
+        assert!(matches!(
+            signal,
+            StatusSignal::ClaudeHook {
+                hook: ClaudeHook::PermissionRequest { .. },
+                ..
+            }
+        ));
+        assert_eq!(metadata.agent_session_id.as_deref(), Some("conversation"));
+        let detail = metadata.needs_input.expect("generic permission detail");
+        assert_eq!(detail.summary, "wants to run `a command`");
     }
 }

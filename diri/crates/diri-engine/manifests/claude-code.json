@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "id": "claude-code",
-  "version": "2026.07.07.1",
+  "version": "2026.08.15.1",
   "statusModel": "full",
   "agent": {
     "id": "claude-code",
@@ -27,6 +27,23 @@
     "resume": {
       "style": "flag",
       "token": "--resume"
+    },
+    "conversation": {
+      "freshArgs": ["--session-id", "{newId}"],
+      "resume": {
+        "exactArgs": ["--resume", "{id}"],
+        "latestArgs": ["--continue"]
+      },
+      "fork": {
+        "exactArgs": ["--resume", "{id}", "--fork-session"],
+        "latestArgs": ["--continue", "--fork-session"]
+      },
+      "stripArgs": [
+        {"token": "--resume", "value": "nonoption"},
+        {"token": "--continue"},
+        {"token": "--session-id", "value": "any"},
+        {"token": "--fork-session"}
+      ]
     },
     "env": {
       "CLAUDE_CODE_NO_FLICKER": "1"

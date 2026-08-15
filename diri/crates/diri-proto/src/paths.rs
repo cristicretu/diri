@@ -22,11 +22,18 @@ pub const HOSTS_CONFIG_FILE_NAME: &str = "hosts.json";
 pub const PREFS_FILE_NAME: &str = "prefs.json";
 pub const QUICK_OPEN_CACHE_FILE_NAME: &str = "quick-open-index.json";
 pub const USAGE_CACHE_FILE_NAME: &str = "usage-cache.json";
+pub const ACTIVITY_LOG_FILE_NAME: &str = "activity-log.jsonl";
+pub const SESSION_RECOVERY_DIR_NAME: &str = "sessions";
 
 pub const ENV_SESSION_ID: &str = "DIRIJOR_SESSION_ID";
 pub const ENV_SOCKET: &str = "DIRIJOR_SOCKET";
 pub const ENV_CLI: &str = "DIRIJOR_CLI";
 pub const ENV_APP_SUPPORT: &str = "DIRIJOR_APP_SUPPORT";
+/// Exact per-session recovery directory exported to hook/notify shims.
+///
+/// The directory is chosen by the Engine rather than reconstructed by the CLI,
+/// so macOS and XDG layouts share one contract and tests never need HOME.
+pub const ENV_SESSION_RECOVERY_DIR: &str = "DIRIJOR_SESSION_RECOVERY_DIR";
 
 pub struct DirijorPaths;
 
@@ -93,6 +100,10 @@ impl DirijorPaths {
 
     pub fn logs_dir(home: impl AsRef<Path>) -> PathBuf {
         Self::state_dir(home).join(LOGS_DIR_NAME)
+    }
+
+    pub fn session_recovery_root(home: impl AsRef<Path>) -> PathBuf {
+        Self::state_dir(home).join(SESSION_RECOVERY_DIR_NAME)
     }
 
     pub fn inject_dir(home: impl AsRef<Path>) -> PathBuf {

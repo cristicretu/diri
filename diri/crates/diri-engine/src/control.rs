@@ -70,6 +70,12 @@ pub struct InjectionConfig {
     pub cli_path: PathBuf,
 }
 
+#[derive(Clone, Copy)]
+enum ConversationAction {
+    Resume,
+    Fork,
+}
+
 /// Whether a local session's execution directory is inside `target`.
 ///
 /// Session cwd values intentionally preserve the spelling supplied at spawn,
@@ -118,6 +124,14 @@ impl ControlServer {
                 eprintln!("diri-engine: Agent configuration unavailable: {error}");
                 crate::agent_catalog::AgentCatalogStore::empty(agent_config_path)
             });
+        let events = crate::events::EventBus::new();
+        let activity_path = logs_dir
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(diri_proto::paths::ACTIVITY_LOG_FILE_NAME);
+        if let Err(error) = events.enable_activity_log(activity_path) {
+            eprintln!("diri-engine: activity history unavailable: {error}");
+        }
         Self {
             registry,
             socket_path,
@@ -125,7 +139,7 @@ impl ControlServer {
             holder: None,
             remote: None,
             remote_bindings,
-            events: crate::events::EventBus::new(),
+            events,
             attach: crate::attach::AttachHub::new(),
             pr_monitor_wake: crate::pr_monitor::PrMonitorWake::default(),
             injection: None,
@@ -173,6 +187,14 @@ impl ControlServer {
     /// socket, matching the Swift daemon's layout.
     pub fn with_logs_dir(mut self, logs_dir: impl Into<PathBuf>) -> Self {
         self.logs_dir = logs_dir.into();
+        let activity_path = self
+            .logs_dir
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(diri_proto::paths::ACTIVITY_LOG_FILE_NAME);
+        if let Err(error) = self.events.enable_activity_log(activity_path) {
+            eprintln!("diri-engine: activity history unavailable: {error}");
+        }
         self
     }
 
@@ -668,6 +690,7 @@ impl ControlServer {
             Method::SESSION_ARCHIVE => self.session_archive(params),
             Method::SESSION_UNARCHIVE => self.session_unarchive(params),
             Method::SESSION_HISTORY => self.session_history(),
+            Method::ACTIVITY_LIST => self.activity_list(params),
             Method::WORKTREE_CREATE => self.worktree_create(params),
             Method::WORKTREE_LIST => self.worktree_list(params),
             Method::WORKTREE_REMOVE => self.worktree_remove(params),
@@ -683,6 +706,7 @@ impl ControlServer {
             Method::HOST_LOCATE_REPO => self.host_locate_repo(params),
             Method::HOOK_REPORT => self.hook_report(params),
             Method::SESSION_RESUME => self.session_resume(params),
+            Method::SESSION_FORK => self.session_fork(params),
             Method::SESSION_RESUME_FROM_HISTORY => self.session_resume_from_history(params),
             Method::SESSION_REOPEN_LAST => self.session_reopen_last(),
             Method::AGENT_READINESS => self.agent_readiness(params),
@@ -805,12 +829,6 @@ impl ControlServer {
         let mut agent_session_id = None;
         if descriptor.binary.is_some() {
             launch_args.extend(descriptor.spawn_args.iter().cloned());
-            agent_session_id = descriptor.session_id_flag.as_ref().map(|flag| {
-                let uuid = crate::inject::uuid_v4();
-                launch_args.push(flag.clone());
-                launch_args.push(uuid.clone());
-                uuid
-            });
             if let Some(injection) = &self.injection {
                 launch_args.extend(crate::inject::injection_args_with_cursor(
                     &descriptor.injection,
@@ -822,6 +840,25 @@ impl ControlServer {
                     }),
                 ));
             }
+            let minted = descriptor
+                .mints_conversation_id()
+                .then(crate::inject::uuid_v4);
+            let provider_dir = registry.recovery_directory(&id).join("provider");
+            let plan = descriptor
+                .conversation_plan(
+                    &launch_args,
+                    crate::agent::ConversationLaunch::Fresh {
+                        new_id: minted.as_deref(),
+                        session_dir: Some(&provider_dir),
+                    },
+                )
+                .ok_or_else(|| {
+                    ControlError::bad_request(format!(
+                        "agent {kind:?} has an incomplete fresh conversation grammar"
+                    ))
+                })?;
+            launch_args = plan.args;
+            agent_session_id = plan.agent_session_id;
         }
 
         let inherited: Vec<(String, String)> = std::env::vars().collect();
@@ -882,6 +919,13 @@ impl ControlServer {
                 pty.env.push((
                     crate::inject::CLI_ENV.into(),
                     injection.cli_path.to_string_lossy().into_owned(),
+                ));
+                pty.env.push((
+                    diri_proto::paths::ENV_SESSION_RECOVERY_DIR.into(),
+                    registry
+                        .recovery_directory(&id)
+                        .to_string_lossy()
+                        .into_owned(),
                 ));
             }
             if let Some(uuid) = &agent_session_id {
@@ -1034,12 +1078,29 @@ impl ControlServer {
         let mut launch_args = caller_argv.clone();
         if descriptor.binary.is_some() {
             launch_args.extend(descriptor.spawn_args.iter().cloned());
-            agent_session_id = descriptor.session_id_flag.as_ref().map(|flag| {
-                let uuid = crate::inject::uuid_v4();
-                launch_args.push(flag.clone());
-                launch_args.push(uuid.clone());
-                uuid
-            });
+            let minted = descriptor
+                .mints_conversation_id()
+                .then(crate::inject::uuid_v4);
+            let provider_dir = inherited
+                .iter()
+                .rev()
+                .find(|(name, value)| name == "HOME" && !value.is_empty())
+                .map(|(_, home)| Path::new(home).join(".diri/session-storage").join(&id));
+            let plan = descriptor
+                .conversation_plan(
+                    &launch_args,
+                    crate::agent::ConversationLaunch::Fresh {
+                        new_id: minted.as_deref(),
+                        session_dir: provider_dir.as_deref(),
+                    },
+                )
+                .ok_or_else(|| {
+                    ControlError::bad_request(format!(
+                        "agent {kind:?} has an incomplete fresh conversation grammar"
+                    ))
+                })?;
+            launch_args = plan.args;
+            agent_session_id = plan.agent_session_id;
         }
 
         let argv = if descriptor.binary.is_some() {
@@ -1781,18 +1842,30 @@ impl ControlServer {
     fn session_remove(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::SessionIdParams = decode(params)?;
         let mut registry = self.registry.lock().map_err(poisoned)?;
+        let removed = registry
+            .record(&p.session_id.0)
+            .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
         registry
             .remove(&p.session_id.0, &self.logs_dir)
             .map_err(io_control_error)?;
         if let Some(store) = &self.remote_bindings {
             let _ = store.remove(&p.session_id.0);
         }
+        self.events.record_removed(&removed);
         self.events.publish(
             diri_proto::EventName::SESSION_REMOVED,
             json!({ "id": p.session_id.0, "reason": "released" }),
             Some(&p.session_id.0),
         );
         Ok(json!({}))
+    }
+
+    fn activity_list(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::ActivityListParams = decode(params)?;
+        let limit = usize::from(p.limit.unwrap_or(100).clamp(1, 300));
+        encode(&diri_proto::ActivityListResult {
+            entries: self.events.recent_activity(limit),
+        })
     }
 
     fn session_rename(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
@@ -1950,9 +2023,77 @@ impl ControlServer {
         serde_json::to_value(&record).map_err(|error| ControlError::internal(error.to_string()))
     }
 
+    /// Starts a new Session whose provider conversation is a native fork of
+    /// `source`. The Diri record and provider identity are both new; lineage
+    /// points at the source and the source remains untouched.
+    fn session_fork(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::SessionForkParams = decode(params)?;
+        let source = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            registry
+                .records()
+                .into_iter()
+                .find(|record| record.id == p.session_id)
+                .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?
+        };
+        let kind = source.effective_kind().clone();
+        let id = next_session_id();
+        let spec = if source.host.is_some() {
+            self.remote_conversation_spec(&source, &id, &kind, ConversationAction::Fork)?
+        } else {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            self.local_conversation_spec(
+                &registry,
+                &id,
+                kind.id(),
+                &source.cwd,
+                source.agent_session_id.as_deref(),
+                ConversationAction::Fork,
+            )?
+        };
+        let remote_persistence = spec.remote.as_ref().map(|remote| remote.launch.persistence);
+        let mut record = new_record(&id, kind.id(), &source.cwd);
+        record.kind = kind;
+        record.project_id = source.project_id.clone();
+        record.worktree_path = source.worktree_path.clone();
+        record.git_branch = source.git_branch.clone();
+        record.parent = Some(source.id.clone());
+        record.host = source.host.clone();
+        record.remote_persistence = remote_persistence;
+        record.title = format!("Fork of {}", source.title);
+        record.title_source = diri_proto::TitleSource::DirijorAssigned;
+
+        let mut registry = self.registry.lock().map_err(poisoned)?;
+        registry.ensure_session_project(&source.cwd, source.host.as_deref());
+        registry
+            .spawn(spec, record)
+            .map_err(|error| ControlError::internal(error.to_string()))?;
+        let _ = registry.persist();
+        self.publish_updated(&registry, &id);
+        let record = registry
+            .record(&id)
+            .ok_or_else(|| ControlError::internal("the forked session vanished"))?;
+        encode(&record)
+    }
+
     fn remote_resume_spec(
         &self,
         record: &diri_proto::SessionRecord,
+    ) -> Result<crate::session::SessionSpec, ControlError> {
+        self.remote_conversation_spec(
+            record,
+            &record.id.0,
+            &record.kind,
+            ConversationAction::Resume,
+        )
+    }
+
+    fn remote_conversation_spec(
+        &self,
+        record: &diri_proto::SessionRecord,
+        target_id: &str,
+        kind: &diri_proto::AgentKind,
+        action: ConversationAction,
     ) -> Result<crate::session::SessionSpec, ControlError> {
         let manager = self
             .remote
@@ -1974,8 +2115,8 @@ impl ControlServer {
         let (mut descriptor, authority) = {
             let registry = self.registry.lock().map_err(poisoned)?;
             let engine = registry.engine();
-            let manifest = engine.manifest(record.kind.id()).ok_or_else(|| {
-                ControlError::not_found(format!("no manifest for agent {}", record.kind.id()))
+            let manifest = engine.manifest(kind.id()).ok_or_else(|| {
+                ControlError::not_found(format!("no manifest for agent {}", kind.id()))
             })?;
             let descriptor = manifest.agent.clone().unwrap_or_default();
             let authority = descriptor.authority();
@@ -1985,7 +2126,7 @@ impl ControlServer {
             let (executable, captured) = self.discover_remote_agent_for_launch(
                 manager.as_ref(),
                 &host,
-                record.kind.id(),
+                kind.id(),
                 binary,
                 record.cwd.clone(),
             )?;
@@ -2009,16 +2150,39 @@ impl ControlServer {
             ));
         }
         let mut launch_args = descriptor.spawn_args.clone();
-        launch_args.extend(
-            descriptor
-                .resume_args(record.agent_session_id.as_deref())
-                .ok_or_else(|| {
-                    ControlError::bad_request(format!(
-                        "agent {} does not support resume",
-                        record.kind.id()
-                    ))
-                })?,
-        );
+        let provider_dir = captured
+            .environment
+            .iter()
+            .rev()
+            .find(|variable| variable.name == "HOME" && !variable.value.is_empty())
+            .map(|variable| {
+                Path::new(&variable.value)
+                    .join(".diri/session-storage")
+                    .join(target_id)
+            });
+        let launch = match action {
+            ConversationAction::Resume => crate::agent::ConversationLaunch::Resume {
+                source_id: record.agent_session_id.as_deref(),
+                session_dir: provider_dir.as_deref(),
+            },
+            ConversationAction::Fork => crate::agent::ConversationLaunch::Fork {
+                source_id: record.agent_session_id.as_deref(),
+                session_dir: provider_dir.as_deref(),
+            },
+        };
+        launch_args = descriptor
+            .conversation_plan(&launch_args, launch)
+            .ok_or_else(|| {
+                ControlError::bad_request(format!(
+                    "agent {} does not support {}",
+                    kind.id(),
+                    match action {
+                        ConversationAction::Resume => "resume",
+                        ConversationAction::Fork => "fork",
+                    }
+                ))
+            })?
+            .args;
         let inherited = captured
             .environment
             .into_iter()
@@ -2026,10 +2190,10 @@ impl ControlServer {
         let pty = descriptor
             .remote_spawn_spec(&cwd, inherited, &launch_args)
             .ok_or_else(|| {
-                ControlError::bad_request(format!("agent {} declares no binary", record.kind.id()))
+                ControlError::bad_request(format!("agent {} declares no binary", kind.id()))
             })?;
         let launch = diri_proto::remote_pty::LaunchRequest {
-            session_id: record.id.0.clone(),
+            session_id: target_id.to_owned(),
             session_token: random_session_token()?,
             argv: pty.argv.clone(),
             cwd: captured.cwd,
@@ -2048,9 +2212,9 @@ impl ControlServer {
             persistence,
         };
         Ok(crate::session::SessionSpec {
-            id: record.id.0.clone(),
+            id: target_id.to_owned(),
             pty,
-            manifest_id: record.kind.id().to_string(),
+            manifest_id: kind.id().to_string(),
             authority,
             logs_dir: self.logs_dir.clone(),
             holder: None,
@@ -2121,6 +2285,25 @@ impl ControlServer {
         cwd: &str,
         agent_session_id: Option<&str>,
     ) -> Result<crate::session::SessionSpec, ControlError> {
+        self.local_conversation_spec(
+            registry,
+            id,
+            kind,
+            cwd,
+            agent_session_id,
+            ConversationAction::Resume,
+        )
+    }
+
+    fn local_conversation_spec(
+        &self,
+        registry: &Registry,
+        id: &str,
+        kind: &str,
+        cwd: &str,
+        agent_session_id: Option<&str>,
+        action: ConversationAction,
+    ) -> Result<crate::session::SessionSpec, ControlError> {
         let engine = registry.engine();
         let manifest = engine
             .manifest(kind)
@@ -2132,25 +2315,10 @@ impl ControlServer {
             .ok_or_else(|| ControlError::bad_request(format!("agent {kind} declares no binary")))?;
         let binary = descriptor.binary.clone().expect("checked above");
         descriptor.binary = Some(self.resolve_local_agent_executable(kind, &binary)?);
-        let tail = descriptor.resume_args(agent_session_id).ok_or_else(|| {
-            ControlError::bad_request(format!("agent {kind} does not support resume"))
-        })?;
-
         let mut launch_args = descriptor.spawn_args.clone();
-        launch_args.extend(tail);
         if let Some(injection) = &self.injection {
-            // Only the appendable flag mechanisms replay on resume, exactly
-            // as in Swift: Codex's global `-c` overrides must precede the
-            // resume SUBCOMMAND and are deliberately not replayed.
-            let replay = crate::agent::InjectionSpec {
-                claude_hooks: descriptor.injection.claude_hooks,
-                claude_mcp: descriptor.injection.claude_mcp,
-                cursor_mcp: descriptor.injection.cursor_mcp,
-                cursor_hooks: descriptor.injection.cursor_hooks,
-                ..Default::default()
-            };
             launch_args.extend(crate::inject::injection_args_with_cursor(
-                &replay,
+                &descriptor.injection,
                 &injection.inject_dir,
                 &injection.cli_path,
                 Some(crate::inject::CursorInject {
@@ -2159,6 +2327,29 @@ impl ControlServer {
                 }),
             ));
         }
+        let provider_dir = registry.recovery_directory(id).join("provider");
+        let launch = match action {
+            ConversationAction::Resume => crate::agent::ConversationLaunch::Resume {
+                source_id: agent_session_id,
+                session_dir: Some(&provider_dir),
+            },
+            ConversationAction::Fork => crate::agent::ConversationLaunch::Fork {
+                source_id: agent_session_id,
+                session_dir: Some(&provider_dir),
+            },
+        };
+        launch_args = descriptor
+            .conversation_plan(&launch_args, launch)
+            .ok_or_else(|| {
+                ControlError::bad_request(format!(
+                    "agent {kind} does not support {}",
+                    match action {
+                        ConversationAction::Resume => "resume",
+                        ConversationAction::Fork => "fork",
+                    }
+                ))
+            })?
+            .args;
 
         let inherited: Vec<(String, String)> = std::env::vars().collect();
         let mut pty = descriptor
@@ -2174,6 +2365,13 @@ impl ControlServer {
             pty.env.push((
                 crate::inject::CLI_ENV.into(),
                 injection.cli_path.to_string_lossy().into_owned(),
+            ));
+            pty.env.push((
+                diri_proto::paths::ENV_SESSION_RECOVERY_DIR.into(),
+                registry
+                    .recovery_directory(id)
+                    .to_string_lossy()
+                    .into_owned(),
             ));
         }
         Ok(crate::session::SessionSpec {
@@ -3585,6 +3783,38 @@ mod tests {
     }
 
     #[test]
+    fn activity_list_reads_the_durable_publication_history() {
+        let temp = tempfile::tempdir().expect("temp");
+        let server = server(temp.path());
+        {
+            let mut registry = server.registry.lock().expect("registry");
+            let mut record = test_record("s_activity");
+            record.kind = diri_proto::AgentKind::CODEX;
+            record.status = diri_proto::SessionStatus::Working;
+            registry.insert_record(record);
+            server.publish_updated(&registry, "s_activity");
+            registry.update_record("s_activity", |record| {
+                record.status = diri_proto::SessionStatus::Idle;
+            });
+            server.publish_updated(&registry, "s_activity");
+        }
+
+        let result = ok_of(call(
+            &server,
+            diri_proto::Method::ACTIVITY_LIST,
+            Some(json!({"limit": 10})),
+        ));
+        assert_eq!(result["entries"][0]["kind"], "finished");
+        assert_eq!(result["entries"][1]["kind"], "started");
+        assert_eq!(result["entries"][0]["sessionID"], "s_activity");
+        assert!(
+            temp.path()
+                .join(diri_proto::paths::ACTIVITY_LOG_FILE_NAME)
+                .is_file()
+        );
+    }
+
+    #[test]
     fn a_client_on_another_protocol_is_told_so() {
         let temp = tempfile::tempdir().expect("temp");
         let server = server(temp.path());
@@ -3662,6 +3892,22 @@ mod tests {
             command.contains(&format!("{}'", executable.display()))
                 && command.contains("'--resume' 'uuid-1'"),
             "resume flags must reach the agent: {command:?}"
+        );
+
+        let fork = server
+            .local_conversation_spec(
+                &registry,
+                "s_fork",
+                "claude-code",
+                "/tmp",
+                Some("uuid-1"),
+                ConversationAction::Fork,
+            )
+            .expect("fork spec");
+        let command = fork.pty.argv.last().expect("fork argv");
+        assert!(
+            command.contains("'--resume' 'uuid-1' '--fork-session'"),
+            "fork grammar must reach the agent: {command:?}"
         );
     }
 

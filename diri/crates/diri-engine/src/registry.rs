@@ -8,7 +8,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use diri_proto::{DateMillis, ExitInfo, ExitReason, SessionRecord, SessionStatus, TitleSource};
+use diri_proto::{
+    AgentKind, DateMillis, ExitInfo, ExitReason, Resumability, SessionRecord, SessionStatus,
+    TitleSource,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::detect::ManifestEngine;
@@ -48,6 +51,9 @@ pub struct Registry {
     /// Sessions the user closed, newest last — the "reopen closed tab" stack.
     recently_closed: Vec<SessionRecord>,
     state_file: JsonStateFile,
+    /// Minimal per-session state used only to rediscover surviving local
+    /// Holders when the global Registry file is unavailable.
+    recovery_root: PathBuf,
     /// Trailing-edge persistence: a mutation inside the debounce window marks
     /// dirty instead of rewriting the whole file (mark-seen fires on every
     /// tab switch), and the flusher or the next persist call writes it out.
@@ -89,13 +95,19 @@ pub fn spawn_persist_flusher(
 
 impl Registry {
     pub fn new(engine: Arc<ManifestEngine>, state_file: impl Into<PathBuf>) -> Self {
+        let state_path = state_file.into();
+        let recovery_root = state_path
+            .parent()
+            .map(|parent| parent.join(diri_proto::paths::SESSION_RECOVERY_DIR_NAME))
+            .unwrap_or_else(|| PathBuf::from(diri_proto::paths::SESSION_RECOVERY_DIR_NAME));
         Self {
             engine,
             sessions: HashMap::new(),
             records: HashMap::new(),
             projects: Vec::new(),
             recently_closed: Vec::new(),
-            state_file: JsonStateFile::new(state_file),
+            state_file: JsonStateFile::new(state_path),
+            recovery_root,
             dirty: false,
             last_persist: None,
         }
@@ -241,10 +253,48 @@ impl Registry {
         self.records.insert(record.id.0.clone(), record);
     }
 
+    /// Exact directory exported to this session's hook/notify process.
+    pub fn recovery_directory(&self, id: &str) -> PathBuf {
+        self.recovery_root.join(id)
+    }
+
+    fn recovery_store(&self, id: &str) -> diri_proto::recovery::SessionRecoveryStore {
+        diri_proto::recovery::SessionRecoveryStore::new(self.recovery_directory(id))
+    }
+
+    fn write_recovery_capsule(&self, record: &SessionRecord) -> std::io::Result<()> {
+        if record.host.is_some() {
+            return Ok(());
+        }
+        self.recovery_store(&record.id.0).write_capsule(
+            &diri_proto::recovery::SessionRecoveryCapsule {
+                version: diri_proto::recovery::SessionRecoveryCapsule::VERSION,
+                session_id: record.id.clone(),
+                manifest_id: record.kind.id().to_owned(),
+                cwd: record.cwd.clone(),
+                created_at: record.created_at,
+                agent_session_id: record.agent_session_id.clone(),
+                transcript_path: record.transcript_path.clone(),
+            },
+        )
+    }
+
     /// Starts a session and takes ownership of it.
     pub fn spawn(&mut self, spec: SessionSpec, record: SessionRecord) -> std::io::Result<String> {
         let id = spec.id.clone();
-        let session = Session::spawn(spec, Arc::clone(&self.engine))?;
+        let recoverable = spec.holder.is_some() && record.host.is_none();
+        if recoverable {
+            self.write_recovery_capsule(&record)?;
+        }
+        let session = match Session::spawn(spec, Arc::clone(&self.engine)) {
+            Ok(session) => session,
+            Err(error) => {
+                if recoverable {
+                    let _ = self.recovery_store(&id).remove_owned_files();
+                }
+                return Err(error);
+            }
+        };
         self.records.insert(id.clone(), record);
         self.sessions.insert(id.clone(), session);
         Ok(id)
@@ -286,8 +336,12 @@ impl Registry {
     /// [`load`]: Registry::load
     /// [`reap_orphans`]: Registry::reap_orphans
     pub fn restore(&mut self, holder: &HolderConfig, logs_dir: &Path) -> Vec<String> {
+        let records_before = self.records.len();
         let adopted = self.adopt_live_holders(holder, logs_dir);
         self.reap_orphans();
+        if self.records.len() > records_before {
+            let _ = self.persist_now();
+        }
         adopted
     }
 
@@ -354,9 +408,6 @@ impl Registry {
 
         let mut adopted = Vec::new();
         for session_id in holder_session_ids {
-            let Some(record) = self.records.get(&session_id) else {
-                continue; // a holder without a record is not ours to run
-            };
             if self.sessions.contains_key(&session_id) {
                 continue;
             }
@@ -366,10 +417,32 @@ impl Registry {
             if !stat.alive {
                 continue;
             }
+            let recovered_from_capsule = if !self.records.contains_key(&session_id) {
+                let Ok(Some(capsule)) = self.recovery_store(&session_id).read_capsule() else {
+                    continue;
+                };
+                if capsule.version != diri_proto::recovery::SessionRecoveryCapsule::VERSION
+                    || capsule.session_id.0 != session_id
+                    || !Path::new(&capsule.cwd).is_absolute()
+                    || self.engine.manifest(&capsule.manifest_id).is_none()
+                {
+                    continue;
+                }
+                let recovered = recovered_record(capsule);
+                self.ensure_session_project(&recovered.cwd, None);
+                self.records.insert(session_id.clone(), recovered);
+                true
+            } else {
+                false
+            };
+            let Some(record) = self.records.get(&session_id) else {
+                continue;
+            };
             let manifest_id = record.kind.id().to_string();
             let record_status = record.status.clone();
             let record_needs_input = record.needs_input.clone();
             let record_hibernated = record.hibernation.is_some();
+            let record_updated_at = record.updated_at.0;
             let spec = SessionSpec {
                 id: session_id.clone(),
                 // The holder owns the real spec; this one only shapes the
@@ -392,6 +465,16 @@ impl Registry {
                         let _ = session.set_hibernated(true);
                     }
                     self.sessions.insert(session_id.clone(), session);
+                    if let Ok(Some(seed)) = self.recovery_store(&session_id).read_activity()
+                        && (recovered_from_capsule
+                            || seed.occurred_at_ms as f64 >= record_updated_at)
+                        && let Some((signal, metadata)) = crate::hooks::parse_activity_seed(&seed)
+                    {
+                        let _ = self.apply_hook_metadata(&session_id, &metadata);
+                        if let Some(session) = self.sessions.get(&session_id) {
+                            session.feed_signal(signal);
+                        }
+                    }
                     adopted.push(session_id);
                 }
                 Err(_) => continue,
@@ -556,6 +639,7 @@ impl Registry {
         if plan.delete_output_log {
             let _ = std::fs::remove_file(logs_dir.join(format!("{id}.bin")));
         }
+        let _ = self.recovery_store(id).remove_owned_files();
         Ok(())
     }
 
@@ -578,6 +662,11 @@ impl Registry {
         let id = spec.id.clone();
         if !self.records.contains_key(&id) {
             return Err(not_found(&id));
+        }
+        let record = self.records.get(&id).expect("checked above");
+        let recoverable = spec.holder.is_some() && record.host.is_none();
+        if recoverable {
+            self.write_recovery_capsule(record)?;
         }
         let session = Session::spawn(spec, Arc::clone(&self.engine))?;
         self.sessions.insert(id.clone(), session);
@@ -721,6 +810,10 @@ impl Registry {
         }
         if changed {
             record.updated_at = DateMillis::from(std::time::SystemTime::now());
+        }
+        let recovery_snapshot = changed.then(|| record.clone());
+        if let Some(record) = recovery_snapshot.as_ref() {
+            let _ = self.write_recovery_capsule(record);
         }
         changed
     }
@@ -1098,14 +1191,13 @@ fn fold_record_lifecycle(engine: &ManifestEngine, record: &mut SessionRecord) {
 }
 
 fn can_reenter(engine: &ManifestEngine, record: &SessionRecord) -> bool {
-    let Some(agent_session_id) = record.agent_session_id.as_deref() else {
-        return false;
-    };
     engine
         .manifest(record.kind.id())
         .and_then(|manifest| manifest.agent.as_ref())
-        .and_then(|agent| agent.resume_args(Some(agent_session_id)))
-        .is_some()
+        .is_some_and(|agent| {
+            agent.supports_resume()
+                && (record.agent_session_id.is_some() || agent.supports_id_free_resume())
+        })
 }
 
 fn normalize_agent_title(title: &str) -> Option<String> {
@@ -1136,6 +1228,44 @@ fn is_generic_terminal_title(title: &str, record: &SessionRecord) -> bool {
             compact_title.as_str(),
             "claude" | "claudecode" | "codex" | "cursor" | "gemini" | "terminal" | "shell"
         )
+}
+
+fn recovered_record(capsule: diri_proto::recovery::SessionRecoveryCapsule) -> SessionRecord {
+    let now = DateMillis::from(std::time::SystemTime::now());
+    let project_id = session_project_id(&capsule.cwd, None);
+    SessionRecord {
+        id: capsule.session_id,
+        kind: AgentKind::new(capsule.manifest_id),
+        cwd: capsule.cwd,
+        project_id,
+        worktree_path: None,
+        git_branch: None,
+        title: "Recovered session".into(),
+        title_source: TitleSource::Placeholder,
+        originating_prompt: None,
+        agent_session_id: capsule.agent_session_id,
+        transcript_path: capsule.transcript_path,
+        status: SessionStatus::Starting,
+        status_evidence: None,
+        needs_input: None,
+        resumability: Resumability::Live,
+        capabilities: None,
+        parent: None,
+        created_at: capsule.created_at,
+        updated_at: now,
+        last_turn_completed_at: None,
+        last_seen_at: None,
+        pinned: false,
+        archived_at: None,
+        host: None,
+        remote_persistence: None,
+        hibernation: None,
+        memory_bytes: None,
+        artifacts: None,
+        pull_requests: None,
+        listening_ports: None,
+        foreground_agent: None,
+    }
 }
 
 fn not_found(id: &str) -> std::io::Error {

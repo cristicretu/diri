@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "id": "gemini",
-  "version": "2026.07.10",
+  "version": "2026.08.15.1",
   "statusModel": "full",
   "agent": {
     "id": "gemini",
@@ -25,6 +25,17 @@
     "resume": {
       "style": "flag",
       "token": "--resume"
+    },
+    "conversation": {
+      "freshArgs": ["--session-id", "{newId}"],
+      "resume": {
+        "exactArgs": ["--resume", "{id}"],
+        "latestArgs": ["--resume", "latest"]
+      },
+      "stripArgs": [
+        {"token": "--resume", "value": "any"},
+        {"token": "--session-id", "value": "any"}
+      ]
     },
     "envScrubPrefixes": [
       "GEMINI_CLI",

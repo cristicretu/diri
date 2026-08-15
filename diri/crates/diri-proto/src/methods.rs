@@ -23,6 +23,7 @@ impl Method {
     pub const SESSION_REMOVE: &'static str = "session.remove";
     pub const SESSION_RENAME: &'static str = "session.rename";
     pub const SESSION_RESUME: &'static str = "session.resume";
+    pub const SESSION_FORK: &'static str = "session.fork";
     pub const SESSION_SEND_TEXT: &'static str = "session.send_text";
     pub const SESSION_RESIZE: &'static str = "session.resize";
     pub const SESSION_READ_SCREEN: &'static str = "session.read_screen";
@@ -42,6 +43,7 @@ impl Method {
     pub const HOST_INITIALIZE: &'static str = "host.initialize";
     pub const HOST_LIST_DIRECTORIES: &'static str = "host.list_directories";
     pub const SESSION_HISTORY: &'static str = "session.history";
+    pub const ACTIVITY_LIST: &'static str = "activity.list";
     pub const SESSION_RESUME_FROM_HISTORY: &'static str = "session.resume_from_history";
     pub const WORKTREE_CREATE: &'static str = "worktree.create";
     pub const WORKTREE_LIST: &'static str = "worktree.list";
@@ -88,6 +90,21 @@ pub struct SessionResourcesEvent {
 pub struct EmptyParams {}
 
 pub type EmptyResult = EmptyParams;
+pub type SessionForkParams = SessionIdParams;
+pub type SessionForkResult = SessionRecord;
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u16>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ActivityListResult {
+    /// Newest first.
+    pub entries: Vec<crate::model::ActivityEntry>,
+}
 
 /// Result of a best-effort desktop ownership release. The Engine remains
 /// alive whenever it still owns a live session or another control client is

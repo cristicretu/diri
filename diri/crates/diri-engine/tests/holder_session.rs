@@ -8,14 +8,15 @@
 
 #![cfg(unix)]
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use diri_engine::holder::{HolderClient, HolderPaths};
+use diri_engine::holder::{HolderClient, HolderLaunchSpec, HolderPaths, HolderServer};
 use diri_engine::session::{HolderConfig, Session, SessionSpec};
 use diri_engine::{Authority, ManifestEngine, OutputLog, PtySpec, Registry};
-use diri_proto::SessionStatus;
+use diri_proto::{AgentKind, SessionStatus};
 
 fn engine() -> Arc<ManifestEngine> {
     let dir = diri_engine::detect::bundled_manifest_dir()
@@ -173,6 +174,89 @@ fn a_registry_restore_adopts_live_holders_from_a_previous_life() {
     registry
         .terminate("s_live", Duration::from_secs(2))
         .expect("terminate");
+}
+
+#[test]
+fn a_capsule_and_hook_seed_recover_a_holder_when_global_state_is_gone() {
+    let root = holders_dir("capsule");
+    let logs = root.join("logs");
+    let holder = holder_config(&root);
+    let state_file = root.join("state.json");
+
+    let paths = HolderPaths::new(&holder.holders_dir, "s_recover");
+    let launch = HolderLaunchSpec {
+        session_id: "s_recover".into(),
+        socket_path: paths.socket().to_string_lossy().into_owned(),
+        pid_file_path: paths.pid_file().to_string_lossy().into_owned(),
+        log_file_path: logs.join("s_recover.bin").to_string_lossy().into_owned(),
+        argv: vec!["/bin/cat".into()],
+        cwd: "/tmp".into(),
+        environment: HashMap::from([
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("TERM".into(), "xterm-256color".into()),
+        ]),
+        cols: 80,
+        rows: 24,
+        disk_capacity: diri_engine::holder::protocol::DEFAULT_DISK_CAPACITY,
+    };
+    let holder_thread = std::thread::spawn(move || HolderServer::run(launch));
+    let client = HolderClient::new(paths.socket());
+    wait_until("holder ready", Duration::from_secs(5), || client.is_alive());
+
+    let recovery_dir = root.join("sessions/s_recover");
+    let store = diri_proto::recovery::SessionRecoveryStore::new(&recovery_dir);
+    store
+        .write_capsule(&diri_proto::recovery::SessionRecoveryCapsule {
+            version: diri_proto::recovery::SessionRecoveryCapsule::VERSION,
+            session_id: diri_proto::SessionId::new("s_recover"),
+            manifest_id: AgentKind::CLAUDE_CODE_ID.into(),
+            cwd: "/tmp/recovered-project".into(),
+            created_at: diri_proto::DateMillis(10.0),
+            agent_session_id: None,
+            transcript_path: None,
+        })
+        .expect("capsule");
+    store
+        .write_activity(&diri_proto::recovery::HookActivitySeed {
+            version: diri_proto::recovery::HookActivitySeed::VERSION,
+            kind: "claude-hook".into(),
+            event: Some("Stop".into()),
+            occurred_at_ms: 100,
+            agent_session_id: Some("conversation-recovered".into()),
+            transcript_path: None,
+            notification_type: None,
+            tool_name: None,
+        })
+        .expect("seed");
+
+    let mut registry = Registry::new(engine(), &state_file);
+    let adopted = registry.restore(&holder, &logs);
+    assert_eq!(adopted, ["s_recover"]);
+    let recovered = registry.record("s_recover").expect("recovered record");
+    assert_eq!(recovered.kind, AgentKind::CLAUDE_CODE);
+    assert_eq!(recovered.cwd, "/tmp/recovered-project");
+    assert_eq!(
+        recovered.agent_session_id.as_deref(),
+        Some("conversation-recovered")
+    );
+    wait_until("hook seed restores idle", Duration::from_secs(3), || {
+        matches!(
+            registry.record("s_recover").map(|record| record.status),
+            Some(SessionStatus::Idle)
+        )
+    });
+    assert!(
+        state_file.is_file(),
+        "the reconstructed record is persisted"
+    );
+
+    registry
+        .terminate("s_recover", Duration::from_secs(2))
+        .expect("terminate");
+    holder_thread
+        .join()
+        .expect("holder thread")
+        .expect("holder exits cleanly");
 }
 
 #[test]

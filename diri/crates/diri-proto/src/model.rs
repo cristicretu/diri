@@ -702,10 +702,40 @@ pub struct PortInfo {
 #[serde(rename_all = "camelCase")]
 pub struct SessionCapabilities {
     pub resume: bool,
+    #[serde(default)]
+    pub fork: bool,
     pub archive: bool,
     pub send_text: bool,
     pub quick_approve: bool,
     pub reliable_completion: bool,
+}
+
+string_enum! {
+    pub enum ActivityKind {
+        Started => "started",
+        NeedsInput => "needsInput",
+        Finished => "finished",
+        Exited => "exited",
+    }
+}
+
+/// One durable lifecycle transition with enough display identity to remain
+/// useful after its SessionRecord has been removed.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityEntry {
+    pub id: String,
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    pub kind: ActivityKind,
+    pub at: DateMillis,
+    pub title: String,
+    pub agent_id: String,
+    #[serde(rename = "projectID")]
+    pub project_id: ProjectId,
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

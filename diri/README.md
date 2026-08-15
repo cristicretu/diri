@@ -23,6 +23,27 @@ adopted by whatever daemon starts next.
 on-disk state, while `diri-holder` owns local PTYs across Engine restarts.
 [`PORT.md`](PORT.md) records the completed migration layer by layer.
 
+Holder recovery does not depend solely on the daemon's global registry. Before
+a local Holder starts, the Engine writes a small per-session recovery capsule
+beside its provider storage. Hooks and notifications update a separate,
+privacy-minimized activity seed before attempting the control socket. A new
+daemon can therefore adopt a surviving Holder, reconstruct its identity, and
+replay its last lifecycle signal even when the registry write was interrupted.
+
+Authoritative lifecycle transitions are also appended to
+`activity-log.jsonl`. Entries contain status and session metadata, not terminal
+output, prompts, or tool input. The automation CLI exposes the recent history
+and manifest-supported native forks:
+
+```sh
+dirijor activity --limit 25
+dirijor activity --json
+dirijor session fork <session-id-or-title>
+```
+
+Fork support is capability-driven: it is offered only when the selected agent
+manifest declares a native fork command.
+
 ## Install
 
 ```sh

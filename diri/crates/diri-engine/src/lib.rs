@@ -18,6 +18,7 @@
 //!   it can be built and tested while the existing daemon keeps serving live
 //!   sessions.
 
+pub mod activity;
 pub mod agent;
 pub mod agent_catalog;
 pub mod artifacts;

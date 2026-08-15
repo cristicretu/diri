@@ -129,10 +129,47 @@ an unavailable-agent row, and use `signInHint` only for the documented next
 step after installation. Setup metadata is guidance: Diri does not run either
 hint or open its URL without an explicit user action.
 
-### Resume behavior
+### Conversation behavior
 
-`sessionIDFlag` tells Diri that it may mint an id at launch, for example
-`"--session-id"`. `resume` declares how that id is passed later:
+`conversation` is the preferred launch grammar for fresh, resumed, and forked
+conversations. Its values are argv arrays, never shell fragments:
+
+```jsonc
+"conversation": {
+  "freshArgs": ["--session-id", "{newId}"],
+  "resume": {
+    "exactArgs": ["--resume", "{id}"],
+    "latestArgs": ["--continue"]
+  },
+  "fork": {
+    "exactArgs": ["--fork-session", "{id}"]
+  },
+  "stripArgs": [
+    { "token": "--resume", "value": "any" },
+    { "token": "--continue" },
+    { "token": "--fork-session", "value": "any" }
+  ]
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `freshArgs` | Args applied to a new conversation. Use `{newId}` when Diri should mint and retain the provider id. |
+| `resume.exactArgs` | Resume a known provider conversation. `{id}` is the source provider id. |
+| `resume.latestArgs` | Resume from intentionally session-scoped storage when no provider id is required. |
+| `fork.exactArgs` | Fork a known provider conversation. A fork starts with no known provider id; hooks or notifications can report its new identity later. |
+| `fork.latestArgs` | Provider-native fork of its latest conversation when that is a documented operation. |
+| `stripArgs` | Remove stale conversation markers before applying one canonical mode. `value` is `none` (default), `any`, or `nonoption`. |
+
+The supported placeholders are `{id}`, `{newId}`, and `{sessionDir}`. The last
+one points at Diri's per-session provider-storage directory and is useful for
+agents whose “continue latest” behavior can otherwise select a different
+session. Every placeholder used by the selected command must have a value or
+the launch is rejected.
+
+`sessionIDFlag` and `resume` are the legacy additive form retained for existing
+user manifests. `sessionIDFlag` tells Diri that it may mint an id at launch, for
+example `"--session-id"`. Legacy `resume` declares how that id is passed later:
 
 | `resume.style` | Result |
 | --- | --- |
@@ -143,9 +180,10 @@ hint or open its URL without an explicit user action.
 
 Declare resume only when the CLI documents it and Diri can obtain the required
 id. A flag that accepts an id is not useful if the CLI never reports that id.
-The engine's current built-in representation uses `flag` without an id for bare
-latest-session tokens; follow the closest manifest and verify the actual argv in
-tests rather than guessing.
+Use `latestArgs` without `exactArgs` only when storage is pinned with
+`{sessionDir}`; otherwise an exited record with no provider id remains
+non-resumable. Follow the closest manifest and verify fresh, resume, and fork
+argv in tests rather than guessing.
 
 ### Injection mechanisms
 

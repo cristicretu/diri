@@ -477,6 +477,13 @@ impl DaemonClient {
         Ok(record.id)
     }
 
+    pub async fn fork(&self, session_id: &SessionId) -> Result<SessionId, ClientError> {
+        let record: SessionForkResult = self
+            .typed(Method::SESSION_FORK, &session_params(session_id))
+            .await?;
+        Ok(record.id)
+    }
+
     /// `session.migrate`: git shuttling + respawn can take a while, so this
     /// carries its own generous timeout instead of waiting forever.
     pub async fn migrate(
@@ -752,6 +759,11 @@ impl DaemonClient {
 
     pub async fn history(&self) -> Result<SessionHistoryResult, ClientError> {
         self.no_params(Method::SESSION_HISTORY).await
+    }
+
+    pub async fn activity(&self, limit: Option<u16>) -> Result<ActivityListResult, ClientError> {
+        self.typed(Method::ACTIVITY_LIST, &ActivityListParams { limit })
+            .await
     }
 
     pub async fn resume_from_history(

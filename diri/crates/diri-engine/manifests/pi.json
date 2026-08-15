@@ -2,7 +2,7 @@
   "_notice": "Screen-detection predicates adapted from the herdr project (https://github.com/herdrdev/herdr, src/detect/manifests/*.toml), licensed Apache-2.0. Translated from herdr's TOML rule schema into Dirijor's JSON predicate schema and re-prioritised for this engine; the agent capability block is Dirijor's own.",
   "schemaVersion": 2,
   "id": "pi",
-  "version": "2026.07.31.1",
+  "version": "2026.08.15.1",
   "statusModel": "processOnly",
   "agent": {
     "id": "pi",
@@ -23,12 +23,25 @@
       "style": "flag",
       "token": "-c"
     },
+    "conversation": {
+      "freshArgs": ["--session-dir", "{sessionDir}"],
+      "resume": {
+        "latestArgs": ["--session-dir", "{sessionDir}", "-c"]
+      },
+      "stripArgs": [
+        {"token": "-c"},
+        {"token": "--continue"},
+        {"token": "--session", "value": "any"},
+        {"token": "--session-dir", "value": "any"},
+        {"token": "--fork"}
+      ]
+    },
     "returnToLoginShell": true,
     "foregroundExecNames": [
       "pi"
     ],
     "_resumeNotice": "Verified against Pi's official README: 'pi -c                  # Continue most recent session'. https://github.com/earendil-works/pi/blob/main/packages/coding-agent/README.md. --session requires a path or id.",
-    "_resumeStyleNotice": "Rust's AgentDescriptor::resume_args implements only \"flag\" and \"sessionIDFlag\"; Swift's \"latest\" has no implementation there and would silently resume nothing. Declared as \"flag\": this agent has no sessionIDFlag, so it never carries a caller-minted id and resume_args emits the bare token \u2014 exactly the semantics the token was chosen for.",
+    "_resumeStyleNotice": "Diri pins Pi's fresh and continue commands to a per-session provider directory, so `-c` cannot accidentally select another Diri session's latest conversation.",
     "envScrubPrefixes": [
       "DIRI_",
       "DIRIJOR_"

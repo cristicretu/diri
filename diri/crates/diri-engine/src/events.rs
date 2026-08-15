@@ -174,6 +174,7 @@ struct BusInner {
 #[derive(Clone)]
 pub struct EventBus {
     inner: Arc<Mutex<BusInner>>,
+    activity: Arc<Mutex<Option<crate::activity::ActivityLog>>>,
     ring_capacity: usize,
     ring_byte_capacity: usize,
     subscriber_capacity: usize,
@@ -206,6 +207,7 @@ impl EventBus {
                 subscribers: HashMap::new(),
                 next_subscriber: 0,
             })),
+            activity: Arc::new(Mutex::new(None)),
             ring_capacity,
             ring_byte_capacity,
             subscriber_capacity: subscriber_capacity
@@ -263,7 +265,44 @@ impl EventBus {
         session_id: Option<&str>,
     ) {
         if let Ok(params) = serde_json::to_value(value) {
+            if name == diri_proto::EventName::SESSION_UPDATED
+                && let Ok(record) =
+                    serde_json::from_value::<diri_proto::SessionRecord>(params.clone())
+                && let Ok(mut activity) = self.activity.lock()
+                && let Some(activity) = activity.as_mut()
+                && let Err(error) = activity.observe(&record)
+            {
+                eprintln!("diri-engine: activity log append failed: {error}");
+            }
             self.publish(name, params, session_id);
+        }
+    }
+
+    /// Enables durable history at the same publication seam used by every
+    /// live-status producer. Reconfiguration is used only during daemon/test
+    /// construction, before publishers start.
+    pub fn enable_activity_log(&self, path: impl Into<std::path::PathBuf>) -> std::io::Result<()> {
+        let log = crate::activity::ActivityLog::load(path)?;
+        *self.activity.lock().expect("activity log") = Some(log);
+        Ok(())
+    }
+
+    pub fn recent_activity(&self, limit: usize) -> Vec<diri_proto::ActivityEntry> {
+        self.activity
+            .lock()
+            .ok()
+            .and_then(|activity| activity.as_ref().map(|activity| activity.recent(limit)))
+            .unwrap_or_default()
+    }
+
+    /// Records a final snapshot before `session.remove` makes the Registry
+    /// record unavailable, while keeping the existing wire event unchanged.
+    pub fn record_removed(&self, record: &diri_proto::SessionRecord) {
+        if let Ok(mut activity) = self.activity.lock()
+            && let Some(activity) = activity.as_mut()
+            && let Err(error) = activity.observe_removed(record)
+        {
+            eprintln!("diri-engine: activity log append failed: {error}");
         }
     }
 

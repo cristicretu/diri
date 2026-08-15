@@ -66,6 +66,7 @@ fn run(arguments: &[String]) -> Result<(), CliError> {
         "mcp-tools" => mcp_tools(),
         "mcp-call" => mcp_call(arguments.get(1..).unwrap_or_default()),
         "status" => session_list(arguments.get(1..).unwrap_or_default(), true),
+        "activity" => activity(arguments.get(1..).unwrap_or_default()),
         "session" => session(arguments.get(1..).unwrap_or_default()),
         "worktree" => worktree(arguments.get(1..).unwrap_or_default()),
         "artifacts" => artifacts(arguments.get(1..).unwrap_or_default()),
@@ -82,7 +83,7 @@ fn run(arguments: &[String]) -> Result<(), CliError> {
 fn print_help() {
     println!(
         "dirijor — Diri automation CLI\n\n\
-         Usage:\n  dirijor status [--json]\n  dirijor session <list|get|read|send|wait|spawn|release|archive> ...\n  \
+         Usage:\n  dirijor status [--json]\n  dirijor activity [--limit N] [--json]\n  dirijor session <list|get|read|send|wait|spawn|fork|release|archive> ...\n  \
          dirijor worktree <list|create|remove> ...\n  dirijor artifacts <session> [--json]\n  \
          dirijor events <subscribe|wait> ...\n  dirijor ports [--json]\n  dirijor doctor\n  \
          dirijor hook <event>\n  dirijor notify <json>\n  dirijor mcp-tools\n  \
@@ -118,6 +119,7 @@ fn map_bridge_error(message: String) -> CliError {
 fn hook(event: Option<&str>) -> Result<(), CliError> {
     let event = event.unwrap_or_default();
     let payload = stdin_json(1 << 20, Duration::from_millis(500));
+    persist_hook_activity("claude-hook", Some(event), &payload);
     let result = bridge().request(
         Method::HOOK_REPORT,
         json!({
@@ -154,6 +156,9 @@ fn notify(arguments: &[String]) -> Result<(), CliError> {
         return Ok(());
     };
     let payload = serde_json::from_str(raw).unwrap_or_else(|_| json!({"raw": raw}));
+    if payload.get("type").and_then(Value::as_str) == Some("agent-turn-complete") {
+        persist_hook_activity("codex-notify", None, &payload);
+    }
     let _ = bridge().request(
         Method::HOOK_REPORT,
         json!({
@@ -165,6 +170,47 @@ fn notify(arguments: &[String]) -> Result<(), CliError> {
         Duration::from_secs(3),
     );
     Ok(())
+}
+
+/// Records only lifecycle and identity fields before attempting delivery.
+/// Raw prompts, tool inputs, and notification messages never enter this file.
+fn persist_hook_activity(kind: &str, event: Option<&str>, payload: &Value) {
+    let Some(directory) = std::env::var_os(diri_proto::paths::ENV_SESSION_RECOVERY_DIR)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    else {
+        return;
+    };
+    let occurred_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    let string = |key: &str| {
+        payload
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    let seed = diri_proto::recovery::HookActivitySeed {
+        version: diri_proto::recovery::HookActivitySeed::VERSION,
+        kind: kind.to_owned(),
+        event: event.filter(|value| !value.is_empty()).map(str::to_owned),
+        occurred_at_ms,
+        agent_session_id: string(if kind == "codex-notify" {
+            "thread-id"
+        } else {
+            "session_id"
+        }),
+        transcript_path: string("transcript_path"),
+        notification_type: string("notification_type"),
+        tool_name: string("tool_name"),
+    };
+    // Hook contracts are fail-open. A read-only disk or interrupted rename
+    // must not prevent the provider from completing its own callback.
+    let _ = diri_proto::recovery::SessionRecoveryStore::new(directory).write_activity(&seed);
 }
 
 fn mcp_stdio() -> Result<(), CliError> {
@@ -242,6 +288,7 @@ fn session(arguments: &[String]) -> Result<(), CliError> {
         "send" => session_send(rest),
         "wait" => session_wait(rest),
         "spawn" => session_spawn(rest),
+        "fork" => session_fork(rest),
         "release" => session_release(rest),
         "archive" => session_archive(rest),
         other => Err(CliError::failure(format!(
@@ -262,6 +309,40 @@ fn session_list(arguments: &[String], include_archived_by_default: bool) -> Resu
         print_json(&json!({"sessions": sessions}));
     } else {
         print_session_table(&sessions);
+    }
+    Ok(())
+}
+
+fn activity(arguments: &[String]) -> Result<(), CliError> {
+    let limit = option_value(arguments, "--limit")
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(50)
+        .clamp(1, 300);
+    let result = request(
+        Method::ACTIVITY_LIST,
+        json!({"limit": limit}),
+        Duration::from_secs(10),
+    )?;
+    if has_flag(arguments, "--json") {
+        print_json(&result);
+        return Ok(());
+    }
+    let entries = result
+        .get("entries")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for entry in entries {
+        let kind = entry
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let session = entry
+            .get("sessionID")
+            .and_then(Value::as_str)
+            .unwrap_or("?");
+        let title = entry.get("title").and_then(Value::as_str).unwrap_or("");
+        println!("{kind:<10}  {session:<16}  {title}");
     }
     Ok(())
 }
@@ -464,6 +545,26 @@ fn session_spawn(arguments: &[String]) -> Result<(), CliError> {
         print_json(&result);
     } else if let Some(id) = result.get("id").and_then(Value::as_str) {
         println!("spawned {id}");
+    } else {
+        print_json(&result);
+    }
+    Ok(())
+}
+
+fn session_fork(arguments: &[String]) -> Result<(), CliError> {
+    let target = positional(arguments, 0)
+        .ok_or_else(|| CliError::failure("session fork requires a target"))?;
+    let sessions = sessions()?;
+    let source = resolve_session(&target, &sessions)?;
+    let result = request(
+        Method::SESSION_FORK,
+        json!({"sessionID": source.id.0}),
+        Duration::from_secs(30),
+    )?;
+    if has_flag(arguments, "--json") {
+        print_json(&result);
+    } else if let Some(id) = result.get("id").and_then(Value::as_str) {
+        println!("forked {} from {}", id, source.id.0);
     } else {
         print_json(&result);
     }
