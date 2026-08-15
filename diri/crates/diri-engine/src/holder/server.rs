@@ -59,6 +59,10 @@ const OUTPUT_SEND_PATIENCE: Duration = Duration::from_millis(50);
 /// Buffer for one subscriber's socket writes.
 const OUTPUT_WRITE_BUFFER: usize = 256 << 10;
 
+/// How long a subscriber's writer waits for a frame before looping. Only sets
+/// how promptly it notices the queue closing.
+const OUTPUT_IDLE_WAIT: Duration = Duration::from_millis(100);
+
 pub struct HolderServer;
 
 struct Shared {
@@ -101,7 +105,7 @@ struct OutputFanout {
 /// allowed to stall the PTY. A dropped subscriber loses nothing, because every
 /// byte is in the log it will fall back to.
 struct OutputSubscriber {
-    frames: std::sync::mpsc::SyncSender<(u64, Arc<[u8]>)>,
+    frames: Arc<super::fanout::FrameQueue>,
 }
 
 impl HolderServer {
@@ -218,14 +222,14 @@ impl HolderServer {
                             start_offset,
                         );
                         if socket::write_json_line(&mut client, &response).is_ok() {
-                            let (send, receive) = std::sync::mpsc::sync_channel::<(u64, Arc<[u8]>)>(
-                                OUTPUT_QUEUE_DEPTH,
-                            );
-                            fanout.subscribers.push(OutputSubscriber { frames: send });
+                            let frames = super::fanout::FrameQueue::new(OUTPUT_QUEUE_DEPTH);
+                            fanout.subscribers.push(OutputSubscriber {
+                                frames: Arc::clone(&frames),
+                            });
                             drop(fanout);
                             let _ = std::thread::Builder::new()
                                 .name(format!("holder-output-{}", shared.spec.session_id))
-                                .spawn(move || serve_output_stream(client, receive));
+                                .spawn(move || serve_output_stream(client, &frames));
                         }
                         continue;
                     }
@@ -294,7 +298,7 @@ fn pump_pty(shared: &Arc<Shared>, reader: &mut crate::pty::PtyStream) {
     // The channel is bounded, so a writer that genuinely cannot keep up applies
     // backpressure rather than growing without limit. Ordering is preserved
     // because exactly one thread writes.
-    let (send, receive) = std::sync::mpsc::sync_channel::<Vec<u8>>(WRITE_QUEUE_DEPTH);
+    let (send, receive) = std::sync::mpsc::sync_channel::<Arc<[u8]>>(WRITE_QUEUE_DEPTH);
     let writer = {
         let shared = Arc::clone(shared);
         std::thread::Builder::new()
@@ -367,15 +371,16 @@ fn pump_pty(shared: &Arc<Shared>, reader: &mut crate::pty::PtyStream) {
             // session should not wait for a disk write to see the bytes, and
             // this ordering is what decouples display latency from filesystem
             // throughput.
-            broadcast_output(shared, &buffer[..filled]);
+            let chunk: Arc<[u8]> = Arc::from(&buffer[..filled]);
+            broadcast_output(shared, &chunk);
             // Bytes read are handed on even if `finished` was just set: the
             // exit watcher joins this thread before writing the marker, so
             // nothing can land beyond it — but a byte consumed from the kernel
             // and then dropped would be lost.
             match queue.as_ref() {
-                Some(queue) if queue.send(buffer[..filled].to_vec()).is_ok() => {}
+                Some(queue) if queue.send(Arc::clone(&chunk)).is_ok() => {}
                 _ => {
-                    let _ = shared.log.lock().expect("log").append(&buffer[..filled]);
+                    let _ = shared.log.lock().expect("log").append(&chunk);
                 }
             }
         }
@@ -401,20 +406,19 @@ fn pump_pty(shared: &Arc<Shared>, reader: &mut crate::pty::PtyStream) {
 /// ahead of the screen that renders it — and giving up keeps a wedged or dead
 /// daemon from stalling the PTY. Anything a dropped subscriber misses is in the
 /// log, which is where it resumes.
-fn broadcast_output(shared: &Shared, data: &[u8]) {
+fn broadcast_output(shared: &Shared, frame: &Arc<[u8]>) {
     let mut fanout = shared.output.lock().expect("output");
     let offset = fanout.next_offset;
     // Advanced whether or not anyone is listening: a subscriber that arrives
     // later is told to start here, and must not be told an offset that skipped
     // bytes already handed out.
-    fanout.next_offset += data.len() as u64;
+    fanout.next_offset += frame.len() as u64;
     if fanout.subscribers.is_empty() {
         return;
     }
-    let frame: Arc<[u8]> = Arc::from(data);
     fanout
         .subscribers
-        .retain(|subscriber| offer_frame(subscriber, offset, &frame));
+        .retain(|subscriber| offer_frame(subscriber, offset, frame));
 }
 
 /// Offers one frame to a subscriber, waiting only as long as
@@ -423,37 +427,29 @@ fn broadcast_output(shared: &Shared, data: &[u8]) {
 /// Returns false when the subscriber should be dropped: either it is gone, or
 /// it is far enough behind that continuing to wait would stall the PTY.
 fn offer_frame(subscriber: &OutputSubscriber, offset: u64, frame: &Arc<[u8]>) -> bool {
-    use std::sync::mpsc::TrySendError;
-    let deadline = std::time::Instant::now() + OUTPUT_SEND_PATIENCE;
-    let mut pending = (offset, Arc::clone(frame));
-    loop {
-        match subscriber.frames.try_send(pending) {
-            Ok(()) => return true,
-            Err(TrySendError::Disconnected(_)) => return false,
-            Err(TrySendError::Full(returned)) => {
-                if std::time::Instant::now() >= deadline {
-                    return false;
-                }
-                pending = returned;
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
-    }
+    subscriber
+        .frames
+        .push((offset, Arc::clone(frame)), OUTPUT_SEND_PATIENCE)
 }
 
 /// Writes frames to one subscriber until it disappears or the channel closes.
-fn serve_output_stream(
-    stream: std::os::unix::net::UnixStream,
-    frames: std::sync::mpsc::Receiver<(u64, Arc<[u8]>)>,
-) {
+fn serve_output_stream(stream: std::os::unix::net::UnixStream, frames: &super::fanout::FrameQueue) {
     let mut stream = std::io::BufWriter::with_capacity(OUTPUT_WRITE_BUFFER, stream);
-    let mut queued: Option<(u64, Arc<[u8]>)> = None;
+    let mut queued: Option<super::fanout::Frame> = None;
     loop {
         let (offset, frame) = match queued.take() {
             Some(frame) => frame,
-            None => match frames.recv() {
-                Ok(frame) => frame,
-                Err(_) => break,
+            None => match frames.pop(OUTPUT_IDLE_WAIT) {
+                Some(frame) => frame,
+                None if frames.is_closed() => break,
+                // Nothing to write: flush what is buffered and keep waiting.
+                None => {
+                    if stream.flush().is_err() {
+                        frames.close();
+                        return;
+                    }
+                    continue;
+                }
             },
         };
         let length = frame.len() as u32;
@@ -461,15 +457,17 @@ fn serve_output_stream(
             || stream.write_all(&length.to_be_bytes()).is_err()
             || stream.write_all(&frame).is_err()
         {
+            frames.close();
             return;
         }
         // Flushed only once nothing else is waiting, so a burst coalesces into
         // few writes while a lone chunk still leaves immediately. The frame
         // taken here is carried to the next turn, never dropped.
-        match frames.try_recv() {
-            Ok(next) => queued = Some(next),
-            Err(_) => {
+        match frames.pop(Duration::ZERO) {
+            Some(next) => queued = Some(next),
+            None => {
                 if stream.flush().is_err() {
+                    frames.close();
                     return;
                 }
             }

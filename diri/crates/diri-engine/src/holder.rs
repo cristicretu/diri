@@ -28,6 +28,8 @@ mod socket;
 #[cfg(unix)]
 pub mod server;
 
+mod fanout;
+
 pub use client::{HolderClient, HolderManagerClient, HolderOutputStream};
 pub use launcher::HolderLauncher;
 pub use paths::{HolderManagerPaths, HolderPaths};

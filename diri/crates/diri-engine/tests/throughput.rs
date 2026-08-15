@@ -22,9 +22,14 @@ use diri_engine::{Authority, ManifestEngine, PtySpec};
 /// Payload size. Big enough that per-read overhead shows up over process
 /// startup, small enough to stay quick in CI.
 const PAYLOAD_BYTES: usize = 8 << 20;
-/// Slowest acceptable drain. The path measured ~150 MB/s when this was written;
-/// the pre-fix implementation managed ~12 MB/s.
-const FLOOR_MB_PER_SEC: f64 = 40.0;
+/// Slowest acceptable drain.
+///
+/// Deliberately far below what the path achieves (~90-150 MB/s depending on
+/// how busy the machine is). This guards against the class of regression that
+/// made output cost grow with the size of a buffer — which measured ~12 MB/s —
+/// not against a few percent of tuning, and a tight bound would only flake on
+/// a loaded CI box.
+const FLOOR_MB_PER_SEC: f64 = 25.0;
 
 /// These tests time a pipeline, so they cannot share a machine with each
 /// other: cargo runs tests in one binary concurrently, and a burst in the next

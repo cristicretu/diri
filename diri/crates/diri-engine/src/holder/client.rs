@@ -116,8 +116,9 @@ impl HolderClient {
             return Ok(None);
         };
         Ok(Some(HolderOutputStream {
-            stream,
+            stream: std::io::BufReader::with_capacity(OUTPUT_READ_BUFFER, stream),
             start_offset,
+            timeout: None,
         }))
     }
 
@@ -167,17 +168,66 @@ impl HolderClient {
     }
 }
 
+/// Read buffer for one output subscription.
+const OUTPUT_READ_BUFFER: usize = 256 << 10;
+
 /// A subscription to one holder's PTY output.
 pub struct HolderOutputStream {
-    stream: std::os::unix::net::UnixStream,
+    /// Buffered, because a frame costs two reads and frames are small: at PTY
+    /// chunk sizes the syscalls cost more than the parsing they feed.
+    stream: std::io::BufReader<std::os::unix::net::UnixStream>,
     start_offset: u64,
+    /// The timeout currently set on the socket. Setting it is a syscall, and
+    /// the coalescing loop would otherwise pay one per frame.
+    timeout: Option<Duration>,
 }
 
 impl HolderOutputStream {
+    fn set_timeout(&mut self, timeout: Option<Duration>) -> HolderResult<()> {
+        if self.timeout == timeout {
+            return Ok(());
+        }
+        self.stream
+            .get_ref()
+            .set_read_timeout(timeout)
+            .map_err(|error| HolderError::io("set output stream timeout", error))?;
+        self.timeout = timeout;
+        Ok(())
+    }
+
     /// Offset of the first byte this stream will deliver.
     #[must_use]
     pub fn start_offset(&self) -> u64 {
         self.start_offset
+    }
+
+    /// Blocks up to `timeout` for the next frame, then folds in every frame
+    /// already waiting behind it, up to `budget` bytes.
+    ///
+    /// Frames are PTY-sized, and the pump's per-pass work — locking the
+    /// screen, checking timers, publishing — is charged per call rather than
+    /// per byte. Handing back one large contiguous run instead of a dozen
+    /// small ones is worth several times the throughput, and costs nothing:
+    /// only frames that had already arrived are folded in.
+    pub fn next_run(
+        &mut self,
+        timeout: Duration,
+        budget: usize,
+    ) -> HolderResult<Option<(u64, Vec<u8>)>> {
+        let Some((offset, mut payload)) = self.next_frame(timeout)? else {
+            return Ok(None);
+        };
+        while payload.len() < budget {
+            match self.next_frame(Duration::ZERO) {
+                Ok(Some((_, mut more))) => payload.append(&mut more),
+                Ok(None) => break,
+                // A frame that fails mid-run leaves the stream unusable, but
+                // what was already read is contiguous and safe to return; the
+                // next call surfaces the error.
+                Err(_) => break,
+            }
+        }
+        Ok(Some((offset, payload)))
     }
 
     /// Blocks up to `timeout` for the next frame, returning its stream offset
@@ -187,9 +237,10 @@ impl HolderOutputStream {
     /// `Err` means the stream is finished or broken, and the caller must go
     /// back to the log, which has everything.
     pub fn next_frame(&mut self, timeout: Duration) -> HolderResult<Option<(u64, Vec<u8>)>> {
-        self.stream
-            .set_read_timeout(Some(timeout))
-            .map_err(|error| HolderError::io("set output stream timeout", error))?;
+        // A zero `SO_RCVTIMEO` means "no timeout", which would block forever;
+        // the shortest expressible wait is what "poll" has to mean here.
+        let timeout = timeout.max(Duration::from_nanos(1));
+        self.set_timeout(Some(timeout))?;
         let mut header = [0_u8; 12];
         match self.stream.read_exact(&mut header) {
             Ok(()) => {}
@@ -212,9 +263,7 @@ impl HolderOutputStream {
         }
         // The rest of a frame that has started must arrive: a timeout here
         // would strand half of it and desynchronize the stream.
-        self.stream
-            .set_read_timeout(None)
-            .map_err(|error| HolderError::io("set output stream timeout", error))?;
+        self.set_timeout(None)?;
         let mut payload = vec![0_u8; length];
         self.stream
             .read_exact(&mut payload)
@@ -322,8 +371,9 @@ impl HolderManagerClient {
             return Ok(None);
         };
         Ok(Some(HolderOutputStream {
-            stream,
+            stream: std::io::BufReader::with_capacity(OUTPUT_READ_BUFFER, stream),
             start_offset,
+            timeout: None,
         }))
     }
 

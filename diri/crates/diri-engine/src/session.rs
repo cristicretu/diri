@@ -2684,7 +2684,7 @@ fn pump_held(
         // Frames only once the file has been followed up to where they begin.
         let streaming = live.is_some() && offset >= live_from;
         let (start, chunk) = match live.as_mut().filter(|_| streaming) {
-            Some(stream) => match stream.next_frame(shared.quiet_tick()) {
+            Some(stream) => match stream.next_run(shared.quiet_tick(), LOG_READ_BUDGET) {
                 // Contiguous by construction, and checked anyway: a frame that
                 // does not start where the last one ended means something
                 // raced, and the log is the authority to fall back on rather
