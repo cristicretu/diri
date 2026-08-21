@@ -873,10 +873,7 @@ impl ControlServer {
                 // Diri's colour-capable PTY, so assert the same capabilities
                 // as manifest-backed Agents instead of leaving tools such as
                 // `clear` unable to operate.
-                spec.env
-                    .retain(|(key, _)| !matches!(key.as_str(), "NO_COLOR" | "TERM" | "COLORTERM"));
-                spec.env.push(("TERM".into(), "xterm-256color".into()));
-                spec.env.push(("COLORTERM".into(), "truecolor".into()));
+                crate::agent::assert_color_environment(&mut spec.env);
                 spec
             }
             None => {
@@ -1126,9 +1123,7 @@ impl ControlServer {
         } else {
             let mut spec = crate::pty::PtySpec::new(argv, &cwd);
             spec.env = inherited;
-            spec.env.retain(|(key, _)| key != "NO_COLOR");
-            spec.env.retain(|(key, _)| key != "TERM");
-            spec.env.push(("TERM".into(), "xterm-256color".into()));
+            crate::agent::assert_color_environment(&mut spec.env);
             spec
         };
         if let (Some(cols), Some(rows)) = (p.initial_cols, p.initial_rows) {
