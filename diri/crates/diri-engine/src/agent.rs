@@ -392,8 +392,10 @@ impl AgentDescriptor {
     ///   it.
     /// - **Colour is asserted, not inherited.** An inherited `NO_COLOR` (or a
     ///   missing `TERM`) silently turns an agent's output monochrome, which
-    ///   then breaks the screen rules that look for its prompt box. `TERM` and
-    ///   `COLORTERM` are set explicitly and `NO_COLOR` is removed.
+    ///   then breaks the screen rules that look for its prompt box. Shells hit
+    ///   the same hole: a GUI daemon often has no `TERM`, and PTY spawn clears
+    ///   the parent env. `TERM` and `COLORTERM` are set explicitly and
+    ///   `NO_COLOR` is removed.
     /// - **The agent's own `env` is applied last**, so a manifest can override
     ///   anything above.
     pub fn spawn_spec(
@@ -413,11 +415,7 @@ impl AgentDescriptor {
             }
             spec.env.push((key, value));
         }
-        spec.env.retain(|(key, _)| key != "NO_COLOR");
-        spec.env
-            .retain(|(key, _)| key != "TERM" && key != "COLORTERM");
-        spec.env.push(("TERM".into(), "xterm-256color".into()));
-        spec.env.push(("COLORTERM".into(), "truecolor".into()));
+        assert_color_environment(&mut spec.env);
         for (key, value) in &self.env {
             spec.env.retain(|(existing, _)| existing != key);
             spec.env.push((key.clone(), value.clone()));
@@ -491,10 +489,7 @@ impl AgentDescriptor {
                 spec.env.push((key, value));
             }
         }
-        spec.env
-            .retain(|(key, _)| !matches!(key.as_str(), "NO_COLOR" | "TERM" | "COLORTERM"));
-        spec.env.push(("TERM".into(), "xterm-256color".into()));
-        spec.env.push(("COLORTERM".into(), "truecolor".into()));
+        assert_color_environment(&mut spec.env);
         for (key, value) in &self.env {
             spec.env.retain(|(existing, _)| existing != key);
             spec.env.push((key.clone(), value.clone()));
@@ -507,6 +502,18 @@ impl AgentDescriptor {
             .iter()
             .any(|prefix| key.starts_with(prefix))
     }
+}
+
+/// Forces a real colour terminal onto a PTY child.
+///
+/// The local Engine is a GUI daemon: it often has no `TERM` at all. PTY spawn
+/// also `env_clear()`s the parent, so a missing value here is a missing value
+/// in the child. `clear`, `tput`, and most TUIs then fail with
+/// `TERM environment variable not set.`
+pub(crate) fn assert_color_environment(env: &mut Vec<(String, String)>) {
+    env.retain(|(key, _)| !matches!(key.as_str(), "NO_COLOR" | "TERM" | "COLORTERM"));
+    env.push(("TERM".into(), "xterm-256color".into()));
+    env.push(("COLORTERM".into(), "truecolor".into()));
 }
 
 fn shell_quote(value: &str) -> String {
@@ -873,6 +880,24 @@ mod tests {
         assert_eq!(get("NO_COLOR"), None, "NO_COLOR must be removed");
         assert_eq!(get("TERM"), Some("xterm-256color"));
         assert_eq!(get("COLORTERM"), Some("truecolor"));
+    }
+
+    #[test]
+    fn a_gui_daemon_without_term_still_gets_a_real_terminal() {
+        // Local shells skip spawn_spec (no binary). The Engine is a GUI
+        // process, so inherited env often has no TERM at all. PTY spawn then
+        // env_clear()s the parent: missing here means missing in the child,
+        // and `clear` prints "TERM environment variable not set."
+        let mut env = Vec::new();
+        super::assert_color_environment(&mut env);
+        let get = |name: &str| {
+            env.iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(get("TERM"), Some("xterm-256color"));
+        assert_eq!(get("COLORTERM"), Some("truecolor"));
+        assert_eq!(get("NO_COLOR"), None);
     }
 
     #[test]
