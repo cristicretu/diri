@@ -5208,11 +5208,13 @@ mod tests {
         cx.run_until_parked();
         let surfaces = view.read_with(cx, |harness, _| harness.surfaces.clone());
         let field = cx.debug_bounds("HOST_FIELD_NAME").expect("name field");
-        let text = cx
-            .debug_bounds("HOST_FIELD_TEXT_NAME")
-            .expect("name field text bounds");
 
-        cx.simulate_click(point(text.left(), field.center().y), Modifiers::default());
+        // Click inside the field's left padding, which is unambiguously before
+        // the first glyph across text-shaping backends and display scales.
+        cx.simulate_click(
+            point(field.left() + px(2.0), field.center().y),
+            Modifiers::default(),
+        );
         assert_eq!(
             surfaces.read_with(cx, |surfaces, _| surfaces
                 .host_editor
