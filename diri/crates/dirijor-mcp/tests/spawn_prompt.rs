@@ -11,7 +11,7 @@ use diri_engine::control::ControlServer;
 use diri_engine::detect::ManifestEngine;
 use diri_engine::registry::Registry;
 use diri_proto::{
-    AgentKind, DateMillis, Project, Resumability, SessionId, SessionRecord, SessionStatus,
+    AgentKind, DateMillis, Method, Project, Resumability, SessionId, SessionRecord, SessionStatus,
     TitleSource,
 };
 use dirijor_mcp::Bridge;
@@ -188,6 +188,46 @@ fn call_spawn_agent_through_mcp(socket: &Path, arguments: serde_json::Value) -> 
             .expect("MCP text content"),
     )
     .expect("decode spawn result")
+}
+
+#[test]
+fn standalone_cli_spawn_creates_a_root_session_without_an_mcp_caller() {
+    let temp = tempfile::tempdir().expect("temp");
+    let repo = temp.path().join("repo");
+    let fixture = temp.path().join("prompt-fixture");
+    std::fs::create_dir_all(&repo).expect("create repository directory");
+    std::fs::write(&fixture, "#!/bin/sh\nsleep 30\n").expect("write fixture");
+    std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o700))
+        .expect("make fixture executable");
+
+    let server = start_server(temp.path(), &fixture, &repo);
+    let bridge = Bridge::new(server.socket_path().to_path_buf(), None);
+    let spawned = bridge
+        .spawn_user_session(&json!({
+            "kind": "prompt-fixture",
+            "cwd": repo,
+            "name": "standalone CLI regression",
+        }))
+        .expect("standalone spawn");
+    let id = spawned["id"].as_str().expect("session id");
+    let sessions = bridge
+        .request(Method::SESSION_LIST, json!({}), Duration::from_secs(3))
+        .expect("list sessions");
+    let record = sessions["sessions"]
+        .as_array()
+        .expect("session array")
+        .iter()
+        .find(|record| record["id"] == id)
+        .expect("spawned session record");
+
+    assert!(record["parent"].is_null(), "standalone sessions are roots");
+    bridge
+        .request(
+            Method::SESSION_KILL,
+            json!({"sessionID": id}),
+            Duration::from_secs(3),
+        )
+        .expect("release standalone session");
 }
 
 #[test]
