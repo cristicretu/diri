@@ -5219,6 +5219,10 @@ mod tests {
             0
         );
 
+        cx.run_until_parked();
+        let field = cx
+            .debug_bounds("HOST_FIELD_NAME")
+            .expect("focused name field");
         cx.simulate_click(
             point(field.right() - px(11.0), field.center().y),
             Modifiers::default(),
