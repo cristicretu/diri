@@ -105,7 +105,7 @@ printf '%s\n' '{"prompt":"package smoke"}' \
     | DIRIJOR_APP_SUPPORT="${smoke_root}/support" DIRIJOR_SESSION_ID="${session_id}" \
         dirijor hook UserPromptSubmit >/dev/null
 printf '%s\n' '{}' \
-    | DIRIJOR_APP_SUPPORT="${smoke_root}/support" \
+    | DIRIJOR_APP_SUPPORT="${smoke_root}/support" DIRIJOR_SESSION_ID="${session_id}" \
         dirijor mcp-call --tool list_agents \
     | jq -e --arg id "${session_id}" '.ok.agents[] | select(.id == $id)' >/dev/null
 
