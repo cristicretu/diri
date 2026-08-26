@@ -37,6 +37,8 @@ const SETTINGS_TRANSITION_DURATION: Duration = Duration::from_millis(190);
 const SETTINGS_SECTION_GAP: f32 = 16.0;
 const SETTINGS_ROW_HEIGHT: f32 = 50.0;
 const RESULT_LIMIT: usize = 200;
+const HOST_FIELD_HORIZONTAL_PADDING: f32 = 10.0;
+const HOST_FIELD_TEXT_INSET: f32 = HOST_FIELD_HORIZONTAL_PADDING + 1.0; // border_1
 /// Reinstall success is confirmation, not persistent host state. Errors stay
 /// actionable and first-time setup keeps its "Use by default" action.
 const HOST_REINSTALL_SUCCESS_VISIBILITY: Duration = Duration::from_secs(3);
@@ -3330,7 +3332,7 @@ impl UtilitySurfaces {
         if let Some(error) = &editor.error {
             form = form.child(
                 div()
-                    .px(px(10.0))
+                    .px(px(HOST_FIELD_HORIZONTAL_PADDING))
                     .py(px(8.0))
                     .rounded(px(Radius::BADGE))
                     .bg(Ink::DANGER.alpha(0.08))
@@ -3514,7 +3516,8 @@ impl UtilitySurfaces {
                         let Some(bounds) = this.host_field_bounds[field.index()].get() else {
                             return;
                         };
-                        let x = (event.position().x - bounds.left() - px(10.0)).max(px(0.0));
+                        let x = (event.position().x - bounds.left() - px(HOST_FIELD_TEXT_INSET))
+                            .max(px(0.0));
                         let offset = this.host_editor.as_ref().map_or(0, |editor| {
                             text_offset_for_x(editor.field(field).text(), x, window, colors)
                         });
@@ -5204,11 +5207,11 @@ mod tests {
         cx.run_until_parked();
         let surfaces = view.read_with(cx, |harness, _| harness.surfaces.clone());
         let field = cx.debug_bounds("HOST_FIELD_NAME").expect("name field");
+        let text = cx
+            .debug_bounds("host-field-caret")
+            .expect("active field text");
 
-        cx.simulate_click(
-            point(field.left() + px(11.0), field.center().y),
-            Modifiers::default(),
-        );
+        cx.simulate_click(point(text.left(), field.center().y), Modifiers::default());
         assert_eq!(
             surfaces.read_with(cx, |surfaces, _| surfaces
                 .host_editor

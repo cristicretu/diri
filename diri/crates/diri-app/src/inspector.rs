@@ -627,11 +627,9 @@ impl WorkbenchInspector {
                     .map(snapshot_from_read_diff)
                     .map(Arc::new)
             } else {
-                tokio
-                    .spawn_blocking(move || load_local_diff(&cwd, layer))
+                cx.background_spawn(async move { load_local_diff(&cwd, layer) })
                     .await
-                    .map_err(|error| format!("Diff worker stopped: {error}"))
-                    .and_then(|result| result.map_err(|error| error.to_string()))
+                    .map_err(|error| error.to_string())
                     .map(Arc::new)
             };
             let _ = this.update(cx, |this, cx| {
@@ -733,16 +731,14 @@ impl WorkbenchInspector {
         if !matches!(self.review_state, ReviewLoadState::Ready(_)) {
             self.review_state = ReviewLoadState::Loading;
         }
-        let tokio = self.tokio.clone();
         self.review_task = Some(cx.spawn(async move |this, cx| {
-            let result = tokio
-                .spawn_blocking(move || {
+            let result = cx
+                .background_spawn(async move {
                     let repository = GitRepository::discover(&cwd)?;
                     repository.status()
                 })
                 .await
-                .map_err(|error| format!("Git status worker stopped: {error}"))
-                .and_then(|result| result.map_err(|error| error.to_string()));
+                .map_err(|error: GitReviewError| error.to_string());
             let _ = this.update(cx, |this, cx| {
                 if this.review_generation != generation {
                     return;
@@ -768,10 +764,9 @@ impl WorkbenchInspector {
         self.discard_armed = false;
         self.armed_hunk = None;
         cx.notify();
-        let tokio = self.tokio.clone();
         self.review_action_task = Some(cx.spawn(async move |this, cx| {
-            let result = tokio
-                .spawn_blocking(move || -> Result<String, GitReviewError> {
+            let result = cx
+                .background_spawn(async move {
                     let repository = GitRepository::discover(&context.cwd)?;
                     match action {
                         ReviewAction::Stage(paths) => {
@@ -802,8 +797,7 @@ impl WorkbenchInspector {
                     }
                 })
                 .await
-                .map_err(|error| format!("Git action worker stopped: {error}"))
-                .and_then(|result| result.map_err(|error| error.to_string()));
+                .map_err(|error: GitReviewError| error.to_string());
             let _ = this.update(cx, |this, cx| {
                 this.review_action_busy = false;
                 match result {
@@ -5216,10 +5210,8 @@ mod tests {
             InspectorTab::Info
         );
         inspector.update(cx, |inspector, cx| inspector.set_visible(true, cx));
-        // Drain the Info refresh before asserts/teardown. Leaving a live
-        // `cx.spawn` + `tokio.spawn_blocking` task lets GPUI's test scheduler
-        // abort it on a worker thread ("local task dropped by a thread that
-        // didn't spawn it") after the test already reported ok.
+        // Drain the Info refresh before asserts/teardown so no background Git
+        // work outlives the deterministic GPUI test scheduler.
         cx.run_until_parked();
 
         let (generation, context, polling) = inspector.read_with(cx, |inspector, _| {
