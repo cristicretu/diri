@@ -101,17 +101,6 @@ impl HostFormField {
             Self::NodeId => "NODE_ID",
         }
     }
-
-    const fn index(self) -> usize {
-        match self {
-            Self::Name => 0,
-            Self::Ssh => 1,
-            Self::DefaultCwd => 2,
-            Self::NodeEndpoint => 3,
-            Self::NodeTokenFile => 4,
-            Self::NodeId => 5,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -274,7 +263,6 @@ pub struct UtilitySurfaces {
     host_editor: Option<HostEditor>,
     host_initialization: Option<HostInitialization>,
     host_initialization_generation: u64,
-    host_field_text_bounds: [Rc<Cell<Option<Bounds<Pixels>>>>; 6],
     prefs: Prefs,
     store: Arc<RwLock<SessionStore>>,
     store_runtime: Arc<StoreRuntime>,
@@ -385,7 +373,6 @@ impl UtilitySurfaces {
             host_editor: None,
             host_initialization: None,
             host_initialization_generation: 0,
-            host_field_text_bounds: std::array::from_fn(|_| Rc::new(Cell::new(None))),
             prefs,
             store: Arc::clone(&store_runtime.store),
             store_runtime,
@@ -3476,8 +3463,15 @@ impl UtilitySurfaces {
             .host_editor
             .as_ref()
             .is_some_and(|host_editor| host_editor.active_field == field);
-        let bounds_slot = Rc::clone(&self.host_field_text_bounds[field.index()]);
-        let value = host_field_value(editor, placeholder, active, field, colors, bounds_slot);
+        let bounds_slot = Rc::new(Cell::new(None));
+        let value = host_field_value(
+            editor,
+            placeholder,
+            active,
+            field,
+            colors,
+            Rc::clone(&bounds_slot),
+        );
         div()
             .min_w(px(0.0))
             .flex()
@@ -3512,7 +3506,7 @@ impl UtilitySurfaces {
                     .cursor(CursorStyle::IBeam)
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         this.select_host_field(field, window, cx);
-                        let Some(bounds) = this.host_field_text_bounds[field.index()].get() else {
+                        let Some(bounds) = bounds_slot.get() else {
                             return;
                         };
                         let x = (event.position().x - bounds.left()).max(px(0.0));
