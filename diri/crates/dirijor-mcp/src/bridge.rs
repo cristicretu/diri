@@ -122,6 +122,19 @@ impl Bridge {
             self.caller.as_deref(),
         )?
         .authorize(WriteAction::Spawn)?;
+        self.spawn_session(arguments, self.caller.clone().map(SessionId))
+    }
+
+    /// Spawn a top-level session for the regular user-facing CLI.
+    ///
+    /// MCP writes remain policy-gated through [`Self::spawn_agent`]. The
+    /// standalone `dirijor session spawn` command is a direct user automation
+    /// surface and intentionally creates a root session without an MCP caller.
+    pub fn spawn_user_session(&self, arguments: &Value) -> Result<Value, String> {
+        self.spawn_session(arguments, None)
+    }
+
+    fn spawn_session(&self, arguments: &Value, parent: Option<SessionId>) -> Result<Value, String> {
         let requested = required_string(arguments, "kind")?;
         let readiness: AgentReadinessResult =
             self.request_typed(Method::AGENT_READINESS, json!({}), DEFAULT_TIMEOUT)?;
@@ -134,7 +147,7 @@ impl Bridge {
             worktree_branch: optional_string(arguments, "branch"),
             title: optional_string(arguments, "name"),
             initial_prompt: optional_string(arguments, "prompt"),
-            parent: self.caller.clone().map(SessionId),
+            parent,
             initial_cols: None,
             initial_rows: None,
             host: optional_string(arguments, "host"),

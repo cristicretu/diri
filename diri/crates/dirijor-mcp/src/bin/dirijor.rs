@@ -528,18 +528,15 @@ fn session_spawn(arguments: &[String]) -> Result<(), CliError> {
         })
         .ok_or_else(|| CliError::failure("could not determine the working directory"))?;
     let result = bridge()
-        .call(
-            "spawn_agent",
-            &json!({
-                "kind": kind,
-                "cwd": cwd,
-                "worktree": has_flag(arguments, "--worktree"),
-                "branch": option_value(arguments, "--branch"),
-                "prompt": option_value(arguments, "--prompt"),
-                "name": option_value(arguments, "--title").or_else(|| option_value(arguments, "--name")),
-                "host": option_value(arguments, "--host"),
-            }),
-        )
+        .spawn_user_session(&json!({
+            "kind": kind,
+            "cwd": cwd,
+            "worktree": has_flag(arguments, "--worktree"),
+            "branch": option_value(arguments, "--branch"),
+            "prompt": option_value(arguments, "--prompt"),
+            "name": option_value(arguments, "--title").or_else(|| option_value(arguments, "--name")),
+            "host": option_value(arguments, "--host"),
+        }))
         .map_err(map_bridge_error)?;
     if has_flag(arguments, "--json") {
         print_json(&result);
