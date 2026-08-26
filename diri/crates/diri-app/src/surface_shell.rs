@@ -5204,11 +5204,11 @@ mod tests {
         cx.run_until_parked();
         let surfaces = view.read_with(cx, |harness, _| harness.surfaces.clone());
         let field = cx.debug_bounds("HOST_FIELD_NAME").expect("name field");
+        let text = cx
+            .debug_bounds("host-field-caret")
+            .expect("active field text");
 
-        cx.simulate_click(
-            point(field.left() + px(11.0), field.center().y),
-            Modifiers::default(),
-        );
+        cx.simulate_click(point(text.left(), field.center().y), Modifiers::default());
         assert_eq!(
             surfaces.read_with(cx, |surfaces, _| surfaces
                 .host_editor
