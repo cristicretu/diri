@@ -38,7 +38,6 @@ const SETTINGS_SECTION_GAP: f32 = 16.0;
 const SETTINGS_ROW_HEIGHT: f32 = 50.0;
 const RESULT_LIMIT: usize = 200;
 const HOST_FIELD_HORIZONTAL_PADDING: f32 = 10.0;
-const HOST_FIELD_TEXT_INSET: f32 = HOST_FIELD_HORIZONTAL_PADDING + 1.0; // border_1
 /// Reinstall success is confirmation, not persistent host state. Errors stay
 /// actionable and first-time setup keeps its "Use by default" action.
 const HOST_REINSTALL_SUCCESS_VISIBILITY: Duration = Duration::from_secs(3);
@@ -275,7 +274,7 @@ pub struct UtilitySurfaces {
     host_editor: Option<HostEditor>,
     host_initialization: Option<HostInitialization>,
     host_initialization_generation: u64,
-    host_field_bounds: [Rc<Cell<Option<Bounds<Pixels>>>>; 6],
+    host_field_text_bounds: [Rc<Cell<Option<Bounds<Pixels>>>>; 6],
     prefs: Prefs,
     store: Arc<RwLock<SessionStore>>,
     store_runtime: Arc<StoreRuntime>,
@@ -386,7 +385,7 @@ impl UtilitySurfaces {
             host_editor: None,
             host_initialization: None,
             host_initialization_generation: 0,
-            host_field_bounds: std::array::from_fn(|_| Rc::new(Cell::new(None))),
+            host_field_text_bounds: std::array::from_fn(|_| Rc::new(Cell::new(None))),
             prefs,
             store: Arc::clone(&store_runtime.store),
             store_runtime,
@@ -3477,8 +3476,8 @@ impl UtilitySurfaces {
             .host_editor
             .as_ref()
             .is_some_and(|host_editor| host_editor.active_field == field);
-        let value = host_field_value(editor, placeholder, active, field, colors);
-        let bounds_slot = Rc::clone(&self.host_field_bounds[field.index()]);
+        let bounds_slot = Rc::clone(&self.host_field_text_bounds[field.index()]);
+        let value = host_field_value(editor, placeholder, active, field, colors, bounds_slot);
         div()
             .min_w(px(0.0))
             .flex()
@@ -3499,7 +3498,7 @@ impl UtilitySurfaces {
                     .relative()
                     .min_w(px(0.0))
                     .h(px(34.0))
-                    .px(px(10.0))
+                    .px(px(HOST_FIELD_HORIZONTAL_PADDING))
                     .rounded(px(Radius::BADGE))
                     .border_1()
                     .border_color(colors.primary.alpha(if active { 0.26 } else { 0.11 }))
@@ -3513,11 +3512,10 @@ impl UtilitySurfaces {
                     .cursor(CursorStyle::IBeam)
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         this.select_host_field(field, window, cx);
-                        let Some(bounds) = this.host_field_bounds[field.index()].get() else {
+                        let Some(bounds) = this.host_field_text_bounds[field.index()].get() else {
                             return;
                         };
-                        let x = (event.position().x - bounds.left() - px(HOST_FIELD_TEXT_INSET))
-                            .max(px(0.0));
+                        let x = (event.position().x - bounds.left()).max(px(0.0));
                         let offset = this.host_editor.as_ref().map_or(0, |editor| {
                             text_offset_for_x(editor.field(field).text(), x, window, colors)
                         });
@@ -3529,14 +3527,6 @@ impl UtilitySurfaces {
                         cx.notify();
                     }))
                     .child(value)
-                    .child(
-                        canvas(
-                            move |bounds, _, _| bounds_slot.set(Some(bounds)),
-                            |_, _, _, _| {},
-                        )
-                        .absolute()
-                        .inset_0(),
-                    )
             })
     }
 
@@ -4083,6 +4073,7 @@ fn host_field_value(
     active: bool,
     field: HostFormField,
     colors: SemanticColors,
+    bounds_slot: Rc<Cell<Option<Bounds<Pixels>>>>,
 ) -> AnyElement {
     let debug_name = field.debug_name();
     let content = if active {
@@ -4100,12 +4091,22 @@ fn host_field_value(
         div().child(editor.text().to_owned()).into_any_element()
     };
     div()
+        .debug_selector(move || format!("HOST_FIELD_TEXT_{debug_name}"))
+        .relative()
         .min_w(px(0.0))
         .w_full()
         .overflow_hidden()
         .whitespace_nowrap()
         .text_ellipsis()
         .child(content)
+        .child(
+            canvas(
+                move |bounds, _, _| bounds_slot.set(Some(bounds)),
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .inset_0(),
+        )
         .into_any_element()
 }
 
@@ -5208,8 +5209,8 @@ mod tests {
         let surfaces = view.read_with(cx, |harness, _| harness.surfaces.clone());
         let field = cx.debug_bounds("HOST_FIELD_NAME").expect("name field");
         let text = cx
-            .debug_bounds("host-field-caret")
-            .expect("active field text");
+            .debug_bounds("HOST_FIELD_TEXT_NAME")
+            .expect("name field text bounds");
 
         cx.simulate_click(point(text.left(), field.center().y), Modifiers::default());
         assert_eq!(
