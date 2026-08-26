@@ -1,0 +1,856 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>diri</title>
+<!-- viewport-fit=cover is what lets the composer sit against the home
+     indicator instead of floating above a white bar. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#0b0c0e">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="diri">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icon.svg">
+<style>
+  :root {
+    --bg: #0b0c0e;
+    --surface: #15171a;
+    --surface-high: #1c1f24;
+    --border: #24272c;
+    --text: #e6e8eb;
+    --muted: #878e97;
+    --accent: #4c9aff;
+    --amber: #ffb020;
+    --green: #3ecf8e;
+    --red: #ff5c5c;
+    --safe-top: env(safe-area-inset-top, 0px);
+    --safe-bottom: env(safe-area-inset-bottom, 0px);
+    --header: 52px;
+  }
+
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: var(--bg); color: var(--text);
+    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    -webkit-text-size-adjust: 100%;
+    overscroll-behavior: none;
+  }
+
+  button, input, textarea { font: inherit; color: inherit; }
+  button { background: none; border: 0; padding: 0; cursor: pointer; }
+
+  .view { position: fixed; inset: 0; display: flex; flex-direction: column; background: var(--bg); }
+  /* `!important` is load-bearing, not laziness: the per-view ID rules below
+     set `display`, and an ID selector outranks `.view[hidden]`. Without this
+     the gate renders on top of a working session. */
+  [hidden] { display: none !important; }
+
+  header {
+    flex: 0 0 auto;
+    padding: calc(var(--safe-top) + 8px) 12px 8px;
+    display: flex; align-items: center; gap: 10px;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: saturate(1.6) blur(12px);
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 { margin: 0; font-size: 17px; font-weight: 620; letter-spacing: -0.01em; }
+  header .sub { font-size: 12px; color: var(--muted); }
+  header .grow { flex: 1; min-width: 0; }
+  .icon-btn {
+    width: 34px; height: 34px; flex: 0 0 auto;
+    display: grid; place-items: center;
+    border-radius: 9px; background: var(--surface); border: 1px solid var(--border);
+    font-size: 16px; line-height: 1;
+  }
+  .icon-btn:active { background: var(--surface-high); }
+  .icon-btn.danger { color: var(--red); }
+
+  .scroll { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+
+  /* ---- session list ---- */
+  #sessions { padding: 10px 12px calc(var(--safe-bottom) + 24px); display: flex; flex-direction: column; gap: 8px; }
+
+  .card {
+    display: block; width: 100%; text-align: left;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 13px; padding: 11px 12px;
+    transition: transform 90ms ease, background 120ms ease;
+  }
+  .card:active { transform: scale(0.985); background: var(--surface-high); }
+  .card.attention { border-color: color-mix(in srgb, var(--amber) 55%, var(--border)); }
+
+  .card-top { display: flex; align-items: center; gap: 8px; }
+  /* inline-block, not inline: in the header this sits in flowing text, where
+     an inline span would drop the width and height entirely. */
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+         flex: 0 0 auto; background: var(--muted); vertical-align: middle; }
+  .dot.working { background: var(--green); animation: pulse 1.6s ease-in-out infinite; }
+  .dot.needsInput { background: var(--amber); animation: pulse 1.1s ease-in-out infinite; }
+  .dot.exited { background: var(--red); }
+  .dot.starting { background: var(--accent); animation: pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1 } 50% { opacity: 0.35 } }
+  @media (prefers-reduced-motion: reduce) { .dot { animation: none !important } .card { transition: none } }
+
+  .title { font-weight: 560; font-size: 15px; flex: 1; min-width: 0;
+           overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .when { font-size: 11px; color: var(--muted); flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+
+  .card-meta { margin-top: 5px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .chip {
+    font-size: 11px; padding: 2px 7px; border-radius: 6px;
+    background: var(--surface-high); color: var(--muted); border: 1px solid var(--border);
+    max-width: 62vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .chip.host { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 35%, var(--border)); }
+  .chip.branch { color: var(--green); }
+  .chip.waiting { color: var(--amber); border-color: color-mix(in srgb, var(--amber) 40%, var(--border)); }
+
+  .ask {
+    margin-top: 8px; padding: 8px 9px; border-radius: 9px;
+    background: color-mix(in srgb, var(--amber) 10%, var(--surface-high));
+    border: 1px solid color-mix(in srgb, var(--amber) 30%, var(--border));
+    font-size: 13px; line-height: 1.4;
+  }
+  .ask .risk { color: var(--amber); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .ask ol { margin: 6px 0 0; padding-left: 18px; color: var(--muted); font-size: 12px; }
+
+  .empty { padding: 48px 24px; text-align: center; color: var(--muted); font-size: 14px; }
+
+  /* ---- terminal ---- */
+  #screen {
+    flex: 1; overflow: auto; -webkit-overflow-scrolling: touch;
+    padding: 10px 12px calc(var(--safe-bottom) + 8px);
+    margin: 0;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 11px; line-height: 1.35;
+    /* Wrapped by default. A phone fits ~59 columns and these sessions run at
+       120, so the unwrapped view means dragging sideways to read every line of
+       what is mostly prose. The toggle restores true columns for diffs and
+       tables, where alignment is the information. */
+    white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 4;
+    color: #cfd4da;
+  }
+  #screen.nowrap { white-space: pre; overflow-wrap: normal; }
+
+  /* ---- composer ---- */
+  .composer {
+    flex: 0 0 auto; border-top: 1px solid var(--border);
+    background: color-mix(in srgb, var(--bg) 92%, transparent);
+    backdrop-filter: blur(12px);
+    padding: 8px 10px calc(var(--safe-bottom) + 8px);
+  }
+  .keys { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 8px; scrollbar-width: none; }
+  .keys::-webkit-scrollbar { display: none; }
+  .key {
+    flex: 0 0 auto; padding: 7px 11px; border-radius: 8px;
+    background: var(--surface); border: 1px solid var(--border);
+    font-size: 13px; font-family: ui-monospace, Menlo, monospace; white-space: nowrap;
+  }
+  .key:active { background: var(--accent); border-color: var(--accent); color: #06101f; }
+  .key.wide { font-family: inherit; }
+  .key.affirm { color: var(--green); }
+  .key.deny { color: var(--red); }
+
+  .entry { display: flex; gap: 8px; align-items: flex-end; }
+  textarea {
+    flex: 1; min-height: 40px; max-height: 34vh; resize: none;
+    padding: 9px 11px; border-radius: 11px;
+    background: var(--surface); border: 1px solid var(--border);
+    /* 16px or iOS zooms the whole page on focus. */
+    font-size: 16px; line-height: 1.35;
+  }
+  textarea:focus { outline: none; border-color: var(--accent); }
+  .send {
+    flex: 0 0 auto; width: 40px; height: 40px; border-radius: 11px;
+    background: var(--accent); color: #06101f; font-size: 17px; font-weight: 700;
+    display: grid; place-items: center;
+  }
+  .send:disabled { opacity: 0.35; }
+
+  /* ---- spawn sheet ---- */
+  .sheet-backdrop {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+    display: flex; align-items: flex-end; z-index: 20;
+  }
+  .sheet {
+    width: 100%; background: var(--surface); border-radius: 18px 18px 0 0;
+    border-top: 1px solid var(--border);
+    padding: 16px 14px calc(var(--safe-bottom) + 16px);
+    display: flex; flex-direction: column; gap: 12px;
+    max-height: 88vh; overflow-y: auto;
+    animation: rise 180ms cubic-bezier(0.32, 0.72, 0, 1);
+  }
+  @keyframes rise { from { transform: translateY(100%) } to { transform: none } }
+  @media (prefers-reduced-motion: reduce) { .sheet { animation: none } }
+  .sheet h2 { margin: 0; font-size: 16px; }
+  .field { display: flex; flex-direction: column; gap: 6px; }
+  .field label { font-size: 12px; color: var(--muted); }
+  .field input, .field select, .field textarea {
+    padding: 10px 11px; border-radius: 10px; font-size: 16px;
+    background: var(--surface-high); border: 1px solid var(--border);
+  }
+  .field input:focus, .field select:focus, .field textarea:focus { outline: none; border-color: var(--accent); }
+  .row { display: flex; gap: 8px; }
+  .row > * { flex: 1; }
+  .primary {
+    padding: 12px; border-radius: 11px; background: var(--accent); color: #06101f;
+    font-weight: 640; font-size: 15px; text-align: center;
+  }
+  .secondary {
+    padding: 12px; border-radius: 11px; background: var(--surface-high);
+    border: 1px solid var(--border); text-align: center; font-size: 15px;
+  }
+  .cwd-list { display: flex; gap: 6px; flex-wrap: wrap; }
+  .cwd-list button { font-size: 12px; padding: 5px 9px; border-radius: 7px;
+                     background: var(--surface-high); border: 1px solid var(--border); color: var(--muted); }
+
+  /* ---- toast + gate ---- */
+  #toast {
+    position: fixed; left: 50%; transform: translateX(-50%);
+    bottom: calc(var(--safe-bottom) + 84px); z-index: 40;
+    background: var(--surface-high); border: 1px solid var(--border);
+    padding: 9px 14px; border-radius: 10px; font-size: 13px;
+    max-width: 86vw; text-align: center;
+    opacity: 0; pointer-events: none; transition: opacity 160ms ease;
+  }
+  #toast.show { opacity: 1; }
+  #toast.bad { border-color: var(--red); color: var(--red); }
+
+  #gate { padding: calc(var(--safe-top) + 60px) 22px 22px; display: flex; flex-direction: column; gap: 14px; }
+  #gate p { color: var(--muted); font-size: 14px; margin: 0; }
+  code { font-family: ui-monospace, Menlo, monospace; font-size: 13px; color: var(--accent); }
+</style>
+</head>
+<body>
+
+<!-- Shown only when the API answers 401: the token never made it into a cookie. -->
+<section class="view" id="gate" hidden>
+  <h1>diri</h1>
+  <p>This browser has no valid token. Open the enrolment link once, or paste the token below.</p>
+  <p>On the host: <code>diri-web url</code></p>
+  <div class="field">
+    <label for="gate-token">Token</label>
+    <input id="gate-token" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="hex token">
+  </div>
+  <button class="primary" id="gate-go">Unlock</button>
+</section>
+
+<section class="view" id="list-view">
+  <header>
+    <div class="grow">
+      <h1>diri</h1>
+      <div class="sub"><span class="dot" id="daemon-dot"></span> <span id="host-label">…</span></div>
+    </div>
+    <button class="icon-btn" id="refresh-btn" aria-label="Refresh">⟳</button>
+    <button class="icon-btn" id="new-btn" aria-label="New session">+</button>
+  </header>
+  <div class="scroll"><div id="sessions"></div></div>
+</section>
+
+<section class="view" id="session-view" hidden>
+  <header>
+    <button class="icon-btn" id="back-btn" aria-label="Back">‹</button>
+    <div class="grow">
+      <h1 id="session-title">…</h1>
+      <div class="sub" id="session-sub"></div>
+    </div>
+    <button class="icon-btn" id="wrap-btn" aria-label="Toggle wrapping">↵</button>
+    <button class="icon-btn danger" id="kill-btn" aria-label="Kill session">✕</button>
+  </header>
+  <pre id="screen"></pre>
+  <div class="composer">
+    <div class="keys" id="keys"></div>
+    <div class="entry">
+      <textarea id="input" rows="1" placeholder="Message…" autocapitalize="sentences" autocorrect="on"></textarea>
+      <button class="send" id="send-btn" aria-label="Send">↑</button>
+    </div>
+  </div>
+</section>
+
+<div class="sheet-backdrop" id="spawn-sheet" hidden>
+  <div class="sheet">
+    <h2>New session</h2>
+    <div class="field">
+      <label for="spawn-kind">Agent</label>
+      <select id="spawn-kind"></select>
+    </div>
+    <div class="field">
+      <label for="spawn-cwd">Directory</label>
+      <input id="spawn-cwd" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="/home/you/code">
+      <div class="cwd-list" id="cwd-list"></div>
+    </div>
+    <div class="field">
+      <label for="spawn-prompt">First prompt (optional)</label>
+      <textarea id="spawn-prompt" rows="3" placeholder="What should it start on?"></textarea>
+    </div>
+    <div class="row">
+      <button class="secondary" id="spawn-cancel">Cancel</button>
+      <button class="primary" id="spawn-go">Start</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------- transport
+
+// A token typed into the gate lives here; the normal path is a cookie the
+// server set, and then this stays null.
+let manualToken = null;
+
+async function call(path, options = {}) {
+  const headers = Object.assign({}, options.headers);
+  if (options.body !== undefined) headers["Content-Type"] = "application/json";
+  if (manualToken) headers["X-Diri-Token"] = manualToken;
+
+  const response = await fetch(path, {
+    method: options.method || "GET",
+    headers,
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+    credentials: "same-origin",
+    cache: "no-store",
+  });
+
+  if (response.status === 401) {
+    showGate();
+    throw new Error("unauthorized");
+  }
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.error || ("HTTP " + response.status));
+  return payload;
+}
+
+// ------------------------------------------------------------------- state
+
+const state = {
+  sessions: [],
+  openId: null,
+  agents: [],
+  screenTimer: null,
+  events: null,
+  pinnedToBottom: true,
+};
+
+const el = (id) => document.getElementById(id);
+
+// ------------------------------------------------------------------ helpers
+
+function toast(message, bad = false) {
+  const node = el("toast");
+  node.textContent = message;
+  node.classList.toggle("bad", bad);
+  node.classList.add("show");
+  clearTimeout(node._timer);
+  node._timer = setTimeout(() => node.classList.remove("show"), bad ? 4000 : 1800);
+}
+
+function statusCase(session) {
+  const status = session.status;
+  if (!status || typeof status !== "object") return "unknown";
+  return Object.keys(status)[0] || "unknown";
+}
+
+// `AgentKind` is a Swift-style keyed enum on the wire: the five original
+// kinds encode as their legacy case name, manifest agents as
+// {"agent":{"id":"…"}}, and generic carries its command. Decoding back to the
+// manifest id matters twice over — it is both what we show and what /api/spawn
+// expects, so a display-only mapping would spawn the wrong thing.
+const LEGACY_KINDS = {
+  claudeCode: "claude-code",
+  codex: "codex",
+  cursor: "cursor",
+  gemini: "gemini",
+  shell: "shell",
+};
+
+function kindId(kind) {
+  if (!kind || typeof kind !== "object") return "agent";
+  const name = Object.keys(kind)[0];
+  if (!name) return "agent";
+  if (LEGACY_KINDS[name]) return LEGACY_KINDS[name];
+  if (name === "agent") return (kind[name] || {}).id || "agent";
+  return name;
+}
+
+function relative(millis) {
+  if (!millis) return "";
+  const seconds = Math.max(0, (Date.now() - millis) / 1000);
+  if (seconds < 45) return "now";
+  if (seconds < 3600) return Math.round(seconds / 60) + "m";
+  if (seconds < 86400) return Math.round(seconds / 3600) + "h";
+  return Math.round(seconds / 86400) + "d";
+}
+
+function basename(path) {
+  if (!path) return "";
+  const parts = path.split("/").filter(Boolean);
+  return parts[parts.length - 1] || path;
+}
+
+// Sessions that want something from you come first; then the freshest.
+function order(a, b) {
+  const rank = (session) => {
+    const kind = statusCase(session);
+    if (kind === "needsInput") return 0;
+    if (kind === "working" || kind === "starting") return 1;
+    if (kind === "exited") return 3;
+    return 2;
+  };
+  const difference = rank(a) - rank(b);
+  if (difference !== 0) return difference;
+  return (b.updatedAt || 0) - (a.updatedAt || 0);
+}
+
+// ------------------------------------------------------------- session list
+
+function renderList() {
+  const container = el("sessions");
+  const live = state.sessions.filter((session) => !session.archivedAt).sort(order);
+
+  if (live.length === 0) {
+    container.innerHTML = '<div class="empty">No sessions.<br>Tap + to start one.</div>';
+    return;
+  }
+
+  container.replaceChildren(...live.map((session) => {
+    const kind = statusCase(session);
+    const card = document.createElement("button");
+    card.className = "card" + (kind === "needsInput" ? " attention" : "");
+    card.onclick = () => openSession(session.id);
+
+    const top = document.createElement("div");
+    top.className = "card-top";
+    const dot = document.createElement("span");
+    dot.className = "dot " + kind;
+    const title = document.createElement("span");
+    title.className = "title";
+    title.textContent = session.title || basename(session.cwd) || session.id;
+    const when = document.createElement("span");
+    when.className = "when";
+    when.textContent = relative(session.updatedAt);
+    top.append(dot, title, when);
+
+    const meta = document.createElement("div");
+    meta.className = "card-meta";
+    const agent = document.createElement("span");
+    agent.className = "chip";
+    agent.textContent = kindId(session.foregroundAgent || session.kind);
+    meta.append(agent);
+    if (session.host) {
+      const host = document.createElement("span");
+      host.className = "chip host";
+      host.textContent = session.host;
+      meta.append(host);
+    }
+    if (session.gitBranch) {
+      const branch = document.createElement("span");
+      branch.className = "chip branch";
+      branch.textContent = session.gitBranch;
+      meta.append(branch);
+    }
+    const where = document.createElement("span");
+    where.className = "chip";
+    where.textContent = basename(session.worktreePath || session.cwd);
+    meta.append(where);
+
+    card.append(top, meta);
+
+    // The whole point of the phone: see what it is asking before deciding.
+    // Only worth a block when there is something specific to read — the bare
+    // "Claude is waiting for your input" adds nothing the amber dot and border
+    // have not already said, and repeated down a list it buries the sessions
+    // that *are* asking something concrete.
+    const ask = session.needsInput;
+    const options = (ask && ask.options) || [];
+    const detail = ask && (ask.promptExcerpt || (options.length ? ask.summary : null));
+    if (ask && detail) {
+      const box = document.createElement("div");
+      box.className = "ask";
+      if (ask.riskHint && ask.riskHint !== "neutral") {
+        const risk = document.createElement("div");
+        risk.className = "risk";
+        risk.textContent = ask.riskHint;
+        box.append(risk);
+      }
+      const summary = document.createElement("div");
+      summary.textContent = detail;
+      box.append(summary);
+      if (options.length) {
+        const list = document.createElement("ol");
+        options.forEach((option) => {
+          const item = document.createElement("li");
+          item.textContent = option;
+          list.append(item);
+        });
+        box.append(list);
+      }
+      card.append(box);
+    } else if (ask) {
+      const chip = document.createElement("span");
+      chip.className = "chip waiting";
+      chip.textContent = ask.kind === "permission" ? "wants permission" : "waiting for you";
+      meta.append(chip);
+    }
+
+    return card;
+  }));
+}
+
+async function refreshSessions() {
+  try {
+    const payload = await call("/api/sessions");
+    state.sessions = payload.sessions || [];
+    el("host-label").textContent = payload.host || "";
+    renderList();
+    if (state.openId) renderSessionHeader();
+  } catch (error) {
+    if (error.message !== "unauthorized") toast(error.message, true);
+  }
+}
+
+// ---------------------------------------------------------- session terminal
+
+function currentSession() {
+  return state.sessions.find((session) => session.id === state.openId);
+}
+
+function renderSessionHeader() {
+  const session = currentSession();
+  if (!session) return;
+  el("session-title").textContent = session.title || basename(session.cwd);
+  const kind = statusCase(session);
+  const bits = [kind];
+  if (session.gitBranch) bits.push(session.gitBranch);
+  if (session.host) bits.push(session.host);
+  el("session-sub").textContent = bits.join(" · ");
+}
+
+async function pollScreen() {
+  if (!state.openId || document.hidden) return;
+  try {
+    const payload = await call("/api/session/" + encodeURIComponent(state.openId) + "/screen");
+    const screen = el("screen");
+    if (screen.textContent !== payload.text) {
+      screen.textContent = payload.text;
+      if (state.pinnedToBottom) screen.scrollTop = screen.scrollHeight;
+    }
+  } catch (error) {
+    if (error.message !== "unauthorized") { /* transient; the next tick retries */ }
+  }
+}
+
+function startPolling() {
+  stopPolling();
+  pollScreen();
+  state.screenTimer = setInterval(pollScreen, 1100);
+}
+
+function stopPolling() {
+  if (state.screenTimer) clearInterval(state.screenTimer);
+  state.screenTimer = null;
+}
+
+async function openSession(id) {
+  state.openId = id;
+  state.pinnedToBottom = true;
+  el("screen").textContent = "";
+  el("list-view").hidden = true;
+  el("session-view").hidden = false;
+  renderSessionHeader();
+  startPolling();
+  // Opening it is seeing it; clear the unread state the desktop uses too.
+  call("/api/session/" + encodeURIComponent(id) + "/seen", { method: "POST" }).catch(() => {});
+}
+
+function closeSession() {
+  state.openId = null;
+  stopPolling();
+  el("session-view").hidden = true;
+  el("list-view").hidden = false;
+  refreshSessions();
+}
+
+async function sendText(text, submit) {
+  if (!state.openId) return;
+  await call("/api/session/" + encodeURIComponent(state.openId) + "/send", {
+    method: "POST",
+    body: { text, submit },
+  });
+  state.pinnedToBottom = true;
+  setTimeout(pollScreen, 120);
+}
+
+async function sendKey(key) {
+  if (!state.openId) return;
+  try {
+    await call("/api/session/" + encodeURIComponent(state.openId) + "/key", {
+      method: "POST",
+      body: { key },
+    });
+    state.pinnedToBottom = true;
+    setTimeout(pollScreen, 120);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+// The row is deliberately short and ordered by how often a phone needs it:
+// answering a prompt, moving a selection, then the escape hatches.
+const KEY_ROW = [
+  { key: "enter", label: "⏎", class: "" },
+  { key: "yes", label: "y", class: "affirm" },
+  { key: "no", label: "n", class: "deny" },
+  { key: "up", label: "↑", class: "" },
+  { key: "down", label: "↓", class: "" },
+  { key: "escape", label: "esc", class: "wide" },
+  { key: "tab", label: "⇥", class: "" },
+  { key: "shift-tab", label: "⇧⇥", class: "" },
+  { key: "alt-enter", label: "⌥⏎", class: "" },
+  { key: "digit-1", label: "1", class: "" },
+  { key: "digit-2", label: "2", class: "" },
+  { key: "digit-3", label: "3", class: "" },
+  { key: "ctrl-u", label: "^U", class: "" },
+  { key: "ctrl-c", label: "^C", class: "deny" },
+  { key: "ctrl-r", label: "^R", class: "" },
+];
+
+function renderKeys() {
+  el("keys").replaceChildren(...KEY_ROW.map((entry) => {
+    const button = document.createElement("button");
+    button.className = "key " + entry.class;
+    button.textContent = entry.label;
+    button.onclick = () => sendKey(entry.key);
+    return button;
+  }));
+}
+
+// ------------------------------------------------------------------- spawn
+
+async function openSpawn() {
+  el("spawn-sheet").hidden = false;
+  if (state.agents.length === 0) {
+    try {
+      const payload = await call("/api/agents");
+      // `path` is set only when the daemon actually found the binary, so this
+      // offers the agents this host can really start rather than the catalog.
+      state.agents = (payload.agents || []).filter((item) => Boolean(item.path));
+    } catch (error) {
+      state.agents = [];
+    }
+  }
+  const select = el("spawn-kind");
+  const ids = state.agents.map((item) => kindId(item.kind)).filter((id) => id !== "agent");
+  const choices = ids.length ? ids : ["claude-code", "codex", "shell"];
+  select.replaceChildren(...choices.map((id) => {
+    const option = document.createElement("option");
+    option.value = id;
+    option.textContent = id;
+    return option;
+  }));
+
+  // Directories you already have sessions in are almost always the answer.
+  const seen = [...new Set(state.sessions.map((session) => session.cwd).filter(Boolean))].slice(0, 8);
+  el("cwd-list").replaceChildren(...seen.map((path) => {
+    const button = document.createElement("button");
+    button.textContent = basename(path);
+    button.title = path;
+    button.onclick = () => { el("spawn-cwd").value = path; };
+    return button;
+  }));
+  if (!el("spawn-cwd").value && seen.length) el("spawn-cwd").value = seen[0];
+}
+
+async function doSpawn() {
+  const cwd = el("spawn-cwd").value.trim();
+  if (!cwd) { toast("Pick a directory", true); return; }
+  const button = el("spawn-go");
+  button.disabled = true;
+  button.textContent = "Starting…";
+  try {
+    const record = await call("/api/spawn", {
+      method: "POST",
+      body: {
+        kind: el("spawn-kind").value,
+        cwd,
+        prompt: el("spawn-prompt").value,
+      },
+    });
+    el("spawn-sheet").hidden = true;
+    el("spawn-prompt").value = "";
+    await refreshSessions();
+    if (record && record.id) openSession(record.id);
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    button.disabled = false;
+    button.textContent = "Start";
+  }
+}
+
+// ------------------------------------------------------------------- events
+
+function connectEvents() {
+  if (state.events) state.events.close();
+  // EventSource cannot carry a header, so this path needs the cookie. A
+  // gate-entered token falls back to polling, which refreshSessions already
+  // does on its own timer.
+  if (manualToken) return;
+
+  const source = new EventSource("/api/events");
+  state.events = source;
+
+  const dot = el("daemon-dot");
+  source.onopen = () => { dot.className = "dot working"; };
+  source.onerror = () => { dot.className = "dot exited"; };
+
+  // Every daemon event means the same thing to a phone: refetch.
+  const nudge = debounce(() => refreshSessions(), 250);
+  ["session.updated", "session.added", "session.removed", "resync", "ready"].forEach((name) => {
+    source.addEventListener(name, nudge);
+  });
+  source.addEventListener("daemon", (event) => {
+    try {
+      const data = JSON.parse(event.data);
+      dot.className = "dot " + (data.state.startsWith("Connected") ? "working" : "exited");
+    } catch (error) { /* the dot simply stays as it was */ }
+  });
+}
+
+function debounce(callback, delay) {
+  let timer = null;
+  return () => {
+    clearTimeout(timer);
+    timer = setTimeout(callback, delay);
+  };
+}
+
+// --------------------------------------------------------------------- gate
+
+function showGate() {
+  el("gate").hidden = false;
+  el("list-view").hidden = true;
+  el("session-view").hidden = true;
+  stopPolling();
+}
+
+// --------------------------------------------------------------------- wire
+
+function wire() {
+  el("refresh-btn").onclick = () => { refreshSessions(); toast("Refreshed"); };
+  el("new-btn").onclick = openSpawn;
+  el("back-btn").onclick = closeSession;
+  el("spawn-cancel").onclick = () => { el("spawn-sheet").hidden = true; };
+  el("spawn-go").onclick = doSpawn;
+  el("spawn-sheet").onclick = (event) => {
+    if (event.target === el("spawn-sheet")) el("spawn-sheet").hidden = true;
+  };
+
+  el("wrap-btn").onclick = () => {
+    const screen = el("screen");
+    screen.classList.toggle("nowrap");
+    if (state.pinnedToBottom) screen.scrollTop = screen.scrollHeight;
+  };
+
+  el("kill-btn").onclick = async () => {
+    const session = currentSession();
+    if (!session) return;
+    if (!confirm("Kill “" + (session.title || session.id) + "”?")) return;
+    try {
+      await call("/api/session/" + encodeURIComponent(session.id) + "/kill", { method: "POST" });
+      toast("Killed");
+      closeSession();
+    } catch (error) {
+      toast(error.message, true);
+    }
+  };
+
+  const input = el("input");
+  const send = el("send-btn");
+
+  const autosize = () => {
+    input.style.height = "auto";
+    input.style.height = Math.min(input.scrollHeight, window.innerHeight * 0.34) + "px";
+    send.disabled = input.value.trim().length === 0;
+  };
+  input.addEventListener("input", autosize);
+  autosize();
+
+  send.onclick = async () => {
+    const text = input.value;
+    if (!text.trim()) return;
+    input.value = "";
+    autosize();
+    try {
+      await sendText(text, true);
+    } catch (error) {
+      input.value = text;  // never silently eat a prompt
+      autosize();
+      toast(error.message, true);
+    }
+  };
+
+  // Track whether the reader has scrolled up; if so, stop yanking them down.
+  const screen = el("screen");
+  screen.addEventListener("scroll", () => {
+    const slack = screen.scrollHeight - screen.scrollTop - screen.clientHeight;
+    state.pinnedToBottom = slack < 40;
+  }, { passive: true });
+
+  el("gate-go").onclick = async () => {
+    const token = el("gate-token").value.trim();
+    if (!token) return;
+    manualToken = token;
+    try {
+      await call("/api/sessions");
+      el("gate").hidden = true;
+      el("list-view").hidden = false;
+      start();
+    } catch (error) {
+      manualToken = null;
+      toast("That token was not accepted", true);
+    }
+  };
+
+  // iOS keeps the page behind the keyboard unless it is told the viewport
+  // shrank. Pinning the app height to the visual viewport keeps the composer
+  // and the last terminal lines visible while typing.
+  if (window.visualViewport) {
+    const fit = () => {
+      document.documentElement.style.height = window.visualViewport.height + "px";
+      if (state.pinnedToBottom) screen.scrollTop = screen.scrollHeight;
+    };
+    window.visualViewport.addEventListener("resize", fit);
+    fit();
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      stopPolling();
+    } else {
+      refreshSessions();
+      if (state.openId) startPolling();
+    }
+  });
+}
+
+function start() {
+  renderKeys();
+  refreshSessions();
+  connectEvents();
+  // A slow backstop under SSE: if the stream dies quietly, the list still
+  // moves. Cheap enough to be unnoticeable on a tailnet.
+  setInterval(() => { if (!document.hidden) refreshSessions(); }, 15000);
+}
+
+wire();
+start();
+</script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192" role="img" aria-label="diri">
+  <rect width="192" height="192" rx="42" fill="#0b0c0e"/>
+  <!-- Three sessions, each a beat: the conductor the name refers to. -->
+  <g fill="none" stroke-linecap="round" stroke-width="13">
+    <path d="M52 74h58" stroke="#3ecf8e"/>
+    <path d="M52 106h88" stroke="#4c9aff"/>
+    <path d="M52 138h34" stroke="#ffb020"/>
+  </g>
+  <circle cx="140" cy="74" r="9" fill="#3ecf8e"/>
+</svg>

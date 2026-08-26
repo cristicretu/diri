@@ -1537,7 +1537,7 @@ dependencies = [
 
 [[package]]
 name = "diri-app"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "block2 0.6.2",
  "diri-client",
@@ -1688,6 +1688,19 @@ dependencies = [
 [[package]]
 name = "diri-usage"
 version = "0.1.0"
+
+[[package]]
+name = "diri-web"
+version = "0.1.0"
+dependencies = [
+ "diri-client",
+ "diri-proto",
+ "getrandom 0.4.3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
 
 [[package]]
 name = "dirijor-mcp"
