@@ -3,9 +3,11 @@ xcuserdata/
 dist/
 sidecar/node_modules/
 .skill-build/
+.swiftpm/
 
 # Rust build output
 diri/target/
+diri/.build-detect/
 
 # Agent worktrees created by Claude Code (EnterWorktree) — never committed.
 .claude/worktrees/
