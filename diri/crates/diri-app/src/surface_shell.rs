@@ -4111,7 +4111,7 @@ fn host_field_value(
 }
 
 fn text_offset_for_x(text: &str, x: Pixels, window: &Window, colors: SemanticColors) -> usize {
-    if text.is_empty() {
+    if text.is_empty() || x <= px(0.0) {
         return 0;
     }
     let run = TextRun {
