@@ -608,12 +608,9 @@ impl NativeMenuBar {
         self.last_attention = Some(attention);
 
         let header_tint = match attention {
-            AttentionLevel::NeedsInput => rgba_ns(
-                Ink::ATTENTION.r,
-                Ink::ATTENTION.g,
-                Ink::ATTENTION.b,
-                1.0,
-            ),
+            AttentionLevel::NeedsInput => {
+                rgba_ns(Ink::ATTENTION.r, Ink::ATTENTION.g, Ink::ATTENTION.b, 1.0)
+            }
             AttentionLevel::DoneUnseen => rgba_ns(Ink::FRESH.r, Ink::FRESH.g, Ink::FRESH.b, 1.0),
             AttentionLevel::Working => self.theme.primary_alpha(0.82),
             AttentionLevel::IdleSeen | AttentionLevel::None | AttentionLevel::Unknown => {
