@@ -643,6 +643,9 @@ impl Registry {
             record.transcript_path = Some(transcript.clone());
             changed = true;
         }
+        if repair_persisted_agent_title(record) {
+            changed = true;
+        }
         if let Some(title) = &meta.first_prompt_title
             && record.title_source == TitleSource::Placeholder
         {
@@ -881,6 +884,10 @@ impl Registry {
 
 fn fold_session_view(record: &mut SessionRecord, view: &SessionView) {
     fold_session_status(record, view);
+    // cursor-agent (and similar) stamp a brand/status OSC title as soon as
+    // they are idle. That must not freeze the record as AgentProvided, or
+    // the first real prompt can never name the session.
+    repair_persisted_agent_title(record);
     if record.kind == diri_proto::AgentKind::SHELL
         || matches!(
             record.title_source,
@@ -955,7 +962,33 @@ fn is_generic_terminal_title(title: &str, record: &SessionRecord) -> bool {
         || title == directory
         || matches!(
             compact_title.as_str(),
-            "claude" | "claudecode" | "codex" | "cursor" | "gemini" | "terminal" | "shell"
+            "claude"
+                | "claudecode"
+                | "codex"
+                | "cursor"
+                | "cursoragent"
+                | "gemini"
+                | "terminal"
+                | "shell"
+        )
+        || is_cursor_status_title(&title)
+}
+
+fn is_cursor_status_title(title: &str) -> bool {
+    let rest = title
+        .strip_prefix("cursor agent")
+        .or_else(|| title.strip_prefix("cursor-agent"));
+    let Some(rest) = rest else {
+        return false;
+    };
+    let compact: String = rest
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .collect();
+    compact.is_empty()
+        || matches!(
+            compact.as_str(),
+            "ready" | "working" | "thinking" | "generating" | "idle" | "newchat"
         )
 }
 
@@ -1461,7 +1494,7 @@ mod tests {
         decorated.kind = AgentKind::CLAUDE_CODE;
         let decorated_view = SessionView {
             title: Some("✳ Claude Code".to_owned()),
-            ..generic_view
+            ..generic_view.clone()
         };
         fold_session_view(&mut decorated, &decorated_view);
         assert_eq!(decorated.title_source, TitleSource::Placeholder);
@@ -1471,5 +1504,49 @@ mod tests {
         assert!(repair_persisted_agent_title(&mut decorated));
         assert_eq!(decorated.title, AgentKind::CLAUDE_CODE_ID);
         assert_eq!(decorated.title_source, TitleSource::Placeholder);
+
+        let mut cursor = record("cursor");
+        cursor.kind = AgentKind::CURSOR;
+        let cursor_ready = SessionView {
+            title: Some("Cursor Agent - \u{2705} Ready".to_owned()),
+            title_source: Some(TitleSource::AgentProvided),
+            ..generic_view
+        };
+        fold_session_view(&mut cursor, &cursor_ready);
+        assert_eq!(cursor.title_source, TitleSource::Placeholder);
+
+        cursor.title = "Cursor Agent - \u{2705} Ready".to_owned();
+        cursor.title_source = TitleSource::AgentProvided;
+        let cursor_prompt = SessionView {
+            title: Some("Fix the cursor session title".to_owned()),
+            title_source: Some(TitleSource::FirstPrompt),
+            ..cursor_ready
+        };
+        fold_session_view(&mut cursor, &cursor_prompt);
+        assert_eq!(cursor.title, "Fix the cursor session title");
+        assert_eq!(cursor.title_source, TitleSource::FirstPrompt);
+    }
+
+    #[test]
+    fn a_cursor_status_title_does_not_block_the_first_prompt_hook() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let mut session = record("cursor");
+        session.kind = AgentKind::CURSOR;
+        session.title = "Cursor Agent - \u{2705} Ready".to_owned();
+        session.title_source = TitleSource::AgentProvided;
+        registry.insert_record(session);
+
+        assert!(registry.apply_hook_metadata(
+            "cursor",
+            &crate::hooks::HookMetadata {
+                first_prompt_title: Some("Rename cursor chats from the first prompt".into()),
+                ..crate::hooks::HookMetadata::default()
+            }
+        ));
+
+        let updated = registry.record("cursor").expect("record");
+        assert_eq!(updated.title, "Rename cursor chats from the first prompt");
+        assert_eq!(updated.title_source, TitleSource::FirstPrompt);
     }
 }
