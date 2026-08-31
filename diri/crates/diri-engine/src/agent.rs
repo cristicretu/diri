@@ -38,6 +38,73 @@ pub struct ResumeSpec {
     pub token: Option<String>,
 }
 
+/// Manifest-owned grammar for one conversation verb.
+///
+/// Tokens are argv, not a shell fragment. `{id}`, `{newId}`, and
+/// `{sessionDir}` are the only substitutions, keeping launch construction
+/// structured all the way into local and remote Holders.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationCommandSpec {
+    #[serde(default)]
+    pub exact_args: Vec<String>,
+    #[serde(default)]
+    pub latest_args: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StripValue {
+    #[default]
+    None,
+    Any,
+    Nonoption,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationStripSpec {
+    pub token: String,
+    #[serde(default)]
+    pub value: StripValue,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationSpec {
+    #[serde(default)]
+    pub fresh_args: Vec<String>,
+    #[serde(default)]
+    pub resume: Option<ConversationCommandSpec>,
+    #[serde(default)]
+    pub fork: Option<ConversationCommandSpec>,
+    #[serde(default)]
+    pub strip_args: Vec<ConversationStripSpec>,
+}
+
+pub enum ConversationLaunch<'a> {
+    Fresh {
+        new_id: Option<&'a str>,
+        session_dir: Option<&'a std::path::Path>,
+    },
+    Resume {
+        source_id: Option<&'a str>,
+        session_dir: Option<&'a std::path::Path>,
+    },
+    Fork {
+        source_id: Option<&'a str>,
+        session_dir: Option<&'a std::path::Path>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConversationLaunchPlan {
+    pub args: Vec<String>,
+    /// Provider-side identity known at launch. Forks intentionally clear it:
+    /// the provider will report the newly created conversation.
+    pub agent_session_id: Option<String>,
+}
+
 /// The config-injection mechanisms a manifest can opt into. Each is a
 /// Dirijor-implemented shim (hooks file, MCP config, notify callback): the
 /// manifest names the mechanism, the daemon owns the file it points at.
@@ -51,6 +118,13 @@ pub struct InjectionSpec {
     pub codex_notify: bool,
     #[serde(default, rename = "codexMCP")]
     pub codex_mcp: bool,
+    /// Cursor has no `--mcp-config`. Launch a session-local `--plugin-dir`
+    /// whose `mcp.json` advertises the `dirijor` stdio server.
+    #[serde(default, rename = "cursorMCP")]
+    pub cursor_mcp: bool,
+    /// Same plugin ships hooks: Cursor `stop` → `dirijor hook Stop`.
+    #[serde(default, rename = "cursorHooks")]
+    pub cursor_hooks: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -60,6 +134,19 @@ pub struct ApproveSpec {
     pub text: Option<String>,
     #[serde(default)]
     pub submit: bool,
+}
+
+/// Display-only setup metadata. It is parsed here so user overrides can carry
+/// it, but the Engine never executes the hint or opens the URL.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupSpec {
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub install_hint: Option<String>,
+    #[serde(default)]
+    pub sign_in_hint: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -73,6 +160,11 @@ pub struct AgentDescriptor {
     pub aliases: Vec<String>,
     #[serde(default)]
     pub first_class: bool,
+    /// Product default order in Agent catalogs and quick-create surfaces.
+    /// User-defined ordering can override this later without changing the
+    /// manifest; unspecified Agents follow the ordered entries by id.
+    #[serde(default)]
+    pub catalog_order: Option<u16>,
     #[serde(default)]
     pub status_authority: Option<StatusAuthority>,
     /// The executable to run. Absent for `shell` and `generic`, whose command
@@ -94,6 +186,10 @@ pub struct AgentDescriptor {
     pub injection: InjectionSpec,
     #[serde(default)]
     pub resume: Option<ResumeSpec>,
+    /// Structured fresh/resume/fork grammar. `resume` above remains the
+    /// additive compatibility path for older user manifests.
+    #[serde(default)]
+    pub conversation: Option<ConversationSpec>,
     /// Environment the agent needs.
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
@@ -105,14 +201,185 @@ pub struct AgentDescriptor {
     pub env_scrub_prefixes: Vec<String>,
     #[serde(default)]
     pub approve: Option<ApproveSpec>,
+    #[serde(default)]
+    pub setup: Option<SetupSpec>,
 }
 
 impl AgentDescriptor {
+    /// Resolves the static manifest facts and the session's current lifecycle
+    /// into one wire value. This is the only place callers need to understand
+    /// which descriptor fields imply a supported verb.
+    pub fn session_capabilities(
+        &self,
+        resumability: diri_proto::Resumability,
+        status: &diri_proto::SessionStatus,
+        archived: bool,
+        agent_session_id: Option<&str>,
+    ) -> diri_proto::SessionCapabilities {
+        let live = !archived && !matches!(status, diri_proto::SessionStatus::Exited(_));
+        diri_proto::SessionCapabilities {
+            resume: resumability == diri_proto::Resumability::Resumable,
+            fork: self.can_fork(agent_session_id),
+            archive: !archived,
+            send_text: live,
+            quick_approve: self.approve.is_some(),
+            reliable_completion: self.authority() != Authority::ProcessOnly,
+        }
+    }
+
     /// The reducer authority this agent declares, defaulting to the
     /// conservative one when a manifest does not say.
     pub fn authority(&self) -> Authority {
         self.status_authority
             .map_or(Authority::ProcessOnly, Authority::from)
+    }
+
+    pub fn supports_resume(&self) -> bool {
+        self.conversation
+            .as_ref()
+            .is_some_and(|conversation| conversation.resume.is_some())
+            || self.resume.is_some()
+    }
+
+    /// Whether the manifest intentionally resumes from session-scoped storage
+    /// without requiring a provider conversation identifier.
+    pub fn supports_id_free_resume(&self) -> bool {
+        self.conversation
+            .as_ref()
+            .and_then(|conversation| conversation.resume.as_ref())
+            .is_some_and(|resume| resume.exact_args.is_empty() && !resume.latest_args.is_empty())
+    }
+
+    pub fn supports_fork(&self) -> bool {
+        self.conversation
+            .as_ref()
+            .is_some_and(|conversation| conversation.fork.is_some())
+    }
+
+    pub fn can_fork(&self, agent_session_id: Option<&str>) -> bool {
+        self.conversation
+            .as_ref()
+            .and_then(|conversation| conversation.fork.as_ref())
+            .is_some_and(|fork| {
+                (agent_session_id.is_some() && !fork.exact_args.is_empty())
+                    || !fork.latest_args.is_empty()
+            })
+    }
+
+    pub fn mints_conversation_id(&self) -> bool {
+        self.session_id_flag.is_some()
+            || self.conversation.as_ref().is_some_and(|conversation| {
+                conversation
+                    .fresh_args
+                    .iter()
+                    .any(|token| token == "{newId}")
+            })
+    }
+
+    /// Canonicalizes caller/manifest args and applies exactly one
+    /// conversation mode. Every launch path uses this interface, preventing a
+    /// stale resume marker from being stacked with a new identity.
+    pub fn conversation_plan(
+        &self,
+        base_args: &[String],
+        launch: ConversationLaunch<'_>,
+    ) -> Option<ConversationLaunchPlan> {
+        let mut args = self.strip_conversation_args(base_args);
+        if let Some(conversation) = &self.conversation {
+            let (tokens, agent_session_id) = match launch {
+                ConversationLaunch::Fresh {
+                    new_id,
+                    session_dir,
+                } => (
+                    render_tokens(&conversation.fresh_args, new_id, new_id, session_dir)?,
+                    new_id.map(str::to_owned),
+                ),
+                ConversationLaunch::Resume {
+                    source_id,
+                    session_dir,
+                } => (
+                    render_command(conversation.resume.as_ref()?, source_id, session_dir)?,
+                    source_id.map(str::to_owned),
+                ),
+                ConversationLaunch::Fork {
+                    source_id,
+                    session_dir,
+                } => (
+                    render_command(conversation.fork.as_ref()?, source_id, session_dir)?,
+                    None,
+                ),
+            };
+            args.extend(tokens);
+            return Some(ConversationLaunchPlan {
+                args,
+                agent_session_id,
+            });
+        }
+
+        match launch {
+            ConversationLaunch::Fresh { new_id, .. } => {
+                if let (Some(flag), Some(id)) = (&self.session_id_flag, new_id) {
+                    args.extend([flag.clone(), id.to_owned()]);
+                }
+                Some(ConversationLaunchPlan {
+                    args,
+                    agent_session_id: new_id.map(str::to_owned),
+                })
+            }
+            ConversationLaunch::Resume { source_id, .. } => {
+                args.extend(self.legacy_resume_args(source_id)?);
+                Some(ConversationLaunchPlan {
+                    args,
+                    agent_session_id: source_id.map(str::to_owned),
+                })
+            }
+            ConversationLaunch::Fork { .. } => None,
+        }
+    }
+
+    fn strip_conversation_args(&self, base_args: &[String]) -> Vec<String> {
+        let mut markers: Vec<(&str, StripValue)> = self
+            .conversation
+            .as_ref()
+            .into_iter()
+            .flat_map(|conversation| conversation.strip_args.iter())
+            .map(|marker| (marker.token.as_str(), marker.value))
+            .collect();
+        if let Some(flag) = self.session_id_flag.as_deref()
+            && !markers.iter().any(|(token, _)| *token == flag)
+        {
+            markers.push((flag, StripValue::Any));
+        }
+        if self.conversation.is_none()
+            && let Some(resume) = &self.resume
+            && let Some(token) = resume.token.as_deref()
+            && !markers.iter().any(|(candidate, _)| *candidate == token)
+        {
+            markers.push((token, StripValue::Nonoption));
+        }
+
+        let mut stripped = Vec::with_capacity(base_args.len());
+        let mut index = 0;
+        while index < base_args.len() {
+            let token = &base_args[index];
+            if let Some((_, value)) = markers.iter().find(|(marker, _)| *marker == token) {
+                index += 1;
+                let consumes = match value {
+                    StripValue::None => false,
+                    StripValue::Any => index < base_args.len(),
+                    StripValue::Nonoption => base_args
+                        .get(index)
+                        .is_some_and(|candidate| !candidate.starts_with('-')),
+                };
+                if consumes {
+                    index += 1;
+                }
+            } else {
+                stripped.push(token.clone());
+                index += 1;
+            }
+        }
+        stripped
     }
 
     /// Builds the launch spec for this agent in `cwd`.
@@ -125,8 +392,10 @@ impl AgentDescriptor {
     ///   it.
     /// - **Colour is asserted, not inherited.** An inherited `NO_COLOR` (or a
     ///   missing `TERM`) silently turns an agent's output monochrome, which
-    ///   then breaks the screen rules that look for its prompt box. `TERM` and
-    ///   `COLORTERM` are set explicitly and `NO_COLOR` is removed.
+    ///   then breaks the screen rules that look for its prompt box. Shells hit
+    ///   the same hole: a GUI daemon often has no `TERM`, and PTY spawn clears
+    ///   the parent env. `TERM` and `COLORTERM` are set explicitly and
+    ///   `NO_COLOR` is removed.
     /// - **The agent's own `env` is applied last**, so a manifest can override
     ///   anything above.
     pub fn spawn_spec(
@@ -146,11 +415,7 @@ impl AgentDescriptor {
             }
             spec.env.push((key, value));
         }
-        spec.env.retain(|(key, _)| key != "NO_COLOR");
-        spec.env
-            .retain(|(key, _)| key != "TERM" && key != "COLORTERM");
-        spec.env.push(("TERM".into(), "xterm-256color".into()));
-        spec.env.push(("COLORTERM".into(), "truecolor".into()));
+        assert_color_environment(&mut spec.env);
         for (key, value) in &self.env {
             spec.env.retain(|(existing, _)| existing != key);
             spec.env.push((key.clone(), value.clone()));
@@ -224,10 +489,7 @@ impl AgentDescriptor {
                 spec.env.push((key, value));
             }
         }
-        spec.env
-            .retain(|(key, _)| !matches!(key.as_str(), "NO_COLOR" | "TERM" | "COLORTERM"));
-        spec.env.push(("TERM".into(), "xterm-256color".into()));
-        spec.env.push(("COLORTERM".into(), "truecolor".into()));
+        assert_color_environment(&mut spec.env);
         for (key, value) in &self.env {
             spec.env.retain(|(existing, _)| existing != key);
             spec.env.push((key.clone(), value.clone()));
@@ -240,6 +502,18 @@ impl AgentDescriptor {
             .iter()
             .any(|prefix| key.starts_with(prefix))
     }
+}
+
+/// Forces a real colour terminal onto a PTY child.
+///
+/// The local Engine is a GUI daemon: it often has no `TERM` at all. PTY spawn
+/// also `env_clear()`s the parent, so a missing value here is a missing value
+/// in the child. `clear`, `tput`, and most TUIs then fail with
+/// `TERM environment variable not set.`
+pub(crate) fn assert_color_environment(env: &mut Vec<(String, String)>) {
+    env.retain(|(key, _)| !matches!(key.as_str(), "NO_COLOR" | "TERM" | "COLORTERM"));
+    env.push(("TERM".into(), "xterm-256color".into()));
+    env.push(("COLORTERM".into(), "truecolor".into()));
 }
 
 fn shell_quote(value: &str) -> String {
@@ -275,6 +549,18 @@ pub(crate) fn resolve_on_path(binary: &str, path: &str) -> Option<String> {
 impl AgentDescriptor {
     /// The argv tail that resumes an existing conversation, if the agent can.
     pub fn resume_args(&self, agent_session_id: Option<&str>) -> Option<Vec<String>> {
+        self.conversation_plan(
+            &[],
+            ConversationLaunch::Resume {
+                source_id: agent_session_id,
+                session_dir: None,
+            },
+        )
+        .map(|plan| plan.args)
+        .or_else(|| self.legacy_resume_args(agent_session_id))
+    }
+
+    fn legacy_resume_args(&self, agent_session_id: Option<&str>) -> Option<Vec<String>> {
         let resume = self.resume.as_ref()?;
         let token = resume.token.clone()?;
         match resume.style.as_str() {
@@ -292,6 +578,37 @@ impl AgentDescriptor {
             _ => None,
         }
     }
+}
+
+fn render_command(
+    command: &ConversationCommandSpec,
+    id: Option<&str>,
+    session_dir: Option<&std::path::Path>,
+) -> Option<Vec<String>> {
+    if let Some(id) = id
+        && !command.exact_args.is_empty()
+    {
+        return render_tokens(&command.exact_args, Some(id), None, session_dir);
+    }
+    (!command.latest_args.is_empty())
+        .then(|| render_tokens(&command.latest_args, id, None, session_dir))?
+}
+
+fn render_tokens(
+    tokens: &[String],
+    id: Option<&str>,
+    new_id: Option<&str>,
+    session_dir: Option<&std::path::Path>,
+) -> Option<Vec<String>> {
+    tokens
+        .iter()
+        .map(|token| match token.as_str() {
+            "{id}" => id.map(str::to_owned),
+            "{newId}" => new_id.map(str::to_owned),
+            "{sessionDir}" => session_dir.map(|path| path.to_string_lossy().into_owned()),
+            _ => Some(token.clone()),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -415,7 +732,7 @@ mod tests {
         );
     }
 
-    /// Sixteen of the twenty shipped manifests declare `returnToLoginShell`;
+    /// Eighteen of the twenty-two shipped manifests declare `returnToLoginShell`;
     /// only `cursor`, `gemini` and the two command-less manifests do not. The
     /// flag has been lost wholesale once already, so assert the whole set
     /// rather than a sample: a port that drops it fails here.
@@ -443,6 +760,7 @@ mod tests {
                 "amp",
                 "antigravity",
                 "claude-code",
+                "cline",
                 "codex",
                 "copilot",
                 "devin",
@@ -452,10 +770,39 @@ mod tests {
                 "kilo",
                 "kimi",
                 "kiro",
+                "maki",
                 "opencode",
                 "pi",
                 "qoder",
             ]
+        );
+    }
+
+    #[test]
+    fn every_shipped_cli_agent_has_an_https_setup_url() {
+        let (engine, failed) = ManifestEngine::load_dir(&manifest_dir()).expect("load");
+        assert!(failed.is_empty(), "manifests failed to decode: {failed:?}");
+
+        let missing = engine
+            .ids()
+            .into_iter()
+            .filter(|id| {
+                engine
+                    .manifest(id)
+                    .and_then(|manifest| manifest.agent.as_ref())
+                    .is_some_and(|agent| {
+                        agent.binary.is_some()
+                            && !agent
+                                .setup
+                                .as_ref()
+                                .and_then(|setup| setup.url.as_deref())
+                                .is_some_and(|url| url.starts_with("https://"))
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            missing.is_empty(),
+            "CLI Agents without setup URLs: {missing:?}"
         );
     }
 
@@ -536,6 +883,24 @@ mod tests {
     }
 
     #[test]
+    fn a_gui_daemon_without_term_still_gets_a_real_terminal() {
+        // Local shells skip spawn_spec (no binary). The Engine is a GUI
+        // process, so inherited env often has no TERM at all. PTY spawn then
+        // env_clear()s the parent: missing here means missing in the child,
+        // and `clear` prints "TERM environment variable not set."
+        let mut env = Vec::new();
+        super::assert_color_environment(&mut env);
+        let get = |name: &str| {
+            env.iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(get("TERM"), Some("xterm-256color"));
+        assert_eq!(get("COLORTERM"), Some("truecolor"));
+        assert_eq!(get("NO_COLOR"), None);
+    }
+
+    #[test]
     fn a_manifests_own_env_wins() {
         let claude = descriptor("claude-code");
         let spec = claude
@@ -562,7 +927,7 @@ mod tests {
         );
         assert_eq!(
             claude.resume_args(None),
-            Some(vec!["--resume".to_string()]),
+            Some(vec!["--continue".to_string()]),
             "claude can resume the latest session without an id"
         );
 
@@ -581,7 +946,6 @@ mod tests {
         for (id, token) in [
             ("opencode", "--continue"),
             ("aider", "--restore-chat-history"),
-            ("codex", "resume"),
             ("cursor", "resume"),
             ("pi", "-c"),
         ] {
@@ -591,6 +955,132 @@ mod tests {
                 "{id} must resume"
             );
         }
+        assert_eq!(
+            descriptor("codex").resume_args(None),
+            Some(vec!["resume".into(), "--last".into()])
+        );
+    }
+
+    #[test]
+    fn conversation_plans_replace_stale_markers_and_support_native_forks() {
+        let claude = descriptor("claude-code");
+        let base = vec![
+            "--resume".into(),
+            "stale".into(),
+            "--fork-session".into(),
+            "--settings".into(),
+            "hooks.json".into(),
+        ];
+        let resumed = claude
+            .conversation_plan(
+                &base,
+                ConversationLaunch::Resume {
+                    source_id: Some("current"),
+                    session_dir: None,
+                },
+            )
+            .expect("resume");
+        assert_eq!(
+            resumed.args,
+            ["--settings", "hooks.json", "--resume", "current"]
+        );
+        let forked = claude
+            .conversation_plan(
+                &resumed.args,
+                ConversationLaunch::Fork {
+                    source_id: Some("current"),
+                    session_dir: None,
+                },
+            )
+            .expect("fork");
+        assert_eq!(
+            forked.args,
+            [
+                "--settings",
+                "hooks.json",
+                "--resume",
+                "current",
+                "--fork-session"
+            ]
+        );
+        assert!(forked.agent_session_id.is_none());
+
+        let codex = descriptor("codex");
+        let codex_fork = codex
+            .conversation_plan(
+                &[
+                    "-c".into(),
+                    "notify=[]".into(),
+                    "resume".into(),
+                    "old".into(),
+                ],
+                ConversationLaunch::Fork {
+                    source_id: Some("thread-9"),
+                    session_dir: None,
+                },
+            )
+            .expect("codex fork");
+        assert_eq!(codex_fork.args, ["-c", "notify=[]", "fork", "thread-9"]);
+    }
+
+    #[test]
+    fn pi_storage_pinning_makes_continue_session_specific() {
+        let pi = descriptor("pi");
+        let directory = Path::new("/tmp/diri/s_pi/provider");
+        let fresh = pi
+            .conversation_plan(
+                &[],
+                ConversationLaunch::Fresh {
+                    new_id: None,
+                    session_dir: Some(directory),
+                },
+            )
+            .expect("fresh");
+        assert_eq!(fresh.args, ["--session-dir", "/tmp/diri/s_pi/provider"]);
+        let resumed = pi
+            .conversation_plan(
+                &fresh.args,
+                ConversationLaunch::Resume {
+                    source_id: None,
+                    session_dir: Some(directory),
+                },
+            )
+            .expect("resume");
+        assert_eq!(
+            resumed.args,
+            ["--session-dir", "/tmp/diri/s_pi/provider", "-c"]
+        );
+    }
+
+    #[test]
+    fn manifest_and_lifecycle_resolve_session_capabilities_once() {
+        let codex = descriptor("codex");
+        let exited = diri_proto::SessionStatus::Exited(diri_proto::ExitInfo {
+            reason: diri_proto::ExitReason::Exited,
+            code: Some(0),
+            signal: None,
+        });
+        let capabilities = codex.session_capabilities(
+            diri_proto::Resumability::Resumable,
+            &exited,
+            false,
+            Some("thread-1"),
+        );
+        assert!(capabilities.resume);
+        assert!(capabilities.fork);
+        assert!(capabilities.archive);
+        assert!(!capabilities.send_text);
+        assert!(capabilities.quick_approve);
+        assert!(capabilities.reliable_completion);
+
+        let archived = codex.session_capabilities(
+            diri_proto::Resumability::Resumable,
+            &exited,
+            true,
+            Some("thread-1"),
+        );
+        assert!(archived.resume, "restore can re-enter the conversation");
+        assert!(!archived.archive);
     }
 
     #[test]

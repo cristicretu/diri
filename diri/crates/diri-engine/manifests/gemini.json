@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "id": "gemini",
-  "version": "2026.07.10",
+  "version": "2026.08.15.1",
   "statusModel": "full",
   "agent": {
     "id": "gemini",
@@ -13,12 +13,29 @@
       "gemini-cli"
     ],
     "firstClass": true,
+    "catalogOrder": 50,
+    "setup": {
+      "url": "https://github.com/google-gemini/gemini-cli",
+      "installHint": "Follow Google's Gemini CLI installation guide.",
+      "signInHint": "Run gemini and choose an available Google or API-key authentication method."
+    },
     "statusAuthority": "screen",
     "binary": "gemini",
     "sessionIDFlag": "--session-id",
     "resume": {
       "style": "flag",
       "token": "--resume"
+    },
+    "conversation": {
+      "freshArgs": ["--session-id", "{newId}"],
+      "resume": {
+        "exactArgs": ["--resume", "{id}"],
+        "latestArgs": ["--resume", "latest"]
+      },
+      "stripArgs": [
+        {"token": "--resume", "value": "any"},
+        {"token": "--session-id", "value": "any"}
+      ]
     },
     "envScrubPrefixes": [
       "GEMINI_CLI",

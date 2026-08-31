@@ -29,6 +29,7 @@ use diri_proto::remote_pty::{
     FullSnapshot, GridDelta, LaunchRequest, ProcessExit, RemoteCodec, RemoteMessage,
     RemoteProcessState,
 };
+use diri_proto::terminal::MouseModes;
 use diri_proto::{NeedsInputDetail, SessionStatus};
 use diri_terminal_state::GridMirror;
 
@@ -42,6 +43,7 @@ use crate::pty::{Exit, Pty, PtySpec};
 use crate::remote::binding::{RemoteBinding, RemoteBindingStore};
 use crate::remote::client::RemoteSessionClient;
 use crate::remote::manager::{InstalledHelper, RemoteManager};
+use crate::remote::stream::{OutputFrameAction, reconcile_output_frame};
 use crate::screen::HeadlessScreen;
 use crate::status::{Authority, ClaudeHook, ReducerOutcome, StatusReducer, StatusSignal};
 
@@ -97,15 +99,104 @@ const LAUNCH_DEBOUNCE: Duration = Duration::from_millis(120);
 /// Elapsed-based so the probe cadence is the same on fast and idle ticks.
 const LIVENESS_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How long a half-erased screen waits for the rest of its repaint.
+///
+/// A TUI repaint is not one write. Ink, Ratatui and friends erase the old
+/// frame and draw the new one in separate `write`s, and a PTY hands each one
+/// over the instant it lands — so a reader that publishes per read publishes
+/// the half-erased screen in between, which is the flash users see as
+/// flickering. A terminal emulator never shows that state because its reader
+/// drains everything queued before it renders. Draining alone is not enough
+/// here: the daemon is usually parked in `poll` and wakes on the *first* write
+/// of a repaint, with the rest usually microseconds behind but occasionally a
+/// scheduler quantum behind on a loaded machine. This is the quiet window that
+/// lets the rest arrive. It is only ever waited out by a screen that just lost
+/// content, so typed echo and additive scrolling are not slowed by it. The
+/// wait returns as soon as bytes arrive; 16 ms is only its worst-case ceiling.
+const OUTPUT_SETTLE: Duration = Duration::from_millis(16);
+
+/// Ceiling on how long one batch may hold back a repaint. Output that never
+/// goes quiet (a build log) would otherwise wait on `OUTPUT_SETTLE` forever.
+/// One 120 Hz display interval, so continuous streaming cannot be held longer
+/// than the renderer's own frame cadence.
+const OUTPUT_BATCH_CEILING: Duration = Duration::from_millis(8);
+
+/// A destructive repaint gets one 60 Hz interval to recover from an erase.
+/// This is deliberately separate from [`OUTPUT_BATCH_CEILING`], so a build log
+/// that continuously adds content still publishes at up to 120 Hz.
+const OUTPUT_REPAINT_CEILING: Duration = Duration::from_millis(16);
+
+/// An entirely blank intermediate frame gets a little more grace than a
+/// partial repaint. A loaded machine can deschedule a TUI between its clear
+/// and redraw writes for longer than one display frame; publishing that state
+/// is the most visible possible flash. Keep enough headroom beyond a typical
+/// 30 ms scheduler pause for the resumed process to issue its redraw; a
+/// program that intentionally clears and stops still appears within the
+/// sub-100 ms perceptual-continuity bound.
+///
+/// This window is measured from the moment the screen actually went blank —
+/// see [`feed_output_batch`] — not from the start of the batch that happened
+/// to contain the erase.
+const OUTPUT_BLANK_REPAINT_CEILING: Duration = Duration::from_millis(80);
+
+/// Upper bound on a widened blank-repaint grace. Far beyond any perceptual
+/// budget, so nothing but a test would ask for it.
+const MAX_OUTPUT_BLANK_REPAINT_CEILING: Duration = Duration::from_secs(5);
+
+/// The blank-repaint grace, widened when the environment asks for it.
+///
+/// A test that drives a real PTY on a contended CI runner cannot assert
+/// anything about an 80 ms window: the runner can stall a shell for longer
+/// than that between two writes, and the resulting failure says nothing about
+/// the coalescing logic under test. Such a test widens the window instead, so
+/// scheduler noise is small against it, and the invariant it asserts is the
+/// real one.
+///
+/// Only ever raised, never lowered: a smaller value than the default would
+/// mean shipping more flicker, so it is clamped away. Malformed values fall
+/// back to the default.
+fn blank_repaint_ceiling() -> Duration {
+    std::env::var("DIRIJOR_BLANK_REPAINT_CEILING_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(OUTPUT_BLANK_REPAINT_CEILING, |ms| {
+            Duration::from_millis(ms).clamp(
+                OUTPUT_BLANK_REPAINT_CEILING,
+                MAX_OUTPUT_BLANK_REPAINT_CEILING,
+            )
+        })
+}
+
+/// Byte ceiling on one batch, matching `alacritty_terminal`'s
+/// `MAX_LOCKED_READ`. A child that writes faster than it can be parsed must
+/// not starve the grid indefinitely.
+const OUTPUT_BATCH_BYTES: usize = 1 << 20;
+
+/// How much of a held session's log the follow pump reads per pass. A full
+/// read means more is already waiting, which is how that pump recognizes a
+/// repaint it has only half consumed.
+const LOG_READ_BUDGET: usize = 512 << 10;
+
+/// How often status detection may run while output is still backed up. Reading
+/// is what keeps the pump close behind the holder, and a screen that changed
+/// twice within one frame is not two observations worth having.
+const EVAL_INTERVAL: Duration = Duration::from_millis(16);
+
+/// How far ahead of the pump a subscription may start and still be worth
+/// taking. Beyond this the file is followed instead, which costs latency for a
+/// moment rather than churning subscriptions that cannot be read yet.
+const LIVE_HANDOVER_GAP: u64 = 256 << 10;
+
 /// What a session looks like from the outside.
 #[derive(Clone, Debug)]
 pub struct SessionView {
     pub id: String,
     pub status: SessionStatus,
+    pub status_evidence: Option<diri_proto::StatusEvidence>,
     pub needs_input: Option<NeedsInputDetail>,
+    pub last_turn_completed_at: Option<diri_proto::DateMillis>,
     pub title: Option<String>,
     pub title_source: Option<diri_proto::TitleSource>,
-    pub last_turn_completed_at: Option<diri_proto::DateMillis>,
     pub tail_offset: u64,
     pub exited: bool,
 }
@@ -186,6 +277,9 @@ struct Shared {
     /// Seconds since UNIX_EPOCH of the last attach-pump poll or input write.
     /// Keeps interactive sessions on the fast quiet-tick.
     last_hot: AtomicU64,
+    /// Unlike `last_hot`, starts cold: restored/background sessions should not
+    /// receive interactive scheduler priority until actually attached or used.
+    last_interaction: AtomicU64,
     /// URLs scanned off the visible screen (PRs, previews, links).
     artifacts: Mutex<Vec<diri_proto::SessionArtifact>>,
     /// True while the child tree is SIGSTOPped. Writing into a stopped
@@ -215,19 +309,26 @@ impl Shared {
     }
 
     fn note_hot(&self) {
-        self.last_hot.store(unix_secs(), Ordering::Relaxed);
+        let now = unix_secs();
+        self.last_hot.store(now, Ordering::Relaxed);
+        self.last_interaction.store(now, Ordering::Relaxed);
     }
 
     /// Fast quiet-tick while the session is attached/touched or Working;
     /// everything else can wait a second.
     fn wants_fast_tick(&self) -> bool {
-        if unix_secs().saturating_sub(self.last_hot.load(Ordering::Relaxed)) <= HOT_WINDOW_SECS {
+        if self.was_recently_touched() {
             return true;
         }
         matches!(
             *self.status.lock().expect("status"),
             SessionStatus::Working | SessionStatus::Starting
         )
+    }
+
+    fn was_recently_touched(&self) -> bool {
+        let last = self.last_interaction.load(Ordering::Relaxed);
+        last != 0 && unix_secs().saturating_sub(last) <= HOT_WINDOW_SECS
     }
 
     fn quiet_tick(&self) -> Duration {
@@ -254,7 +355,7 @@ pub struct GridSignature {
     pub size: (usize, usize),
     pub cursor: (u16, u16, bool),
     pub alt_screen: bool,
-    pub mouse_reporting: bool,
+    pub mouse: MouseModes,
 }
 
 /// Event source for the attachment writer. PTY readers advance it only after
@@ -360,7 +461,7 @@ fn grid_wake_event(state: &GridWakeState, observed: u64) -> GridWakeEvent {
 
 pub(crate) struct AttachmentSeed {
     pub grid: diri_proto::grid::GridUpdate,
-    pub modes: (bool, bool),
+    pub modes: (bool, bool, MouseModes),
     pub signature: GridSignature,
     pub wake: GridWake,
     pub wake_generation: u64,
@@ -636,7 +737,7 @@ impl Session {
             0,
         ));
         let log = OutputLog::writer(&spec.logs_dir, &spec.id)?;
-        let shared = new_shared(&spec, log);
+        let shared = new_shared(&spec, log, &engine);
         *shared.remote_grid.lock().expect("remote grid") = Some(RemoteGridState {
             mirror: GridMirror::new(),
             revision: 0,
@@ -694,7 +795,7 @@ impl Session {
             remote.output_offset,
         ));
         let log = OutputLog::writer(&spec.logs_dir, &spec.id)?;
-        let shared = new_shared(&spec, log);
+        let shared = new_shared(&spec, log, &engine);
         shared
             .remote_output_offset
             .store(remote.output_offset, Ordering::SeqCst);
@@ -733,7 +834,7 @@ impl Session {
     fn spawn_direct(spec: SessionSpec, engine: Arc<ManifestEngine>) -> std::io::Result<Self> {
         let pty = Pty::spawn(&spec.pty)?;
         let log = OutputLog::writer(&spec.logs_dir, &spec.id)?;
-        let shared = new_shared(&spec, log);
+        let shared = new_shared(&spec, log, &engine);
         shared.child_pid.store(pty.pid() as i32, Ordering::SeqCst);
 
         let reader = pty.reader()?;
@@ -809,7 +910,7 @@ impl Session {
         let paths = HolderPaths::new(&holder.holders_dir, &spec.id);
         let client = HolderClient::new(paths.socket());
         let log = OutputLog::reader(&spec.logs_dir, &spec.id)?;
-        let shared = new_shared(&spec, log);
+        let shared = new_shared(&spec, log, &engine);
         let deferred = Arc::new(DeferredLaunch::new());
 
         let pump = {
@@ -950,7 +1051,7 @@ impl Session {
         engine: Arc<ManifestEngine>,
     ) -> std::io::Result<Self> {
         let log = OutputLog::reader(&spec.logs_dir, &spec.id)?;
-        let shared = new_shared(&spec, log);
+        let shared = new_shared(&spec, log, &engine);
         if let Ok(stat) = client.stat() {
             shared.child_pid.store(stat.child_pid, Ordering::SeqCst);
         }
@@ -1000,14 +1101,21 @@ impl Session {
         SessionView {
             id: self.shared.id.clone(),
             status: self.shared.status.lock().expect("status").clone(),
+            status_evidence: self
+                .shared
+                .reducer
+                .lock()
+                .expect("reducer")
+                .evidence()
+                .cloned(),
             needs_input: self.shared.needs_input.lock().expect("needs input").clone(),
-            title,
-            title_source,
             last_turn_completed_at: *self
                 .shared
                 .last_turn_completed_at
                 .lock()
                 .expect("last turn completed"),
+            title,
+            title_source,
             tail_offset: self.shared.log.lock().expect("log").tail_offset(),
             exited: self.shared.exited.load(Ordering::SeqCst),
         }
@@ -1077,16 +1185,16 @@ impl Session {
                     let grid = remote.mirror.full_update()?;
                     let (cols, rows) = remote.mirror.size();
                     let (cursor_col, cursor_row, cursor_visible) = remote.mirror.cursor();
-                    let (alt_screen, _, mouse_reporting) = remote.mirror.modes();
+                    let (alt_screen, bracketed_paste, mouse) = remote.mirror.modes();
                     Some((
                         grid,
-                        (alt_screen, mouse_reporting),
+                        (alt_screen, bracketed_paste, mouse),
                         GridSignature {
                             content_seq: remote.revision,
                             size: (usize::from(cols), usize::from(rows)),
                             cursor: (cursor_col, cursor_row, cursor_visible),
                             alt_screen,
-                            mouse_reporting,
+                            mouse,
                         },
                     ))
                 })
@@ -1095,13 +1203,17 @@ impl Session {
                 let screen = self.shared.screen.lock().expect("screen");
                 (
                     screen.full_snapshot(),
-                    (screen.is_alt_screen(), screen.mouse_reporting()),
+                    (
+                        screen.is_alt_screen(),
+                        screen.bracketed_paste(),
+                        screen.mouse_modes(),
+                    ),
                     GridSignature {
                         content_seq: screen.content_seq(),
                         size: screen.size(),
                         cursor: screen.cursor(),
                         alt_screen: screen.is_alt_screen(),
-                        mouse_reporting: screen.mouse_reporting(),
+                        mouse: screen.mouse_modes(),
                     },
                 )
             });
@@ -1133,13 +1245,13 @@ impl Session {
         {
             let (cols, rows) = remote.mirror.size();
             let (cursor_col, cursor_row, cursor_visible) = remote.mirror.cursor();
-            let (alt_screen, _, mouse_reporting) = remote.mirror.modes();
+            let (alt_screen, _, mouse) = remote.mirror.modes();
             let current = GridSignature {
                 content_seq: remote.revision,
                 size: (usize::from(cols), usize::from(rows)),
                 cursor: (cursor_col, cursor_row, cursor_visible),
                 alt_screen,
-                mouse_reporting,
+                mouse,
             };
             if current == *signature {
                 return None;
@@ -1156,7 +1268,7 @@ impl Session {
             size: screen.size(),
             cursor: screen.cursor(),
             alt_screen: screen.is_alt_screen(),
-            mouse_reporting: screen.mouse_reporting(),
+            mouse: screen.mouse_modes(),
         };
         if current == *signature {
             return None;
@@ -1185,8 +1297,8 @@ impl Session {
         self.shared.screen.lock().expect("screen").bracketed_paste()
     }
 
-    /// Current (alt_screen, mouse_reporting).
-    pub fn modes(&self) -> (bool, bool) {
+    /// Current alternate-screen, bracketed-paste, and granular mouse modes.
+    pub fn modes(&self) -> (bool, bool, MouseModes) {
         if let Some(remote) = self
             .shared
             .remote_grid
@@ -1195,17 +1307,28 @@ impl Session {
             .as_ref()
             && remote.mirror.sequence().is_some()
         {
-            let (alt_screen, _, mouse_reporting) = remote.mirror.modes();
-            return (alt_screen, mouse_reporting);
+            return remote.mirror.modes();
         }
         let screen = self.shared.screen.lock().expect("screen");
-        (screen.is_alt_screen(), screen.mouse_reporting())
+        (
+            screen.is_alt_screen(),
+            screen.bracketed_paste(),
+            screen.mouse_modes(),
+        )
     }
 
     /// A wheel event from an attached client: forwarded to the child when it
     /// asked for mouse reporting, otherwise ignored (the client scrolls its
     /// own scrollback).
     pub fn scroll(&self, up: bool, lines: usize, col: usize, row: usize) -> std::io::Result<()> {
+        if let Transport::Remote(client) = &self.transport {
+            return client.scroll(
+                u8::from(!up),
+                u16::try_from(lines).unwrap_or(u16::MAX),
+                u16::try_from(col).unwrap_or(u16::MAX),
+                u16::try_from(row).unwrap_or(u16::MAX),
+            );
+        }
         let bytes = self
             .shared
             .screen
@@ -1283,6 +1406,10 @@ impl Session {
     }
 
     fn write_raw(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.write_raw_kind(bytes, false)
+    }
+
+    fn write_raw_kind(&self, bytes: &[u8], mouse: bool) -> std::io::Result<()> {
         // Before the deferred exec there is no PTY: queue for the launch
         // flush, exactly like the Swift daemon's `queuedLaunchInput`.
         if let Some(deferred) = &self.deferred
@@ -1306,8 +1433,20 @@ impl Session {
                 writer.flush()
             }
             Transport::Held(client) => client.write(bytes).map_err(holder_io_error),
+            Transport::Remote(client) if mouse => client.write_mouse(bytes),
             Transport::Remote(client) => client.write(bytes),
         }
+    }
+
+    /// Sends a pre-encoded terminal mouse report without presenting it to the
+    /// prompt/status reducers as typed text.
+    pub fn write_mouse(&self, bytes: &[u8]) -> std::io::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.shared.note_hot();
+        self.shared.grid_wake.prioritize_interactive_changes();
+        self.write_raw_kind(bytes, true)
     }
 
     /// Sends text the way a user would.
@@ -1364,10 +1503,8 @@ impl Session {
         // so the echo renders promptly.
         self.shared.note_hot();
         if !bytes.is_empty() {
-            // The next grid changes are likely a trailing echo already in
-            // flight and the TUI's response. Let the attachment pump interrupt
-            // its background coalescing wait instead of making typed input
-            // cross a 16 ms frame boundary before the host can render it.
+            // Let the attachment pump interrupt a background coalescing wait
+            // instead of making typed input cross an 8 ms frame boundary.
             self.shared.grid_wake.prioritize_interactive_changes();
         }
         self.observe_prompt_input(bytes);
@@ -1600,7 +1737,10 @@ impl Drop for Session {
     }
 }
 
-fn new_shared(spec: &SessionSpec, log: OutputLog) -> Arc<Shared> {
+fn new_shared(spec: &SessionSpec, log: OutputLog, engine: &ManifestEngine) -> Arc<Shared> {
+    let manifest_version = engine
+        .manifest(&spec.manifest_id)
+        .map(|manifest| manifest.version.clone());
     Arc::new(Shared {
         id: spec.id.clone(),
         status: Mutex::new(SessionStatus::Starting),
@@ -1614,12 +1754,16 @@ fn new_shared(spec: &SessionSpec, log: OutputLog) -> Arc<Shared> {
             spec.pty.cols as usize,
             spec.pty.rows as usize,
         )),
-        reducer: Mutex::new(StatusReducer::new(spec.authority, SystemTime::now())),
+        reducer: Mutex::new(
+            StatusReducer::new(spec.authority, SystemTime::now())
+                .with_manifest(spec.manifest_id.clone(), manifest_version),
+        ),
         exit: Mutex::new(None),
         exited: AtomicBool::new(false),
         stop: AtomicBool::new(false),
         state_version: AtomicU64::new(0),
         last_hot: AtomicU64::new(unix_secs()),
+        last_interaction: AtomicU64::new(0),
         artifacts: Mutex::new(Vec::new()),
         hibernated: AtomicBool::new(false),
         queued_input: Mutex::new(Vec::new()),
@@ -1644,7 +1788,7 @@ fn wait_for_holder(
     session_id: &str,
     pre_spawn_tail: u64,
 ) -> Result<u64, crate::holder::HolderError> {
-    for _ in 0..250 {
+    for delay in crate::holder::readiness_delays().take(300) {
         if let Ok(stat) = client.stat() {
             return Ok(stat.epoch_offset.unwrap_or(pre_spawn_tail));
         }
@@ -1654,7 +1798,7 @@ fn wait_for_holder(
                 return Ok(pre_spawn_tail);
             }
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(delay);
     }
     Err(crate::holder::HolderError::Launch(
         "holder did not become ready".into(),
@@ -1696,6 +1840,9 @@ fn apply(shared: &Shared, outcome: &ReducerOutcome) {
             .expect("last turn completed") = Some(diri_proto::DateMillis::from(SystemTime::now()));
         changed = true;
     }
+    // The reducer already suppresses evidence with unchanged structured
+    // meaning, so an emitted value always warrants a record/UI refresh.
+    changed |= outcome.status_evidence.is_some();
     // Leaving a needs-input state clears the pending detail, so the UI does not
     // keep showing a prompt that has been answered.
     if matches!(
@@ -1959,8 +2106,7 @@ fn handle_remote_message(
                 let Some((offset, bytes)) = frame.output_payload() else {
                     return RemoteConnectionDisposition::Fatal;
                 };
-                client.observe_output_offset(offset.saturating_add(bytes.len() as u64));
-                apply_remote_output(
+                match apply_remote_output(
                     shared,
                     engine,
                     manifest_id,
@@ -1968,8 +2114,13 @@ fn handle_remote_message(
                     offset,
                     bytes,
                     *replaying,
-                );
-                RemoteConnectionDisposition::Continue
+                ) {
+                    Some(next_offset) => {
+                        client.observe_output_offset(next_offset);
+                        RemoteConnectionDisposition::Continue
+                    }
+                    None => RemoteConnectionDisposition::Reconnect,
+                }
             }
             _ => RemoteConnectionDisposition::Fatal,
         },
@@ -2023,24 +2174,32 @@ fn apply_remote_output(
     offset: u64,
     bytes: &[u8],
     replaying: bool,
-) {
+) -> Option<u64> {
     let expected = shared.remote_output_offset.load(Ordering::SeqCst);
     let end = offset.saturating_add(bytes.len() as u64);
-    if end <= expected {
-        return;
-    }
-    let skip = expected.saturating_sub(offset).min(bytes.len() as u64) as usize;
-    let bytes = &bytes[skip..];
+    let bytes = match reconcile_output_frame(expected, offset, bytes.len()) {
+        OutputFrameAction::Feed => bytes,
+        OutputFrameAction::FeedSuffix { drop_leading } => &bytes[drop_leading..],
+        OutputFrameAction::Skip => return Some(expected),
+        // Replay is bounded by the Holder. If older bytes have already fallen
+        // out of that bound, the FullSnapshot queued after ReplayEnd is the
+        // authoritative recovery. A gap in the live stream instead means the
+        // connection must be reseeded before more output is consumed.
+        OutputFrameAction::Gap { .. } if replaying => bytes,
+        OutputFrameAction::Gap { .. } => return None,
+    };
     if bytes.is_empty() {
-        return;
+        return Some(expected);
     }
     shared.remote_output_offset.store(end, Ordering::SeqCst);
     let _ = shared.log.lock().expect("log").append(bytes);
-    let observation = {
-        let mut screen = shared.screen.lock().expect("screen");
-        screen.feed(bytes);
-        evaluate_if_screen_changed(shared, &mut screen, engine, manifest_id, last_eval_seq)
-    };
+    let observation = (!replaying)
+        .then(|| {
+            let mut screen = shared.screen.lock().expect("screen");
+            screen.feed(bytes);
+            evaluate_if_screen_changed(shared, &mut screen, engine, manifest_id, last_eval_seq)
+        })
+        .flatten();
     let now = SystemTime::now();
     let mut reducer = shared.reducer.lock().expect("reducer");
     if !replaying {
@@ -2052,6 +2211,7 @@ fn apply_remote_output(
         drop(reducer);
         apply(shared, &outcome);
     }
+    Some(end)
 }
 
 fn apply_remote_snapshot(
@@ -2073,7 +2233,7 @@ fn apply_remote_snapshot(
                 &snapshot.grid,
                 snapshot.alt_screen,
                 snapshot.bracketed_paste,
-                snapshot.mouse_reporting,
+                snapshot.mouse,
             )
             .map_err(std::io::Error::other)?;
         remote.revision = remote.revision.saturating_add(1);
@@ -2093,7 +2253,7 @@ fn apply_remote_snapshot(
             &snapshot.grid,
             snapshot.alt_screen,
             snapshot.bracketed_paste,
-            snapshot.mouse_reporting,
+            snapshot.mouse,
         ) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -2126,7 +2286,7 @@ fn apply_remote_delta(shared: &Shared, delta: GridDelta) -> std::io::Result<()> 
                 &delta.grid,
                 delta.alt_screen,
                 delta.bracketed_paste,
-                delta.mouse_reporting,
+                delta.mouse,
             )
             .map_err(std::io::Error::other)?;
         remote.revision = remote.revision.saturating_add(1);
@@ -2237,24 +2397,32 @@ fn pump(
             Ok(usize::MAX) => {}
             Ok(0) => break, // the child closed the terminal
             Ok(n) => {
-                let chunk = &buffer[..n];
-                {
-                    let mut log = shared.log.lock().expect("log");
-                    // A failed disk write must not stop the session: the child
-                    // is still running and its status still matters.
-                    let _ = log.append(chunk);
-                }
-                let observation = {
+                let closed = feed_output_batch(&shared, &mut reader, &mut buffer, n);
+                // One detection pass per batch, not per read: the reducer
+                // discards observations it has already judged anyway.
+                let (observation, replies) = {
                     let mut screen = shared.screen.lock().expect("screen");
-                    screen.feed(chunk);
-                    evaluate_if_screen_changed(
-                        &shared,
-                        &mut screen,
-                        &engine,
-                        &manifest_id,
-                        &mut last_eval_seq,
+                    let replies = screen.take_replies();
+                    (
+                        evaluate_if_screen_changed(
+                            &shared,
+                            &mut screen,
+                            &engine,
+                            &manifest_id,
+                            &mut last_eval_seq,
+                        ),
+                        replies,
                     )
                 };
+                // Answers to the child's queries go back before anything else
+                // is published: it is blocked reading them.
+                if !replies.is_empty() {
+                    use std::io::Write;
+                    if let Ok(mut writer) = pty.lock().expect("pty").writer() {
+                        let _ = writer.write_all(&replies);
+                        let _ = writer.flush();
+                    }
+                }
                 shared.grid_wake.notify();
 
                 let now = SystemTime::now();
@@ -2266,10 +2434,15 @@ fn pump(
                     drop(reducer);
                     apply(&shared, &outcome);
                 }
+                if closed {
+                    break;
+                }
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         }
+
+        release_stalled_sync(&shared);
 
         // Ticks drive the debounce timers even when the child is quiet.
         if last_tick.elapsed().unwrap_or_default() >= TICK_INTERVAL {
@@ -2298,6 +2471,109 @@ fn pump(
     apply(&shared, &outcome);
     shared.exited.store(true, Ordering::SeqCst);
     let _ = shared.log.lock().expect("log").flush();
+}
+
+/// Feeds one batch of PTY output: the read the caller already made, plus every
+/// continuation that arrives before the batch settles.
+///
+/// The point of the batch is that the caller publishes the grid *once*, after
+/// it returns. A repaint the child split across several writes therefore
+/// reaches attached clients as one frame instead of as an erase followed by a
+/// redraw, which is what a pane paints as a flicker. See [`OUTPUT_SETTLE`].
+///
+/// The screen lock is released between chunks so the grid can still be read
+/// mid-batch, which is safe because nothing wakes a reader until the caller
+/// publishes.
+///
+/// Returns true when the child closed the terminal.
+fn feed_output_batch(
+    shared: &Shared,
+    reader: &mut crate::pty::PtyStream,
+    buffer: &mut [u8],
+    first: usize,
+) -> bool {
+    let started_at = Instant::now();
+    let batch_deadline = started_at + OUTPUT_BATCH_CEILING;
+    let repaint_deadline = started_at + OUTPUT_REPAINT_CEILING;
+    let blank_ceiling = blank_repaint_ceiling();
+    let mut count = first;
+    let mut total = 0usize;
+    let mut filled_before = None;
+    // When the screen first went blank, which is when its redraw budget
+    // starts. Anchoring this to `started_at` instead would spend part of the
+    // budget on whatever the batch did before the erase arrived, so a busy
+    // session gets a shorter grace than an idle one and publishes the flash
+    // this batching exists to prevent.
+    let mut blank_since: Option<Instant> = None;
+    loop {
+        {
+            let mut log = shared.log.lock().expect("log");
+            // A failed disk write must not stop the session: the child is
+            // still running and its status still matters.
+            let _ = log.append(&buffer[..count]);
+        }
+        let (mid_repaint, blank_repaint) = {
+            let mut screen = shared.screen.lock().expect("screen");
+            let before = *filled_before.get_or_insert_with(|| screen.filled_cells());
+            screen.feed(&buffer[..count]);
+            let after = screen.filled_cells();
+            (after < before, after == 0 && before != 0)
+        };
+        total += count;
+
+        // A screen that recovered content is no longer mid-erase; a later
+        // erase in the same batch starts its own budget.
+        if !blank_repaint {
+            blank_since = None;
+        }
+
+        let deadline = if blank_repaint {
+            *blank_since.get_or_insert_with(Instant::now) + blank_ceiling
+        } else if mid_repaint {
+            repaint_deadline
+        } else {
+            batch_deadline
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if total >= OUTPUT_BATCH_BYTES || remaining.is_zero() {
+            return false;
+        }
+        // Bytes already queued are always folded in — that costs nothing and
+        // is what a terminal emulator's reader does. Waiting for bytes that
+        // have not arrived is reserved for a screen that currently holds less
+        // than it did when the batch opened, which is a repaint caught between
+        // its erase and its redraw. An echo, which only adds, never waits.
+        let settle = if blank_repaint {
+            // A full erase is the most destructive intermediate frame. Give
+            // its redraw the entire bounded grace period instead of falling
+            // through the ordinary 16 ms partial-repaint settle window.
+            remaining
+        } else if mid_repaint {
+            OUTPUT_SETTLE
+        } else {
+            Duration::ZERO
+        };
+        if !matches!(reader.wait_readable(remaining.min(settle)), Ok(true)) {
+            return false;
+        }
+        count = match reader.read(buffer) {
+            Ok(0) => return true, // the child closed the terminal
+            Ok(next) => next,
+            // Ending the batch here is safe: the caller polls again straight
+            // away and picks the rest up.
+            Err(_) => return false,
+        };
+    }
+}
+
+/// Publishes a synchronized update the child opened and never closed.
+///
+/// Cheap enough to run every loop iteration: it is an `Option<Instant>` test
+/// unless an update is actually overdue.
+fn release_stalled_sync(shared: &Shared) {
+    if shared.screen.lock().expect("screen").flush_expired_sync() {
+        shared.grid_wake.notify();
+    }
 }
 
 /// Runs manifest detection only when the visible screen actually changed.
@@ -2368,7 +2644,7 @@ fn pump_held(
                     &checkpoint.grid,
                     checkpoint.alt_screen,
                     checkpoint.bracketed_paste,
-                    checkpoint.mouse_reporting,
+                    checkpoint.mouse,
                 )
             });
         match restored {
@@ -2394,22 +2670,154 @@ fn pump_held(
     let mut checkpoint_dirty_at: Option<Instant> = None;
     let mut last_liveness = Instant::now();
     let mut last_eval_seq = 0u64;
+    let mut last_eval_at: Option<Instant> = None;
+    // Set when a chunk was fed without detection running, so the settle below
+    // knows the screen still needs judging.
+    let mut eval_dirty = false;
     let mut last_scan_at = None;
     let mut last_scan_seq = 0u64;
     let mut exit_status: Option<HolderExitStatus> = None;
+    let mut interactive_qos = false;
+    // Set while a repaint is being assembled across more than one log read.
+    let mut publish_pending: Option<Instant> = None;
     // Until the tail is first caught up, bytes are history, not activity:
     // they must render, but not flip a quiet adopted session to Working.
     let mut replaying = true;
+    // Everything already in the log when this pump attached. A query below it
+    // was asked before we were here and has either been answered or outlived
+    // its asker; a query above it came from the running child and is owed an
+    // answer, even if the pump has not finished draining the tail yet.
+    let replay_until = {
+        let mut log = shared.log.lock().expect("log");
+        // Refreshed first: the handle may predate output the holder has
+        // already written, and a stale tail here would answer queries that
+        // belong to a previous incarnation.
+        log.refresh_from_disk();
+        log.tail_offset()
+    };
+
+    // Output arrives one of two ways. The log always holds every byte, and
+    // tailing it is all an older holder supports — but the file is written
+    // asynchronously, so a screen fed from it waits on the filesystem. A
+    // subscription delivers the same bytes as the holder reads them, with the
+    // log still underneath: the stream can end or be dropped at any moment,
+    // and the loop just goes back to reading the file from the offset it had
+    // reached.
+    let mut live: Option<crate::holder::HolderOutputStream> = None;
+    // Reused across passes: a fresh allocation per pass would charge every
+    // byte of output an allocation it does not need.
+    let mut live_run: Vec<u8> = Vec::new();
+    // Where the subscription's first frame sits. The holder is ahead of the
+    // log by whatever it has read but not yet written, so the file has to be
+    // followed up to this point before a frame can be consumed.
+    let mut live_from: u64 = 0;
+    // Set once the log has been read to its end, which is the only safe moment
+    // to subscribe.
+    let mut drained = false;
 
     while !shared.stop.load(Ordering::SeqCst) && exit_status.is_none() {
         scan_artifacts_if_due(&shared, &mut last_scan_at, &mut last_scan_seq);
-        let (start, chunk) = {
-            let mut log = shared.log.lock().expect("log");
-            log.refresh_from_disk();
-            log.read(offset, 64 << 10)
+        // Subscribe only from a standing start, with the log drained.
+        //
+        // A subscription taken while still catching up is worse than none: the
+        // holder begins filling a queue this loop is not yet reading, and once
+        // that queue is full the pump waits on it for every chunk. Waiting for
+        // a drained log keeps the handover to a few frames.
+        if live.is_none() && drained {
+            if let Ok(Some(stream)) = client.open_output_stream() {
+                // A drained log does not mean the holder is where the log
+                // ends: writes are queued, so it can be megabytes further on.
+                // Subscribing across that distance is the worst case — the
+                // holder fills a queue this loop cannot read until the file
+                // catches up, then drops it for being full, and both ends
+                // repeat. Take the subscription only when the gap is small
+                // enough to close immediately, and otherwise keep tailing and
+                // try again the next time the log runs dry.
+                live_from = stream.start_offset();
+                if live_from.saturating_sub(offset) <= LIVE_HANDOVER_GAP {
+                    live = Some(stream);
+                }
+            }
+            drained = false;
+        }
+        // Frames only once the file has been followed up to where they begin.
+        let streaming = live.is_some() && offset >= live_from;
+        let from_log;
+        let (start, chunk): (u64, &[u8]) = match live.as_mut().filter(|_| streaming) {
+            Some(stream) => {
+                match stream.next_run_into(shared.quiet_tick(), LOG_READ_BUDGET, &mut live_run) {
+                    // Contiguous by construction, and checked anyway: a run
+                    // that does not start where the last one ended means
+                    // something raced, and the log is the authority to fall
+                    // back on rather than feed the emulator a gap it cannot
+                    // detect.
+                    Ok(Some(at)) if at == offset => (offset, &live_run[..]),
+                    Ok(Some(_)) => {
+                        live = None;
+                        continue;
+                    }
+                    // Quiet: fall through to the timers with nothing to feed.
+                    Ok(None) => (offset, &[][..]),
+                    Err(_) => {
+                        // Dropped for falling behind, or the child is gone.
+                        // The log has every byte; resume from it.
+                        live = None;
+                        continue;
+                    }
+                }
+            }
+            None => {
+                let mut log = shared.log.lock().expect("log");
+                log.refresh_from_disk();
+                from_log = log.read(offset, LOG_READ_BUDGET);
+                (from_log.0, &from_log.1[..])
+            }
+        };
+        // A full read means the tail is not caught up, so this pass may hold
+        // half a repaint. Publishing it would flicker; fold the rest into the
+        // same frame instead — bounded, so a holder streaming faster than we
+        // parse still updates.
+        // "Nothing more is waiting." A short log read means the file is
+        // drained; a live frame says nothing either way, since the holder may
+        // already have more, so only an empty poll settles the stream.
+        let caught_up = if streaming {
+            chunk.is_empty()
+        } else {
+            chunk.len() < LOG_READ_BUDGET
         };
 
         if chunk.is_empty() {
+            if publish_pending.take().is_some() {
+                shared.grid_wake.notify();
+            }
+            // Output stopped with a screen detection has not judged yet: this
+            // is the settle, and it is what makes throttling safe.
+            if eval_dirty {
+                eval_dirty = false;
+                last_eval_at = Some(Instant::now());
+                let observation = {
+                    let mut screen = shared.screen.lock().expect("screen");
+                    evaluate_if_screen_changed(
+                        &shared,
+                        &mut screen,
+                        &engine,
+                        &manifest_id,
+                        &mut last_eval_seq,
+                    )
+                };
+                if let Some(observation) = observation {
+                    let outcome = shared
+                        .reducer
+                        .lock()
+                        .expect("reducer")
+                        .reduce(StatusSignal::Screen(observation), SystemTime::now());
+                    apply(&shared, &outcome);
+                }
+            }
+            release_stalled_sync(&shared);
+            if live.is_none() && !replaying {
+                drained = true;
+            }
             if replaying {
                 replaying = false;
                 // The replay tail is drained: checkpoint immediately, as the
@@ -2433,11 +2841,19 @@ fn pump_held(
                     &mut last_checkpoint_key,
                 );
             }
+            let should_be_interactive = shared.was_recently_touched();
+            if should_be_interactive != interactive_qos {
+                set_current_thread_interactive(should_be_interactive);
+                interactive_qos = should_be_interactive;
+            }
             // Quiet: block on the log watcher, which wakes the instant the
             // holder appends — the tick interval is only the ceiling for
             // reducer timers and the liveness probe. Attached or Working
             // sessions keep the fast ceiling; idle background ones stretch it.
             let log_replaced = match watcher.as_mut() {
+                // A subscription already waited a tick for its frame; waiting
+                // again here would add one to every quiet pass.
+                _ if streaming => false,
                 Some(watcher) => watcher.wait(shared.quiet_tick()),
                 None => {
                     std::thread::sleep(shared.quiet_tick());
@@ -2488,38 +2904,90 @@ fn pump_held(
         let honored_from = exit_marker_floor
             .saturating_sub(start)
             .min(chunk.len() as u64) as usize;
-        let mut output = Vec::new();
-        if honored_from > 0 {
-            marker_buffer.extend_from_slice(&chunk[..honored_from]);
-            let (replayed, _stale_exit) = HolderExitMarker::drain(&mut marker_buffer);
-            output.extend_from_slice(&replayed);
-            if start + honored_from as u64 >= exit_marker_floor {
-                marker_buffer.clear(); // an unfinished stale marker ends here
+        // Ordinary output carries no exit marker, and accumulating it only to
+        // be handed the same bytes back costs several copies of everything a
+        // session ever prints. When there is nothing buffered and nothing
+        // marker-shaped in the chunk, it is fed where it lies.
+        let staged;
+        let output: &[u8] = if honored_from == 0
+            && marker_buffer.is_empty()
+            && HolderExitMarker::absent_from(chunk)
+        {
+            chunk
+        } else {
+            let mut assembled = Vec::new();
+            if honored_from > 0 {
+                marker_buffer.extend_from_slice(&chunk[..honored_from]);
+                let (replayed, _stale_exit) = HolderExitMarker::drain(&mut marker_buffer);
+                assembled.extend_from_slice(&replayed);
+                if start + honored_from as u64 >= exit_marker_floor {
+                    marker_buffer.clear(); // an unfinished stale marker ends here
+                }
             }
-        }
-        if honored_from < chunk.len() {
-            marker_buffer.extend_from_slice(&chunk[honored_from..]);
-            let (live, exit) = HolderExitMarker::drain(&mut marker_buffer);
-            output.extend_from_slice(&live);
-            if exit.is_some() {
-                exit_status = exit;
+            if honored_from < chunk.len() {
+                marker_buffer.extend_from_slice(&chunk[honored_from..]);
+                let (live, exit) = HolderExitMarker::drain(&mut marker_buffer);
+                assembled.extend_from_slice(&live);
+                if exit.is_some() {
+                    exit_status = exit;
+                }
             }
-        }
+            staged = assembled;
+            &staged
+        };
 
         if !output.is_empty() {
             checkpoint_dirty_at = Some(Instant::now());
-            let observation = {
+            // Detection snapshots the whole screen and walks it with the
+            // manifest's patterns. That is cheap per screen and ruinous per
+            // read: a session streaming output produces thousands of reads a
+            // second, and paying for it on each one puts the pump behind the
+            // holder — which shows up as latency, because a query the child
+            // makes cannot be answered until the pump reaches it. While output
+            // is still backed up it runs on a timer, and the moment the pump
+            // catches up it runs again, so a settled screen is never stale.
+            let evaluate_now = last_eval_at.is_none_or(|at: Instant| at.elapsed() >= EVAL_INTERVAL);
+            eval_dirty = !evaluate_now;
+            let (observation, replies) = {
                 let mut screen = shared.screen.lock().expect("screen");
-                screen.feed(&output);
-                evaluate_if_screen_changed(
-                    &shared,
-                    &mut screen,
-                    &engine,
-                    &manifest_id,
-                    &mut last_eval_seq,
-                )
+                screen.feed(output);
+                let replies = screen.take_replies();
+                let observation = if evaluate_now {
+                    last_eval_at = Some(Instant::now());
+                    evaluate_if_screen_changed(
+                        &shared,
+                        &mut screen,
+                        &engine,
+                        &manifest_id,
+                        &mut last_eval_seq,
+                    )
+                } else {
+                    None
+                };
+                (observation, replies)
             };
-            shared.grid_wake.notify();
+            // The child is blocked reading the answer to its query, so send it
+            // through the holder's input path before publishing anything.
+            //
+            // Not for replayed history: those queries were asked by a program
+            // that has already moved on — often one that has exited — and the
+            // answers would arrive as unsolicited keystrokes. They are taken
+            // and dropped so a replayed query cannot leak into the live
+            // stream.
+            //
+            // The boundary is the log tail at attach, not whether the tail has
+            // been drained: a child that asks the moment it starts — which a
+            // shell setting up its prompt does — would otherwise be answered
+            // only if the pump happened to see an empty read first.
+            let historical = offset <= replay_until;
+            if !replies.is_empty() && !historical {
+                let _ = client.write(&replies);
+            }
+            let batch_started = *publish_pending.get_or_insert_with(Instant::now);
+            if caught_up || batch_started.elapsed() >= OUTPUT_BATCH_CEILING {
+                publish_pending = None;
+                shared.grid_wake.notify();
+            }
             let now = SystemTime::now();
             let mut reducer = shared.reducer.lock().expect("reducer");
             if !replaying {
@@ -2532,6 +3000,16 @@ fn pump_held(
                 apply(&shared, &outcome);
             }
         }
+    }
+
+    if interactive_qos {
+        set_current_thread_interactive(false);
+    }
+
+    // A repaint still being assembled when the holder exited is the last thing
+    // clients will ever see of this session: publish it.
+    if publish_pending.take().is_some() {
+        shared.grid_wake.notify();
     }
 
     // Detaching or exiting: capture the final screen, so the next daemon
@@ -2569,6 +3047,25 @@ fn pump_held(
     shared.exited.store(true, Ordering::SeqCst);
 }
 
+/// The held-output follower is on the input-to-pixel path while a terminal is
+/// attached, but the same thread may later follow background work. Raise its
+/// Apple QoS only for the existing hot window and restore the default class
+/// when it cools; other platforms keep their native scheduler behavior.
+#[cfg(target_vendor = "apple")]
+fn set_current_thread_interactive(interactive: bool) {
+    let qos = if interactive {
+        libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE
+    } else {
+        libc::qos_class_t::QOS_CLASS_DEFAULT
+    };
+    // SAFETY: this changes only the calling thread's QoS class. Priority zero
+    // is the documented relative priority for both selected classes.
+    let _ = unsafe { libc::pthread_set_qos_class_self_np(qos, 0) };
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn set_current_thread_interactive(_interactive: bool) {}
+
 /// Records a deferred launch that never produced a child: the session
 /// reports exit 127, the spawn-failure convention the app already knows.
 fn mark_launch_failed(shared: &Shared) {
@@ -2595,7 +3092,7 @@ struct CheckpointKey {
     marker_bytes: usize,
     alt_screen: bool,
     bracketed_paste: bool,
-    mouse_reporting: bool,
+    mouse: MouseModes,
 }
 
 /// Writes the current screen as a durable checkpoint, skipping the write when
@@ -2607,14 +3104,14 @@ fn persist_checkpoint(
     marker_buffer: &[u8],
     last_key: &mut Option<CheckpointKey>,
 ) {
-    let (history, grid, alt_screen, bracketed_paste, mouse_reporting, content_seq) = {
+    let (history, grid, alt_screen, bracketed_paste, mouse, content_seq) = {
         let screen = shared.screen.lock().expect("screen");
         (
             screen.history_snapshot(),
             screen.full_snapshot(),
             screen.is_alt_screen(),
             screen.bracketed_paste(),
-            screen.mouse_reporting(),
+            screen.mouse_modes(),
             screen.content_seq(),
         )
     };
@@ -2624,7 +3121,7 @@ fn persist_checkpoint(
         marker_bytes: marker_buffer.len(),
         alt_screen,
         bracketed_paste,
-        mouse_reporting,
+        mouse,
     };
     if *last_key == Some(key) {
         return;
@@ -2636,7 +3133,7 @@ fn persist_checkpoint(
         marker_buffer: marker_buffer.to_vec(),
         alt_screen,
         bracketed_paste,
-        mouse_reporting,
+        mouse,
     };
     // A failed write must not stop the session; the checkpoint is a cache.
     if checkpoint.write_atomically(path).is_ok() {
@@ -2869,9 +3366,16 @@ mod grid_wake_tests {
         thread.join().expect("notifier");
         assert!(changed.generation > observed);
         assert!(!changed.interactive);
+
+        // The waiter may wake after the first notification while the notifier
+        // advances the generation again. Catch up to the latest coalesced
+        // generation before asserting that a quiet source stays asleep.
+        let latest = wake.wait_for_change(changed.generation, Duration::ZERO);
+        assert_eq!(latest.generation, wake.generation());
+        assert!(!latest.interactive);
         assert_eq!(
-            wake.wait_for_change(changed.generation, Duration::from_millis(5)),
-            changed
+            wake.wait_for_change(latest.generation, Duration::from_millis(5)),
+            latest
         );
     }
 

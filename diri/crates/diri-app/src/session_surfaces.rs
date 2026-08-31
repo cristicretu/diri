@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
-use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
+use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::store::{SessionStore, StoreRuntime};
 use crate::switcher::{
     OverviewArrow, OverviewFilter, OverviewLane, OverviewMode, SwitcherKey, display_title,
@@ -108,11 +108,17 @@ impl SessionSurfaces {
         }
     }
 
-    pub(crate) fn open_overview(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_overview(&mut self, cx: &mut Context<Self>) {
         let mut store = self.store.write().expect("session store lock poisoned");
-        if !store.overview_state().is_visible() {
-            store.toggle_overview();
-        }
+        store.toggle_overview();
+        cx.notify();
+    }
+
+    pub(crate) fn dismiss(&mut self, cx: &mut Context<Self>) {
+        let mut store = self.store.write().expect("session store lock poisoned");
+        store.cancel_switcher();
+        store.dismiss_overview();
+        drop(store);
         cx.notify();
     }
 }
@@ -186,13 +192,6 @@ impl SessionSurfaces {
         }
 
         let modifiers = event.keystroke.modifiers;
-        if event.keystroke.key == "o" && modifiers.platform && modifiers.shift {
-            store.toggle_overview();
-            cx.stop_propagation();
-            cx.notify();
-            return;
-        }
-
         if !store.overview_state().is_visible() {
             if event.keystroke.key == "escape" && !store.sidebar_selection().is_empty() {
                 // Match Swift: clear Finder-style sidebar gathering, but do not
@@ -517,7 +516,10 @@ impl SessionSurfaces {
                 div()
                     .text_size(px(11.0))
                     .text_color(colors.tertiary)
-                    .child("⌘ click to select"),
+                    .child(format!(
+                        "{} to select",
+                        crate::commands::primary_click_label()
+                    )),
             )
             .child(mode_selector)
             .child(
@@ -1517,11 +1519,14 @@ mod tests {
             git_branch: Some(format!("feature/session-{index:02}")),
             title: format!("Overflowing session {index:02}"),
             title_source: TitleSource::AgentProvided,
+            originating_prompt: None,
             agent_session_id: None,
             transcript_path: None,
             status: SessionStatus::Working,
+            status_evidence: None,
             needs_input: None,
             resumability: Resumability::Live,
+            capabilities: None,
             parent: None,
             created_at: DateMillis(index as f64),
             updated_at: DateMillis(index as f64),
@@ -1554,6 +1559,7 @@ mod tests {
                     root: "/work/overview".into(),
                     name: "Overview".into(),
                     pinned_order: None,
+                    host: None,
                 }],
             });
         runtime

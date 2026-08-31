@@ -1,25 +1,37 @@
+mod agent_catalog;
 mod app_theme;
 mod clipboard_transfer;
 mod code_intelligence;
 mod code_viewer;
+mod commands;
 mod composer;
 #[cfg(unix)]
 mod daemon_launch;
+mod delegation;
 mod dev_build;
+mod diagnostics;
 pub mod diff;
+mod external_drop;
 pub mod fonts;
 pub mod fuzzy;
 mod git_review;
 pub mod history;
+mod icons;
 mod inspector;
+mod launch_recipe;
 mod launcher;
 pub mod markdown;
 mod markdown_view;
+#[cfg(any(target_os = "macos", test))]
+mod menu_inbox;
 pub mod navigation;
 pub mod notifications;
 pub mod palette;
+mod platform;
 pub mod query_editor;
 pub mod quick_open;
+pub mod quote;
+mod recovery;
 pub mod review_prompt;
 pub mod root;
 pub mod seam;
@@ -27,9 +39,11 @@ mod session_surfaces;
 pub mod settings;
 pub mod sidebar;
 pub mod sounds;
+mod status_debug;
 mod surface_shell;
 pub mod switcher;
 pub mod terminal_pane;
+pub mod transcript;
 pub mod updates;
 pub mod usage;
 mod workbench;
@@ -45,17 +59,22 @@ use std::time::Duration;
 
 use dev_build::DevBuildIdentity;
 use diri_client::DaemonClient;
+#[cfg(target_os = "macos")]
+use gpui::SystemMenuType;
 use gpui::{
-    App, AppContext as _, Bounds, KeyBinding, Menu, MenuItem, OsAction, SystemMenuType,
-    TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds, WindowOptions, actions,
-    point, px, size,
+    App, AppContext as _, Bounds, Menu, MenuItem, OsAction, TitlebarOptions, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowOptions, point, px, size,
 };
 use gpui_platform::application;
 use root::RootView;
 use sidebar::{PreviewScenario, SidebarPreviewFixture};
-use terminal_pane::bind_terminal_keys;
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 
+#[cfg(target_os = "macos")]
+use crate::commands::HideApp;
+use crate::commands::{
+    CloseSession, CloseWindow, CopySelection, OpenLauncher, Paste, Quit, ReopenSession,
+};
 use crate::store::{StoreRuntime, WindowMode, WindowPlacement};
 use crate::updates::UpdateHandle;
 use crate::usage::{
@@ -69,12 +88,11 @@ const MIN_WINDOW_HEIGHT: f32 = 560.0;
 const USAGE_REFRESH_DEBOUNCE: Duration = Duration::from_secs(2);
 const USAGE_RECONCILE_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
-actions!(diri_app, [Quit, HideApp, CloseWindow]);
-
-/// Standard macOS app behaviors route through the application menu: without
-/// one, cmd-Q / cmd-H / cmd-W and the Edit menu simply do not exist.
+/// Install native application menus without exposing actions that the current
+/// desktop cannot implement.
 fn install_app_menus(cx: &mut App) {
     cx.on_action(|_: &Quit, cx| cx.quit());
+    #[cfg(target_os = "macos")]
     cx.on_action(|_: &HideApp, cx| cx.hide());
     cx.on_action(|_: &CloseWindow, cx| {
         if let Some(window) = cx.active_window() {
@@ -84,18 +102,12 @@ fn install_app_menus(cx: &mut App) {
     // Cmd+W routes through CloseSession: RootView closes the selected
     // session and only propagates here — closing the window — when no
     // session is selected.
-    cx.on_action(|_: &root::CloseSession, cx| {
+    cx.on_action(|_: &CloseSession, cx| {
         if let Some(window) = cx.active_window() {
             let _ = window.update(cx, |_, window, _| window.remove_window());
         }
     });
-    cx.bind_keys([
-        KeyBinding::new("cmd-n", root::OpenLauncher, None),
-        KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("cmd-h", HideApp, None),
-        KeyBinding::new("cmd-w", root::CloseSession, None),
-        KeyBinding::new("cmd-shift-t", root::ReopenSession, None),
-    ]);
+    #[cfg(target_os = "macos")]
     cx.set_menus([
         Menu::new("diri").items([
             MenuItem::os_submenu("Services", SystemMenuType::Services),
@@ -104,14 +116,31 @@ fn install_app_menus(cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("Quit diri", Quit),
         ]),
-        Menu::new("File").items([MenuItem::action("New Session", root::OpenLauncher)]),
+        Menu::new("File").items([MenuItem::action("New Session", OpenLauncher)]),
         Menu::new("Edit").items([
-            MenuItem::os_action("Copy", terminal_pane::CopySelection, OsAction::Copy),
-            MenuItem::os_action("Paste", terminal_pane::Paste, OsAction::Paste),
+            MenuItem::os_action("Copy", CopySelection, OsAction::Copy),
+            MenuItem::os_action("Paste", Paste, OsAction::Paste),
         ]),
         Menu::new("Window").items([
-            MenuItem::action("Close Session", root::CloseSession),
-            MenuItem::action("Reopen Closed Session", root::ReopenSession),
+            MenuItem::action("Close Session", CloseSession),
+            MenuItem::action("Reopen Closed Session", ReopenSession),
+            MenuItem::action("Close Window", CloseWindow),
+        ]),
+    ]);
+    #[cfg(not(target_os = "macos"))]
+    cx.set_menus([
+        Menu::new("File").items([
+            MenuItem::action("New Session", OpenLauncher),
+            MenuItem::separator(),
+            MenuItem::action("Quit diri", Quit),
+        ]),
+        Menu::new("Edit").items([
+            MenuItem::os_action("Copy", CopySelection, OsAction::Copy),
+            MenuItem::os_action("Paste", Paste, OsAction::Paste),
+        ]),
+        Menu::new("Window").items([
+            MenuItem::action("Close Session", CloseSession),
+            MenuItem::action("Reopen Closed Session", ReopenSession),
             MenuItem::action("Close Window", CloseWindow),
         ]),
     ]);
@@ -122,28 +151,33 @@ pub(crate) struct AppServices {
     pub(crate) store: Arc<StoreRuntime>,
     pub(crate) usage_tx: tokio::sync::watch::Sender<UsageSnapshot>,
     pub(crate) updates: UpdateHandle,
-    pub(crate) tokio: Arc<Runtime>,
     pub(crate) dev_build: Option<DevBuildIdentity>,
+    #[cfg(unix)]
+    daemon_startup: Option<daemon_launch::DeferredDaemonStartup>,
+    // Declared last so every service and its owned startup handle drops before
+    // the executor during early unwinding as well as ordinary app shutdown.
+    pub(crate) tokio: Arc<Runtime>,
 }
 
 fn main() {
-    #[cfg(target_os = "macos")]
     if std::env::var_os("DIRI_PROBE_SYMBOLS").is_some() {
-        macos::sf_symbols::probe();
+        icons::probe();
         return;
     }
 
+    let smoke_test = std::env::var_os("DIRI_UI_SMOKE_TEST").is_some();
     let preview_value = std::env::var("DIRIJOR_SIDEBAR_PREVIEW").ok();
-    let preview = preview_value.as_deref().is_some_and(|value| value != "0");
+    let preview = smoke_test || preview_value.as_deref().is_some_and(|value| value != "0");
     let scenario_value = std::env::var("DIRIJOR_SIDEBAR_SCENARIO")
         .ok()
         .or_else(|| preview_value.filter(|value| value != "1"));
     let scenario = PreviewScenario::from_env(scenario_value.as_deref());
     #[cfg(target_os = "macos")]
     let bundle_id = macos::bundle_identifier();
-    #[cfg(not(target_os = "macos"))]
-    let bundle_id = None;
+    #[cfg(target_os = "macos")]
     let dev_build = DevBuildIdentity::from_process_environment(bundle_id.as_deref());
+    #[cfg(not(target_os = "macos"))]
+    let dev_build = DevBuildIdentity::from_process_environment(None);
 
     // The client runtime multiplexes one daemon socket plus a handful of
     // event-driven housekeeping tasks. The default Tokio constructor creates
@@ -158,25 +192,26 @@ fn main() {
             .expect("failed to start diri async runtime"),
     );
 
-    // diri is self-contained: if no daemon socket is live, launch the daemon
-    // bundled in Contents/Resources/bin, then let DaemonClient's reconnect loop
-    // pick it up. A Rust Engine whose executable hash differs from the
-    // bundled one is gracefully replaced so app and remote Helper catalogs
-    // advance together; Holder-owned sessions survive and are adopted.
+    // Plan app-owned Engine supervision now, but do not probe the socket or
+    // hash the bundled executable on GPUI's first-paint path. The one-shot plan
+    // is consumed only after the first window has been opened below.
     #[cfg(unix)]
-    if !preview {
-        let home = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("/nonexistent"));
-        let socket_path = diri_proto::paths::DirijorPaths::socket(home);
-        daemon_launch::ensure_daemon_running(&socket_path);
-    }
+    let daemon_startup = (!preview)
+        .then(daemon_launch::DeferredDaemonStartup::for_process)
+        .flatten();
+    #[cfg(unix)]
+    let defer_client_start = daemon_startup.is_some();
+    #[cfg(not(unix))]
+    let defer_client_start = false;
 
     let client = Arc::new(DaemonClient::new());
     let store_runtime = {
         let _guard = tokio.enter();
         Arc::new(if preview {
             StoreRuntime::inert()
+        } else if defer_client_start {
+            StoreRuntime::start_default_deferred(Arc::clone(&client))
+                .expect("failed to load diri state")
         } else {
             StoreRuntime::start_default(Arc::clone(&client)).expect("failed to load diri state")
         })
@@ -298,8 +333,10 @@ fn main() {
         store: store_runtime,
         usage_tx,
         updates,
-        tokio,
         dev_build,
+        #[cfg(unix)]
+        daemon_startup,
+        tokio,
     });
 
     let app = application().with_assets(diri_ui::IconAssets);
@@ -317,15 +354,34 @@ fn main() {
         load_system_fonts(cx);
         #[cfg(target_os = "macos")]
         diri_ui::set_mark_rasterizer(macos::brand_raster::raster_mark);
-        bind_terminal_keys(cx);
+        commands::bind_default_keys(cx);
         install_app_menus(cx);
-        let quit_store = Arc::clone(&services.store);
+        let quit_services = Arc::clone(&services);
+        let quit_updates = services.updates.clone();
         let release_owned_daemon =
             !preview && std::env::var_os(diri_proto::paths::ENV_SOCKET).is_none();
         cx.on_app_quit(move |_| {
-            let quit_store = Arc::clone(&quit_store);
+            let quit_services = Arc::clone(&quit_services);
+            let quit_updates = quit_updates.clone();
+            // This runs while GPUI is constructing the quit future, before its
+            // 200 ms grace period begins. The coordinator never transfers its
+            // sole task handle into that cancellable future: pending startup
+            // and idle release remain owned by runtime blocking workers.
+            #[cfg(unix)]
+            let startup_owns_release =
+                quit_services
+                    .daemon_startup
+                    .as_ref()
+                    .is_some_and(|startup| {
+                        startup
+                            .request_shutdown(&quit_services.tokio, quit_services.store.client());
+                        true
+                    });
+            #[cfg(not(unix))]
+            let startup_owns_release = false;
             async move {
-                if let Err(error) = quit_store
+                if let Err(error) = quit_services
+                    .store
                     .store
                     .write()
                     .expect("session store lock poisoned")
@@ -333,17 +389,41 @@ fn main() {
                 {
                     eprintln!("diri: could not flush preferences while quitting: {error}");
                 }
+                // Automatic updates are already downloaded and verified. Start
+                // the detached swap helper now; it waits for this process to
+                // exit and deliberately does not reopen an app the user quit.
+                quit_updates.install_on_quit();
                 if release_owned_daemon
-                    && let Err(error) = quit_store.client().shutdown_daemon_if_idle().await
+                    && !startup_owns_release
+                    && let Err(error) = quit_services.store.client().shutdown_daemon_if_idle().await
                 {
                     eprintln!("diri: could not release the idle Engine while quitting: {error}");
                 }
-                quit_store.shutdown().await;
+                quit_services.store.shutdown().await;
             }
         })
         .detach();
-        open_main_window(cx, services, preview, scenario);
+        open_main_window(cx, Arc::clone(&services), preview, scenario);
         cx.activate(true);
+        // `open_main_window` must stay before this call. The supervisor can
+        // spend up to five seconds probing and retiring an outdated Engine;
+        // it runs on Tokio's blocking pool and releases the reconnect loop
+        // only after replacement is complete, so the UI cannot race a daemon
+        // that is about to shut down.
+        #[cfg(unix)]
+        if let Some(startup) = services.daemon_startup.as_ref() {
+            startup.after_window_open(&services.tokio, Arc::clone(services.store.client()));
+        }
+        if smoke_test {
+            cx.spawn(async move |cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(750))
+                    .await;
+                eprintln!("diri: UI smoke window opened successfully");
+                cx.update(|cx| cx.quit());
+            })
+            .detach();
+        }
     });
 }
 
@@ -419,10 +499,11 @@ fn open_main_window(
             app_id: Some(app_id),
             titlebar: Some(TitlebarOptions {
                 title,
-                appears_transparent: true,
+                appears_transparent: cfg!(target_os = "macos"),
                 // GPUI uses top/left insets here: AppKit's native 8 pt origin plus the
                 // spec's +12 x / -6 frame-origin nudge maps to 20 pt left and 14 pt top.
-                traffic_light_position: Some(point(px(20.0), px(14.0))),
+                traffic_light_position: cfg!(target_os = "macos")
+                    .then_some(point(px(20.0), px(14.0))),
             }),
             ..Default::default()
         },

@@ -43,20 +43,7 @@ impl NodeServer {
     }
 }
 
-fn private_bind_address(address: SocketAddr) -> bool {
-    use std::net::IpAddr;
-
-    match address.ip() {
-        IpAddr::V4(ip) => {
-            let octets = ip.octets();
-            ip.is_loopback()
-                || ip.is_private()
-                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
-                || ip.is_link_local()
-        }
-        IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local(),
-    }
-}
+use diri_proto::net::is_private_bind_address as private_bind_address;
 
 async fn serve_connection(stream: TcpStream, service: Arc<NodeService>) -> NodeResult<()> {
     stream.set_nodelay(true)?;

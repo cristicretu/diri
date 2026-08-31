@@ -17,9 +17,9 @@ use gpui::{
 use crate::code_intelligence::{
     CodeIntelligence, CodeIntelligenceError, SearchHit, SearchHitKind, SourceSnapshot,
 };
-use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
+use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
-use diri_ui::{FloatingSurface, Radius, SemanticColors, Typo};
+use diri_ui::{Appearance, FloatingSurface, Radius, SemanticColors, Typo};
 
 #[cfg(test)]
 use crate::code_intelligence::SourceTarget;
@@ -38,6 +38,7 @@ enum ViewerState {
 pub struct CodeViewer {
     tokio: tokio::runtime::Handle,
     focus: FocusHandle,
+    colors: SemanticColors,
     workspace_cwd: Option<PathBuf>,
     intelligence: Option<Arc<CodeIntelligence>>,
     state: ViewerState,
@@ -55,10 +56,15 @@ pub struct CodeViewer {
 }
 
 impl CodeViewer {
-    pub fn new(tokio: tokio::runtime::Handle, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        tokio: tokio::runtime::Handle,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self {
             tokio,
             focus: cx.focus_handle(),
+            colors,
             workspace_cwd: None,
             intelligence: None,
             state: ViewerState::Empty,
@@ -74,6 +80,19 @@ impl CodeViewer {
             history: Vec::new(),
             history_index: 0,
         }
+    }
+
+    pub fn set_colors(&mut self, colors: SemanticColors, cx: &mut Context<Self>) {
+        if self.colors == colors {
+            return;
+        }
+        self.colors = colors;
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn appearance(&self) -> diri_ui::Appearance {
+        self.colors.appearance
     }
 
     fn toggle_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -571,7 +590,7 @@ impl CodeViewer {
                             if symbol { "curlybraces" } else { "doc.text" },
                             11.5,
                             if symbol {
-                                rgba(0xc792eaff)
+                                code_palette(colors).keyword
                             } else {
                                 colors.secondary
                             },
@@ -712,7 +731,7 @@ impl Focusable for CodeViewer {
 
 impl Render for CodeViewer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = SemanticColors::dark();
+        let colors = self.colors;
         let snapshot = match &self.state {
             ViewerState::Ready(snapshot) => Some(Arc::clone(snapshot)),
             _ => None,
@@ -722,7 +741,10 @@ impl Render for CodeViewer {
                 colors,
                 "cursorarrow.click.2",
                 "Open code from the terminal",
-                "⌘-click a file path, stack frame, or compiler location to inspect it here.",
+                format!(
+                    "{} a file path, stack frame, or compiler location to inspect it here.",
+                    crate::commands::primary_click_label()
+                ),
             ),
             ViewerState::Loading { reference } => self.render_message(
                 colors,
@@ -762,11 +784,12 @@ fn source_row(
     content_width: f32,
     colors: SemanticColors,
 ) -> AnyElement {
+    let palette = code_palette(colors);
     let line = &snapshot.lines[index];
     let source = snapshot.text[line.range.clone()]
         .trim_end_matches(['\r', '\n'])
         .to_owned();
-    let styled = highlighted_source(source, extension);
+    let styled = highlighted_source(source, extension, palette);
     div()
         .id(index)
         .h(px(SOURCE_ROW_HEIGHT))
@@ -811,14 +834,39 @@ fn source_row(
                 .items_center()
                 .font_family(crate::fonts::mono_family())
                 .text_size(px(11.5))
-                .text_color(rgba(0xd8dee9ff))
+                .text_color(palette.foreground)
                 .child(styled),
         )
         .into_any_element()
 }
 
-fn highlighted_source(source: String, extension: &str) -> AnyElement {
-    let ranges = lexical_highlights(&source, extension);
+#[derive(Clone, Copy)]
+struct CodePalette {
+    foreground: gpui::Rgba,
+    comment: gpui::Rgba,
+    string: gpui::Rgba,
+    keyword: gpui::Rgba,
+}
+
+fn code_palette(colors: SemanticColors) -> CodePalette {
+    match colors.appearance {
+        Appearance::Dark => CodePalette {
+            foreground: rgba(0xd8dee9ff),
+            comment: rgba(0x718096ff),
+            string: rgba(0xd7ba7dff),
+            keyword: rgba(0xc792eaff),
+        },
+        Appearance::Light => CodePalette {
+            foreground: rgba(0x2f3337ff),
+            comment: rgba(0x5f6368ff),
+            string: rgba(0x7a4d00ff),
+            keyword: rgba(0x6f42c1ff),
+        },
+    }
+}
+
+fn highlighted_source(source: String, extension: &str, palette: CodePalette) -> AnyElement {
+    let ranges = lexical_highlights(&source, extension, palette);
     if ranges.is_empty() {
         return div().child(source).into_any_element();
     }
@@ -827,7 +875,11 @@ fn highlighted_source(source: String, extension: &str) -> AnyElement {
         .into_any_element()
 }
 
-fn lexical_highlights(source: &str, extension: &str) -> Vec<(Range<usize>, HighlightStyle)> {
+fn lexical_highlights(
+    source: &str,
+    extension: &str,
+    palette: CodePalette,
+) -> Vec<(Range<usize>, HighlightStyle)> {
     let mut ranges = Vec::new();
     let comment_start = match extension {
         "py" | "rb" | "sh" | "bash" | "zsh" | "fish" | "toml" | "yaml" | "yml" => source.find('#'),
@@ -839,7 +891,7 @@ fn lexical_highlights(source: &str, extension: &str) -> Vec<(Range<usize>, Highl
         ranges.push((
             start..source.len(),
             HighlightStyle {
-                color: Some(rgba(0x718096ff).into()),
+                color: Some(palette.comment.into()),
                 font_style: Some(gpui::FontStyle::Italic),
                 ..HighlightStyle::default()
             },
@@ -869,7 +921,7 @@ fn lexical_highlights(source: &str, extension: &str) -> Vec<(Range<usize>, Highl
         ranges.push((
             start..cursor,
             HighlightStyle {
-                color: Some(rgba(0xd7ba7dff).into()),
+                color: Some(palette.string.into()),
                 ..HighlightStyle::default()
             },
         ));
@@ -891,7 +943,7 @@ fn lexical_highlights(source: &str, extension: &str) -> Vec<(Range<usize>, Highl
                 ranges.push((
                     start..end,
                     HighlightStyle {
-                        color: Some(rgba(0xc792eaff).into()),
+                        color: Some(palette.keyword.into()),
                         font_weight: Some(FontWeight::MEDIUM),
                         ..HighlightStyle::default()
                     },
@@ -1002,10 +1054,27 @@ const COMMON_KEYWORDS: &[&str] = &[
 mod tests {
     use super::*;
 
+    fn relative_luminance(color: gpui::Rgba) -> f32 {
+        fn linear(channel: f32) -> f32 {
+            if channel <= 0.03928 {
+                channel / 12.92
+            } else {
+                ((channel + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        0.2126 * linear(color.r) + 0.7152 * linear(color.g) + 0.0722 * linear(color.b)
+    }
+
+    fn contrast(left: gpui::Rgba, right: gpui::Rgba) -> f32 {
+        let left = relative_luminance(left);
+        let right = relative_luminance(right);
+        (left.max(right) + 0.05) / (left.min(right) + 0.05)
+    }
+
     #[test]
     fn highlights_keywords_strings_and_comments_without_overlapping() {
         let source = "pub fn main() { let value = \"hello\"; // note";
-        let ranges = lexical_highlights(source, "rs");
+        let ranges = lexical_highlights(source, "rs", code_palette(SemanticColors::dark()));
         assert!(
             ranges
                 .iter()
@@ -1031,12 +1100,32 @@ mod tests {
     #[test]
     fn keyword_boundaries_do_not_color_identifiers() {
         let source = "format for before";
-        let ranges = lexical_highlights(source, "rs");
+        let ranges = lexical_highlights(source, "rs", code_palette(SemanticColors::dark()));
         let words: Vec<_> = ranges
             .iter()
             .map(|(range, _)| &source[range.clone()])
             .collect();
         assert_eq!(words, vec!["for"]);
+    }
+
+    #[test]
+    fn light_code_palette_keeps_source_tokens_readable() {
+        for theme in ["dirijor-light", "solarized-light", "github-light"] {
+            let colors = crate::app_theme::colors(theme);
+            let palette = code_palette(colors);
+
+            for (role, foreground) in [
+                ("source", palette.foreground),
+                ("comment", palette.comment),
+                ("string", palette.string),
+                ("keyword", palette.keyword),
+            ] {
+                assert!(
+                    contrast(foreground, colors.background) >= 4.5,
+                    "{role} contrast must remain readable with {theme}"
+                );
+            }
+        }
     }
 
     #[test]

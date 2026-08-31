@@ -163,7 +163,7 @@ pub fn parse_porcelain(porcelain: &str) -> Vec<WorktreeInfo> {
 /// git that can hang forever, and ambient config from the host has no business
 /// affecting what the daemon sees.
 fn run(args: &[&str], cwd: &Path) -> std::io::Result<String> {
-    let output = Command::new("/usr/bin/git")
+    let output = Command::new("git")
         .args(args)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())

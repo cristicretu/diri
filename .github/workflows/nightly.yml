@@ -1,0 +1,453 @@
+name: Nightly
+
+# Everything that answers "can we ship what is on main?" rather than "is this
+# change correct?". These jobs used to run on every pull request, where they
+# gated nothing — branch protection only requires the two workspace checks —
+# and cost roughly forty minutes of runner time per push, most of it on macOS
+# at ten-times billing.
+#
+# They still run: once a night against main, on demand, and on any pull
+# request that touches the packaging or CI machinery they exercise.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/nightly.yml
+      - diri/scripts/**
+      - sidecar/**
+      - diri/crates/diri-remote/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release-macos:
+    name: Release build and perf gates (macOS)
+    runs-on: macos-15
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: diri
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            diri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('diri/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      # Both gates assert latencies. A shared runner under an unknown
+      # neighbour's load is the wrong place to hold a merge on a timing, but a
+      # fine place to notice a regression trending the wrong way overnight.
+      - name: Remote Holder acceptance and latency gates
+        run: scripts/remote-acceptance.sh
+      - name: Terminal interaction and rendering hot-path gates
+        run: scripts/terminal-perf-gate.sh
+      - name: Release build
+        run: cargo build --workspace --release
+
+  app-linux:
+    name: Full test suite, release build and GUI smokes (Linux x86_64)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 75
+    defaults:
+      run:
+        working-directory: diri
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install GPUI and display-server dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential clang cmake libasound2-dev libfontconfig-dev \
+            libglib2.0-dev libssl-dev libstdc++-12-dev libvulkan1 \
+            libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev \
+            mesa-vulkan-drivers pkg-config weston xvfb
+      - name: Report Linux environment
+        run: |
+          cat /etc/os-release
+          uname -a
+          rustc --version --verbose
+          ldd --version | head -1
+      # Shares a cache prefix with the pull-request Linux job so this build
+      # starts from that job's debug artifacts rather than from nothing, and
+      # so linux-package below can in turn restore this job's release ones.
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            diri/target
+          key: linux-app-cargo-${{ hashFiles('diri/Cargo.lock') }}-${{ github.event.pull_request.head.sha || github.sha }}
+          restore-keys: |
+            linux-app-cargo-${{ hashFiles('diri/Cargo.lock') }}-
+            linux-app-cargo-
+      # The gate runs clippy on Linux, which type-checks every crate, and runs
+      # the PTY and engine suites natively on 24.04. What it does not do is
+      # execute the whole suite on Linux — that lives here, where a failure
+      # costs a morning rather than every reviewer's afternoon.
+      - name: Test complete Rust workspace natively
+        run: cargo test --locked --workspace -- --nocapture
+      - name: Release build
+        run: cargo build --locked --workspace --release
+      - name: Smoke GUI under X11
+        run: xvfb-run -a env -u WAYLAND_DISPLAY DIRI_UI_SMOKE_TEST=1 target/release/diri
+      - name: Smoke GUI under Wayland
+        run: |
+          export XDG_RUNTIME_DIR="${RUNNER_TEMP}/diri-wayland-runtime"
+          mkdir -p "${XDG_RUNTIME_DIR}"
+          chmod 700 "${XDG_RUNTIME_DIR}"
+          # GPUI requires a wl_seat. Weston's pure headless backend advertises
+          # none, so run its Wayland compositor nested in Xvfb to provide a
+          # virtual keyboard/pointer while the app still connects via Wayland.
+          xvfb-run -a bash -euo pipefail -c '
+            weston --backend=x11-backend.so --socket=diri-ci-wayland \
+              --idle-time=0 --log="${RUNNER_TEMP}/weston.log" &
+            weston_pid=$!
+            trap '\''kill "${weston_pid}" 2>/dev/null || true'\'' EXIT
+            for attempt in $(seq 1 100); do
+              test -S "${XDG_RUNTIME_DIR}/diri-ci-wayland" && break
+              sleep 0.05
+            done
+            test -S "${XDG_RUNTIME_DIR}/diri-ci-wayland"
+            WAYLAND_DISPLAY=diri-ci-wayland DIRI_UI_SMOKE_TEST=1 \
+              target/release/diri
+          '
+
+  remote-helper-native:
+    name: Remote Helper (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    defaults:
+      run:
+        working-directory: diri
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install target
+        run: rustup target add "${{ matrix.target }}"
+      - name: Install native musl linker
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+      - name: Build exact release Helper
+        env:
+          DIRI_REMOTE_BUILD_ID: ci-${{ matrix.target }}
+        run: cargo build --locked --release --package diri-remote --target "${{ matrix.target }}"
+      - name: Execute native probe and verify identity
+        env:
+          EXPECTED_TARGET: ${{ matrix.target }}
+          EXPECTED_BUILD: ci-${{ matrix.target }}
+        run: |
+          helper="target/${EXPECTED_TARGET}/release/diri-remote"
+          test -x "${helper}"
+          probe="$("${helper}" probe --format=json)"
+          jq -e \
+            --arg target "${EXPECTED_TARGET}" \
+            --arg build "${EXPECTED_BUILD}" \
+            '.target == $target and .buildId == $build and .protocol.major == 1 and .supported and .holderAvailable' \
+            <<<"${probe}"
+
+  remote-ssh-soak:
+    name: Remote OpenSSH detach/reconnect
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: diri
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Start disposable ordinary-user SSH endpoint
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes openssh-server
+          # sshd refuses to start without its privilege separation directory,
+          # which the package does not create on a fresh runner image.
+          sudo mkdir -p /run/sshd
+          # The runner account ships with no password, which leaves it locked
+          # ("!" in shadow) and makes sshd reject it before it ever considers
+          # the key. Unlock it without setting one; password and
+          # keyboard-interactive auth stay disabled below, so keys remain the
+          # only way in on this throwaway host.
+          sudo usermod -p '*' "${USER}"
+          mkdir -p "${HOME}/.ssh" "${RUNNER_TEMP}/sshd"
+          chmod 700 "${HOME}/.ssh"
+          ssh-keygen -q -t ed25519 -N '' -f "${RUNNER_TEMP}/diri_ci_key"
+          cat "${RUNNER_TEMP}/diri_ci_key.pub" >> "${HOME}/.ssh/authorized_keys"
+          chmod 600 "${HOME}/.ssh/authorized_keys"
+          printf '%s\n' \
+            'Host diri-ci-soak' \
+            '  HostName 127.0.0.1' \
+            '  Port 2222' \
+            "  User ${USER}" \
+            "  IdentityFile ${RUNNER_TEMP}/diri_ci_key" \
+            '  IdentitiesOnly yes' \
+            '  StrictHostKeyChecking accept-new' \
+            "  UserKnownHostsFile ${RUNNER_TEMP}/known_hosts" \
+            > "${HOME}/.ssh/config"
+          chmod 600 "${HOME}/.ssh/config"
+          sudo /usr/sbin/sshd -D -e -p 2222 \
+            -o PasswordAuthentication=no \
+            -o KbdInteractiveAuthentication=no \
+            -o UsePAM=no \
+            -o AllowUsers="${USER}" \
+            -o PidFile="${RUNNER_TEMP}/sshd/sshd.pid" \
+            >"${RUNNER_TEMP}/sshd.log" 2>&1 &
+          for attempt in $(seq 1 50); do
+            if ssh -o BatchMode=yes diri-ci-soak true; then
+              exit 0
+            fi
+            sleep 0.1
+          done
+          cat "${RUNNER_TEMP}/sshd.log"
+          exit 1
+      - name: Run real SSH persistence soak
+        env:
+          DIRI_REMOTE_SSH_TARGET: diri-ci-soak
+          DIRI_REMOTE_SOAK_SECONDS: "5"
+        run: scripts/remote-ssh-soak.sh
+      - name: Start PAM/logind logout-policy endpoint
+        run: |
+          sudo useradd --create-home --shell /bin/bash diri-pam
+          sudo usermod -p '*' diri-pam
+          sudo install -d -m 700 -o diri-pam -g diri-pam /home/diri-pam/.ssh
+          sudo install -m 600 -o diri-pam -g diri-pam \
+            "${RUNNER_TEMP}/diri_ci_key.pub" /home/diri-pam/.ssh/authorized_keys
+          sudo mkdir -p /etc/systemd/logind.conf.d
+          printf '%s\n' \
+            '[Login]' \
+            'KillUserProcesses=yes' \
+            'UserStopDelaySec=0' \
+            | sudo tee /etc/systemd/logind.conf.d/99-diri-ci.conf >/dev/null
+          sudo systemctl restart systemd-logind
+          printf '%s\n' \
+            'Host diri-ci-pam' \
+            '  HostName 127.0.0.1' \
+            '  Port 2223' \
+            '  User diri-pam' \
+            "  IdentityFile ${RUNNER_TEMP}/diri_ci_key" \
+            '  IdentitiesOnly yes' \
+            '  StrictHostKeyChecking accept-new' \
+            "  UserKnownHostsFile ${RUNNER_TEMP}/known_hosts" \
+            >> "${HOME}/.ssh/config"
+          sudo /usr/sbin/sshd -D -e -p 2223 \
+            -o PasswordAuthentication=no \
+            -o KbdInteractiveAuthentication=no \
+            -o UsePAM=yes \
+            -o AllowUsers=diri-pam \
+            -o PidFile="${RUNNER_TEMP}/sshd/pam-sshd.pid" \
+            >"${RUNNER_TEMP}/sshd/pam-sshd.log" 2>&1 &
+          for attempt in $(seq 1 50); do
+            if ssh -o BatchMode=yes diri-ci-pam true; then
+              exit 0
+            fi
+            sleep 0.1
+          done
+          cat "${RUNNER_TEMP}/sshd/pam-sshd.log"
+          exit 1
+      - name: Verify PAM/logind logout is not misclassified
+        env:
+          DIRI_REMOTE_SSH_TARGET: diri-ci-pam
+        run: >-
+          cargo test --locked --release --package diri-remote --test real_ssh_soak
+          real_ssh_pam_logout_is_classified_non_persistent -- --ignored --exact --nocapture
+
+  bundle:
+    name: Package diri.app (unsigned)
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            diri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('diri/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      # package.sh lipos two slices into a universal binary, so both targets
+      # have to be installed — and installed for the toolchain diri/ pins in
+      # rust-toolchain.toml, not the runner default. Adding them from the repo
+      # root silently equips the wrong toolchain and the x86_64 pass then fails
+      # with "can't find crate for std".
+      - name: Install universal targets
+        working-directory: diri
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-musl x86_64-unknown-linux-musl
+      - name: Install Rust packaging tools
+        run: |
+          brew install zig
+          cargo install cargo-packager --locked
+          cargo install cargo-zigbuild --locked
+      - name: Package
+        env:
+          DIRI_DIST_DIR: ${{ runner.temp }}/diri-dist
+        run: diri/scripts/package.sh
+      - name: Verify bundle structure and signature
+        run: |
+          app="${RUNNER_TEMP}/diri-dist/diri.app"
+          plutil -lint "${app}/Contents/Info.plist"
+          test -x "${app}/Contents/Resources/bin/dirijor"
+          test -x "${app}/Contents/Resources/bin/dirijor-mcp"
+          test -x "${app}/Contents/Resources/bin/dirijord-rs"
+          test -x "${app}/Contents/Resources/bin/diri-holder"
+          test -x "${app}/Contents/Resources/bin/diri-ssh-askpass"
+          test -f "${app}/Contents/Resources/bin/manifests/codex.json"
+          lipo "${app}/Contents/Resources/bin/dirijord-rs" -verify_arch arm64 x86_64
+          lipo "${app}/Contents/Resources/bin/dirijor" -verify_arch arm64 x86_64
+          lipo "${app}/Contents/Resources/bin/dirijor-mcp" -verify_arch arm64 x86_64
+          lipo "${app}/Contents/Resources/bin/diri-holder" -verify_arch arm64 x86_64
+          lipo "${app}/Contents/Resources/bin/diri-ssh-askpass" -verify_arch arm64 x86_64
+          test -f "${app}/Contents/Resources/bin/remote-helpers/manifest.json"
+          test "$(find "${app}/Contents/Resources/bin/remote-helpers/artifacts" -name diri-remote -type f | wc -l | tr -d ' ')" = 3
+          codesign --verify --deep --strict "${app}"
+
+  linux-package:
+    name: Linux packages (Ubuntu 22.04)
+    needs: app-linux
+    runs-on: ubuntu-22.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: sidecar/package-lock.json
+      - name: Install build, package, and smoke dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential clang cmake desktop-file-utils jq libasound2-dev \
+            libfontconfig-dev libglib2.0-dev libssl-dev \
+            libstdc++-12-dev libvulkan1 libwayland-dev libx11-xcb-dev \
+            libxkbcommon-x11-dev mesa-vulkan-drivers pkg-config xvfb
+          cargo install cargo-packager --version 0.11.8 --locked
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            diri/target
+          key: linux-package-cargo-${{ hashFiles('diri/Cargo.lock') }}-${{ github.event.pull_request.head.sha || github.sha }}
+          restore-keys: |
+            linux-package-cargo-${{ hashFiles('diri/Cargo.lock') }}-
+            linux-package-cargo-
+            linux-app-cargo-${{ hashFiles('diri/Cargo.lock') }}-
+            linux-app-cargo-
+      - name: Build AppImage and Debian package
+        env:
+          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: diri/scripts/package-linux.sh
+      - name: Verify package layouts and metadata
+        run: |
+          diri/scripts/verify-linux-package.sh diri/dist/linux
+          deb="$(find diri/dist/linux -maxdepth 1 -name '*.deb' -print -quit)"
+          stage="${RUNNER_TEMP}/diri-desktop-entry"
+          dpkg-deb --extract "${deb}" "${stage}"
+          desktop-file-validate "${stage}/usr/share/applications/diri.desktop"
+          (cd diri/dist/linux && sha256sum --check SHA256SUMS)
+          jq -e \
+            --arg commit "${{ github.event.pull_request.head.sha || github.sha }}" \
+            '.platform == "linux" and .architecture == "x86_64" and .commit == $commit and (.artifacts | length) == 2' \
+            diri/dist/linux/linux-release.json
+      - name: Exercise Debian upgrade, runtime, and uninstall
+        run: |
+          previous="${RUNNER_TEMP}/diri-previous"
+          DIRI_DIST_DIR="${previous}" DIRI_VERSION=0.5.0 \
+            DIRI_LINUX_FORMATS=deb diri/scripts/package-linux.sh
+          old_deb="$(find "${previous}" -maxdepth 1 -name '*.deb' -print -quit)"
+          new_deb="$(find "${PWD}/diri/dist/linux" -maxdepth 1 -name '*.deb' -print -quit)"
+          sudo apt-get install --yes "${old_deb}"
+          sudo apt-get install --yes "${new_deb}"
+          test "$(dpkg-query -W -f='${Version}' diri)" = "$(jq -r .version diri/dist/linux/linux-release.json)"
+          xvfb-run -a env -u WAYLAND_DISPLAY DIRI_UI_SMOKE_TEST=1 diri
+          diri/scripts/smoke-installed-linux.sh
+          sudo apt-get purge --yes diri
+          test ! -e /usr/bin/diri
+          test ! -e /usr/bin/dirijor
+      - name: Smoke AppImage launch
+        run: |
+          appimage="$(find diri/dist/linux -maxdepth 1 -name '*.AppImage' -print -quit)"
+          xvfb-run -a env -u WAYLAND_DISPLAY APPIMAGE_EXTRACT_AND_RUN=1 \
+            DIRI_UI_SMOKE_TEST=1 "${appimage}"
+      - name: Upload Linux release artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-packages-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            diri/dist/linux/*.AppImage
+            diri/dist/linux/*.deb
+            diri/dist/linux/SHA256SUMS
+            diri/dist/linux/linux-release.json
+            diri/dist/linux/THIRD-PARTY-LICENSES.json
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-package-ubuntu-24:
+    name: Linux package smoke (Ubuntu 24.04)
+    needs: linux-package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: linux-packages-${{ github.event.pull_request.head.sha || github.sha }}
+          path: diri/dist/linux
+      - name: Install clean-machine runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes jq libvulkan1 \
+            mesa-vulkan-drivers xvfb
+      - name: Install, launch, recover a session, and uninstall
+        run: |
+          deb="$(find "${PWD}/diri/dist/linux" -maxdepth 1 -name '*.deb' -print -quit)"
+          appimage="$(find "${PWD}/diri/dist/linux" -maxdepth 1 -name '*.AppImage' -print -quit)"
+          chmod +x "${appimage}"
+          sudo apt-get install --yes "${deb}"
+          xvfb-run -a env -u WAYLAND_DISPLAY DIRI_UI_SMOKE_TEST=1 diri
+          diri/scripts/smoke-installed-linux.sh
+          xvfb-run -a env -u WAYLAND_DISPLAY APPIMAGE_EXTRACT_AND_RUN=1 \
+            DIRI_UI_SMOKE_TEST=1 "${appimage}"
+          sudo apt-get purge --yes diri
+          test ! -e /usr/bin/diri
+
+  browser-sidecar:
+    name: Browser sidecar integration
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install sidecar and browser engines
+        working-directory: sidecar
+        run: |
+          npm ci
+          npm audit --omit=dev
+          npx playwright install chromium webkit firefox
+      - name: Run browser integration tests
+        working-directory: diri
+        env:
+          DIRIJOR_RUN_BROWSER_TESTS: "1"
+        run: cargo test --package diri-engine browser_integration_runs_across_engines -- --nocapture

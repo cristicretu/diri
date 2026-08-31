@@ -15,13 +15,17 @@
 
 use std::sync::mpsc::{self, Receiver, SyncSender};
 
-use alacritty_terminal::event::{Event, EventListener};
+use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
 use diri_proto::grid::{ChangedRow, GridCell, GridRowCodec, GridUpdate, TermColor, TermStyle};
+use diri_proto::terminal::{
+    MouseEncoding, MouseModes, MouseTrackingMode, TerminalMouseEvent, TerminalMouseModifiers,
+    encode_mouse_event,
+};
 
 /// Receiver-side authority for a remote terminal stream. A mirror accepts a
 /// full snapshot as a new baseline and then only contiguous sequenced diffs;
@@ -38,7 +42,7 @@ pub struct GridMirror {
     sequence: Option<u64>,
     alt_screen: bool,
     bracketed_paste: bool,
-    mouse_reporting: bool,
+    mouse: MouseModes,
 }
 
 impl GridMirror {
@@ -53,7 +57,7 @@ impl GridMirror {
         grid: &GridUpdate,
         alt_screen: bool,
         bracketed_paste: bool,
-        mouse_reporting: bool,
+        mouse: MouseModes,
     ) -> Result<(), MirrorError> {
         if !grid.is_full_snapshot {
             return Err(MirrorError::SnapshotRequired);
@@ -64,7 +68,7 @@ impl GridMirror {
         self.sequence = Some(sequence);
         self.alt_screen = alt_screen;
         self.bracketed_paste = bracketed_paste;
-        self.mouse_reporting = mouse_reporting;
+        self.mouse = mouse;
         Ok(())
     }
 
@@ -74,7 +78,7 @@ impl GridMirror {
         grid: &GridUpdate,
         alt_screen: bool,
         bracketed_paste: bool,
-        mouse_reporting: bool,
+        mouse: MouseModes,
     ) -> Result<(), MirrorError> {
         let Some(previous) = self.sequence else {
             return Err(MirrorError::SnapshotRequired);
@@ -97,7 +101,7 @@ impl GridMirror {
         self.sequence = Some(sequence);
         self.alt_screen = alt_screen;
         self.bracketed_paste = bracketed_paste;
-        self.mouse_reporting = mouse_reporting;
+        self.mouse = mouse;
         Ok(())
     }
 
@@ -130,8 +134,8 @@ impl GridMirror {
     }
 
     #[must_use]
-    pub const fn modes(&self) -> (bool, bool, bool) {
-        (self.alt_screen, self.bracketed_paste, self.mouse_reporting)
+    pub const fn modes(&self) -> (bool, bool, MouseModes) {
+        (self.alt_screen, self.bracketed_paste, self.mouse)
     }
 
     #[must_use]
@@ -291,10 +295,28 @@ pub struct HeadlessScreen {
     progress_value: Option<i64>,
 
     content_seq: u64,
-    last_digest: u64,
+    filled_cells: usize,
+    /// Per-row text fingerprints let status detection distinguish real text
+    /// changes from cursor/mode damage without hashing the full viewport.
+    row_digests: Vec<u64>,
+    row_filled_cells: Vec<usize>,
+    /// Damage produced by the current parser advance, reused to avoid a fresh
+    /// allocation for every PTY read.
+    current_damage_rows: Vec<bool>,
+    /// Damage accumulated until the next attached-client grid publication.
+    /// This remains valid across multiple parser advances in one output batch.
+    pending_damage_rows: Vec<bool>,
     /// Trailing bytes of the previous chunk, so an OSC split across a read
     /// boundary is still recognized.
     progress_carry: Vec<u8>,
+    /// Answers the emulator owes the child: a cursor-position report, a device
+    /// attributes reply, and anything else generated in response to a query.
+    /// A program that asks and is never answered blocks until its own timeout,
+    /// or forever, so the pump must write these back to the PTY.
+    replies: Vec<u8>,
+    /// Whether the title moved since the last settle, tracked where it is
+    /// assigned so no per-chunk clone is needed to notice.
+    title_changed: bool,
 
     /// Diff baseline for [`grid_update`]: the cells last handed out, so the
     /// next call sends only changed rows.
@@ -317,7 +339,7 @@ impl HeadlessScreen {
             ..Config::default()
         };
         let term = Term::new(config, &geometry, Collector(sender));
-        Self {
+        let mut screen = Self {
             term,
             parser: Processor::new(),
             events,
@@ -326,12 +348,20 @@ impl HeadlessScreen {
             progress_state: None,
             progress_value: None,
             content_seq: 0,
-            last_digest: 0,
+            filled_cells: 0,
+            row_digests: Vec::new(),
+            row_filled_cells: Vec::new(),
+            current_damage_rows: vec![false; geometry.rows],
+            pending_damage_rows: vec![true; geometry.rows],
             progress_carry: Vec::new(),
+            replies: Vec::new(),
+            title_changed: false,
             last_cells: Vec::new(),
             last_grid_cols: 0,
             last_grid_rows: 0,
-        }
+        };
+        screen.rebuild_content_cache();
+        screen
     }
 
     /// Feeds raw PTY output into the emulator.
@@ -341,26 +371,96 @@ impl HeadlessScreen {
     /// difference is multi-x on heavy output like build logs.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.scan_progress(bytes);
-        let title_before = self.title.clone();
         self.parser.advance(&mut self.term, bytes);
-        self.drain_events();
+        self.settle();
+    }
 
-        // Damage is the cheap gate: when the emulator reports nothing
-        // touched, skip fingerprinting entirely. When it does (which includes
-        // invisible changes like a cursor toggle), a direct cell hash — no
-        // per-line String allocation — decides whether the *content* changed.
-        let damaged = match self.term.damage() {
-            alacritty_terminal::term::TermDamage::Full => true,
-            alacritty_terminal::term::TermDamage::Partial(mut lines) => lines.next().is_some(),
+    /// Ends a synchronized update (DECSET 2026) whose deadline has passed.
+    ///
+    /// Between `\e[?2026h` and `\e[?2026l` the parser holds every byte back so
+    /// the repaint lands as one atomic screen — which is exactly what we want,
+    /// and the reason a TUI that speaks this protocol never flickers. But the
+    /// escape hatch is the host's job: vte's timeout only records a deadline,
+    /// and nothing expires it. A child that opens a synchronized update and
+    /// then dies, stalls, or simply overruns 150ms would otherwise freeze the
+    /// pane until 2 MiB of output had piled up behind it. Callers tick this.
+    ///
+    /// Returns true when a held update was released.
+    pub fn flush_expired_sync(&mut self) -> bool {
+        let Some(deadline) = self.parser.sync_timeout().sync_timeout() else {
+            return false;
         };
-        self.term.reset_damage();
-        if damaged || self.title != title_before {
-            let digest = self.digest_cells();
-            if digest != self.last_digest {
-                self.last_digest = digest;
-                self.content_seq += 1;
+        if std::time::Instant::now() < deadline {
+            return false;
+        }
+        self.parser.stop_sync(&mut self.term);
+        self.settle();
+        true
+    }
+
+    /// Post-parse bookkeeping shared by `feed` and `flush_expired_sync`.
+    ///
+    /// Damage is preserved at row granularity for both status detection and
+    /// the next wire diff. Cursor-only damage hashes at most the touched rows;
+    /// a one-line echo never scans the rest of the viewport.
+    fn settle(&mut self) {
+        self.drain_events();
+        let rows = self.geometry.rows;
+        self.current_damage_rows.resize(rows, false);
+        self.current_damage_rows.fill(false);
+        self.pending_damage_rows.resize(rows, false);
+        match self.term.damage() {
+            alacritty_terminal::term::TermDamage::Full => {
+                self.current_damage_rows.fill(true);
+                self.pending_damage_rows.fill(true);
+            }
+            alacritty_terminal::term::TermDamage::Partial(lines) => {
+                for damage in lines {
+                    if damage.line < rows {
+                        self.current_damage_rows[damage.line] = true;
+                        self.pending_damage_rows[damage.line] = true;
+                    }
+                }
             }
         }
+        self.term.reset_damage();
+        // The title is compared where it is assigned, so settling costs no
+        // clone of it per chunk of output.
+        let mut content_changed = std::mem::take(&mut self.title_changed);
+        if self.row_digests.len() != rows || self.row_filled_cells.len() != rows {
+            self.rebuild_content_cache();
+            content_changed = true;
+        } else {
+            for row in 0..rows {
+                if !self.current_damage_rows[row] {
+                    continue;
+                }
+                let (digest, filled) = self.fingerprint_row(row);
+                if self.row_digests[row] != digest {
+                    self.row_digests[row] = digest;
+                    self.filled_cells = self
+                        .filled_cells
+                        .saturating_sub(self.row_filled_cells[row])
+                        .saturating_add(filled);
+                    self.row_filled_cells[row] = filled;
+                    content_changed = true;
+                }
+            }
+        }
+        if content_changed {
+            self.content_seq = self.content_seq.saturating_add(1);
+        }
+    }
+
+    /// How many cells currently hold something other than a blank.
+    ///
+    /// A repaint that has erased but not yet redrawn is the one screen state
+    /// no observer should ever see, and this is what makes it recognizable:
+    /// output that only *removes* content is a repaint caught halfway. Free to
+    /// maintain — it falls out of the fingerprint walk already done per feed.
+    #[must_use]
+    pub fn filled_cells(&self) -> usize {
+        self.filled_cells
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -369,6 +469,7 @@ impl HeadlessScreen {
             rows: rows.max(1),
         };
         self.term.resize(self.geometry);
+        self.settle();
     }
 
     pub fn content_seq(&self) -> u64 {
@@ -400,9 +501,29 @@ impl HeadlessScreen {
         (self.geometry.cols, self.geometry.rows)
     }
 
-    /// Whether the child asked for mouse reporting (any flavor).
+    /// The independent tracking and encoding modes requested by the child.
+    pub fn mouse_modes(&self) -> MouseModes {
+        let mode = self.term.mode();
+        let tracking = if mode.contains(TermMode::MOUSE_MOTION) {
+            MouseTrackingMode::AnyMotion
+        } else if mode.contains(TermMode::MOUSE_DRAG) {
+            MouseTrackingMode::ButtonMotion
+        } else if mode.contains(TermMode::MOUSE_REPORT_CLICK) {
+            MouseTrackingMode::ButtonEvents
+        } else {
+            MouseTrackingMode::Off
+        };
+        let encoding = if mode.contains(TermMode::SGR_MOUSE) {
+            MouseEncoding::Sgr
+        } else {
+            MouseEncoding::Legacy
+        };
+        MouseModes::new(tracking, encoding)
+    }
+
+    /// Whether any tracking mode is active.
     pub fn mouse_reporting(&self) -> bool {
-        self.term.mode().intersects(TermMode::MOUSE_MODE)
+        self.mouse_modes().is_reporting()
     }
 
     /// Cursor (col, row, visible) without touching cell data.
@@ -431,8 +552,19 @@ impl HeadlessScreen {
         }
 
         let grid = self.term.grid();
-        let mut changed = Vec::new();
+        let candidate_count = if force_full {
+            rows
+        } else {
+            self.pending_damage_rows
+                .iter()
+                .filter(|dirty| **dirty)
+                .count()
+        };
+        let mut changed = Vec::with_capacity(candidate_count);
         for y in 0..rows {
+            if !force_full && !self.pending_damage_rows.get(y).copied().unwrap_or(false) {
+                continue;
+            }
             let line = Line(y as i32);
             let base = y * cols;
             let mut row = Vec::with_capacity(cols);
@@ -450,6 +582,7 @@ impl HeadlessScreen {
             self.last_cells[base..base + cols].copy_from_slice(&row);
             changed.push(ChangedRow::new(y as u16, row));
         }
+        self.pending_damage_rows.fill(false);
 
         let cursor = grid.cursor.point;
         GridUpdate {
@@ -521,7 +654,7 @@ impl HeadlessScreen {
         update: &GridUpdate,
         alt_screen: bool,
         bracketed_paste: bool,
-        mouse_reporting: bool,
+        mouse: MouseModes,
     ) -> bool {
         let cols = self.geometry.cols;
         let rows = self.geometry.rows;
@@ -593,8 +726,11 @@ impl HeadlessScreen {
         if bracketed_paste {
             bytes.extend_from_slice(b"\x1b[?2004h");
         }
-        if mouse_reporting {
-            bytes.extend_from_slice(b"\x1b[?1000h\x1b[?1006h");
+        if let Some(mode) = mouse.tracking.dec_private_mode() {
+            bytes.extend_from_slice(format!("\x1b[?{mode}h").as_bytes());
+        }
+        if matches!(mouse.encoding, MouseEncoding::Sgr) {
+            bytes.extend_from_slice(b"\x1b[?1006h");
         }
         bytes.extend_from_slice(if update.cursor_visible {
             b"\x1b[?25h"
@@ -626,19 +762,23 @@ impl HeadlessScreen {
         }
         let x = col.min(self.geometry.cols.saturating_sub(1));
         let y = row.min(self.geometry.rows.saturating_sub(1));
-        let button = if up { 64 } else { 65 }; // X11 wheel buttons 4/5, wheel-flagged
         let mut out = Vec::new();
         for _ in 0..lines {
-            if self.term.mode().contains(TermMode::SGR_MOUSE) {
-                out.extend_from_slice(format!("\x1b[<{button};{};{}M", x + 1, y + 1).as_bytes());
+            let event = if up {
+                TerminalMouseEvent::WheelUp
             } else {
-                // Legacy X10 encoding: 32 + button, 32 + 1-based coordinate.
-                out.push(0x1b);
-                out.extend_from_slice(b"[M");
-                out.push(32 + button as u8);
-                out.push((32 + x + 1).min(255) as u8);
-                out.push((32 + y + 1).min(255) as u8);
-            }
+                TerminalMouseEvent::WheelDown
+            };
+            let Some(report) = encode_mouse_event(
+                self.mouse_modes(),
+                event,
+                TerminalMouseModifiers::default(),
+                x as u16,
+                y as u16,
+            ) else {
+                break;
+            };
+            out.extend_from_slice(&report);
         }
         out
     }
@@ -743,32 +883,79 @@ impl HeadlessScreen {
 
     fn drain_events(&mut self) {
         while let Ok(event) = self.events.try_recv() {
-            if let Event::Title(title) = event {
-                self.title = Some(title);
-            } else if matches!(event, Event::ResetTitle) {
-                self.title = None;
+            match event {
+                Event::Title(title) => {
+                    let title = Some(title);
+                    self.title_changed |= self.title != title;
+                    self.title = title;
+                }
+                Event::ResetTitle => {
+                    self.title_changed |= self.title.is_some();
+                    self.title = None;
+                }
+                // Replies to queries the child made — CSI 6n, device
+                // attributes, and so on. Collected here and written back by
+                // the pump, which owns the write side of the PTY.
+                Event::PtyWrite(text) => self.replies.extend_from_slice(text.as_bytes()),
+                Event::TextAreaSizeRequest(format) => {
+                    // Cell pixel size is a rendering concern the daemon does
+                    // not know; report the grid it does know. Callers use this
+                    // to size output, and cols/rows is the part they act on.
+                    let size = WindowSize {
+                        num_cols: self.geometry.cols as u16,
+                        num_lines: self.geometry.rows as u16,
+                        cell_width: 0,
+                        cell_height: 0,
+                    };
+                    self.replies.extend_from_slice(format(size).as_bytes());
+                }
+                _ => {}
             }
         }
     }
 
+    /// Takes the answers owed to the child. The pump writes these to the PTY
+    /// after feeding a chunk; nothing else may consume them.
+    #[must_use]
+    pub fn take_replies(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.replies)
+    }
+
     // (cell mapping lives at module level; see `wire_cell`)
 
-    /// Content fingerprint hashed straight off the grid cells, so
-    /// `content_seq` only advances when the visible screen actually changed.
-    /// Detection uses that to skip re-evaluating a frame it has already
-    /// judged.
-    fn digest_cells(&self) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    fn fingerprint_row(&self, row: usize) -> (u64, usize) {
+        // FNV-1a is sufficient for change detection and much cheaper than
+        // constructing SipHash state for every damaged row. Grid publication
+        // still compares the actual cells, so this fingerprint never decides
+        // wire correctness.
+        let mut digest = 0xcbf2_9ce4_8422_2325u64;
+        let mut filled = 0;
         let grid = self.term.grid();
-        for row in 0..self.geometry.rows {
-            let line = Line(row as i32);
-            for column in 0..self.geometry.cols {
-                grid[line][Column(column)].c.hash(&mut hasher);
+        let line = Line(row as i32);
+        for column in 0..self.geometry.cols {
+            let character = grid[line][Column(column)].c;
+            digest ^= u64::from(character);
+            digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+            if character != ' ' && character != '\0' {
+                filled += 1;
             }
         }
-        self.title.hash(&mut hasher);
-        hasher.finish()
+        (digest, filled)
+    }
+
+    fn rebuild_content_cache(&mut self) {
+        self.row_digests.clear();
+        self.row_filled_cells.clear();
+        self.row_digests.reserve(self.geometry.rows);
+        self.row_filled_cells.reserve(self.geometry.rows);
+        let mut total_filled = 0;
+        for row in 0..self.geometry.rows {
+            let (digest, filled) = self.fingerprint_row(row);
+            self.row_digests.push(digest);
+            self.row_filled_cells.push(filled);
+            total_filled += filled;
+        }
+        self.filled_cells = total_filled;
     }
 
     /// Extracts `ESC ] 9 ; 4 ; state ; value` progress reports.
@@ -776,13 +963,37 @@ impl HeadlessScreen {
     /// Agents use this to say "I am working, 40% through"; the emulator has no
     /// concept of it and would silently drop the sequence.
     fn scan_progress(&mut self, bytes: &[u8]) {
-        const PREFIX: &[u8] = b"\x1b]9;4;";
+        if self.progress_carry.is_empty() {
+            if !bytes.contains(&0x1b) {
+                return;
+            }
+            // Scan the chunk where it lies. Joining it to an empty carry would
+            // copy every byte of every read, and reads that leave a carry
+            // behind are the rare case — the common one is output that merely
+            // contains color escapes.
+            if let Some(start) = self.scan_progress_within(bytes) {
+                self.progress_carry.extend_from_slice(&bytes[start..]);
+            }
+            return;
+        }
         let mut haystack = std::mem::take(&mut self.progress_carry);
         haystack.extend_from_slice(bytes);
+        if let Some(start) = self.scan_progress_within(&haystack) {
+            haystack.drain(..start);
+            self.progress_carry = haystack;
+        }
+    }
 
+    /// Scans one buffer for progress reports, returning where a carry for the
+    /// next chunk should begin if the buffer ends mid-sequence.
+    fn scan_progress_within(&mut self, haystack: &[u8]) -> Option<usize> {
+        const PREFIX: &[u8] = b"\x1b]9;4;";
+        const MAX_INCOMPLETE_BYTES: usize = 64;
         let mut search_from = 0;
+        let mut incomplete = None;
         while let Some(found) = find(&haystack[search_from..], PREFIX) {
-            let start = search_from + found + PREFIX.len();
+            let prefix_start = search_from + found;
+            let start = prefix_start + PREFIX.len();
             // Terminated by BEL or ST (ESC \).
             let Some(end) = haystack[start..]
                 .iter()
@@ -790,6 +1001,7 @@ impl HeadlessScreen {
                 .map(|offset| start + offset)
             else {
                 // Truncated: keep it for the next chunk.
+                incomplete = Some(prefix_start);
                 break;
             };
             let payload = String::from_utf8_lossy(&haystack[start..end]);
@@ -799,9 +1011,18 @@ impl HeadlessScreen {
             search_from = end;
         }
 
-        // Keep a tail long enough to rejoin a sequence split across reads.
-        let keep = haystack.len().saturating_sub(64);
-        self.progress_carry = haystack[keep..].to_vec();
+        if let Some(start) = incomplete
+            && haystack.len() - start <= MAX_INCOMPLETE_BYTES
+        {
+            return Some(start);
+        }
+        // A malformed unterminated OSC must not turn the scanner into an
+        // unbounded copy of the PTY stream. Fall through and retain only a
+        // possible prefix suffix.
+        (1..PREFIX.len())
+            .rev()
+            .find(|length| haystack.ends_with(&PREFIX[..*length]))
+            .map(|length| haystack.len() - length)
     }
 }
 
@@ -1030,6 +1251,54 @@ mod tests {
     }
 
     #[test]
+    fn an_unterminated_progress_sequence_has_bounded_carry() {
+        let mut screen = HeadlessScreen::new(80, 24);
+        let mut input = b"\x1b]9;4;1;".to_vec();
+        input.extend(std::iter::repeat_n(b'9', 16 << 10));
+        screen.feed(&input);
+        assert!(screen.progress_carry.len() < 8);
+    }
+
+    #[test]
+    fn a_synchronized_repaint_never_shows_its_erased_half() {
+        // What DECSET 2026 exists for: the child erases and redraws inside the
+        // bracket, and no observer may see the gap between the two.
+        let mut screen = screen_with(b"before the repaint\r\n");
+        let quiet = screen.content_seq();
+
+        screen.feed(b"\x1b[?2026h\x1b[2J\x1b[H");
+        assert_eq!(
+            screen.lines(),
+            vec!["before the repaint"],
+            "the erase is held back until the update closes"
+        );
+        assert_eq!(screen.content_seq(), quiet);
+
+        screen.feed(b"after the repaint\r\n\x1b[?2026l");
+        assert_eq!(screen.lines(), vec!["after the repaint"]);
+        assert!(screen.content_seq() > quiet);
+    }
+
+    #[test]
+    fn a_synchronized_update_the_child_never_closes_is_released() {
+        // vte records the 150ms deadline but nothing expires it, so without a
+        // host-side flush an abandoned bracket freezes the pane until 2 MiB of
+        // output has piled up behind it.
+        let mut screen = screen_with(b"before the repaint\r\n");
+        screen.feed(b"\x1b[?2026h\x1b[2J\x1b[Hafter the repaint\r\n");
+        assert!(!screen.flush_expired_sync(), "the deadline has not passed");
+        assert_eq!(screen.lines(), vec!["before the repaint"]);
+
+        std::thread::sleep(std::time::Duration::from_millis(160));
+        assert!(screen.flush_expired_sync(), "an overdue update is released");
+        assert_eq!(screen.lines(), vec!["after the repaint"]);
+        assert!(
+            !screen.flush_expired_sync(),
+            "releasing it once clears the deadline"
+        );
+    }
+
+    #[test]
     fn content_seq_advances_only_when_the_screen_changes() {
         let mut screen = HeadlessScreen::new(80, 24);
         screen.feed(b"hello\r\n");
@@ -1076,7 +1345,13 @@ mod tests {
 
         let mut restored = HeadlessScreen::new(40, 10);
         assert!(
-            restored.restore(&[], &snapshot, false, true, true),
+            restored.restore(
+                &[],
+                &snapshot,
+                false,
+                true,
+                MouseModes::new(MouseTrackingMode::ButtonEvents, MouseEncoding::Sgr),
+            ),
             "restorable"
         );
         assert_eq!(restored.lines(), original.lines());
@@ -1096,7 +1371,7 @@ mod tests {
 
         let mut smaller = HeadlessScreen::new(39, 10);
         assert!(
-            !smaller.restore(&[], &snapshot, false, false, false),
+            !smaller.restore(&[], &snapshot, false, false, MouseModes::OFF),
             "a checkpoint from another geometry is a cache miss"
         );
     }
@@ -1114,7 +1389,7 @@ mod tests {
 
         let mut restored = HeadlessScreen::new(12, 2);
         assert!(
-            restored.restore(&history, &snapshot, false, false, false),
+            restored.restore(&history, &snapshot, false, false, MouseModes::OFF),
             "restorable"
         );
         assert_eq!(restored.scrollback(), original.scrollback());
@@ -1142,11 +1417,11 @@ mod tests {
         let snapshot = screen.full_snapshot();
         let mut mirror = GridMirror::new();
         mirror
-            .apply_snapshot(9, &snapshot, false, true, false)
+            .apply_snapshot(9, &snapshot, false, true, MouseModes::OFF)
             .expect("snapshot");
         assert_eq!(mirror.sequence(), Some(9));
         assert_eq!(mirror.size(), (8, 2));
-        assert_eq!(mirror.modes(), (false, true, false));
+        assert_eq!(mirror.modes(), (false, true, MouseModes::OFF));
 
         let mut delta_source = HeadlessScreen::new(8, 2);
         delta_source.feed(b"one");
@@ -1154,15 +1429,56 @@ mod tests {
         delta_source.feed(b" two");
         let delta = delta_source.grid_update(false);
         mirror
-            .apply_delta(10, &delta, true, false, true)
+            .apply_delta(
+                10,
+                &delta,
+                true,
+                false,
+                MouseModes::new(MouseTrackingMode::AnyMotion, MouseEncoding::Sgr),
+            )
             .expect("contiguous delta");
-        assert_eq!(mirror.modes(), (true, false, true));
+        assert_eq!(
+            mirror.modes(),
+            (
+                true,
+                false,
+                MouseModes::new(MouseTrackingMode::AnyMotion, MouseEncoding::Sgr)
+            )
+        );
         assert!(matches!(
-            mirror.apply_delta(12, &delta, false, false, false),
+            mirror.apply_delta(12, &delta, false, false, MouseModes::OFF),
             Err(MirrorError::SequenceGap {
                 expected: 11,
                 actual: 12
             })
         ));
+    }
+
+    #[test]
+    fn parser_preserves_each_tracking_mode_and_encoding_independently() {
+        let mut screen = HeadlessScreen::new(300, 24);
+        assert_eq!(screen.mouse_modes(), MouseModes::OFF);
+
+        screen.feed(b"\x1b[?1000h");
+        assert_eq!(
+            screen.mouse_modes(),
+            MouseModes::new(MouseTrackingMode::ButtonEvents, MouseEncoding::Legacy)
+        );
+        screen.feed(b"\x1b[?1002h\x1b[?1006h");
+        assert_eq!(
+            screen.mouse_modes(),
+            MouseModes::new(MouseTrackingMode::ButtonMotion, MouseEncoding::Sgr)
+        );
+        screen.feed(b"\x1b[?1003h\x1b[?1006l");
+        assert_eq!(
+            screen.mouse_modes(),
+            MouseModes::new(MouseTrackingMode::AnyMotion, MouseEncoding::Legacy)
+        );
+        screen.feed(b"\x1b[?1003l\x1b[?1006h");
+        assert_eq!(
+            screen.mouse_modes(),
+            MouseModes::new(MouseTrackingMode::Off, MouseEncoding::Sgr),
+            "1006 is independent of tracking"
+        );
     }
 }

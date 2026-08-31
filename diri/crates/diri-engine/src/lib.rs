@@ -18,7 +18,9 @@
 //!   it can be built and tested while the existing daemon keeps serving live
 //!   sessions.
 
+pub mod activity;
 pub mod agent;
+pub mod agent_catalog;
 pub mod artifacts;
 pub mod attach;
 pub mod browser;
@@ -36,8 +38,8 @@ pub mod hooks;
 pub mod hosts;
 pub mod inject;
 pub mod legacy_remote;
+mod lifecycle;
 pub mod log;
-pub mod mcp;
 pub mod migrate;
 pub mod pr_monitor;
 pub mod pty;
@@ -45,6 +47,7 @@ pub mod registry;
 pub mod remote;
 pub mod screen;
 pub mod session;
+mod state_file;
 pub mod status;
 
 pub use control::ControlServer;

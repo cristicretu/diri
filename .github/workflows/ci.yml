@@ -1,5 +1,21 @@
 name: CI
 
+# The pull-request gate has a five-minute budget. The three jobs run in
+# parallel, so the number a reviewer waits on is the slowest one:
+#
+#   Rust workspace              macos-15       ~4m   tests
+#   Lints                       ubuntu-22.04   ~3m   fmt, clippy, scripts
+#   Rust engine (Linux x86_64)  ubuntu-24.04   ~2m   PTY and engine tests
+#
+# Two facts shape this. First, the macOS test step is compile-bound, not
+# test-bound: of its four minutes, three were spent compiling and one running.
+# Second, clippy compiles the same workspace to a different metadata hash, so
+# running it before the tests in one job paid that cost twice, serially.
+#
+# Anything that builds a release profile, packages an artifact, or measures a
+# latency belongs in nightly.yml. Those answer "can we ship this?", not "is
+# this change correct?".
+
 on:
   push:
     branches: [main]
@@ -8,64 +24,36 @@ on:
 permissions:
   contents: read
 
-jobs:
-  engine:
-    name: Swift engine (daemon + CLI)
-    runs-on: macos-15
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.0.0
-      - name: Validate shell scripts
-        run: bash -n scripts/*.sh diri/scripts/*.sh
-      - name: Verify reviewed regressions stay fixed
-        run: diri/scripts/verify-remote-refactor.sh
-      - name: Test release publishing guards
-        run: |
-          bash diri/scripts/test-publish-github-release.sh
-          bash diri/scripts/test-publish-homebrew-cask.sh
-      - name: Install and audit browser sidecar
-        working-directory: sidecar
-        run: |
-          npm ci
-          npm audit --omit=dev
-      # --no-parallel is load-bearing on CI. Run in parallel, every test starts
-      # at once, and the suite then stalls indefinitely on a 3-core runner: the
-      # PTY and holder tests block inside async contexts, and with that few
-      # cores the cooperative pool has no thread left to make progress on.
-      # A developer Mac has enough cores to hide it. Serial costs ~30s.
-      #
-      # SwiftPM also block-buffers when stdout is a pipe, so a test process that
-      # dies takes most of its console output with it — hence the xunit file.
-      # `script` gives the run a pty, which makes SwiftPM line-buffer. Piped, it
-      # block-buffers, and a test process that dies takes the tail of its output
-      # with it — so the log's last line is wherever the buffer happened to
-      # flush, not where the run actually stopped. That cost real debugging
-      # time. The xunit file is no help either: it is only written at the end.
-      - name: Test
-        env:
-          # Runner spawns and socket binds are far slower than on a dev Mac; the
-          # 5s liveness waits time out there. See waitUntil in the test helpers.
-          DIRIJOR_TEST_TIMEOUT_SCALE: "6"
-        run: |
-          set -o pipefail
-          script -q /dev/null swift test --no-parallel | tee "${RUNNER_TEMP}/test.log"
-          grep -q "Test run with .* passed" "${RUNNER_TEMP}/test.log"
-      - name: Where it stopped
-        if: failure()
-        run: tail -40 "${RUNNER_TEMP}/test.log" || true
-      - name: Release build
-        run: swift build -c release
+# A new push supersedes the run it interrupts. macOS runners queue — a public
+# repo gets five concurrent — so without this a branch pushed three times in a
+# row sits behind two runs whose results nobody will read.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
+env:
+  # Test binaries are compiled once, run once, and thrown away, and full debug
+  # info is the most expensive artifact CI produces that nothing ever reads.
+  # line-tables-only still gives a panic a file and a line number, which is the
+  # only part of a backtrace anyone looks at in a CI log.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Required check: "Rust workspace". Renaming this job dangles the branch
+  # protection rule on main and merges will wait forever for a check that no
+  # longer reports.
   app:
-    name: Rust app (diri)
+    name: Rust workspace
     runs-on: macos-15
-    timeout-minutes: 60
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: diri
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.0.0
-      # rust-toolchain.toml pins 1.95.0 with clippy + rustfmt.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # rust-toolchain.toml pins the compiler with clippy + rustfmt.
       - name: Cache cargo registry and target
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -73,128 +61,103 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             diri/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('diri/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
-      - name: Check dependency license policy
-        run: python3 ../scripts/check-licenses.py
-      - name: Format
-        run: cargo fmt --all -- --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('diri/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-test-
+      # This job does one thing. Every second it spends on something other than
+      # compiling and running the tests is a second on the critical path of
+      # every pull request.
       - name: Test
         run: cargo test --workspace
-      - name: Remote Holder acceptance and latency gates
-        run: scripts/remote-acceptance.sh
-      - name: Release build
-        run: cargo build --workspace --release
 
-  remote-helper-native:
-    name: Remote Helper (${{ matrix.target }})
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-24.04
-            target: x86_64-unknown-linux-musl
-          - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
-          - runner: macos-15
-            target: aarch64-apple-darwin
+  ios:
+    name: iPhone app
+    runs-on: macos-15
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ios
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The Xcode project is generated from project.yml and never committed, so
+      # a stale checked-in pbxproj cannot drift from the source list.
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate project
+        run: xcodegen generate
+      # Simulator only: this runner has no signing identity, and the target
+      # sets CODE_SIGNING_ALLOWED=NO to match.
+      - name: Test
+        run: |
+          xcodebuild -project DiriPhone.xcodeproj -scheme DiriPhone \
+            -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
+
+  lints:
+    name: Lints
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: diri
     steps:
-      - uses: actions/checkout@v5
-      - name: Install target
-        run: rustup target add "${{ matrix.target }}"
-      - name: Install native musl linker
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install --yes musl-tools
-      - name: Build exact release Helper
-        env:
-          DIRI_REMOTE_BUILD_ID: ci-${{ matrix.target }}
-        run: cargo build --locked --release --package diri-remote --target "${{ matrix.target }}"
-      - name: Execute native probe and verify identity
-        env:
-          EXPECTED_TARGET: ${{ matrix.target }}
-          EXPECTED_BUILD: ci-${{ matrix.target }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The GUI crate links against these even when only checked, so the list
+      # stays whether or not a window is ever opened. weston, xvfb and the
+      # Vulkan drivers moved to nightly with the smoke tests that use them.
+      - name: Install GPUI build dependencies
         run: |
-          helper="target/${EXPECTED_TARGET}/release/diri-remote"
-          test -x "${helper}"
-          probe="$("${helper}" probe --format=json)"
-          jq -e \
-            --arg target "${EXPECTED_TARGET}" \
-            --arg build "${EXPECTED_BUILD}" \
-            '.target == $target and .buildId == $build and .protocol.major == 1 and .supported and .holderAvailable' \
-            <<<"${probe}"
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential clang cmake libasound2-dev libfontconfig-dev \
+            libglib2.0-dev libssl-dev libstdc++-12-dev libwayland-dev \
+            libx11-xcb-dev libxkbcommon-x11-dev pkg-config
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            diri/target
+          key: linux-lint-cargo-${{ hashFiles('diri/Cargo.lock') }}
+          restore-keys: linux-lint-cargo-
+      # Lints are platform-independent, so they run on the cheap runner rather
+      # than lengthening the macOS job. Doing them here also keeps the Linux
+      # build honest: clippy type-checks the whole workspace, so a change that
+      # only fails to compile on Linux still fails this gate even though the
+      # full Linux test suite now runs nightly.
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Validate shell and release scripts
+        run: |
+          bash -n ../scripts/*.sh scripts/*.sh
+          bash scripts/verify-remote-refactor.sh
+          bash scripts/test-publish-github-release.sh
+          bash scripts/test-publish-homebrew-cask.sh
+      - name: Check dependency license policy
+        run: python3 ../scripts/check-licenses.py
 
-  remote-ssh-soak:
-    name: Remote OpenSSH detach/reconnect
+  # Required check: "Rust engine (Linux x86_64)". Same warning as above about
+  # renaming. Ubuntu 24.04 is the point of this job rather than an accident:
+  # it is the only newer-glibc coverage in the gate, and it runs the suites
+  # where Linux and macOS genuinely disagree — process groups, inherited
+  # descriptors, EIO at EOF — against real child processes. It needs no apt
+  # packages, so it costs about two minutes.
+  engine-linux:
+    name: Rust engine (Linux x86_64)
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     defaults:
       run:
         working-directory: diri
     steps:
-      - uses: actions/checkout@v5
-      - name: Start disposable ordinary-user SSH endpoint
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Report Linux environment
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes openssh-server
-          # sshd refuses to start without its privilege separation directory,
-          # which the package does not create on a fresh runner image.
-          sudo mkdir -p /run/sshd
-          # The runner account ships with no password, which leaves it locked
-          # ("!" in shadow) and makes sshd reject it before it ever considers
-          # the key. Unlock it without setting one; password and
-          # keyboard-interactive auth stay disabled below, so keys remain the
-          # only way in on this throwaway host.
-          sudo usermod -p '*' "${USER}"
-          mkdir -p "${HOME}/.ssh" "${RUNNER_TEMP}/sshd"
-          chmod 700 "${HOME}/.ssh"
-          ssh-keygen -q -t ed25519 -N '' -f "${RUNNER_TEMP}/diri_ci_key"
-          cat "${RUNNER_TEMP}/diri_ci_key.pub" >> "${HOME}/.ssh/authorized_keys"
-          chmod 600 "${HOME}/.ssh/authorized_keys"
-          printf '%s\n' \
-            'Host diri-ci-soak' \
-            '  HostName 127.0.0.1' \
-            '  Port 2222' \
-            "  User ${USER}" \
-            "  IdentityFile ${RUNNER_TEMP}/diri_ci_key" \
-            '  IdentitiesOnly yes' \
-            '  StrictHostKeyChecking accept-new' \
-            "  UserKnownHostsFile ${RUNNER_TEMP}/known_hosts" \
-            > "${HOME}/.ssh/config"
-          chmod 600 "${HOME}/.ssh/config"
-          sudo /usr/sbin/sshd -D -e -p 2222 \
-            -o PasswordAuthentication=no \
-            -o KbdInteractiveAuthentication=no \
-            -o UsePAM=no \
-            -o AllowUsers="${USER}" \
-            -o PidFile="${RUNNER_TEMP}/sshd/sshd.pid" \
-            >"${RUNNER_TEMP}/sshd.log" 2>&1 &
-          for attempt in $(seq 1 50); do
-            if ssh -o BatchMode=yes diri-ci-soak true; then
-              exit 0
-            fi
-            sleep 0.1
-          done
-          cat "${RUNNER_TEMP}/sshd.log"
-          exit 1
-      - name: Run real SSH persistence soak
-        env:
-          DIRI_REMOTE_SSH_TARGET: diri-ci-soak
-          DIRI_REMOTE_SOAK_SECONDS: "5"
-        run: scripts/remote-ssh-soak.sh
-
-  bundle:
-    name: Package diri.app (unsigned)
-    runs-on: macos-15
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.0.0
+          cat /etc/os-release
+          uname -a
+          rustc --version --verbose
+          ldd --version | head -1
       - name: Cache cargo registry and target
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -202,53 +165,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             diri/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('diri/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
-      # package.sh lipos two slices into a universal binary, so both targets
-      # have to be installed — and installed for the toolchain diri/ pins in
-      # rust-toolchain.toml, not the runner default. Adding them from the repo
-      # root silently equips the wrong toolchain and the x86_64 pass then fails
-      # with "can't find crate for std".
-      - name: Install universal targets
-        working-directory: diri
-        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-musl x86_64-unknown-linux-musl
-      - name: Install Rust packaging tools
-        run: |
-          brew install zig
-          cargo install cargo-packager --locked
-          cargo install cargo-zigbuild --locked
-      - name: Package
-        env:
-          DIRI_DIST_DIR: ${{ runner.temp }}/diri-dist
-        run: diri/scripts/package.sh
-      - name: Verify bundle structure and signature
-        run: |
-          app="${RUNNER_TEMP}/diri-dist/diri.app"
-          plutil -lint "${app}/Contents/Info.plist"
-          test -x "${app}/Contents/Resources/bin/dirijor"
-          test -x "${app}/Contents/Resources/bin/dirijord-rs"
-          test -x "${app}/Contents/Resources/bin/diri-holder"
-          test -x "${app}/Contents/Resources/bin/diri-ssh-askpass"
-          test -f "${app}/Contents/Resources/bin/manifests/codex.json"
-          lipo "${app}/Contents/Resources/bin/dirijord-rs" -verify_arch arm64 x86_64
-          lipo "${app}/Contents/Resources/bin/diri-holder" -verify_arch arm64 x86_64
-          lipo "${app}/Contents/Resources/bin/diri-ssh-askpass" -verify_arch arm64 x86_64
-          test -f "${app}/Contents/Resources/bin/remote-helpers/manifest.json"
-          test "$(find "${app}/Contents/Resources/bin/remote-helpers/artifacts" -name diri-remote -type f | wc -l | tr -d ' ')" = 3
-          codesign --verify --deep --strict "${app}"
-
-  browser-sidecar:
-    name: Browser sidecar integration
-    runs-on: macos-15
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.0.0
-      - name: Install sidecar and browser engines
-        working-directory: sidecar
-        run: |
-          npm ci
-          npx playwright install chromium webkit firefox
-      - name: Run browser integration tests
-        env:
-          DIRIJOR_RUN_BROWSER_TESTS: "1"
-        run: swift test --filter BrowserPoolTests
+          key: linux-engine-cargo-${{ hashFiles('diri/Cargo.lock') }}
+          restore-keys: linux-engine-cargo-
+      - name: Test shared PTY crate natively
+        run: cargo test --locked -p diri-pty -- --nocapture
+      - name: Test Rust engine natively
+        run: cargo test --locked -p diri-engine -- --nocapture

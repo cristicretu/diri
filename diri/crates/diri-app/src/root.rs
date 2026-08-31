@@ -2,27 +2,40 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use diri_proto::SessionId;
-use diri_ui::{FloatingSurface, Ink, Radius, SemanticColors, Typo};
+use diri_proto::{AgentKind, SessionId, SessionRecord, SessionStatus};
+use diri_ui::{FloatingSurface, Ink, Metrics, Radius, SemanticColors, Typo};
 use gpui::{
-    AnyElement, App, Context, CursorStyle, DragMoveEvent, Entity, FocusHandle, Focusable,
-    FontWeight, KeyDownEvent, KeyUpEvent, Modifiers, ModifiersChangedEvent, MouseButton, Render,
-    StyleRefinement, Subscription, Task, Window, actions, deferred, div, prelude::*, px, rgba,
+    Animation, AnimationExt, AnyElement, App, Context, CursorStyle, DragMoveEvent, Entity,
+    FocusHandle, Focusable, FontWeight, KeyContext, KeyDownEvent, KeyUpEvent,
+    ModifiersChangedEvent, MouseButton, Render, StyleRefinement, Subscription, Task, Window,
+    deferred, div, ease_out_quint, prelude::*, px, rgba,
 };
 
 use crate::AppServices;
+use crate::commands::{
+    self, APP_CONTEXT, ArchiveSelectedSession, CheckForUpdates, CloseSession, CommandId,
+    DelegateSelectedSession, FocusSidebar, MoveSelectedSessionDown, MoveSelectedSessionUp,
+    NewCodexSession, NewDefaultSession, NewTerminal, OpenLauncher, OpenSettings, OpenWorktrees,
+    QuoteSelection, QuoteSelectionToSession, RenameSelectedSession, ReopenSession,
+    SESSION_NAVIGATION_CONTEXT, SelectLastSession, SelectNextAttentionSession, SelectNextSession,
+    SelectPreviousSession, SelectSession1, SelectSession2, SelectSession3, SelectSession4,
+    SelectSession5, SelectSession6, SelectSession7, SelectSession8, ToggleAuxiliaryTerminal,
+    ToggleCommandPalette, ToggleHistory, ToggleInspector, ToggleOverview, ToggleQuickOpen,
+    ToggleSidebar,
+};
+use crate::external_drop::ExternalDropAction;
+use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::inspector::{InspectorEvent, WorkbenchInspector};
 use crate::launcher::{LauncherEvent, LauncherOverlay};
-use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
-use crate::navigation::{
-    NavigationEvent, NavigationOverlay, ToggleCommandPalette, ToggleQuickOpen,
-};
+use crate::navigation::NavigationOverlay;
 use crate::notifications::{InAppBanner, NotificationSound};
+use crate::quote::Quote;
+use crate::recovery::{RecoveryAction, RecoveryKind, RecoveryNotice};
 use crate::seam::{SeamSlide, toggle_has_settled};
 use crate::session_surfaces::SessionSurfaces;
 use crate::sidebar::{PreviewScenario, Sidebar, SidebarEvent};
-use crate::sounds::{self, AfplayPlayer, SoundGate, StatusSound};
-use crate::store::{DefaultAgent, SpawnOptions};
+use crate::sounds::{self, PlatformPlayer, SoundGate, StatusSound};
+use crate::store::SpawnOptions;
 use crate::surface_shell::UtilitySurfaces;
 use crate::terminal_pane::{TerminalPane, TerminalPaneEvent, TerminalViewport};
 use crate::updates::UpdatePhase;
@@ -34,50 +47,56 @@ pub(crate) fn cached_window_overlay<T: Render>(view: Entity<T>) -> impl IntoElem
     view.cached(StyleRefinement::default().absolute().inset_0())
 }
 
+/// Joins the two halves of the settings destination: the surface owns the
+/// state and paints the page, the sidebar paints the navigation beside it.
+///
+/// The mirror is one-directional -- the surface's state projects into the
+/// sidebar, and the sidebar reports clicks back -- so the list and the page
+/// cannot drift into disagreeing about the selected page or the search text.
+/// RootView wires this for the window; tests wire the same two entities.
+pub(crate) fn wire_settings_navigation<V: 'static>(
+    sidebar: Entity<Sidebar>,
+    surfaces: Entity<UtilitySurfaces>,
+    window: &mut Window,
+    cx: &mut Context<V>,
+) -> [Subscription; 2] {
+    let mirror = {
+        let sidebar = sidebar.clone();
+        cx.observe(&surfaces, move |_, surfaces, cx| {
+            let nav = surfaces.read(cx).settings_nav();
+            sidebar.update(cx, |sidebar, cx| sidebar.set_settings_nav(nav, cx));
+            cx.notify();
+        })
+    };
+    let clicks = cx.subscribe_in(
+        &sidebar,
+        window,
+        move |_, _, event, window, cx| match event {
+            SidebarEvent::SettingsTabSelected(tab) => {
+                let tab = *tab;
+                surfaces.update(cx, |surfaces, cx| surfaces.open_settings_tab(tab, cx));
+            }
+            SidebarEvent::SettingsSearchFocused => {
+                surfaces.update(cx, |surfaces, cx| {
+                    surfaces.focus_settings_search(window, cx)
+                });
+            }
+            SidebarEvent::SettingsSearchCleared => {
+                surfaces.update(cx, |surfaces, cx| {
+                    surfaces.clear_settings_search(window, cx)
+                });
+            }
+            SidebarEvent::SettingsDismissed => {
+                surfaces.update(cx, |surfaces, cx| surfaces.dismiss(cx));
+            }
+            _ => {}
+        },
+    );
+    [mirror, clicks]
+}
+
 #[cfg(target_os = "macos")]
 use crate::macos::{menu_bar::NativeMenuBar, notifier::NativeNotifier};
-
-actions!(diri, [CloseSession, ReopenSession, OpenLauncher]);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NewSessionShortcut {
-    Default,
-    Shell,
-    Codex,
-}
-
-/// The session-creation shortcut policy, kept separate from dispatch so it can
-/// be regression-tested without constructing the full daemon-backed root view.
-fn new_session_shortcut(key: &str, modifiers: Modifiers) -> Option<NewSessionShortcut> {
-    if !modifiers.platform {
-        return None;
-    }
-    match key {
-        "t" if modifiers.alt => Some(NewSessionShortcut::Shell),
-        "t" if !modifiers.shift => Some(NewSessionShortcut::Default),
-        "n" if modifiers.shift => Some(NewSessionShortcut::Codex),
-        _ => None,
-    }
-}
-
-/// Session navigation owns only its explicit shortcut. Returning `None` leaves
-/// arrow keys available to the focused text field or terminal.
-fn session_navigation_delta(
-    key: &str,
-    modifiers: Modifiers,
-    arrow_surface_visible: bool,
-) -> Option<isize> {
-    if !modifiers.platform || arrow_surface_visible {
-        return None;
-    }
-    match key {
-        "up" | "left" if modifiers.alt => Some(-1),
-        "down" | "right" if modifiers.alt => Some(1),
-        "[" | "{" => Some(-1),
-        "]" | "}" => Some(1),
-        _ => None,
-    }
-}
 
 /// Drag payload for the sidebar resize seam. Renders nothing -- it exists so
 /// GPUI keeps routing mouse moves to the root while the seam is being dragged.
@@ -108,6 +127,22 @@ impl Render for DraggedInspectorEdge {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         gpui::Empty
     }
+}
+
+#[derive(Clone, Debug)]
+struct QuoteTargetPicker {
+    quote: Quote,
+    targets: Vec<SessionRecord>,
+    highlighted: usize,
+    return_surface: QuoteSurface,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum QuoteSurface {
+    #[default]
+    PrimaryTerminal,
+    AuxiliaryTerminal,
+    Inspector,
 }
 
 /// Advances one panel's seam by a frame and returns the width to paint,
@@ -173,7 +208,12 @@ pub struct RootView {
     window_bounds_save: Option<Task<()>>,
     status_banner: Option<InAppBanner>,
     status_banner_generation: u64,
+    quote_target_picker: Option<QuoteTargetPicker>,
+    last_quote_surface: QuoteSurface,
     sound_gate: SoundGate,
+    /// Set when opening settings had to reveal a hidden sidebar to put its
+    /// navigation somewhere, so closing settings can hide it again.
+    sidebar_revealed_for_settings: bool,
     preview: bool,
     preview_scenario: PreviewScenario,
     #[cfg(target_os = "macos")]
@@ -243,37 +283,84 @@ impl RootView {
             });
         }
         if let Some(terminal) = &terminal {
-            cx.subscribe(terminal, |this, _, event, cx| match event {
-                TerminalPaneEvent::ToggleSidebar => {
-                    this.sidebar.update(cx, |sidebar, cx| sidebar.toggle(cx));
-                }
-                TerminalPaneEvent::ToggleInspector => this.toggle_inspector(cx),
-                TerminalPaneEvent::OpenFileReference { reference, cwd, .. } => {
-                    let inspector = this.inspector.clone();
-                    this.reveal_inspector(cx);
-                    if let Some(inspector) = inspector {
-                        inspector.update(cx, |inspector, cx| {
-                            inspector.open_file_reference(cwd.clone(), reference.clone(), cx);
-                        });
-                    }
+            cx.subscribe(terminal, |this, _, event, cx| {
+                let TerminalPaneEvent::OpenFileReference { reference, cwd, .. } = event;
+                let inspector = this.inspector.clone();
+                this.reveal_inspector(cx);
+                if let Some(inspector) = inspector {
+                    inspector.update(cx, |inspector, cx| {
+                        inspector.open_file_reference(cwd.clone(), reference.clone(), cx);
+                    });
                 }
             })
             .detach();
         }
         cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
-            if matches!(event, SidebarEvent::SessionActivated)
-                && let Some(terminal) = &this.terminal
+            if let SidebarEvent::HandoffProposed(proposal) = event {
+                this.launcher.update(cx, |launcher, cx| {
+                    launcher.open_handoff(proposal.clone(), window, cx);
+                });
+            }
+            if let SidebarEvent::ExternalDrop(plan) = event
+                && let Some(action) = &plan.action
             {
-                terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
-                this.sync_auxiliary_terminal(window, cx);
+                let notice = plan.feedback();
+                match action {
+                    ExternalDropAction::OpenLauncher { root } => {
+                        this.launcher.update(cx, |launcher, cx| {
+                            launcher.open_at_directory(root.clone(), notice, window, cx);
+                        });
+                    }
+                    ExternalDropAction::OpenSessionComposer {
+                        session_id,
+                        insertion,
+                    } => {
+                        this.launcher.update(cx, |launcher, cx| {
+                            launcher.open_local_paths_for_session(
+                                session_id.clone(),
+                                insertion,
+                                notice,
+                                window,
+                                cx,
+                            );
+                        });
+                    }
+                }
+                // Like Command-N, a drop swaps the main-pane branch. Focus
+                // once more after GPUI mounts the composer so the insertion
+                // caret is ready without a click.
+                let launcher = this.launcher.clone();
+                cx.defer_in(window, move |_, window, cx| {
+                    launcher.update(cx, |launcher, cx| launcher.focus(window, cx));
+                });
+            }
+            if matches!(event, SidebarEvent::SessionActivated) {
+                if this.launcher.read(cx).is_open() {
+                    this.launcher
+                        .update(cx, |launcher, cx| launcher.dismiss(cx));
+                }
+                if let Some(terminal) = &this.terminal {
+                    terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+                    this.sync_auxiliary_terminal(window, cx);
+                }
+            }
+            if matches!(event, SidebarEvent::FocusTerminal) {
+                if let Some(terminal) = &this.terminal {
+                    terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+                    this.sync_auxiliary_terminal(window, cx);
+                } else {
+                    window.focus(&this.focus, cx);
+                }
             }
             if let SidebarEvent::Update(command) = event {
                 this.services.updates.send(command.clone());
             }
-            if matches!(event, SidebarEvent::OpenSettings)
+            if let SidebarEvent::OpenAgentSettings(host) = event
                 && let Some(surfaces) = &this.utility_surfaces
             {
-                surfaces.update(cx, |surfaces, cx| surfaces.open_settings(cx));
+                surfaces.update(cx, |surfaces, cx| {
+                    surfaces.open_agent_settings(host.clone(), cx);
+                });
             }
             if matches!(event, SidebarEvent::AddRemoteHost)
                 && let Some(surfaces) = &this.utility_surfaces
@@ -284,14 +371,50 @@ impl RootView {
             }
             if matches!(event, SidebarEvent::VisibilityChanged) {
                 this.begin_sidebar_slide(cx);
+                // Settings navigation lives in the sidebar, so hiding the
+                // sidebar is also the way out of settings.
+                if !this.sidebar.read(cx).is_visible()
+                    && let Some(surfaces) = &this.utility_surfaces
+                    && surfaces.read(cx).is_settings_open()
+                {
+                    this.sidebar_revealed_for_settings = false;
+                    surfaces.update(cx, |surfaces, cx| surfaces.dismiss(cx));
+                }
             }
             cx.notify();
         })
         .detach();
+        if let Some(surfaces) = &utility_surfaces {
+            // Settings navigation is painted by the sidebar, so a settings
+            // that opened onto a hidden sidebar has to bring it back -- and
+            // give it up again on the way out.
+            cx.observe(surfaces, |this, surfaces, cx| {
+                let open = surfaces.read(cx).is_settings_open();
+                if open && !this.sidebar.read(cx).is_visible() {
+                    this.sidebar_revealed_for_settings = true;
+                    this.sidebar.update(cx, |sidebar, cx| sidebar.reveal(cx));
+                } else if !open && std::mem::take(&mut this.sidebar_revealed_for_settings) {
+                    this.sidebar.update(cx, |sidebar, cx| sidebar.conceal(cx));
+                }
+            })
+            .detach();
+            for subscription in
+                wire_settings_navigation(sidebar.clone(), surfaces.clone(), window, cx)
+            {
+                subscription.detach();
+            }
+        }
         cx.subscribe_in(
             &launcher,
             window,
-            |this, _, _: &LauncherEvent, window, cx| {
+            |this, _, event: &LauncherEvent, window, cx| {
+                if let LauncherEvent::ManageAgents(host) = event
+                    && let Some(surfaces) = &this.utility_surfaces
+                {
+                    surfaces.update(cx, |surfaces, cx| {
+                        surfaces.open_agent_settings(host.clone(), cx);
+                    });
+                }
                 if let Some(terminal) = &this.terminal {
                     terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
                 } else {
@@ -303,32 +426,6 @@ impl RootView {
             },
         )
         .detach();
-        if let Some(navigation) = &navigation {
-            cx.subscribe(navigation, |this, _, event, cx| match event {
-                NavigationEvent::ToggleSidebar => {
-                    this.sidebar.update(cx, |sidebar, cx| sidebar.toggle(cx));
-                }
-                NavigationEvent::OpenOverview => {
-                    if let Some(surfaces) = &this.session_surfaces {
-                        surfaces.update(cx, |surfaces, cx| surfaces.open_overview(cx));
-                    }
-                }
-                NavigationEvent::OpenWorktrees => {
-                    if let Some(surfaces) = &this.utility_surfaces {
-                        surfaces.update(cx, |surfaces, cx| surfaces.open_worktrees(cx));
-                    }
-                }
-                NavigationEvent::OpenSettings => {
-                    if let Some(surfaces) = &this.utility_surfaces {
-                        surfaces.update(cx, |surfaces, cx| surfaces.open_settings(cx));
-                    }
-                }
-                NavigationEvent::CheckForUpdates => {
-                    this.services.updates.check(true);
-                }
-            })
-            .detach();
-        }
         if let Some(inspector) = &inspector {
             cx.subscribe(inspector, |this, _, event, cx| {
                 if matches!(event, InspectorEvent::Close) {
@@ -353,7 +450,7 @@ impl RootView {
             .and_then(|mtm| NativeMenuBar::new(mtm, Arc::clone(&services.store.store)));
         #[cfg(target_os = "macos")]
         if let Some(menu_bar) = &mut menu_bar {
-            menu_bar.update(&snapshots.borrow());
+            menu_bar.refresh();
         }
         #[cfg(target_os = "macos")]
         let notifier = NativeNotifier::new(services.store.notification_action_sender());
@@ -395,7 +492,7 @@ impl RootView {
                                     NotificationSound::Frozen => StatusSound::Frozen,
                                 };
                                 if this.sound_gate.should_play(sound, Instant::now()) {
-                                    let _ = sounds::play(&AfplayPlayer, sound);
+                                    let _ = sounds::play(&PlatformPlayer, sound);
                                 }
                             }
                             #[cfg(target_os = "macos")]
@@ -427,11 +524,11 @@ impl RootView {
                     }
                     changed = snapshots.changed() => {
                         if changed.is_err() { break; }
-                        let snapshot = snapshots.borrow_and_update().clone();
-                        let _ = this.update(cx, |this, _cx| {
+                        let _ = snapshots.borrow_and_update();
+                        let _ = this.update(cx, |_this, _cx| {
                             #[cfg(target_os = "macos")]
-                            if let Some(menu_bar) = &mut this.menu_bar {
-                                menu_bar.update(&snapshot);
+                            if let Some(menu_bar) = &mut _this.menu_bar {
+                                menu_bar.refresh();
                             }
                         });
                     }
@@ -489,6 +586,36 @@ impl RootView {
                     Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         if this
                             .update_in(cx, |this, window, cx| {
+                                // This loop runs on every store change; probe under
+                                // a read lock so only the rare menu-bar request
+                                // pays for exclusive access.
+                                let pending = this
+                                    .services
+                                    .store
+                                    .store
+                                    .read()
+                                    .expect("session store lock poisoned")
+                                    .has_pending_ui_request();
+                                let (open_launcher, open_settings) = if pending {
+                                    let mut store = this
+                                        .services
+                                        .store
+                                        .store
+                                        .write()
+                                        .expect("session store lock poisoned");
+                                    (
+                                        store.take_open_launcher_request(),
+                                        store.take_open_settings_request(),
+                                    )
+                                } else {
+                                    (false, false)
+                                };
+                                if open_launcher {
+                                    this.open_launcher(&OpenLauncher, window, cx);
+                                }
+                                if open_settings && let Some(surfaces) = &this.utility_surfaces {
+                                    surfaces.update(cx, |surfaces, cx| surfaces.open_settings(cx));
+                                }
                                 this.sync_auxiliary_terminal(window, cx);
                             })
                             .is_err()
@@ -555,7 +682,10 @@ impl RootView {
             window_bounds_save: None,
             status_banner: None,
             status_banner_generation: 0,
+            quote_target_picker: None,
+            last_quote_surface: QuoteSurface::default(),
             sound_gate: SoundGate::default(),
+            sidebar_revealed_for_settings: false,
             preview,
             preview_scenario,
             #[cfg(target_os = "macos")]
@@ -619,15 +749,308 @@ impl RootView {
         crate::app_theme::colors(&store.preferences().terminal_theme)
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.launcher.read(cx).is_open() {
-            let reopen = event.keystroke.modifiers.platform
-                && event.keystroke.key == "n"
-                && !event.keystroke.modifiers.shift;
-            self.launcher.update(cx, |launcher, cx| {
-                launcher.handle_key_down(event, _window, cx);
+    fn show_quote_feedback(
+        &mut self,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.status_banner_generation = self.status_banner_generation.wrapping_add(1);
+        let generation = self.status_banner_generation;
+        self.status_banner = Some(InAppBanner {
+            title: title.into(),
+            body: body.into(),
+        });
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(4)).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.status_banner_generation == generation {
+                    this.status_banner = None;
+                    cx.notify();
+                }
             });
-            if !reopen {
+        })
+        .detach();
+    }
+
+    fn focused_quote_surface(&self, window: &Window, cx: &App) -> Option<QuoteSurface> {
+        if let Some(auxiliary) = &self.auxiliary_terminal
+            && auxiliary.read(cx).is_focused(window)
+        {
+            return Some(QuoteSurface::AuxiliaryTerminal);
+        }
+        if let Some(inspector) = &self.inspector
+            && inspector.read(cx).is_focused(window)
+        {
+            return Some(QuoteSurface::Inspector);
+        }
+        if let Some(terminal) = &self.terminal
+            && terminal.read(cx).is_focused(window)
+        {
+            return Some(QuoteSurface::PrimaryTerminal);
+        }
+        None
+    }
+
+    fn quote_from_surface(&self, surface: QuoteSurface, cx: &App) -> Option<Quote> {
+        match surface {
+            QuoteSurface::PrimaryTerminal => self
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.read(cx).quote_selection()),
+            QuoteSurface::AuxiliaryTerminal => self
+                .auxiliary_terminal
+                .as_ref()
+                .and_then(|terminal| terminal.read(cx).quote_selection()),
+            QuoteSurface::Inspector => self
+                .inspector
+                .as_ref()
+                .and_then(|inspector| inspector.read(cx).quote_selection()),
+        }
+    }
+
+    fn remember_quote_surface(&mut self, window: &Window, cx: &App) {
+        if let Some(surface) = self.focused_quote_surface(window, cx) {
+            self.last_quote_surface = surface;
+        }
+    }
+
+    fn restore_quote_focus(
+        &self,
+        surface: QuoteSurface,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let handle = match surface {
+            QuoteSurface::PrimaryTerminal => self
+                .terminal
+                .as_ref()
+                .map(|terminal| terminal.read(cx).quote_focus_handle()),
+            QuoteSurface::AuxiliaryTerminal => self
+                .auxiliary_terminal
+                .as_ref()
+                .map(|terminal| terminal.read(cx).quote_focus_handle()),
+            QuoteSurface::Inspector => self
+                .inspector
+                .as_ref()
+                .map(|inspector| inspector.read(cx).focus_handle(cx)),
+        };
+        if let Some(handle) = handle {
+            window.focus(&handle, cx);
+        }
+    }
+
+    fn selected_quote(&self, window: &Window, cx: &App) -> Option<Quote> {
+        if let Some(surface) = self.focused_quote_surface(window, cx) {
+            return self.quote_from_surface(surface, cx);
+        }
+        // Palette execution temporarily owns focus. Preserve the visible
+        // source surface rather than making Quote Selection palette-only fail.
+        self.quote_from_surface(self.last_quote_surface, cx)
+            .or_else(|| {
+                self.terminal
+                    .as_ref()
+                    .and_then(|terminal| terminal.read(cx).quote_selection())
+            })
+    }
+
+    fn quote_targets(&self) -> Vec<SessionRecord> {
+        self.services
+            .store
+            .store
+            .write()
+            .expect("session store lock poisoned")
+            .ordered_sessions()
+            .into_iter()
+            .filter(is_quote_target)
+            .collect()
+    }
+
+    fn quote_selection(&mut self, pick_target: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(quote) = self.selected_quote(window, cx) else {
+            self.show_quote_feedback(
+                "Nothing selected",
+                "Select terminal text, a diff hunk or line range, or a Markdown turn first.",
+                cx,
+            );
+            return;
+        };
+        if pick_target {
+            let return_surface = self
+                .focused_quote_surface(window, cx)
+                .unwrap_or(self.last_quote_surface);
+            let targets = self.quote_targets();
+            if targets.is_empty() {
+                self.show_quote_feedback(
+                    "No target session",
+                    "Start an agent to stage this quote.",
+                    cx,
+                );
+                return;
+            }
+            let active = self
+                .services
+                .store
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .selected_session_id()
+                .cloned();
+            let highlighted = active
+                .as_ref()
+                .and_then(|id| targets.iter().position(|session| &session.id == id))
+                .unwrap_or(0);
+            self.sidebar.update(cx, |sidebar, cx| sidebar.reveal(cx));
+            self.quote_target_picker = Some(QuoteTargetPicker {
+                quote,
+                targets,
+                highlighted,
+                return_surface,
+            });
+            window.focus(&self.focus, cx);
+            cx.notify();
+            return;
+        }
+        let target = self
+            .services
+            .store
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .selected_session_id()
+            .cloned();
+        let Some(target) = target else {
+            self.show_quote_feedback(
+                "No active session",
+                "Select an agent to receive the quote.",
+                cx,
+            );
+            return;
+        };
+        if !self
+            .quote_targets()
+            .iter()
+            .any(|session| session.id == target)
+        {
+            self.show_quote_feedback(
+                "Active session unavailable",
+                "Choose a running or sleeping agent—not a shell—as the quote target.",
+                cx,
+            );
+            return;
+        }
+        self.open_quote_draft(target, quote, window, cx);
+    }
+
+    fn open_quote_draft(
+        &mut self,
+        target: SessionId,
+        quote: Quote,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target_record = self
+            .services
+            .store
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .sessions()
+            .get(&target)
+            .cloned();
+        let Some(target_record) = target_record else {
+            self.show_quote_feedback("Target unavailable", "That session no longer exists.", cx);
+            return;
+        };
+        if !is_quote_target(&target_record) {
+            self.show_quote_feedback(
+                "Target unavailable",
+                "Quotes can be staged only in an agent draft, not a shell.",
+                cx,
+            );
+            return;
+        }
+        let text = quote.framed();
+        self.launcher.update(cx, |launcher, cx| {
+            launcher.open_for_session(target, &text, None, window, cx);
+        });
+        // Mount the app-owned composer before focusing its insertion caret.
+        // This changes no sidebar/session selection and does not touch the PTY.
+        let launcher = self.launcher.clone();
+        cx.defer_in(window, move |_, window, cx| {
+            launcher.update(cx, |launcher, cx| launcher.focus(window, cx));
+        });
+    }
+
+    fn activate_quote_target(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(picker) = self.quote_target_picker.take() else {
+            return;
+        };
+        // Resolve against the snapshot shown to the user. A concurrent store
+        // reorder must never redirect a click to a different session.
+        let Some(target) = quote_target_id(&picker.targets, index) else {
+            self.show_quote_feedback("Target unavailable", "Choose another session.", cx);
+            return;
+        };
+        self.open_quote_draft(target, picker.quote, window, cx);
+    }
+
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quote_target_picker.is_some() {
+            let target_count = self
+                .quote_target_picker
+                .as_ref()
+                .map_or(0, |picker| picker.targets.len());
+            match event.keystroke.key.as_str() {
+                "escape" => {
+                    if let Some(picker) = self.quote_target_picker.take() {
+                        self.restore_quote_focus(picker.return_surface, window, cx);
+                    }
+                    cx.notify();
+                }
+                "up" if target_count > 0 => {
+                    let picker = self.quote_target_picker.as_mut().expect("picker exists");
+                    picker.highlighted = picker
+                        .highlighted
+                        .checked_sub(1)
+                        .unwrap_or(target_count - 1);
+                    cx.notify();
+                }
+                "down" if target_count > 0 => {
+                    let picker = self.quote_target_picker.as_mut().expect("picker exists");
+                    picker.highlighted = (picker.highlighted + 1) % target_count;
+                    cx.notify();
+                }
+                "enter" if target_count > 0 => {
+                    let highlighted = self
+                        .quote_target_picker
+                        .as_ref()
+                        .expect("picker exists")
+                        .highlighted;
+                    self.activate_quote_target(highlighted, window, cx);
+                }
+                _ => {}
+            }
+            cx.stop_propagation();
+            return;
+        }
+        // The sidebar is a real keyboard surface. Let its bubble handler own
+        // navigation and rename input instead of mirroring the same keystroke
+        // into the live terminal during root capture.
+        if self.sidebar.read(cx).is_focused(window) {
+            return;
+        }
+        if self.launcher.read(cx).is_open() {
+            let reopen = commands::matches_keystroke(CommandId::OpenLauncher, &event.keystroke);
+            let focus_sidebar =
+                commands::matches_keystroke(CommandId::FocusSidebar, &event.keystroke);
+            if !focus_sidebar {
+                self.launcher.update(cx, |launcher, cx| {
+                    launcher.handle_key_down(event, window, cx);
+                });
+            }
+            if !reopen && !focus_sidebar {
                 cx.stop_propagation();
             }
             return;
@@ -635,11 +1058,18 @@ impl RootView {
         if let Some(surfaces) = &self.utility_surfaces
             && surfaces.read(cx).is_open()
         {
-            let global_overlay_shortcut = event.keystroke.modifiers.platform
-                && matches!(event.keystroke.key.as_str(), "h" | "," | "k" | "p");
-            if !global_overlay_shortcut {
+            let global_overlay_command = [
+                CommandId::ToggleHistory,
+                CommandId::OpenSettings,
+                CommandId::ToggleCommandPalette,
+                CommandId::ToggleQuickOpen,
+                CommandId::FocusSidebar,
+            ]
+            .into_iter()
+            .any(|command| commands::matches_keystroke(command, &event.keystroke));
+            if !global_overlay_command {
                 surfaces.update(cx, |surfaces, cx| {
-                    surfaces.key_down(event, _window, cx);
+                    surfaces.key_down(event, window, cx);
                 });
                 cx.stop_propagation();
                 return;
@@ -647,161 +1077,155 @@ impl RootView {
         }
         if let Some(surfaces) = &self.session_surfaces {
             surfaces.update(cx, |surfaces, cx| {
-                surfaces.handle_key_down(event, _window, cx);
+                surfaces.handle_key_down(event, window, cx);
             });
         }
-        if !event.keystroke.modifiers.platform {
-            return;
-        }
-        match event.keystroke.key.as_str() {
-            "k" => {
+    }
+
+    /// Executes application commands after GPUI has resolved the active key
+    /// context. This is the only place that translates static commands into
+    /// mutations of RootView's child modules.
+    fn run_command(&mut self, command: CommandId, window: &mut Window, cx: &mut Context<Self>) {
+        match command {
+            // A spawn the catalog vetoes falls back to the launcher, where the
+            // unavailability is visible and another Agent is one keystroke
+            // away, instead of a shortcut that silently does nothing.
+            CommandId::NewDefaultSession => {
+                if !self.spawn_default() {
+                    self.open_launcher(&OpenLauncher, window, cx);
+                }
+            }
+            CommandId::NewTerminal => {
+                self.spawn(None);
+            }
+            CommandId::NewCodexSession => {
+                if !self.spawn(Some(AgentKind::CODEX)) {
+                    self.open_launcher(&OpenLauncher, window, cx);
+                }
+            }
+            CommandId::ToggleCommandPalette => {
+                self.remember_quote_surface(window, cx);
                 if let Some(navigation) = &self.navigation {
                     navigation.update(cx, |navigation, cx| {
-                        navigation.toggle_command_palette(&ToggleCommandPalette, _window, cx);
+                        navigation.toggle_command_palette(&ToggleCommandPalette, window, cx);
                     });
                 }
             }
-            "p" => {
+            CommandId::ToggleQuickOpen => {
                 if let Some(navigation) = &self.navigation {
                     navigation.update(cx, |navigation, cx| {
-                        navigation.toggle_quick_open(&ToggleQuickOpen, _window, cx);
+                        navigation.toggle_quick_open(&ToggleQuickOpen, window, cx);
                     });
                 }
             }
-            "h" if event.keystroke.modifiers.shift => {
+            CommandId::ToggleHistory => {
                 if let Some(surfaces) = &self.utility_surfaces {
                     surfaces.update(cx, |surfaces, cx| surfaces.toggle_history(cx));
                 }
             }
-            "," => {
-                if let Some(surfaces) = &self.utility_surfaces {
-                    surfaces.update(cx, |surfaces, cx| surfaces.open_settings(cx));
+            CommandId::ToggleOverview => {
+                if let Some(surfaces) = &self.session_surfaces {
+                    surfaces.update(cx, |surfaces, cx| surfaces.toggle_overview(cx));
                 }
             }
-            "b" => self.sidebar.update(cx, |sidebar, cx| sidebar.toggle(cx)),
-            "d" if event.keystroke.modifiers.shift => self.toggle_inspector(cx),
-            key @ ("t" | "n") => match new_session_shortcut(key, event.keystroke.modifiers) {
-                Some(NewSessionShortcut::Default) => {
-                    if !self.spawn_default() {
-                        return;
-                    }
-                }
-                Some(NewSessionShortcut::Shell) => {
-                    if !self.spawn(None) {
-                        return;
-                    }
-                }
-                Some(NewSessionShortcut::Codex) => {
-                    if !self.spawn(Some(DefaultAgent::Codex)) {
-                        return;
-                    }
-                }
-                None => return,
-            },
-            // ⌥⌘W: worktrees overview. ⌘⇧W archives the selected session;
-            // plain ⌘W is bound globally to CloseSession.
-            "w" if event.keystroke.modifiers.alt => {
+            CommandId::OpenWorktrees => {
                 if let Some(surfaces) = &self.utility_surfaces {
                     surfaces.update(cx, |surfaces, cx| surfaces.open_worktrees(cx));
-                } else {
-                    return;
                 }
             }
-            "w" if event.keystroke.modifiers.shift => {
-                let archived = self
-                    .sidebar
+            CommandId::OpenSettings => {
+                if let Some(surfaces) = &self.utility_surfaces {
+                    surfaces.update(cx, |surfaces, cx| surfaces.toggle_settings(cx));
+                }
+            }
+            CommandId::ToggleSidebar => {
+                self.sidebar.update(cx, |sidebar, cx| sidebar.toggle(cx));
+            }
+            CommandId::FocusSidebar => {
+                if self.launcher.read(cx).is_open() {
+                    self.launcher
+                        .update(cx, |launcher, cx| launcher.dismiss(cx));
+                }
+                if let Some(navigation) = &self.navigation {
+                    navigation.update(cx, |navigation, cx| navigation.dismiss(cx));
+                }
+                if let Some(surfaces) = &self.utility_surfaces {
+                    surfaces.update(cx, |surfaces, cx| surfaces.dismiss(cx));
+                }
+                if let Some(surfaces) = &self.session_surfaces {
+                    surfaces.update(cx, |surfaces, cx| surfaces.dismiss(cx));
+                }
+                self.sidebar
+                    .update(cx, |sidebar, cx| sidebar.focus(window, cx));
+            }
+            CommandId::ToggleInspector => self.toggle_inspector(cx),
+            CommandId::ToggleAuxiliaryTerminal => {
+                self.open_auxiliary_terminal(window, cx);
+            }
+            CommandId::QuoteSelection => self.quote_selection(false, window, cx),
+            CommandId::QuoteSelectionToSession => self.quote_selection(true, window, cx),
+            CommandId::ArchiveSelectedSession => {
+                self.sidebar
                     .update(cx, |sidebar, cx| sidebar.archive_selected(cx));
-                if !archived {
-                    return;
+            }
+            CommandId::RenameSelectedSession => {
+                self.sidebar
+                    .update(cx, |sidebar, cx| sidebar.rename_selected(window, cx));
+            }
+            CommandId::DelegateSelectedSession => {
+                let handled = self
+                    .sidebar
+                    .update(cx, |sidebar, cx| sidebar.mark_or_delegate_selected(cx));
+                if !handled {
+                    cx.propagate();
                 }
             }
-            "r" if !event.keystroke.modifiers.shift => {
-                let renaming = self
-                    .sidebar
-                    .update(cx, |sidebar, cx| sidebar.rename_selected(_window, cx));
-                if !renaming {
-                    return;
-                }
-            }
-            // ⇧⌘J retains the attention-navigation command that previously
-            // occupied plain ⌘J.
-            "j" if event.keystroke.modifiers.shift => {
-                let selected = self
-                    .sidebar
+            CommandId::SelectNextAttentionSession => {
+                self.sidebar
                     .update(cx, |sidebar, cx| sidebar.select_next_needing_input(cx));
-                if !selected {
-                    return;
-                }
             }
-            // ⌘J opens (or focuses) a terminal owned by the selected agent's
-            // workbench, below the primary pane.
-            "j" => {
-                if !self.open_auxiliary_terminal(_window, cx) {
-                    return;
-                }
+            CommandId::CheckForUpdates => self.services.updates.check(true),
+            CommandId::SelectPreviousSession if !self.arrow_surface_visible() => {
+                self.sidebar
+                    .update(cx, |sidebar, cx| sidebar.select_relative(-1, cx));
             }
-            digit @ ("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8") => {
-                // ⌘1–⌘8 select the nth session, matching the sidebar's row
-                // hints; selection also focuses the terminal via
-                // SessionActivated.
-                let index = (digit.as_bytes()[0] - b'1') as usize;
-                let selected = self
-                    .sidebar
-                    .update(cx, |sidebar, cx| sidebar.select_shortcut(index, cx));
-                if !selected {
-                    return;
-                }
+            CommandId::SelectNextSession if !self.arrow_surface_visible() => {
+                self.sidebar
+                    .update(cx, |sidebar, cx| sidebar.select_relative(1, cx));
             }
-            // ⌘9 jumps to the last session, the browser convention.
-            "9" => {
-                let selected = self
-                    .sidebar
+            CommandId::MoveSelectedSessionUp if !self.arrow_surface_visible() => {
+                self.sidebar
+                    .update(cx, |sidebar, cx| sidebar.reorder_selected(-1, cx));
+            }
+            CommandId::MoveSelectedSessionDown if !self.arrow_surface_visible() => {
+                self.sidebar
+                    .update(cx, |sidebar, cx| sidebar.reorder_selected(1, cx));
+            }
+            CommandId::SelectSession1 => self.select_session_shortcut(0, cx),
+            CommandId::SelectSession2 => self.select_session_shortcut(1, cx),
+            CommandId::SelectSession3 => self.select_session_shortcut(2, cx),
+            CommandId::SelectSession4 => self.select_session_shortcut(3, cx),
+            CommandId::SelectSession5 => self.select_session_shortcut(4, cx),
+            CommandId::SelectSession6 => self.select_session_shortcut(5, cx),
+            CommandId::SelectSession7 => self.select_session_shortcut(6, cx),
+            CommandId::SelectSession8 => self.select_session_shortcut(7, cx),
+            CommandId::SelectLastSession => {
+                self.sidebar
                     .update(cx, |sidebar, cx| sidebar.select_last(cx));
-                if !selected {
-                    return;
-                }
             }
-            // ⌃⌘↑/⌃⌘↓ move the selected row within its project group.
-            "up" | "down" if event.keystroke.modifiers.control && !self.arrow_surface_visible() => {
-                let delta = if event.keystroke.key == "up" { -1 } else { 1 };
-                let moved = self
-                    .sidebar
-                    .update(cx, |sidebar, cx| sidebar.reorder_selected(delta, cx));
-                if !moved {
-                    return;
-                }
-            }
-            // The explicit session-navigation shortcut steps through sidebar
-            // order, wrapping. The switcher and overview own arrows while open.
-            key if session_navigation_delta(
-                key,
-                event.keystroke.modifiers,
-                self.arrow_surface_visible(),
-            )
-            .is_some() =>
-            {
-                let delta = session_navigation_delta(
-                    key,
-                    event.keystroke.modifiers,
-                    self.arrow_surface_visible(),
-                )
-                .expect("guard checked navigation shortcut");
-                let selected = self
-                    .sidebar
-                    .update(cx, |sidebar, cx| sidebar.select_relative(delta, cx));
-                if !selected {
-                    return;
-                }
-            }
-            _ => return,
+            _ => cx.propagate(),
         }
-        cx.stop_propagation();
+    }
+
+    fn select_session_shortcut(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.select_shortcut(index, cx));
     }
 
     /// Spawns a shell (`None`) or a specific agent straight from a shortcut,
     /// bypassing the sidebar's picker. No-ops in preview, which has no daemon
     /// to spawn into. Reports whether the spawn was dispatched.
-    fn spawn(&self, agent: Option<DefaultAgent>) -> bool {
+    fn spawn(&self, agent: Option<AgentKind>) -> bool {
         if self.preview {
             return false;
         }
@@ -814,8 +1238,15 @@ impl RootView {
         match agent {
             Some(agent) => {
                 let host = store.default_spawn_host();
+                if !crate::agent_catalog::kind_spawnable(
+                    &agent,
+                    store.agent_catalog(host.as_deref()),
+                ) {
+                    store.request_agent_catalog(host, false);
+                    return false;
+                }
                 store.spawn_kind(
-                    agent.kind(),
+                    agent,
                     SpawnOptions {
                         host,
                         ..SpawnOptions::default()
@@ -831,13 +1262,17 @@ impl RootView {
         if self.preview {
             return false;
         }
-        self.services
+        let mut store = self
+            .services
             .store
             .store
             .write()
-            .expect("session store lock poisoned")
-            .spawn_default(SpawnOptions::default());
-        true
+            .expect("session store lock poisoned");
+        let host = store.default_spawn_host();
+        store.spawn_default(SpawnOptions {
+            host,
+            ..SpawnOptions::default()
+        })
     }
 
     fn open_auxiliary_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -1045,6 +1480,20 @@ impl RootView {
         cx.notify();
         // The launcher was not mounted while the terminal branch was active.
         // Focus it on the next frame, after GPUI has installed its focus node.
+        let launcher = self.launcher.clone();
+        cx.defer_in(window, move |_, window, cx| {
+            launcher.update(cx, |launcher, cx| launcher.focus(window, cx));
+        });
+    }
+
+    fn toggle_launcher(&mut self, _: &OpenLauncher, window: &mut Window, cx: &mut Context<Self>) {
+        let opens = self
+            .launcher
+            .update(cx, |launcher, cx| launcher.toggle(window, cx));
+        cx.notify();
+        if !opens {
+            return;
+        }
         let launcher = self.launcher.clone();
         cx.defer_in(window, move |_, window, cx| {
             launcher.update(cx, |launcher, cx| launcher.focus(window, cx));
@@ -1793,6 +2242,219 @@ impl RootView {
         )
     }
 
+    fn quote_target_picker(
+        &self,
+        colors: SemanticColors,
+        sidebar_width: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let picker = self.quote_target_picker.as_ref()?;
+        let targets = picker.targets.clone();
+        let active = self
+            .services
+            .store
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .selected_session_id()
+            .cloned();
+        let mut rows = div().py(px(4.0)).flex().flex_col().gap(px(1.0));
+        for (index, session) in targets.into_iter().enumerate() {
+            let highlighted = index == picker.highlighted;
+            let is_active = active.as_ref() == Some(&session.id);
+            let detail = if session.hibernation.is_some() {
+                "Sleeping · stages without waking"
+            } else if is_active {
+                "Active session"
+            } else {
+                "Keeps current session active"
+            };
+            rows = rows.child(
+                div()
+                    .id(("quote-target", index))
+                    .debug_selector(move || format!("QUOTE_TARGET_{index}"))
+                    .min_h(px(46.0))
+                    .mx(px(4.0))
+                    .px(px(8.0))
+                    .py(px(6.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .rounded(px(Radius::ROW))
+                    .bg(if highlighted {
+                        rgba(0x5b8fd12f)
+                    } else {
+                        colors.primary.alpha(0.0)
+                    })
+                    .border_1()
+                    .border_color(if highlighted {
+                        rgba(0x8bb9e878)
+                    } else {
+                        colors.primary.alpha(0.0)
+                    })
+                    .cursor_pointer()
+                    .hover(move |row| row.bg(colors.primary.alpha(0.075)))
+                    .child(
+                        div()
+                            .size(px(26.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(colors.primary.alpha(0.055))
+                            .child(sf_symbol("terminal", 11.0, colors.secondary)),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(Typo::ROW.size))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(colors.primary)
+                                    .child(session.title),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(Typo::META.size))
+                                    .text_color(colors.tertiary)
+                                    .child(detail),
+                            ),
+                    )
+                    .when(highlighted, |row| {
+                        row.child(sf_symbol("return", 9.5, colors.secondary))
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.activate_quote_target(index, window, cx);
+                        cx.stop_propagation();
+                    })),
+            );
+        }
+
+        let panel = div()
+            .id("quote-target-picker")
+            .debug_selector(|| "QUOTE_TARGET_PICKER".to_owned())
+            .absolute()
+            .top(px(Metrics::TITLE_BAR + 6.0))
+            .left(px(7.0))
+            .w(px((sidebar_width - 14.0).max(220.0)))
+            .max_h(px(460.0))
+            .flex()
+            .flex_col()
+            .rounded(px(Radius::PANEL))
+            .overflow_hidden()
+            .bg(colors.floating_surface())
+            .border_1()
+            .border_color(colors.floating_stroke())
+            .shadow_lg()
+            .occlude()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .h(px(43.0))
+                    .px(px(11.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(7.0))
+                    .border_b_1()
+                    .border_color(colors.primary.alpha(0.07))
+                    .child(sf_symbol("text.quote", 11.5, rgba(0x8bb9e8ff)))
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.0))
+                            .child(
+                                div()
+                                    .text_size(px(Typo::ROW.size))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(colors.primary)
+                                    .child("Quote into…"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(Typo::META.size))
+                                    .text_color(colors.tertiary)
+                                    .child("↑↓ choose · Return stage · Esc cancel"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("quote-target-close")
+                            .size(px(21.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(Radius::CHIP))
+                            .cursor_pointer()
+                            .hover(move |button| button.bg(colors.primary.alpha(0.07)))
+                            .child(sf_symbol("xmark", 9.0, colors.tertiary))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if let Some(picker) = this.quote_target_picker.take() {
+                                    this.restore_quote_focus(picker.return_surface, window, cx);
+                                }
+                                cx.notify();
+                                cx.stop_propagation();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .id("quote-target-scroll")
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .child(rows),
+            );
+        let panel = if cx.reduce_motion() {
+            panel.into_any_element()
+        } else {
+            panel
+                .with_animation(
+                    "quote-target-picker-enter",
+                    Animation::new(Duration::from_millis(150)).with_easing(ease_out_quint()),
+                    |panel, delta| {
+                        panel
+                            .top(px(Metrics::TITLE_BAR + (1.0 - delta) * 6.0 + 6.0))
+                            .opacity(0.72 + delta * 0.28)
+                    },
+                )
+                .into_any_element()
+        };
+
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left_0()
+                .w(px(sidebar_width.max(234.0)))
+                .bg(colors.background.alpha(0.20))
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        if let Some(picker) = this.quote_target_picker.take() {
+                            this.restore_quote_focus(picker.return_surface, window, cx);
+                        }
+                        cx.notify();
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(panel)
+                .into_any_element(),
+        )
+    }
+
     fn status_banner(&self, colors: SemanticColors, cx: &mut Context<Self>) -> Option<AnyElement> {
         let banner = self.status_banner.as_ref()?;
         Some(
@@ -1862,11 +2524,128 @@ impl RootView {
             .into_any_element(),
         )
     }
+
+    fn recovery_notice(&self, notice: RecoveryNotice, colors: SemanticColors) -> AnyElement {
+        let accent = match notice.kind {
+            RecoveryKind::Connecting
+            | RecoveryKind::Reconnecting
+            | RecoveryKind::RetryingAction => colors.secondary,
+            RecoveryKind::ManualAttention | RecoveryKind::ActionFailed => Ink::ATTENTION,
+        };
+        let mut bar = div()
+            .id("recovery-notice")
+            .debug_selector(|| "RECOVERY_NOTICE".to_owned())
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(px(42.0))
+            .px(px(14.0))
+            .flex()
+            .items_center()
+            .gap(px(9.0))
+            .bg(colors.sidebar_surface())
+            .border_b_1()
+            .border_color(colors.primary.alpha(0.08))
+            .text_color(colors.primary)
+            .child(div().size(px(7.0)).flex_none().rounded_full().bg(accent))
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .flex_1()
+                    .flex()
+                    .items_baseline()
+                    .gap(px(7.0))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(Typo::ROW_EMPHASIZED.size))
+                            .font_weight(Typo::ROW_EMPHASIZED.weight)
+                            .child(notice.title),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .text_ellipsis()
+                            .text_size(px(Typo::META.size))
+                            .text_color(colors.secondary)
+                            .child(bounded_notice_body(&notice.body)),
+                    ),
+            );
+        if let Some((action, label)) = notice.primary_action {
+            let store = Arc::clone(&self.services.store.store);
+            bar = bar.child(
+                div()
+                    .id("recovery-primary-action")
+                    .h(px(27.0))
+                    .px(px(9.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .rounded(px(Radius::ROW))
+                    .cursor_pointer()
+                    .bg(colors.primary.alpha(0.075))
+                    .hover(move |button| button.bg(colors.primary.alpha(0.12)))
+                    .text_size(px(Typo::META.size))
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(label)
+                    .on_click(move |_, _, cx| {
+                        let mut store = store.write().expect("session store lock poisoned");
+                        match action {
+                            RecoveryAction::RetryConnection => store.retry_connection(),
+                            RecoveryAction::RetryAction => store.retry_last_action(),
+                        }
+                        cx.stop_propagation();
+                    }),
+            );
+        }
+        if notice.dismissible {
+            let store = Arc::clone(&self.services.store.store);
+            bar = bar.child(
+                div()
+                    .id("dismiss-recovery-notice")
+                    .size(px(24.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(Radius::CHIP))
+                    .cursor_pointer()
+                    .hover(move |button| button.bg(colors.primary.alpha(0.06)))
+                    .child(sf_symbol_weighted(
+                        "xmark",
+                        8.5,
+                        SymbolWeight::Bold,
+                        colors.tertiary,
+                    ))
+                    .on_click(move |_, _, cx| {
+                        store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .dismiss_action_failure();
+                        cx.stop_propagation();
+                    }),
+            );
+        }
+        bar.into_any_element()
+    }
 }
 
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.colors();
+        let recovery_notice = if self.preview {
+            None
+        } else {
+            let store = self
+                .services
+                .store
+                .store
+                .read()
+                .expect("session store lock poisoned");
+            RecoveryNotice::resolve(store.daemon_state(), store.action_failure())
+        };
+        let recovery_height = if recovery_notice.is_some() { 42.0 } else { 0.0 };
         let launcher_open = self.launcher.read(cx).is_open();
         let sidebar_visible = self.sidebar.read(cx).is_visible();
         let sidebar_width = self.sidebar.read(cx).width();
@@ -1888,6 +2667,9 @@ impl Render for RootView {
         self.inspector_seam = advance_seam(&mut self.inspector_slide, inspector_width, now, window);
         let seam = self.sidebar_seam;
         let inspector_seam = self.inspector_seam;
+        let mut key_context = KeyContext::new_with_defaults();
+        key_context.add(APP_CONTEXT);
+        key_context.add(SESSION_NAVIGATION_CONTEXT);
         // Each panel keeps its full width and is pinned to the wrapper edge it
         // lives against -- the sidebar's right, the inspector's left -- so
         // narrowing a wrapper slides its panel out under the clip instead of
@@ -1918,7 +2700,10 @@ impl Render for RootView {
 
         let mut root = div()
             .id("root")
+            .key_context(key_context)
+            .relative()
             .size_full()
+            .pt(px(recovery_height))
             // Real SF Pro (registered from SFNS.ttf at startup) for every UI
             // surface; the terminal grid sets its own mono font.
             .font_family(crate::fonts::ui_family())
@@ -1932,7 +2717,116 @@ impl Render for RootView {
             .capture_key_up(cx.listener(Self::on_key_up))
             .on_action(cx.listener(Self::close_selected_session))
             .on_action(cx.listener(Self::reopen_last_session))
-            .on_action(cx.listener(Self::open_launcher))
+            .on_action(cx.listener(Self::toggle_launcher))
+            .on_action(cx.listener(|this, _: &NewDefaultSession, window, cx| {
+                this.run_command(CommandId::NewDefaultSession, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NewTerminal, window, cx| {
+                this.run_command(CommandId::NewTerminal, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NewCodexSession, window, cx| {
+                this.run_command(CommandId::NewCodexSession, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| {
+                this.run_command(CommandId::ToggleCommandPalette, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleQuickOpen, window, cx| {
+                this.run_command(CommandId::ToggleQuickOpen, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleHistory, window, cx| {
+                this.run_command(CommandId::ToggleHistory, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleOverview, window, cx| {
+                this.run_command(CommandId::ToggleOverview, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenWorktrees, window, cx| {
+                this.run_command(CommandId::OpenWorktrees, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                this.run_command(CommandId::OpenSettings, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| {
+                this.run_command(CommandId::ToggleSidebar, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusSidebar, window, cx| {
+                this.run_command(CommandId::FocusSidebar, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleInspector, window, cx| {
+                this.run_command(CommandId::ToggleInspector, window, cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &ToggleAuxiliaryTerminal, window, cx| {
+                    this.run_command(CommandId::ToggleAuxiliaryTerminal, window, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &QuoteSelection, window, cx| {
+                this.run_command(CommandId::QuoteSelection, window, cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &QuoteSelectionToSession, window, cx| {
+                    this.run_command(CommandId::QuoteSelectionToSession, window, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &ArchiveSelectedSession, window, cx| {
+                this.run_command(CommandId::ArchiveSelectedSession, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &RenameSelectedSession, window, cx| {
+                this.run_command(CommandId::RenameSelectedSession, window, cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &DelegateSelectedSession, window, cx| {
+                    this.run_command(CommandId::DelegateSelectedSession, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &SelectNextAttentionSession, window, cx| {
+                    this.run_command(CommandId::SelectNextAttentionSession, window, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &CheckForUpdates, window, cx| {
+                this.run_command(CommandId::CheckForUpdates, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectPreviousSession, window, cx| {
+                this.run_command(CommandId::SelectPreviousSession, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectNextSession, window, cx| {
+                this.run_command(CommandId::SelectNextSession, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MoveSelectedSessionUp, window, cx| {
+                this.run_command(CommandId::MoveSelectedSessionUp, window, cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &MoveSelectedSessionDown, window, cx| {
+                    this.run_command(CommandId::MoveSelectedSessionDown, window, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &SelectSession1, window, cx| {
+                this.run_command(CommandId::SelectSession1, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectSession2, window, cx| {
+                this.run_command(CommandId::SelectSession2, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectSession3, window, cx| {
+                this.run_command(CommandId::SelectSession3, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectSession4, window, cx| {
+                this.run_command(CommandId::SelectSession4, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectSession5, window, cx| {
+                this.run_command(CommandId::SelectSession5, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectSession6, window, cx| {
+                this.run_command(CommandId::SelectSession6, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectSession7, window, cx| {
+                this.run_command(CommandId::SelectSession7, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectSession8, window, cx| {
+                this.run_command(CommandId::SelectSession8, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectLastSession, window, cx| {
+                this.run_command(CommandId::SelectLastSession, window, cx);
+            }))
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             // Fires for every move once the seam drag starts, wherever the
             // pointer wanders -- unlike hover-gated move listeners.
@@ -2024,25 +2918,66 @@ impl Render for RootView {
             root = root.child(cached_window_overlay(surfaces.clone()));
         }
         if let Some(surfaces) = &self.utility_surfaces {
-            root = root.child(cached_window_overlay(surfaces.clone()));
+            // Settings is not a sheet floating over the workbench: it replaces
+            // it, and the sidebar it navigates from stays put beside it. Laying
+            // it out against the live seam -- rather than a width settings
+            // snapshotted for itself -- keeps the two edges together while the
+            // sidebar slides or is dragged wider.
+            let mut placement = StyleRefinement::default().absolute().inset_0();
+            if surfaces.read(cx).is_settings_open() {
+                placement = placement.left(px(seam));
+            }
+            root = root.child(surfaces.clone().cached(placement));
         }
         if let Some(navigation) = &self.navigation {
             root = root.child(cached_window_overlay(navigation.clone()));
         }
+        if let Some(picker) = self.quote_target_picker(colors, sidebar_width, cx) {
+            root = root.child(deferred(picker));
+        }
         if let Some(status) = self.status_banner(colors, cx) {
             root = root.child(status);
         }
+        if let Some(notice) = recovery_notice {
+            root = root.child(self.recovery_notice(notice, colors));
+        }
         if let Some(build) = &self.services.dev_build {
-            root = root.child(dev_build_marker(build.marker_label(), colors));
+            root = root.child(dev_build_marker(
+                build.marker_label(),
+                colors,
+                recovery_height + 10.0,
+            ));
         }
         root
     }
 }
 
-fn dev_build_marker(label: &str, colors: SemanticColors) -> AnyElement {
+fn bounded_notice_body(body: &str) -> String {
+    body.trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(240)
+        .collect()
+}
+
+fn quote_target_id(targets: &[SessionRecord], index: usize) -> Option<SessionId> {
+    targets.get(index).map(|session| session.id.clone())
+}
+
+fn is_quote_target(session: &SessionRecord) -> bool {
+    !session.is_archived()
+        && !matches!(session.status, SessionStatus::Exited(_))
+        // Shell and generic sessions are raw terminals. A local agent draft
+        // is safe precisely because its eventual send is an explicit prompt;
+        // offering that affordance for a shell would turn prompt-shaped quote
+        // data into an executable command when the user confirms it.
+        && !session.effective_kind().is_terminal()
+}
+
+fn dev_build_marker(label: &str, colors: SemanticColors, top: f32) -> AnyElement {
     div()
         .absolute()
-        .top(px(10.0))
+        .top(px(top))
         .left_0()
         .right_0()
         .flex()
@@ -2126,40 +3061,53 @@ fn preview_hint(system_image: &str, label: &str, colors: SemanticColors) -> AnyE
 }
 
 #[cfg(test)]
-mod tests {
+mod quote_target_tests {
     use super::*;
+    use crate::sidebar::{PreviewScenario, SidebarPreviewFixture};
 
-    fn command_modifiers() -> Modifiers {
-        Modifiers {
-            platform: true,
-            ..Modifiers::default()
-        }
+    #[test]
+    fn picker_resolves_the_chosen_target_without_changing_the_active_id() {
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let sessions = fixture.list.sessions;
+        assert!(sessions.len() >= 2);
+        let active = sessions[0].id.clone();
+        let chosen = quote_target_id(&sessions, 1).expect("second target");
+        assert_eq!(chosen, sessions[1].id);
+        assert_eq!(
+            active, sessions[0].id,
+            "target lookup has no navigation side effect"
+        );
     }
 
     #[test]
-    fn command_t_launches_the_configured_default_agent() {
-        assert_eq!(
-            new_session_shortcut("t", command_modifiers()),
-            Some(NewSessionShortcut::Default)
-        );
-    }
+    fn quote_targets_exclude_shells_generic_terminals_archived_and_exited_sessions() {
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let template = fixture.list.sessions[0].clone();
+        let mut agent = template.clone();
+        agent.kind = AgentKind::CODEX;
+        agent.foreground_agent = None;
+        agent.archived_at = None;
+        agent.status = SessionStatus::Idle;
+        assert!(is_quote_target(&agent));
 
-    #[test]
-    fn session_navigation_requires_command_option_arrows() {
-        let command = command_modifiers();
-        assert_eq!(session_navigation_delta("left", command, false), None);
+        let mut shell = agent.clone();
+        shell.kind = AgentKind::SHELL;
+        assert!(!is_quote_target(&shell));
 
-        let command_option = Modifiers {
-            alt: true,
-            ..command
-        };
-        assert_eq!(
-            session_navigation_delta("left", command_option, false),
-            Some(-1)
-        );
-        assert_eq!(
-            session_navigation_delta("right", command_option, false),
-            Some(1)
-        );
+        let mut generic = agent.clone();
+        generic.kind = AgentKind::generic("custom-command");
+        assert!(!is_quote_target(&generic));
+
+        let mut archived = agent.clone();
+        archived.archived_at = Some(diri_proto::DateMillis(1.0));
+        assert!(!is_quote_target(&archived));
+
+        let mut exited = agent;
+        exited.status = SessionStatus::Exited(diri_proto::ExitInfo {
+            reason: diri_proto::ExitReason::Exited,
+            code: Some(0),
+            signal: None,
+        });
+        assert!(!is_quote_target(&exited));
     }
 }

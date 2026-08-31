@@ -15,6 +15,7 @@ use diri_proto::frames::{Frame, FrameCodec, FrameType};
 use diri_proto::grid::GridUpdate;
 use diri_proto::methods::{AttachRequest, ClientRole};
 use diri_proto::model::SessionId;
+use diri_proto::terminal::MouseModes;
 use futures_core::Stream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -26,6 +27,7 @@ const READ_BUFFER_BYTES: usize = 64 * 1024;
 const KEEPALIVE_CHECK_EVERY: Duration = Duration::from_secs(5);
 const PING_AFTER: Duration = Duration::from_secs(20);
 const DEAD_AFTER: Duration = Duration::from_secs(30);
+const CHUNK_QUEUE_CAPACITY: usize = 256;
 
 /// A decoded event from the daemon's authoritative terminal data channel.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,7 +35,8 @@ pub enum TerminalChunk {
     Grid(GridUpdate),
     Modes {
         alt_screen: bool,
-        mouse_reporting: bool,
+        bracketed_paste: bool,
+        mouse: MouseModes,
     },
     Pong,
 }
@@ -44,7 +47,7 @@ pub enum TerminalChunk {
 /// need a stream extension trait for the common one-at-a-time use case.
 #[derive(Debug)]
 pub struct AttachmentChunks {
-    receiver: mpsc::UnboundedReceiver<TerminalChunk>,
+    receiver: mpsc::Receiver<TerminalChunk>,
 }
 
 impl AttachmentChunks {
@@ -134,6 +137,10 @@ impl SessionAttachmentHandle {
         self.send(Frame::input(bytes))
     }
 
+    pub fn send_mouse(&self, bytes: impl Into<Vec<u8>>) -> Result<(), AttachmentClosed> {
+        self.send(Frame::mouse(bytes))
+    }
+
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), AttachmentClosed> {
         self.send(Frame::resize(cols, rows))
     }
@@ -183,7 +190,11 @@ impl SessionAttachment {
         stream.write_all(&line).await?;
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
-        let (chunk_tx, chunk_rx) = mpsc::unbounded_channel();
+        // Bound decoded terminal work between the socket and UI. The daemon's
+        // PTY drain is independent of this connection, so brief UI stalls
+        // backpressure only the attach writer instead of growing client memory
+        // without limit.
+        let (chunk_tx, chunk_rx) = mpsc::channel(CHUNK_QUEUE_CAPACITY);
         let task = tokio::spawn(run_connection(stream, command_rx, chunk_tx));
 
         Ok(Self {
@@ -196,6 +207,11 @@ impl SessionAttachment {
     /// Queues raw keystroke bytes for the session PTY.
     pub fn send_input(&self, bytes: impl Into<Vec<u8>>) -> Result<(), AttachmentClosed> {
         self.handle().send_input(bytes)
+    }
+
+    /// Queues a pre-encoded mouse report on the raw interactive path.
+    pub fn send_mouse(&self, bytes: impl Into<Vec<u8>>) -> Result<(), AttachmentClosed> {
+        self.handle().send_mouse(bytes)
     }
 
     /// Queues a PTY resize. Debouncing and first-resize semantics belong to the caller.
@@ -248,7 +264,7 @@ enum Command {
 async fn run_connection(
     mut stream: UnixStream,
     mut commands: mpsc::UnboundedReceiver<Command>,
-    chunks: mpsc::UnboundedSender<TerminalChunk>,
+    chunks: mpsc::Sender<TerminalChunk>,
 ) {
     let mut codec = FrameCodec::new();
     let mut read_buffer = vec![0_u8; READ_BUFFER_BYTES];
@@ -298,28 +314,33 @@ async fn run_connection(
 async fn process_incoming(
     frame: Frame,
     stream: &mut UnixStream,
-    chunks: &mpsc::UnboundedSender<TerminalChunk>,
+    chunks: &mpsc::Sender<TerminalChunk>,
 ) -> Result<(), ()> {
     match frame.frame_type {
         FrameType::Grid => {
             let update = frame.grid_payload().map_err(|_| ())?.ok_or(())?;
-            chunks.send(TerminalChunk::Grid(update)).map_err(|_| ())?;
+            chunks
+                .send(TerminalChunk::Grid(update))
+                .await
+                .map_err(|_| ())?;
         }
         FrameType::Modes => {
-            let (alt_screen, mouse_reporting) = frame.modes_payload().ok_or(())?;
+            let (alt_screen, bracketed_paste, mouse) = frame.terminal_modes_payload().ok_or(())?;
             chunks
                 .send(TerminalChunk::Modes {
                     alt_screen,
-                    mouse_reporting,
+                    bracketed_paste,
+                    mouse,
                 })
+                .await
                 .map_err(|_| ())?;
         }
         FrameType::Ping => write_frame(stream, &Frame::pong()).await.map_err(|_| ())?,
-        FrameType::Pong => chunks.send(TerminalChunk::Pong).map_err(|_| ())?,
+        FrameType::Pong => chunks.send(TerminalChunk::Pong).await.map_err(|_| ())?,
         // These byte-replay frames belong to the retired VT-parsing client.
         FrameType::Output | FrameType::ReplayBegin | FrameType::ReplayEnd => {}
         // The daemon does not send client-to-daemon frame types.
-        FrameType::Input | FrameType::Resize | FrameType::Scroll => {}
+        FrameType::Input | FrameType::Resize | FrameType::Scroll | FrameType::Mouse => {}
     }
     Ok(())
 }
@@ -337,12 +358,14 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use diri_proto::control::{ControlMessage, decode_line, encode_line};
+    use diri_proto::frames::Frame;
     use diri_proto::grid::GridCell;
     use diri_proto::methods::{
         HelloParams, HelloResult, Method, SessionIdParams, SessionSpawnParams,
     };
     use diri_proto::model::{AgentKind, SessionId, SessionRecord};
     use diri_proto::paths::{DirijorEnv, DirijorPaths};
+    use diri_proto::terminal::{MouseEncoding, MouseModes, MouseTrackingMode};
     use serde::Serialize;
     use serde::de::DeserializeOwned;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -350,7 +373,31 @@ mod tests {
     use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
     use tokio::time::timeout;
 
-    use super::{SessionAttachment, TerminalChunk};
+    use super::{SessionAttachment, TerminalChunk, process_incoming};
+
+    #[tokio::test]
+    async fn mode_frames_keep_bracketed_paste_state() {
+        let (mut stream, _peer) = UnixStream::pair().expect("unix stream pair");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mouse = MouseModes::new(MouseTrackingMode::ButtonMotion, MouseEncoding::Sgr);
+
+        process_incoming(
+            Frame::modes_with_bracketed_paste(true, true, mouse),
+            &mut stream,
+            &tx,
+        )
+        .await
+        .expect("valid modes frame");
+
+        assert_eq!(
+            rx.recv().await,
+            Some(TerminalChunk::Modes {
+                alt_screen: true,
+                bracketed_paste: true,
+                mouse,
+            })
+        );
+    }
 
     struct TestControl {
         reader: BufReader<OwnedReadHalf>,

@@ -14,6 +14,7 @@ use diri_engine::registry::Registry;
 use diri_proto::ControlMessage;
 use diri_proto::frames::{Frame, FrameCodec, FrameType};
 use diri_proto::grid::GridUpdate;
+use diri_proto::terminal::MouseModes;
 use serde_json::json;
 
 fn engine() -> Arc<ManifestEngine> {
@@ -111,7 +112,11 @@ fn an_attach_is_seeded_then_streams_diffs_and_answers_input() {
         params: Some(json!({
             "kind": { "shell": {} },
             "cwd": "/tmp",
-            "argv": ["/bin/sh", "-c", "printf 'seeded-screen\\n'; exec cat"],
+            "argv": [
+                "/bin/sh",
+                "-c",
+                "stty -echo; printf '\\033[?2004hseeded-screen\\n'; IFS= read -r _; printf '\\033[?2004l'; stty echo; exec cat"
+            ],
         })),
     });
     let mut reader = std::io::BufReader::new(control.try_clone().expect("clone"));
@@ -149,9 +154,28 @@ fn an_attach_is_seeded_then_streams_diffs_and_answers_input() {
         "the seed carries what the child already painted"
     );
 
-    let _modes = frames.until("initial modes", |frame| {
+    let modes = frames.until("initial modes", |frame| {
         frame.frame_type == FrameType::Modes
     });
+    assert_eq!(
+        modes.terminal_modes_payload(),
+        Some((false, true, MouseModes::OFF)),
+        "the attachment seed carries the child's current paste mode"
+    );
+
+    // The setup shell drops bracketed paste after its first input. A mode-only
+    // terminal change must wake the attachment pump even when no visible cell
+    // changes with it.
+    data.write_all(&FrameCodec::encode(&Frame::input(b"finish-setup\n".to_vec())).expect("encode"))
+        .expect("finish child setup");
+    let modes = frames.until("updated modes", |frame| {
+        frame.frame_type == FrameType::Modes
+    });
+    assert_eq!(
+        modes.terminal_modes_payload(),
+        Some((false, false, MouseModes::OFF)),
+        "live mode changes propagate independently of grid damage"
+    );
 
     // Let the per-session pump establish its shared diff baseline. Its first
     // sample is allowed to be a FullSnapshot: if input beats that first tick,
@@ -168,12 +192,28 @@ fn an_attach_is_seeded_then_streams_diffs_and_answers_input() {
                 .is_some_and(|update| grid_text(&update).contains("warm-up-pump"))
     });
 
+    // Mouse reports use their own frame kind so the Engine takes the raw
+    // interactive path instead of treating escape bytes as prompt text. The
+    // payload remains ordered with keyboard input and reaches the same PTY.
+    data.write_all(
+        &FrameCodec::encode(&Frame::mouse(b"mouse-over-attach\n".to_vec())).expect("encode"),
+    )
+    .expect("send mouse payload");
+    frames.until("the raw mouse payload echo", |frame| {
+        frame.frame_type == FrameType::Grid
+            && frame
+                .grid_payload()
+                .ok()
+                .flatten()
+                .is_some_and(|update| grid_text(&update).contains("mouse-over-attach"))
+    });
+
     // Typing through the established data channel: cat echoes, and each echo
     // comes back as a grid DIFF (not a full snapshot). Use the median so a
     // single scheduler hiccup cannot fail the test, while a fixed 16 ms frame
     // boundary on every keystroke still does.
     let mut interactive_latencies = Vec::new();
-    for index in 0..5 {
+    for index in 0..101 {
         let marker = format!("typed-over-attach-{index}");
         let sent_at = Instant::now();
         data.write_all(

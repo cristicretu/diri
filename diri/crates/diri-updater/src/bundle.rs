@@ -93,6 +93,7 @@ mod tests {
         assert!(enclosing_bundle(Path::new("/opt/diri/Contents/MacOS/diri")).is_none());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn reports_a_plausible_system_version() {
         // Guards the parse, not the value: any real macOS is well past 10.

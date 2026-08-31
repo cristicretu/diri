@@ -321,6 +321,29 @@ belongs to exactly one top-level Project. The same path on two SSH hosts is two
 different Projects, and project-level Agent creation inherits that Project's
 host and directory.
 
+## Agent executable discovery
+
+Agent availability and executable overrides are target-specific: local and
+each configured SSH host have independent catalog state. The Engine owns the
+catalog and preferences; the Helper only reports filesystem facts from the
+remote account.
+
+Protocol 1.3 adds the required `executable-discovery` capability. One bounded
+`executables` request carries every bundled manifest binary and any configured
+override. The Helper captures the login environment exactly once, resolves all
+queries directly from that PATH without spawning `which` per Agent, validates
+manual paths as executable regular files, and returns both the detected and
+configured resolution. An Agent launch reuses that same captured environment
+and cwd, so discovery does not add a second login-shell startup.
+
+The Engine caches each target catalog for five minutes and single-flights
+concurrent scans per target. Menus render only cached facts and never execute
+filesystem or SSH work. Missing Agents stay in Settings for discovery and
+manual binding but do not appear in quick-create menus. A valid manual path has
+precedence over PATH; an invalid override is reported while a valid PATH result
+remains usable. Executable preferences and quick-create visibility are stored
+in an owner-only, additive Engine configuration file.
+
 ## Holder and process lifecycle
 
 The Holder owns the PTY master, the Agent child/process group, terminal state,
@@ -358,10 +381,11 @@ restart/adoption preserves still-running sessions.
 every Linux host. PAM or `systemd-logind` policy may kill all processes from a
 login session.
 
-Each host is therefore probed rather than assumed. Diri launches a temporary
-Holder, closes the first SSH channel, reconnects through an independent channel,
-checks the process identity, and cleans up the test session. The result is one
-of:
+Each host is therefore probed rather than assumed. Diri closes any finite-lived
+bootstrap ControlMaster, launches a temporary Holder over a non-multiplexed SSH
+connection, waits for that underlying connection to close, reconnects over a
+second non-multiplexed connection, checks the process identity, and cleans up
+the test session. The result is one of:
 
 ```text
 native-detach
@@ -393,21 +417,53 @@ PTY bytes -> shared terminal parser -> Grid + Cursor + Modes
 
 On attach, the Holder sends a `FullSnapshot`, followed by sequenced incremental
 updates. A snapshot contains only the visible grid, cursor, modes, dimensions,
-and sequence. Scrollback is bounded to 4 MiB and served on demand through
-`Scroll`. Raw output is bounded to 32 MiB.
+and sequence. Mouse state preserves the selected tracking regime (off, DECSET
+1000, 1002, or 1003) independently from legacy/SGR coordinate encoding. The
+wire mode byte retains its historical any-mouse bit and uses previously unused
+bits for those details. A live protocol 1.3 Holder exposes only the historical
+bit, so the Engine preserves those details as unknown: it does not synthesize
+button or motion reports, while wheel intent remains encoded by that Holder's
+authoritative parser. Scrollback is bounded to 4 MiB and served on demand
+through `Scroll`. Raw output is bounded to 32 MiB.
 
 The PTY reader must never block on a client. The Holder uses bounded queues. It
-coalesces background output for no more than 16 ms, while up to two grid
+coalesces background output for no more than 8 ms, while up to two grid
 publications after interactive input bypass that wait (one trailing publication
-may already be in flight before the actual response). When no client is
-attached, it continues parsing terminal state but does not construct or
-serialize diffs. If an attached client falls behind, stale updates are discarded
-and the connection is reseeded from a complete snapshot after reconnect.
+may already be in flight before the actual response). If a destructive repaint
+temporarily removes screen content, the Holder instead gives its redraw bytes up
+to 16 ms to arrive, returning immediately when they do. That longer ceiling is
+isolated from typed echo and additive scrolling. When no client is attached, it
+continues parsing terminal state but does not construct or serialize diffs. If
+an attached client falls behind, stale updates are discarded and the connection
+is reseeded from a complete snapshot after reconnect.
+
+The Engine reconciles raw-output offsets before feeding any local observer:
+duplicates are skipped, overlaps feed only the unseen suffix, and a forward gap
+on the live stream forces reconnect. Bounded replay may contain a gap because
+the Holder follows it with an authoritative `FullSnapshot`; replay bytes are
+logged for continuity but never treated as a second live status observation.
 
 One owner/event loop handles PTY drain, terminal parsing, diff construction, and
 attach writes. The hot path does not put an `Arc<Mutex<Terminal>>` across tasks.
 Buffers are reused where practical, and idle Holders do not poll, heartbeat, or
 run GC.
+
+### Local Holder input compatibility
+
+The durable local Holder is outside the remote Helper wire protocol, but it
+shares the survival invariant: an application upgrade must not abandon a live
+Holder and Agent. Local input therefore starts with an additive `streamVersion`
+negotiation over the legacy JSON request interface. A new Holder accepts version
+1 and keeps the Unix connection open for bounded binary input and resize frames,
+acknowledging each operation. An old live Holder rejects the unknown operation
+in its normal way; the new client then pins that Holder to legacy JSON/base64
+requests. Control and lifecycle operations remain independent request/response
+connections. A stream error after a frame may have reached the PTY is reported
+without retry, so a keystroke can never be duplicated. On Apple platforms the
+dedicated input thread uses interactive QoS so persistence does not trade a
+faster socket acknowledgement for slower end-to-grid delivery. The local
+daemon's held-output follower is raised only while the session is recently
+attached or receiving input, then returns to default QoS.
 
 ## Controller lease
 
@@ -422,14 +478,22 @@ Only the current epoch may send:
 - `Scroll`;
 - session termination requests.
 
+Input and signals are at-most-once effects. If a write fails before accepting
+any frame byte, input may be retained for a later controller lease. A partial
+write or lost flush acknowledgement has an unknown outcome: the Engine surfaces
+the transport error and never queues or replays that effect.
+
 Stale epochs fail with a structured protocol error. Multiple read-only observers
 are a future enhancement and are not part of the completed baseline.
 
 ## Wire protocol
 
-`diri-proto::remote_pty` is the versioned protocol authority. Protocol 1.2
+`diri-proto::remote_pty` is the versioned protocol authority. Protocol 1.3
 declares terminal, session management, environment capture, directory listing,
-persistence probing, and atomic activation as required capabilities.
+batched executable discovery, persistence probing, and atomic activation as
+required capabilities. Protocol 1.4 additively preserves granular mouse
+tracking/encoding bits and the raw mouse-input frame while retaining the old
+any-mouse compatibility bit.
 
 The protocol includes:
 
@@ -443,6 +507,7 @@ Grid
 Scroll
 Modes
 Input
+Mouse
 Resize
 Ping
 Pong
@@ -575,10 +640,14 @@ OpenSSH detach/reconnect soak. These are mandatory release gates and do not use
 Rosetta or a developer's real SSH host.
 
 The acceptance suite validates release-mode UDS performance, a 23 MiB slow-
-attach recovery case, and transient user-supervisor behavior. The real SSH soak
-verifies bootstrap, login-shell handling, persistence probing, Bridge
-disconnection, same-PID/same-incarnation reconnection, snapshot restoration,
-continued input, and cleanup.
+attach recovery case, transient user-supervisor behavior, and an actual Holder
+PTY's `isatty`, canonical editing, resize, and `SIGWINCH` behavior. The real SSH
+soak verifies bootstrap, login-shell handling, persistence probing, Bridge
+disconnection, explicit ControlMaster teardown, same-PID/same-incarnation
+reconnection, snapshot restoration, continued input, and cleanup. A separate
+PAM/logind endpoint with logout process cleanup enabled verifies that such a
+host is classified as non-persistent rather than receiving a false detach
+guarantee.
 
 An optional manual soak uses:
 
@@ -611,6 +680,8 @@ The completed refactor includes all of the following:
 - account/cwd environment capture and structured `argv`/`cwd`/environment
   execution;
 - bounded remote directory selection and host-aware project identity;
+- target-aware local/remote Agent discovery, manual executable binding, and
+  shared availability-filtered quick-create surfaces;
 - location-aware working-tree inspection with non-Git compatibility;
 - explicit persistence probing with no privilege escalation;
 - native artifacts and release gates for Linux x86_64, Linux aarch64, and

@@ -22,6 +22,7 @@
 //!
 //! Not internally synchronized: one owner per session, as with the Swift actor.
 
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
@@ -32,6 +33,12 @@ const MAGIC: u32 = 0x4449_524A;
 const VERSION: u32 = 1;
 const HEADER_SIZE: usize = 16;
 const MAX_SYNC_POINTS: usize = 64;
+/// Longest sync-point sequence is four bytes (CSI 2J), so three trailing bytes
+/// carried across a chunk boundary are enough to find one that was split.
+const CARRY_BYTES: usize = 3;
+/// How much of the spill file survives a rewrite. Keeping a quarter rather
+/// than a half cuts the copying a burst of output pays for to a third.
+const DISK_KEEP_DIVISOR: usize = 8;
 const SYNC_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Default in-memory window: 4 MiB.
@@ -46,7 +53,11 @@ pub struct OutputLog {
     tail_offset: u64,
     /// Oldest offset still resident in memory.
     ring_start_offset: u64,
-    ring: Vec<u8>,
+    /// A deque, not a `Vec`: eviction drops from the front, and on a `Vec` that
+    /// is a memmove of the entire retained window on every append. A PTY hands
+    /// over about a kilobyte per read, so that shape spent ~4 MiB of copying
+    /// per kilobyte appended — the dominant cost of a burst of output.
+    ring: VecDeque<u8>,
 
     path: PathBuf,
     read_only: bool,
@@ -80,7 +91,7 @@ impl OutputLog {
             disk_capacity,
             tail_offset: 0,
             ring_start_offset: 0,
-            ring: Vec::new(),
+            ring: VecDeque::new(),
             path: dir.join(format!("{session_id}.bin")),
             read_only,
             write_handle: None,
@@ -149,12 +160,17 @@ impl OutputLog {
 
         self.scan_for_sync_points(data, start);
 
-        self.ring.extend_from_slice(data);
+        // A chunk larger than the window can only leave its own tail behind, so
+        // keep just that much and skip staging bytes that are about to be
+        // evicted anyway.
+        let keep = data.len().min(self.ring_capacity);
+        self.ring.extend(&data[data.len() - keep..]);
         if self.ring.len() > self.ring_capacity {
             let drop = self.ring.len() - self.ring_capacity;
             self.ring.drain(..drop);
             self.ring_start_offset += drop as u64;
         }
+        self.ring_start_offset += (data.len() - keep) as u64;
         self.tail_offset += data.len() as u64;
 
         self.append_to_disk(data)?;
@@ -179,7 +195,19 @@ impl OutputLog {
         {
             let lower = (start - self.ring_start_offset) as usize;
             let upper = (end - self.ring_start_offset) as usize;
-            return (start, self.ring[lower..upper].to_vec());
+            // The window wraps, so copy through the two contiguous halves
+            // rather than byte at a time.
+            let (front, back) = self.ring.as_slices();
+            let mut out = Vec::with_capacity(upper - lower);
+            let from_front = front.len().min(upper).saturating_sub(lower);
+            if from_front > 0 {
+                out.extend_from_slice(&front[lower..lower + from_front]);
+            }
+            if upper > front.len() {
+                let back_lower = lower.saturating_sub(front.len());
+                out.extend_from_slice(&back[back_lower..upper - front.len()]);
+            }
+            return (start, out);
         }
         self.read_from_disk(start, end)
     }
@@ -252,39 +280,77 @@ impl OutputLog {
     // MARK: Sync-point scanning
 
     fn scan_for_sync_points(&mut self, data: &[u8], chunk_start: u64) {
-        // Work over carry + chunk so sequences split across chunks are found.
-        let carry_count = self.carry.len();
-        let mut haystack = std::mem::take(&mut self.carry);
-        haystack.extend_from_slice(data);
-        let keep = haystack.len().saturating_sub(3);
-        self.carry = haystack[keep..].to_vec();
+        // Conceptually this scans carry ++ chunk, so a sequence split across
+        // two reads is still found. It is not materialized: building that
+        // haystack allocated twice per append, which at PTY chunk sizes cost
+        // more than the scan itself. Instead the straddling positions — the
+        // only ones that can read from both — are handled separately, and the
+        // rest of the chunk is scanned in place.
+        let carry_count = self.carry.len().min(CARRY_BYTES);
+        let mut carry = [0u8; CARRY_BYTES];
+        carry[..carry_count].copy_from_slice(&self.carry[..carry_count]);
+        let total = carry_count + data.len();
 
-        if haystack.len() < 2 {
+        let byte = |index: usize| -> u8 {
+            if index < carry_count {
+                carry[index]
+            } else {
+                data[index - carry_count]
+            }
+        };
+
+        // Straddling positions: those that begin inside the carry.
+        for index in 0..carry_count.min(total.saturating_sub(1)) {
+            if byte(index) != 0x1B {
+                continue;
+            }
+            let found = byte(index + 1) == 0x63 // ESC c — full reset
+                || (index + 3 < total
+                    && byte(index + 1) == 0x5B
+                    && byte(index + 2) == 0x32
+                    && byte(index + 3) == 0x4A); // CSI 2J — erase display
+            if found {
+                // A sequence beginning inside the carry starts before
+                // `chunk_start` — still a valid (earlier) replay start.
+                let signed = chunk_start as i64 + (index as i64 - carry_count as i64);
+                self.record_sync_point(signed.max(0) as u64);
+            }
+        }
+
+        // Positions wholly inside the chunk.
+        let mut index = 0;
+        while index + 1 < data.len() {
+            if data[index] != 0x1B {
+                index += 1;
+                continue;
+            }
+            let found = data[index + 1] == 0x63
+                || (index + 3 < data.len()
+                    && data[index + 1] == 0x5B
+                    && data[index + 2] == 0x32
+                    && data[index + 3] == 0x4A);
+            if found {
+                self.record_sync_point(chunk_start + index as u64);
+            }
+            index += 1;
+        }
+
+        // Carry the trailing bytes of the virtual haystack forward.
+        let keep = total.saturating_sub(CARRY_BYTES);
+        self.carry.clear();
+        for index in keep..total {
+            self.carry.push(byte(index));
+        }
+    }
+
+    fn record_sync_point(&mut self, offset: u64) {
+        if self.sync_points.last() == Some(&offset) {
             return;
         }
-        for i in 0..haystack.len() - 1 {
-            if haystack[i] != 0x1B {
-                continue;
-            }
-            let found = haystack[i + 1] == 0x63 // ESC c — full reset
-                || (i + 3 < haystack.len()
-                    && haystack[i + 1] == 0x5B
-                    && haystack[i + 2] == 0x32
-                    && haystack[i + 3] == 0x4A); // CSI 2J — erase display
-            if !found {
-                continue;
-            }
-            // A sequence beginning inside the carry region starts before
-            // chunk_start — still a valid (earlier) replay start.
-            let signed = chunk_start as i64 + (i as i64 - carry_count as i64);
-            let offset = signed.max(0) as u64;
-            if self.sync_points.last() != Some(&offset) {
-                self.sync_points.push(offset);
-                if self.sync_points.len() > MAX_SYNC_POINTS {
-                    let excess = self.sync_points.len() - MAX_SYNC_POINTS;
-                    self.sync_points.drain(..excess);
-                }
-            }
+        self.sync_points.push(offset);
+        if self.sync_points.len() > MAX_SYNC_POINTS {
+            let excess = self.sync_points.len() - MAX_SYNC_POINTS;
+            self.sync_points.drain(..excess);
         }
     }
 
@@ -360,29 +426,39 @@ impl OutputLog {
     /// offset so stream offsets stay monotonic across the rewrite.
     fn truncate_to_half(&mut self) -> io::Result<()> {
         self.invalidate_read_handle();
-        let keep = self.disk_capacity / 2;
+        // Every rewrite copies what it keeps, so how much is kept sets the
+        // write amplification of the whole log: keeping half meant copying a
+        // byte for every byte ever appended. Keeping a quarter makes the
+        // rewrite both smaller and rarer — a third of the work — while the
+        // retained history stays well above the in-memory window.
+        let keep = self.disk_capacity / DISK_KEEP_DIVISOR;
         let drop_bytes = self.file_bytes.saturating_sub(keep);
 
         let mut read = File::open(&self.path)?;
         read.seek(SeekFrom::Start((HEADER_SIZE + drop_bytes) as u64))?;
-        let mut kept = Vec::new();
-        read.read_to_end(&mut kept)?;
-        drop(read);
         self.write_handle = None;
 
         let new_base = self.file_base_offset + drop_bytes as u64;
-        let mut content = Vec::with_capacity(HEADER_SIZE + kept.len());
-        content.extend_from_slice(&MAGIC.to_be_bytes());
-        content.extend_from_slice(&VERSION.to_be_bytes());
-        content.extend_from_slice(&new_base.to_be_bytes());
-        content.extend_from_slice(&kept);
-
         let tmp = self.path.with_extension("tmp");
-        write_private(&tmp, &content)?;
+        // Streamed rather than staged through one big buffer: this runs on the
+        // PTY pump, and a burst of output is exactly when it fires.
+        let kept_len = {
+            let file = create_private(&tmp)?;
+            let mut writer = io::BufWriter::with_capacity(256 << 10, file);
+            writer.write_all(&MAGIC.to_be_bytes())?;
+            writer.write_all(&VERSION.to_be_bytes())?;
+            writer.write_all(&new_base.to_be_bytes())?;
+            let copied = io::copy(
+                &mut io::BufReader::with_capacity(256 << 10, read),
+                &mut writer,
+            )?;
+            writer.flush()?;
+            copied as usize
+        };
         fs::rename(&tmp, &self.path)?;
 
         self.file_base_offset = new_base;
-        self.file_bytes = kept.len();
+        self.file_bytes = kept_len;
         self.write_handle = Some(open_for_append(&self.path)?);
         self.sync_points.retain(|&s| s >= new_base);
         Ok(())
@@ -438,7 +514,7 @@ fn open_for_append(path: &Path) -> io::Result<File> {
 
 /// Writes owner-only. Session output is the user's terminal content and must
 /// not be world-readable.
-fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
+fn create_private(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -446,7 +522,11 @@ fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(path)?;
+    options.open(path)
+}
+
+fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let mut file = create_private(path)?;
     file.write_all(contents)?;
     Ok(())
 }
@@ -510,6 +590,52 @@ mod tests {
         let (offset, data) = log.read(0, 4);
         assert_eq!(offset, 0, "evicted bytes are still addressable");
         assert_eq!(data, b"0123", "and come back from the spill file");
+    }
+
+    #[test]
+    fn a_chunk_larger_than_the_ring_leaves_only_its_own_tail_resident() {
+        let root = dir();
+        let mut log = OutputLog::open(root.path(), "s", 4, 1 << 20, false).expect("open");
+        log.append(b"ab").expect("append");
+        // Twelve bytes into a four-byte window: the earlier append and all but
+        // the last four bytes of this one are only on disk now.
+        log.append(b"0123456789AB").expect("append");
+
+        assert_eq!(log.tail_offset(), 14);
+        assert_eq!(
+            log.ring_start_offset(),
+            10,
+            "resident window starts four bytes back from the tail"
+        );
+        let (offset, data) = log.read(10, 4);
+        assert_eq!((offset, data.as_slice()), (10, b"89AB".as_slice()));
+        let (offset, data) = log.read(0, 6);
+        assert_eq!(
+            (offset, data.as_slice()),
+            (0, b"ab0123".as_slice()),
+            "everything below the window still reads back from the spill file"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_ring_reads_back_in_order() {
+        let root = dir();
+        let mut log = OutputLog::open(root.path(), "s", 8, 1 << 20, false).expect("open");
+        // Repeated small appends walk the deque's head past its start, so the
+        // resident window straddles the two halves of the backing buffer.
+        for chunk in [b"0123", b"4567", b"89AB", b"CDEF"] {
+            log.append(chunk).expect("append");
+        }
+
+        assert_eq!(log.ring_start_offset(), 8);
+        let (offset, data) = log.read(8, 8);
+        assert_eq!((offset, data.as_slice()), (8, b"89ABCDEF".as_slice()));
+        let (offset, data) = log.read(10, 3);
+        assert_eq!(
+            (offset, data.as_slice()),
+            (10, b"ABC".as_slice()),
+            "a partial read spanning the wrap point stays contiguous"
+        );
     }
 
     #[test]

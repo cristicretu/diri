@@ -337,8 +337,9 @@ fn resolve_node() -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// The sidecar script: env override, then app-bundle Resources, then upward
-/// from the executable (dev checkouts run from target dirs under diri/).
+/// The sidecar script: env override, installed Linux resources, app-bundle
+/// Resources, then upward from the executable (dev checkouts run from target
+/// dirs under diri/).
 fn locate_sidecar() -> Option<PathBuf> {
     if let Ok(configured) = std::env::var("DIRIJOR_SIDECAR") {
         let path = PathBuf::from(configured);
@@ -348,6 +349,11 @@ fn locate_sidecar() -> Option<PathBuf> {
     }
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(exe) = std::env::current_exe().and_then(|exe| exe.canonicalize()) {
+        // /usr/bin/<exe> -> /usr/lib/diri/sidecar/server.js. AppImage keeps the
+        // same layout beneath its mounted AppDir.
+        candidates.push(
+            diri_proto::paths::DirijorPaths::packaged_resources(&exe).join("sidecar/server.js"),
+        );
         // Resources/bin/<exe> → Resources/sidecar/server.js in the bundle.
         let mut dir = exe.parent().map(Path::to_path_buf);
         for _ in 0..7 {
@@ -370,6 +376,42 @@ fn locate_sidecar() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_integration_runs_across_engines() {
+        if std::env::var("DIRIJOR_RUN_BROWSER_TESTS").as_deref() != Ok("1") {
+            return;
+        }
+        assert!(
+            BrowserPool::is_available(),
+            "node, the sidecar, and installed Playwright browsers are required"
+        );
+        let temp = tempfile::tempdir().expect("temp browser fixture");
+        let page = temp.path().join("page.html");
+        std::fs::write(
+            &page,
+            r#"<!doctype html><meta charset=utf8>
+               <input id=name>
+               <button id=go onclick="out.textContent='Hi '+document.querySelector('#name').value">Go</button>
+               <div id=out></div>"#,
+        )
+        .expect("write browser fixture");
+
+        let pool = BrowserPool::new(temp.path());
+        let result = pool
+            .run(json!({
+                "url": format!("file://{}", page.display()),
+                "engines": ["chromium", "webkit", "firefox"],
+                "steps": [
+                    {"fill": ["#name", "Diri"]},
+                    {"click": "#go"},
+                    {"assert": {"selector": "#out", "text": "Hi Diri"}}
+                ]
+            }))
+            .expect("run browser flow");
+        pool.shutdown();
+        assert_eq!(result["pass"], true, "{result}");
+    }
 
     #[test]
     fn shutdown_wakes_pending_requests_and_is_idempotent() {

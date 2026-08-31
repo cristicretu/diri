@@ -7,6 +7,7 @@ use std::error::Error;
 use std::fmt;
 
 use crate::grid::{GridCodecError, GridUpdate};
+use crate::terminal::MouseModes;
 
 /// A single frame larger than this indicates a corrupt stream.
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -24,6 +25,9 @@ pub enum FrameType {
     Grid = 8,
     Scroll = 9,
     Modes = 10,
+    /// Pre-encoded terminal mouse report. Kept distinct from `Input` so
+    /// status/prompt reducers never mistake escape sequences for typed text.
+    Mouse = 11,
 }
 
 impl TryFrom<u8> for FrameType {
@@ -41,6 +45,7 @@ impl TryFrom<u8> for FrameType {
             8 => Ok(Self::Grid),
             9 => Ok(Self::Scroll),
             10 => Ok(Self::Modes),
+            11 => Ok(Self::Mouse),
             other => Err(FrameCodecError::UnknownFrameType(other)),
         }
     }
@@ -72,6 +77,11 @@ impl Frame {
     #[must_use]
     pub fn input(bytes: impl Into<Vec<u8>>) -> Self {
         Self::new(FrameType::Input, bytes.into())
+    }
+
+    #[must_use]
+    pub fn mouse(bytes: impl Into<Vec<u8>>) -> Self {
+        Self::new(FrameType::Mouse, bytes.into())
     }
 
     #[must_use]
@@ -118,8 +128,28 @@ impl Frame {
     }
 
     #[must_use]
-    pub fn modes(alt_screen: bool, mouse_reporting: bool) -> Self {
-        let bits = u8::from(alt_screen) | (u8::from(mouse_reporting) << 1);
+    pub fn modes(alt_screen: bool, mouse: MouseModes) -> Self {
+        Self::modes_with_bracketed_paste(alt_screen, false, mouse)
+    }
+
+    /// Builds the additive terminal-mode payload. [`Self::modes`] remains the
+    /// source-compatible constructor for peers that only know screen and
+    /// mouse state.
+    #[must_use]
+    pub fn modes_with_bracketed_paste(
+        alt_screen: bool,
+        bracketed_paste: bool,
+        mouse: MouseModes,
+    ) -> Self {
+        // Bit 1 stays the historical "any mouse reporting" flag so older
+        // clients continue to route the pointer to the terminal. Granular
+        // tracking, encoding, and bracketed paste live in previously unused
+        // bits. Old clients ignore bit 5; new clients decode it as false from
+        // every frame emitted before this extension.
+        let bits = u8::from(alt_screen)
+            | (u8::from(mouse.is_reporting()) << 1)
+            | (mouse.detail_bits() << 2)
+            | (u8::from(bracketed_paste) << 5);
         Self::new(FrameType::Modes, vec![bits])
     }
 
@@ -175,13 +205,25 @@ impl Frame {
     }
 
     #[must_use]
-    pub fn modes_payload(&self) -> Option<(bool, bool)> {
+    pub fn modes_payload(&self) -> Option<(bool, MouseModes)> {
+        self.terminal_modes_payload()
+            .map(|(alt_screen, _, mouse)| (alt_screen, mouse))
+    }
+
+    /// Decodes all currently defined mode bits. [`Self::modes_payload`]
+    /// retains its original two-field API for existing consumers.
+    #[must_use]
+    pub fn terminal_modes_payload(&self) -> Option<(bool, bool, MouseModes)> {
         if self.frame_type != FrameType::Modes {
             return None;
         }
-        self.payload
-            .first()
-            .map(|bits| (bits & 1 != 0, bits & 2 != 0))
+        self.payload.first().map(|bits| {
+            (
+                bits & 1 != 0,
+                bits & (1 << 5) != 0,
+                MouseModes::from_detail_bits(bits >> 2, bits & 2 != 0),
+            )
+        })
     }
 
     fn offset_frame(frame_type: FrameType, offset: u64) -> Self {
@@ -218,6 +260,7 @@ impl Error for FrameCodecError {}
 #[derive(Clone, Debug, Default)]
 pub struct FrameCodec {
     buffer: Vec<u8>,
+    start: usize,
 }
 
 impl FrameCodec {
@@ -249,9 +292,9 @@ impl FrameCodec {
     pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<Frame>, FrameCodecError> {
         self.buffer.extend_from_slice(bytes);
         let mut frames = Vec::new();
-        let mut consumed = 0;
+        let mut consumed = self.start;
 
-        while self.buffer.len() - consumed >= 5 {
+        while self.buffer.len().saturating_sub(consumed) >= 5 {
             let frame_type = FrameType::try_from(self.buffer[consumed])?;
             let length = u32::from_be_bytes(
                 self.buffer[consumed + 1..consumed + 5]
@@ -275,8 +318,14 @@ impl FrameCodec {
             consumed = frame_end;
         }
 
-        if consumed != 0 {
-            self.buffer.drain(..consumed);
+        self.start = consumed;
+        if self.start == self.buffer.len() {
+            self.buffer.clear();
+            self.start = 0;
+        } else if self.start >= 64 * 1024 && self.start >= self.buffer.len() / 2 {
+            self.buffer.copy_within(self.start.., 0);
+            self.buffer.truncate(self.buffer.len() - self.start);
+            self.start = 0;
         }
         Ok(frames)
     }
@@ -288,7 +337,7 @@ impl FrameCodec {
 
     #[must_use]
     pub fn buffered_len(&self) -> usize {
-        self.buffer.len()
+        self.buffer.len() - self.start
     }
 }
 
@@ -317,6 +366,7 @@ mod tests {
             FrameType::Grid,
             FrameType::Scroll,
             FrameType::Modes,
+            FrameType::Mouse,
         ];
         for (index, frame_type) in types.into_iter().enumerate() {
             assert_eq!(frame_type as u8, index as u8 + 1);
@@ -327,8 +377,8 @@ mod tests {
             Err(FrameCodecError::UnknownFrameType(0))
         );
         assert_eq!(
-            FrameType::try_from(11),
-            Err(FrameCodecError::UnknownFrameType(11))
+            FrameType::try_from(12),
+            Err(FrameCodecError::UnknownFrameType(12))
         );
     }
 
@@ -358,14 +408,55 @@ mod tests {
         assert_eq!(scroll.scroll_payload(), Some((1, 0x0203, 0x0405, 0x0607)));
 
         for alt_screen in [false, true] {
-            for mouse_reporting in [false, true] {
-                let modes = Frame::modes(alt_screen, mouse_reporting);
-                assert_eq!(modes.modes_payload(), Some((alt_screen, mouse_reporting)));
+            for bracketed_paste in [false, true] {
+                for mouse in [
+                    MouseModes::OFF,
+                    MouseModes::UNKNOWN,
+                    MouseModes::new(
+                        crate::terminal::MouseTrackingMode::Off,
+                        crate::terminal::MouseEncoding::Sgr,
+                    ),
+                    MouseModes::new(
+                        crate::terminal::MouseTrackingMode::ButtonEvents,
+                        crate::terminal::MouseEncoding::Legacy,
+                    ),
+                    MouseModes::new(
+                        crate::terminal::MouseTrackingMode::ButtonMotion,
+                        crate::terminal::MouseEncoding::Sgr,
+                    ),
+                    MouseModes::new(
+                        crate::terminal::MouseTrackingMode::AnyMotion,
+                        crate::terminal::MouseEncoding::Sgr,
+                    ),
+                ] {
+                    let modes =
+                        Frame::modes_with_bracketed_paste(alt_screen, bracketed_paste, mouse);
+                    assert_eq!(
+                        modes.terminal_modes_payload(),
+                        Some((alt_screen, bracketed_paste, mouse))
+                    );
+                    assert_eq!(modes.modes_payload(), Some((alt_screen, mouse)));
+                    assert_eq!(modes.payload[0] & 0b10 != 0, mouse.is_reporting());
+                    assert_eq!(modes.payload[0] & 0b10_0000 != 0, bracketed_paste);
+                }
             }
         }
+        assert_eq!(
+            Frame::modes(true, MouseModes::OFF).terminal_modes_payload(),
+            Some((true, false, MouseModes::OFF))
+        );
         assert_eq!(Frame::ping().payload, Vec::<u8>::new());
         assert_eq!(Frame::pong().payload, Vec::<u8>::new());
         assert_eq!(Frame::input(b"input".to_vec()).payload, b"input");
+        assert_eq!(Frame::mouse(b"mouse".to_vec()).payload, b"mouse");
+    }
+
+    #[test]
+    fn modes_decode_the_historical_boolean_wire_format() {
+        assert_eq!(
+            Frame::new(FrameType::Modes, vec![0b11]).terminal_modes_payload(),
+            Some((true, false, MouseModes::UNKNOWN))
+        );
     }
 
     #[test]
@@ -448,6 +539,10 @@ mod tests {
         );
         assert_eq!(
             Frame::new(FrameType::Modes, Vec::new()).modes_payload(),
+            None
+        );
+        assert_eq!(
+            Frame::new(FrameType::Modes, Vec::new()).terminal_modes_payload(),
             None
         );
         assert_eq!(

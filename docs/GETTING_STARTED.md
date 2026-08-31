@@ -26,6 +26,13 @@ Claude Code and Codex have first-class status detection and resume support.
 Other agents may offer partial detection; every agent can still run as a normal
 terminal.
 
+## Working from the keyboard
+
+⌘N opens the launcher, ⌘T starts a session with the default agent, ⌘K is the
+command palette, and ⌃⇥ switches between running sessions. The
+[keyboard shortcuts reference](KEYBOARD_SHORTCUTS.md) lists every binding grouped
+by task, and explains which surface wins when two of them want the same key.
+
 ## Parallel work with worktrees
 
 Create separate sessions with separate git worktrees when agents may edit the

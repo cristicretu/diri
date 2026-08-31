@@ -12,8 +12,10 @@
 //! Rust-owned. The socket paths, NDJSON request/response shapes, pid-file
 //! contents and in-band OSC 777 exit marker are versioned internal contracts.
 //!
-//! Wire protocol, per connection: one JSON request line in, one JSON response
-//! line out, connection closed. No framing beyond the newline; no pipelining.
+//! Control protocol, per connection: one JSON request line in, one JSON
+//! response line out, connection closed. Input/resize may negotiate the
+//! additive acknowledged binary stream; older live Holders remain valid and
+//! receive the original one-request form.
 
 pub mod client;
 pub mod launcher;
@@ -26,7 +28,22 @@ mod socket;
 #[cfg(unix)]
 pub mod server;
 
-pub use client::{HolderClient, HolderManagerClient};
+mod fanout;
+
+pub use client::{HolderClient, HolderManagerClient, HolderOutputStream};
+
+/// Delays for polling something that is about to become ready.
+///
+/// A holder answers within a couple of milliseconds, so asking again on a
+/// fixed 20 ms cadence spent most of a session's startup asleep. These start
+/// almost immediately and settle into the same slow cadence, which keeps the
+/// patience of a long wait without charging it to the common case.
+pub(crate) fn readiness_delays() -> impl Iterator<Item = std::time::Duration> {
+    use std::time::Duration;
+    std::iter::successors(Some(Duration::from_micros(200)), |delay| {
+        Some((*delay * 2).min(Duration::from_millis(20)))
+    })
+}
 pub use launcher::HolderLauncher;
 pub use paths::{HolderManagerPaths, HolderPaths};
 pub use protocol::{

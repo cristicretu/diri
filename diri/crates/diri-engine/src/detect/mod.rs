@@ -139,6 +139,36 @@ impl ManifestEngine {
         self.manifests.get(id)
     }
 
+    /// Resolves frontend verbs from the same manifest that owns launch and
+    /// status behavior. Unknown Agents get a conservative, lifecycle-only
+    /// answer rather than being guessed from their command text.
+    pub fn session_capabilities(
+        &self,
+        record: &diri_proto::SessionRecord,
+    ) -> diri_proto::SessionCapabilities {
+        self.manifest(record.effective_kind().id())
+            .and_then(|manifest| manifest.agent.as_ref())
+            .map_or_else(
+                || diri_proto::SessionCapabilities {
+                    resume: false,
+                    fork: false,
+                    archive: !record.is_archived(),
+                    send_text: !record.is_archived()
+                        && !matches!(record.status, diri_proto::SessionStatus::Exited(_)),
+                    quick_approve: false,
+                    reliable_completion: false,
+                },
+                |agent| {
+                    agent.session_capabilities(
+                        record.resumability,
+                        &record.status,
+                        record.is_archived(),
+                        record.agent_session_id.as_deref(),
+                    )
+                },
+            )
+    }
+
     pub fn ids(&self) -> Vec<&str> {
         self.manifests.keys().map(String::as_str).collect()
     }
@@ -261,7 +291,7 @@ mod tests {
 
         // The whole catalog, by name. A shrunken catalog does not error: a
         // missing agent just spawns as a bare login shell, which is how this
-        // shipped broken once already. Spelling out all twenty ids means a
+        // shipped broken once already. Spelling out all twenty-two ids means a
         // dropped manifest fails here instead of in someone's terminal.
         let mut ids = engine.ids();
         ids.sort_unstable();
@@ -272,6 +302,7 @@ mod tests {
                 "amp",
                 "antigravity",
                 "claude-code",
+                "cline",
                 "codex",
                 "copilot",
                 "cursor",
@@ -284,6 +315,7 @@ mod tests {
                 "kilo",
                 "kimi",
                 "kiro",
+                "maki",
                 "opencode",
                 "pi",
                 "qoder",
@@ -300,7 +332,7 @@ mod tests {
             .into_iter()
             .map(|id| engine.manifest(id).expect("manifest").rules.len())
             .sum();
-        assert_eq!(rules, 89, "the shipped ruleset lost rules");
+        assert_eq!(rules, 99, "the shipped ruleset lost rules");
 
         for id in engine.ids() {
             let expected_empty = matches!(id, "shell" | "generic" | "pi");
@@ -316,7 +348,7 @@ mod tests {
     /// decodes it as `diri_proto::AgentDescriptor`. That type needs `id` and
     /// `displayName`, and a single manifest missing either fails the *whole*
     /// response — leaving the client with no catalog and every agent spawning
-    /// as a bare shell. Decode all twenty the way the client will.
+    /// as a bare shell. Decode all twenty-two the way the client will.
     #[test]
     fn every_shipped_descriptor_decodes_the_way_the_client_decodes_it() {
         let engine = engine();
@@ -335,6 +367,37 @@ mod tests {
     }
 
     #[test]
+    fn cline_and_maki_carry_official_setup_guidance() {
+        let engine = engine();
+        for (id, expected_url) in [
+            (
+                "cline",
+                "https://docs.cline.bot/getting-started/installing-cline",
+            ),
+            ("maki", "https://github.com/tontinton/maki#installation"),
+        ] {
+            let setup = engine
+                .raw_agent(id)
+                .and_then(|agent| agent.get("setup"))
+                .and_then(serde_json::Value::as_object)
+                .unwrap_or_else(|| panic!("{id} has no setup metadata"));
+            assert_eq!(
+                setup.get("url").and_then(serde_json::Value::as_str),
+                Some(expected_url)
+            );
+            for field in ["installHint", "signInHint"] {
+                assert!(
+                    setup
+                        .get(field)
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|hint| !hint.trim().is_empty()),
+                    "{id} has no {field}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn rules_are_sorted_by_descending_priority() {
         let engine = engine();
         for id in engine.ids() {
@@ -349,6 +412,85 @@ mod tests {
                     pair[1].priority
                 );
             }
+        }
+    }
+
+    #[test]
+    fn cline_rules_cover_permission_question_working_and_idle() {
+        let engine = engine();
+        let cases = [
+            (
+                vec![
+                    "Approve tool call?",
+                    "run_commands",
+                    "[y] approve  [n] deny",
+                ],
+                ManifestState::BlockedPermission,
+                "tool-permission",
+            ),
+            (
+                vec![
+                    "Which approach should I use?",
+                    "❯ Keep the API",
+                    "  Type a response...",
+                    "↑/↓ navigate, Enter to select, 1-2 to pick",
+                ],
+                ManifestState::BlockedQuestion,
+                "follow-up-question",
+            ),
+            (
+                vec!["⠋ streaming a response", "❯ Ask anything..."],
+                ManifestState::Working,
+                "streaming-spinner",
+            ),
+            (
+                vec!["❯ Ask anything...", "● Act (Tab)"],
+                ManifestState::Idle,
+                "idle-input-placeholder",
+            ),
+        ];
+
+        for (lines, state, rule) in cases {
+            let observation = engine
+                .evaluate(&ScreenSnapshot::from_lines(lines), "cline")
+                .expect("Cline screen should match");
+            assert_eq!(observation.state, state);
+            assert_eq!(observation.matched_rule_id, rule);
+        }
+    }
+
+    #[test]
+    fn maki_rules_cover_permission_plan_working_and_idle() {
+        let engine = engine();
+        let cases = [
+            (
+                vec!["Permission required", "y allow    n deny"],
+                ManifestState::BlockedPermission,
+                "permission-prompt",
+            ),
+            (
+                vec!["Plan complete", "space toggle parallel", "enter confirm"],
+                ManifestState::BlockedQuestion,
+                "plan-complete-form",
+            ),
+            (
+                vec![" ⠋ ⠙ [BUILD] model"],
+                ManifestState::Working,
+                "status-bar-spinner-working",
+            ),
+            (
+                vec![" [PLAN] model"],
+                ManifestState::Idle,
+                "status-bar-idle",
+            ),
+        ];
+
+        for (lines, state, rule) in cases {
+            let observation = engine
+                .evaluate(&ScreenSnapshot::from_lines(lines), "maki")
+                .expect("Maki screen should match");
+            assert_eq!(observation.state, state);
+            assert_eq!(observation.matched_rule_id, rule);
         }
     }
 
@@ -453,5 +595,59 @@ mod tests {
         let engine = engine();
         let snapshot = ScreenSnapshot::from_lines(["anything"]);
         assert!(engine.evaluate(&snapshot, "no-such-agent").is_none());
+    }
+
+    #[test]
+    fn first_class_agents_ship_verified_official_setup_links() {
+        let engine = engine();
+        let mut first_class_count = 0;
+        for id in engine.ids() {
+            let descriptor: diri_proto::AgentDescriptor =
+                serde_json::from_value(engine.raw_agent(id).expect("bundled descriptor").clone())
+                    .expect("client descriptor");
+            if !descriptor.first_class {
+                continue;
+            }
+            first_class_count += 1;
+            let setup = descriptor.setup.expect("first-class setup metadata");
+            let url = setup
+                .url
+                .as_deref()
+                .filter(|url| url.starts_with("https://") || url.starts_with("http://"))
+                .unwrap_or_else(|| panic!("{id} needs a verified HTTP(S) setup URL"));
+            let authority = url
+                .split_once("://")
+                .expect("checked scheme")
+                .1
+                .split(['/', '?', '#'])
+                .next()
+                .unwrap_or_default();
+            assert!(!authority.is_empty(), "{id} setup URL has no host");
+            assert!(
+                setup
+                    .install_hint
+                    .as_deref()
+                    .is_some_and(|hint| !hint.trim().is_empty()),
+                "{id} needs an install hint"
+            );
+            assert!(
+                setup
+                    .sign_in_hint
+                    .as_deref()
+                    .is_some_and(|hint| !hint.trim().is_empty()),
+                "{id} needs a sign-in hint"
+            );
+            if id == "amp" {
+                assert_eq!(
+                    setup.sign_in_hint.as_deref(),
+                    Some("Sign in at ampcode.com, then run amp."),
+                    "Amp guidance must stay within its official manual"
+                );
+            }
+        }
+        assert!(
+            first_class_count >= 17,
+            "the bundled first-class roster unexpectedly shrank"
+        );
     }
 }

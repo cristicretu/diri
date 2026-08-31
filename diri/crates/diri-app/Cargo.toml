@@ -1,6 +1,6 @@
 [package]
 name = "diri-app"
-version = "0.5.0"
+version = "0.5.2"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -38,6 +38,7 @@ diri-usage.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 image.workspace = true
+libc = "0.2"
 nucleo-matcher.workspace = true
 notify.workspace = true
 serde.workspace = true
@@ -47,51 +48,74 @@ smallvec.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 unicode-segmentation.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+gpui_platform = { workspace = true, features = ["test-support"] }
+# Pauses the clock so the notification settle window is exercised without
+# spending its wall-clock duration in the test suite.
+tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "=0.6.2"
 objc2 = "=0.6.4"
 objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
+    "NSAppearance",
     "NSApplication",
+    "NSAttributedString",
     "NSBezierPath",
     "NSBitmapImageRep",
     "NSBox",
     "NSButton",
     "NSButtonCell",
     "NSCell",
+    "NSClipView",
     "NSColor",
     "NSControl",
+    "NSEvent",
     "NSFont",
     "NSFontDescriptor",
+    "NSGradient",
     "NSGraphics",
     "NSGraphicsContext",
     "NSImage",
+    "NSImageCell",
     "NSImageView",
     "NSImageRep",
     "NSPanel",
     "NSParagraphStyle",
     "NSResponder",
+    "NSRunningApplication",
+    "NSScrollView",
     "NSStatusBar",
     "NSStatusBarButton",
     "NSStatusItem",
     "NSText",
     "NSTextField",
+    "NSTrackingArea",
     "NSView",
     "NSVisualEffectView",
     "NSWindow",
+    "NSWorkspace",
+    "block2",
     "objc2-core-foundation",
 ] }
 objc2-foundation = { version = "=0.3.2", default-features = false, features = [
     "NSArray",
+    "NSAttributedString",
     "NSBundle",
+    "NSDictionary",
     "NSError",
     "NSGeometry",
+    "NSNotification",
     "NSObject",
+    "NSOperation",
+    "NSRange",
     "NSSet",
     "NSString",
+    "NSTimer",
+    "block2",
 ] }
 objc2-user-notifications = { version = "=0.3.2", default-features = false, features = [
     "UNNotification",

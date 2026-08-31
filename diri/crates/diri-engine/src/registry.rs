@@ -8,13 +8,18 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use diri_proto::{DateMillis, ExitInfo, ExitReason, SessionRecord, SessionStatus, TitleSource};
+use diri_proto::{
+    AgentKind, DateMillis, ExitInfo, ExitReason, Resumability, SessionRecord, SessionStatus,
+    TitleSource,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::detect::ManifestEngine;
 use crate::history::CursorTranscriptTurn;
 use crate::holder::{HolderClient, HolderManagerPaths, HolderPaths};
+use crate::lifecycle::{LifecycleAction, LifecyclePlan};
 use crate::session::{HolderConfig, RemoteAdoptSpec, Session, SessionSpec, SessionView};
+use crate::state_file::JsonStateFile;
 use crate::status::StatusSignal;
 
 /// The versioned on-disk snapshot.
@@ -47,7 +52,10 @@ pub struct Registry {
     projects: Vec<serde_json::Value>,
     /// Sessions the user closed, newest last — the "reopen closed tab" stack.
     recently_closed: Vec<SessionRecord>,
-    state_file: PathBuf,
+    state_file: JsonStateFile,
+    /// Minimal per-session state used only to rediscover surviving local
+    /// Holders when the global Registry file is unavailable.
+    recovery_root: PathBuf,
     /// Trailing-edge persistence: a mutation inside the debounce window marks
     /// dirty instead of rewriting the whole file (mark-seen fires on every
     /// tab switch), and the flusher or the next persist call writes it out.
@@ -90,13 +98,19 @@ pub fn spawn_persist_flusher(
 
 impl Registry {
     pub fn new(engine: Arc<ManifestEngine>, state_file: impl Into<PathBuf>) -> Self {
+        let state_path = state_file.into();
+        let recovery_root = state_path
+            .parent()
+            .map(|parent| parent.join(diri_proto::paths::SESSION_RECOVERY_DIR_NAME))
+            .unwrap_or_else(|| PathBuf::from(diri_proto::paths::SESSION_RECOVERY_DIR_NAME));
         Self {
             engine,
             sessions: HashMap::new(),
             records: HashMap::new(),
             projects: Vec::new(),
             recently_closed: Vec::new(),
-            state_file: state_file.into(),
+            state_file: JsonStateFile::new(state_path),
+            recovery_root,
             dirty: false,
             last_persist: None,
             cursor_title_refresh_at: None,
@@ -109,12 +123,23 @@ impl Registry {
     /// ignored: treating it as a fresh install would make the next write
     /// overwrite every session record the user had.
     pub fn load(&mut self) -> std::io::Result<usize> {
-        let bytes = match std::fs::read(&self.state_file) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        let document = match self.state_file.read() {
+            Ok(Some(document)) => document,
+            Ok(None) => return Ok(0),
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                let quarantine = self.state_file.path().with_extension("json.corrupt");
+                let _ = std::fs::rename(self.state_file.path(), &quarantine);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "state file did not parse ({error}); quarantined at {}",
+                        quarantine.display()
+                    ),
+                ));
+            }
             Err(error) => return Err(error),
         };
-        match serde_json::from_slice::<PersistedState>(&bytes) {
+        match serde_json::from_value::<PersistedState>(serde_json::Value::Object(document)) {
             Ok(state) => {
                 self.projects = state.projects;
                 let project_roots = self
@@ -147,8 +172,8 @@ impl Registry {
                 Ok(self.records.len())
             }
             Err(error) => {
-                let quarantine = self.state_file.with_extension("json.corrupt");
-                let _ = std::fs::rename(&self.state_file, &quarantine);
+                let quarantine = self.state_file.path().with_extension("json.corrupt");
+                let _ = std::fs::rename(self.state_file.path(), &quarantine);
                 Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
@@ -175,6 +200,17 @@ impl Registry {
         self.persist_now()
     }
 
+    /// Commits the latest state before the daemon acknowledges a shutdown.
+    ///
+    /// Shutdown is a durability boundary, not another debounced mutation: the
+    /// process may exit immediately after the acknowledgement, so neither the
+    /// background flusher nor [`Drop`] is guaranteed to run. Always write the
+    /// current snapshot synchronously, even when a recent persist would
+    /// normally be deferred.
+    pub fn persist_for_shutdown(&mut self) -> std::io::Result<()> {
+        self.persist_now()
+    }
+
     /// Writes out a deferred persist, if one is pending.
     pub fn flush_dirty(&mut self) -> std::io::Result<()> {
         if !self.dirty {
@@ -186,14 +222,19 @@ impl Registry {
     /// Writes the current state atomically, unconditionally.
     fn persist_now(&mut self) -> std::io::Result<()> {
         let state = PersistedState::current(self.records_for_persistence(), self.projects.clone());
-        let bytes = serde_json::to_vec(&state)?;
-        let temp = self.state_file.with_extension("json.tmp");
-        if let Some(parent) = self.state_file.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&temp, &bytes)?;
-        // Rename is atomic, so a crash mid-write cannot truncate the real file.
-        std::fs::rename(&temp, &self.state_file)?;
+        let known = serde_json::to_value(state)?;
+        let known = known
+            .as_object()
+            .expect("PersistedState serializes as an object");
+        self.state_file.update(|document| {
+            for key in ["version", "projects", "sessions"] {
+                document.insert(
+                    key.to_owned(),
+                    known.get(key).cloned().expect("known persistence key"),
+                );
+            }
+            Ok(())
+        })?;
         self.dirty = false;
         self.last_persist = Some(std::time::Instant::now());
         Ok(())
@@ -202,9 +243,7 @@ impl Registry {
     fn records_for_persistence(&self) -> Vec<SessionRecord> {
         let mut records: Vec<SessionRecord> = self.records.values().cloned().collect();
         for record in &mut records {
-            if let Some(session) = self.sessions.get(&record.id.0) {
-                fold_session_status(record, &session.view());
-            }
+            self.fold_live(record);
         }
         records.sort_by(|a, b| a.id.0.cmp(&b.id.0));
         records
@@ -218,10 +257,48 @@ impl Registry {
         self.records.insert(record.id.0.clone(), record);
     }
 
+    /// Exact directory exported to this session's hook/notify process.
+    pub fn recovery_directory(&self, id: &str) -> PathBuf {
+        self.recovery_root.join(id)
+    }
+
+    fn recovery_store(&self, id: &str) -> diri_proto::recovery::SessionRecoveryStore {
+        diri_proto::recovery::SessionRecoveryStore::new(self.recovery_directory(id))
+    }
+
+    fn write_recovery_capsule(&self, record: &SessionRecord) -> std::io::Result<()> {
+        if record.host.is_some() {
+            return Ok(());
+        }
+        self.recovery_store(&record.id.0).write_capsule(
+            &diri_proto::recovery::SessionRecoveryCapsule {
+                version: diri_proto::recovery::SessionRecoveryCapsule::VERSION,
+                session_id: record.id.clone(),
+                manifest_id: record.kind.id().to_owned(),
+                cwd: record.cwd.clone(),
+                created_at: record.created_at,
+                agent_session_id: record.agent_session_id.clone(),
+                transcript_path: record.transcript_path.clone(),
+            },
+        )
+    }
+
     /// Starts a session and takes ownership of it.
     pub fn spawn(&mut self, spec: SessionSpec, record: SessionRecord) -> std::io::Result<String> {
         let id = spec.id.clone();
-        let session = Session::spawn(spec, Arc::clone(&self.engine))?;
+        let recoverable = spec.holder.is_some() && record.host.is_none();
+        if recoverable {
+            self.write_recovery_capsule(&record)?;
+        }
+        let session = match Session::spawn(spec, Arc::clone(&self.engine)) {
+            Ok(session) => session,
+            Err(error) => {
+                if recoverable {
+                    let _ = self.recovery_store(&id).remove_owned_files();
+                }
+                return Err(error);
+            }
+        };
         self.records.insert(id.clone(), record);
         self.sessions.insert(id.clone(), session);
         Ok(id)
@@ -263,8 +340,12 @@ impl Registry {
     /// [`load`]: Registry::load
     /// [`reap_orphans`]: Registry::reap_orphans
     pub fn restore(&mut self, holder: &HolderConfig, logs_dir: &Path) -> Vec<String> {
+        let records_before = self.records.len();
         let adopted = self.adopt_live_holders(holder, logs_dir);
         self.reap_orphans();
+        if self.records.len() > records_before {
+            let _ = self.persist_now();
+        }
         adopted
     }
 
@@ -331,9 +412,6 @@ impl Registry {
 
         let mut adopted = Vec::new();
         for session_id in holder_session_ids {
-            let Some(record) = self.records.get(&session_id) else {
-                continue; // a holder without a record is not ours to run
-            };
             if self.sessions.contains_key(&session_id) {
                 continue;
             }
@@ -343,10 +421,32 @@ impl Registry {
             if !stat.alive {
                 continue;
             }
+            let recovered_from_capsule = if !self.records.contains_key(&session_id) {
+                let Ok(Some(capsule)) = self.recovery_store(&session_id).read_capsule() else {
+                    continue;
+                };
+                if capsule.version != diri_proto::recovery::SessionRecoveryCapsule::VERSION
+                    || capsule.session_id.0 != session_id
+                    || !Path::new(&capsule.cwd).is_absolute()
+                    || self.engine.manifest(&capsule.manifest_id).is_none()
+                {
+                    continue;
+                }
+                let recovered = recovered_record(capsule);
+                self.ensure_session_project(&recovered.cwd, None);
+                self.records.insert(session_id.clone(), recovered);
+                true
+            } else {
+                false
+            };
+            let Some(record) = self.records.get(&session_id) else {
+                continue;
+            };
             let manifest_id = record.kind.id().to_string();
             let record_status = record.status.clone();
             let record_needs_input = record.needs_input.clone();
             let record_hibernated = record.hibernation.is_some();
+            let record_updated_at = record.updated_at.0;
             let spec = SessionSpec {
                 id: session_id.clone(),
                 // The holder owns the real spec; this one only shapes the
@@ -369,6 +469,16 @@ impl Registry {
                         let _ = session.set_hibernated(true);
                     }
                     self.sessions.insert(session_id.clone(), session);
+                    if let Ok(Some(seed)) = self.recovery_store(&session_id).read_activity()
+                        && (recovered_from_capsule
+                            || seed.occurred_at_ms as f64 >= record_updated_at)
+                        && let Some((signal, metadata)) = crate::hooks::parse_activity_seed(&seed)
+                    {
+                        let _ = self.apply_hook_metadata(&session_id, &metadata);
+                        if let Some(session) = self.sessions.get(&session_id) {
+                            session.feed_signal(signal);
+                        }
+                    }
                     adopted.push(session_id);
                 }
                 Err(_) => continue,
@@ -418,34 +528,7 @@ impl Registry {
         if let Some(session) = self.sessions.get(&record.id.0) {
             fold_session_view(record, &session.view());
         }
-        // `Live` only records that the agent named its conversation while it
-        // was running. Once the session is gone the question every Resume
-        // affordance asks is a different one — can that conversation be
-        // re-entered — so answer it here rather than leaving a stale `Live`
-        // that reads as "not resumable" to each of them.
-        if matches!(record.status, SessionStatus::Exited(_))
-            && record.resumability == diri_proto::Resumability::Live
-        {
-            record.resumability = if self.can_reenter(record) {
-                diri_proto::Resumability::Resumable
-            } else {
-                diri_proto::Resumability::NotResumable
-            };
-        }
-    }
-
-    /// Whether this record's agent can be relaunched back into its own
-    /// conversation — a known conversation id plus a manifest that declares
-    /// how to resume one.
-    fn can_reenter(&self, record: &SessionRecord) -> bool {
-        let Some(agent_session_id) = record.agent_session_id.as_deref() else {
-            return false;
-        };
-        self.engine
-            .manifest(record.kind.id())
-            .and_then(|manifest| manifest.agent.as_ref())
-            .and_then(|agent| agent.resume_args(Some(agent_session_id)))
-            .is_some()
+        fold_record_lifecycle(&self.engine, record);
     }
 
     /// Diffs live sessions' state versions against `published` (updating it in
@@ -467,22 +550,31 @@ impl Registry {
                 (published.get(id) != Some(&version)).then(|| (id.clone(), version, session.view()))
             })
             .collect::<Vec<_>>();
-        let mut title_changed = false;
+        let mut persistence_changed = false;
         for (id, version, view) in changed_views {
             published.insert(id.clone(), version);
             if let Some(record) = self.records.get_mut(&id) {
-                let previous_title = (record.title.clone(), record.title_source);
+                let previous_persisted = (
+                    record.title.clone(),
+                    record.title_source,
+                    record.last_turn_completed_at,
+                );
                 fold_session_view(record, &view);
-                let record_title_changed =
-                    previous_title != (record.title.clone(), record.title_source);
-                if record_title_changed {
+                fold_record_lifecycle(&self.engine, record);
+                let record_persistence_changed = previous_persisted
+                    != (
+                        record.title.clone(),
+                        record.title_source,
+                        record.last_turn_completed_at,
+                    );
+                if record_persistence_changed {
                     record.updated_at = DateMillis::from(std::time::SystemTime::now());
-                    title_changed = true;
+                    persistence_changed = true;
                 }
                 changed.push((id, record.clone()));
             }
         }
-        if title_changed {
+        if persistence_changed {
             self.dirty = true;
         }
         changed
@@ -597,18 +689,32 @@ impl Registry {
     /// Ends the session (if live), deletes its record AND its output log.
     /// This is the user closing a tab for good, not archiving.
     pub fn remove(&mut self, id: &str, logs_dir: &Path) -> std::io::Result<()> {
-        if self.sessions.contains_key(id) {
-            let _ = self.terminate(id, std::time::Duration::from_millis(500));
+        let record = self.records.get(id).cloned().ok_or_else(|| not_found(id))?;
+        let plan = LifecyclePlan::for_record(
+            &record,
+            LifecycleAction::Remove,
+            DateMillis::from(std::time::SystemTime::now()),
+        )?;
+        self.state_file.verify_editable()?;
+        if plan.terminate_live_session && self.sessions.contains_key(id) {
+            self.terminate(id, std::time::Duration::from_millis(500))?;
         }
-        let Some(record) = self.records.remove(id) else {
-            return Err(not_found(id));
-        };
-        self.recently_closed.push(record);
-        if self.recently_closed.len() > 10 {
-            self.recently_closed.remove(0);
+        self.records.remove(id);
+        if plan.retain_for_reopen {
+            self.recently_closed.push(record.clone());
+            if self.recently_closed.len() > 10 {
+                self.recently_closed.remove(0);
+            }
         }
-        self.sessions.remove(id);
-        let _ = std::fs::remove_file(logs_dir.join(format!("{id}.bin")));
+        if let Err(error) = self.persist_now() {
+            self.records.insert(id.to_owned(), record);
+            self.recently_closed.retain(|closed| closed.id.0 != id);
+            return Err(error);
+        }
+        if plan.delete_output_log {
+            let _ = std::fs::remove_file(logs_dir.join(format!("{id}.bin")));
+        }
+        let _ = self.recovery_store(id).remove_owned_files();
         Ok(())
     }
 
@@ -631,6 +737,11 @@ impl Registry {
         let id = spec.id.clone();
         if !self.records.contains_key(&id) {
             return Err(not_found(&id));
+        }
+        let record = self.records.get(&id).expect("checked above");
+        let recoverable = spec.holder.is_some() && record.host.is_none();
+        if recoverable {
+            self.write_recovery_capsule(record)?;
         }
         let session = Session::spawn(spec, Arc::clone(&self.engine))?;
         self.sessions.insert(id.clone(), session);
@@ -685,32 +796,68 @@ impl Registry {
     /// and Claude's generated `ai-title` when it becomes available. Returns
     /// whether anything changed.
     pub fn apply_hook_metadata(&mut self, id: &str, meta: &crate::hooks::HookMetadata) -> bool {
-        let home = user_home();
+        let Ok(home) = std::env::var("HOME") else {
+            return self.apply_hook_metadata_with_home(id, meta, None);
+        };
+        self.apply_hook_metadata_with_home(id, meta, Some(Path::new(&home)))
+    }
+
+    fn apply_hook_metadata_with_home(
+        &mut self,
+        id: &str,
+        meta: &crate::hooks::HookMetadata,
+        home: Option<&Path>,
+    ) -> bool {
         let claimed = self.claimed_agent_ids(Some(id));
-        let generated_title = self.records.get(id).and_then(|record| {
-            let accepts_generated_title = matches!(
-                record.title_source,
-                TitleSource::Placeholder | TitleSource::FirstPrompt | TitleSource::Unknown
-            );
-            if !accepts_generated_title {
+        let mut transcript = self.records.get(id).and_then(|record| {
+            if record.host.is_some() {
                 return None;
             }
-            if record.kind == diri_proto::AgentKind::CLAUDE_CODE {
-                return meta
-                    .transcript_path
-                    .as_deref()
-                    .or(record.transcript_path.as_deref())
-                    .and_then(|path| crate::history::latest_claude_ai_title(Path::new(path)))
-                    .and_then(|title| normalize_agent_title(&title));
-            }
-            None
+            let home = home?;
+            let agent_id = meta
+                .agent_session_id
+                .as_deref()
+                .or(record.agent_session_id.as_deref())?;
+            let kind = record.effective_kind();
+            let validate = |candidate: &str| {
+                crate::history::validate_transcript_path(
+                    home,
+                    kind,
+                    agent_id,
+                    &record.cwd,
+                    Path::new(candidate),
+                )
+            };
+            meta.transcript_path
+                .as_deref()
+                .and_then(validate)
+                .or_else(|| record.transcript_path.as_deref().and_then(validate))
+                .or_else(|| {
+                    (kind.id() == diri_proto::AgentKind::CODEX_ID)
+                        .then(|| {
+                            crate::history::find_live_codex_transcript(home, agent_id, &record.cwd)
+                        })
+                        .flatten()
+                })
+        });
+        let generated_title = self.records.get(id).and_then(|record| {
+            let accepts_generated_title = record.kind == diri_proto::AgentKind::CLAUDE_CODE
+                && matches!(
+                    record.title_source,
+                    TitleSource::Placeholder | TitleSource::FirstPrompt | TitleSource::Unknown
+                );
+            accepts_generated_title
+                .then_some(transcript.as_mut())
+                .flatten()
+                .and_then(|transcript| transcript.latest_claude_ai_title())
+                .and_then(|title| normalize_agent_title(&title))
         });
         let cursor = self.records.get(id).and_then(|record| {
             if record.kind != diri_proto::AgentKind::CURSOR {
                 return None;
             }
             crate::history::cursor_conversation(
-                home.as_deref()?,
+                home?,
                 &record.cwd,
                 meta.agent_session_id
                     .as_deref()
@@ -730,10 +877,11 @@ impl Registry {
             record.resumability = diri_proto::Resumability::Live;
             changed = true;
         }
-        if let Some(transcript) = &meta.transcript_path
-            && record.transcript_path.as_ref() != Some(transcript)
+        if let Some(transcript) =
+            transcript.map(|transcript| transcript.path().to_string_lossy().into_owned())
+            && record.transcript_path.as_ref() != Some(&transcript)
         {
-            record.transcript_path = Some(transcript.clone());
+            record.transcript_path = Some(transcript);
             changed = true;
         }
         if let Some(conversation) = cursor {
@@ -758,6 +906,10 @@ impl Registry {
         }
         if changed {
             record.updated_at = DateMillis::from(std::time::SystemTime::now());
+        }
+        let recovery_snapshot = changed.then(|| record.clone());
+        if let Some(record) = recovery_snapshot.as_ref() {
+            let _ = self.write_recovery_capsule(record);
         }
         changed
     }
@@ -891,16 +1043,27 @@ impl Registry {
         let id = session_project_id(root, host).0;
         if let Some(existing) = self
             .projects
-            .iter()
+            .iter_mut()
             .find(|project| project.get("id").and_then(|value| value.as_str()) == Some(&id))
         {
+            // Records persisted before projects carried their host learn it
+            // here; without it a remote project with no live sessions cannot
+            // tell the app which machine owns its root.
+            if let Some(host) = host
+                && existing.get("host").is_none()
+            {
+                existing["host"] = serde_json::Value::String(host.to_owned());
+            }
             return existing.clone();
         }
         let name = Path::new(root)
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| root.to_string());
-        let project = serde_json::json!({ "id": id, "root": root, "name": name });
+        let mut project = serde_json::json!({ "id": id, "root": root, "name": name });
+        if let Some(host) = host {
+            project["host"] = serde_json::Value::String(host.to_owned());
+        }
         self.projects.push(project.clone());
         project
     }
@@ -913,6 +1076,59 @@ impl Registry {
         Ok(())
     }
 
+    /// Moves an ended resumable record to another checkout of the same
+    /// project and persists the change as one logical operation. Validation of
+    /// repository membership and target ownership lives in the control method.
+    ///
+    /// Persistence can fail after the in-memory edit (for example, when the
+    /// state directory becomes unavailable). Restore every touched field in
+    /// that case so callers never observe a failed request as a hidden move
+    /// that a later flush makes durable.
+    pub fn reparent_worktree(
+        &mut self,
+        id: &str,
+        cwd: String,
+        branch: Option<String>,
+    ) -> std::io::Result<SessionRecord> {
+        let was_dirty = self.dirty;
+        let previous = {
+            let record = self.records.get_mut(id).ok_or_else(|| not_found(id))?;
+            let previous = (
+                record.cwd.clone(),
+                record.worktree_path.clone(),
+                record.git_branch.clone(),
+                record.updated_at,
+            );
+            record.cwd.clone_from(&cwd);
+            record.worktree_path = Some(cwd);
+            record.git_branch = branch;
+            record.updated_at = DateMillis::from(std::time::SystemTime::now());
+            previous
+        };
+
+        // A confirmed move is user-visible identity metadata, not a sampled
+        // field that may wait for the normal debounce. Force the atomic write
+        // now so an `Ok` response means this exact checkout survived a crash.
+        if let Err(error) = self.persist_now() {
+            let record = self
+                .records
+                .get_mut(id)
+                .expect("record cannot disappear during a locked mutation");
+            record.cwd = previous.0;
+            record.worktree_path = previous.1;
+            record.git_branch = previous.2;
+            record.updated_at = previous.3;
+            self.dirty = was_dirty;
+            return Err(error);
+        }
+
+        Ok(self
+            .records
+            .get(id)
+            .expect("record cannot disappear during a locked mutation")
+            .clone())
+    }
+
     pub fn mark_seen(&mut self, id: &str) -> std::io::Result<()> {
         let record = self.records.get_mut(id).ok_or_else(|| not_found(id))?;
         record.last_seen_at = Some(DateMillis::from(std::time::SystemTime::now()));
@@ -922,32 +1138,45 @@ impl Registry {
     /// Ends the session but keeps its record on the shelf: kill-tree,
     /// keep-record, stamp `archivedAt`.
     pub fn archive(&mut self, id: &str) -> std::io::Result<()> {
-        if !self.records.contains_key(id) {
-            return Err(not_found(id));
+        let original = self.records.get(id).cloned().ok_or_else(|| not_found(id))?;
+        let plan = LifecyclePlan::for_record(
+            &original,
+            LifecycleAction::Archive,
+            DateMillis::from(std::time::SystemTime::now()),
+        )?;
+        self.state_file.verify_editable()?;
+        if plan.terminate_live_session && self.sessions.contains_key(id) {
+            self.terminate(id, std::time::Duration::from_millis(500))?;
         }
-        if self.sessions.contains_key(id) {
-            let _ = self.terminate(id, std::time::Duration::from_millis(500));
+        self.records.insert(
+            id.to_owned(),
+            plan.replacement.expect("archive keeps the record"),
+        );
+        if let Err(error) = self.persist_now() {
+            self.records.insert(id.to_owned(), original);
+            return Err(error);
         }
-        let record = self.records.get_mut(id).expect("checked above");
-        record.archived_at = Some(DateMillis::from(std::time::SystemTime::now()));
-        if !matches!(record.status, SessionStatus::Exited(_)) {
-            record.status = SessionStatus::Exited(diri_proto::ExitInfo {
-                reason: diri_proto::ExitReason::Archived,
-                code: None,
-                signal: None,
-            });
-        }
-        record.needs_input = None;
         Ok(())
     }
 
     pub fn unarchive(&mut self, id: &str) -> std::io::Result<()> {
-        let record = self.records.get_mut(id).ok_or_else(|| not_found(id))?;
-        if record.archived_at.is_none() {
+        let original = self.records.get(id).cloned().ok_or_else(|| not_found(id))?;
+        if original.archived_at.is_none() {
             return Ok(());
         }
-        record.archived_at = None;
-        record.updated_at = DateMillis::from(std::time::SystemTime::now());
+        let plan = LifecyclePlan::for_record(
+            &original,
+            LifecycleAction::Restore,
+            DateMillis::from(std::time::SystemTime::now()),
+        )?;
+        self.records.insert(
+            id.to_owned(),
+            plan.replacement.expect("restore keeps the record"),
+        );
+        if let Err(error) = self.persist_now() {
+            self.records.insert(id.to_owned(), original);
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -974,7 +1203,7 @@ impl Registry {
     }
 
     pub fn state_file(&self) -> &Path {
-        &self.state_file
+        self.state_file.path()
     }
 
     fn claimed_agent_ids(&self, except: Option<&str>) -> HashSet<String> {
@@ -1092,10 +1321,46 @@ fn repair_persisted_agent_title(record: &mut SessionRecord) -> bool {
 
 fn fold_session_status(record: &mut SessionRecord, view: &SessionView) {
     record.status.clone_from(&view.status);
+    // Keep evidence only when it explains this exact canonical state. This is
+    // both a mixed-version guard and protection against observing the reducer
+    // and shared record on opposite sides of an in-flight transition.
+    record.status_evidence = view
+        .status_evidence
+        .as_ref()
+        .filter(|evidence| evidence.status == view.status)
+        .cloned();
     record.needs_input.clone_from(&view.needs_input);
     if view.last_turn_completed_at > record.last_turn_completed_at {
         record.last_turn_completed_at = view.last_turn_completed_at;
     }
+}
+
+/// Resolves status-dependent facts at the one seam shared by snapshots and
+/// incremental events, so clients never have to reconstruct Agent behavior.
+fn fold_record_lifecycle(engine: &ManifestEngine, record: &mut SessionRecord) {
+    // `Live` only records that the agent named its conversation while it was
+    // running. After exit, Resume needs the stronger answer: whether that
+    // conversation can actually be re-entered through its manifest.
+    if matches!(record.status, SessionStatus::Exited(_))
+        && record.resumability == diri_proto::Resumability::Live
+    {
+        record.resumability = if can_reenter(engine, record) {
+            diri_proto::Resumability::Resumable
+        } else {
+            diri_proto::Resumability::NotResumable
+        };
+    }
+    record.capabilities = Some(engine.session_capabilities(record));
+}
+
+fn can_reenter(engine: &ManifestEngine, record: &SessionRecord) -> bool {
+    engine
+        .manifest(record.kind.id())
+        .and_then(|manifest| manifest.agent.as_ref())
+        .is_some_and(|agent| {
+            agent.supports_resume()
+                && (record.agent_session_id.is_some() || agent.supports_id_free_resume())
+        })
 }
 
 fn normalize_agent_title(title: &str) -> Option<String> {
@@ -1182,6 +1447,44 @@ fn is_cursor_status_stamp(compact: &str) -> bool {
         )
 }
 
+fn recovered_record(capsule: diri_proto::recovery::SessionRecoveryCapsule) -> SessionRecord {
+    let now = DateMillis::from(std::time::SystemTime::now());
+    let project_id = session_project_id(&capsule.cwd, None);
+    SessionRecord {
+        id: capsule.session_id,
+        kind: AgentKind::new(capsule.manifest_id),
+        cwd: capsule.cwd,
+        project_id,
+        worktree_path: None,
+        git_branch: None,
+        title: "Recovered session".into(),
+        title_source: TitleSource::Placeholder,
+        originating_prompt: None,
+        agent_session_id: capsule.agent_session_id,
+        transcript_path: capsule.transcript_path,
+        status: SessionStatus::Starting,
+        status_evidence: None,
+        needs_input: None,
+        resumability: Resumability::Live,
+        capabilities: None,
+        parent: None,
+        created_at: capsule.created_at,
+        updated_at: now,
+        last_turn_completed_at: None,
+        last_seen_at: None,
+        pinned: false,
+        archived_at: None,
+        host: None,
+        remote_persistence: None,
+        hibernation: None,
+        memory_bytes: None,
+        artifacts: None,
+        pull_requests: None,
+        listening_ports: None,
+        foreground_agent: None,
+    }
+}
+
 fn not_found(id: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::NotFound, format!("no session {id}"))
 }
@@ -1221,11 +1524,14 @@ mod tests {
             git_branch: None,
             title: "test".into(),
             title_source: TitleSource::Placeholder,
+            originating_prompt: None,
             agent_session_id: None,
             transcript_path: None,
             status: SessionStatus::Starting,
+            status_evidence: None,
             needs_input: None,
             resumability: Resumability::NotResumable,
+            capabilities: None,
             parent: None,
             created_at: DateMillis(0.0),
             updated_at: DateMillis(0.0),
@@ -1275,6 +1581,95 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_persistence_commits_a_snapshot_deferred_by_the_debounce() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state_file = temp.path().join("state.json");
+        let mut registry = Registry::new(engine(), &state_file);
+
+        registry.insert_record(record("before"));
+        registry.persist().expect("initial persist");
+        registry.insert_record(record("latest"));
+        registry.persist().expect("debounced persist");
+
+        let deferred: PersistedState =
+            serde_json::from_slice(&std::fs::read(&state_file).expect("read deferred state"))
+                .expect("parse deferred state");
+        assert_eq!(
+            deferred.sessions.len(),
+            1,
+            "the second regular persist should still be waiting for the flusher"
+        );
+
+        registry
+            .persist_for_shutdown()
+            .expect("shutdown persistence");
+        let committed: PersistedState =
+            serde_json::from_slice(&std::fs::read(&state_file).expect("read committed state"))
+                .expect("parse committed state");
+        assert_eq!(
+            committed
+                .sessions
+                .iter()
+                .map(|record| record.id.0.as_str())
+                .collect::<Vec<_>>(),
+            ["before", "latest"]
+        );
+    }
+
+    #[test]
+    fn failed_worktree_persistence_rolls_back_every_metadata_field() {
+        let temp = tempfile::tempdir().expect("temp");
+        let blocked_parent = temp.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, b"file").expect("blocking file");
+        let mut registry = Registry::new(engine(), blocked_parent.join("state.json"));
+        let mut original = record("s_move");
+        original.cwd = "/repo/main".into();
+        original.worktree_path = Some("/repo/main".into());
+        original.git_branch = Some("main".into());
+        original.updated_at = DateMillis(42.0);
+        registry.records.insert("s_move".into(), original.clone());
+
+        let error = registry
+            .reparent_worktree("s_move", "/repo/feature".into(), Some("feature".into()))
+            .expect_err("unwritable state path must fail");
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotADirectory
+            ),
+            "unexpected error: {error}"
+        );
+
+        let current = registry.records.get("s_move").expect("record");
+        assert_eq!(current.cwd, original.cwd);
+        assert_eq!(current.worktree_path, original.worktree_path);
+        assert_eq!(current.git_branch, original.git_branch);
+        assert_eq!(current.updated_at, original.updated_at);
+        assert!(!registry.dirty, "failed edit must not be flushed later");
+    }
+
+    #[test]
+    fn destructive_lifecycle_edits_stop_before_unwritable_state() {
+        let temp = tempfile::tempdir().expect("temp");
+        let blocked_parent = temp.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, b"file").expect("blocking file");
+        let mut registry = Registry::new(engine(), blocked_parent.join("state.json"));
+        let original = record("guarded");
+        registry.insert_record(original.clone());
+
+        registry
+            .archive("guarded")
+            .expect_err("archive must not outrun persistence");
+        assert_eq!(registry.records.get("guarded"), Some(&original));
+
+        registry
+            .remove("guarded", temp.path())
+            .expect_err("remove must not outrun persistence");
+        assert_eq!(registry.records.get("guarded"), Some(&original));
+        assert!(registry.recently_closed.is_empty());
+    }
+
+    #[test]
     fn loading_repairs_same_path_sessions_into_host_scoped_projects() {
         let temp = tempfile::tempdir().expect("temp");
         let state_file = temp.path().join("state.json");
@@ -1292,6 +1687,29 @@ mod tests {
         let records = registry.records();
         assert_ne!(records[0].project_id, records[1].project_id);
         assert_eq!(registry.projects_raw().len(), 2);
+    }
+
+    /// The project record — not its sessions — is what tells the app which
+    /// machine owns a root: after the last session of a remote project is
+    /// closed, launch surfaces must still spawn on that host, not locally
+    /// with the remote path as cwd. Pre-host records learn theirs on ensure.
+    #[test]
+    fn projects_record_their_owning_host_and_legacy_records_learn_it() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+
+        let local = registry.ensure_session_project("/workspace/app", None);
+        assert_eq!(local.get("host"), None);
+        let remote = registry.ensure_session_project("/srv/app", Some("forge"));
+        assert_eq!(remote["host"], "forge");
+
+        // A record persisted before projects carried hosts: same id, no host.
+        let id = session_project_id("/srv/legacy", Some("forge")).0;
+        registry
+            .projects
+            .push(serde_json::json!({ "id": id, "root": "/srv/legacy", "name": "legacy" }));
+        let repaired = registry.ensure_session_project("/srv/legacy", Some("forge"));
+        assert_eq!(repaired["host"], "forge");
     }
 
     /// Older records stored `projectID` as the raw directory path instead of a
@@ -1588,6 +2006,27 @@ mod tests {
     }
 
     #[test]
+    fn unknown_top_level_state_survives_a_registry_write() {
+        let temp = tempfile::tempdir().expect("temp");
+        let state_file = temp.path().join("state.json");
+        std::fs::write(
+            &state_file,
+            br#"{"version":1,"projects":[],"sessions":[],"future":{"theme":"plum"}}"#,
+        )
+        .expect("write");
+
+        let mut registry = Registry::new(engine(), &state_file);
+        registry.load().expect("load");
+        registry.insert_record(record("new"));
+        registry.persist().expect("persist");
+
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_file).expect("read")).expect("parse");
+        assert_eq!(raw["future"], serde_json::json!({"theme": "plum"}));
+        assert_eq!(raw["sessions"][0]["id"], "new");
+    }
+
+    #[test]
     fn project_identity_includes_the_execution_host() {
         let local = session_project_id("/workspace/app", None);
         let forge = session_project_id("/workspace/app", Some("forge"));
@@ -1600,7 +2039,12 @@ mod tests {
     #[test]
     fn live_claude_metadata_promotes_the_generated_conversation_title() {
         let temp = tempfile::tempdir().expect("temp");
-        let transcript = temp.path().join("conversation.jsonl");
+        let agent_id = "0199f2c4-1a2b-4c3d-8e9f-000000000009";
+        let transcript = temp
+            .path()
+            .join(".claude/projects/-tmp")
+            .join(format!("{agent_id}.jsonl"));
+        std::fs::create_dir_all(transcript.parent().expect("parent")).expect("mkdir");
         std::fs::write(
             &transcript,
             "{\"type\":\"user\",\"message\":{\"content\":\"vague prompt\"}}\n\
@@ -1610,16 +2054,18 @@ mod tests {
         let mut registry = Registry::new(engine(), temp.path().join("state.json"));
         let mut session = record("claude");
         session.kind = AgentKind::CLAUDE_CODE;
+        session.agent_session_id = Some(agent_id.to_owned());
         session.title = "vague prompt".to_owned();
         session.title_source = TitleSource::FirstPrompt;
         registry.insert_record(session);
 
-        assert!(registry.apply_hook_metadata(
+        assert!(registry.apply_hook_metadata_with_home(
             "claude",
             &crate::hooks::HookMetadata {
                 transcript_path: Some(transcript.to_string_lossy().into_owned()),
                 ..crate::hooks::HookMetadata::default()
-            }
+            },
+            Some(temp.path()),
         ));
 
         let updated = registry.record("claude").expect("record");
@@ -1628,14 +2074,104 @@ mod tests {
     }
 
     #[test]
+    fn first_codex_notify_associates_the_matching_live_rollout() {
+        let temp = tempfile::tempdir().expect("temp");
+        let transcript = temp
+            .path()
+            .join(".codex/sessions/2026/08/13/rollout-now-thread-9.jsonl");
+        std::fs::create_dir_all(transcript.parent().expect("parent")).expect("mkdir");
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-9\",\"cwd\":\"/tmp\"}}\n",
+        )
+        .expect("write transcript");
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let mut session = record("codex");
+        session.kind = AgentKind::CODEX;
+        registry.insert_record(session);
+
+        assert!(registry.apply_hook_metadata_with_home(
+            "codex",
+            &crate::hooks::HookMetadata {
+                agent_session_id: Some("thread-9".to_owned()),
+                ..crate::hooks::HookMetadata::default()
+            },
+            Some(temp.path()),
+        ));
+        let updated = registry.record("codex").expect("record");
+        assert_eq!(updated.agent_session_id.as_deref(), Some("thread-9"));
+        assert_eq!(
+            updated.transcript_path.as_deref(),
+            Some(transcript.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn arbitrary_hook_transcript_paths_never_enter_the_record() {
+        let temp = tempfile::tempdir().expect("temp");
+        let outside = temp.path().join("outside.jsonl");
+        std::fs::write(&outside, "{}\n").expect("write");
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let mut session = record("claude");
+        session.kind = AgentKind::CLAUDE_CODE;
+        session.agent_session_id = Some("0199f2c4-1a2b-4c3d-8e9f-000000000009".to_owned());
+        registry.insert_record(session);
+
+        assert!(!registry.apply_hook_metadata_with_home(
+            "claude",
+            &crate::hooks::HookMetadata {
+                transcript_path: Some(outside.to_string_lossy().into_owned()),
+                ..crate::hooks::HookMetadata::default()
+            },
+            Some(temp.path()),
+        ));
+        assert!(
+            registry
+                .record("claude")
+                .expect("record")
+                .transcript_path
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn legacy_arbitrary_transcript_paths_never_feed_generated_titles() {
+        let temp = tempfile::tempdir().expect("temp");
+        let outside = temp.path().join("outside.jsonl");
+        std::fs::write(
+            &outside,
+            "{\"type\":\"ai-title\",\"aiTitle\":\"untrusted promoted title\"}\n",
+        )
+        .expect("write");
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let mut session = record("claude");
+        session.kind = AgentKind::CLAUDE_CODE;
+        session.agent_session_id = Some("0199f2c4-1a2b-4c3d-8e9f-000000000009".to_owned());
+        session.transcript_path = Some(outside.to_string_lossy().into_owned());
+        session.title = "safe existing title".to_owned();
+        session.title_source = TitleSource::FirstPrompt;
+        registry.insert_record(session);
+
+        assert!(!registry.apply_hook_metadata_with_home(
+            "claude",
+            &crate::hooks::HookMetadata::default(),
+            Some(temp.path()),
+        ));
+        let updated = registry.record("claude").expect("record");
+        assert_eq!(updated.title, "safe existing title");
+        assert_eq!(updated.title_source, TitleSource::FirstPrompt);
+    }
+
+    #[test]
     fn pty_titles_are_filtered_fallbacks_and_never_override_user_renames() {
         let view = SessionView {
             id: "claude".to_owned(),
             status: SessionStatus::Working,
+            status_evidence: None,
             needs_input: None,
+            last_turn_completed_at: None,
             title: Some("Repair remote attach".to_owned()),
             title_source: Some(TitleSource::AgentProvided),
-            last_turn_completed_at: None,
             tail_offset: 0,
             exited: false,
         };
@@ -1785,5 +2321,27 @@ mod tests {
         assert_eq!(session.title, "Cursor Integration Fix");
         assert_eq!(session.title_source, TitleSource::AgentProvided);
         assert_eq!(session.agent_session_id.as_deref(), Some(id));
+    }
+
+    #[test]
+    fn completed_turn_time_folds_into_attention_state() {
+        let mut session = record("completed");
+        session.status = SessionStatus::Working;
+        let view = SessionView {
+            id: "completed".to_owned(),
+            status: SessionStatus::Idle,
+            status_evidence: None,
+            needs_input: None,
+            last_turn_completed_at: Some(DateMillis(2_000.0)),
+            title: None,
+            title_source: None,
+            tail_offset: 0,
+            exited: false,
+        };
+
+        fold_session_status(&mut session, &view);
+
+        assert_eq!(session.last_turn_completed_at, Some(DateMillis(2_000.0)));
+        assert_eq!(session.attention(), diri_proto::AttentionLevel::DoneUnseen);
     }
 }

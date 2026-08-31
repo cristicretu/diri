@@ -1,0 +1,141 @@
+{
+  "_notice": "Screen predicates adapted from Herdr's Apache-2.0 Cline manifest and cross-checked against Cline's official CLI TUI source and README on 2026-08-11. The rule text is limited to strings Cline itself renders; the agent capability block is Diri's own.",
+  "schemaVersion": 2,
+  "id": "cline",
+  "version": "2026.08.11.1",
+  "statusModel": "full",
+  "agent": {
+    "id": "cline",
+    "displayName": "Cline CLI",
+    "shortLabel": "cline",
+    "glyph": "C",
+    "aliases": [
+      "cline",
+      "cline-cli"
+    ],
+    "firstClass": true,
+    "setup": {
+      "url": "https://docs.cline.bot/getting-started/installing-cline",
+      "installHint": "Install Cline CLI with npm install -g cline.",
+      "signInHint": "Run cline auth and choose a provider or API key."
+    },
+    "statusAuthority": "screen",
+    "binary": "cline",
+    "returnToLoginShell": true,
+    "foregroundExecNames": [
+      "cline"
+    ],
+    "envScrubPrefixes": [
+      "DIRI_",
+      "DIRIJOR_"
+    ],
+    "approve": {
+      "text": "y",
+      "submit": true
+    },
+    "deny": {
+      "text": "n",
+      "submit": true
+    }
+  },
+  "rules": [
+    {
+      "id": "tool-permission",
+      "state": "blockedPermission",
+      "priority": 1000,
+      "region": "whole_recent",
+      "when": {
+        "all": [
+          {
+            "contains": "approve tool call?"
+          },
+          {
+            "contains": "[y] approve"
+          },
+          {
+            "contains": "[n] deny"
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      },
+      "_notice": "Exact labels from apps/cli/src/tui/components/dialogs/tool-approval.tsx. Requiring all three avoids matching prose that merely discusses approval."
+    },
+    {
+      "id": "follow-up-question",
+      "state": "blockedQuestion",
+      "priority": 980,
+      "region": "whole_recent",
+      "when": {
+        "all": [
+          {
+            "contains": "type a response..."
+          },
+          {
+            "any": [
+              {
+                "contains": "enter to select"
+              },
+              {
+                "contains": "enter to submit, esc to go back"
+              }
+            ]
+          }
+        ]
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 14,
+        "maxChars": 400
+      },
+      "_notice": "Exact labels from apps/cli/src/tui/components/dialogs/ask-question.tsx."
+    },
+    {
+      "id": "thinking-cancel-hint",
+      "state": "working",
+      "priority": 900,
+      "region": "whole_recent",
+      "when": {
+        "contains": "thinking... (esc to cancel)"
+      },
+      "_notice": "Cline renders this while a turn is waiting for its first content block."
+    },
+    {
+      "id": "streaming-spinner",
+      "state": "working",
+      "priority": 890,
+      "region": "whole_recent",
+      "when": {
+        "lineRegex": "^\\s*[⠀-⣿]"
+      },
+      "_notice": "OpenTUI's dots spinner occupies the first cell of streaming assistant, reasoning, and tool rows. Completed rows replace it with a non-braille marker."
+    },
+    {
+      "id": "idle-input-placeholder",
+      "state": "idle",
+      "priority": 500,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 8,
+      "when": {
+        "any": [
+          {
+            "contains": "ask anything..."
+          },
+          {
+            "contains": "plan something..."
+          }
+        ]
+      },
+      "_notice": "The two placeholders are the empty input bar in Act and Plan mode. Working rules outrank this because Cline keeps the composer visible during a turn."
+    }
+  ]
+}

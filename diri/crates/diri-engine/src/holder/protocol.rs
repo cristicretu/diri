@@ -36,6 +36,28 @@ pub struct HolderLaunchSpec {
 /// Default output-log spill cap, matching the Swift spec default.
 pub const DEFAULT_DISK_CAPACITY: i64 = 32 << 20;
 
+/// Additive local Holder input protocol negotiated over the legacy NDJSON
+/// connection. Version 1 frames are `[kind u8][length u32][payload]` and each
+/// frame receives one acknowledgement byte after the PTY operation completes.
+pub const HOLDER_STREAM_VERSION: u16 = 1;
+pub const HOLDER_STREAM_INPUT: u8 = 1;
+pub const HOLDER_STREAM_RESIZE: u8 = 2;
+pub const HOLDER_STREAM_ACK: u8 = 0;
+pub const HOLDER_STREAM_MAX_PAYLOAD: usize = 1 << 20;
+
+/// One-way output protocol. After the NDJSON handshake the holder writes
+/// `[offset u64][length u32][payload]` frames until the child exits or the
+/// subscriber falls too far behind.
+///
+/// Frames are contiguous by construction, and each still carries its offset so
+/// the subscriber can check rather than trust: a mismatch means fall back to
+/// the log, which turns any race here into a resynchronization instead of a
+/// silently corrupted screen.
+pub const HOLDER_OUTPUT_STREAM_VERSION: u16 = 1;
+/// Largest single output frame. A PTY read cannot exceed the pump's buffer,
+/// so this only bounds what a subscriber must be willing to allocate.
+pub const HOLDER_OUTPUT_MAX_FRAME: usize = 1 << 20;
+
 /// A (pid, start time) pair. The start time is the identity check that makes
 /// signalling a recycled pid safe.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -96,6 +118,16 @@ pub enum HolderExitReason {
 /// The per-session request set.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum HolderOperation {
+    /// Upgrade this connection to the acknowledged binary input protocol.
+    /// Older live holders reject the unknown operation, which is the explicit
+    /// signal for a new daemon to keep using one-request NDJSON.
+    #[serde(rename = "stream")]
+    Stream,
+    /// Upgrade this connection to a one-way stream of PTY output. Older
+    /// holders reject the unknown operation, which is the signal for the
+    /// daemon to keep tailing the log file instead.
+    #[serde(rename = "output-stream")]
+    OutputStream,
     #[serde(rename = "write")]
     Write,
     #[serde(rename = "resize")]
@@ -111,6 +143,12 @@ pub enum HolderOperation {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HolderRequest {
     pub op: HolderOperation,
+    #[serde(
+        rename = "streamVersion",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stream_version: Option<u16>,
     /// base64 payload for `write`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<String>,
@@ -126,6 +164,7 @@ impl HolderRequest {
     pub fn op(op: HolderOperation) -> Self {
         Self {
             op,
+            stream_version: None,
             data: None,
             cols: None,
             rows: None,
@@ -137,21 +176,48 @@ impl HolderRequest {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HolderResponse {
     pub ok: bool,
+    #[serde(
+        rename = "streamVersion",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stream_version: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stat: Option<HolderStat>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tree: Option<Vec<HolderProcessSample>>,
+    /// Stream offset the first output frame will carry. Everything below it
+    /// belongs to the log, which the subscriber must finish reading first.
+    #[serde(
+        rename = "startOffset",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub start_offset: Option<u64>,
 }
 
 impl HolderResponse {
+    /// Accepts an output-stream upgrade, naming the offset the first frame
+    /// will carry.
+    pub fn output_stream(version: u16, start_offset: u64) -> Self {
+        Self {
+            ok: true,
+            stream_version: Some(version),
+            start_offset: Some(start_offset),
+            ..Self::success()
+        }
+    }
+
     pub fn success() -> Self {
         Self {
             ok: true,
+            stream_version: None,
             error: None,
             stat: None,
             tree: None,
+            start_offset: None,
         }
     }
 
@@ -172,9 +238,18 @@ impl HolderResponse {
     pub fn failure(message: impl Into<String>) -> Self {
         Self {
             ok: false,
+            stream_version: None,
             error: Some(message.into()),
             stat: None,
             tree: None,
+            start_offset: None,
+        }
+    }
+
+    pub fn stream(version: u16) -> Self {
+        Self {
+            stream_version: Some(version),
+            ..Self::success()
         }
     }
 }
@@ -279,6 +354,17 @@ impl HolderExitMarker {
         marker
     }
 
+    /// Whether a chunk can go straight to the emulator.
+    ///
+    /// True when it holds no marker and does not end in something that could
+    /// become one, which is every chunk of ordinary output. The caller can
+    /// then feed the bytes where they lie instead of copying them through an
+    /// accumulator to have the same bytes handed back.
+    #[must_use]
+    pub fn absent_from(chunk: &[u8]) -> bool {
+        find(chunk, Self::PREFIX).is_none() && longest_suffix_of_prefix(chunk) == 0
+    }
+
     /// Pulls complete output and markers from a chunk accumulator. A possible
     /// split marker prefix stays buffered for the next append. Returns the
     /// displayable bytes and the last complete exit status found, if any.
@@ -319,9 +405,20 @@ impl HolderExitMarker {
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+    // Anchored on the first byte rather than comparing the whole needle at
+    // every offset. Every byte of every session's output passes through here,
+    // and a nineteen-byte window comparison per position was costing more than
+    // parsing the bytes did.
+    let (first, rest) = needle.split_first()?;
+    let mut offset = 0;
+    while let Some(hit) = haystack[offset..].iter().position(|byte| byte == first) {
+        let start = offset + hit;
+        if haystack[start + 1..].starts_with(rest) {
+            return Some(start);
+        }
+        offset = start + 1;
+    }
+    None
 }
 
 fn longest_suffix_of_prefix(data: &[u8]) -> usize {

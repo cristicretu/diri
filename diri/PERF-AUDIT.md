@@ -2,13 +2,25 @@
 
 **Status (same day):** fixed and verified — A1, A2 (via A1's caching), A3, A4,
 A5, A6, A7, A10, A15 (blast radius now inspector-only); B1, B2, B4, B6, B7, B9;
-B3 scoped to static coders + off-actor writes/probes (a persistent holder
-connection needs a protocol migration old live holders would not survive —
-deliberately not done); C1, C2 (adaptive tick + attach-driven hot signal, not
+B3 originally scoped to static coders + off-actor writes/probes; C1, C2
+(adaptive tick + attach-driven hot signal, not
 kqueue), C3, C4, C5, C7, C10, and the direct pump's 8KiB→64KiB buffer. Plus
 `[profile.release]` thin LTO + codegen-units=1 — **later reverted**: both make
 the linker reject gpui_macos's Objective-C statics ("pointer not aligned"),
 nondeterministically; the release profile is back to defaults.
+
+**Terminal pass (2026-08-13):** B3 is now complete without abandoning old live
+Holders. The Rust client negotiates an additive versioned stream over the
+legacy request interface; an old Holder's normal rejection selects legacy
+JSON/base64 for that process, while a new Holder keeps one binary input/resize
+connection with per-operation acknowledgements. A failed ambiguous stream
+write is never retried, preventing duplicate keystrokes. A same-process release
+fixture measures legacy and stream paths and requires the stream p95 to win.
+The persistent lane runs at interactive QoS on Apple platforms. The daemon's
+held-output follower adopts that class only during its existing recently-
+attached/input hot window and restores default QoS afterward. The release
+attach fixture gates 101 writes through the complete input-to-grid path,
+including the viewport's scrolling phase, not just socket acknowledgement.
 
 **Second pass (2026-08-07):** instant session switching landed — evicted
 sessions park their last-known grid (bounded MRU, ~100KB each) and re-selection
@@ -20,11 +32,11 @@ thread remains open), and A9's record clone (Arc). Still open: A8 (mostly
 defused by A1), A11's background-spawn half, A14, B5, B8, B10–B12 (all made
 moot if the dirijord-rs flip sticks), C6, C8, C9.
 
-Three parallel deep audits: the GPUI client, the Swift daemon (still what ships),
-and the Rust engine (the future daemon). Findings ranked per area; file:line
-references verified at audit time. The two previously-fixed items (leading-edge
-daemon flush, 16ms client pacing) and the two already-landed engine fixes
-(batched vte feed, allocation-free digest) are excluded.
+Three parallel deep audits: the GPUI client, the Swift daemon (still what
+shipped at audit time), and the Rust engine. Findings ranked per area; file:line
+references were verified then. The 2026-08-13 terminal pass supersedes the old
+fixed 16 ms client pacer: GPUI's display link now owns client pacing, while the
+daemon's leading edge and interactive response bypass background coalescing.
 
 ## A. GPUI client (`diri-app`, `diri-term`)
 
@@ -141,7 +153,7 @@ it, ~23k cells per flush, ≤60 flushes/s ≈ 1.4M Character constructions/s per
 busy session. **Fix:** compare raw `CharData`/`Attribute` first; build
 `GridCell`s only for differing rows.
 
-### B3. Every keystroke = fresh UDS connect + JSON + base64, blocking the actor
+### B3. Every keystroke used to open a fresh UDS connection
 `HolderClient.swift:40-52` — per call: connect, new JSONEncoder, blocking
 readLine, new JSONDecoder; `write()` base64-expands the payload (`:12`). Called
 from `writeRaw` per keystroke (`AgentSession.swift:977`) — stalls log draining
@@ -150,6 +162,10 @@ session) runs serially **inside** `StatusEngine.tickAll`, so one slow holder
 stalls status for all sessions; `agentWorkingDir()` similar every 5s.
 **Fix:** persistent connection per holder, length-prefixed binary write frames;
 move stat/ProcessTree probes off the actor.
+
+**Implemented:** the current Rust Holder uses the additive negotiated binary
+stream described above. Control operations remain independent legacy requests,
+and old live Holder processes continue to work until they naturally exit.
 
 ### B4. Dead `.output` frames still built and sent per chunk
 `AgentSession.swift:536-543` — the GPUI client discards `FrameType::Output`

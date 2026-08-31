@@ -6,7 +6,7 @@ use gpui::{
     prelude::*, px, svg,
 };
 
-use crate::{Fill, IconName, Radius, SemanticColors, rgba_f32};
+use crate::{Chip, Fill, IconName, Ink, Radius, SemanticColors, Typo, rgba_f32};
 
 /// Shared, platform-independent activity mark for bounded asynchronous work.
 /// Repeating GPUI animations automatically become static when Reduce Motion
@@ -40,6 +40,74 @@ impl RenderOnce for LoadingIndicator {
                 Animation::new(Duration::from_millis(850)).repeat(),
                 |icon, delta| icon.with_transformation(Transformation::rotate(percentage(delta))),
             )
+    }
+}
+
+/// Compact row chip used by the sidebar (and matched by the menubar AppKit
+/// surface via [`Chip`] tokens). One shape for every quiet state label.
+#[derive(IntoElement)]
+pub struct StateChip {
+    label: SharedString,
+    tint: Rgba,
+    colors: SemanticColors,
+}
+
+impl StateChip {
+    pub fn new(label: impl Into<SharedString>, tint: Rgba, colors: SemanticColors) -> Self {
+        Self {
+            label: label.into(),
+            tint,
+            colors,
+        }
+    }
+}
+
+impl RenderOnce for StateChip {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        div()
+            .flex_none()
+            .px(px(Chip::PAD_X))
+            .py(px(Chip::PAD_Y))
+            .rounded(px(Radius::CHIP))
+            .bg(Fill::subtle(self.colors))
+            .text_size(px(Chip::font_size()))
+            .line_height(px(Chip::LINE_H))
+            .font_weight(Typo::META.weight)
+            .text_color(self.tint)
+            .whitespace_nowrap()
+            .child(self.label)
+    }
+}
+
+/// Same geometry as [`StateChip`], danger tint for blockers that must outrank
+/// the rest of the chip lane.
+#[derive(IntoElement)]
+pub struct AlertChip {
+    label: SharedString,
+}
+
+impl AlertChip {
+    pub fn new(label: impl Into<SharedString>) -> Self {
+        Self {
+            label: label.into(),
+        }
+    }
+}
+
+impl RenderOnce for AlertChip {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        div()
+            .flex_none()
+            .px(px(Chip::PAD_X))
+            .py(px(Chip::PAD_Y))
+            .rounded(px(Radius::CHIP))
+            .bg(Ink::DANGER.alpha(0.12))
+            .text_size(px(Chip::font_size()))
+            .line_height(px(Chip::LINE_H))
+            .font_weight(Typo::META.weight)
+            .text_color(Ink::DANGER)
+            .whitespace_nowrap()
+            .child(self.label)
     }
 }
 
@@ -180,6 +248,8 @@ impl RowFill {
 pub struct FloatingSurface {
     colors: SemanticColors,
     child: AnyElement,
+    radius: f32,
+    animate_entry: bool,
 }
 
 impl FloatingSurface {
@@ -187,16 +257,30 @@ impl FloatingSurface {
         Self {
             colors,
             child: child.into_any_element(),
+            radius: Radius::PANEL,
+            animate_entry: true,
         }
+    }
+
+    pub const fn radius(mut self, radius: f32) -> Self {
+        self.radius = radius;
+        self
+    }
+
+    pub const fn animate_entry(mut self, animate: bool) -> Self {
+        self.animate_entry = animate;
+        self
     }
 }
 
 impl RenderOnce for FloatingSurface {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let colors = self.colors;
-        div()
+        let animate_entry = self.animate_entry;
+        let surface = div()
             .relative()
-            .rounded(px(Radius::PANEL))
+            .rounded(px(self.radius))
+            .overflow_hidden()
             // Floating chrome keeps the sidebar hue but uses a denser material
             // so live terminal content never competes with labels or controls.
             .bg(colors.floating_surface())
@@ -218,12 +302,47 @@ impl RenderOnce for FloatingSurface {
                     inset: true,
                 },
             ])
-            .child(self.child)
-            .with_animation(
-                "floating-surface-entry",
-                Animation::new(Duration::from_millis(160)).with_easing(ease_out_quint()),
-                |surface, delta| surface.opacity(0.76 + 0.24 * delta),
-            )
+            .child(self.child);
+        if !animate_entry
+            || floating_surface_motion(cx.reduce_motion()) == FloatingSurfaceMotion::Immediate
+        {
+            surface.into_any_element()
+        } else {
+            surface
+                .with_animation(
+                    // Animation state belongs to this mounted element. The stable
+                    // key prevents ordinary parent repaints from restarting it;
+                    // closing unmounts the element and drops that state, so a
+                    // rapid close/open creates a fresh, fully hit-testable surface
+                    // rather than resuming stale partial opacity.
+                    "floating-surface-entry",
+                    Animation::new(Duration::from_millis(160)).with_easing(ease_out_quint()),
+                    |surface, delta| surface.opacity(floating_surface_opacity(false, delta)),
+                )
+                .into_any_element()
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FloatingSurfaceMotion {
+    Immediate,
+    EntryFade,
+}
+
+fn floating_surface_motion(reduce_motion: bool) -> FloatingSurfaceMotion {
+    if reduce_motion {
+        FloatingSurfaceMotion::Immediate
+    } else {
+        FloatingSurfaceMotion::EntryFade
+    }
+}
+
+fn floating_surface_opacity(reduce_motion: bool, progress: f32) -> f32 {
+    if reduce_motion {
+        1.0
+    } else {
+        0.76 + 0.24 * progress.clamp(0.0, 1.0)
     }
 }
 
@@ -278,5 +397,24 @@ mod tests {
         assert_eq!(marquee_progress(0.10, 0.20, 0.80), 0.0);
         assert!((marquee_progress(0.50, 0.20, 0.80) - 0.5).abs() < f32::EPSILON);
         assert_eq!(marquee_progress(0.90, 0.20, 0.80), 1.0);
+    }
+
+    #[test]
+    fn floating_surface_motion_policy_is_immediate_when_reduced() {
+        assert_eq!(
+            floating_surface_motion(true),
+            FloatingSurfaceMotion::Immediate
+        );
+        assert_eq!(
+            floating_surface_motion(false),
+            FloatingSurfaceMotion::EntryFade
+        );
+        // Immediate policy cannot inherit a stale mid-animation opacity from
+        // an open/close/open sequence. Normal motion keeps the old endpoints.
+        for stale_progress in [-1.0, 0.0, 0.4, 1.0, 2.0] {
+            assert_eq!(floating_surface_opacity(true, stale_progress), 1.0);
+        }
+        assert_eq!(floating_surface_opacity(false, 0.0), 0.76);
+        assert_eq!(floating_surface_opacity(false, 1.0), 1.0);
     }
 }

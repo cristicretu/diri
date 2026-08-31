@@ -407,6 +407,7 @@ fn project(id: &str, root: &str, name: &str) -> Project {
         root: root.into(),
         name: name.into(),
         pinned_order: None,
+        host: None,
     }
 }
 
@@ -488,11 +489,14 @@ fn session(
         git_branch: branch.map(str::to_owned),
         title: title.into(),
         title_source: TitleSource::AgentProvided,
+        originating_prompt: None,
         agent_session_id: None,
         transcript_path: None,
         status,
+        status_evidence: None,
         needs_input: None,
         resumability,
+        capabilities: None,
         parent: None,
         created_at: DateMillis(created),
         updated_at: DateMillis(created),

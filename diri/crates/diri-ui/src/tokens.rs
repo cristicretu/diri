@@ -276,6 +276,31 @@ impl Fill {
     }
 }
 
+/// Shared geometry for the compact state chips (Zzz, Ended, host, …).
+///
+/// GPUI draws them via [`crate::StateChip`]; AppKit menubar rows must use the
+/// same numbers so the two surfaces stay optically identical.
+pub struct Chip;
+
+impl Chip {
+    pub const PAD_X: f32 = 5.0;
+    pub const PAD_Y: f32 = 1.0;
+    /// The chip pins its own line box rather than inheriting GPUI's default for
+    /// the font size. AppKit has no line box at all, so leaving this implicit
+    /// meant the menubar had to guess at a text engine it does not run — and it
+    /// guessed with a magic `+ 4.0` on top of this token.
+    pub const LINE_H: f32 = 15.0;
+
+    pub const fn font_size() -> f32 {
+        Typo::META.size
+    }
+
+    /// Full painted height of the pill. Both surfaces size from this.
+    pub const fn height() -> f32 {
+        Self::LINE_H + Self::PAD_Y * 2.0
+    }
+}
+
 pub struct Space;
 
 impl Space {

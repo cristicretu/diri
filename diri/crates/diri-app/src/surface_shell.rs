@@ -5,48 +5,42 @@ use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
+use crate::delegation::worktree_move_proposal;
+use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::query_label;
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
-use crate::settings::{HostDraft, SettingsTab, default_agent_label, theme};
-use crate::store::{DefaultAgent, Prefs, SessionStore, StoreRuntime};
+use crate::settings::{HostDraft, SettingsNav, SettingsTab, theme};
+use crate::sidebar::DraggedSidebarItem;
+use crate::store::{Prefs, SessionStore, StoreRuntime};
 use crate::updates::{UpdateCommand, UpdateHandle, UpdatePhase};
 use crate::worktrees::WorktreesSheet;
 use diri_proto::{AgentKind as ProtoAgentKind, HistoryEntry, HostEntry, HostsConfig};
 use diri_term::theme::{TermTheme, ThemeAppearance};
 use diri_ui::{
     AgentLogo, Fill, FloatingSurface, HairlineDivider, Ink, LoadingIndicator, Metrics, Palette,
-    Radius, SemanticColors, Space, Typo,
+    Radius, SemanticColors, Typo,
 };
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, FocusHandle, Focusable, FontWeight,
-    IntoElement, KeyDownEvent, MouseButton, Pixels, Render, Rgba, SharedString, Task, TextRun,
-    Window, actions, canvas, deferred, div, font, prelude::*, px, rgba,
+    Animation, AnimationExt, AnyElement, App, Bounds, ClickEvent, Context, CursorStyle,
+    FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton, PathPromptOptions,
+    Pixels, Render, Rgba, ScrollHandle, SharedString, Task, TextRun, Window, canvas, deferred, div,
+    ease_out_quint, font, point, prelude::*, px, rgba,
 };
 use tokio::runtime::Runtime;
 
-const SETTINGS_WIDTH: f32 = 600.0;
-const SETTINGS_HEIGHT: f32 = 420.0;
-const SETTINGS_NAV_WIDTH: f32 = 150.0;
+use crate::commands::{
+    Activate, CloseSurface, CommandId, MoveDown, MoveUp, OpenSettings, OpenWorktrees,
+    ToggleHistory, UTILITY_CONTEXT,
+};
+const SETTINGS_CONTENT_MAX_WIDTH: f32 = 760.0;
+const SETTINGS_TRANSITION_DURATION: Duration = Duration::from_millis(190);
 const SETTINGS_SECTION_GAP: f32 = 16.0;
 const SETTINGS_ROW_HEIGHT: f32 = 50.0;
 const RESULT_LIMIT: usize = 200;
+const HOST_FIELD_HORIZONTAL_PADDING: f32 = 10.0;
 /// Reinstall success is confirmation, not persistent host state. Errors stay
 /// actionable and first-time setup keeps its "Use by default" action.
 const HOST_REINSTALL_SUCCESS_VISIBILITY: Duration = Duration::from_secs(3);
-
-actions!(
-    diri,
-    [
-        ToggleHistory,
-        OpenWorktrees,
-        OpenSettings,
-        CloseSurface,
-        MoveUp,
-        MoveDown,
-        Activate
-    ]
-);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Surface {
@@ -55,6 +49,7 @@ enum Surface {
     History,
     Worktrees,
     Settings,
+    Diagnostics,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,17 +101,6 @@ impl HostFormField {
             Self::NodeId => "NODE_ID",
         }
     }
-
-    const fn index(self) -> usize {
-        match self {
-            Self::Name => 0,
-            Self::Ssh => 1,
-            Self::DefaultCwd => 2,
-            Self::NodeEndpoint => 3,
-            Self::NodeTokenFile => 4,
-            Self::NodeId => 5,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -131,6 +115,14 @@ struct HostEditor {
     active_field: HostFormField,
     error: Option<String>,
     confirm_remove: bool,
+}
+
+struct AgentPathEditor {
+    kind: ProtoAgentKind,
+    host: Option<String>,
+    path: QueryEditor,
+    show_in_quick_create: bool,
+    error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -259,19 +251,25 @@ pub struct UtilitySurfaces {
     history_error: Option<String>,
     worktrees: WorktreesSheet,
     settings_tab: SettingsTab,
+    settings_scroll: ScrollHandle,
+    settings_search: QueryEditor,
+    settings_search_active: bool,
+    settings_transition_generation: u64,
     settings_menu: Option<SettingsMenu>,
+    agents_host: Option<String>,
+    agent_path_editor: Option<AgentPathEditor>,
     hosts_path: PathBuf,
     hosts: Vec<HostEntry>,
     host_editor: Option<HostEditor>,
     host_initialization: Option<HostInitialization>,
     host_initialization_generation: u64,
-    host_field_bounds: [Rc<Cell<Option<Bounds<Pixels>>>>; 6],
     prefs: Prefs,
     store: Arc<RwLock<SessionStore>>,
     store_runtime: Arc<StoreRuntime>,
     runtime: Arc<Runtime>,
     updates: UpdateHandle,
     activity: String,
+    diagnostics_report: Option<String>,
     _update_changes: Task<()>,
     _store_changes: Task<()>,
 }
@@ -289,22 +287,35 @@ impl UtilitySurfaces {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         let hosts_path = diri_proto::paths::DirijorPaths::hosts_config_file(&home);
-        let (prefs, hosts) = {
+        let (prefs, hosts, agents_host) = {
             let store = store_runtime
                 .store
                 .read()
                 .expect("session store lock poisoned");
-            (store.preferences().clone(), store.hosts().to_vec())
+            (
+                store.preferences().clone(),
+                store.hosts().to_vec(),
+                store.default_spawn_host(),
+            )
         };
         let settings_preview = std::env::var("DIRI_SETTINGS_PREVIEW")
             .ok()
             .map(|value| value.to_ascii_lowercase());
         let settings_tab = match settings_preview.as_deref() {
             Some("terminal") => SettingsTab::Terminal,
+            Some("agents") => SettingsTab::Agents,
             Some("resources") => SettingsTab::Resources,
             Some("remote") => SettingsTab::Remote,
             _ => SettingsTab::General,
         };
+        let diagnostics_preview = settings_preview.as_deref() == Some("diagnostics");
+        let diagnostics_report = diagnostics_preview.then(|| {
+            let store = store_runtime
+                .store
+                .read()
+                .expect("session store lock poisoned");
+            build_diagnostics_report(&store)
+        });
         // The Settings pane renders update state it does not own, so it has to
         // be woken when that state moves.
         let update_changes = {
@@ -336,7 +347,9 @@ impl UtilitySurfaces {
         };
         Self {
             focus,
-            surface: if settings_preview.is_some() {
+            surface: if diagnostics_preview {
+                Surface::Diagnostics
+            } else if settings_preview.is_some() {
                 Surface::Settings
             } else {
                 Surface::None
@@ -348,19 +361,25 @@ impl UtilitySurfaces {
             history_error: None,
             worktrees: WorktreesSheet::default(),
             settings_tab,
+            settings_scroll: ScrollHandle::new(),
+            settings_search: QueryEditor::default(),
+            settings_search_active: false,
+            settings_transition_generation: 0,
             settings_menu: None,
+            agents_host,
+            agent_path_editor: None,
             hosts_path,
             hosts,
             host_editor: None,
             host_initialization: None,
             host_initialization_generation: 0,
-            host_field_bounds: std::array::from_fn(|_| Rc::new(Cell::new(None))),
             prefs,
             store: Arc::clone(&store_runtime.store),
             store_runtime,
             runtime,
             updates,
             activity: "Connected client · shared daemon remains untouched".to_owned(),
+            diagnostics_report,
             _update_changes: update_changes,
             _store_changes: store_changes,
         }
@@ -430,6 +449,12 @@ impl UtilitySurfaces {
     }
 
     pub(crate) fn open_worktrees(&mut self, cx: &mut Context<Self>) {
+        self.prefs = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .clone();
         self.surface = Surface::Worktrees;
         self.refresh_worktrees(cx);
     }
@@ -458,11 +483,11 @@ impl UtilitySurfaces {
     }
 
     fn resume_history(&mut self, entry: HistoryEntry, cx: &mut Context<Self>) {
-        let Some(params) = crate::history::resume_spawn(&entry) else {
+        if !entry.cwd_exists || !Path::new(&entry.cwd).is_dir() {
             self.history_error = Some("The conversation folder is no longer available".to_owned());
             cx.notify();
             return;
-        };
+        }
         self.history_loading = true;
         self.history_error = None;
         let client = Arc::clone(self.store_runtime.client());
@@ -470,7 +495,7 @@ impl UtilitySurfaces {
         cx.spawn(async move |this, cx| {
             let task = runtime.spawn(async move {
                 client.wait_until_connected(Duration::from_secs(5)).await?;
-                client.spawn(params).await
+                crate::history::resume(&client, &entry).await
             });
             let result = match task.await {
                 Ok(result) => result.map_err(|error| error.to_string()),
@@ -517,6 +542,18 @@ impl UtilitySurfaces {
         .detach();
     }
 
+    fn confirm_worktree_move(&mut self, cx: &mut Context<Self>) {
+        let Some(params) = self.worktrees.confirm_move() else {
+            return;
+        };
+        self.store
+            .read()
+            .expect("session store lock poisoned")
+            .reparent_worktree(params);
+        self.activity = "Moving session to worktree…".to_owned();
+        cx.notify();
+    }
+
     fn persist_prefs(&mut self) {
         self.prefs.normalize();
         let prefs = self.prefs.clone();
@@ -528,6 +565,7 @@ impl UtilitySurfaces {
         {
             self.activity = format!("Could not save settings: {error}");
         } else {
+            self.store_runtime.publish_local_change();
             self.activity = "Settings saved for diri".to_owned();
         }
     }
@@ -659,6 +697,10 @@ impl UtilitySurfaces {
                 }
                 match outcome {
                     Ok(result) => {
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .request_agent_catalog(Some(host.id.clone()), true);
                         this.activity = match kind {
                             HostPreparationKind::Initialize => {
                                 format!("{} is ready", host.display_name())
@@ -860,6 +902,72 @@ impl UtilitySurfaces {
         true
     }
 
+    fn handle_agent_path_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.surface != Surface::Settings
+            || self.settings_tab != SettingsTab::Agents
+            || self.agent_path_editor.is_none()
+        {
+            return false;
+        }
+        let key = &event.keystroke;
+        match key.key.as_str() {
+            "escape" => {
+                self.agent_path_editor = None;
+                cx.notify();
+            }
+            "enter" => {
+                let Some(editor) = &self.agent_path_editor else {
+                    return true;
+                };
+                let path = editor.path.text().trim();
+                if path.is_empty() {
+                    if let Some(editor) = &mut self.agent_path_editor {
+                        editor.error = Some("Enter an executable path.".into());
+                    }
+                } else {
+                    self.store
+                        .write()
+                        .expect("session store lock poisoned")
+                        .configure_agent(diri_proto::AgentConfigureParams {
+                            host: editor.host.clone(),
+                            kind: editor.kind.clone(),
+                            executable_path: Some(path.to_owned()),
+                            show_in_quick_create: editor.show_in_quick_create,
+                        });
+                    self.agent_path_editor = None;
+                }
+                cx.notify();
+            }
+            _ => {
+                let Some(edit) = query_editor::edit_for(key) else {
+                    return false;
+                };
+                let Some(editor) = &mut self.agent_path_editor else {
+                    return false;
+                };
+                match edit {
+                    Edit::Local(local) => {
+                        editor.path.apply(local);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Copy) => {
+                        query_editor::copy_selection(&editor.path, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Cut) => {
+                        query_editor::cut_selection(&mut editor.path, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Paste) => {
+                        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                            editor.path.insert(&text);
+                        }
+                    }
+                }
+                editor.error = None;
+                cx.notify();
+            }
+        }
+        true
+    }
+
     fn visible_history(&self) -> Vec<HistoryEntry> {
         self.history
             .iter()
@@ -894,12 +1002,21 @@ impl UtilitySurfaces {
     fn close_surface(&mut self, cx: &mut Context<Self>) {
         if self.worktrees.pending_cleanup.is_some() {
             self.worktrees.cancel_cleanup();
+        } else if self.worktrees.pending_move.is_some() || self.worktrees.move_refusal.is_some() {
+            self.worktrees.cancel_move();
         } else {
             self.surface = Surface::None;
             self.settings_menu = None;
             self.host_editor = None;
+            self.agent_path_editor = None;
         }
         cx.notify();
+    }
+
+    pub(crate) fn dismiss(&mut self, cx: &mut Context<Self>) {
+        if self.surface != Surface::None {
+            self.close_surface(cx);
+        }
     }
 
     pub(crate) fn is_open(&self) -> bool {
@@ -914,8 +1031,159 @@ impl UtilitySurfaces {
             .preferences()
             .clone();
         self.surface = Surface::Settings;
+        self.settings_scroll.set_offset(point(px(0.0), px(0.0)));
+        self.settings_search.clear();
+        self.settings_search_active = false;
+        self.settings_transition_generation = self.settings_transition_generation.wrapping_add(1);
         self.settings_menu = None;
         self.host_editor = None;
+        self.agent_path_editor = None;
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_settings(&mut self, cx: &mut Context<Self>) {
+        if self.surface == Surface::Settings {
+            self.close_surface(cx);
+        } else {
+            self.open_settings(cx);
+        }
+    }
+
+    fn visible_settings_tabs(&self) -> Vec<SettingsTab> {
+        SettingsTab::ALL
+            .into_iter()
+            .filter(|tab| settings_tab_matches(*tab, self.settings_search.text()))
+            .collect()
+    }
+
+    pub(crate) fn is_settings_open(&self) -> bool {
+        self.surface == Surface::Settings
+    }
+
+    /// What the app sidebar paints while settings owns the workbench. `None`
+    /// puts the sidebar back on sessions.
+    pub(crate) fn settings_nav(&self) -> Option<SettingsNav> {
+        (self.surface == Surface::Settings).then(|| SettingsNav {
+            tabs: self.visible_settings_tabs(),
+            active: self.settings_tab,
+            search: self.settings_search.clone(),
+            search_active: self.settings_search_active,
+        })
+    }
+
+    /// The sidebar rendered the navigation, so it is the sidebar that reports
+    /// a click on it. Every other entry point into a page goes through the
+    /// same method.
+    pub(crate) fn open_settings_tab(&mut self, tab: SettingsTab, cx: &mut Context<Self>) {
+        if self.surface != Surface::Settings {
+            return;
+        }
+        self.select_settings_tab(tab, cx);
+    }
+
+    /// Clicking the sidebar's search field types into settings, so keyboard
+    /// focus has to come back across with it.
+    pub(crate) fn focus_settings_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.surface != Surface::Settings {
+            return;
+        }
+        self.settings_search_active = true;
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn clear_settings_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.surface != Surface::Settings {
+            return;
+        }
+        self.settings_search.clear();
+        self.settings_search_active = true;
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn select_settings_tab(&mut self, tab: SettingsTab, cx: &mut Context<Self>) {
+        if self.settings_tab != tab {
+            self.settings_scroll.set_offset(point(px(0.0), px(0.0)));
+        }
+        self.settings_tab = tab;
+        self.settings_search_active = false;
+        self.settings_menu = None;
+        self.host_editor = None;
+        self.agent_path_editor = None;
+        if tab == SettingsTab::Remote {
+            self.reload_hosts();
+        } else if tab == SettingsTab::Agents {
+            self.store
+                .write()
+                .expect("session store lock poisoned")
+                .request_agent_catalog(self.agents_host.clone(), false);
+        }
+        cx.notify();
+    }
+
+    fn handle_settings_search_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.surface != Surface::Settings || !self.settings_search_active {
+            return false;
+        }
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                if self.settings_search.is_empty() {
+                    self.settings_search_active = false;
+                } else {
+                    self.settings_search.clear();
+                }
+                cx.notify();
+            }
+            "enter" => {
+                if let Some(tab) = self.visible_settings_tabs().first().copied() {
+                    self.select_settings_tab(tab, cx);
+                }
+            }
+            _ => {
+                let Some(edit) = query_editor::edit_for(&event.keystroke) else {
+                    return true;
+                };
+                match edit {
+                    Edit::Local(local) => {
+                        self.settings_search.apply(local);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Copy) => {
+                        query_editor::copy_selection(&self.settings_search, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Cut) => {
+                        query_editor::cut_selection(&mut self.settings_search, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Paste) => {
+                        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                            self.settings_search.insert(&text);
+                        }
+                    }
+                }
+                cx.notify();
+            }
+        }
+        true
+    }
+
+    pub(crate) fn open_agent_settings(&mut self, host: Option<String>, cx: &mut Context<Self>) {
+        self.open_settings(cx);
+        self.settings_tab = SettingsTab::Agents;
+        self.agents_host = host.clone();
+        self.store
+            .write()
+            .expect("session store lock poisoned")
+            .request_agent_catalog(host, false);
+        cx.notify();
+    }
+
+    fn open_diagnostics(&mut self, cx: &mut Context<Self>) {
+        let store = self.store.read().expect("session store lock poisoned");
+        let report = build_diagnostics_report(&store);
+        drop(store);
+        self.diagnostics_report = Some(report);
+        self.surface = Surface::Diagnostics;
+        self.settings_menu = None;
         cx.notify();
     }
 
@@ -943,11 +1211,22 @@ impl UtilitySurfaces {
         if self.surface == Surface::None {
             return;
         }
-        if self.handle_host_editor_key(event, cx) {
+        if self.handle_agent_path_key(event, cx) || self.handle_host_editor_key(event, cx) {
+            return;
+        }
+        if self.handle_settings_search_key(event, cx) {
+            cx.stop_propagation();
             return;
         }
         let key = &event.keystroke;
-        if key.key == "escape" && self.surface == Surface::Settings && self.settings_menu.is_some()
+        if key.key == "escape"
+            && (self.worktrees.pending_move.is_some() || self.worktrees.move_refusal.is_some())
+        {
+            self.worktrees.cancel_move();
+            cx.notify();
+        } else if key.key == "escape"
+            && self.surface == Surface::Settings
+            && self.settings_menu.is_some()
         {
             self.settings_menu = None;
             cx.notify();
@@ -1120,12 +1399,16 @@ impl UtilitySurfaces {
 
     fn render_worktrees(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.colors();
+        let entity = cx.entity();
         let cards = self
             .worktrees
             .entries
             .iter()
             .map(|entry| {
                 let path = entry.path.clone();
+                let drop_entry = entry.clone();
+                let hover_entry = entry.clone();
+                let hover_entity = entity.clone();
                 let branch = entry
                     .branch
                     .clone()
@@ -1144,6 +1427,58 @@ impl UtilitySurfaces {
                         colors.primary.alpha(0.06)
                     })
                     .bg(Fill::subtle(colors))
+                    .drag_over::<DraggedSidebarItem>(move |card, dragged, _, cx| {
+                        let Some(source_id) = dragged.session_id() else {
+                            return card;
+                        };
+                        let valid = {
+                            let this = hover_entity.read(cx);
+                            let store = this.store.read().expect("session store lock poisoned");
+                            store.sessions().get(source_id).is_some_and(|source| {
+                                worktree_move_proposal(
+                                    source,
+                                    store.projects().get(&source.project_id),
+                                    &hover_entry,
+                                )
+                                .is_ok()
+                            })
+                        };
+                        if valid {
+                            card.border_1()
+                                .border_color(Palette::CLAY.alpha(0.72))
+                                .bg(Palette::CLAY.alpha(0.14))
+                                .cursor(CursorStyle::DragCopy)
+                        } else {
+                            card.border_1()
+                                .border_color(Ink::DANGER.alpha(0.56))
+                                .bg(Ink::DANGER.alpha(0.08))
+                                .cursor(CursorStyle::OperationNotAllowed)
+                        }
+                    })
+                    .on_drop(
+                        cx.listener(move |this, dragged: &DraggedSidebarItem, _, cx| {
+                            if let Some(source_id) = dragged.session_id() {
+                                let result = {
+                                    let store =
+                                        this.store.read().expect("session store lock poisoned");
+                                    store.sessions().get(source_id).map_or_else(
+                                        || Err("The dragged session no longer exists.".to_owned()),
+                                        |source| {
+                                            worktree_move_proposal(
+                                                source,
+                                                store.projects().get(&source.project_id),
+                                                &drop_entry,
+                                            )
+                                            .map_err(|refusal| refusal.0)
+                                        },
+                                    )
+                                };
+                                this.worktrees.propose_move(result);
+                            }
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
                     .flex()
                     .flex_col()
                     .gap(px(8.0))
@@ -1202,6 +1537,8 @@ impl UtilitySurfaces {
             })
             .collect::<Vec<_>>();
         let pending = self.worktrees.pending_cleanup.clone();
+        let pending_move = self.worktrees.pending_move.clone();
+        let move_refusal = self.worktrees.move_refusal.clone();
         FloatingSurface::new(
             self.colors(),
             div()
@@ -1335,176 +1672,203 @@ impl UtilitySurfaces {
                                     })),
                             )),
                     )
+                })
+                .when_some(pending_move, |sheet, proposal| {
+                    let branch = proposal.branch.as_deref().unwrap_or("detached");
+                    sheet.child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .occlude()
+                            .bg(rgba(0x00000088))
+                            .flex()
+                            .items_end()
+                            .justify_center()
+                            .pb(px(18.0))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.worktrees.cancel_move();
+                                    cx.notify();
+                                    cx.stop_propagation();
+                                }),
+                            )
+                            .child(FloatingSurface::new(
+                                self.colors(),
+                                div()
+                                    .w(px(560.0))
+                                    .p(px(16.0))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(12.0))
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(4.0))
+                                            .child(
+                                                div()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .child("Move session to this worktree?"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.0))
+                                                    .text_color(colors.secondary)
+                                                    .child(format!(
+                                                        "{} → {branch} · {}",
+                                                        proposal.source_title,
+                                                        proposal.worktree_path
+                                                    )),
+                                            ),
+                                    )
+                                    .child(surface_button(
+                                        "Cancel",
+                                        "cancel-worktree-move",
+                                        colors,
+                                        cx,
+                                        |this, cx| {
+                                            this.worktrees.cancel_move();
+                                            cx.notify();
+                                        },
+                                    ))
+                                    .child(surface_button(
+                                        "Move Session",
+                                        "confirm-worktree-move",
+                                        colors,
+                                        cx,
+                                        |this, cx| this.confirm_worktree_move(cx),
+                                    )),
+                            )),
+                    )
+                })
+                .when_some(move_refusal, |sheet, reason| {
+                    sheet.child(
+                        div()
+                            .absolute()
+                            .left(px(16.0))
+                            .right(px(16.0))
+                            .bottom(px(16.0))
+                            .p(px(11.0))
+                            .rounded(px(Radius::ROW))
+                            .bg(colors.floating_surface())
+                            .border_1()
+                            .border_color(Ink::DANGER.alpha(0.36))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(sf_symbol(
+                                "exclamationmark.triangle.fill",
+                                12.0,
+                                Ink::DANGER,
+                            ))
+                            .child(
+                                div()
+                                    .min_w(px(0.0))
+                                    .flex_1()
+                                    .text_size(px(11.0))
+                                    .text_color(colors.secondary)
+                                    .child(reason),
+                            )
+                            .child(
+                                div()
+                                    .id("dismiss-worktree-refusal")
+                                    .size(px(20.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.worktrees.cancel_move();
+                                        cx.notify();
+                                    }))
+                                    .child(sf_symbol("xmark", 9.0, colors.tertiary)),
+                            ),
+                    )
                 }),
         )
     }
 
     fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        /* ─────────────────────────────────────────────────────────
+         * SETTINGS SHELL STORYBOARD
+         *
+         *    0ms   the workbench is replaced in place; the app sidebar swaps
+         *          its own body over to settings navigation
+         *   70ms   the page follows the navigation in, from 12px right
+         *  190ms   both surfaces settle at their final position and opacity
+         *
+         * Navigation is deliberately absent here: it is the window sidebar,
+         * which this surface is inset against, so settings never paints a
+         * second rail beside the app's own. Reduced motion mounts the final
+         * layout immediately.
+         * ───────────────────────────────────────────────────────── */
         let colors = self.settings_colors();
-        let tabs = SettingsTab::ALL
-            .into_iter()
-            .map(|tab| {
-                let selected = tab == self.settings_tab;
-                div()
-                    .id(SharedString::from(format!("settings-{}", tab.label())))
-                    .h(px(30.0))
-                    .px(px(8.0))
-                    .rounded(px(Radius::ROW))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .bg(Fill::selected(colors, selected))
-                    .text_color(if selected {
-                        colors.primary
-                    } else {
-                        colors.secondary
-                    })
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(Fill::hover(colors, true)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.settings_tab = tab;
-                        this.settings_menu = None;
-                        this.host_editor = None;
-                        if tab == SettingsTab::Remote {
-                            this.reload_hosts();
-                        }
-                        cx.notify();
-                    }))
-                    .child(sf_symbol(
-                        tab.icon(),
-                        13.0,
-                        if selected {
-                            colors.primary
-                        } else {
-                            colors.tertiary
-                        },
-                    ))
-                    .child(
-                        div()
-                            .text_size(px(Typo::ROW.size))
-                            .font_weight(if selected {
-                                FontWeight::MEDIUM
-                            } else {
-                                FontWeight::NORMAL
-                            })
-                            .child(tab.label()),
-                    )
-                    .into_any_element()
-            })
-            .collect::<Vec<_>>();
+        let generation = self.settings_transition_generation;
         let pane = match self.settings_tab {
             SettingsTab::General => self.general_settings(cx).into_any_element(),
+            SettingsTab::Agents => self.agents_settings(cx).into_any_element(),
             SettingsTab::Terminal => self.terminal_settings(cx).into_any_element(),
             SettingsTab::Resources => self.resource_settings(cx).into_any_element(),
             SettingsTab::Remote => self.remote_settings(cx).into_any_element(),
         };
-        FloatingSurface::new(
-            colors,
-            div()
-                .id("settings-dialog")
-                .debug_selector(|| "settings-dialog".into())
-                .w(px(SETTINGS_WIDTH))
-                .h(px(SETTINGS_HEIGHT))
-                .rounded(px(Radius::PANEL))
-                .overflow_hidden()
-                .flex()
-                // The dialog owns clicks within its bounds. When a select is
-                // open, any click elsewhere in Settings dismisses that select
-                // before the clicked control runs its own action.
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        if this.settings_menu.take().is_some() {
-                            cx.notify();
-                        }
-                        cx.stop_propagation();
-                    }),
-                )
-                .child(
-                    div()
-                        .w(px(SETTINGS_NAV_WIDTH))
-                        .h_full()
-                        .bg(colors.primary.alpha(0.018))
-                        .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .h(px(Metrics::TITLE_BAR))
-                                .px(px(Metrics::TOOLBAR_EDGE_INSET))
-                                .flex()
-                                .items_center()
-                                .gap(px(Metrics::TOOLBAR_ITEM_GAP))
-                                .child(sf_symbol("gearshape", 15.0, colors.secondary))
-                                .child(
-                                    div()
-                                        .text_size(px(Typo::TITLE.size))
-                                        .font_weight(Typo::TITLE.weight)
-                                        .child("Settings"),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .px(px(Space::INSET))
-                                .pt(px(2.0))
-                                .pb(px(10.0))
-                                .flex_1()
-                                .flex()
-                                .flex_col()
-                                .gap(px(2.0))
-                                .children(tabs),
-                        )
-                        .child(
-                            div()
-                                .px(px(Metrics::TOOLBAR_EDGE_INSET))
-                                .pb(px(10.0))
-                                .text_size(px(Typo::META.size))
-                                .text_color(colors.tertiary)
-                                .child(format!("diri {}", crate::updates::CURRENT_VERSION)),
-                        ),
-                )
-                .child(HairlineDivider::vertical(colors))
-                .child(
-                    div()
-                        .relative()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .h_full()
-                        .child(
-                            div()
-                                .id("settings-pane")
-                                .debug_selector(|| "settings-pane".into())
-                                .absolute()
-                                .inset_0()
-                                .overflow_y_scroll()
-                                .child(pane),
-                        )
-                        .child(
-                            div()
-                                .id("close-settings")
-                                .debug_selector(|| "close-settings".into())
-                                .absolute()
-                                .top(px(8.0))
-                                .right(px(Metrics::TOOLBAR_EDGE_INSET))
-                                .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
-                                .rounded(px(Radius::BADGE))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .cursor_pointer()
-                                .hover(move |style| style.bg(Fill::subtle(colors)))
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.close_surface(cx);
-                                }))
-                                .child(sf_symbol_weighted(
-                                    "xmark",
-                                    13.5,
-                                    SymbolWeight::Bold,
-                                    colors.secondary,
-                                )),
-                        ),
-                ),
-        )
+        let pane = div()
+            .id("settings-pane")
+            .debug_selector(|| "settings-pane".into())
+            .relative()
+            .track_scroll(&self.settings_scroll)
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full()
+            .overflow_y_scroll()
+            .bg(colors.background)
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(SETTINGS_CONTENT_MAX_WIDTH))
+                    .mx_auto()
+                    .child(pane),
+            );
+        let pane = if cx.reduce_motion() {
+            pane.into_any_element()
+        } else {
+            pane.with_animation(
+                SharedString::from(format!("settings-canvas-enter-{generation}")),
+                Animation::new(SETTINGS_TRANSITION_DURATION).with_easing(ease_out_quint()),
+                |pane, delta| {
+                    pane.left(px((1.0 - delta) * 12.0))
+                        .opacity(0.64 + 0.36 * delta)
+                },
+            )
+            .into_any_element()
+        };
+
+        div()
+            .id("settings-shell")
+            .debug_selector(|| "settings-shell".into())
+            .size_full()
+            .pt(px(Metrics::TITLE_BAR))
+            .overflow_hidden()
+            .bg(colors.background)
+            .flex()
+            // Settings owns the workbench beside the sidebar. Clicking inside
+            // still closes any open select before the clicked control handles
+            // its action.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.settings_menu.take().is_some() {
+                        cx.notify();
+                    }
+                    cx.stop_propagation();
+                }),
+            )
+            .child(pane)
     }
 
     fn general_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1524,7 +1888,12 @@ impl UtilitySurfaces {
                     "New sessions",
                     setting_row(
                         "Default agent",
-                        "Used by ⌘T and Quick Open.",
+                        format!(
+                            "Used by {} and Quick Open.",
+                            crate::commands::command(CommandId::NewDefaultSession)
+                                .shortcut_label()
+                                .unwrap_or_default()
+                        ),
                         self.default_agent_dropdown(cx),
                         colors,
                     ),
@@ -1535,20 +1904,23 @@ impl UtilitySurfaces {
                     div()
                         .flex()
                         .flex_col()
-                        .child(toggle_row(
-                            "Start diri at login",
-                            "Open diri automatically after you sign in.",
-                            self.prefs.start_at_login,
-                            "toggle-login",
-                            colors,
-                            cx,
-                            |this, cx| {
-                                this.prefs.start_at_login = !this.prefs.start_at_login;
-                                this.persist_prefs();
-                                cx.notify();
-                            },
-                        ))
-                        .child(setting_divider(colors))
+                        .when(cfg!(target_os = "macos"), |behavior| {
+                            behavior
+                                .child(toggle_row(
+                                    "Start diri at login",
+                                    "Open diri automatically after you sign in.",
+                                    self.prefs.start_at_login,
+                                    "toggle-login",
+                                    colors,
+                                    cx,
+                                    |this, cx| {
+                                        this.prefs.start_at_login = !this.prefs.start_at_login;
+                                        this.persist_prefs();
+                                        cx.notify();
+                                    },
+                                ))
+                                .child(setting_divider(colors))
+                        })
                         .child(toggle_row(
                             "Confirm before closing a session",
                             "Ask before closing a session with a running process.",
@@ -1580,6 +1952,22 @@ impl UtilitySurfaces {
                     colors,
                 ))
                 .child(self.update_settings(cx))
+                .child(setting_section(
+                    "Support",
+                    setting_row(
+                        "Copy diagnostics",
+                        "Preview a privacy-safe report before copying it.",
+                        surface_button(
+                            "Preview…",
+                            "preview-diagnostics",
+                            colors,
+                            cx,
+                            |this, cx| this.open_diagnostics(cx),
+                        ),
+                        colors,
+                    ),
+                    colors,
+                ))
                 .child(setting_section(
                     "Quick Open",
                     div()
@@ -1630,12 +2018,480 @@ impl UtilitySurfaces {
         )
     }
 
+    fn agents_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        let host = self.agents_host.clone();
+        let (catalog, loading, error, hosts) = {
+            let store = self.store.read().expect("session store lock poisoned");
+            (
+                store.agent_catalog(host.as_deref()).cloned(),
+                store.agent_catalog_is_loading(host.as_deref()),
+                store
+                    .agent_catalog_error(host.as_deref())
+                    .map(str::to_owned),
+                store.hosts().to_vec(),
+            )
+        };
+        let mut targets = div().p(px(8.0)).flex().flex_wrap().gap(px(6.0));
+        let mut choices = vec![(
+            None,
+            crate::platform::local_machine_label().to_owned(),
+            "desktopcomputer",
+        )];
+        choices.extend(hosts.iter().map(|entry| {
+            (
+                Some(entry.id.clone()),
+                entry.display_name().to_owned(),
+                "network",
+            )
+        }));
+        for (index, (target, label, symbol)) in choices.into_iter().enumerate() {
+            let selected = target == host;
+            targets = targets.child(
+                div()
+                    .id(format!("agent-target-{index}"))
+                    .h(px(28.0))
+                    .px(px(8.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .rounded(px(Radius::CHIP))
+                    .border_1()
+                    .border_color(colors.primary.alpha(if selected { 0.18 } else { 0.07 }))
+                    .bg(Fill::selected(colors, selected))
+                    .cursor_pointer()
+                    .hover(move |row| row.bg(colors.primary.alpha(0.07)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.agents_host.clone_from(&target);
+                        this.agent_path_editor = None;
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .request_agent_catalog(target.clone(), false);
+                        cx.notify();
+                    }))
+                    .child(sf_symbol(symbol, 10.0, colors.secondary))
+                    .child(div().text_size(px(11.0)).child(label)),
+            );
+        }
+
+        let mut catalog_rows = div().flex().flex_col();
+        if let Some(catalog) = catalog {
+            let agents = crate::agent_catalog::settings_agent_items(catalog.agents);
+            let agent_count = agents.len();
+            for (index, item) in agents.into_iter().enumerate() {
+                catalog_rows = catalog_rows.child(self.agent_settings_row(index, item, colors, cx));
+                if index + 1 < agent_count {
+                    catalog_rows = catalog_rows.child(setting_divider(colors));
+                }
+            }
+        } else if loading {
+            catalog_rows = catalog_rows.child(empty_label("Checking installed Agents…", colors));
+        } else {
+            catalog_rows = catalog_rows.child(empty_label(
+                "Agent detection has not run for this host.",
+                colors,
+            ));
+        }
+        if let Some(error) = error {
+            catalog_rows = catalog_rows.child(
+                div()
+                    .px(px(12.0))
+                    .py(px(9.0))
+                    .whitespace_normal()
+                    .text_size(px(11.0))
+                    .text_color(Ink::DANGER)
+                    .child(error),
+            );
+        }
+        if let Some(editor) = &self.agent_path_editor {
+            catalog_rows = catalog_rows.child(self.agent_path_editor_row(editor, colors, cx));
+        }
+
+        let refresh_host = host.clone();
+        settings_page(
+            "Agents",
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(SETTINGS_SECTION_GAP))
+                .child(setting_section("Execution target", targets, colors))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(colors.tertiary)
+                                .child("Detected from the account login PATH."),
+                        )
+                        .child(surface_button(
+                            if loading { "Checking…" } else { "Refresh" },
+                            "refresh-agent-catalog",
+                            colors,
+                            cx,
+                            move |this, cx| {
+                                this.store
+                                    .write()
+                                    .expect("session store lock poisoned")
+                                    .request_agent_catalog(refresh_host.clone(), true);
+                                cx.notify();
+                            },
+                        )),
+                )
+                .child(setting_section("Supported Agents", catalog_rows, colors)),
+            colors,
+        )
+    }
+
+    fn agent_settings_row(
+        &self,
+        index: usize,
+        item: diri_proto::AgentReadinessItem,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let label = item
+            .descriptor
+            .as_ref()
+            .map(|descriptor| descriptor.display_name.clone())
+            .filter(|label| !label.is_empty())
+            .unwrap_or_else(|| item.kind.id().to_owned());
+        let path = item.path.clone().unwrap_or_else(|| "Not found".into());
+        let status = match item.path_source {
+            Some(diri_proto::AgentPathSource::Manual) => "Manual",
+            Some(diri_proto::AgentPathSource::SystemPath) => "Installed",
+            None => "Not found",
+        };
+        let status_color = if item.available() {
+            Ink::FRESH
+        } else {
+            colors.tertiary
+        };
+        let host = self.agents_host.clone();
+        let toggle_kind = item.kind.clone();
+        let toggle_path = item.configured_path.clone();
+        let show = item.show_in_quick_create;
+        let mut actions = div().flex_none().flex().items_center().gap(px(6.0));
+        if item.available() {
+            actions = actions.child(
+                div()
+                    .id(format!("agent-quick-toggle-{index}"))
+                    .h(px(24.0))
+                    .px(px(7.0))
+                    .rounded(px(Radius::CHIP))
+                    .bg(if show {
+                        Ink::FRESH.alpha(0.12)
+                    } else {
+                        colors.primary.alpha(0.06)
+                    })
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .configure_agent(diri_proto::AgentConfigureParams {
+                                host: host.clone(),
+                                kind: toggle_kind.clone(),
+                                executable_path: toggle_path.clone(),
+                                show_in_quick_create: !show,
+                            });
+                        cx.notify();
+                    }))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(sf_symbol(
+                        if show {
+                            "checkmark.circle.fill"
+                        } else {
+                            "circle"
+                        },
+                        10.0,
+                        if show { Ink::FRESH } else { colors.tertiary },
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(colors.secondary)
+                            .child("Quick"),
+                    ),
+            );
+        }
+        if let Some(url) = item
+            .descriptor
+            .as_ref()
+            .and_then(|descriptor| descriptor.setup.as_ref())
+            .and_then(|setup| setup.url.as_deref())
+            .and_then(crate::agent_catalog::normal_web_url)
+        {
+            actions = actions.child(
+                div()
+                    .id(format!("agent-website-{index}"))
+                    .size(px(24.0))
+                    .rounded(px(Radius::CHIP))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(move |button| button.bg(colors.primary.alpha(0.07)))
+                    .on_click(move |_, _, cx| cx.open_url(&url))
+                    .child(sf_symbol("arrow.up.right.square", 10.0, colors.secondary)),
+            );
+        }
+        let edit_kind = item.kind.clone();
+        let edit_path = item.configured_path.clone().unwrap_or_default();
+        let edit_host = self.agents_host.clone();
+        let edit_show = !item.available() || item.show_in_quick_create;
+        actions = actions.child(
+            div()
+                .id(format!("agent-bind-{index}"))
+                .h(px(24.0))
+                .px(px(7.0))
+                .rounded(px(Radius::CHIP))
+                .bg(colors.primary.alpha(0.06))
+                .cursor_pointer()
+                .hover(move |button| button.bg(colors.primary.alpha(0.09)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if edit_host.is_none() {
+                        let paths = cx.prompt_for_paths(PathPromptOptions {
+                            files: true,
+                            directories: false,
+                            multiple: false,
+                            prompt: Some("Choose Agent Executable".into()),
+                        });
+                        let kind = edit_kind.clone();
+                        cx.spawn_in(window, async move |this, cx| {
+                            let Ok(Ok(Some(mut paths))) = paths.await else {
+                                return;
+                            };
+                            let Some(path) = paths.pop() else {
+                                return;
+                            };
+                            let _ = this.update_in(cx, |this, _, cx| {
+                                this.store
+                                    .write()
+                                    .expect("session store lock poisoned")
+                                    .configure_agent(diri_proto::AgentConfigureParams {
+                                        host: None,
+                                        kind: kind.clone(),
+                                        executable_path: Some(path.to_string_lossy().into_owned()),
+                                        show_in_quick_create: edit_show,
+                                    });
+                                cx.notify();
+                            });
+                        })
+                        .detach();
+                    } else {
+                        this.agent_path_editor = Some(AgentPathEditor {
+                            kind: edit_kind.clone(),
+                            host: edit_host.clone(),
+                            path: text_editor(&edit_path),
+                            show_in_quick_create: edit_show,
+                            error: None,
+                        });
+                        cx.notify();
+                    }
+                }))
+                .flex()
+                .items_center()
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(colors.secondary)
+                        .child(if item.available() { "Change" } else { "Add…" }),
+                ),
+        );
+        if item.configured_path.is_some() {
+            let reset_host = self.agents_host.clone();
+            let reset_kind = item.kind.clone();
+            let reset_show = item.show_in_quick_create;
+            actions = actions.child(
+                div()
+                    .id(format!("agent-reset-{index}"))
+                    .size(px(24.0))
+                    .rounded(px(Radius::CHIP))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(move |button| button.bg(colors.primary.alpha(0.07)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .configure_agent(diri_proto::AgentConfigureParams {
+                                host: reset_host.clone(),
+                                kind: reset_kind.clone(),
+                                executable_path: None,
+                                show_in_quick_create: reset_show,
+                            });
+                        cx.notify();
+                    }))
+                    .child(sf_symbol("arrow.uturn.backward", 10.0, colors.secondary)),
+            );
+        }
+
+        div()
+            .id(format!("agent-settings-row-{index}"))
+            .min_h(px(58.0))
+            .px(px(12.0))
+            .py(px(8.0))
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .child(AgentLogo::new(ui_agent(&item.kind), 22.0, colors).badged(false))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(colors.primary)
+                                    .child(label),
+                            )
+                            .child(colored_status_badge(status, status_color)),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_size(px(10.0))
+                            .text_color(if item.error.is_some() {
+                                Ink::DANGER
+                            } else {
+                                colors.tertiary
+                            })
+                            .child(item.error.unwrap_or(path)),
+                    ),
+            )
+            .child(actions)
+            .into_any_element()
+    }
+
+    fn agent_path_editor_row(
+        &self,
+        editor: &AgentPathEditor,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut row = div()
+            .px(px(12.0))
+            .py(px(10.0))
+            .border_t_1()
+            .border_color(colors.primary.alpha(0.06))
+            .flex()
+            .flex_col()
+            .gap(px(7.0))
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(colors.secondary)
+                    .child("Remote executable path (absolute or ~/…)"),
+            )
+            .child(
+                div()
+                    .h(px(30.0))
+                    .px(px(8.0))
+                    .rounded(px(Radius::CHIP))
+                    .border_1()
+                    .border_color(colors.primary.alpha(0.14))
+                    .flex()
+                    .items_center()
+                    .text_size(px(11.0))
+                    .text_color(colors.primary)
+                    .child(query_label(&editor.path)),
+            );
+        if let Some(error) = &editor.error {
+            row = row.child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(Ink::DANGER)
+                    .child(error.clone()),
+            );
+        }
+        row.child(
+            div()
+                .flex()
+                .justify_end()
+                .gap(px(7.0))
+                .child(surface_button(
+                    "Cancel",
+                    "cancel-agent-path",
+                    colors,
+                    cx,
+                    |this, cx| {
+                        this.agent_path_editor = None;
+                        cx.notify();
+                    },
+                ))
+                .child(surface_button(
+                    "Save Path",
+                    "save-agent-path",
+                    colors,
+                    cx,
+                    |this, cx| {
+                        let Some(editor) = &this.agent_path_editor else {
+                            return;
+                        };
+                        let path = editor.path.text().trim();
+                        if path.is_empty() {
+                            if let Some(editor) = &mut this.agent_path_editor {
+                                editor.error = Some("Enter an executable path.".into());
+                            }
+                            cx.notify();
+                            return;
+                        }
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .configure_agent(diri_proto::AgentConfigureParams {
+                                host: editor.host.clone(),
+                                kind: editor.kind.clone(),
+                                executable_path: Some(path.to_owned()),
+                                show_in_quick_create: editor.show_in_quick_create,
+                            });
+                        this.agent_path_editor = None;
+                        cx.notify();
+                    },
+                )),
+        )
+        .into_any_element()
+    }
+
     fn default_agent_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = self.settings_colors();
-        let selected = self.prefs.default_agent;
+        let selected = self.prefs.default_agent.clone();
+        let agents = {
+            let store = self.store.read().expect("session store lock poisoned");
+            // The default agent is a global preference repaired against the
+            // local catalog (see set_agent_catalog); listing the default spawn
+            // host's catalog instead would let a remote host's thinner install
+            // set — or its not-yet-fetched catalog — shrink the choices.
+            crate::agent_catalog::installed_agent_options(store.agent_catalog(None))
+        };
+        let selected_label = agents
+            .iter()
+            .find(|agent| agent.kind == selected)
+            .map(|agent| agent.display_name.clone())
+            .unwrap_or_else(|| crate::agent_catalog::title_case_id(selected.id()));
         let open = self.settings_menu == Some(SettingsMenu::DefaultAgent);
         let trigger = settings_select_button(
-            default_agent_label(selected),
+            selected_label,
             "default-agent-dropdown",
             open,
             SettingsMenu::DefaultAgent,
@@ -1646,13 +2502,15 @@ impl UtilitySurfaces {
         let mut control = div().relative().min_w(px(154.0)).child(trigger);
         if open {
             let mut options = div().p(px(4.0)).flex().flex_col();
-            for (index, agent) in DefaultAgent::ALL.into_iter().enumerate() {
-                let is_selected = agent == selected;
+            for (index, option) in agents.into_iter().enumerate() {
+                let is_selected = option.kind == selected;
+                let agent = option.kind.clone();
                 options = options.child(
                     div()
                         .id(SharedString::from(format!("default-agent-option-{index}")))
-                        .h(px(Metrics::ROW_HEIGHT))
+                        .min_h(px(Metrics::ROW_HEIGHT))
                         .px(px(8.0))
+                        .py(px(5.0))
                         .flex()
                         .items_center()
                         .gap(px(8.0))
@@ -1661,18 +2519,21 @@ impl UtilitySurfaces {
                         .cursor_pointer()
                         .hover(move |style| style.bg(colors.primary.alpha(0.08)))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.prefs.default_agent = agent;
+                            this.prefs.default_agent = agent.clone();
                             this.settings_menu = None;
                             this.persist_prefs();
                             cx.notify();
                         }))
-                        .child(AgentLogo::new(ui_default_agent(agent), 16.0, colors).badged(false))
+                        .child(AgentLogo::new(ui_agent(&option.kind), 16.0, colors).badged(false))
                         .child(
                             div()
+                                .min_w_0()
                                 .flex_1()
+                                .flex()
+                                .flex_col()
                                 .text_size(px(Typo::ROW.size))
                                 .text_color(colors.primary)
-                                .child(default_agent_label(agent)),
+                                .child(option.display_name),
                         )
                         .when(is_selected, |row| {
                             row.child(sf_symbol_weighted(
@@ -1754,8 +2615,8 @@ impl UtilitySurfaces {
         }
         if !unsupported {
             rows = rows.child(setting_divider(colors)).child(toggle_row(
-                "Check automatically",
-                "Look for new releases in the background.",
+                "Update automatically",
+                "Download verified GitHub releases and install when diri quits.",
                 self.prefs.automatic_updates,
                 "toggle-automatic-updates",
                 colors,
@@ -2457,7 +3318,7 @@ impl UtilitySurfaces {
         if let Some(error) = &editor.error {
             form = form.child(
                 div()
-                    .px(px(10.0))
+                    .px(px(HOST_FIELD_HORIZONTAL_PADDING))
                     .py(px(8.0))
                     .rounded(px(Radius::BADGE))
                     .bg(Ink::DANGER.alpha(0.08))
@@ -2602,8 +3463,15 @@ impl UtilitySurfaces {
             .host_editor
             .as_ref()
             .is_some_and(|host_editor| host_editor.active_field == field);
-        let value = host_field_value(editor, placeholder, active, field, colors);
-        let bounds_slot = Rc::clone(&self.host_field_bounds[field.index()]);
+        let bounds_slot = Rc::new(Cell::new(None));
+        let value = host_field_value(
+            editor,
+            placeholder,
+            active,
+            field,
+            colors,
+            Rc::clone(&bounds_slot),
+        );
         div()
             .min_w(px(0.0))
             .flex()
@@ -2624,7 +3492,7 @@ impl UtilitySurfaces {
                     .relative()
                     .min_w(px(0.0))
                     .h(px(34.0))
-                    .px(px(10.0))
+                    .px(px(HOST_FIELD_HORIZONTAL_PADDING))
                     .rounded(px(Radius::BADGE))
                     .border_1()
                     .border_color(colors.primary.alpha(if active { 0.26 } else { 0.11 }))
@@ -2638,10 +3506,10 @@ impl UtilitySurfaces {
                     .cursor(CursorStyle::IBeam)
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         this.select_host_field(field, window, cx);
-                        let Some(bounds) = this.host_field_bounds[field.index()].get() else {
+                        let Some(bounds) = bounds_slot.get() else {
                             return;
                         };
-                        let x = (event.position().x - bounds.left() - px(10.0)).max(px(0.0));
+                        let x = (event.position().x - bounds.left()).max(px(0.0));
                         let offset = this.host_editor.as_ref().map_or(0, |editor| {
                             text_offset_for_x(editor.field(field).text(), x, window, colors)
                         });
@@ -2653,14 +3521,6 @@ impl UtilitySurfaces {
                         cx.notify();
                     }))
                     .child(value)
-                    .child(
-                        canvas(
-                            move |bounds, _, _| bounds_slot.set(Some(bounds)),
-                            |_, _, _, _| {},
-                        )
-                        .absolute()
-                        .inset_0(),
-                    )
             })
     }
 
@@ -2850,6 +3710,168 @@ impl UtilitySurfaces {
         }
         control.into_any_element()
     }
+
+    fn render_diagnostics(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        let report = self.diagnostics_report.clone().unwrap_or_else(|| {
+            "Diagnostics are not available yet. Close this preview and try again.".to_owned()
+        });
+        FloatingSurface::new(
+            colors,
+            div()
+                .id("diagnostics-preview")
+                .debug_selector(|| "diagnostics-preview".into())
+                .w(px(620.0))
+                .h(px(500.0))
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .h(px(54.0))
+                        .px(px(16.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.0))
+                        .child(sf_symbol("stethoscope", 15.0, colors.secondary))
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .flex_1()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .child(
+                                    div()
+                                        .text_size(px(Typo::TITLE.size))
+                                        .font_weight(Typo::TITLE.weight)
+                                        .child("Copy Diagnostics"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(Typo::META.size))
+                                        .text_color(colors.tertiary)
+                                        .child("This is the exact text that will be copied."),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("close-diagnostics")
+                                .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(Radius::BADGE))
+                                .cursor_pointer()
+                                .hover(move |style| style.bg(Fill::subtle(colors)))
+                                .child(sf_symbol_weighted(
+                                    "xmark",
+                                    13.5,
+                                    SymbolWeight::Bold,
+                                    colors.secondary,
+                                ))
+                                .on_click(cx.listener(|this, _, _, cx| this.close_surface(cx))),
+                        ),
+                )
+                .child(HairlineDivider::horizontal(colors))
+                .child(
+                    div()
+                        .id("diagnostics-report-scroll")
+                        .min_h(px(0.0))
+                        .flex_1()
+                        .overflow_y_scroll()
+                        .p(px(16.0))
+                        .child(
+                            div()
+                                .w_full()
+                                .p(px(14.0))
+                                .rounded(px(Radius::CARD))
+                                .bg(colors.primary.alpha(0.035))
+                                .border_1()
+                                .border_color(colors.primary.alpha(0.065))
+                                .font_family(crate::fonts::mono_family())
+                                .text_size(px(11.0))
+                                .line_height(px(17.0))
+                                .text_color(colors.secondary)
+                                .whitespace_normal()
+                                .child(wrappable_setting_copy(report.clone().into())),
+                        ),
+                )
+                .child(HairlineDivider::horizontal(colors))
+                .child(
+                    div()
+                        .px(px(16.0))
+                        .h(px(62.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .max_w(px(390.0))
+                                .text_size(px(Typo::META.size))
+                                .text_color(colors.tertiary)
+                                .child("Diagnostics exclude terminal content and paths by design. Review them before posting anyway."),
+                        )
+                        .child(
+                            div()
+                                .id("copy-diagnostics")
+                                .h(px(32.0))
+                                .px(px(12.0))
+                                .flex()
+                                .items_center()
+                                .gap(px(7.0))
+                                .rounded(px(Radius::ROW))
+                                .cursor_pointer()
+                                .bg(colors.primary.alpha(0.10))
+                                .hover(move |button| button.bg(colors.primary.alpha(0.14)))
+                                .text_size(px(Typo::ROW_EMPHASIZED.size))
+                                .font_weight(Typo::ROW_EMPHASIZED.weight)
+                                .child(sf_symbol("doc.on.doc", 12.0, colors.secondary))
+                                .child("Copy report")
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        report.clone(),
+                                    ));
+                                })),
+                        ),
+                ),
+        )
+    }
+}
+
+fn build_diagnostics_report(store: &SessionStore) -> String {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/nonexistent"));
+    let platform = crate::diagnostics::PlatformMetadata::current();
+    let active_host_ids = store
+        .sessions()
+        .values()
+        .filter_map(|session| session.host.clone())
+        .collect::<HashSet<_>>();
+    // The report describes this Mac; remote hosts appear via their sessions.
+    let empty_catalog = diri_proto::AgentReadinessResult::default();
+    let local_catalog = store.agent_catalog(None).unwrap_or(&empty_catalog);
+    crate::diagnostics::DiagnosticsReport::generate(crate::diagnostics::DiagnosticsInput {
+        app_version: crate::updates::CURRENT_VERSION,
+        app_build: option_env!("DIRI_BUILD_ID").unwrap_or(env!("CARGO_PKG_VERSION")),
+        update_channel: if cfg!(debug_assertions) {
+            "development"
+        } else {
+            "stable"
+        },
+        platform: &platform,
+        daemon_state: store.daemon_state(),
+        daemon_identity: store.daemon_identity(),
+        agents: local_catalog,
+        hosts: store.hosts(),
+        active_host_ids: &active_host_ids,
+        storage_reachable: crate::diagnostics::storage_reachable(&home),
+    })
+    .as_str()
+    .to_owned()
 }
 
 impl Focusable for UtilitySurfaces {
@@ -2860,16 +3882,23 @@ impl Focusable for UtilitySurfaces {
 
 impl Render for UtilitySurfaces {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Worktree delegation starts in the sidebar, so that one surface
+        // deliberately leaves the visible sidebar interactive. The shaded
+        // workspace and sheet remain modal once the pointer crosses the seam.
+        let leave_sidebar_exposed =
+            self.surface == Surface::Worktrees && self.prefs.sidebar_visible;
+        let sidebar_width = self.prefs.sidebar_width;
         let overlay = match self.surface {
             Surface::None => None,
             Surface::History => Some(self.render_history(cx).into_any_element()),
             Surface::Worktrees => Some(self.render_worktrees(cx).into_any_element()),
             Surface::Settings => Some(self.render_settings(cx).into_any_element()),
+            Surface::Diagnostics => Some(self.render_diagnostics(cx).into_any_element()),
         };
         let root = div()
             .id("utility-surfaces")
             .track_focus(&self.focus)
-            .key_context("Diri")
+            .key_context(UTILITY_CONTEXT)
             .on_key_down(cx.listener(Self::key_down))
             .on_action(cx.listener(|this, _: &ToggleHistory, _, cx| {
                 if this.surface == Surface::History {
@@ -2882,7 +3911,8 @@ impl Render for UtilitySurfaces {
                 this.open_worktrees(cx);
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
-                this.open_settings(cx);
+                this.toggle_settings(cx);
+                cx.stop_propagation();
             }))
             .on_action(cx.listener(|this, _: &CloseSurface, _, cx| this.close_surface(cx)))
             .on_action(cx.listener(|this, _: &MoveUp, _, cx| this.move_history(-1, cx)))
@@ -2897,33 +3927,54 @@ impl Render for UtilitySurfaces {
             .size_full()
             .text_color(self.colors().primary);
         if let Some(overlay) = overlay {
-            root.inset_0().child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .debug_selector(|| "surface-backdrop".into())
-                    // The modal backdrop dismisses the topmost surface while
-                    // still protecting terminal selection and scrollback.
-                    .occlude()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.close_surface(cx);
-                            cx.stop_propagation();
-                        }),
-                    )
-                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                    .bg(rgba(0x00000040))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .occlude()
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .child(overlay),
-                    ),
-            )
+            if self.surface == Surface::Settings {
+                root.inset_0().child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .debug_selector(|| "surface-backdrop".into())
+                        .occlude()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                        .bg(self.colors().background)
+                        .child(overlay),
+                )
+            } else {
+                root.inset_0().child(
+                    div()
+                        .absolute()
+                        .when(leave_sidebar_exposed, |backdrop| {
+                            backdrop
+                                .top(px(0.0))
+                                .right(px(0.0))
+                                .bottom(px(0.0))
+                                .left(px(sidebar_width))
+                        })
+                        .when(!leave_sidebar_exposed, |backdrop| backdrop.inset_0())
+                        .debug_selector(|| "surface-backdrop".into())
+                        // Modal sheets still dismiss from their backdrop;
+                        // Settings is the full workbench branch above.
+                        .occlude()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.close_surface(cx);
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                        .bg(rgba(0x00000040))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .occlude()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(overlay),
+                        ),
+                )
+            }
         } else {
             root.size(px(0.0))
         }
@@ -3016,6 +4067,7 @@ fn host_field_value(
     active: bool,
     field: HostFormField,
     colors: SemanticColors,
+    bounds_slot: Rc<Cell<Option<Bounds<Pixels>>>>,
 ) -> AnyElement {
     let debug_name = field.debug_name();
     let content = if active {
@@ -3033,17 +4085,27 @@ fn host_field_value(
         div().child(editor.text().to_owned()).into_any_element()
     };
     div()
+        .debug_selector(move || format!("HOST_FIELD_TEXT_{debug_name}"))
+        .relative()
         .min_w(px(0.0))
         .w_full()
         .overflow_hidden()
         .whitespace_nowrap()
         .text_ellipsis()
         .child(content)
+        .child(
+            canvas(
+                move |bounds, _, _| bounds_slot.set(Some(bounds)),
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .inset_0(),
+        )
         .into_any_element()
 }
 
 fn text_offset_for_x(text: &str, x: Pixels, window: &Window, colors: SemanticColors) -> usize {
-    if text.is_empty() {
+    if text.is_empty() || x <= px(0.0) {
         return 0;
     }
     let run = TextRun {
@@ -3275,6 +4337,31 @@ fn settings_note(
         .into_any_element()
 }
 
+fn settings_tab_matches(tab: SettingsTab, query: &str) -> bool {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let searchable = match tab {
+        SettingsTab::General => {
+            "general default startup login sessions close confirmation sounds chimes support diagnostics quick open search roots updates"
+        }
+        SettingsTab::Agents => {
+            "agents codex claude cursor gemini executable installed command line quick create default"
+        }
+        SettingsTab::Terminal => "terminal appearance color theme font text size zoom",
+        SettingsTab::Resources => {
+            "resources idle sessions hibernate freeze memory limit performance"
+        }
+        SettingsTab::Remote => {
+            "remote ssh openssh hosts machines connections execution tailscale network"
+        }
+    };
+    query
+        .split_whitespace()
+        .all(|word| searchable.contains(word))
+}
+
 fn settings_page(
     title: &'static str,
     content: impl IntoElement,
@@ -3456,6 +4543,10 @@ fn colored_badge(label: &'static str, color: Rgba) -> impl IntoElement {
         .child(label)
 }
 
+fn colored_status_badge(label: &'static str, color: Rgba) -> impl IntoElement {
+    colored_badge(label, color)
+}
+
 fn empty_label(label: &str, colors: SemanticColors) -> impl IntoElement {
     div()
         .h(px(42.0))
@@ -3477,15 +4568,6 @@ fn ui_agent(kind: &ProtoAgentKind) -> diri_ui::AgentKind {
         ProtoAgentKind::GEMINI_ID => diri_ui::AgentKind::Gemini,
         ProtoAgentKind::SHELL_ID => diri_ui::AgentKind::Shell,
         _ => diri_ui::AgentKind::Generic,
-    }
-}
-
-fn ui_default_agent(agent: DefaultAgent) -> diri_ui::AgentKind {
-    match agent {
-        DefaultAgent::ClaudeCode => diri_ui::AgentKind::ClaudeCode,
-        DefaultAgent::Codex => diri_ui::AgentKind::Codex,
-        DefaultAgent::Cursor => diri_ui::AgentKind::Cursor,
-        DefaultAgent::Gemini => diri_ui::AgentKind::Gemini,
     }
 }
 
@@ -3577,8 +4659,12 @@ fn relative_time(milliseconds: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[cfg(target_os = "macos")]
+    use gpui::HeadlessAppContext;
     use gpui::{
         Entity, Modifiers, MouseDownEvent, ScrollDelta, ScrollWheelEvent, StyleRefinement,
         TestAppContext, point, size,
@@ -3588,10 +4674,15 @@ mod tests {
     /// entity root is laid out independently of its content, so mount the
     /// surfaces the way the app does -- not bare -- and a root that cannot size
     /// itself fails here instead of on screen.
+    ///
+    /// Only the screenshot fixtures mount a surface this way now; the settings
+    /// tests compose it against a real sidebar, which is what the window does.
+    #[cfg(target_os = "macos")]
     struct CachedOverlayHarness {
         surfaces: Entity<UtilitySurfaces>,
     }
 
+    #[cfg(target_os = "macos")]
     impl Render for CachedOverlayHarness {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             div().size_full().child(
@@ -3600,6 +4691,114 @@ mod tests {
                     .cached(StyleRefinement::default().absolute().inset_0()),
             )
         }
+    }
+
+    /// Regenerates the issue/PR screenshot without Screen Recording access or
+    /// live user state. It is ignored because its only output is an artifact;
+    /// the ordinary layout assertions below remain part of every test run.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes the deterministic diagnostics screenshot artifact"]
+    fn render_diagnostics_preview_screenshot() {
+        let output = std::env::var_os("DIRI_VISUAL_OUTPUT")
+            .map(PathBuf::from)
+            .expect("set DIRI_VISUAL_OUTPUT to the target PNG path");
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| crate::fonts::init(cx));
+
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let updates = crate::updates::inert();
+        let window = cx
+            .open_window(size(px(1100.0), px(700.0)), move |window, cx| {
+                let surfaces = cx.new(|cx| {
+                    let mut surfaces =
+                        UtilitySurfaces::new(runtime, tokio, updates, window, cx);
+                    surfaces.surface = Surface::Diagnostics;
+                    surfaces.diagnostics_report = Some(
+                        "# Diri diagnostics\nReview this report before posting it publicly.\n\nApp: 0.5.0 (build preview, channel development)\nmacOS: 15.5 (aarch64)\nDaemon: connecting automatically\nSession/state storage: reachable\n\nAgents:\n- codex: installed\n- claude-code: unavailable\n\nRemote hosts:\n- none configured\n\nExcluded by design: terminal content, prompts, logs, environment variables, paths, SSH destinations, tokens, and account identifiers."
+                            .to_owned(),
+                    );
+                    surfaces
+                });
+                cx.new(|_| CachedOverlayHarness { surfaces })
+            })
+            .expect("open headless diagnostics window");
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, _| window.refresh())
+            .expect("refresh diagnostics window");
+        cx.run_until_parked();
+        let screenshot = cx
+            .capture_screenshot(window.into())
+            .expect("capture diagnostics screenshot");
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent).expect("create screenshot directory");
+        }
+        screenshot
+            .save(output)
+            .expect("save diagnostics screenshot");
+    }
+
+    /// Renders the full settings destination -- navigation in the app sidebar,
+    /// page beside it -- after its entrance transition, so layout and visual
+    /// hierarchy can be reviewed without live user state.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes the deterministic settings-shell screenshot artifact"]
+    fn render_settings_shell_preview_screenshot() {
+        let output = std::env::var_os("DIRI_VISUAL_OUTPUT")
+            .map(PathBuf::from)
+            .expect("set DIRI_VISUAL_OUTPUT to the target PNG path");
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            // Entrance animations run on the wall clock, which a headless
+            // capture does not advance. Reduced motion mounts the settled
+            // layout, which is the only thing a still image can show anyway.
+            cx.set_reduce_motion(true);
+        });
+
+        let window = cx
+            .open_window(size(px(1200.0), px(800.0)), move |window, cx| {
+                // Exercise the user-reported state: Remote selected, from a
+                // sidebar the user had previously widened.
+                let harness =
+                    cx.new(|cx| SettingsWorkbenchHarness::open_at(SettingsTab::Remote, window, cx));
+                harness.update(cx, |harness, cx| {
+                    harness
+                        .sidebar
+                        .update(cx, |sidebar, cx| sidebar.set_width(320.0, cx));
+                });
+                harness
+            })
+            .expect("open headless settings window");
+        cx.run_until_parked();
+        cx.advance_clock(SETTINGS_TRANSITION_DURATION + Duration::from_millis(300));
+        cx.update_window(window.into(), |_, window, _| window.refresh())
+            .expect("refresh settings window");
+        cx.run_until_parked();
+        let screenshot = cx
+            .capture_screenshot(window.into())
+            .expect("capture settings screenshot");
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent).expect("create screenshot directory");
+        }
+        screenshot.save(output).expect("save settings screenshot");
     }
 
     struct SettingsModalHarness {
@@ -3661,6 +4860,115 @@ mod tests {
 
     struct CachedSettingsModalHarness {
         surfaces: Entity<UtilitySurfaces>,
+    }
+
+    /// Settings as the window actually composes it: the app sidebar paints the
+    /// navigation, and the page is laid out beside it rather than over it.
+    struct SettingsWorkbenchHarness {
+        sidebar: Entity<crate::sidebar::Sidebar>,
+        surfaces: Entity<UtilitySurfaces>,
+        _subscriptions: [gpui::Subscription; 2],
+    }
+
+    impl SettingsWorkbenchHarness {
+        fn open(window: &mut Window, cx: &mut Context<Self>) -> Self {
+            Self::open_at(SettingsTab::General, window, cx)
+        }
+
+        fn open_at(tab: SettingsTab, window: &mut Window, cx: &mut Context<Self>) -> Self {
+            let runtime = Arc::new(StoreRuntime::inert());
+            let tokio = Arc::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime"),
+            );
+            let sidebar = cx.new(|cx| {
+                crate::sidebar::Sidebar::new(
+                    Some(Arc::clone(&runtime)),
+                    false,
+                    crate::sidebar::PreviewScenario::Typical,
+                    cx,
+                )
+            });
+            let surfaces = cx.new(|cx| {
+                let mut surfaces = UtilitySurfaces::new(
+                    Arc::clone(&runtime),
+                    tokio,
+                    crate::updates::inert(),
+                    window,
+                    cx,
+                );
+                surfaces.open_settings(cx);
+                surfaces.settings_tab = tab;
+                surfaces
+            });
+            // RootView re-renders on the sidebar's own events; this harness
+            // only needs to notice its measure change.
+            cx.observe(&sidebar, |_, _, cx| cx.notify()).detach();
+            let subscriptions = crate::root::wire_settings_navigation(
+                sidebar.clone(),
+                surfaces.clone(),
+                window,
+                cx,
+            );
+            // The mirror runs on notifies; settings was already open before
+            // anything was watching it.
+            let nav = surfaces.read(cx).settings_nav();
+            sidebar.update(cx, |sidebar, cx| sidebar.set_settings_nav(nav, cx));
+            Self {
+                sidebar,
+                surfaces,
+                _subscriptions: subscriptions,
+            }
+        }
+
+        fn sidebar_width(&self, cx: &App) -> f32 {
+            let sidebar = self.sidebar.read(cx);
+            if sidebar.is_visible() {
+                sidebar.width()
+            } else {
+                0.0
+            }
+        }
+    }
+
+    impl Render for SettingsWorkbenchHarness {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let seam = self.sidebar_width(cx);
+            div()
+                .size_full()
+                .flex()
+                .child(
+                    div().flex_none().w(px(seam)).h_full().child(
+                        self.sidebar
+                            .clone()
+                            .cached(StyleRefinement::default().size_full()),
+                    ),
+                )
+                .child(
+                    self.surfaces.clone().cached(
+                        StyleRefinement::default()
+                            .absolute()
+                            .inset_0()
+                            .left(px(seam)),
+                    ),
+                )
+        }
+    }
+
+    fn open_settings_workbench(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<SettingsWorkbenchHarness>,
+        &mut gpui::VisualTestContext,
+    ) {
+        let (harness, cx) = cx.add_window_view(SettingsWorkbenchHarness::open);
+        cx.simulate_resize(size(px(1200.0), px(800.0)));
+        cx.executor()
+            .advance_clock(SETTINGS_TRANSITION_DURATION + Duration::from_millis(300));
+        cx.run_until_parked();
+        (harness, cx)
     }
 
     struct SettingRowHarness;
@@ -3889,11 +5197,16 @@ mod tests {
                 background_events: Arc::new(AtomicUsize::new(0)),
             }
         });
+        cx.executor()
+            .advance_clock(SETTINGS_TRANSITION_DURATION + Duration::from_millis(10));
+        cx.run_until_parked();
         let surfaces = view.read_with(cx, |harness, _| harness.surfaces.clone());
         let field = cx.debug_bounds("HOST_FIELD_NAME").expect("name field");
 
+        // Click inside the field's left padding, which is unambiguously before
+        // the first glyph across text-shaping backends and display scales.
         cx.simulate_click(
-            point(field.left() + px(11.0), field.center().y),
+            point(field.left() + px(2.0), field.center().y),
             Modifiers::default(),
         );
         assert_eq!(
@@ -3906,6 +5219,10 @@ mod tests {
             0
         );
 
+        cx.run_until_parked();
+        let field = cx
+            .debug_bounds("HOST_FIELD_NAME")
+            .expect("focused name field");
         cx.simulate_click(
             point(field.right() - px(11.0), field.center().y),
             Modifiers::default(),
@@ -3961,7 +5278,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn cached_settings_modal_stays_inside_window(cx: &mut TestAppContext) {
+    fn cached_settings_shell_fills_the_window(cx: &mut TestAppContext) {
         let runtime = Arc::new(StoreRuntime::inert());
         let tokio = Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -3982,17 +5299,15 @@ mod tests {
         let root = cx
             .debug_bounds("cached-settings-root")
             .expect("settings root should render");
-        let dialog = cx
-            .debug_bounds("settings-dialog")
-            .expect("settings dialog should render");
+        let shell = cx
+            .debug_bounds("settings-shell")
+            .expect("settings shell should render");
 
-        assert_eq!(dialog.center(), root.center());
-        assert!(dialog.top() >= root.top());
-        assert!(dialog.bottom() <= root.bottom());
+        assert_eq!(shell, root);
     }
 
     #[gpui::test]
-    fn settings_modal_blocks_background_selection_and_scroll(cx: &mut TestAppContext) {
+    fn settings_shell_blocks_background_selection_and_scroll(cx: &mut TestAppContext) {
         let runtime = Arc::new(StoreRuntime::inert());
         let tokio = Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -4028,10 +5343,9 @@ mod tests {
         assert_eq!(background_events.load(Ordering::Relaxed), 0);
         assert_eq!(
             surfaces.read_with(cx, |surfaces, _| surfaces.surface),
-            Surface::None
+            Surface::Settings
         );
 
-        surfaces.update(cx, |surfaces, cx| surfaces.open_settings(cx));
         cx.simulate_event(ScrollWheelEvent {
             position: outside_panel,
             delta: ScrollDelta::Pixels(point(px(0.0), px(-40.0))),
@@ -4072,13 +5386,10 @@ mod tests {
             }
         });
 
-        let dialog = cx
-            .debug_bounds("settings-dialog")
-            .expect("settings dialog should render");
-        cx.simulate_click(
-            point(dialog.center().x, dialog.top() + px(29.0)),
-            Modifiers::default(),
-        );
+        let pane = cx
+            .debug_bounds("settings-pane")
+            .expect("settings pane should render");
+        cx.simulate_click(pane.center(), Modifiers::default());
 
         let surfaces = view.read_with(cx, |harness, _| harness.surfaces.clone());
         assert_eq!(
@@ -4093,50 +5404,87 @@ mod tests {
     }
 
     #[gpui::test]
-    fn settings_dialog_centers_in_the_window_through_the_cached_wrapper(cx: &mut TestAppContext) {
-        let runtime = Arc::new(StoreRuntime::inert());
-        let tokio = Arc::new(
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("test runtime"),
+    fn settings_navigates_from_the_app_sidebar_rather_than_a_second_rail(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+
+        let sidebar = cx
+            .debug_bounds("sidebar")
+            .expect("the app sidebar should stay mounted while settings is open");
+        let navigation = cx
+            .debug_bounds("sidebar-settings")
+            .expect("settings navigation should render inside the app sidebar");
+        let shell = cx
+            .debug_bounds("settings-shell")
+            .expect("settings shell should render");
+        assert!(
+            cx.debug_bounds("settings-rail").is_none(),
+            "settings should navigate from the app sidebar, not a rail of its own"
         );
-        let updates = crate::updates::inert();
-        let (_, cx) = cx.add_window_view(move |window, cx| {
-            let surfaces = cx.new(|cx| {
-                let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
-                surfaces.open_settings(cx);
-                surfaces
-            });
-            CachedOverlayHarness { surfaces }
+        assert_eq!(navigation.left(), sidebar.left());
+        assert_eq!(navigation.size.width, sidebar.size.width);
+        assert_eq!(
+            shell.left(),
+            sidebar.right(),
+            "the settings page should begin where the sidebar ends"
+        );
+        assert_eq!(shell.right(), px(1200.0));
+        assert!(cx.debug_bounds("SETTINGS_TAB_General").is_some());
+        harness.read_with(cx, |harness, cx| {
+            assert!(harness.sidebar.read(cx).shows_settings());
         });
-
-        let viewport = size(px(1200.0), px(800.0));
-        cx.simulate_resize(viewport);
-
-        // The backdrop must cover the window. A collapsed root leaves it
-        // 1200x0, which dims nothing and blocks nothing.
-        let backdrop = cx
-            .debug_bounds("surface-backdrop")
-            .expect("modal backdrop should render");
-        assert_eq!(backdrop.size, viewport);
-
-        let dialog = cx
-            .debug_bounds("settings-dialog")
-            .expect("settings dialog should render");
-        assert_eq!(dialog.size.width, px(SETTINGS_WIDTH));
-        assert_eq!(dialog.size.height, px(SETTINGS_HEIGHT));
-
-        // The dialog is taller than a collapsed root, so a zero-height root
-        // parks it half above the window instead of in the middle.
-        let center = dialog.center();
-        assert_eq!(center.x, viewport.width / 2.0);
-        assert_eq!(center.y, viewport.height / 2.0);
-        assert!(dialog.top() > px(0.0), "dialog hangs above the window top");
     }
 
     #[gpui::test]
-    fn settings_content_close_control_dismisses_the_surface(cx: &mut TestAppContext) {
+    fn opening_settings_swaps_the_sidebar_body_and_leaves_its_frame_alone(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+
+        let in_settings = cx.debug_bounds("sidebar").expect("sidebar");
+        assert!(
+            cx.debug_bounds("new-agent").is_none(),
+            "the session body should give way to navigation"
+        );
+
+        surfaces.update(cx, |surfaces, cx| surfaces.dismiss(cx));
+        cx.executor()
+            .advance_clock(SETTINGS_TRANSITION_DURATION + Duration::from_millis(300));
+        cx.run_until_parked();
+
+        let in_sessions = cx.debug_bounds("sidebar").expect("sidebar");
+        assert_eq!(
+            in_settings, in_sessions,
+            "the panel itself should hold still while its body swaps"
+        );
+        assert!(
+            cx.debug_bounds("sidebar-settings").is_none(),
+            "leaving settings should return the sidebar to sessions"
+        );
+        assert!(cx.debug_bounds("new-agent").is_some());
+    }
+
+    #[gpui::test]
+    fn the_sidebar_back_control_dismisses_settings(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update_in(cx, |surfaces, window, cx| {
+            surfaces.focus.focus(window, cx);
+        });
+
+        let back = cx
+            .debug_bounds("close-settings")
+            .expect("the sidebar should offer the way back out of settings");
+        cx.simulate_click(back.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        assert_eq!(
+            surfaces.read_with(cx, |surfaces, _| surfaces.surface),
+            Surface::None
+        );
+        assert!(!harness.read_with(cx, |harness, cx| harness.sidebar.read(cx).shows_settings()));
+    }
+
+    #[gpui::test]
+    fn settings_shortcut_action_toggles_the_shell(cx: &mut TestAppContext) {
         let runtime = Arc::new(StoreRuntime::inert());
         let tokio = Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -4146,26 +5494,137 @@ mod tests {
         );
         let updates = crate::updates::inert();
         let (view, cx) = cx.add_window_view(move |window, cx| {
-            let surfaces = cx.new(|cx| {
-                let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
-                surfaces.open_settings(cx);
-                surfaces
-            });
+            let surfaces = cx.new(|cx| UtilitySurfaces::new(runtime, tokio, updates, window, cx));
             SettingsModalHarness {
                 surfaces,
                 background_events: Arc::new(AtomicUsize::new(0)),
             }
         });
-
         let surfaces = view.read_with(cx, |harness, _| harness.surfaces.clone());
-        let close = cx
-            .debug_bounds("close-settings")
-            .expect("settings close control should render");
-        cx.simulate_click(close.center(), Modifiers::default());
+        surfaces.update_in(cx, |surfaces, window, cx| {
+            surfaces.focus.focus(window, cx);
+        });
 
+        cx.dispatch_action(OpenSettings);
         assert_eq!(
             surfaces.read_with(cx, |surfaces, _| surfaces.surface),
-            Surface::None
+            Surface::Settings
+        );
+
+        cx.dispatch_action(OpenSettings);
+        assert_eq!(
+            surfaces.read_with(cx, |surfaces, _| surfaces.surface),
+            Surface::None,
+            "a second Command-, action should return to the app"
+        );
+    }
+
+    #[gpui::test]
+    fn settings_navigation_takes_the_workspace_sidebar_measure(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let sidebar = harness.read_with(cx, |harness, _| harness.sidebar.clone());
+
+        sidebar.update(cx, |sidebar, cx| sidebar.set_width(320.0, cx));
+        cx.run_until_parked();
+
+        let navigation = cx
+            .debug_bounds("sidebar-settings")
+            .expect("settings navigation should render inside the app sidebar");
+        let shell = cx
+            .debug_bounds("settings-shell")
+            .expect("settings shell should render");
+        assert_eq!(
+            navigation.size.width,
+            px(320.0),
+            "navigation shares the sidebar the user sized, rather than a measure of its own"
+        );
+        assert_eq!(
+            shell.left(),
+            px(320.0),
+            "the page stays against the sidebar as the seam is dragged"
+        );
+    }
+
+    #[test]
+    fn settings_search_matches_page_copy_not_only_tab_titles() {
+        assert!(settings_tab_matches(SettingsTab::Remote, "ssh"));
+        assert!(settings_tab_matches(SettingsTab::Resources, "memory"));
+        assert!(settings_tab_matches(SettingsTab::General, "login"));
+        assert!(!settings_tab_matches(SettingsTab::Terminal, "ssh"));
+    }
+
+    #[gpui::test]
+    fn the_sidebar_search_field_filters_settings_and_opens_the_first_result(
+        cx: &mut TestAppContext,
+    ) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+
+        let search = cx
+            .debug_bounds("settings-search")
+            .expect("settings search should render in the sidebar");
+        cx.simulate_click(search.center(), Modifiers::default());
+        cx.simulate_input("ssh");
+
+        assert!(cx.debug_bounds("SETTINGS_TAB_Remote").is_some());
+        assert!(cx.debug_bounds("SETTINGS_TAB_General").is_none());
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(surfaces.settings_search.text(), "ssh");
+            assert!(surfaces.settings_search_active);
+        });
+
+        cx.simulate_keystrokes("enter");
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(surfaces.settings_tab, SettingsTab::Remote);
+            assert!(!surfaces.settings_search_active);
+        });
+        assert!(cx.debug_bounds("SETTINGS_NOTE_COPY").is_some());
+    }
+
+    #[gpui::test]
+    fn choosing_a_page_in_the_sidebar_resets_the_shared_pane_scroll(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+
+        let pane = cx
+            .debug_bounds("settings-pane")
+            .expect("settings pane should render");
+        // Read the row before scrolling: a cached view that is reused rather
+        // than re-rendered leaves no debug bounds behind, and the sidebar has
+        // no reason to re-render while the page scrolls.
+        let remote = cx
+            .debug_bounds("SETTINGS_TAB_Remote")
+            .expect("the Remote page should be listed in the sidebar");
+        for _ in 0..8 {
+            cx.simulate_event(ScrollWheelEvent {
+                position: pane.center(),
+                delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
+                ..ScrollWheelEvent::default()
+            });
+        }
+
+        cx.simulate_click(remote.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(surfaces.settings_tab, SettingsTab::Remote);
+            assert_eq!(surfaces.settings_scroll.offset(), point(px(0.0), px(0.0)));
+        });
+        assert_eq!(
+            harness.read_with(cx, |harness, cx| harness.sidebar.read(cx).settings_page()),
+            Some(SettingsTab::Remote),
+            "the sidebar should show the page the click opened as current"
+        );
+
+        let pane = cx
+            .debug_bounds("settings-pane")
+            .expect("settings pane should remain visible");
+        let copy = cx
+            .debug_bounds("SETTINGS_NOTE_COPY")
+            .expect("Remote page content should render");
+        assert!(
+            copy.bottom() > pane.top() && copy.top() < pane.bottom(),
+            "switching pages left the Remote page scrolled out of view: {copy:?} vs {pane:?}"
         );
     }
 }

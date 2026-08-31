@@ -2,8 +2,11 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use diri_proto::paths::DirijorPaths;
 use diri_proto::{AgentKind, ProjectId, SessionId};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::launch_recipe::{LaunchRecipeBook, deserialize_recipe_book};
 
 const DEFAULT_THEME: &str = "dirijor-dark";
 
@@ -40,31 +43,40 @@ pub enum InspectorTab {
     Artifacts,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum DefaultAgent {
-    #[default]
-    ClaudeCode,
-    Codex,
-    Cursor,
-    Gemini,
+/// Preferences intentionally persist the manifest id as a plain string. The
+/// four pre-catalog enum spellings are accepted forever because prefs survive
+/// upgrades; new saves use the canonical manifest ids (for example
+/// `"claude-code"` and `"opencode"`).
+fn serialize_default_agent<S>(agent: &AgentKind, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(agent.id())
 }
 
-impl DefaultAgent {
-    pub fn kind(self) -> AgentKind {
-        match self {
-            Self::ClaudeCode => AgentKind::CLAUDE_CODE,
-            Self::Codex => AgentKind::CODEX,
-            Self::Cursor => AgentKind::CURSOR,
-            Self::Gemini => AgentKind::GEMINI,
-        }
-    }
+fn deserialize_default_agent<'de, D>(deserializer: D) -> Result<AgentKind, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let saved = String::deserialize(deserializer)?;
+    Ok(match saved.as_str() {
+        "claudeCode" | AgentKind::CLAUDE_CODE_ID => AgentKind::CLAUDE_CODE,
+        "codex" => AgentKind::CODEX,
+        "cursor" => AgentKind::CURSOR,
+        "gemini" => AgentKind::GEMINI,
+        "shell" => AgentKind::SHELL,
+        _ => AgentKind::new(saved),
+    })
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Prefs {
-    pub default_agent: DefaultAgent,
+    #[serde(
+        serialize_with = "serialize_default_agent",
+        deserialize_with = "deserialize_default_agent"
+    )]
+    pub default_agent: AgentKind,
     /// Persistent destination for global new-session shortcuts. `None` means
     /// this Mac; a host id means that configured remote host. The alias
     /// migrates preferences written by the earlier last-used implementation.
@@ -73,8 +85,8 @@ pub struct Prefs {
     pub start_at_login: bool,
     pub confirm_before_closing_session: bool,
     pub status_sounds: bool,
-    /// Check the releases feed in the background. Downloading and installing
-    /// always stay manual — see `crate::updates`.
+    /// Check, download, and verify releases in the background. A staged update
+    /// installs on quit or when the user requests a restart.
     pub automatic_updates: bool,
     /// A release the user chose not to install. Persisted so "Skip" outlives
     /// the session that clicked it; empty means nothing is skipped.
@@ -107,6 +119,9 @@ pub struct Prefs {
     /// Sessions whose spawned children are folded away.
     pub sidebar_collapsed_sessions: Vec<SessionId>,
     pub sidebar_expanded_archives: Vec<ProjectId>,
+    /// Versioned, locally owned one-action Agent workflows.
+    #[serde(default, deserialize_with = "deserialize_recipe_book")]
+    pub launch_recipes: LaunchRecipeBook,
     /// Session that should regain focus after the daemon's initial hydrate.
     pub last_selected_session: Option<SessionId>,
 }
@@ -114,7 +129,7 @@ pub struct Prefs {
 impl Default for Prefs {
     fn default() -> Self {
         Self {
-            default_agent: DefaultAgent::ClaudeCode,
+            default_agent: AgentKind::CLAUDE_CODE,
             default_spawn_host: None,
             start_at_login: false,
             confirm_before_closing_session: true,
@@ -140,6 +155,7 @@ impl Default for Prefs {
             sidebar_collapsed_projects: Vec::new(),
             sidebar_collapsed_sessions: Vec::new(),
             sidebar_expanded_archives: Vec::new(),
+            launch_recipes: LaunchRecipeBook::default(),
             last_selected_session: None,
         }
     }
@@ -157,7 +173,7 @@ impl Prefs {
     }
 
     pub fn path_in_home(home: &Path) -> PathBuf {
-        home.join("Library/Application Support/diri/prefs.json")
+        DirijorPaths::prefs_file(home)
     }
 
     pub fn load(path: &Path) -> io::Result<Self> {
@@ -232,5 +248,60 @@ impl Prefs {
         if self.terminal_theme.is_empty() {
             self.terminal_theme = DEFAULT_THEME.to_owned();
         }
+        self.launch_recipes.normalize();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::launch_recipe::{LaunchRecipe, RecipeProject};
+
+    #[test]
+    fn older_preferences_migrate_to_an_empty_recipe_book() {
+        let mut value = serde_json::to_value(Prefs::default()).expect("serialize prefs");
+        value
+            .as_object_mut()
+            .expect("prefs object")
+            .remove("launchRecipes");
+        let prefs: Prefs = serde_json::from_value(value).expect("old preferences remain readable");
+        assert!(prefs.launch_recipes.items().is_empty());
+    }
+
+    #[test]
+    fn malformed_recipe_data_does_not_discard_other_preferences() {
+        let mut value = serde_json::to_value(Prefs {
+            status_sounds: false,
+            ..Prefs::default()
+        })
+        .expect("serialize prefs");
+        value["launchRecipes"] = serde_json::json!({"version": 1, "items": "broken"});
+        let prefs: Prefs =
+            serde_json::from_value(value).expect("malformed recipe field is isolated");
+        assert!(!prefs.status_sounds);
+        assert!(prefs.launch_recipes.items().is_empty());
+    }
+
+    #[test]
+    fn recipe_book_round_trips_through_preferences() {
+        let mut prefs = Prefs::default();
+        prefs
+            .launch_recipes
+            .add(LaunchRecipe::draft(
+                "Review",
+                AgentKind::CODEX,
+                RecipeProject::Path {
+                    path: "/tmp".into(),
+                },
+                None,
+                "Review this branch",
+            ))
+            .expect("add recipe");
+        let json = serde_json::to_vec(&prefs).expect("serialize prefs");
+        let restored: Prefs = serde_json::from_slice(&json).expect("deserialize prefs");
+        assert_eq!(
+            restored.launch_recipes.items(),
+            prefs.launch_recipes.items()
+        );
     }
 }

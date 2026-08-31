@@ -15,6 +15,11 @@
       "sourcegraph-amp"
     ],
     "firstClass": true,
+    "setup": {
+      "url": "https://ampcode.com/manual",
+      "installHint": "Install Amp with its official installer or Homebrew.",
+      "signInHint": "Sign in at ampcode.com, then run amp."
+    },
     "statusAuthority": "screen",
     "binary": "amp",
     "returnToLoginShell": true,

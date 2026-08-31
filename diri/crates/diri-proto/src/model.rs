@@ -191,7 +191,11 @@ impl<'de> Deserialize<'de> for AgentKind {
     where
         D: Deserializer<'de>,
     {
-        let (case, payload) = decode_keyed_enum(deserializer)?;
+        let value = Value::deserialize(deserializer)?;
+        if let Some(id) = value.as_str() {
+            return Ok(Self::new(id));
+        }
+        let (case, payload) = decode_keyed_enum_value(value).map_err(de::Error::custom)?;
         #[derive(Default, Deserialize)]
         struct Payload {
             id: Option<String>,
@@ -317,6 +321,57 @@ string_enum! {
         CodexNotify => "codexNotify",
         ScreenScrape => "screenScrape",
     }
+}
+
+string_enum! {
+    /// The bounded, structured signal that justified a session status.
+    ///
+    /// This deliberately describes only the class of signal. Raw hook
+    /// payloads, terminal captures, prompts, paths, and environment values do
+    /// not belong in status evidence.
+    pub enum StatusEvidenceSource {
+        Hook => "hook",
+        Notify => "notify",
+        ScreenRule => "screenRule",
+        ProcessLiveness => "processLiveness",
+        Staleness => "staleness",
+    }
+}
+
+string_enum! {
+    /// Fixed fallback explanations for decisions without a manifest rule.
+    pub enum StatusFallbackReason {
+        StartupGrace => "startupGrace",
+        ProcessOnly => "processOnly",
+        StaleSignals => "staleSignals",
+        ProcessExited => "processExited",
+    }
+}
+
+/// Privacy-safe evidence for one canonical status decision.
+///
+/// `status` intentionally duplicates the record's status. Clients must ignore
+/// evidence whose status does not match the enclosing record, preventing an
+/// out-of-order or mixed-version update from explaining a newer contradictory
+/// state with stale evidence.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusEvidence {
+    pub status: SessionStatus,
+    pub source: StatusEvidenceSource,
+    pub signal_at: DateMillis,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_rule_id: Option<String>,
+    #[serde(default)]
+    pub startup_grace_active: bool,
+    #[serde(default)]
+    pub anti_flicker_active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<StatusFallbackReason>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -638,6 +693,51 @@ pub struct PortInfo {
     pub process_name: String,
 }
 
+/// Verbs the authoritative Engine has resolved for one concrete session.
+///
+/// Clients consume this value instead of re-parsing commands or hard-coding
+/// Agent names. The field on [`SessionRecord`] is optional so an older Engine
+/// still degrades to the established resumability behavior.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCapabilities {
+    pub resume: bool,
+    #[serde(default)]
+    pub fork: bool,
+    pub archive: bool,
+    pub send_text: bool,
+    pub quick_approve: bool,
+    pub reliable_completion: bool,
+}
+
+string_enum! {
+    pub enum ActivityKind {
+        Started => "started",
+        NeedsInput => "needsInput",
+        Finished => "finished",
+        Exited => "exited",
+    }
+}
+
+/// One durable lifecycle transition with enough display identity to remain
+/// useful after its SessionRecord has been removed.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityEntry {
+    pub id: String,
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    pub kind: ActivityKind,
+    pub at: DateMillis,
+    pub title: String,
+    pub agent_id: String,
+    #[serde(rename = "projectID")]
+    pub project_id: ProjectId,
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRecord {
@@ -652,14 +752,25 @@ pub struct SessionRecord {
     pub git_branch: Option<String>,
     pub title: String,
     pub title_source: TitleSource,
+    /// The first prompt used to create this session. It is retained so a
+    /// sibling proposal can reproduce the user's request without scraping a
+    /// live terminal; older records fall back to their transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub originating_prompt: Option<String>,
     #[serde(rename = "agentSessionID", skip_serializing_if = "Option::is_none")]
     pub agent_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transcript_path: Option<String>,
     pub status: SessionStatus,
+    /// Additive decision metadata. Absent for records written by older Engine
+    /// builds; clients keep the normal status summary primary either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_evidence: Option<StatusEvidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub needs_input: Option<NeedsInputDetail>,
     pub resumability: Resumability,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<SessionCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent: Option<SessionId>,
     pub created_at: DateMillis,
@@ -702,6 +813,14 @@ impl SessionRecord {
         self.archived_at.is_some()
     }
 
+    /// Mixed-version-safe answer used by every Resume surface.
+    pub fn can_resume(&self) -> bool {
+        self.capabilities
+            .map_or(self.resumability == Resumability::Resumable, |value| {
+                value.resume
+            })
+    }
+
     pub fn attention(&self) -> AttentionLevel {
         match self.status {
             SessionStatus::NeedsInput(_) => AttentionLevel::NeedsInput,
@@ -728,6 +847,11 @@ pub struct Project {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pinned_order: Option<i64>,
+    /// `None` means the root is local; a host id means that remote machine
+    /// owns it. Absent from records persisted by older daemons — readers fall
+    /// back to session-derived hosts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -750,13 +874,15 @@ where
     D: Deserializer<'de>,
 {
     let value = Value::deserialize(deserializer)?;
+    decode_keyed_enum_value(value).map_err(de::Error::custom)
+}
+
+fn decode_keyed_enum_value(value: Value) -> Result<(String, Value), &'static str> {
     let object = value
         .as_object()
-        .ok_or_else(|| de::Error::custom("Swift enum must be a keyed JSON object"))?;
+        .ok_or("Swift enum must be a keyed JSON object")?;
     if object.len() != 1 {
-        return Err(de::Error::custom(
-            "Swift enum object must contain exactly one case",
-        ));
+        return Err("Swift enum object must contain exactly one case");
     }
     let (case, payload) = object.iter().next().expect("length checked above");
     Ok((case.clone(), payload.clone()))

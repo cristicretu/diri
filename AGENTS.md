@@ -8,9 +8,11 @@ These instructions apply to the whole repository. The active architecture decisi
 
 - The remote refactor is complete. Maintain the bootstrapped Remote PTY Holder as Diri's only remote session transport; future remote work extends this architecture rather than reopening the transport migration.
 - Implement and maintain remote behavior entirely in the Rust workspace under `diri/`.
-- For remote-refactor *design* decisions, treat `Sources/`, `Package.swift`, and Swift tests as nonexistent: do not derive architecture from them, modify them, add Swift compatibility adapters, or cite Swift build/test results as evidence.
-- That rule is about design, not about data the product still ships. `Sources/DirijorCore/Resources/manifests` remains the reference for **Agent catalog completeness** until the Rust catalog is proven at parity. Reading it to check coverage is required, not forbidden. Writing a Rust catalog from memory instead of porting is how the catalog silently shrank from 20 Agents to 7 — a missing manifest does not error, it spawns a bare login shell, and that has shipped to users before.
-- Existing Rust behavior is the implementation baseline. Historical comments about Swift compatibility do not create new requirements.
+- Implement and verify every product behavior in the Rust workspace. Historical
+  migration documents are context, not an alternate implementation baseline.
+- `diri/crates/diri-engine/manifests` is the canonical Agent catalog. Keep at
+  least the established 20 manifests and preserve the package-time count gate:
+  a missing manifest does not error, it silently spawns a bare login shell.
 - The former Rust SSH + `tmux` transport has been deleted. Never reintroduce it as `legacy_tmux`, a feature flag, a migration path, or a runtime fallback. Missing, corrupt, unsupported, or capability-incompatible Helper artifacts must fail closed with a structured error; an unavailable packaged transport reports `remote_transport_unavailable`.
 - When implementation and `diri/REMOTE_PORT.md` disagree, stop and resolve the design mismatch explicitly instead of silently choosing one.
 
@@ -42,7 +44,7 @@ The Rust toolchain is pinned by `diri/rust-toolchain.toml` to Rust 1.95.0, editi
 - Use exactly one independent Holder process and Unix socket per Session; do not add a multi-session Diri Supervisor to the current baseline.
 - A Holder may spawn one minimal liveness guard for its Agent process group. The guard may only wait for Holder pipe closure and kill that one process group; it must not own a PTY, socket, state, or orchestration.
 - The app and client must verify the local Engine's explicit Rust identity during `Hello`; fail closed on missing, old, or unknown daemon identities.
-- Agent manifests used by the Rust Engine are Rust-owned resources under `diri-engine`; remote launch must not load Swift resource bundles or fall back to a Swift Holder.
+- Agent manifests used by the Rust Engine are Rust-owned resources under `diri-engine`; remote launch must not load another resource bundle or fall back to a different Holder.
 - Share terminal parsing through a minimal `diri-terminal-state` crate; do not make `diri-remote` depend on the full Engine or create a second parser implementation.
 - PTY reads must never block on the attached client. Bound the connection queue; when it falls behind, discard stale diffs and reseed it with a Full Snapshot.
 - The completed baseline permits exactly one live attach/controller. A new attach atomically increments the controller epoch and revokes the old attach. Multiple read-only observers are deferred enhancements.
@@ -79,7 +81,7 @@ cargo test --workspace
 cargo build --workspace --release
 ```
 
-During iteration, run the narrowest relevant package/test first, then the full Rust checks before handoff when practical. Do not run Swift commands for the remote refactor.
+During iteration, run the narrowest relevant package/test first, then the full Rust checks before handoff when practical.
 
 Remote tests should be deterministic and not require a developer's real SSH host by default. Prefer fake `ssh` executables, fixture homes, Unix sockets, and spawned test PTYs. Cover at least:
 

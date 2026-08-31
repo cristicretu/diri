@@ -55,9 +55,13 @@ chmod +x "${fake_gh}"
 # Reproduce issue #9 exactly: the cask edit is committed locally, but the tap's
 # remote branch still serves the old checksum. The publisher must push even
 # when there is no new diff to commit during this recovery run.
-/usr/bin/sed -i '' -E \
+# See the publisher: `sed -i` is not portable, and this test runs on Linux.
+stale_edit="$(mktemp)"
+/usr/bin/sed -E \
     -e "s|^  sha256 \".*\"$|  sha256 \"${expected_sha}\"|" \
-    "${checkout}/Casks/diri.rb"
+    "${checkout}/Casks/diri.rb" >"${stale_edit}"
+cat "${stale_edit}" >"${checkout}/Casks/diri.rb"
+rm -f "${stale_edit}"
 git -C "${checkout}" add Casks/diri.rb
 git -C "${checkout}" commit -q -m "diri 0.4.6"
 

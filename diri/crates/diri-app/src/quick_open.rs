@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use diri_proto::paths::DirijorPaths;
 use serde::{Deserialize, Serialize};
 
 use crate::fuzzy::{FuzzyMatcher, FuzzyQuery, PreparedText, Score};
@@ -110,7 +111,7 @@ pub struct IndexCache {
 }
 
 pub fn cache_file(home: &Path) -> PathBuf {
-    home.join("Library/Application Support/diri/quick-open-index.json")
+    DirijorPaths::quick_open_cache_file(home)
 }
 
 pub fn load_cache(path: &Path, roots: &[PathBuf]) -> Option<Vec<DirectoryEntry>> {

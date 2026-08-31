@@ -14,6 +14,11 @@
       "open-code"
     ],
     "firstClass": true,
+    "setup": {
+      "url": "https://opencode.ai/docs/",
+      "installHint": "Install OpenCode with its official installer or a supported package manager.",
+      "signInHint": "Run opencode, then use /connect to configure a provider."
+    },
     "statusAuthority": "screen",
     "binary": "opencode",
     "resume": {

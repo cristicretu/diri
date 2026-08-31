@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "id": "codex",
-  "version": "2026.07.07",
+  "version": "2026.08.15.1",
   "statusModel": "full",
   "agent": {
     "id": "codex",
@@ -13,12 +13,32 @@
       "openai-codex"
     ],
     "firstClass": true,
+    "catalogOrder": 20,
+    "setup": {
+      "url": "https://developers.openai.com/codex/cli/",
+      "installHint": "Follow OpenAI's Codex CLI installation guide.",
+      "signInHint": "Run codex and choose Sign in with ChatGPT or another offered method."
+    },
     "statusAuthority": "screen",
     "binary": "codex",
     "returnToLoginShell": true,
     "resume": {
       "style": "flag",
       "token": "resume"
+    },
+    "conversation": {
+      "resume": {
+        "exactArgs": ["resume", "{id}"],
+        "latestArgs": ["resume", "--last"]
+      },
+      "fork": {
+        "exactArgs": ["fork", "{id}"],
+        "latestArgs": ["fork", "--last"]
+      },
+      "stripArgs": [
+        {"token": "resume", "value": "any"},
+        {"token": "fork", "value": "any"}
+      ]
     },
     "envScrubPrefixes": [
       "CODEX",
@@ -36,7 +56,7 @@
       "text": "",
       "submit": true
     },
-    "_resumeStyleNotice": "Swift's \"subcommand\" style has no implementation in Rust's AgentDescriptor::resume_args. Declared as \"flag\": with no id it emits `codex resume`, and once a notify payload supplies a thread-id it emits `codex resume <thread-id>` \u2014 both are valid codex invocations.",
+    "_resumeStyleNotice": "The structured conversation grammar keeps Codex's resume/fork subcommands after global Diri config overrides and strips stale conversation subcommands before selecting one canonical launch mode.",
     "deny": {
       "text": "\u001b",
       "submit": false

@@ -5,6 +5,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use diri_proto::paths::DirijorPaths;
+
 use super::{
     cache::{self, UsageCacheFile, UsageFileEntry},
     model::{UsageHourAgg, UsageSnapshot, UsageTotals},
@@ -37,7 +39,7 @@ impl ScanPaths {
                 (home.join(".config/claude/projects"), UsageProvider::Claude),
                 (home.join(".codex/sessions"), UsageProvider::Codex),
             ],
-            cache_file: home.join("Library/Application Support/diri/usage-cache.json"),
+            cache_file: DirijorPaths::usage_cache_file(home),
         }
     }
 }

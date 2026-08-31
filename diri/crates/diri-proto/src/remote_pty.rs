@@ -1,10 +1,10 @@
 //! Versioned wire protocol between the local Engine and a remote PTY Holder.
 //!
-//! Terminal frame kinds 1 through 10 keep their existing payloads and are not
-//! wrapped in another frame. Remote-only control kinds start at 32. Small,
-//! infrequent control payloads use JSON; a full terminal snapshot keeps the
-//! existing binary grid encoding so reconnect does not serialize every cell
-//! as JSON.
+//! Terminal frame kinds 1 through 10 retain their wire meanings; kind 11 adds
+//! raw mouse input. They are not wrapped in another frame. Remote-only control
+//! kinds start at 32. Small, infrequent control payloads use JSON; a full
+//! terminal snapshot keeps the existing binary grid encoding so reconnect
+//! does not serialize every cell as JSON.
 
 use std::error::Error;
 use std::fmt;
@@ -15,9 +15,11 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::frames::{Frame, FrameType, MAX_FRAME_BYTES};
 use crate::grid::{GridCodecError, GridUpdate};
+use crate::terminal::MouseModes;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 2;
+pub const PROTOCOL_MINOR: u16 = 4;
+pub const MOUSE_INPUT_PROTOCOL_MINOR: u16 = 4;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_ARGUMENTS: usize = 512;
 pub const MAX_ENVIRONMENT_VARIABLES: usize = 4096;
@@ -29,6 +31,7 @@ pub const MAX_TERMINAL_CELLS: usize = 1_000_000;
 pub const MAX_DIRECTORY_ENTRIES: usize = 512;
 pub const MAX_DIRECTORY_SCANNED_ENTRIES: usize = 16_384;
 pub const MAX_DIRECTORY_RESPONSE_BYTES: usize = 512 * 1024;
+pub const MAX_EXECUTABLE_QUERIES: usize = 128;
 
 const HEADER_BYTES: usize = 5;
 const FULL_SNAPSHOT_FIXED_BYTES: usize = 9;
@@ -81,6 +84,9 @@ pub enum RemoteCapability {
     EnvironmentCapture,
     /// Helper CLI can return one bounded directory level.
     DirectoryList,
+    /// Helper can resolve a bounded batch of executable names against the
+    /// account login PATH and validate user-selected executable paths.
+    ExecutableDiscovery,
     /// Helper CLI can execute the detach/supervisor persistence probe.
     PersistenceProbe,
     /// Uploaded Helper can activate itself without replacing different bytes.
@@ -110,6 +116,7 @@ impl RemoteCapability {
             Self::SessionManagement => "session-management",
             Self::EnvironmentCapture => "environment-capture",
             Self::DirectoryList => "directory-list",
+            Self::ExecutableDiscovery => "executable-discovery",
             Self::PersistenceProbe => "persistence-probe",
             Self::AtomicActivation => "atomic-activation",
             Self::AgentEvents => "agent-events",
@@ -146,6 +153,7 @@ pub const PHASE_ONE_HELPER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::SessionManagement,
     RemoteCapability::EnvironmentCapture,
     RemoteCapability::DirectoryList,
+    RemoteCapability::ExecutableDiscovery,
     RemoteCapability::PersistenceProbe,
     RemoteCapability::AtomicActivation,
 ];
@@ -258,7 +266,7 @@ pub struct FullSnapshot {
     pub sequence: u64,
     pub alt_screen: bool,
     pub bracketed_paste: bool,
-    pub mouse_reporting: bool,
+    pub mouse: MouseModes,
     pub grid: GridUpdate,
 }
 
@@ -267,7 +275,7 @@ pub struct GridDelta {
     pub sequence: u64,
     pub alt_screen: bool,
     pub bracketed_paste: bool,
-    pub mouse_reporting: bool,
+    pub mouse: MouseModes,
     pub grid: GridUpdate,
 }
 
@@ -356,6 +364,8 @@ pub struct EnvironmentCaptureResult {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct DirectoryListRequest {
     pub path: String,
+    #[serde(default)]
+    pub mode: DirectoryListMode,
 }
 
 impl DirectoryListRequest {
@@ -380,10 +390,28 @@ impl DirectoryListRequest {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DirectoryListMode {
+    #[default]
+    Directories,
+    Executables,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DirectoryEntryKind {
+    #[default]
+    Directory,
+    Executable,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct DirectoryEntry {
     pub name: String,
     pub path: String,
+    #[serde(default)]
+    pub kind: DirectoryEntryKind,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -394,6 +422,101 @@ pub struct DirectoryListResult {
     pub parent: Option<String>,
     pub entries: Vec<DirectoryEntry>,
     pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutableQuery {
+    pub id: String,
+    pub binary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ExecutableDiscoveryRequest {
+    pub queries: Vec<ExecutableQuery>,
+    /// When present, capture the same login environment and resolved working
+    /// directory that will be used to launch the selected Agent. Catalog
+    /// scans omit this and pay for no separate cwd lookup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default = "default_environment_timeout_millis")]
+    pub timeout_millis: u64,
+}
+
+const fn default_environment_timeout_millis() -> u64 {
+    10_000
+}
+
+impl ExecutableDiscoveryRequest {
+    pub fn validate(&self) -> Result<(), RemoteCodecError> {
+        if self.queries.is_empty() || self.queries.len() > MAX_EXECUTABLE_QUERIES {
+            return Err(RemoteCodecError::InvalidLaunch(format!(
+                "executable discovery requires 1..={MAX_EXECUTABLE_QUERIES} queries"
+            )));
+        }
+        if !(100..=10_000).contains(&self.timeout_millis) {
+            return Err(RemoteCodecError::InvalidLaunch(
+                "executable discovery timeout must be between 100 and 10000 ms".into(),
+            ));
+        }
+        EnvironmentCaptureRequest {
+            cwd: self.cwd.clone(),
+            timeout_millis: self.timeout_millis,
+        }
+        .validate()?;
+        let mut total_bytes = self.cwd.as_ref().map_or(0, String::len);
+        for query in &self.queries {
+            validate_identifier("agent id", &query.id)?;
+            if query.binary.is_empty()
+                || query.binary.len() > 512
+                || query.binary.as_bytes().contains(&0)
+            {
+                return Err(RemoteCodecError::InvalidLaunch(
+                    "agent binary must be non-empty, NUL-free, and at most 512 bytes".into(),
+                ));
+            }
+            if let Some(path) = &query.configured_path
+                && (path.is_empty() || path.len() > 4_096 || path.as_bytes().contains(&0))
+            {
+                return Err(RemoteCodecError::InvalidLaunch(
+                    "configured executable path must be NUL-free and at most 4096 bytes".into(),
+                ));
+            }
+            total_bytes = total_bytes
+                .saturating_add(query.id.len())
+                .saturating_add(query.binary.len())
+                .saturating_add(query.configured_path.as_ref().map_or(0, String::len));
+        }
+        if total_bytes > MAX_LAUNCH_BYTES {
+            return Err(RemoteCodecError::InvalidLaunch(format!(
+                "executable discovery payload exceeds {MAX_LAUNCH_BYTES} bytes"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutableDiscoveryItem {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detected_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutableDiscoveryResult {
+    /// The single login environment used to resolve every query. Spawn paths
+    /// reuse it directly, avoiding a second remote shell startup.
+    pub environment: EnvironmentCaptureResult,
+    pub items: Vec<ExecutableDiscoveryItem>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -743,7 +866,11 @@ impl RemoteCodec {
                 output.extend_from_slice(&value.sequence.to_be_bytes());
                 let modes = u8::from(value.alt_screen)
                     | (u8::from(value.bracketed_paste) << 1)
-                    | (u8::from(value.mouse_reporting) << 2);
+                    // Keep bit 2 as the historical any-reporting flag so an
+                    // older peer remains compatible with this additive mode
+                    // byte extension.
+                    | (u8::from(value.mouse.is_reporting()) << 2)
+                    | (value.mouse.detail_bits() << 3);
                 output.push(modes);
                 if !value.grid.is_full_snapshot {
                     return rollback(
@@ -763,7 +890,8 @@ impl RemoteCodec {
                 output.extend_from_slice(&value.sequence.to_be_bytes());
                 let modes = u8::from(value.alt_screen)
                     | (u8::from(value.bracketed_paste) << 1)
-                    | (u8::from(value.mouse_reporting) << 2);
+                    | (u8::from(value.mouse.is_reporting()) << 2)
+                    | (value.mouse.detail_bits() << 3);
                 output.push(modes);
                 if value.grid.is_full_snapshot {
                     return rollback(
@@ -917,7 +1045,7 @@ fn decode_json<T: DeserializeOwned>(kind: u8, payload: &[u8]) -> Result<T, Remot
 }
 
 fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodecError> {
-    if kind <= FrameType::Modes as u8 {
+    if kind <= FrameType::Mouse as u8 {
         return Ok(RemoteMessage::Terminal(Frame::new(
             FrameType::try_from(kind).map_err(|_| RemoteCodecError::UnknownMessageType(kind))?,
             payload.to_vec(),
@@ -954,7 +1082,7 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
                 sequence,
                 alt_screen: modes & 1 != 0,
                 bracketed_paste: modes & 2 != 0,
-                mouse_reporting: modes & 4 != 0,
+                mouse: MouseModes::from_detail_bits(modes >> 3, modes & 4 != 0),
                 grid,
             }))
         }
@@ -978,7 +1106,7 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
                 sequence,
                 alt_screen: modes & 1 != 0,
                 bracketed_paste: modes & 2 != 0,
-                mouse_reporting: modes & 4 != 0,
+                mouse: MouseModes::from_detail_bits(modes >> 3, modes & 4 != 0),
                 grid,
             }))
         }
@@ -1006,7 +1134,7 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
 }
 
 fn validate_kind(kind: u8) -> Result<(), RemoteCodecError> {
-    if (1..=FrameType::Modes as u8).contains(&kind)
+    if (1..=FrameType::Mouse as u8).contains(&kind)
         || (KIND_HELLO..=KIND_SCROLLBACK_RESPONSE).contains(&kind)
     {
         Ok(())
@@ -1090,16 +1218,20 @@ mod tests {
     fn directory_requests_accept_only_normalized_absolute_or_home_paths() {
         for valid in ["/", "/srv/app", "~", "~/code"] {
             assert!(
-                DirectoryListRequest { path: valid.into() }
-                    .validate()
-                    .is_ok(),
+                DirectoryListRequest {
+                    path: valid.into(),
+                    mode: DirectoryListMode::Directories,
+                }
+                .validate()
+                .is_ok(),
                 "{valid}"
             );
         }
         for invalid in ["relative", "/srv/../etc", "/srv/./app", "~/../etc"] {
             assert!(
                 DirectoryListRequest {
-                    path: invalid.into()
+                    path: invalid.into(),
+                    mode: DirectoryListMode::Directories,
                 }
                 .validate()
                 .is_err(),
@@ -1108,12 +1240,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn executable_discovery_is_bounded_and_validates_its_launch_context() {
+        let request = ExecutableDiscoveryRequest {
+            queries: vec![ExecutableQuery {
+                id: "codex".into(),
+                binary: "codex".into(),
+                configured_path: Some("~/.local/bin/codex".into()),
+            }],
+            cwd: Some("~/code".into()),
+            timeout_millis: 1_000,
+        };
+        assert!(request.validate().is_ok());
+
+        let mut empty = request.clone();
+        empty.queries.clear();
+        assert!(empty.validate().is_err());
+
+        let mut traversal = request;
+        traversal.cwd = Some("~/../secrets".into());
+        assert!(traversal.validate().is_err());
+    }
+
     fn snapshot() -> FullSnapshot {
         FullSnapshot {
             sequence: 42,
             alt_screen: true,
             bracketed_paste: true,
-            mouse_reporting: false,
+            mouse: MouseModes::new(
+                crate::terminal::MouseTrackingMode::ButtonMotion,
+                crate::terminal::MouseEncoding::Sgr,
+            ),
             grid: GridUpdate {
                 cols: 2,
                 rows: 1,
@@ -1128,12 +1285,18 @@ mod tests {
 
     #[test]
     fn terminal_frames_keep_their_existing_wire_kind() {
-        let message = RemoteMessage::Terminal(Frame::input(b"abc".to_vec()));
-        let encoded = RemoteCodec::encode(&message).expect("encode");
-        assert_eq!(encoded[0], FrameType::Input as u8);
+        for frame in [
+            Frame::input(b"abc".to_vec()),
+            Frame::mouse(b"mouse".to_vec()),
+        ] {
+            let expected_kind = frame.frame_type as u8;
+            let message = RemoteMessage::Terminal(frame);
+            let encoded = RemoteCodec::encode(&message).expect("encode");
+            assert_eq!(encoded[0], expected_kind);
 
-        let decoded = RemoteCodec::new().feed(&encoded).expect("decode");
-        assert_eq!(decoded, vec![message]);
+            let decoded = RemoteCodec::new().feed(&encoded).expect("decode");
+            assert_eq!(decoded, vec![message]);
+        }
     }
 
     #[test]
@@ -1156,10 +1319,42 @@ mod tests {
         let message = RemoteMessage::FullSnapshot(snapshot());
         let encoded = RemoteCodec::encode(&message).expect("encode");
         assert_eq!(encoded[0], KIND_FULL_SNAPSHOT);
+        assert_ne!(encoded[13] & 0b100, 0, "historical any-mouse bit");
         assert_eq!(
             RemoteCodec::new().feed(&encoded).expect("decode"),
             vec![message]
         );
+    }
+
+    #[test]
+    fn full_snapshot_keeps_pre_1_4_mouse_details_unknown() {
+        let message = RemoteMessage::FullSnapshot(snapshot());
+        let mut encoded = RemoteCodec::encode(&message).expect("encode");
+        // Header (5), sequence (8), then the historical flags byte. Strip
+        // every detailed bit and leave alt/bracketed/any-mouse enabled.
+        encoded[13] = 0b111;
+        let decoded = RemoteCodec::new().feed(&encoded).expect("decode");
+        let RemoteMessage::FullSnapshot(decoded) = &decoded[0] else {
+            panic!("snapshot");
+        };
+        assert_eq!(decoded.mouse, MouseModes::UNKNOWN);
+    }
+
+    #[test]
+    fn each_pre_1_4_mouse_regime_decodes_without_a_false_guess() {
+        // Protocol 1.3 represented all of these states with the same bit. A
+        // new peer must therefore preserve that ambiguity instead of choosing
+        // a tracking mode or coordinate encoding that may be wrong.
+        for legacy_state in ["1000-legacy", "1002-sgr", "1003-legacy"] {
+            let message = RemoteMessage::FullSnapshot(snapshot());
+            let mut encoded = RemoteCodec::encode(&message).expect("encode");
+            encoded[13] = 0b100;
+            let decoded = RemoteCodec::new().feed(&encoded).expect("decode");
+            let RemoteMessage::FullSnapshot(decoded) = &decoded[0] else {
+                panic!("snapshot");
+            };
+            assert_eq!(decoded.mouse, MouseModes::UNKNOWN, "{legacy_state}");
+        }
     }
 
     #[test]
@@ -1171,7 +1366,10 @@ mod tests {
             sequence: 43,
             alt_screen: true,
             bracketed_paste: true,
-            mouse_reporting: false,
+            mouse: MouseModes::new(
+                crate::terminal::MouseTrackingMode::ButtonMotion,
+                crate::terminal::MouseEncoding::Sgr,
+            ),
             grid,
         });
         let encoded = RemoteCodec::encode(&message).expect("encode");

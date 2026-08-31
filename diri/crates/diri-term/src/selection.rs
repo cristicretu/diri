@@ -98,6 +98,18 @@ impl TerminalSelection {
             return;
         }
         let col = col.min(row.len() - 1);
+        if let Some((start, end)) = url_span_at(&row, col) {
+            let absolute_row = viewport.absolute_row(window_row);
+            self.anchor = Some(SelectionPoint {
+                row: absolute_row,
+                col: start,
+            });
+            self.head = Some(SelectionPoint {
+                row: absolute_row,
+                col: end,
+            });
+            return;
+        }
         let class = word_class(row[col]);
         let mut start = col;
         while start > 0 && word_class(row[start - 1]) == class {
@@ -118,6 +130,31 @@ impl TerminalSelection {
         });
     }
 
+    /// Expands a triple-click to the complete visual row. Terminal padding is
+    /// retained in the range so dragging can continue naturally, while copy
+    /// still trims the padding through [`Self::selected_text`].
+    pub fn select_line(
+        &mut self,
+        viewport: &ScrollbackViewport,
+        buffer: &GridBuffer,
+        window_row: usize,
+    ) {
+        let row = viewport.window_row(buffer, window_row);
+        if row.is_empty() {
+            self.clear();
+            return;
+        }
+        let absolute_row = viewport.absolute_row(window_row);
+        self.anchor = Some(SelectionPoint {
+            row: absolute_row,
+            col: 0,
+        });
+        self.head = Some(SelectionPoint {
+            row: absolute_row,
+            col: row.len(),
+        });
+    }
+
     #[must_use]
     pub fn range(&self) -> Option<SelectionRange> {
         let anchor = self.anchor?;
@@ -131,6 +168,23 @@ impl TerminalSelection {
             (head, anchor)
         };
         Some(SelectionRange { start, end })
+    }
+
+    /// Whether a full-row content repaint would replace any selected cell.
+    ///
+    /// Selection endpoints are exclusive, so an endpoint at column zero does
+    /// not make that final row overlap. Keeping that distinction prevents a
+    /// repaint immediately below a selection from dismissing it.
+    #[must_use]
+    pub(crate) fn overlaps_row(&self, absolute_row: i64, cols: usize) -> bool {
+        let Some(range) = self.range() else {
+            return false;
+        };
+        if absolute_row < range.start.row || absolute_row > range.end.row {
+            return false;
+        }
+        let (start, end) = columns_for_row(range, absolute_row, cols);
+        start < end
     }
 
     #[must_use]
@@ -208,13 +262,64 @@ fn columns_for_row(range: SelectionRange, row: i64, cols: usize) -> (usize, usiz
 
 fn word_class(cell: GridCell) -> WordClass {
     let ch = cell_char(cell);
-    if ch.is_alphanumeric() || ch == '_' {
+    if ch.is_alphanumeric() || is_terminal_word_punctuation(ch) {
         WordClass::Word
     } else if ch.is_whitespace() {
         WordClass::Whitespace
     } else {
         WordClass::Punctuation
     }
+}
+
+/// Punctuation people expect to travel with paths, URLs, flags, and common
+/// identifiers when double-clicking in a terminal. Shell separators and quote
+/// delimiters deliberately remain punctuation boundaries.
+fn is_terminal_word_punctuation(ch: char) -> bool {
+    matches!(
+        ch,
+        '_' | '-' | '.' | '/' | '~' | ':' | '@' | '%' | '+' | '=' | '?'
+    )
+}
+
+/// Returns the exact URL/reference span containing `col`, if the surrounding
+/// whitespace-delimited run begins with a scheme people commonly encounter in
+/// terminal output. `&` and `#` are shell boundaries everywhere else, but are
+/// meaningful query/fragment separators inside these recognized references.
+fn url_span_at(row: &[GridCell], col: usize) -> Option<(usize, usize)> {
+    let mut run_start = col;
+    while run_start > 0 && !cell_char(row[run_start - 1]).is_whitespace() {
+        run_start -= 1;
+    }
+    let mut run_end = col + 1;
+    while run_end < row.len() && !cell_char(row[run_end]).is_whitespace() {
+        run_end += 1;
+    }
+
+    let mut start = run_start;
+    while start < run_end && matches!(cell_char(row[start]), '(' | '[' | '{' | '<' | '\'' | '"') {
+        start += 1;
+    }
+    let mut end = run_end;
+    while end > start
+        && matches!(
+            cell_char(row[end - 1]),
+            '.' | ',' | ';' | ':' | ')' | ']' | '}' | '\'' | '"' | '>' | '!' | '?'
+        )
+    {
+        end -= 1;
+    }
+    if col < start || col >= end {
+        return None;
+    }
+
+    let candidate: String = row[start..end].iter().copied().map(cell_char).collect();
+    let recognized = candidate.starts_with("http://")
+        || candidate.starts_with("https://")
+        || candidate.starts_with("file://")
+        || candidate
+            .strip_prefix("www.")
+            .is_some_and(|rest| rest.contains('.'));
+    recognized.then_some((start, end))
 }
 
 pub(crate) fn cell_char(cell: GridCell) -> char {
@@ -308,5 +413,85 @@ mod tests {
         selection.select_word(&viewport, &buffer, 0, 6);
 
         assert_eq!(selection.selected_text(&viewport, &buffer), "two_three");
+    }
+
+    #[test]
+    fn double_click_keeps_paths_urls_and_flags_together() {
+        let viewport = ScrollbackViewport::default();
+        let text = "open ./crates/diri-app:42 https://diri.dev/a?q=1&v=2#install, --all | next";
+        let mut buffer = GridBuffer::new(text.len() as u16, 1);
+        buffer.cells = row(text, text.len());
+        let mut selection = TerminalSelection::default();
+
+        selection.select_word(&viewport, &buffer, 0, text.find("diri-app").expect("path"));
+        assert_eq!(
+            selection.selected_text(&viewport, &buffer),
+            "./crates/diri-app:42"
+        );
+
+        selection.select_word(&viewport, &buffer, 0, text.find("diri.dev").expect("url"));
+        assert_eq!(
+            selection.selected_text(&viewport, &buffer),
+            "https://diri.dev/a?q=1&v=2#install"
+        );
+
+        selection.select_word(&viewport, &buffer, 0, text.find("--all").expect("flag"));
+        assert_eq!(selection.selected_text(&viewport, &buffer), "--all");
+
+        selection.select_word(&viewport, &buffer, 0, text.find('|').expect("pipe"));
+        assert_eq!(selection.selected_text(&viewport, &buffer), "|");
+    }
+
+    #[test]
+    fn double_click_keeps_shell_operators_and_comments_as_boundaries() {
+        let viewport = ScrollbackViewport::default();
+        let text = "true&&false value#comment";
+        let mut buffer = GridBuffer::new(text.len() as u16, 1);
+        buffer.cells = row(text, text.len());
+        let mut selection = TerminalSelection::default();
+
+        selection.select_word(&viewport, &buffer, 0, text.find("true").expect("true"));
+        assert_eq!(selection.selected_text(&viewport, &buffer), "true");
+        selection.select_word(&viewport, &buffer, 0, text.find("false").expect("false"));
+        assert_eq!(selection.selected_text(&viewport, &buffer), "false");
+        selection.select_word(&viewport, &buffer, 0, text.find("value").expect("value"));
+        assert_eq!(selection.selected_text(&viewport, &buffer), "value");
+        selection.select_word(
+            &viewport,
+            &buffer,
+            0,
+            text.find("comment").expect("comment"),
+        );
+        assert_eq!(selection.selected_text(&viewport, &buffer), "comment");
+    }
+
+    #[test]
+    fn triple_click_selects_the_visual_line_without_terminal_padding() {
+        let viewport = ScrollbackViewport::default();
+        let mut buffer = GridBuffer::new(16, 2);
+        buffer.cells = [row("first", 16), row("whole line", 16)].concat();
+        let mut selection = TerminalSelection::default();
+
+        selection.select_line(&viewport, &buffer, 1);
+
+        assert_eq!(selection.selected_text(&viewport, &buffer), "whole line");
+        assert_eq!(
+            selection.range(),
+            Some(SelectionRange {
+                start: SelectionPoint { row: 1, col: 0 },
+                end: SelectionPoint { row: 1, col: 16 },
+            })
+        );
+    }
+
+    #[test]
+    fn row_overlap_respects_the_exclusive_endpoint() {
+        let viewport = ScrollbackViewport::default();
+        let mut selection = TerminalSelection::default();
+        selection.set_from_window(&viewport, 2, 0, 0, 2);
+
+        assert!(selection.overlaps_row(0, 8));
+        assert!(selection.overlaps_row(1, 8));
+        assert!(!selection.overlaps_row(2, 8));
     }
 }

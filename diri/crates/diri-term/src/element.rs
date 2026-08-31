@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuar
 use std::time::{Duration, Instant};
 
 use diri_proto::grid::{GridCell, GridUpdate};
+use diri_proto::terminal::MouseModes;
 use gpui::{
     App, Bounds, ContentMask, Element, ElementId, FocusHandle, Font, FontFallbacks, FontId,
     GlobalElementId, InputHandler, InspectorElementId, IntoElement, LayoutId, PaintQuad, Pixels,
@@ -12,7 +13,10 @@ use gpui::{
 };
 
 use crate::buffer::{ApplySummary, GridBuffer};
-use crate::find::{FindSnapshot, FindSpan, NavigationTarget, SearchRequest, TerminalFindModel};
+use crate::find::{
+    FindSnapshot, FindSpan, NavigationTarget, SearchJob, SearchRequest, SearchResult,
+    TerminalFindModel,
+};
 use crate::metrics::CellMetrics;
 use crate::scrollback::{
     ScrollRouter, ScrollbackApplyError, ScrollbackRequest, ScrollbackViewport, ScrolledState,
@@ -199,6 +203,7 @@ struct ElementSharedState {
     modes: Mutex<TerminalModes>,
     scroll_router: Mutex<ScrollRouter>,
     history_lines: Mutex<HistoryLineCache>,
+    metrics: Mutex<Option<(Font, u32, CellMetrics)>>,
 }
 
 /// Shaped lines for history rows, keyed by absolute row and content-addressed
@@ -316,13 +321,7 @@ struct CursorPaint {
 impl TerminalElement {
     #[must_use]
     pub fn new(buffer: SharedGridBuffer) -> Self {
-        let mut terminal_font = font(".SF NS Mono");
-        terminal_font.fallbacks = Some(FontFallbacks::from_fonts(vec![
-            "Menlo".to_owned(),
-            "Apple Symbols".to_owned(),
-            "STIX Two Math".to_owned(),
-            "Apple Color Emoji".to_owned(),
-        ]));
+        let terminal_font = default_terminal_font();
         Self {
             buffer,
             shared: Arc::new(ElementSharedState {
@@ -337,6 +336,7 @@ impl TerminalElement {
                 modes: Mutex::new(TerminalModes::default()),
                 scroll_router: Mutex::new(ScrollRouter::default()),
                 history_lines: Mutex::new(HistoryLineCache::default()),
+                metrics: Mutex::new(None),
             }),
             theme: TermTheme::default(),
             font: terminal_font,
@@ -371,6 +371,13 @@ impl TerminalElement {
     #[must_use]
     pub fn grid_rows(&self) -> u16 {
         read_lock(&self.buffer).rows
+    }
+
+    /// Columns in the mirrored screen, used to clamp pointer reports to the
+    /// authoritative grid while a resize is in flight.
+    #[must_use]
+    pub fn grid_cols(&self) -> u16 {
+        read_lock(&self.buffer).cols
     }
 
     #[must_use]
@@ -432,7 +439,39 @@ impl TerminalElement {
     /// Terminal hosts use this to keep the authoritative buffer current while
     /// coalescing bursts and suppressing paints for offscreen residents.
     pub fn apply_damage(&self, update: GridUpdate) -> ApplySummary {
-        write_lock(&self.buffer).apply(update)
+        // Absolute rows keep a selection attached while the viewport moves,
+        // but not when the daemon replaces cells at those rows. Damage is
+        // row-granular, so unrelated live output and history remain selected.
+        let live_start_row = mutex_lock(&self.shared.viewport).live_start_row();
+        let mut buffer = write_lock(&self.buffer);
+        let replaces_grid =
+            update.is_full_snapshot || buffer.cols != update.cols || buffer.rows != update.rows;
+        let damaged_cols = usize::from(if replaces_grid {
+            buffer.cols.max(update.cols)
+        } else {
+            update.cols
+        });
+        let mut selection = mutex_lock(&self.shared.selection);
+        let selection_overlaps_damage = if selection.range().is_none() {
+            false
+        } else if replaces_grid {
+            (0..buffer.rows.max(update.rows)).any(|row| {
+                selection.overlaps_row(live_start_row.saturating_add(i64::from(row)), damaged_cols)
+            })
+        } else {
+            update.changed_rows.iter().any(|changed| {
+                changed.y < update.rows
+                    && selection.overlaps_row(
+                        live_start_row.saturating_add(i64::from(changed.y)),
+                        damaged_cols,
+                    )
+            })
+        };
+        let summary = buffer.apply(update);
+        if selection_overlaps_damage {
+            selection.clear();
+        }
+        summary
     }
 
     #[must_use]
@@ -472,21 +511,25 @@ impl TerminalElement {
         mutex_lock(&self.shared.viewport).scroll_to_absolute(absolute_row, anchor, visible_rows)
     }
 
-    pub fn set_modes(&self, alt_screen: bool, mouse_reporting: bool) -> bool {
+    /// Updates daemon-owned terminal modes and reports whether entering the
+    /// alternate screen also moved a scrolled viewport back to live. Either
+    /// alternate-screen transition invalidates the previous screen's rows.
+    pub fn set_modes(&self, alt_screen: bool, mouse: MouseModes) -> bool {
         let mut modes = mutex_lock(&self.shared.modes);
         let entered_alt = alt_screen && !modes.alt_screen;
-        *modes = TerminalModes {
-            alt_screen,
-            mouse_reporting,
-        };
+        let alt_screen_changed = alt_screen != modes.alt_screen;
+        *modes = TerminalModes { alt_screen, mouse };
         drop(modes);
+        if alt_screen_changed {
+            mutex_lock(&self.shared.selection).clear();
+        }
         entered_alt && mutex_lock(&self.shared.viewport).enter_alt_screen()
     }
 
     /// True while the foreground program consumes mouse events, in which case
     /// pointer gestures belong to it rather than local selection.
-    pub fn mouse_reporting(&self) -> bool {
-        mutex_lock(&self.shared.modes).mouse_reporting
+    pub fn mouse_modes(&self) -> MouseModes {
+        mutex_lock(&self.shared.modes).mouse
     }
 
     /// Resolves a wheel event and applies local scrollback movement. Daemon
@@ -494,8 +537,13 @@ impl TerminalElement {
     pub fn route_wheel(&self, event: WheelEvent) -> Option<WheelRoute> {
         let modes = *mutex_lock(&self.shared.modes);
         let route = mutex_lock(&self.shared.scroll_router).route(modes, event)?;
-        if let WheelRoute::Local { lines } = route {
-            mutex_lock(&self.shared.viewport).scroll_by(lines, usize::from(event.visible_rows));
+        match route {
+            WheelRoute::Local { lines } => {
+                mutex_lock(&self.shared.viewport).scroll_by(lines, usize::from(event.visible_rows));
+            }
+            // This route leaves the viewport still while the foreground
+            // program may repaint beneath the selection's coordinates.
+            WheelRoute::Daemon { .. } => mutex_lock(&self.shared.selection).clear(),
         }
         Some(route)
     }
@@ -533,9 +581,15 @@ impl TerminalElement {
     }
 
     pub fn select_word(&self, col: usize, window_row: usize) {
-        let viewport = mutex_lock(&self.shared.viewport).clone();
+        let viewport = mutex_lock(&self.shared.viewport);
         let buffer = read_lock(&self.buffer);
         mutex_lock(&self.shared.selection).select_word(&viewport, &buffer, window_row, col);
+    }
+
+    pub fn select_line(&self, window_row: usize) {
+        let viewport = mutex_lock(&self.shared.viewport);
+        let buffer = read_lock(&self.buffer);
+        mutex_lock(&self.shared.selection).select_line(&viewport, &buffer, window_row);
     }
 
     pub fn clear_selection(&self) {
@@ -559,7 +613,7 @@ impl TerminalElement {
     /// the path itself. Multi-row references are deliberately out of scope.
     #[must_use]
     pub fn reference_at(&self, col: usize, window_row: usize) -> Option<TerminalReference> {
-        let viewport = mutex_lock(&self.shared.viewport).clone();
+        let viewport = mutex_lock(&self.shared.viewport);
         let buffer = read_lock(&self.buffer);
         let absolute_row = viewport.absolute_row(window_row);
         let row = viewport.row_at_absolute(&buffer, absolute_row);
@@ -589,28 +643,35 @@ impl TerminalElement {
 
     #[must_use]
     pub fn selected_text(&self) -> String {
-        let viewport = mutex_lock(&self.shared.viewport).clone();
+        let viewport = mutex_lock(&self.shared.viewport);
         let buffer = read_lock(&self.buffer);
         mutex_lock(&self.shared.selection).selected_text(&viewport, &buffer)
+    }
+
+    #[must_use]
+    pub fn selection_range(&self) -> Option<crate::selection::SelectionRange> {
+        mutex_lock(&self.shared.selection).range()
     }
 
     pub fn set_find_highlights(&self, spans: Vec<FindSpan>) {
         *mutex_lock(&self.shared.find_spans) = spans;
     }
 
-    pub fn apply_find_snapshot(
+    /// Captures the small live grid and packages it with daemon history for a
+    /// lock-free background scan. No history matching happens on the GPUI
+    /// thread.
+    pub fn prepare_find_search(
         &self,
-        model: &mut TerminalFindModel,
+        model: &TerminalFindModel,
         request: &SearchRequest,
         snapshot: FindSnapshot,
-    ) -> bool {
+    ) -> Option<SearchJob> {
         let buffer = read_lock(&self.buffer);
-        model.apply_snapshot(
-            request,
-            snapshot,
-            &buffer,
-            &mut mutex_lock(&self.shared.viewport),
-        )
+        model.prepare_search(request, snapshot, &buffer)
+    }
+
+    pub fn apply_find_result(&self, model: &mut TerminalFindModel, result: SearchResult) -> bool {
+        model.apply_result(result, &mut mutex_lock(&self.shared.viewport))
     }
 
     pub fn find_next(&self, model: &mut TerminalFindModel) -> Option<NavigationTarget> {
@@ -654,21 +715,14 @@ impl TerminalElement {
         window: &mut Window,
     ) -> CachedRow {
         let mut background_quads = Vec::new();
-        append_background_quads(
+        let mut decoration_quads = Vec::new();
+        append_row_quads(
             &cells,
             row,
             origin,
             metrics,
             self.theme,
             &mut background_quads,
-        );
-        let mut decoration_quads = Vec::new();
-        append_decoration_quads(
-            &cells,
-            row,
-            origin,
-            metrics,
-            self.theme,
             &mut decoration_quads,
         );
         let line = self.shape_row(&cells, metrics, window);
@@ -738,6 +792,41 @@ impl TerminalElement {
             Some(metrics.cell_width),
         ))
     }
+}
+
+#[cfg(target_os = "macos")]
+fn default_terminal_font() -> Font {
+    let mut terminal_font = font(".SF NS Mono");
+    terminal_font.fallbacks = Some(FontFallbacks::from_fonts(
+        [
+            "Menlo",
+            "Apple Symbols",
+            "STIX Two Math",
+            "Apple Color Emoji",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+    ));
+    terminal_font
+}
+
+#[cfg(not(target_os = "macos"))]
+fn default_terminal_font() -> Font {
+    let mut terminal_font = font("monospace");
+    terminal_font.fallbacks = Some(FontFallbacks::from_fonts(
+        [
+            "Noto Sans Mono",
+            "DejaVu Sans Mono",
+            "Noto Sans Symbols 2",
+            "STIX Two Math",
+            "Noto Color Emoji",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+    ));
+    terminal_font
 }
 
 impl IntoElement for TerminalElement {
@@ -825,7 +914,22 @@ impl Element for TerminalElement {
         }
 
         let started_at = Instant::now();
-        let metrics = CellMetrics::measure(window.text_system(), &self.font, self.font_size);
+        let font_size_bits = f32::from(self.font_size).to_bits();
+        let metrics = {
+            let mut cached = mutex_lock(&self.shared.metrics);
+            if let Some((cached_font, cached_size, metrics)) = cached.as_ref()
+                && cached_font == &self.font
+                && *cached_size == font_size_bits
+            {
+                *metrics
+            } else {
+                let font_id = window.text_system().resolve_font(&self.font);
+                let metrics =
+                    CellMetrics::measure_font(window.text_system(), font_id, self.font_size);
+                *cached = Some((self.font.clone(), font_size_bits, metrics));
+                metrics
+            }
+        };
         let visible_rows =
             usize::from(grid_rows).min(usize::from(metrics.rows_for_height(bounds.size.height)));
         let visible_cols =
@@ -865,20 +969,13 @@ impl Element for TerminalElement {
                 let absolute = viewport.absolute_row(row_index);
                 let mut cells = viewport.window_row(&buffer, row_index);
                 cells.truncate(visible_cols);
-                append_background_quads(
+                append_row_quads(
                     &cells,
                     row_index as u16,
                     bounds.origin,
                     metrics,
                     self.theme,
                     &mut background_quads,
-                );
-                append_decoration_quads(
-                    &cells,
-                    row_index as u16,
-                    bounds.origin,
-                    metrics,
-                    self.theme,
                     &mut decoration_quads,
                 );
                 let is_history = absolute < viewport.live_start_row();
@@ -1233,6 +1330,33 @@ fn append_background_quads(
         ));
         col = end;
     }
+}
+
+fn append_row_quads(
+    row: &[GridCell],
+    row_index: u16,
+    origin: Point<Pixels>,
+    metrics: CellMetrics,
+    theme: TermTheme,
+    background_quads: &mut Vec<PaintQuad>,
+    decoration_quads: &mut Vec<PaintQuad>,
+) {
+    // Plain terminal output is overwhelmingly default-background text with
+    // no decorations. Recognize the entire row in one cheap pass instead of
+    // scanning it once for backgrounds and again for decorations.
+    let is_plain = row.iter().all(|cell| {
+        !cell.style.contains(diri_proto::grid::TermStyle::INVERSE)
+            && is_default_background(cell.bg)
+            && !cell.style.contains(diri_proto::grid::TermStyle::UNDERLINE)
+            && !cell
+                .style
+                .contains(diri_proto::grid::TermStyle::CROSSED_OUT)
+    });
+    if is_plain {
+        return;
+    }
+    append_background_quads(row, row_index, origin, metrics, theme, background_quads);
+    append_decoration_quads(row, row_index, origin, metrics, theme, decoration_quads);
 }
 
 fn append_decoration_quads(
@@ -1732,5 +1856,184 @@ mod history_cache_tests {
         assert!(cache.get(anchor, digest).is_some(), "the window survives");
         assert!(cache.get(0, digest).is_none(), "distant rows are dropped");
         assert!(cache.lines.len() <= HistoryLineCache::MAX_ROWS);
+    }
+}
+
+#[cfg(test)]
+mod selection_repaint_tests {
+    use diri_proto::grid::{ChangedRow, GridCell, GridUpdate, TermColor, TermStyle};
+    use diri_proto::terminal::MouseModes;
+
+    use super::{TerminalElement, mutex_lock};
+    use crate::buffer::GridBuffer;
+    use crate::scrollback::{WheelDelta, WheelEvent, WheelRoute};
+
+    const COLS: u16 = 8;
+    const ROWS: u16 = 3;
+
+    fn cell(ch: char) -> GridCell {
+        GridCell::new(
+            u32::from(ch),
+            TermColor::Default,
+            TermColor::DefaultInverted,
+            TermStyle::empty(),
+        )
+    }
+
+    fn row(text: &str) -> Vec<GridCell> {
+        let mut cells: Vec<_> = text.chars().map(cell).collect();
+        cells.resize(usize::from(COLS), GridCell::BLANK);
+        cells
+    }
+
+    fn update(full: bool, rows: &[(u16, &str)]) -> GridUpdate {
+        GridUpdate {
+            cols: COLS,
+            rows: ROWS,
+            cursor_col: 0,
+            cursor_row: 0,
+            cursor_visible: false,
+            is_full_snapshot: full,
+            changed_rows: rows
+                .iter()
+                .map(|(y, text)| ChangedRow::new(*y, row(text)))
+                .collect(),
+        }
+    }
+
+    fn populated_element() -> TerminalElement {
+        let element = TerminalElement::with_buffer(GridBuffer::new(COLS, ROWS));
+        element.apply_damage(update(true, &[(0, "zero"), (1, "one"), (2, "two")]));
+        element
+    }
+
+    fn wheel(delta: f32) -> WheelEvent {
+        WheelEvent {
+            delta: WheelDelta::Lines(delta),
+            col: 2,
+            row: 1,
+            visible_rows: ROWS,
+            line_height: 16.0,
+        }
+    }
+
+    fn visible_selection_count(element: &TerminalElement) -> usize {
+        let viewport = mutex_lock(&element.shared.viewport).clone();
+        mutex_lock(&element.shared.selection)
+            .visible_spans(&viewport, usize::from(ROWS), usize::from(COLS))
+            .len()
+    }
+
+    #[test]
+    fn daemon_wheel_drops_the_selection_before_the_tui_can_repaint() {
+        for modes in [(true, MouseModes::OFF), (false, MouseModes::UNKNOWN)] {
+            let element = populated_element();
+            element.set_modes(modes.0, modes.1);
+            element.begin_selection(0, 1);
+            element.drag_selection(3, 1);
+            assert_eq!(element.selected_text(), "one");
+
+            assert!(matches!(
+                element.route_wheel(wheel(1.0)),
+                Some(WheelRoute::Daemon { .. })
+            ));
+            assert_eq!(element.selected_text(), "", "modes: {modes:?}");
+            assert_eq!(visible_selection_count(&element), 0, "modes: {modes:?}");
+        }
+    }
+
+    #[test]
+    fn local_scroll_keeps_selection_attached_across_the_history_live_seam() {
+        let element = populated_element();
+        {
+            let mut viewport = mutex_lock(&element.shared.viewport);
+            viewport.apply_rows(
+                vec![row("hist six"), row("hist sev")],
+                6,
+                8,
+                11,
+                1,
+                usize::from(ROWS),
+            );
+            assert!(viewport.set_view_offset(2, usize::from(ROWS)));
+        }
+        element.begin_selection(0, 0);
+        element.drag_selection(3, 2);
+        let selected = element.selected_text();
+        assert_eq!(selected, "hist six\nhist sev\nzer");
+
+        assert_eq!(
+            element.route_wheel(wheel(1.0)),
+            Some(WheelRoute::Local { lines: 1 })
+        );
+        assert_eq!(element.selected_text(), selected);
+        assert_eq!(visible_selection_count(&element), 2);
+    }
+
+    #[test]
+    fn entering_and_leaving_alt_screen_drop_active_selections() {
+        let element = populated_element();
+        element.begin_selection(0, 1);
+        element.drag_selection(3, 1);
+
+        element.set_modes(true, MouseModes::OFF);
+        assert_eq!(element.selected_text(), "", "entering alt screen");
+
+        element.begin_selection(0, 2);
+        element.drag_selection(3, 2);
+        element.set_modes(false, MouseModes::OFF);
+        assert_eq!(element.selected_text(), "", "leaving alt screen");
+    }
+
+    #[test]
+    fn alt_screen_repaint_only_drops_a_selection_when_damage_overlaps_it() {
+        let element = populated_element();
+        element.set_modes(true, MouseModes::OFF);
+        element.begin_selection(0, 1);
+        element.drag_selection(3, 1);
+
+        element.apply_damage(update(false, &[(0, "ZERO")]));
+        assert_eq!(element.selected_text(), "one");
+        assert_eq!(visible_selection_count(&element), 1);
+
+        element.apply_damage(update(false, &[(1, "new")]));
+        assert_eq!(element.selected_text(), "");
+        assert_eq!(visible_selection_count(&element), 0);
+    }
+
+    #[test]
+    fn normal_screen_output_missing_the_selection_preserves_highlight_and_copy() {
+        let element = populated_element();
+        element.begin_selection(0, 1);
+        element.drag_selection(3, 1);
+
+        element.apply_damage(update(false, &[(2, "TWO")]));
+
+        assert_eq!(element.selected_text(), "one");
+        assert_eq!(visible_selection_count(&element), 1);
+    }
+
+    #[test]
+    fn normal_screen_output_replacing_selected_text_drops_highlight_and_copy() {
+        let element = populated_element();
+        element.begin_selection(0, 1);
+        element.drag_selection(3, 1);
+
+        element.apply_damage(update(false, &[(1, "new")]));
+
+        assert_eq!(element.selected_text(), "");
+        assert_eq!(visible_selection_count(&element), 0);
+    }
+
+    #[test]
+    fn full_snapshot_reseed_drops_any_selection_in_the_live_grid() {
+        let element = populated_element();
+        element.begin_selection(0, 1);
+        element.drag_selection(3, 1);
+
+        element.apply_damage(update(true, &[(0, "zero"), (1, "one"), (2, "two")]));
+
+        assert_eq!(element.selected_text(), "");
+        assert_eq!(visible_selection_count(&element), 0);
     }
 }
