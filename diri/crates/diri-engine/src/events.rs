@@ -394,7 +394,9 @@ pub fn spawn_registry_watcher(
                     let Ok(mut registry) = registry.lock() else {
                         break;
                     };
-                    registry.changed_since(&mut published)
+                    let mut changed = registry.changed_since(&mut published);
+                    changed.extend(registry.refresh_cursor_generated_titles());
+                    changed
                 };
                 for (id, record) in changed {
                     events.publish_encoded(

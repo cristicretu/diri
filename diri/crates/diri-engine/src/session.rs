@@ -105,6 +105,7 @@ pub struct SessionView {
     pub needs_input: Option<NeedsInputDetail>,
     pub title: Option<String>,
     pub title_source: Option<diri_proto::TitleSource>,
+    pub last_turn_completed_at: Option<diri_proto::DateMillis>,
     pub tail_offset: u64,
     pub exited: bool,
 }
@@ -167,6 +168,7 @@ struct Shared {
     id: String,
     status: Mutex<SessionStatus>,
     needs_input: Mutex<Option<NeedsInputDetail>>,
+    last_turn_completed_at: Mutex<Option<diri_proto::DateMillis>>,
     title: Mutex<Option<String>>,
     prompt_title: Mutex<Option<String>>,
     prompt_input: Mutex<PromptInputState>,
@@ -1001,6 +1003,11 @@ impl Session {
             needs_input: self.shared.needs_input.lock().expect("needs input").clone(),
             title,
             title_source,
+            last_turn_completed_at: *self
+                .shared
+                .last_turn_completed_at
+                .lock()
+                .expect("last turn completed"),
             tail_offset: self.shared.log.lock().expect("log").tail_offset(),
             exited: self.shared.exited.load(Ordering::SeqCst),
         }
@@ -1598,6 +1605,7 @@ fn new_shared(spec: &SessionSpec, log: OutputLog) -> Arc<Shared> {
         id: spec.id.clone(),
         status: Mutex::new(SessionStatus::Starting),
         needs_input: Mutex::new(None),
+        last_turn_completed_at: Mutex::new(None),
         title: Mutex::new(None),
         prompt_title: Mutex::new(None),
         prompt_input: Mutex::new(PromptInputState::default()),
@@ -1680,6 +1688,13 @@ fn apply(shared: &Shared, outcome: &ReducerOutcome) {
             *current = Some(detail.clone());
             changed = true;
         }
+    }
+    if outcome.turn_completed {
+        *shared
+            .last_turn_completed_at
+            .lock()
+            .expect("last turn completed") = Some(diri_proto::DateMillis::from(SystemTime::now()));
+        changed = true;
     }
     // Leaving a needs-input state clears the pending detail, so the UI does not
     // keep showing a prompt that has been answered.

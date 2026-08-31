@@ -300,7 +300,7 @@ mod tests {
             .into_iter()
             .map(|id| engine.manifest(id).expect("manifest").rules.len())
             .sum();
-        assert_eq!(rules, 85, "the shipped ruleset lost rules");
+        assert_eq!(rules, 89, "the shipped ruleset lost rules");
 
         for id in engine.ids() {
             let expected_empty = matches!(id, "shell" | "generic" | "pi");
@@ -399,6 +399,53 @@ mod tests {
             observation.is_none() || observation.unwrap().state != ManifestState::BlockedPermission,
             "ordinary output must not read as a blocker"
         );
+    }
+
+    fn cursor_snapshot(lines: &[&str], osc_title: Option<&str>) -> ScreenSnapshot {
+        ScreenSnapshot {
+            lines: lines.iter().map(|line| (*line).to_owned()).collect(),
+            osc_title: osc_title.map(str::to_owned),
+            ..ScreenSnapshot::default()
+        }
+    }
+
+    #[test]
+    fn cursor_osc_title_keeps_tool_turns_working_until_ready() {
+        let engine = engine();
+        let grep = cursor_snapshot(
+            &["Add a follow-up", "Grep AgentKind", "→"],
+            Some("Cursor Integration Fix - \u{23f3} Working ..."),
+        );
+        let observation = engine.evaluate(&grep, "cursor").expect("match");
+        assert_eq!(observation.state, ManifestState::Working);
+        assert_eq!(observation.matched_rule_id, "working-osc-title");
+
+        let ready = cursor_snapshot(
+            &["Add a follow-up"],
+            Some("Cursor Integration Fix - \u{2705} Ready"),
+        );
+        let observation = engine.evaluate(&ready, "cursor").expect("match");
+        assert_eq!(observation.state, ManifestState::Idle);
+        assert_eq!(observation.matched_rule_id, "idle-osc-title");
+
+        let grep_without_osc = cursor_snapshot(&["Grep AgentKind", "Add a follow-up"], None);
+        let observation = engine.evaluate(&grep_without_osc, "cursor").expect("match");
+        assert_eq!(observation.state, ManifestState::Working);
+        assert_eq!(observation.matched_rule_id, "working-status-line");
+
+        let leftover_follow_up = cursor_snapshot(
+            &["Grep AgentKind already finished", "Add a follow-up"],
+            None,
+        );
+        let observation = engine
+            .evaluate(&leftover_follow_up, "cursor")
+            .expect("grep outranks leftover follow-up chrome");
+        assert_eq!(observation.state, ManifestState::Working);
+
+        let idle_prompt = cursor_snapshot(&["\u{2192} Add a follow-up"], None);
+        let observation = engine.evaluate(&idle_prompt, "cursor").expect("match");
+        assert_eq!(observation.state, ManifestState::Idle);
+        assert_eq!(observation.matched_rule_id, "idle-prompt-arrow");
     }
 
     #[test]

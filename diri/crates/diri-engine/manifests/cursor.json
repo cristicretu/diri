@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "id": "cursor",
-  "version": "2026.07.10",
+  "version": "2026.08.31",
   "statusModel": "full",
   "agent": {
     "id": "cursor",
@@ -38,6 +38,59 @@
     }
   },
   "rules": [
+    {
+      "id": "blocked-osc-confirmation",
+      "state": "blockedPermission",
+      "priority": 1300,
+      "region": "osc_title",
+      "when": {
+        "contains": "waiting for confirmation"
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "blocked-osc-waiting-for-you",
+      "state": "blockedQuestion",
+      "priority": 1250,
+      "region": "osc_title",
+      "when": {
+        "contains": "waiting for you"
+      },
+      "flags": [
+        "visible_blocker"
+      ],
+      "capture": {
+        "region": "bottom_non_empty_lines",
+        "regionLines": 12,
+        "maxChars": 400
+      }
+    },
+    {
+      "id": "working-osc-title",
+      "state": "working",
+      "priority": 1200,
+      "region": "osc_title",
+      "_notice": "cursor-agent writes OSC 0 as '{name} - {emoji} {stamp}'. The stamp stays Working/Planning/Running shell for the whole turn, including Grep/Read, so this outranks leftover idle chrome in the TUI.",
+      "when": {
+        "regex": " - [^A-Za-z]*(Working|Planning|Queued|Loading conversation|Reconnecting|Running shell command|Moving to cloud|Reviewing changes)"
+      }
+    },
+    {
+      "id": "idle-osc-title",
+      "state": "idle",
+      "priority": 1150,
+      "region": "osc_title",
+      "when": {
+        "regex": " - [^A-Za-z]*Ready\\s*$"
+      }
+    },
     {
       "id": "confirm-dialog",
       "state": "blockedPermission",
@@ -98,16 +151,17 @@
       "region": "bottom_non_empty_lines",
       "regionLines": 4,
       "when": {
-        "lineRegex": "^\\s*(Generating|Thinking)"
+        "lineRegex": "^\\s*(Generating|Thinking|Responding|Working|Grep|Read |Read file|Edit |Delete |List |Glob |Search |Web search|Fetch |Web fetch|Subagent|Running |Shell command|Codebase search)"
       }
     },
     {
       "id": "idle-prompt-arrow",
       "state": "idle",
       "priority": 500,
-      "region": "prompt_box_body",
+      "region": "bottom_non_empty_lines",
+      "regionLines": 8,
       "when": {
-        "lineRegex": "^\\s*\u2192"
+        "lineRegex": "^\\s*\u2192\\s*Add a follow-up"
       }
     },
     {

@@ -36,7 +36,8 @@ pub fn parse_claude_hook(
     // moves to a different project directory when an agent enters a worktree
     // mid-session, and capturing it once would leave the record pointing at the
     // pre-worktree path forever.
-    meta.agent_session_id = string(payload, "session_id");
+    meta.agent_session_id =
+        string(payload, "session_id").or_else(|| string(payload, "conversation_id"));
     meta.transcript_path = string(payload, "transcript_path");
 
     let hook = match event {
@@ -230,6 +231,23 @@ mod tests {
         assert_eq!(
             meta.transcript_path.as_deref(),
             Some("/new/project/dir/abc-123.jsonl")
+        );
+    }
+
+    #[test]
+    fn cursor_conversation_id_is_accepted_as_session_identity() {
+        let payload = json!({
+            "conversation_id": "11111fcb-7655-4342-8b2f-88068c650200",
+            "prompt": "Fix the cursor session title",
+        });
+        let (_, meta) = parse_claude_hook("UserPromptSubmit", &payload, now()).expect("parsed");
+        assert_eq!(
+            meta.agent_session_id.as_deref(),
+            Some("11111fcb-7655-4342-8b2f-88068c650200")
+        );
+        assert_eq!(
+            meta.first_prompt_title.as_deref(),
+            Some("Fix the cursor session title")
         );
     }
 

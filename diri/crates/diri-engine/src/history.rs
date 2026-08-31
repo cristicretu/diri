@@ -16,6 +16,7 @@
 //!
 //! Ported from the Swift `HistoryScanner`.
 
+use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -29,6 +30,8 @@ const MAX_ENTRIES: usize = 500;
 const CLAUDE_HEAD_CAP: usize = 8 << 20;
 /// Tail window scanned for the newest Claude `ai-title`.
 const CLAUDE_TAIL_BYTES: usize = 16 << 10;
+/// Tail window for Cursor's last jsonl object (turn working/idle).
+const CURSOR_TAIL_BYTES: usize = 64 << 10;
 /// Cap on a Codex `session_meta` first line.
 const CODEX_FIRST_LINE_CAP: usize = 512 << 10;
 const CHUNK: usize = 64 << 10;
@@ -238,6 +241,232 @@ pub(crate) fn latest_claude_ai_title(path: &Path) -> Option<String> {
         }
     }
     newest
+}
+
+/// Cursor conversation identity plus the generated title Cursor writes to
+/// `~/.cursor/chats/<workspace>/<id>/meta.json`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CursorConversation {
+    pub id: String,
+    pub title: Option<String>,
+    pub transcript_path: Option<String>,
+}
+
+/// Last complete jsonl object in a Cursor transcript: in-flight or done.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CursorTranscriptTurn {
+    Working,
+    Idle,
+}
+
+/// Cursor writes `tool_use` while a turn is in flight and a text-only
+/// assistant line (or `turn_ended`) when it is done. `turn_ended` is the
+/// whole conversation, not each turn, so the last object is the signal.
+pub(crate) fn cursor_transcript_turn(path: &Path) -> Option<CursorTranscriptTurn> {
+    classify_cursor_transcript_object(&last_jsonl_object(path)?)
+}
+
+fn classify_cursor_transcript_object(object: &Value) -> Option<CursorTranscriptTurn> {
+    if object.get("type").and_then(Value::as_str) == Some("turn_ended") {
+        return Some(CursorTranscriptTurn::Idle);
+    }
+    match object.get("role").and_then(Value::as_str) {
+        Some("user") => Some(CursorTranscriptTurn::Working),
+        Some("assistant") => Some(if assistant_uses_tool(object) {
+            CursorTranscriptTurn::Working
+        } else {
+            CursorTranscriptTurn::Idle
+        }),
+        _ => None,
+    }
+}
+
+fn assistant_uses_tool(object: &Value) -> bool {
+    object
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)
+        .is_some_and(|content| {
+            content
+                .iter()
+                .any(|part| part.get("type").and_then(Value::as_str) == Some("tool_use"))
+        })
+}
+
+fn last_jsonl_object(path: &Path) -> Option<Value> {
+    let mut handle = std::fs::File::open(path).ok()?;
+    let end = handle.seek(SeekFrom::End(0)).ok()?;
+    if end == 0 {
+        return None;
+    }
+    let start = end.saturating_sub(CURSOR_TAIL_BYTES as u64);
+    handle.seek(SeekFrom::Start(start)).ok()?;
+    let mut data = Vec::new();
+    handle
+        .take((CURSOR_TAIL_BYTES + (4 << 10)) as u64)
+        .read_to_end(&mut data)
+        .ok()?;
+    let text = String::from_utf8_lossy(&data);
+    let mut lines = text.split('\n').filter(|line| !line.is_empty());
+    if start > 0 {
+        lines.next();
+    }
+    let mut newest = None;
+    for line in lines {
+        if let Ok(value) = serde_json::from_str::<Value>(line) {
+            newest = Some(value);
+        }
+    }
+    newest
+}
+
+/// `~/.cursor/projects/<slug>/` slug for a working directory: leading slash
+/// stripped, remaining `/` replaced by `-`.
+pub(crate) fn cursor_project_slug(cwd: &str) -> String {
+    cwd.trim_end_matches('/')
+        .trim_start_matches('/')
+        .replace('/', "-")
+}
+
+/// Resolve a Cursor conversation and its generated title.
+///
+/// `conversation_id` wins when the caller already knows it (hook payload).
+/// Otherwise the newest unclaimed transcript under the cwd's project whose
+/// `createdAtMs` is at or after `created_after_ms` is chosen.
+pub(crate) fn cursor_conversation(
+    home: &Path,
+    cwd: &str,
+    conversation_id: Option<&str>,
+    created_after_ms: f64,
+    claimed: &HashSet<String>,
+) -> Option<CursorConversation> {
+    if let Some(id) = conversation_id.filter(|id| is_cursor_conversation_id(id)) {
+        return Some(read_cursor_conversation(home, cwd, id));
+    }
+    discover_cursor_conversation(home, cwd, created_after_ms, claimed)
+}
+
+fn is_cursor_conversation_id(id: &str) -> bool {
+    (32..80).contains(&id.len())
+        && id
+            .chars()
+            .all(|character| character.is_ascii_hexdigit() || character == '-')
+}
+
+fn read_cursor_conversation(home: &Path, cwd: &str, id: &str) -> CursorConversation {
+    let transcript = cursor_transcript_path(home, cwd, id).filter(|path| path.is_file());
+    CursorConversation {
+        title: cursor_meta_title(home, id),
+        transcript_path: transcript.map(|path| path.to_string_lossy().into_owned()),
+        id: id.to_owned(),
+    }
+}
+
+fn discover_cursor_conversation(
+    home: &Path,
+    cwd: &str,
+    created_after_ms: f64,
+    claimed: &HashSet<String>,
+) -> Option<CursorConversation> {
+    let transcripts = cursor_transcripts_dir(home, cwd)?;
+    let Ok(entries) = std::fs::read_dir(&transcripts) else {
+        return None;
+    };
+    let floor = created_after_ms - 2_000.0;
+    let mut best: Option<(f64, CursorConversation)> = None;
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let id = entry.file_name().to_string_lossy().into_owned();
+        if claimed.contains(&id) || !is_cursor_conversation_id(&id) {
+            continue;
+        }
+        let conversation = read_cursor_conversation(home, cwd, &id);
+        let created = cursor_meta_created_ms(home, &id).unwrap_or_else(|| {
+            std::fs::metadata(&path)
+                .and_then(|meta| meta.created().or_else(|_| meta.modified()))
+                .ok()
+                .map(system_time_ms)
+                .unwrap_or(0.0)
+        });
+        if created < floor {
+            continue;
+        }
+        let better = best.as_ref().is_none_or(|(best_created, _)| {
+            (created - created_after_ms).abs() < (best_created - created_after_ms).abs()
+        });
+        if better {
+            best = Some((created, conversation));
+        }
+    }
+    best.map(|(_, conversation)| conversation)
+}
+
+fn cursor_transcripts_dir(home: &Path, cwd: &str) -> Option<PathBuf> {
+    let dir = home
+        .join(".cursor/projects")
+        .join(cursor_project_slug(cwd))
+        .join("agent-transcripts");
+    confined_dir(home.join(".cursor"), &dir)
+}
+
+fn cursor_transcript_path(home: &Path, cwd: &str, id: &str) -> Option<PathBuf> {
+    let path = cursor_transcripts_dir(home, cwd)?
+        .join(id)
+        .join(format!("{id}.jsonl"));
+    confined_file(home.join(".cursor"), &path)
+}
+
+fn cursor_meta_title(home: &Path, id: &str) -> Option<String> {
+    cursor_meta(home, id)?
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(str::to_owned)
+}
+
+fn cursor_meta_created_ms(home: &Path, id: &str) -> Option<f64> {
+    cursor_meta(home, id)?
+        .get("createdAtMs")
+        .and_then(Value::as_f64)
+}
+
+fn cursor_meta(home: &Path, id: &str) -> Option<Value> {
+    let chats = home.join(".cursor/chats");
+    let Ok(workspaces) = std::fs::read_dir(&chats) else {
+        return None;
+    };
+    for workspace in workspaces.filter_map(Result::ok) {
+        let meta = workspace.path().join(id).join("meta.json");
+        let Some(meta) = confined_file(&chats, &meta) else {
+            continue;
+        };
+        let bytes = std::fs::read(&meta).ok()?;
+        return serde_json::from_slice(&bytes).ok();
+    }
+    None
+}
+
+fn confined_dir(root: impl AsRef<Path>, path: &Path) -> Option<PathBuf> {
+    let root = root.as_ref().canonicalize().ok()?;
+    let canonical = path.canonicalize().ok()?;
+    canonical.starts_with(&root).then_some(canonical)
+}
+
+fn confined_file(root: impl AsRef<Path>, path: &Path) -> Option<PathBuf> {
+    if !path.is_file() {
+        return None;
+    }
+    confined_dir(root, path)
+}
+
+fn system_time_ms(time: SystemTime) -> f64 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|since| since.as_secs_f64() * 1000.0)
+        .unwrap_or(0.0)
 }
 
 // MARK: Codex
@@ -611,5 +840,114 @@ mod tests {
         );
         let entries = scan_roots(&claude, &temp.path().join("codex"), &[]);
         assert_eq!(entries[0].cwd, "/tmp");
+    }
+
+    #[test]
+    fn a_cursor_meta_title_is_the_generated_conversation_name() {
+        let temp = tempfile::tempdir().expect("temp");
+        let home = temp.path();
+        let id = "11111fcb-7655-4342-8b2f-88068c650200";
+        let cwd = "/Users/alex/GitHub/diri";
+        write_cursor_chat(home, cwd, id, "Cursor Integration Fix", 1_788_110_437_802.0);
+
+        let conversation =
+            cursor_conversation(home, cwd, Some(id), 0.0, &HashSet::new()).expect("found");
+        assert_eq!(conversation.id, id);
+        assert_eq!(
+            conversation.title.as_deref(),
+            Some("Cursor Integration Fix")
+        );
+    }
+
+    #[test]
+    fn an_unclaimed_cursor_transcript_is_matched_to_the_session_cwd() {
+        let temp = tempfile::tempdir().expect("temp");
+        let home = temp.path();
+        let cwd = "/Users/alex/GitHub/diri";
+        let claimed = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa".to_owned();
+        write_cursor_chat(home, cwd, &claimed, "Old chat", 1_000.0);
+        write_cursor_chat(
+            home,
+            cwd,
+            "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb",
+            "Cursor Integration Fix",
+            5_000.0,
+        );
+
+        let conversation = cursor_conversation(home, cwd, None, 4_500.0, &HashSet::from([claimed]))
+            .expect("found");
+        assert_eq!(conversation.id, "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb");
+        assert_eq!(
+            conversation.title.as_deref(),
+            Some("Cursor Integration Fix")
+        );
+    }
+
+    #[test]
+    fn cursor_transcript_last_object_is_working_or_idle() {
+        let temp = tempfile::tempdir().expect("temp");
+        let path = temp.path().join("chat.jsonl");
+
+        write(
+            &path,
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"hi"}]}}
+"#,
+        );
+        assert_eq!(
+            cursor_transcript_turn(&path),
+            Some(CursorTranscriptTurn::Working)
+        );
+
+        write(
+            &path,
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"hi"}]}}
+{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Grep"}]}}
+"#,
+        );
+        assert_eq!(
+            cursor_transcript_turn(&path),
+            Some(CursorTranscriptTurn::Working)
+        );
+
+        write(
+            &path,
+            r#"{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Grep"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"done"}]}}
+"#,
+        );
+        assert_eq!(
+            cursor_transcript_turn(&path),
+            Some(CursorTranscriptTurn::Idle)
+        );
+
+        write(
+            &path,
+            r#"{"role":"assistant","message":{"content":[{"type":"text","text":"done"}]}}
+{"type":"turn_ended","status":"success"}
+"#,
+        );
+        assert_eq!(
+            cursor_transcript_turn(&path),
+            Some(CursorTranscriptTurn::Idle)
+        );
+    }
+
+    fn write_cursor_chat(home: &Path, cwd: &str, id: &str, title: &str, created_at_ms: f64) {
+        let transcripts = home
+            .join(".cursor/projects")
+            .join(cursor_project_slug(cwd))
+            .join("agent-transcripts")
+            .join(id);
+        std::fs::create_dir_all(&transcripts).expect("transcripts");
+        std::fs::write(transcripts.join(format!("{id}.jsonl")), "{}\n").expect("jsonl");
+        let meta_dir = home.join(".cursor/chats/workspace").join(id);
+        std::fs::create_dir_all(&meta_dir).expect("meta");
+        std::fs::write(
+            meta_dir.join("meta.json"),
+            format!(
+                r#"{{"schemaVersion":1,"createdAtMs":{created_at_ms},"title":"{title}","cwd":"{cwd}"}}"#
+            ),
+        )
+        .expect("meta");
     }
 }

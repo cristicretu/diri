@@ -493,3 +493,40 @@ fn a_repeated_screen_sequence_is_not_reprocessed() {
     assert_eq!(outcome.status_change, None);
     assert_eq!(*reducer.status(), SessionStatus::Working);
 }
+
+#[test]
+fn cursor_transcript_idle_commits_even_when_the_osc_still_says_working() {
+    let mut reducer = StatusReducer::new(Authority::ScreenPrimary, t0());
+    let mut now = settled(&mut reducer, t0());
+
+    reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::Working, 1)),
+        now,
+    );
+    now += Duration::from_millis(100);
+    reducer.reduce(StatusSignal::CursorTranscriptIdle, now);
+    now += Duration::from_millis(100);
+    let still_working = reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::Working, 2)),
+        now,
+    );
+    assert_eq!(still_working.status_change, None);
+    assert_eq!(*reducer.status(), SessionStatus::Working);
+
+    now += Duration::from_millis(100);
+    let outcome = reducer.reduce(StatusSignal::Tick, now);
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert!(outcome.turn_completed);
+
+    now += Duration::from_millis(100);
+    let stale_osc = reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::Working, 3)),
+        now,
+    );
+    assert_eq!(stale_osc.status_change, None);
+    assert_eq!(*reducer.status(), SessionStatus::Idle);
+
+    now += Duration::from_millis(100);
+    reducer.reduce(StatusSignal::CursorTranscriptWorking, now);
+    assert_eq!(*reducer.status(), SessionStatus::Working);
+}

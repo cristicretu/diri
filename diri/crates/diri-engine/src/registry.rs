@@ -4,7 +4,7 @@
 //! It also owns the additive `{ version, projects, sessions }` persistence
 //! envelope. Unknown project fields survive a read/write cycle.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -12,8 +12,10 @@ use diri_proto::{DateMillis, ExitInfo, ExitReason, SessionRecord, SessionStatus,
 use serde::{Deserialize, Serialize};
 
 use crate::detect::ManifestEngine;
+use crate::history::CursorTranscriptTurn;
 use crate::holder::{HolderClient, HolderManagerPaths, HolderPaths};
 use crate::session::{HolderConfig, RemoteAdoptSpec, Session, SessionSpec, SessionView};
+use crate::status::StatusSignal;
 
 /// The versioned on-disk snapshot.
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -51,6 +53,7 @@ pub struct Registry {
     /// tab switch), and the flusher or the next persist call writes it out.
     dirty: bool,
     last_persist: Option<std::time::Instant>,
+    cursor_title_refresh_at: Option<std::time::Instant>,
 }
 
 /// How long consecutive persists coalesce. Matches the Swift daemon's
@@ -96,6 +99,7 @@ impl Registry {
             state_file: state_file.into(),
             dirty: false,
             last_persist: None,
+            cursor_title_refresh_at: None,
         }
     }
 
@@ -484,6 +488,77 @@ impl Registry {
         changed
     }
 
+    /// Pulls Cursor's generated `meta.json` title and jsonl turn state into
+    /// live Cursor sessions. Cheap when none are running: one kind check per
+    /// live session, then at most one bounded directory walk per second.
+    pub fn refresh_cursor_generated_titles(&mut self) -> Vec<(String, SessionRecord)> {
+        let Some(home) = user_home() else {
+            return Vec::new();
+        };
+        let now = std::time::Instant::now();
+        if self.cursor_title_refresh_at.is_some_and(|previous| {
+            now.duration_since(previous) < std::time::Duration::from_secs(1)
+        }) {
+            return Vec::new();
+        }
+        self.cursor_title_refresh_at = Some(now);
+        let live: Vec<String> = self
+            .sessions
+            .keys()
+            .filter(|id| {
+                self.records
+                    .get(*id)
+                    .is_some_and(|record| record.kind == diri_proto::AgentKind::CURSOR)
+            })
+            .cloned()
+            .collect();
+        if live.is_empty() {
+            return Vec::new();
+        }
+        let mut changed = Vec::new();
+        for id in live {
+            let claimed = self.claimed_agent_ids(Some(&id));
+            let mut record_changed = false;
+            let transcript = {
+                let Some(record) = self.records.get_mut(&id) else {
+                    continue;
+                };
+                if apply_cursor_store_title(record, &home, &claimed) {
+                    record.updated_at = DateMillis::from(std::time::SystemTime::now());
+                    self.dirty = true;
+                    record_changed = true;
+                }
+                record.transcript_path.clone()
+            };
+            let mut status_changed = false;
+            if let (Some(path), Some(session)) = (transcript, self.sessions.get(&id))
+                && let Some(turn) = crate::history::cursor_transcript_turn(Path::new(&path))
+            {
+                let outcome = match turn {
+                    CursorTranscriptTurn::Working => {
+                        session.feed_signal(StatusSignal::CursorTranscriptWorking)
+                    }
+                    CursorTranscriptTurn::Idle => {
+                        session.feed_signal(StatusSignal::CursorTranscriptIdle);
+                        session.feed_signal(StatusSignal::Tick)
+                    }
+                };
+                status_changed = outcome.status_change.is_some() || outcome.turn_completed;
+            }
+            if !(record_changed || status_changed) {
+                continue;
+            }
+            let Some(record) = self.records.get_mut(&id) else {
+                continue;
+            };
+            if let Some(session) = self.sessions.get(&id) {
+                fold_session_view(record, &session.view());
+            }
+            changed.push((id, record.clone()));
+        }
+        changed
+    }
+
     /// Ends a session but keeps its record, which is what archiving means here.
     pub fn terminate(
         &mut self,
@@ -610,21 +685,39 @@ impl Registry {
     /// and Claude's generated `ai-title` when it becomes available. Returns
     /// whether anything changed.
     pub fn apply_hook_metadata(&mut self, id: &str, meta: &crate::hooks::HookMetadata) -> bool {
+        let home = user_home();
+        let claimed = self.claimed_agent_ids(Some(id));
         let generated_title = self.records.get(id).and_then(|record| {
-            let accepts_generated_title = record.kind == diri_proto::AgentKind::CLAUDE_CODE
-                && matches!(
-                    record.title_source,
-                    TitleSource::Placeholder | TitleSource::FirstPrompt | TitleSource::Unknown
-                );
-            accepts_generated_title
-                .then(|| {
-                    meta.transcript_path
-                        .as_deref()
-                        .or(record.transcript_path.as_deref())
-                })
-                .flatten()
-                .and_then(|path| crate::history::latest_claude_ai_title(Path::new(path)))
-                .and_then(|title| normalize_agent_title(&title))
+            let accepts_generated_title = matches!(
+                record.title_source,
+                TitleSource::Placeholder | TitleSource::FirstPrompt | TitleSource::Unknown
+            );
+            if !accepts_generated_title {
+                return None;
+            }
+            if record.kind == diri_proto::AgentKind::CLAUDE_CODE {
+                return meta
+                    .transcript_path
+                    .as_deref()
+                    .or(record.transcript_path.as_deref())
+                    .and_then(|path| crate::history::latest_claude_ai_title(Path::new(path)))
+                    .and_then(|title| normalize_agent_title(&title));
+            }
+            None
+        });
+        let cursor = self.records.get(id).and_then(|record| {
+            if record.kind != diri_proto::AgentKind::CURSOR {
+                return None;
+            }
+            crate::history::cursor_conversation(
+                home.as_deref()?,
+                &record.cwd,
+                meta.agent_session_id
+                    .as_deref()
+                    .or(record.agent_session_id.as_deref()),
+                record.created_at.0,
+                &claimed,
+            )
         });
         let Some(record) = self.records.get_mut(id) else {
             return false;
@@ -642,6 +735,9 @@ impl Registry {
         {
             record.transcript_path = Some(transcript.clone());
             changed = true;
+        }
+        if let Some(conversation) = cursor {
+            changed |= apply_cursor_conversation(record, conversation);
         }
         if repair_persisted_agent_title(record) {
             changed = true;
@@ -880,6 +976,69 @@ impl Registry {
     pub fn state_file(&self) -> &Path {
         &self.state_file
     }
+
+    fn claimed_agent_ids(&self, except: Option<&str>) -> HashSet<String> {
+        self.records
+            .iter()
+            .filter(|(id, _)| except != Some(id.as_str()))
+            .filter_map(|(_, record)| record.agent_session_id.clone())
+            .collect()
+    }
+}
+
+fn user_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+fn apply_cursor_store_title(
+    record: &mut SessionRecord,
+    home: &Path,
+    claimed: &HashSet<String>,
+) -> bool {
+    let Some(conversation) = crate::history::cursor_conversation(
+        home,
+        &record.cwd,
+        record.agent_session_id.as_deref(),
+        record.created_at.0,
+        claimed,
+    ) else {
+        return false;
+    };
+    apply_cursor_conversation(record, conversation)
+}
+
+fn apply_cursor_conversation(
+    record: &mut SessionRecord,
+    conversation: crate::history::CursorConversation,
+) -> bool {
+    let mut changed = false;
+    if record.agent_session_id.as_deref() != Some(conversation.id.as_str()) {
+        record.agent_session_id = Some(conversation.id);
+        record.resumability = diri_proto::Resumability::Live;
+        changed = true;
+    }
+    if let Some(path) = conversation.transcript_path
+        && record.transcript_path.as_ref() != Some(&path)
+    {
+        record.transcript_path = Some(path);
+        changed = true;
+    }
+    let accepts_generated_title = matches!(
+        record.title_source,
+        TitleSource::Placeholder | TitleSource::FirstPrompt | TitleSource::Unknown
+    );
+    if accepts_generated_title
+        && let Some(title) = conversation
+            .title
+            .and_then(|title| normalize_agent_title(&title))
+            .filter(|title| !is_generic_terminal_title(title, record))
+        && (record.title != title || record.title_source != TitleSource::AgentProvided)
+    {
+        record.title = title;
+        record.title_source = TitleSource::AgentProvided;
+        changed = true;
+    }
+    changed
 }
 
 fn fold_session_view(record: &mut SessionRecord, view: &SessionView) {
@@ -934,6 +1093,9 @@ fn repair_persisted_agent_title(record: &mut SessionRecord) -> bool {
 fn fold_session_status(record: &mut SessionRecord, view: &SessionView) {
     record.status.clone_from(&view.status);
     record.needs_input.clone_from(&view.needs_input);
+    if view.last_turn_completed_at > record.last_turn_completed_at {
+        record.last_turn_completed_at = view.last_turn_completed_at;
+    }
 }
 
 fn normalize_agent_title(title: &str) -> Option<String> {
@@ -978,17 +1140,45 @@ fn is_cursor_status_title(title: &str) -> bool {
     let rest = title
         .strip_prefix("cursor agent")
         .or_else(|| title.strip_prefix("cursor-agent"));
-    let Some(rest) = rest else {
-        return false;
-    };
-    let compact: String = rest
+    if let Some(rest) = rest {
+        let compact: String = rest
+            .chars()
+            .filter(|character| character.is_alphanumeric())
+            .collect();
+        if compact.is_empty() || is_cursor_status_stamp(&compact) {
+            return true;
+        }
+    }
+    title
+        .rsplit_once(" - ")
+        .is_some_and(|(_, stamp)| is_cursor_status_stamp(&compact_alnum(stamp)))
+}
+
+fn compact_alnum(value: &str) -> String {
+    value
         .chars()
         .filter(|character| character.is_alphanumeric())
-        .collect();
-    compact.is_empty()
+        .collect()
+}
+
+fn is_cursor_status_stamp(compact: &str) -> bool {
+    compact.starts_with("working")
         || matches!(
-            compact.as_str(),
-            "ready" | "working" | "thinking" | "generating" | "idle" | "newchat"
+            compact,
+            "ready"
+                | "thinking"
+                | "generating"
+                | "idle"
+                | "newchat"
+                | "planning"
+                | "queued"
+                | "runningshellcommand"
+                | "loadingconversation"
+                | "reconnecting"
+                | "movingtocloud"
+                | "reviewingchanges"
+                | "waitingforyou"
+                | "waitingforconfirmation"
         )
 }
 
@@ -1445,6 +1635,7 @@ mod tests {
             needs_input: None,
             title: Some("Repair remote attach".to_owned()),
             title_source: Some(TitleSource::AgentProvided),
+            last_turn_completed_at: None,
             tail_offset: 0,
             exited: false,
         };
@@ -1520,9 +1711,20 @@ mod tests {
         let cursor_prompt = SessionView {
             title: Some("Fix the cursor session title".to_owned()),
             title_source: Some(TitleSource::FirstPrompt),
-            ..cursor_ready
+            ..cursor_ready.clone()
         };
         fold_session_view(&mut cursor, &cursor_prompt);
+        assert_eq!(cursor.title, "Fix the cursor session title");
+        assert_eq!(cursor.title_source, TitleSource::FirstPrompt);
+
+        cursor.title = "Fix the cursor session title".to_owned();
+        cursor.title_source = TitleSource::FirstPrompt;
+        let named_working = SessionView {
+            title: Some("Cursor Integration Fix - \u{23f3} Working ...".to_owned()),
+            title_source: Some(TitleSource::AgentProvided),
+            ..cursor_ready
+        };
+        fold_session_view(&mut cursor, &named_working);
         assert_eq!(cursor.title, "Fix the cursor session title");
         assert_eq!(cursor.title_source, TitleSource::FirstPrompt);
     }
@@ -1548,5 +1750,40 @@ mod tests {
         let updated = registry.record("cursor").expect("record");
         assert_eq!(updated.title, "Rename cursor chats from the first prompt");
         assert_eq!(updated.title_source, TitleSource::FirstPrompt);
+    }
+
+    #[test]
+    fn a_cursor_generated_meta_title_promotes_over_the_first_prompt() {
+        let temp = tempfile::tempdir().expect("temp");
+        let home = temp.path();
+        let cwd = "/Users/alex/GitHub/diri";
+        let id = "11111fcb-7655-4342-8b2f-88068c650200";
+        let transcripts = home
+            .join(".cursor/projects")
+            .join("Users-alex-GitHub-diri")
+            .join("agent-transcripts")
+            .join(id);
+        std::fs::create_dir_all(&transcripts).expect("transcripts");
+        std::fs::write(transcripts.join(format!("{id}.jsonl")), "{}\n").expect("jsonl");
+        let meta_dir = home.join(".cursor/chats/workspace").join(id);
+        std::fs::create_dir_all(&meta_dir).expect("meta");
+        std::fs::write(
+            meta_dir.join("meta.json"),
+            format!(
+                r#"{{"schemaVersion":1,"createdAtMs":5000,"title":"Cursor Integration Fix","cwd":"{cwd}"}}"#
+            ),
+        )
+        .expect("meta");
+
+        let mut session = record("cursor");
+        session.kind = AgentKind::CURSOR;
+        session.cwd = cwd.into();
+        session.title = "on another pr created from main".into();
+        session.title_source = TitleSource::FirstPrompt;
+        session.created_at = DateMillis(4_000.0);
+        apply_cursor_store_title(&mut session, home, &HashSet::new());
+        assert_eq!(session.title, "Cursor Integration Fix");
+        assert_eq!(session.title_source, TitleSource::AgentProvided);
+        assert_eq!(session.agent_session_id.as_deref(), Some(id));
     }
 }
