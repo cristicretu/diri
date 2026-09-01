@@ -151,7 +151,6 @@ fn rgba_color(color: Rgba) -> Retained<NSColor> {
 pub struct NativeMenuBar {
     store: Arc<RwLock<SessionStore>>,
     _status_item: Retained<NSStatusItem>,
-    button: Retained<NSStatusBarButton>,
     panel: Retained<MenuBarPanel>,
     surface: Retained<NSVisualEffectView>,
     brand_hit: Retained<MenuBarBrandHit>,
@@ -169,7 +168,7 @@ pub struct NativeMenuBar {
     /// Re-syncs row hover while the list scrolls; see [`MenuBarHoverRow::sync_hover_to_pointer`].
     scroll_observer: Option<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
     last_fingerprint: Option<u64>,
-    /// Last level pushed to the status item; see [`NativeMenuBar::set_attention`].
+    /// Last level applied to the panel header; see [`NativeMenuBar::set_attention`].
     last_attention: Option<AttentionLevel>,
     theme: MenuTheme,
     /// Colors are baked into views when they are built, so a theme change has
@@ -444,7 +443,8 @@ impl NativeMenuBar {
             button.setTarget(Some(&*target as &AnyObject));
             button.setAction(Some(sel!(toggleDiriMenu:)));
         }
-        // Template mark set once; attention only retints (same Ink map as row glyphs).
+        // Template mark set once. Leave `contentTintColor` nil so AppKit paints
+        // it like every other extra; attention color lives on the panel header.
         if let Some(image) = &logo {
             button.setImage(Some(image));
         }
@@ -454,7 +454,6 @@ impl NativeMenuBar {
         let mut menu_bar = Self {
             store,
             _status_item: status_item,
-            button,
             panel,
             surface,
             brand_hit,
@@ -498,18 +497,14 @@ impl NativeMenuBar {
     }
 
     pub fn refresh(&mut self) {
-        // Closed panel: only the status-item tint. Building the inbox first
-        // would put the most expensive work on the hottest path.
+        // Closed panel: skip the inbox rebuild. The status-item glyph is a
+        // stable template, so there is no extra to retint on this path.
         if !self.panel.isVisible() {
-            let (attention, theme_id) = {
+            let theme_id = {
                 let store = self.store.read().expect("session store lock poisoned");
-                (
-                    store.global_attention(),
-                    store.preferences().terminal_theme.clone(),
-                )
+                store.preferences().terminal_theme.clone()
             };
             self.sync_theme(&theme_id);
-            self.set_attention(attention);
             self.last_fingerprint = None;
             return;
         }
@@ -599,43 +594,29 @@ impl NativeMenuBar {
         self.rebuild_body(model, content_height, selected_session_id, opening, mtm);
     }
 
-    /// Retint the template status-item / header mark. Same Ink map as row
-    /// [`glyph_tint`] / sidebar `StatusGlyph` — logo pixels stay fixed.
+    /// Retint the panel header mark. Same Ink map as row [`glyph_tint`] /
+    /// sidebar `StatusGlyph`; logo pixels stay fixed.
+    ///
+    /// The status item stays an untinted template. `contentTintColor` on
+    /// `NSStatusBarButton` resolves against the app appearance, so even the
+    /// absolute Ink colors used here for needs-input / done paint the extra
+    /// black on a dark menu bar.
     fn set_attention(&mut self, attention: AttentionLevel) {
         if self.last_attention == Some(attention) {
             return;
         }
         self.last_attention = Some(attention);
 
-        // Absolute sRGB only, and nil for anything that is not a real signal.
-        // A dynamic color like `labelColor` resolves against the app's
-        // appearance rather than the menu bar's, so tinting with it paints the
-        // mark black on a dark bar — which is what made the working state
-        // disappear. Leaving the tint nil lets AppKit render the template the
-        // way it renders every other status item.
-        let signal_tint = match attention {
-            AttentionLevel::NeedsInput => Some(rgba_ns(
-                Ink::ATTENTION.r,
-                Ink::ATTENTION.g,
-                Ink::ATTENTION.b,
-                1.0,
-            )),
-            AttentionLevel::DoneUnseen => {
-                Some(rgba_ns(Ink::FRESH.r, Ink::FRESH.g, Ink::FRESH.b, 1.0))
+        let header_tint = match attention {
+            AttentionLevel::NeedsInput => {
+                rgba_ns(Ink::ATTENTION.r, Ink::ATTENTION.g, Ink::ATTENTION.b, 1.0)
             }
-            AttentionLevel::Working
-            | AttentionLevel::IdleSeen
-            | AttentionLevel::None
-            | AttentionLevel::Unknown => None,
-        };
-        self.button.setContentTintColor(signal_tint.as_deref());
-
-        // The header mark sits inside the panel, where `labelColor` resolves
-        // against the right appearance, so it can keep the quieter idle tones.
-        let header_tint = signal_tint.unwrap_or_else(|| match attention {
+            AttentionLevel::DoneUnseen => rgba_ns(Ink::FRESH.r, Ink::FRESH.g, Ink::FRESH.b, 1.0),
             AttentionLevel::Working => self.theme.primary_alpha(0.82),
-            _ => Retained::clone(&self.theme.primary),
-        });
+            AttentionLevel::IdleSeen | AttentionLevel::None | AttentionLevel::Unknown => {
+                Retained::clone(&self.theme.primary)
+            }
+        };
         self.brand_mark.setContentTintColor(Some(&header_tint));
     }
 
