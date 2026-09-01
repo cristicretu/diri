@@ -16,7 +16,7 @@
 //!
 //! Ported from the Swift `HistoryScanner`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -37,6 +37,16 @@ const CLAUDE_HEAD_CAP: usize = 8 << 20;
 const CLAUDE_TAIL_BYTES: usize = 16 << 10;
 /// Tail window for Cursor's last jsonl object (turn working/idle).
 const CURSOR_TAIL_BYTES: usize = 64 << 10;
+/// Candidate transcript directories considered while associating a live
+/// Cursor session. Association is best-effort and must not turn the registry
+/// watcher into an unbounded filesystem crawl.
+const CURSOR_ASSOCIATION_ENTRIES: usize = 1_024;
+/// Cursor chat workspaces considered while resolving generated metadata.
+const CURSOR_CHAT_WORKSPACES: usize = 256;
+/// Total conversation directories considered across those workspaces.
+const CURSOR_CHAT_ENTRIES: usize = 4_096;
+/// `meta.json` is tiny; reject an unexpectedly large provider file.
+const CURSOR_META_BYTES: usize = 64 << 10;
 /// Cap on a Codex `session_meta` first line.
 const CODEX_FIRST_LINE_CAP: usize = 512 << 10;
 const CHUNK: usize = 64 << 10;
@@ -447,6 +457,12 @@ pub(crate) struct CursorConversation {
     pub transcript_path: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+struct CursorMetadata {
+    title: Option<String>,
+    created_at_ms: Option<f64>,
+}
+
 /// Last complete jsonl object in a Cursor transcript: in-flight or done.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CursorTranscriptTurn {
@@ -489,7 +505,7 @@ fn assistant_uses_tool(object: &Value) -> bool {
 }
 
 fn last_jsonl_object(path: &Path) -> Option<Value> {
-    let mut handle = std::fs::File::open(path).ok()?;
+    let mut handle = open_regular_readonly(path)?;
     let end = handle.seek(SeekFrom::End(0)).ok()?;
     if end == 0 {
         return None;
@@ -551,7 +567,7 @@ fn is_cursor_conversation_id(id: &str) -> bool {
 fn read_cursor_conversation(home: &Path, cwd: &str, id: &str) -> CursorConversation {
     let transcript = cursor_transcript_path(home, cwd, id).filter(|path| path.is_file());
     CursorConversation {
-        title: cursor_meta_title(home, id),
+        title: cursor_metadata_for_id(home, id).and_then(|metadata| metadata.title),
         transcript_path: transcript.map(|path| path.to_string_lossy().into_owned()),
         id: id.to_owned(),
     }
@@ -564,31 +580,40 @@ fn discover_cursor_conversation(
     claimed: &HashSet<String>,
 ) -> Option<CursorConversation> {
     let transcripts = cursor_transcripts_dir(home, cwd)?;
-    let Ok(entries) = std::fs::read_dir(&transcripts) else {
-        return None;
-    };
     let floor = created_after_ms - 2_000.0;
-    let mut best: Option<(f64, CursorConversation)> = None;
-    for entry in entries.filter_map(Result::ok) {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let id = entry.file_name().to_string_lossy().into_owned();
+    let mut candidates = Vec::new();
+    for path in bounded_child_dirs(&transcripts, CURSOR_ASSOCIATION_ENTRIES) {
+        let id = path.file_name()?.to_string_lossy().into_owned();
         if claimed.contains(&id) || !is_cursor_conversation_id(&id) {
             continue;
         }
-        let conversation = read_cursor_conversation(home, cwd, &id);
-        let created = cursor_meta_created_ms(home, &id).unwrap_or_else(|| {
-            std::fs::metadata(&path)
-                .and_then(|meta| meta.created().or_else(|_| meta.modified()))
-                .ok()
-                .map(system_time_ms)
-                .unwrap_or(0.0)
-        });
+        let fallback_created_at_ms = std::fs::metadata(&path)
+            .and_then(|meta| meta.created().or_else(|_| meta.modified()))
+            .ok()
+            .map(system_time_ms)
+            .unwrap_or(0.0);
+        candidates.push((id, fallback_created_at_ms));
+    }
+    let wanted = candidates
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect::<HashSet<_>>();
+    let metadata = cursor_metadata_index(home, &wanted);
+    let mut best: Option<(f64, CursorConversation)> = None;
+    for (id, fallback_created_at_ms) in candidates {
+        let metadata = metadata.get(&id);
+        let created = metadata
+            .and_then(|metadata| metadata.created_at_ms)
+            .unwrap_or(fallback_created_at_ms);
         if created < floor {
             continue;
         }
+        let conversation = CursorConversation {
+            transcript_path: cursor_transcript_path(home, cwd, &id)
+                .map(|path| path.to_string_lossy().into_owned()),
+            title: metadata.and_then(|metadata| metadata.title.clone()),
+            id,
+        };
         let better = best.as_ref().is_none_or(|(best_created, _)| {
             (created - created_after_ms).abs() < (best_created - created_after_ms).abs()
         });
@@ -614,35 +639,72 @@ fn cursor_transcript_path(home: &Path, cwd: &str, id: &str) -> Option<PathBuf> {
     confined_file(home.join(".cursor"), &path)
 }
 
-fn cursor_meta_title(home: &Path, id: &str) -> Option<String> {
-    cursor_meta(home, id)?
+fn cursor_metadata_for_id(home: &Path, id: &str) -> Option<CursorMetadata> {
+    let chats = home.join(".cursor/chats");
+    for workspace in bounded_child_dirs(&chats, CURSOR_CHAT_WORKSPACES) {
+        if let Some(metadata) = read_cursor_metadata(&chats, &workspace.join(id).join("meta.json"))
+        {
+            return Some(metadata);
+        }
+    }
+    None
+}
+
+fn cursor_metadata_index(home: &Path, wanted: &HashSet<String>) -> HashMap<String, CursorMetadata> {
+    if wanted.is_empty() {
+        return HashMap::new();
+    }
+    let chats = home.join(".cursor/chats");
+    let mut found = HashMap::new();
+    let mut visited = 0usize;
+    for workspace in bounded_child_dirs(&chats, CURSOR_CHAT_WORKSPACES) {
+        let Ok(entries) = std::fs::read_dir(&workspace) else {
+            continue;
+        };
+        for entry in entries.take(CURSOR_CHAT_ENTRIES - visited) {
+            visited += 1;
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let id = entry.file_name().to_string_lossy().into_owned();
+            if !wanted.contains(&id) {
+                continue;
+            }
+            if let Some(metadata) = read_cursor_metadata(&chats, &entry.path().join("meta.json")) {
+                found.insert(id, metadata);
+                if found.len() == wanted.len() {
+                    return found;
+                }
+            }
+        }
+        if visited >= CURSOR_CHAT_ENTRIES {
+            break;
+        }
+    }
+    found
+}
+
+fn read_cursor_metadata(root: &Path, path: &Path) -> Option<CursorMetadata> {
+    let file = open_trusted_regular_file(root, path)?;
+    if file.metadata().ok()?.len() > CURSOR_META_BYTES as u64 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(CURSOR_META_BYTES as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    let title = value
         .get("title")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|title| !title.is_empty())
-        .map(str::to_owned)
-}
-
-fn cursor_meta_created_ms(home: &Path, id: &str) -> Option<f64> {
-    cursor_meta(home, id)?
-        .get("createdAtMs")
-        .and_then(Value::as_f64)
-}
-
-fn cursor_meta(home: &Path, id: &str) -> Option<Value> {
-    let chats = home.join(".cursor/chats");
-    let Ok(workspaces) = std::fs::read_dir(&chats) else {
-        return None;
-    };
-    for workspace in workspaces.filter_map(Result::ok) {
-        let meta = workspace.path().join(id).join("meta.json");
-        let Some(meta) = confined_file(&chats, &meta) else {
-            continue;
-        };
-        let bytes = std::fs::read(&meta).ok()?;
-        return serde_json::from_slice(&bytes).ok();
-    }
-    None
+        .map(str::to_owned);
+    let created_at_ms = value.get("createdAtMs").and_then(Value::as_f64);
+    Some(CursorMetadata {
+        title,
+        created_at_ms,
+    })
 }
 
 fn confined_dir(root: impl AsRef<Path>, path: &Path) -> Option<PathBuf> {
@@ -740,6 +802,18 @@ fn child_dirs(path: &Path) -> Vec<PathBuf> {
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.is_dir())
+        .collect()
+}
+
+fn bounded_child_dirs(path: &Path, limit: usize) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return Vec::new();
+    };
+    entries
+        .take(limit)
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path())
         .collect()
 }
 
@@ -1202,6 +1276,19 @@ mod tests {
         assert_eq!(
             conversation.title.as_deref(),
             Some("Cursor Integration Fix")
+        );
+    }
+
+    #[test]
+    fn cursor_live_association_directory_walks_are_bounded() {
+        let temp = tempfile::tempdir().expect("temp");
+        for index in 0..(CURSOR_ASSOCIATION_ENTRIES + 8) {
+            std::fs::create_dir(temp.path().join(format!("entry-{index:04}"))).expect("entry");
+        }
+
+        assert_eq!(
+            bounded_child_dirs(temp.path(), CURSOR_ASSOCIATION_ENTRIES).len(),
+            CURSOR_ASSOCIATION_ENTRIES
         );
     }
 
