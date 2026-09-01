@@ -101,6 +101,10 @@ pub enum StatusSignal {
         is_subagent: bool,
     },
     CodexTurnComplete,
+    /// Cursor jsonl tail: last object is a user prompt or `tool_use`.
+    CursorTranscriptWorking,
+    /// Cursor jsonl tail: last object is assistant text or `turn_ended`.
+    CursorTranscriptIdle,
     Screen(ScreenObservation),
     PtyOutputActivity,
     UserKeystroke,
@@ -166,6 +170,10 @@ struct InternalState {
     responding_since: Option<SystemTime>,
     /// Last needs-input detail produced, for dedupe upstream.
     pending_needs_input: Option<NeedsInputDetail>,
+    /// Cursor jsonl said the turn ended. Ignore leftover Working OSC until
+    /// the transcript shows work again — cursor-agent does not update the
+    /// title to Ready at end of turn.
+    hold_idle_against_screen: bool,
 }
 
 impl InternalState {
@@ -188,6 +196,7 @@ impl InternalState {
             skip_active: false,
             responding_since: None,
             pending_needs_input: None,
+            hold_idle_against_screen: false,
         }
     }
 }
@@ -313,7 +322,10 @@ impl StatusReducer {
 
         let evidence_hint = match &signal {
             StatusSignal::ClaudeHook { .. } => Some((StatusEvidenceSource::Hook, None, None)),
-            StatusSignal::CodexTurnComplete => Some((StatusEvidenceSource::Notify, None, None)),
+            StatusSignal::CodexTurnComplete | StatusSignal::CursorTranscriptIdle => {
+                Some((StatusEvidenceSource::Notify, None, None))
+            }
+            StatusSignal::CursorTranscriptWorking => Some((StatusEvidenceSource::Hook, None, None)),
             StatusSignal::Screen(observation) => Some((
                 StatusEvidenceSource::ScreenRule,
                 Some(observation.matched_rule_id.clone()),
@@ -355,6 +367,19 @@ impl StatusReducer {
                     self.state.last_codex_completion_at = Some(now);
                 }
                 self.handle_strong_idle(now, &mut outcome);
+            }
+            StatusSignal::CursorTranscriptWorking => {
+                if matches!(self.status, SessionStatus::NeedsInput(_)) {
+                    return outcome;
+                }
+                self.go_working(now, false, &mut outcome);
+            }
+            StatusSignal::CursorTranscriptIdle => {
+                self.state.last_signal_at = now;
+                if self.status == SessionStatus::Working {
+                    self.state.hold_idle_against_screen = true;
+                    self.handle_strong_idle(now, &mut outcome);
+                }
             }
             StatusSignal::Screen(observation) => self.handle_screen(observation, now, &mut outcome),
             StatusSignal::Tick => self.handle_tick(now, &mut outcome),
@@ -500,6 +525,7 @@ impl StatusReducer {
         clear_screen_blocker: bool,
         outcome: &mut ReducerOutcome,
     ) {
+        self.state.hold_idle_against_screen = false;
         self.cancel_idle_candidacy();
         if clear_screen_blocker {
             self.state.screen_blocker_active = false;
@@ -731,6 +757,7 @@ impl StatusReducer {
             let detail = screen_detail(kind, &observation, now);
             self.state.pending_needs_input = Some(detail.clone());
             outcome.needs_input = Some(detail);
+            self.state.hold_idle_against_screen = false;
             self.cancel_idle_candidacy();
             self.set_status(SessionStatus::NeedsInput(kind), outcome);
             return;
@@ -775,7 +802,12 @@ impl StatusReducer {
         outcome: &mut ReducerOutcome,
     ) {
         match observation.state {
-            ManifestState::Working => self.go_working(now, false, outcome),
+            ManifestState::Working => {
+                if self.state.hold_idle_against_screen {
+                    return;
+                }
+                self.go_working(now, false, outcome);
+            }
             ManifestState::Idle => {
                 if self.status == SessionStatus::Working {
                     self.confirm_idle(now, outcome);

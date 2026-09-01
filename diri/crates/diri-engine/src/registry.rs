@@ -4,7 +4,7 @@
 //! It also owns the additive `{ version, projects, sessions }` persistence
 //! envelope. Unknown project fields survive a read/write cycle.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -15,10 +15,12 @@ use diri_proto::{
 use serde::{Deserialize, Serialize};
 
 use crate::detect::ManifestEngine;
+use crate::history::CursorTranscriptTurn;
 use crate::holder::{HolderClient, HolderManagerPaths, HolderPaths};
 use crate::lifecycle::{LifecycleAction, LifecyclePlan};
 use crate::session::{HolderConfig, RemoteAdoptSpec, Session, SessionSpec, SessionView};
 use crate::state_file::JsonStateFile;
+use crate::status::StatusSignal;
 
 /// The versioned on-disk snapshot.
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -59,6 +61,25 @@ pub struct Registry {
     /// tab switch), and the flusher or the next persist call writes it out.
     dirty: bool,
     last_persist: Option<std::time::Instant>,
+    cursor_title_refresh_at: Option<std::time::Instant>,
+}
+
+/// Immutable input for a Cursor provider-store scan. The events watcher builds
+/// these while holding the Registry lock, then performs filesystem I/O after
+/// releasing it.
+pub(crate) struct CursorRefreshRequest {
+    id: String,
+    cwd: String,
+    agent_session_id: Option<String>,
+    created_at: DateMillis,
+    updated_at: DateMillis,
+    claimed: HashSet<String>,
+}
+
+pub(crate) struct CursorRefreshResult {
+    request: CursorRefreshRequest,
+    conversation: Option<crate::history::CursorConversation>,
+    turn: Option<CursorTranscriptTurn>,
 }
 
 /// How long consecutive persists coalesce. Matches the Swift daemon's
@@ -110,6 +131,7 @@ impl Registry {
             recovery_root,
             dirty: false,
             last_persist: None,
+            cursor_title_refresh_at: None,
         }
     }
 
@@ -576,6 +598,96 @@ impl Registry {
         changed
     }
 
+    /// Captures the local Cursor sessions due for a provider-store refresh.
+    /// Filesystem work happens later, after the Registry lock is released.
+    pub(crate) fn cursor_refresh_requests(&mut self) -> Vec<CursorRefreshRequest> {
+        let now = std::time::Instant::now();
+        if self.cursor_title_refresh_at.is_some_and(|previous| {
+            now.duration_since(previous) < std::time::Duration::from_secs(1)
+        }) {
+            return Vec::new();
+        }
+        self.cursor_title_refresh_at = Some(now);
+        let live = self
+            .sessions
+            .keys()
+            .filter(|id| self.records.get(*id).is_some_and(is_local_cursor_record))
+            .cloned()
+            .collect::<Vec<_>>();
+        live.into_iter()
+            .filter_map(|id| {
+                let record = self.records.get(&id)?;
+                Some(CursorRefreshRequest {
+                    claimed: self.claimed_agent_ids(Some(&id)),
+                    agent_session_id: record.agent_session_id.clone(),
+                    created_at: record.created_at,
+                    updated_at: record.updated_at,
+                    cwd: record.cwd.clone(),
+                    id,
+                })
+            })
+            .collect()
+    }
+
+    /// Applies provider-store results only if the same local Cursor session is
+    /// still live. A respawn or hook identity update makes an in-flight scan
+    /// stale and leaves it for the next one-second refresh.
+    pub(crate) fn apply_cursor_refreshes(
+        &mut self,
+        refreshes: Vec<CursorRefreshResult>,
+    ) -> Vec<(String, SessionRecord)> {
+        let mut changed = Vec::new();
+        for refresh in refreshes {
+            let id = refresh.request.id;
+            let current = self.records.get(&id).is_some_and(|record| {
+                is_local_cursor_record(record)
+                    && record.cwd == refresh.request.cwd
+                    && record.created_at == refresh.request.created_at
+                    && record.updated_at == refresh.request.updated_at
+                    && record.agent_session_id == refresh.request.agent_session_id
+            });
+            if !current || !self.sessions.contains_key(&id) {
+                continue;
+            }
+            let mut record_changed = false;
+            if let Some(conversation) = refresh.conversation
+                && let Some(record) = self.records.get_mut(&id)
+                && apply_cursor_conversation(record, conversation)
+            {
+                record.updated_at = DateMillis::from(std::time::SystemTime::now());
+                self.dirty = true;
+                record_changed = true;
+            }
+            let mut status_changed = false;
+            if let (Some(turn), Some(session)) = (refresh.turn, self.sessions.get(&id)) {
+                let changed = |outcome: crate::status::ReducerOutcome| {
+                    outcome.status_change.is_some() || outcome.turn_completed
+                };
+                status_changed = match turn {
+                    CursorTranscriptTurn::Working => {
+                        changed(session.feed_signal(StatusSignal::CursorTranscriptWorking))
+                    }
+                    CursorTranscriptTurn::Idle => {
+                        let idle = session.feed_signal(StatusSignal::CursorTranscriptIdle);
+                        let tick = session.feed_signal(StatusSignal::Tick);
+                        changed(idle) || changed(tick)
+                    }
+                };
+            }
+            if !(record_changed || status_changed) {
+                continue;
+            }
+            let Some(record) = self.records.get_mut(&id) else {
+                continue;
+            };
+            if let Some(session) = self.sessions.get(&id) {
+                fold_session_view(record, &session.view());
+            }
+            changed.push((id, record.clone()));
+        }
+        changed
+    }
+
     /// Ends a session but keeps its record, which is what archiving means here.
     pub fn terminate(
         &mut self,
@@ -733,6 +845,7 @@ impl Registry {
         meta: &crate::hooks::HookMetadata,
         home: Option<&Path>,
     ) -> bool {
+        let claimed = self.claimed_agent_ids(Some(id));
         let mut transcript = self.records.get(id).and_then(|record| {
             if record.host.is_some() {
                 return None;
@@ -776,6 +889,20 @@ impl Registry {
                 .and_then(|transcript| transcript.latest_claude_ai_title())
                 .and_then(|title| normalize_agent_title(&title))
         });
+        let cursor = self.records.get(id).and_then(|record| {
+            if !is_local_cursor_record(record) {
+                return None;
+            }
+            crate::history::cursor_conversation(
+                home?,
+                &record.cwd,
+                meta.agent_session_id
+                    .as_deref()
+                    .or(record.agent_session_id.as_deref()),
+                record.created_at.0,
+                &claimed,
+            )
+        });
         let Some(record) = self.records.get_mut(id) else {
             return false;
         };
@@ -792,6 +919,12 @@ impl Registry {
             && record.transcript_path.as_ref() != Some(&transcript)
         {
             record.transcript_path = Some(transcript);
+            changed = true;
+        }
+        if let Some(conversation) = cursor {
+            changed |= apply_cursor_conversation(record, conversation);
+        }
+        if repair_persisted_agent_title(record) {
             changed = true;
         }
         if let Some(title) = &meta.first_prompt_title
@@ -1109,10 +1242,93 @@ impl Registry {
     pub fn state_file(&self) -> &Path {
         self.state_file.path()
     }
+
+    fn claimed_agent_ids(&self, except: Option<&str>) -> HashSet<String> {
+        self.records
+            .iter()
+            .filter(|(id, _)| except != Some(id.as_str()))
+            .filter_map(|(_, record)| record.agent_session_id.clone())
+            .collect()
+    }
+}
+
+fn user_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+pub(crate) fn scan_cursor_refreshes(
+    requests: Vec<CursorRefreshRequest>,
+) -> Vec<CursorRefreshResult> {
+    let Some(home) = user_home() else {
+        return Vec::new();
+    };
+    requests
+        .into_iter()
+        .map(|request| {
+            let conversation = crate::history::cursor_conversation(
+                &home,
+                &request.cwd,
+                request.agent_session_id.as_deref(),
+                request.created_at.0,
+                &request.claimed,
+            );
+            let turn = conversation
+                .as_ref()
+                .and_then(|conversation| conversation.transcript_path.as_deref())
+                .and_then(|path| crate::history::cursor_transcript_turn(Path::new(path)));
+            CursorRefreshResult {
+                request,
+                conversation,
+                turn,
+            }
+        })
+        .collect()
+}
+
+fn apply_cursor_conversation(
+    record: &mut SessionRecord,
+    conversation: crate::history::CursorConversation,
+) -> bool {
+    let mut changed = false;
+    if record.agent_session_id.as_deref() != Some(conversation.id.as_str()) {
+        record.agent_session_id = Some(conversation.id);
+        record.resumability = diri_proto::Resumability::Live;
+        changed = true;
+    }
+    if let Some(path) = conversation.transcript_path
+        && record.transcript_path.as_ref() != Some(&path)
+    {
+        record.transcript_path = Some(path);
+        changed = true;
+    }
+    let accepts_generated_title = matches!(
+        record.title_source,
+        TitleSource::Placeholder | TitleSource::FirstPrompt | TitleSource::Unknown
+    );
+    if accepts_generated_title
+        && let Some(title) = conversation
+            .title
+            .and_then(|title| normalize_agent_title(&title))
+            .filter(|title| !is_generic_terminal_title(title, record))
+        && (record.title != title || record.title_source != TitleSource::AgentProvided)
+    {
+        record.title = title;
+        record.title_source = TitleSource::AgentProvided;
+        changed = true;
+    }
+    changed
+}
+
+fn is_local_cursor_record(record: &SessionRecord) -> bool {
+    record.kind == diri_proto::AgentKind::CURSOR && record.host.is_none()
 }
 
 fn fold_session_view(record: &mut SessionRecord, view: &SessionView) {
     fold_session_status(record, view);
+    // cursor-agent (and similar) stamp a brand/status OSC title as soon as
+    // they are idle. That must not freeze the record as AgentProvided, or
+    // the first real prompt can never name the session.
+    repair_persisted_agent_title(record);
     if record.kind == diri_proto::AgentKind::SHELL
         || matches!(
             record.title_source,
@@ -1226,7 +1442,61 @@ fn is_generic_terminal_title(title: &str, record: &SessionRecord) -> bool {
         || title == directory
         || matches!(
             compact_title.as_str(),
-            "claude" | "claudecode" | "codex" | "cursor" | "gemini" | "terminal" | "shell"
+            "claude"
+                | "claudecode"
+                | "codex"
+                | "cursor"
+                | "cursoragent"
+                | "gemini"
+                | "terminal"
+                | "shell"
+        )
+        || (record.kind == diri_proto::AgentKind::CURSOR && is_cursor_status_title(&title))
+}
+
+fn is_cursor_status_title(title: &str) -> bool {
+    let rest = title
+        .strip_prefix("cursor agent")
+        .or_else(|| title.strip_prefix("cursor-agent"));
+    if let Some(rest) = rest {
+        let compact: String = rest
+            .chars()
+            .filter(|character| character.is_alphanumeric())
+            .collect();
+        if compact.is_empty() || is_cursor_status_stamp(&compact) {
+            return true;
+        }
+    }
+    title
+        .rsplit_once(" - ")
+        .is_some_and(|(_, stamp)| is_cursor_status_stamp(&compact_alnum(stamp)))
+}
+
+fn compact_alnum(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .collect()
+}
+
+fn is_cursor_status_stamp(compact: &str) -> bool {
+    compact.starts_with("working")
+        || matches!(
+            compact,
+            "ready"
+                | "thinking"
+                | "generating"
+                | "idle"
+                | "newchat"
+                | "planning"
+                | "queued"
+                | "runningshellcommand"
+                | "loadingconversation"
+                | "reconnecting"
+                | "movingtocloud"
+                | "reviewingchanges"
+                | "waitingforyou"
+                | "waitingforconfirmation"
         )
 }
 
@@ -2004,7 +2274,7 @@ mod tests {
         decorated.kind = AgentKind::CLAUDE_CODE;
         let decorated_view = SessionView {
             title: Some("✳ Claude Code".to_owned()),
-            ..generic_view
+            ..generic_view.clone()
         };
         fold_session_view(&mut decorated, &decorated_view);
         assert_eq!(decorated.title_source, TitleSource::Placeholder);
@@ -2014,6 +2284,161 @@ mod tests {
         assert!(repair_persisted_agent_title(&mut decorated));
         assert_eq!(decorated.title, AgentKind::CLAUDE_CODE_ID);
         assert_eq!(decorated.title_source, TitleSource::Placeholder);
+
+        let mut non_cursor_status_suffix = record("non-cursor-status-suffix");
+        non_cursor_status_suffix.kind = AgentKind::CLAUDE_CODE;
+        non_cursor_status_suffix.title = "Release - Ready".to_owned();
+        non_cursor_status_suffix.title_source = TitleSource::AgentProvided;
+        assert!(!repair_persisted_agent_title(&mut non_cursor_status_suffix));
+        assert_eq!(non_cursor_status_suffix.title, "Release - Ready");
+        assert_eq!(
+            non_cursor_status_suffix.title_source,
+            TitleSource::AgentProvided
+        );
+
+        let mut cursor = record("cursor");
+        cursor.kind = AgentKind::CURSOR;
+        let cursor_ready = SessionView {
+            title: Some("Cursor Agent - \u{2705} Ready".to_owned()),
+            title_source: Some(TitleSource::AgentProvided),
+            ..generic_view
+        };
+        fold_session_view(&mut cursor, &cursor_ready);
+        assert_eq!(cursor.title_source, TitleSource::Placeholder);
+
+        cursor.title = "Cursor Agent - \u{2705} Ready".to_owned();
+        cursor.title_source = TitleSource::AgentProvided;
+        let cursor_prompt = SessionView {
+            title: Some("Fix the cursor session title".to_owned()),
+            title_source: Some(TitleSource::FirstPrompt),
+            ..cursor_ready.clone()
+        };
+        fold_session_view(&mut cursor, &cursor_prompt);
+        assert_eq!(cursor.title, "Fix the cursor session title");
+        assert_eq!(cursor.title_source, TitleSource::FirstPrompt);
+
+        cursor.title = "Fix the cursor session title".to_owned();
+        cursor.title_source = TitleSource::FirstPrompt;
+        let named_working = SessionView {
+            title: Some("Cursor Integration Fix - \u{23f3} Working ...".to_owned()),
+            title_source: Some(TitleSource::AgentProvided),
+            ..cursor_ready
+        };
+        fold_session_view(&mut cursor, &named_working);
+        assert_eq!(cursor.title, "Fix the cursor session title");
+        assert_eq!(cursor.title_source, TitleSource::FirstPrompt);
+    }
+
+    #[test]
+    fn a_cursor_status_title_does_not_block_the_first_prompt_hook() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let mut session = record("cursor");
+        session.kind = AgentKind::CURSOR;
+        session.title = "Cursor Agent - \u{2705} Ready".to_owned();
+        session.title_source = TitleSource::AgentProvided;
+        registry.insert_record(session);
+
+        assert!(registry.apply_hook_metadata(
+            "cursor",
+            &crate::hooks::HookMetadata {
+                first_prompt_title: Some("Rename cursor chats from the first prompt".into()),
+                ..crate::hooks::HookMetadata::default()
+            }
+        ));
+
+        let updated = registry.record("cursor").expect("record");
+        assert_eq!(updated.title, "Rename cursor chats from the first prompt");
+        assert_eq!(updated.title_source, TitleSource::FirstPrompt);
+    }
+
+    #[test]
+    fn a_cursor_generated_meta_title_promotes_over_the_first_prompt() {
+        let temp = tempfile::tempdir().expect("temp");
+        let home = temp.path();
+        let cwd = "/Users/alex/GitHub/diri";
+        let id = "11111fcb-7655-4342-8b2f-88068c650200";
+        let transcripts = home
+            .join(".cursor/projects")
+            .join("Users-alex-GitHub-diri")
+            .join("agent-transcripts")
+            .join(id);
+        std::fs::create_dir_all(&transcripts).expect("transcripts");
+        std::fs::write(transcripts.join(format!("{id}.jsonl")), "{}\n").expect("jsonl");
+        let meta_dir = home.join(".cursor/chats/workspace").join(id);
+        std::fs::create_dir_all(&meta_dir).expect("meta");
+        std::fs::write(
+            meta_dir.join("meta.json"),
+            format!(
+                r#"{{"schemaVersion":1,"createdAtMs":5000,"title":"Cursor Integration Fix","cwd":"{cwd}"}}"#
+            ),
+        )
+        .expect("meta");
+
+        let mut session = record("cursor");
+        session.kind = AgentKind::CURSOR;
+        session.cwd = cwd.into();
+        session.title = "on another pr created from main".into();
+        session.title_source = TitleSource::FirstPrompt;
+        session.created_at = DateMillis(4_000.0);
+        let conversation = crate::history::cursor_conversation(
+            home,
+            &session.cwd,
+            session.agent_session_id.as_deref(),
+            session.created_at.0,
+            &HashSet::new(),
+        )
+        .expect("conversation");
+        apply_cursor_conversation(&mut session, conversation);
+        assert_eq!(session.title, "Cursor Integration Fix");
+        assert_eq!(session.title_source, TitleSource::AgentProvided);
+        assert_eq!(session.agent_session_id.as_deref(), Some(id));
+    }
+
+    #[test]
+    fn remote_cursor_metadata_never_reads_the_local_store() {
+        let temp = tempfile::tempdir().expect("temp");
+        let home = temp.path();
+        let cwd = "/srv/diri";
+        let id = "11111fcb-7655-4342-8b2f-88068c650200";
+        let transcripts = home
+            .join(".cursor/projects")
+            .join(crate::history::cursor_project_slug(cwd))
+            .join("agent-transcripts")
+            .join(id);
+        std::fs::create_dir_all(&transcripts).expect("transcripts");
+        std::fs::write(transcripts.join(format!("{id}.jsonl")), "{}\n").expect("jsonl");
+        let meta_dir = home.join(".cursor/chats/workspace").join(id);
+        std::fs::create_dir_all(&meta_dir).expect("meta");
+        std::fs::write(
+            meta_dir.join("meta.json"),
+            format!(
+                r#"{{"schemaVersion":1,"createdAtMs":5000,"title":"Local conversation","cwd":"{cwd}"}}"#
+            ),
+        )
+        .expect("meta");
+
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let mut session = record("remote-cursor");
+        session.kind = AgentKind::CURSOR;
+        session.cwd = cwd.into();
+        session.host = Some("forge".into());
+        registry.insert_record(session);
+
+        assert!(registry.apply_hook_metadata_with_home(
+            "remote-cursor",
+            &crate::hooks::HookMetadata {
+                agent_session_id: Some(id.into()),
+                first_prompt_title: Some("Remote prompt".into()),
+                ..crate::hooks::HookMetadata::default()
+            },
+            Some(home),
+        ));
+
+        let updated = registry.record("remote-cursor").expect("record");
+        assert_eq!(updated.title, "Remote prompt");
+        assert_eq!(updated.title_source, TitleSource::FirstPrompt);
+        assert_eq!(updated.transcript_path, None);
     }
 
     #[test]
