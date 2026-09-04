@@ -429,21 +429,25 @@ pub fn spawn_registry_watcher(
             // every pass, all under the registry lock.
             let mut published: HashMap<String, u64> = HashMap::new();
             while !stop.load(Ordering::SeqCst) {
-                let (mut changed, cursor_requests) = {
+                let (mut changed, cursor_requests, native_title_requests) = {
                     let Ok(mut registry) = registry.lock() else {
                         break;
                     };
                     (
                         registry.changed_since(&mut published),
                         registry.cursor_refresh_requests(),
+                        registry.native_title_refresh_requests(),
                     )
                 };
                 let cursor_refreshes = crate::registry::scan_cursor_refreshes(cursor_requests);
-                if !cursor_refreshes.is_empty() {
+                let native_title_refreshes =
+                    crate::registry::scan_native_title_refreshes(native_title_requests);
+                if !cursor_refreshes.is_empty() || !native_title_refreshes.is_empty() {
                     let Ok(mut registry) = registry.lock() else {
                         break;
                     };
                     changed.extend(registry.apply_cursor_refreshes(cursor_refreshes));
+                    changed.extend(registry.apply_native_title_refreshes(native_title_refreshes));
                 }
                 for (id, record) in changed {
                     events.publish_encoded(
