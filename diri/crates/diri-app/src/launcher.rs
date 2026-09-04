@@ -1364,6 +1364,14 @@ impl LauncherOverlay {
                     |error| format!("Could not check Agents on this host: {error}"),
                 ))
             }
+            Err(RecipeIssue::EmptyPrompt) if self.active_recipe.is_none() => Some(
+                if self.selected_harness.is_terminal() {
+                    "Enter a command to start a terminal session."
+                } else {
+                    "Describe a task to start your session."
+                }
+                .to_owned(),
+            ),
             Err(issue) => Some(issue.message()),
         }
     }
@@ -1480,6 +1488,18 @@ impl LauncherOverlay {
         }
         if self.picker.is_some() && self.handle_picker_key(event, window, cx) {
             return true;
+        }
+        if self.needs_folder() {
+            if event.keystroke.key == "enter" {
+                self.choose_folder(window, cx);
+                return true;
+            }
+            // There is no editor on the folder step. Do not collect invisible
+            // prompt text or cycle an agent the user cannot see.
+            let opens_recipes = event.keystroke.key == "r" && event.keystroke.modifiers.platform;
+            if event.keystroke.key != "escape" && !opens_recipes {
+                return true;
+            }
         }
         let shift = event.keystroke.modifiers.shift;
         match event.keystroke.key.as_str() {
@@ -2441,6 +2461,52 @@ impl LauncherOverlay {
             )
     }
 
+    /// A missing folder is an explicit first step, not a disabled composer.
+    fn needs_folder(&self) -> bool {
+        matches!(self.target, LauncherTarget::NewSession)
+            && matches!(self.mode, LauncherMode::NewSession)
+            && self.selected_root.is_empty()
+            && self.active_recipe.is_none()
+            && self.picker.is_none()
+    }
+
+    fn render_folder_step(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("launcher-folder-step")
+            .w_full().max_w(px(420.0)).mx(px(28.0))
+            .flex().flex_col().gap(px(22.0))
+            .child(sf_symbol("folder", 32.0, Palette::CLAY))
+            .child(
+                div().flex().flex_col().gap(px(10.0))
+                    .child(div().text_size(px(26.0)).font_weight(FontWeight::MEDIUM)
+                        .text_color(colors.primary).child("Where are we working?"))
+                    .child(div().text_size(px(14.0)).line_height(px(22.0))
+                        .text_color(colors.secondary)
+                        .child("Choose a project folder on your computer. Next, pick an agent and give it a task.")),
+            )
+            .child(
+                div().flex().items_center().gap(px(14.0))
+                    .child(
+                        div().id("launcher-choose-first-folder")
+                            .debug_selector(|| "launcher-choose-first-folder".into())
+                            .role(Role::Button).aria_label("Choose a project folder")
+                            .h(px(40.0)).px(px(16.0)).rounded(px(Radius::ROW))
+                            .bg(colors.primary).text_color(colors.background)
+                            .text_size(px(13.0)).font_weight(FontWeight::MEDIUM)
+                            .flex().items_center().gap(px(10.0)).cursor_pointer()
+                            .hover(|button| button.opacity(0.88))
+                            .active(|button| button.opacity(0.74))
+                            .on_click(cx.listener(|this, _, window, cx| this.choose_folder(window, cx)))
+                            .child(sf_symbol("folder", 14.0, colors.background))
+                            .child("Choose folder"),
+                    )
+                    .child(div().text_size(px(12.0)).text_color(colors.secondary).child("↵  Choose folder")),
+            )
+            .child(div().text_size(px(12.0)).line_height(px(18.0)).text_color(colors.secondary)
+                .child("Nothing runs until you start the session."))
+            .into_any_element()
+    }
+
     fn render_panel(
         &self,
         viewport_height: f32,
@@ -2453,6 +2519,9 @@ impl LauncherOverlay {
         }
         if matches!(self.target, LauncherTarget::Session(_)) {
             return self.render_session_panel(colors, focused, cx);
+        }
+        if self.needs_folder() {
+            return self.render_folder_step(colors, cx);
         }
         let can_submit = self.can_submit();
         let harness_open = self.picker == Some(Picker::Harness);
@@ -2490,11 +2559,13 @@ impl LauncherOverlay {
                 .when(focused, |line| {
                     line.child(div().text_color(colors.primary.alpha(0.92)).child(CARET))
                 })
-                .child(
-                    div()
-                        .text_color(colors.tertiary)
-                        .child("Describe the task…"),
-                )
+                .child(div().text_color(colors.tertiary).child(
+                    if self.selected_harness.is_terminal() {
+                        "Enter a shell command…"
+                    } else {
+                        "Describe the task…"
+                    },
+                ))
                 .into_any_element()
         } else {
             div()
@@ -2525,14 +2596,14 @@ impl LauncherOverlay {
                     .relative()
                     .h(px(TITLE_HEIGHT))
                     .flex()
+                    .flex_row_reverse()
                     .items_center()
-                    .justify_center()
+                    .justify_between()
+                    .px(px(COMPOSER_INSET))
                     .child(
                         div()
                             .id("launcher-recipes-button")
                             .debug_selector(|| "launcher-recipes-button".into())
-                            .absolute()
-                            .left(px(COMPOSER_INSET))
                             .h(px(28.0))
                             .px(px(9.0))
                             .flex()
@@ -2572,7 +2643,11 @@ impl LauncherOverlay {
                             .text_size(px(22.0))
                             .font_weight(FontWeight::NORMAL)
                             .text_color(colors.primary.alpha(0.94))
-                            .child("What should we work on?"),
+                            .child(if self.selected_harness.is_terminal() {
+                                "Run a command"
+                            } else {
+                                "What should we work on?"
+                            }),
                     ),
             )
             .child(
@@ -2618,44 +2693,41 @@ impl LauncherOverlay {
                                     .flex()
                                     .items_center()
                                     .gap(px(8.0))
-                                    .child(
-                                        div()
-                                            .id("launcher-add-project")
-                                            .h(px(CONTROL_SIZE))
-                                            .px(px(9.0))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .gap(px(6.0))
-                                            .rounded(px(CONTROL_RADIUS))
-                                            .cursor_pointer()
-                                            .hover(move |button| button.bg(Fill::subtle(colors)))
-                                            .active(move |button| {
-                                                button.bg(colors.primary.alpha(0.10))
-                                            })
-                                            .child(sf_symbol("plus", 11.0, colors.secondary))
-                                            .child(
-                                                div()
-                                                    .text_size(px(10.0))
-                                                    .text_color(colors.secondary)
-                                                    .child("Choose folder"),
-                                            )
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.choose_folder(window, cx);
-                                            })),
-                                    )
+                                    .when(self.selected_root.is_empty(), |row| {
+                                        row.child(
+                                            div()
+                                                .id("launcher-add-project")
+                                                .h(px(CONTROL_SIZE))
+                                                .px(px(9.0))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .gap(px(6.0))
+                                                .rounded(px(CONTROL_RADIUS))
+                                                .cursor_pointer()
+                                                .hover(move |button| {
+                                                    button.bg(Fill::subtle(colors))
+                                                })
+                                                .active(move |button| {
+                                                    button.bg(colors.primary.alpha(0.10))
+                                                })
+                                                .child(sf_symbol("plus", 11.0, colors.secondary))
+                                                .child(
+                                                    div()
+                                                        .text_size(px(10.0))
+                                                        .text_color(colors.secondary)
+                                                        .child("Choose folder"),
+                                                )
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.choose_folder(window, cx);
+                                                })),
+                                        )
+                                    })
                                     .child(
                                         div()
                                             .text_size(px(10.0))
                                             .text_color(colors.tertiary)
-                                            .child(
-                                                blocker
-                                                    .clone()
-                                                    .or_else(|| self.fallback_notice.clone())
-                                                    .unwrap_or_else(|| {
-                                                        "⇧↵  New line   ⇥  Agent".to_owned()
-                                                    }),
-                                            ),
+                                            .child("⇧↵  New line"),
                                     ),
                             )
                             .child(
@@ -2698,7 +2770,11 @@ impl LauncherOverlay {
                                     .child(
                                         div()
                                             .id("launcher-submit")
-                                            .size(px(CONTROL_SIZE))
+                                            .role(Role::Button)
+                                            .aria_label(if self.selected_harness.is_terminal() { "Run command" } else { "Start session" })
+                                            .h(px(CONTROL_SIZE))
+                                            .px(px(12.0))
+                                            .gap(px(7.0))
                                             .flex()
                                             .items_center()
                                             .justify_center()
@@ -2717,6 +2793,13 @@ impl LauncherOverlay {
                                                         this.submit(cx);
                                                     }))
                                             })
+                                            .text_size(px(12.0))
+                                            .text_color(if can_submit {
+                                                colors.background
+                                            } else {
+                                                colors.tertiary
+                                            })
+                                            .child(if self.selected_harness.is_terminal() { "Run command" } else { "Start session" })
                                             .child(sf_symbol_weighted(
                                                 "chevron.up",
                                                 10.0,
@@ -2857,13 +2940,47 @@ impl LauncherOverlay {
                                         },
                                     ))
                                     .child(if fresh_worktree {
-                                        "Fresh lane"
+                                        "New worktree"
                                     } else {
-                                        "Current"
+                                        "Current folder"
                                     }),
                             ),
                     ),
             )
+            .when_some(
+                blocker.or_else(|| self.fallback_notice.clone()),
+                |panel, message| {
+                    panel.child(
+                        div()
+                            .id("launcher-readiness-message")
+                            .mx(px(COMPOSER_INSET))
+                            .mt(px(12.0))
+                            .text_size(px(12.0))
+                            .line_height(px(18.0))
+                            .text_color(colors.secondary)
+                            .child(message),
+                    )
+                },
+            )
+            .when(self.selected_harness.is_terminal(), |panel| {
+                panel.child(
+                    div().id("launcher-agent-setup").mx(px(COMPOSER_INSET)).mt(px(12.0))
+                        .flex().flex_col().gap(px(6.0))
+                        .child(div().text_size(px(12.0)).line_height(px(18.0)).text_color(colors.secondary)
+                            .child("Terminal runs shell commands. To describe a task in plain language, choose a coding agent."))
+                        .child(div().id("launcher-setup-agents").role(Role::Button)
+                            .aria_label("Set up a coding agent").text_size(px(12.0)).text_color(colors.primary)
+                            .py(px(5.0)).cursor_pointer()
+                            .hover(move |button| button.text_color(Palette::CLAY))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.open = false;
+                                this.picker = None;
+                                cx.emit(LauncherEvent::ManageAgents(this.selected_host.clone()));
+                                cx.notify();
+                            }))
+                            .child("Set up a coding agent…")),
+                )
+            })
             .when(harness_open, |panel| {
                 panel.child(
                     self.floating(picker_top, cx)
@@ -3487,6 +3604,28 @@ impl Render for LauncherOverlay {
             )
             // Command-N is a high-frequency keyboard action; the destination
             // appears immediately rather than making the user wait on motion.
+            .child(
+                div()
+                    .id("launcher-back")
+                    .absolute()
+                    .top(px(12.0))
+                    .right(px(16.0))
+                    .h(px(30.0))
+                    .px(px(10.0))
+                    .rounded(px(Radius::ROW))
+                    .role(Role::Button)
+                    .aria_label("Back to workspace")
+                    .flex()
+                    .items_center()
+                    .gap(px(7.0))
+                    .cursor_pointer()
+                    .text_size(px(12.0))
+                    .text_color(colors.secondary)
+                    .hover(move |button| button.bg(Fill::subtle(colors)))
+                    .on_click(cx.listener(|this, _, _, cx| this.close(cx)))
+                    .child("Back")
+                    .child(div().text_color(colors.tertiary).child("esc")),
+            )
             .child(self.render_panel(window.viewport_size().height.as_f32(), colors, focused, cx))
     }
 }
@@ -3710,6 +3849,31 @@ mod tests {
     fn manifest_ids_have_readable_fallback_labels() {
         assert_eq!(title_case_id("claude-code"), "Claude Code");
         assert_eq!(title_case_id("open_code"), "Open Code");
+    }
+
+    #[gpui::test]
+    fn folder_step_preserves_drafts_and_does_not_collect_invisible_input(cx: &mut TestAppContext) {
+        let services = test_services(Arc::new(StoreRuntime::inert()));
+        let (launcher, cx) = cx.add_window_view(move |window, cx| {
+            let mut launcher = LauncherOverlay::new(services, true, cx);
+            launcher.open(window, cx);
+            launcher
+        });
+        assert!(cx.debug_bounds("launcher-choose-first-folder").is_some());
+        launcher.update_in(cx, |launcher, window, cx| {
+            assert!(launcher.needs_folder());
+            launcher.handle_key_down(&key("x"), window, cx);
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("Hidden paste".into()));
+            launcher.handle_key_down(&key("cmd-v"), window, cx);
+            assert!(launcher.prompt.is_empty());
+            launcher.selected_root = "/tmp".into();
+            assert!(!launcher.needs_folder());
+            launcher.prompt.insert_multiline("Explain this project");
+            launcher.handle_key_down(&key("escape"), window, cx);
+            launcher.open(window, cx);
+            assert_eq!(launcher.prompt.text(), "Explain this project");
+            assert!(!launcher.needs_folder());
+        });
     }
 
     #[gpui::test]
@@ -4209,6 +4373,127 @@ mod tests {
             .expect("keyboard-selected last recipe");
         assert!(last.top() >= list.top());
         assert!(last.bottom() <= list.bottom());
+    }
+
+    /// Capture production empty-state components without a daemon or personal state.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes first-experience visual review artifacts"]
+    fn render_first_experience_screenshots() {
+        struct Welcome(SemanticColors);
+        impl Render for Welcome {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .bg(self.0.background)
+                    .font_family(crate::fonts::ui_family())
+                    .flex()
+                    .flex_col()
+                    .child(crate::empty_workbench::render(false, self.0))
+            }
+        }
+        let output = std::path::PathBuf::from(
+            std::env::var_os("DIRI_VISUAL_OUTPUT").expect("set DIRI_VISUAL_OUTPUT directory"),
+        );
+        std::fs::create_dir_all(&output).unwrap();
+        for (theme, width, height) in [
+            ("dirijor-dark", 1100.0, 700.0),
+            ("dirijor-light", 760.0, 560.0),
+        ] {
+            let platform = gpui_platform::current_platform(true);
+            let mut cx = gpui::HeadlessAppContext::with_platform(
+                platform.text_system(),
+                Arc::new(diri_ui::IconAssets),
+                gpui_platform::current_headless_renderer,
+            );
+            cx.update(|cx| {
+                crate::fonts::init(cx);
+                cx.set_reduce_motion(true);
+            });
+            let welcome = cx
+                .open_window(gpui::size(px(width), px(height)), |_, cx| {
+                    cx.new(|_| Welcome(launcher_colors_for_theme(theme)))
+                })
+                .unwrap();
+            cx.run_until_parked();
+            cx.capture_screenshot(welcome.into())
+                .unwrap()
+                .save(output.join(format!("{theme}-welcome.png")))
+                .unwrap();
+            welcome
+                .update(&mut cx, |_, window, _| window.remove_window())
+                .unwrap();
+            cx.run_until_parked();
+            let runtime = Arc::new(StoreRuntime::inert());
+            runtime
+                .store
+                .write()
+                .unwrap()
+                .update_preferences(|prefs| {
+                    prefs.terminal_theme = theme.into();
+                    prefs.default_agent = AgentKind::CODEX;
+                })
+                .unwrap();
+            let services = test_services(Arc::clone(&runtime));
+            let launcher = cx
+                .open_window(gpui::size(px(width), px(height)), |window, cx| {
+                    cx.new(|cx| {
+                        let mut launcher = LauncherOverlay::new(services, true, cx);
+                        launcher.open(window, cx);
+                        launcher
+                    })
+                })
+                .unwrap();
+            cx.run_until_parked();
+            cx.capture_screenshot(launcher.into())
+                .unwrap()
+                .save(output.join(format!("{theme}-folder.png")))
+                .unwrap();
+            runtime
+                .store
+                .write()
+                .unwrap()
+                .set_agent_catalog(diri_proto::AgentReadinessResult {
+                    agents: vec![diri_proto::AgentReadinessItem {
+                        kind: AgentKind::CODEX,
+                        binary: "codex".into(),
+                        path: Some("/usr/local/bin/codex".into()),
+                        show_in_quick_create: true,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                });
+            launcher
+                .update(&mut cx, |launcher, window, cx| {
+                    launcher.open_at_directory("/tmp".into(), None, window, cx)
+                })
+                .unwrap();
+            cx.run_until_parked();
+            cx.capture_screenshot(launcher.into())
+                .unwrap()
+                .save(output.join(format!("{theme}-compose.png")))
+                .unwrap();
+            runtime
+                .store
+                .write()
+                .unwrap()
+                .set_agent_catalog(diri_proto::AgentReadinessResult::default());
+            launcher
+                .update(&mut cx, |launcher, _, cx| {
+                    launcher.reconcile_harness();
+                    cx.notify();
+                })
+                .unwrap();
+            cx.run_until_parked();
+            cx.capture_screenshot(launcher.into())
+                .unwrap()
+                .save(output.join(format!("{theme}-no-agents.png")))
+                .unwrap();
+            launcher
+                .update(&mut cx, |_, window, _| window.remove_window())
+                .unwrap();
+            cx.run_until_parked();
+        }
     }
 
     /// Writes a deterministic visual artifact for design review without live

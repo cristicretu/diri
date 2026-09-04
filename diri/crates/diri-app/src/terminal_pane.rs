@@ -3425,16 +3425,16 @@ impl Render for TerminalPane {
                             .child(control),
                     )
                 })
-                .child(
-                    div()
-                        .flex_1()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_size(px(13.0))
-                        .text_color(sidebar_colors.tertiary)
-                        .child("Start a terminal from the sidebar"),
-                )
+                .child(crate::empty_workbench::render(
+                    !self
+                        .runtime
+                        .store
+                        .read()
+                        .expect("session store lock poisoned")
+                        .sessions()
+                        .is_empty(),
+                    colors,
+                ))
                 .into_any_element()
         };
 
@@ -4946,6 +4946,10 @@ mod tests {
         assert!(
             pane.read_with(cx, |pane, _| pane.selected_session().is_none()),
             "fixture must exercise the empty terminal state"
+        );
+        assert!(
+            cx.debug_bounds("empty-start-session").is_some(),
+            "the empty pane offers a direct next action"
         );
         assert!(
             cx.debug_bounds("show-sidebar").is_some(),

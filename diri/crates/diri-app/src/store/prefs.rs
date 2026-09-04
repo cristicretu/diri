@@ -141,9 +141,9 @@ impl Default for Prefs {
             terminal_theme: DEFAULT_THEME.to_owned(),
             terminal_font_size: 13.0,
             window_placement: None,
-            sidebar_visible: true,
+            sidebar_visible: false,
             sidebar_width: 248.0,
-            inspector_open: true,
+            inspector_open: false,
             inspector_width: 440.0,
             inspector_tab: InspectorTab::Info,
             workbench_primary_fraction: crate::workbench::DEFAULT_PRIMARY_FRACTION,
@@ -256,6 +256,26 @@ impl Prefs {
 mod tests {
     use super::*;
     use crate::launch_recipe::{LaunchRecipe, RecipeProject};
+
+    #[test]
+    fn fresh_preferences_close_panels_but_saved_choices_survive() {
+        let fresh: Prefs = serde_json::from_str("{}").expect("missing preferences use defaults");
+        assert!(!fresh.sidebar_visible);
+        assert!(!fresh.inspector_open);
+        for sidebar in [false, true] {
+            for inspector in [false, true] {
+                let saved = Prefs {
+                    sidebar_visible: sidebar,
+                    inspector_open: inspector,
+                    ..Prefs::default()
+                };
+                let restored: Prefs =
+                    serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+                assert_eq!(restored.sidebar_visible, sidebar);
+                assert_eq!(restored.inspector_open, inspector);
+            }
+        }
+    }
 
     #[test]
     fn older_preferences_migrate_to_an_empty_recipe_book() {

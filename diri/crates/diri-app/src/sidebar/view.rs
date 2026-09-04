@@ -1428,7 +1428,7 @@ impl Sidebar {
                 cx.stop_propagation();
                 this.external_drop(paths, ExternalDropTarget::EmptySpace, cx);
             }))
-            .child(AgentLogo::new(AgentKind::ClaudeCode, 44.0, colors).badged(false))
+            .child(sf_symbol("square.stack.3d.up", 28.0, colors.tertiary))
             .child(
                 div()
                     .flex()
@@ -1440,14 +1440,14 @@ impl Sidebar {
                             .text_size(px(Typo::ROW_EMPHASIZED.size))
                             .font_weight(Typo::ROW_EMPHASIZED.weight)
                             .text_color(colors.secondary)
-                            .child("Bring up your first agent"),
+                            .child("Your sessions live here"),
                     )
                     .child(
                         div()
                             .text_size(px(Typo::META.size))
                             .text_color(colors.tertiary)
                             .child(
-                                crate::commands::command(CommandId::NewDefaultSession)
+                                crate::commands::command(CommandId::OpenLauncher)
                                     .shortcut_label()
                                     .unwrap_or_default(),
                             ),
@@ -1465,12 +1465,12 @@ impl Sidebar {
                     .text_color(colors.secondary)
                     .cursor_pointer()
                     .hover(move |element| element.bg(colors.primary.alpha(0.06)))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.open_new_agent_popover(None, cx);
-                    }))
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(crate::commands::OpenLauncher), cx);
+                    })
                     .gap(px(7.0))
                     .child(sf_symbol("square.and.pencil", 13.0, colors.secondary))
-                    .child("New Agent"),
+                    .child("Start a session"),
             )
             .into_any_element()
     }
