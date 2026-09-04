@@ -1131,6 +1131,13 @@ impl Session {
         self.shared.status.lock().expect("status").clone()
     }
 
+    /// Total bytes the child has ever written. The governor compares this
+    /// across sweeps: a growing tail is a working session, whatever the
+    /// status heuristics currently believe.
+    pub fn output_tail(&self) -> u64 {
+        self.shared.log.lock().expect("log").tail_offset()
+    }
+
     /// Reads recorded output by absolute stream offset, for attach and replay.
     pub fn read_output(&self, from_offset: u64, max_bytes: usize) -> (u64, Vec<u8>) {
         self.shared
