@@ -1949,7 +1949,7 @@ impl Sidebar {
             RowFill::Selected
         } else if multi {
             RowFill::MultiSelected
-        } else if hovered {
+        } else if hovered || focused {
             RowFill::Hover
         } else {
             RowFill::Clear
@@ -2060,8 +2060,6 @@ impl Sidebar {
             .border_1()
             .border_color(if marked {
                 Palette::CLAY.alpha(0.78)
-            } else if focused {
-                Ink::FRESH.alpha(0.82)
             } else {
                 colors.primary.alpha(0.0)
             })
@@ -2529,17 +2527,13 @@ impl Sidebar {
             .opacity(if focused { 0.82 } else { 0.58 })
             .bg(if selected {
                 RowFill::Selected.color(colors)
-            } else if hovered {
+            } else if hovered || focused {
                 RowFill::Hover.color(colors)
             } else {
                 RowFill::Clear.color(colors)
             })
             .border_1()
-            .border_color(if focused {
-                Ink::FRESH.alpha(0.82)
-            } else {
-                colors.primary.alpha(0.0)
-            })
+            .border_color(colors.primary.alpha(0.0))
             .cursor_pointer()
             .on_hover(cx.listener({
                 let id = id.clone();
