@@ -86,6 +86,7 @@ pub(crate) struct CursorRefreshResult {
 /// Immutable input for a local provider-title refresh. Like Cursor metadata,
 /// provider file/database reads happen after releasing the Registry lock.
 pub(crate) struct NativeTitleRefreshRequest {
+    account_profile: Option<diri_proto::AgentAccountProfile>,
     id: String,
     kind: AgentKind,
     cwd: String,
@@ -307,6 +308,7 @@ impl Registry {
         }
         self.recovery_store(&record.id.0).write_capsule(
             &diri_proto::recovery::SessionRecoveryCapsule {
+                account_profile: record.account_profile.clone(),
                 version: diri_proto::recovery::SessionRecoveryCapsule::VERSION,
                 session_id: record.id.clone(),
                 manifest_id: record.kind.id().to_owned(),
@@ -730,6 +732,7 @@ impl Registry {
                     return None;
                 }
                 Some(NativeTitleRefreshRequest {
+                    account_profile: record.account_profile.clone(),
                     id: id.clone(),
                     kind: record.kind.clone(),
                     cwd: record.cwd.clone(),
@@ -945,7 +948,8 @@ impl Registry {
                 .or(record.agent_session_id.as_deref())?;
             let kind = record.effective_kind();
             let validate = |candidate: &str| {
-                crate::history::validate_transcript_path(
+                crate::history::validate_profile_transcript_path(
+                    record.account_profile.as_ref(),
                     home,
                     kind,
                     agent_id,
@@ -960,7 +964,12 @@ impl Registry {
                 .or_else(|| {
                     (kind.id() == diri_proto::AgentKind::CODEX_ID)
                         .then(|| {
-                            crate::history::find_live_codex_transcript(home, agent_id, &record.cwd)
+                            crate::history::find_profile_codex_transcript(
+                                record.account_profile.as_ref(),
+                                home,
+                                agent_id,
+                                &record.cwd,
+                            )
                         })
                         .flatten()
                 })
@@ -979,7 +988,11 @@ impl Registry {
                         .agent_session_id
                         .as_deref()
                         .or(record.agent_session_id.as_deref())?;
-                    crate::history::codex_title(home, agent_id)
+                    crate::history::profile_codex_title(
+                        record.account_profile.as_ref(),
+                        home,
+                        agent_id,
+                    )
                 }
                 _ => None,
             }?;
@@ -1395,7 +1408,8 @@ pub(crate) fn scan_native_title_refreshes(
                     .transcript_path
                     .as_deref()
                     .and_then(|path| {
-                        crate::history::validate_transcript_path(
+                        crate::history::validate_profile_transcript_path(
+                            request.account_profile.as_ref(),
                             &home,
                             &request.kind,
                             &request.agent_session_id,
@@ -1404,9 +1418,11 @@ pub(crate) fn scan_native_title_refreshes(
                         )
                     })
                     .and_then(|mut transcript| transcript.latest_claude_title()),
-                AgentKind::CODEX_ID => {
-                    crate::history::codex_title(&home, &request.agent_session_id)
-                }
+                AgentKind::CODEX_ID => crate::history::profile_codex_title(
+                    request.account_profile.as_ref(),
+                    &home,
+                    &request.agent_session_id,
+                ),
                 _ => None,
             };
             NativeTitleRefreshResult { request, title }
@@ -1668,6 +1684,7 @@ fn recovered_record(capsule: diri_proto::recovery::SessionRecoveryCapsule) -> Se
         git_branch: None,
         title: "Recovered session".into(),
         title_source: TitleSource::Placeholder,
+        account_profile: capsule.account_profile,
         originating_prompt: None,
         agent_session_id: capsule.agent_session_id,
         transcript_path: capsule.transcript_path,
@@ -1733,6 +1750,7 @@ mod tests {
             git_branch: None,
             title: "test".into(),
             title_source: TitleSource::Placeholder,
+            account_profile: None,
             originating_prompt: None,
             agent_session_id: None,
             transcript_path: None,

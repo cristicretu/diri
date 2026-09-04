@@ -412,6 +412,17 @@ impl RootView {
             &launcher,
             window,
             |this, _, event: &LauncherEvent, window, cx| {
+                if matches!(event, LauncherEvent::ManageAccounts)
+                    && let Some(surfaces) = &this.utility_surfaces
+                {
+                    surfaces.update(cx, |surfaces, cx| {
+                        surfaces.open_settings(cx);
+                        surfaces.open_settings_tab(crate::settings::SettingsTab::Accounts, cx);
+                        surfaces.focus_handle(cx).focus(window, cx);
+                    });
+                    cx.notify();
+                    return;
+                }
                 if let LauncherEvent::ManageAgents(host) = event
                     && let Some(surfaces) = &this.utility_surfaces
                 {

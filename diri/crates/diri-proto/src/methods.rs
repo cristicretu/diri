@@ -54,6 +54,9 @@ impl Method {
     pub const GOVERNOR_CONFIGURE: &'static str = "governor.configure";
     pub const AGENT_READINESS: &'static str = "agent.readiness";
     pub const AGENT_CONFIGURE: &'static str = "agent.configure";
+    pub const ACCOUNT_PROFILES_LIST: &'static str = "account.profiles.list";
+    pub const ACCOUNT_PROFILES_SAVE: &'static str = "account.profiles.save";
+    pub const ACCOUNT_PROFILES_REMOVE: &'static str = "account.profiles.remove";
     pub const EVENTS_SUBSCRIBE: &'static str = "events.subscribe";
     pub const EVENTS_WAIT: &'static str = "events.wait";
     pub const HOOK_REPORT: &'static str = "hook.report";
@@ -350,6 +353,9 @@ pub type AgentConfigureResult = AgentReadinessResult;
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionSpawnParams {
+    /// None uses the target's configured default; an empty id uses the CLI environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_profile_id: Option<String>,
     pub kind: AgentKind,
     pub cwd: String,
     #[serde(skip_serializing_if = "Option::is_none")]

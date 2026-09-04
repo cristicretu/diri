@@ -28,6 +28,7 @@ use crate::launch_recipe::{
 use crate::navigation::CARET;
 use crate::notifications::SendTextCommand;
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
+mod accounts;
 
 const PANEL_WIDTH: f32 = 540.0;
 const TITLE_HEIGHT: f32 = 36.0;
@@ -121,9 +122,14 @@ struct LauncherProject {
 pub(crate) enum LauncherEvent {
     Closed,
     ManageAgents(Option<String>),
+    ManageAccounts,
 }
 
 pub(crate) struct LauncherOverlay {
+    accounts: diri_proto::AgentAccountCatalog,
+    accounts_loading: bool,
+    accounts_error: Option<String>,
+    selected_account: Option<String>,
     services: Arc<AppServices>,
     focus: FocusHandle,
     prompt: PromptComposer,
@@ -172,6 +178,7 @@ pub(crate) struct LauncherOverlay {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Picker {
+    Account,
     Harness,
     Project,
     Recipe,
@@ -341,6 +348,10 @@ impl LauncherOverlay {
         });
 
         Self {
+            accounts: diri_proto::AgentAccountCatalog::default(),
+            accounts_loading: false,
+            accounts_error: None,
+            selected_account: None,
             services,
             focus,
             prompt: PromptComposer::default(),
@@ -386,6 +397,7 @@ impl LauncherOverlay {
         // check something — threw the prompt away with no way back. It is
         // cleared on submit, and only there.
         if self.prompt.is_empty() {
+            self.selected_account = None;
             let (harness, root, host) = initial_target(&self.services);
             self.selected_harness = harness;
             self.selected_root = root;
@@ -428,6 +440,7 @@ impl LauncherOverlay {
         self.switch_target(LauncherTarget::NewSession);
         self.selected_root = root;
         self.selected_host = None;
+        self.reconcile_account();
         self.selected_worktree = WorktreePolicy::CurrentCheckout;
         self.selected_title = None;
         self.draft_recipe_name = None;
@@ -477,6 +490,7 @@ impl LauncherOverlay {
     }
 
     fn activate_new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_launcher_accounts(cx);
         self.services
             .store
             .store
@@ -764,6 +778,7 @@ impl LauncherOverlay {
             self.prompt.text(),
         );
         recipe.worktree = self.selected_worktree.clone();
+        recipe.account_profile_id.clone_from(&self.selected_account);
         recipe.title.clone_from(&self.selected_title);
         recipe
     }
@@ -772,6 +787,7 @@ impl LauncherOverlay {
         &self,
         recipe: &LaunchRecipe,
     ) -> Result<crate::launch_recipe::ResolvedRecipe, RecipeIssue> {
+        self.validate_recipe_account(recipe)?;
         let store = self
             .services
             .store
@@ -795,6 +811,7 @@ impl LauncherOverlay {
     }
 
     fn validate_recipe(&self, recipe: &LaunchRecipe) -> Result<(), RecipeIssue> {
+        self.validate_recipe_account(recipe)?;
         let store = self
             .services
             .store
@@ -942,6 +959,7 @@ impl LauncherOverlay {
     }
 
     fn preview_recipe(&mut self, recipe: &LaunchRecipe) {
+        self.selected_account.clone_from(&recipe.account_profile_id);
         self.pending_recipe_activation = None;
         self.selected_harness.clone_from(&recipe.agent);
         self.selected_host.clone_from(&recipe.host);
@@ -1513,6 +1531,15 @@ impl LauncherOverlay {
                 true
             }
             "enter" => self.submit(cx),
+            "a" if event.keystroke.modifiers.platform
+                && event.keystroke.modifiers.shift
+                && matches!(self.target, LauncherTarget::NewSession)
+                && matches!(self.selected_harness.id(), "codex" | "claude-code") =>
+            {
+                self.toggle_picker(Picker::Account);
+                cx.notify();
+                true
+            }
             "r" if event.keystroke.modifiers.platform
                 && event.keystroke.modifiers.shift
                 && matches!(self.target, LauncherTarget::NewSession) =>
@@ -1557,6 +1584,7 @@ impl LauncherOverlay {
         cx: &mut Context<Self>,
     ) -> bool {
         let count = match self.picker {
+            Some(Picker::Account) => self.account_choices().len() + 1,
             Some(Picker::Harness) => self.harness_choices().len(),
             Some(Picker::Project) => self.projects().len() + 1,
             Some(Picker::Recipe) => self.recipes().len() + 1,
@@ -1642,10 +1670,18 @@ impl LauncherOverlay {
 
     fn commit_highlight(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.picker {
+            Some(Picker::Account) => {
+                if let Some((id, _)) = self.account_choices().get(self.highlight) {
+                    self.selected_account = id.clone();
+                } else {
+                    self.manage_accounts(cx);
+                }
+            }
             Some(Picker::Harness) => {
                 if let Some(choice) = self.harness_choices().get(self.highlight) {
                     self.pending_recipe_activation = None;
                     self.selected_harness = choice.kind.clone();
+                    self.reconcile_account();
                     self.fallback_notice = None;
                 }
             }
@@ -1656,6 +1692,7 @@ impl LauncherOverlay {
                         self.pending_recipe_activation = None;
                         self.selected_root.clone_from(&projects[index].project.root);
                         self.selected_host.clone_from(&projects[index].host);
+                        self.reconcile_account();
                         self.recipe_project_edited = true;
                         self.services
                             .store
@@ -1700,6 +1737,10 @@ impl LauncherOverlay {
             self.recipe_scroll = ScrollHandle::new();
         }
         self.highlight = match picker {
+            Picker::Account => self
+                .account_choices()
+                .iter()
+                .position(|(id, _)| *id == self.selected_account),
             Picker::Harness => self
                 .harness_choices()
                 .iter()
@@ -1731,6 +1772,7 @@ impl LauncherOverlay {
         let next = (current as isize + delta).rem_euclid(count) as usize;
         self.pending_recipe_activation = None;
         self.selected_harness = choices[next].kind.clone();
+        self.reconcile_account();
         self.fallback_notice = None;
     }
 
@@ -1802,6 +1844,7 @@ impl LauncherOverlay {
                 if apply_folder_choice(&mut this.selected_root, selected.as_deref()) {
                     this.pending_recipe_activation = None;
                     this.selected_host = None;
+                    this.reconcile_account();
                     this.recipe_project_edited = true;
                     this.services
                         .store
@@ -1850,6 +1893,7 @@ impl LauncherOverlay {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.pending_recipe_activation = None;
                         this.selected_harness = kind.clone();
+                        this.reconcile_account();
                         this.fallback_notice = None;
                         this.picker = None;
                         cx.notify();
@@ -2767,6 +2811,7 @@ impl LauncherOverlay {
                                                 cx.notify();
                                             })),
                                     )
+                                    .when(matches!(self.selected_harness.id(), "codex" | "claude-code"), |row| row.child(self.account_picker_button(colors, cx)))
                                     .child(
                                         div()
                                             .id("launcher-submit")
@@ -2987,6 +3032,11 @@ impl LauncherOverlay {
                         .right(px(COMPOSER_INSET))
                         .child(self.render_harness_picker(colors, cx)),
                 )
+            })
+            .when(self.picker == Some(Picker::Account), |panel| {
+                panel.child(div().absolute().right(px(COMPOSER_INSET)).bottom(px(SHELF_HEIGHT + COMPOSER_CONTROLS_HEIGHT + 8.0))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.stop_propagation()))
+                    .child(self.render_account_picker(colors, cx)))
             })
             .when(project_open, |panel| {
                 panel.child(
@@ -3851,6 +3901,77 @@ mod tests {
         assert_eq!(title_case_id("open_code"), "Open Code");
     }
 
+    fn account_fixture(
+        id: &str,
+        agent: &str,
+        host: Option<&str>,
+        default: bool,
+    ) -> diri_proto::AgentAccountProfile {
+        diri_proto::AgentAccountProfile {
+            id: id.into(),
+            label: title_case_id(id),
+            agent: agent.into(),
+            host: host.map(str::to_owned),
+            config_home: format!("~/.{agent}-{id}"),
+            is_default: default,
+        }
+    }
+
+    #[gpui::test]
+    fn account_picker_filters_by_target_and_recipes_keep_explicit_identity(
+        cx: &mut TestAppContext,
+    ) {
+        let services = test_services(Arc::new(StoreRuntime::inert()));
+        let (launcher, cx) = cx.add_window_view(move |window, cx| {
+            let mut launcher = LauncherOverlay::new(services, true, cx);
+            launcher.open(window, cx);
+            launcher
+        });
+        launcher.update_in(cx, |launcher, window, cx| {
+            launcher.accounts.profiles = vec![
+                account_fixture("work", "codex", None, true),
+                account_fixture("personal", "codex", None, false),
+                account_fixture("remote", "codex", Some("server"), true),
+                account_fixture("claude", "claude-code", None, true),
+            ];
+            launcher.selected_harness = AgentKind::CODEX;
+            launcher.selected_root = "/tmp".into();
+            launcher.selected_host = None;
+            assert_eq!(launcher.account_choices().len(), 4);
+            assert_eq!(launcher.account_choices()[0].1, "Default · Work");
+            launcher.handle_key_down(&key("cmd-shift-a"), window, cx);
+            assert_eq!(launcher.picker, Some(Picker::Account));
+            launcher.highlight = 2;
+            launcher.commit_highlight(window, cx);
+            assert_eq!(launcher.selected_account.as_deref(), Some("work"));
+            let mut recipe = LaunchRecipe::draft(
+                "Work",
+                AgentKind::CODEX,
+                RecipeProject::Path {
+                    path: "/tmp".into(),
+                },
+                None,
+                "Check this",
+            );
+            recipe.account_profile_id = launcher.selected_account.clone();
+            let mut recipe: LaunchRecipe =
+                serde_json::from_slice(&serde_json::to_vec(&recipe).unwrap()).unwrap();
+            assert!(launcher.validate_recipe_account(&recipe).is_ok());
+            launcher.accounts.profiles.retain(|p| p.id != "work");
+            assert!(matches!(
+                launcher.validate_recipe_account(&recipe),
+                Err(RecipeIssue::AccountUnavailable)
+            ));
+            launcher.selected_host = Some("server".into());
+            launcher.reconcile_account();
+            assert!(launcher.selected_account.is_none());
+            assert_eq!(launcher.account_choices()[0].1, "Default · Remote");
+            assert_eq!(launcher.account_choices().len(), 3);
+            recipe.account_profile_id = Some(String::new());
+            assert!(launcher.validate_recipe_account(&recipe).is_ok());
+        });
+    }
+
     #[gpui::test]
     fn folder_step_preserves_drafts_and_does_not_collect_invisible_input(cx: &mut TestAppContext) {
         let services = test_services(Arc::new(StoreRuntime::inert()));
@@ -4513,7 +4634,10 @@ mod tests {
             Arc::new(diri_ui::IconAssets),
             gpui_platform::current_headless_renderer,
         );
-        cx.update(|cx| crate::fonts::init(cx));
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
 
         let runtime = Arc::new(StoreRuntime::inert());
         let repository_root = std::env::current_dir()
@@ -4625,6 +4749,15 @@ mod tests {
                     launcher.picker = Some(Picker::Recipe);
                     launcher.highlight = 7;
                     launcher.recipe_scroll.scroll_to_item(7);
+                    if std::env::var_os("DIRI_VISUAL_ACCOUNTS").is_some() {
+                        launcher.accounts.profiles = vec![
+                            account_fixture("work", "codex", None, true),
+                            account_fixture("personal", "codex", None, false),
+                        ];
+                        launcher.picker = Some(Picker::Account);
+                        launcher.highlight = 2;
+                        launcher.selected_account = Some("work".into());
+                    }
                     launcher
                 })
             })

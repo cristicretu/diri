@@ -38,6 +38,7 @@ fn session(value: &str, project: &str, created: f64) -> SessionRecord {
         git_branch: None,
         title: value.to_owned(),
         title_source: TitleSource::Placeholder,
+        account_profile: None,
         originating_prompt: None,
         agent_session_id: None,
         transcript_path: None,

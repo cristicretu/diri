@@ -44,6 +44,7 @@ pub enum SettingsTab {
     #[default]
     General,
     Agents,
+    Accounts,
     Shortcuts,
     Terminal,
     Resources,
@@ -51,9 +52,10 @@ pub enum SettingsTab {
 }
 
 impl SettingsTab {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::General,
         Self::Agents,
+        Self::Accounts,
         Self::Shortcuts,
         Self::Terminal,
         Self::Resources,
@@ -64,6 +66,7 @@ impl SettingsTab {
         match self {
             Self::General => "General",
             Self::Agents => "Agents",
+            Self::Accounts => "Accounts",
             Self::Shortcuts => "Shortcuts",
             Self::Terminal => "Appearance",
             Self::Resources => "Resources",
@@ -75,6 +78,7 @@ impl SettingsTab {
         match self {
             Self::General => "Startup, sessions, and updates",
             Self::Agents => "Installed CLIs and quick create",
+            Self::Accounts => "Profiles for work and personal accounts",
             Self::Shortcuts => "Keyboard commands and bindings",
             Self::Terminal => "Themes and terminal type",
             Self::Resources => "Idle sessions and memory",
@@ -86,7 +90,7 @@ impl SettingsTab {
     /// describe the machines and resources sessions run on.
     pub const fn section(self) -> SettingsSection {
         match self {
-            Self::General | Self::Agents | Self::Shortcuts | Self::Terminal => {
+            Self::General | Self::Agents | Self::Accounts | Self::Shortcuts | Self::Terminal => {
                 SettingsSection::Personal
             }
             Self::Resources | Self::Remote => SettingsSection::System,
@@ -97,6 +101,7 @@ impl SettingsTab {
         match self {
             Self::General => "gearshape",
             Self::Agents => "sparkles",
+            Self::Accounts => "account.circle",
             Self::Shortcuts => "keyboard",
             Self::Terminal => "terminal",
             Self::Resources => "server.rack",

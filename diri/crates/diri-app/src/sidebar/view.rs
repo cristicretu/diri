@@ -3332,6 +3332,7 @@ impl Sidebar {
                                         SpawnOptions {
                                             cwd: Some(target.clone()),
                                             host: spawn_host.clone(),
+                                            account_profile_id: None,
                                             same_repo_as: same_repo_as.clone(),
                                             ..SpawnOptions::default()
                                         },

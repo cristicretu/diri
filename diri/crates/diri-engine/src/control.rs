@@ -59,6 +59,7 @@ pub struct ControlServer {
     browser: std::sync::OnceLock<crate::browser::BrowserPool>,
     active_connections: Arc<AtomicUsize>,
     agent_catalog: Arc<Mutex<crate::agent_catalog::AgentCatalogStore>>,
+    accounts: Mutex<crate::accounts::AccountStore>,
     agent_scans: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>>,
 }
 
@@ -122,8 +123,11 @@ impl ControlServer {
         let agent_catalog = crate::agent_catalog::AgentCatalogStore::new(&agent_config_path)
             .unwrap_or_else(|error| {
                 eprintln!("diri-engine: Agent configuration unavailable: {error}");
-                crate::agent_catalog::AgentCatalogStore::empty(agent_config_path)
+                crate::agent_catalog::AgentCatalogStore::empty(&agent_config_path)
             });
+        let accounts = Mutex::new(crate::accounts::AccountStore::new(
+            agent_config_path.with_file_name("accounts.json"),
+        ));
         let events = crate::events::EventBus::new();
         let activity_path = logs_dir
             .parent()
@@ -147,6 +151,7 @@ impl ControlServer {
             browser: std::sync::OnceLock::new(),
             active_connections: Arc::new(AtomicUsize::new(0)),
             agent_catalog: Arc::new(Mutex::new(agent_catalog)),
+            accounts,
             agent_scans: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
@@ -702,6 +707,20 @@ impl ControlServer {
 
     fn dispatch(&self, method: &str, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         match method {
+            Method::ACCOUNT_PROFILES_LIST => {
+                encode(&self.accounts.lock().map_err(poisoned)?.catalog()?)
+            }
+            Method::ACCOUNT_PROFILES_SAVE => {
+                let profile: diri_proto::AgentAccountProfile = decode(params)?;
+                if let Some(host) = &profile.host {
+                    self.resolve_host(host)?;
+                }
+                encode(&self.accounts.lock().map_err(poisoned)?.upsert(profile)?)
+            }
+            Method::ACCOUNT_PROFILES_REMOVE => {
+                let params: diri_proto::AgentAccountId = decode(params)?;
+                encode(&self.accounts.lock().map_err(poisoned)?.remove(&params.id)?)
+            }
             Method::HELLO => self.hello(params),
             Method::SESSION_SPAWN => self.session_spawn(params),
             Method::SESSION_LIST | Method::STATE_SNAPSHOT => self.session_list(),
@@ -797,8 +816,13 @@ impl ControlServer {
             })
             .unwrap_or_default();
         let p: diri_proto::SessionSpawnParams = decode(Some(raw))?;
+        let mut account_profile = self.accounts.lock().map_err(poisoned)?.resolve(
+            p.account_profile_id.as_deref(),
+            p.kind.id(),
+            p.host.as_deref(),
+        )?;
         if p.host.is_some() {
-            return self.session_spawn_remote(p, argv);
+            return self.session_spawn_remote(p, argv, account_profile);
         }
         let kind = p.kind.id().to_string();
         // A generic kind carries the user's command line inside itself.
@@ -910,7 +934,11 @@ impl ControlServer {
             }
         };
 
+        if let Some(profile) = &mut account_profile {
+            crate::accounts::bind_pty(profile, &mut pty)?;
+        }
         let mut record = new_record(&id, &kind, &cwd);
+        record.account_profile = account_profile;
         record.kind = p.kind.clone();
         record.originating_prompt = p.initial_prompt.clone();
         // A linked worktree is an execution cwd inside the project selected
@@ -958,7 +986,24 @@ impl ControlServer {
                     && let Ok(home) = std::env::var("HOME")
                 {
                     record.transcript_path = Some(
-                        crate::inject::claude_transcript_path(Path::new(&home), &cwd, uuid)
+                        record
+                            .account_profile
+                            .as_ref()
+                            .map_or_else(
+                                || {
+                                    crate::inject::claude_transcript_path(
+                                        Path::new(&home),
+                                        &cwd,
+                                        uuid,
+                                    )
+                                },
+                                |profile| {
+                                    Path::new(&profile.config_home)
+                                        .join("projects")
+                                        .join(crate::inject::claude_project_slug(&cwd))
+                                        .join(format!("{uuid}.jsonl"))
+                                },
+                            )
                             .to_string_lossy()
                             .into_owned(),
                     );
@@ -1019,6 +1064,7 @@ impl ControlServer {
         &self,
         p: diri_proto::SessionSpawnParams,
         caller_argv: Vec<String>,
+        mut account_profile: Option<diri_proto::AgentAccountProfile>,
     ) -> Result<JsonValue, ControlError> {
         let manager = self
             .remote
@@ -1158,7 +1204,13 @@ impl ControlServer {
             pty.rows = rows.clamp(2, u16::MAX as i64) as u16;
         }
 
+        if let Some(profile) = &mut account_profile {
+            crate::accounts::bind_pty(profile, &mut pty)?;
+        }
         let token = random_session_token()?;
+        if let Some(profile) = &account_profile {
+            crate::accounts::prepare_remote_directory(profile, &host, &manager)?;
+        }
         let launch = diri_proto::remote_pty::LaunchRequest {
             session_id: id.clone(),
             session_token: token,
@@ -1180,6 +1232,7 @@ impl ControlServer {
         };
 
         let mut record = new_record(&id, &kind, &captured.cwd);
+        record.account_profile = account_profile;
         record.kind = p.kind.clone();
         record.originating_prompt = p.initial_prompt.clone();
         record.host = Some(host.id.clone());
@@ -1396,6 +1449,11 @@ impl ControlServer {
                 .find(|record| record.id.0 == id)
                 .ok_or_else(|| ControlError::not_found(id.clone()))?
         };
+        if record.account_profile.is_some() {
+            return Err(ControlError::bad_request(
+                "Moving an account-bound session requires an explicit destination account; start a new session on the destination host",
+            ));
+        }
         // Handoff needs no terminal multiplexer of its own. Its phases are
         // git preparation over `hosts::run_shell`, stopping the source through
         // the session's own transport (which signals the remote Agent via its
@@ -1994,7 +2052,7 @@ impl ControlServer {
             }
             record
         };
-        let spec = if record.host.is_some() {
+        let mut spec = if record.host.is_some() {
             self.remote_resume_spec(&record)?
         } else {
             let registry = self.registry.lock().map_err(poisoned)?;
@@ -2006,6 +2064,16 @@ impl ControlServer {
                 record.agent_session_id.as_deref(),
             )?
         };
+        if record.host.is_none()
+            && let Some(mut profile) = record.account_profile.clone()
+        {
+            if profile.host.is_some() || profile.agent != record.kind.id() {
+                return Err(ControlError::bad_request(
+                    "Session account does not match its Agent or host",
+                ));
+            }
+            crate::accounts::bind_pty(&mut profile, &mut spec.pty)?;
+        }
         let remote_persistence = spec.remote.as_ref().map(|remote| remote.launch.persistence);
         let mut registry = self.registry.lock().map_err(poisoned)?;
         let record = registry
@@ -2060,7 +2128,7 @@ impl ControlServer {
         };
         let kind = source.effective_kind().clone();
         let id = next_session_id();
-        let spec = if source.host.is_some() {
+        let mut spec = if source.host.is_some() {
             self.remote_conversation_spec(&source, &id, &kind, ConversationAction::Fork)?
         } else {
             let registry = self.registry.lock().map_err(poisoned)?;
@@ -2074,7 +2142,18 @@ impl ControlServer {
             )?
         };
         let remote_persistence = spec.remote.as_ref().map(|remote| remote.launch.persistence);
+        if source.host.is_none()
+            && let Some(mut profile) = source.account_profile.clone()
+        {
+            if profile.host.is_some() || profile.agent != kind.id() {
+                return Err(ControlError::bad_request(
+                    "Session account does not match its Agent or host",
+                ));
+            }
+            crate::accounts::bind_pty(&mut profile, &mut spec.pty)?;
+        }
         let mut record = new_record(&id, kind.id(), &source.cwd);
+        record.account_profile = source.account_profile.clone();
         record.kind = kind;
         record.project_id = source.project_id.clone();
         record.worktree_path = source.worktree_path.clone();
@@ -2209,11 +2288,20 @@ impl ControlServer {
             .environment
             .into_iter()
             .map(|variable| (variable.name, variable.value));
-        let pty = descriptor
+        let mut pty = descriptor
             .remote_spawn_spec(&cwd, inherited, &launch_args)
             .ok_or_else(|| {
                 ControlError::bad_request(format!("agent {} declares no binary", kind.id()))
             })?;
+        if let Some(mut profile) = record.account_profile.clone() {
+            if profile.host != record.host || profile.agent != kind.id() {
+                return Err(ControlError::bad_request(
+                    "Session account binding does not match its execution target",
+                ));
+            }
+            crate::accounts::bind_pty(&mut profile, &mut pty)?;
+            crate::accounts::prepare_remote_directory(&profile, &host, &manager)?;
+        }
         let launch = diri_proto::remote_pty::LaunchRequest {
             session_id: target_id.to_owned(),
             session_token: random_session_token()?,
@@ -3018,6 +3106,7 @@ pub(crate) fn new_record(id: &str, kind: &str, cwd: &str) -> diri_proto::Session
         git_branch: None,
         title: kind.to_string(),
         title_source: TitleSource::Placeholder,
+        account_profile: None,
         originating_prompt: None,
         agent_session_id: None,
         transcript_path: None,
@@ -3639,6 +3728,7 @@ mod tests {
             git_branch: None,
             title: "test".into(),
             title_source: TitleSource::Placeholder,
+            account_profile: None,
             originating_prompt: None,
             agent_session_id: None,
             transcript_path: None,
@@ -3921,6 +4011,112 @@ mod tests {
             command.contains("'--resume' 'uuid-1' '--fork-session'"),
             "fork grammar must reach the agent: {command:?}"
         );
+    }
+
+    #[test]
+    fn account_binding_survives_profile_edits_removal_resume_and_fork() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let server = server(temp.path());
+        let executable = temp.path().join("codex");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' launch >> \"$CODEX_HOME/launches\"\nexec /bin/sleep 30\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        server
+            .agent_catalog
+            .lock()
+            .unwrap()
+            .configure(
+                None,
+                "codex",
+                crate::agent_catalog::AgentPreference {
+                    executable_path: Some(executable.to_string_lossy().into_owned()),
+                    show_in_quick_create: Some(true),
+                },
+            )
+            .unwrap();
+        let profile = diri_proto::AgentAccountProfile {
+            id: "work".into(),
+            label: "Work".into(),
+            agent: "codex".into(),
+            host: None,
+            config_home: temp
+                .path()
+                .join("work-account")
+                .to_string_lossy()
+                .into_owned(),
+            is_default: true,
+        };
+        server
+            .accounts
+            .lock()
+            .unwrap()
+            .upsert(profile.clone())
+            .unwrap();
+        let spawned = server.session_spawn(Some(json!({"kind": diri_proto::AgentKind::CODEX, "cwd": temp.path(), "accountProfileId": "work"}))).unwrap();
+        let record: diri_proto::SessionRecord = serde_json::from_value(spawned).unwrap();
+        assert_eq!(record.account_profile.as_ref(), Some(&profile));
+        let wait_for_launches = |count| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::fs::read_to_string(Path::new(&profile.config_home).join("launches"))
+                .unwrap_or_default()
+                .lines()
+                .count()
+                < count
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fake provider launch timed out"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        wait_for_launches(1);
+        let mut changed = profile.clone();
+        changed.config_home = temp
+            .path()
+            .join("different-account")
+            .to_string_lossy()
+            .into_owned();
+        server.accounts.lock().unwrap().upsert(changed).unwrap();
+        server.accounts.lock().unwrap().remove("work").unwrap();
+        server
+            .registry
+            .lock()
+            .unwrap()
+            .update_record(&record.id.0, |r| {
+                r.agent_session_id = Some("thread-test".into())
+            });
+        server
+            .session_kill(Some(json!({"sessionID": record.id})))
+            .unwrap();
+        let resumed: diri_proto::SessionRecord = serde_json::from_value(
+            server
+                .session_resume(Some(json!({"sessionID": record.id})))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resumed.account_profile.as_ref(), Some(&profile));
+        wait_for_launches(2);
+        let fork: diri_proto::SessionRecord = serde_json::from_value(
+            server
+                .session_fork(Some(json!({"sessionID": record.id})))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(fork.account_profile.as_ref(), Some(&profile));
+        wait_for_launches(3);
+        server
+            .session_kill(Some(json!({"sessionID": fork.id})))
+            .unwrap();
+        server
+            .session_kill(Some(json!({"sessionID": record.id})))
+            .unwrap();
+        assert!(!temp.path().join("different-account").exists());
+        assert!(server.session_spawn(Some(json!({"kind": diri_proto::AgentKind::CODEX, "cwd": temp.path(), "accountProfileId": "work"}))).is_err());
     }
 
     /// Without a manual path the manifest's binary stays bare: the interactive

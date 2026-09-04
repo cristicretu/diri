@@ -220,6 +220,7 @@ mod tests {
             git_branch: None,
             title: id.into(),
             title_source: TitleSource::Placeholder,
+            account_profile: None,
             originating_prompt: None,
             agent_session_id: None,
             transcript_path: None,

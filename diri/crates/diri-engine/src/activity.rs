@@ -205,6 +205,7 @@ mod tests {
             git_branch: None,
             title: format!("Session {id}"),
             title_source: TitleSource::Placeholder,
+            account_profile: None,
             originating_prompt: None,
             agent_session_id: None,
             transcript_path: None,

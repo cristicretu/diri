@@ -72,6 +72,23 @@ The current baseline:
   capability-compatible Helper is available;
 - retains orchestration and user-facing state in the local Rust Engine.
 
+## Account-profile enhancement
+
+The local Engine owns the account-profile catalog and immutable per-session
+launch binding described in [ACCOUNTS.md](ACCOUNTS.md). A remote profile is scoped
+to one Agent and saved host. Its directory resolves against the remote login
+environment; credentials never move between machines. The Engine prepares a
+missing provider directory with its existing bounded, authenticated fixed-script
+SSH seam (the directory travels as stdin data), then sends the selected provider
+environment through the existing structured LaunchRequest. Resume and fork use
+the recorded binding, not the current catalog default. Cross-host migration of
+bound sessions fails until an explicit destination-account mapping exists.
+
+The Helper protocol and Holder ownership remain unchanged. Account settings,
+directory preparation, and profile resolution belong to the local Engine;
+the Holder receives only the resulting argv/environment/cwd. This enhancement
+adds no remote service, credential store, or transport dependency.
+
 ## Why the old transport was replaced
 
 `tmux` provided a practical PTY, process survival, and reconnection mechanism,

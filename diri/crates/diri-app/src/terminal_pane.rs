@@ -138,6 +138,21 @@ pub struct PaneChip {
 impl PaneChip {
     pub fn for_session(session: &SessionRecord) -> Vec<Self> {
         let mut result = Vec::new();
+        if let Some(profile) = &session.account_profile {
+            result.push(Self {
+                id: "account-profile".into(),
+                label: profile.label.clone(),
+                system_image: "account.circle",
+                open_url: None,
+                copy_string: profile.label.clone(),
+                tint: None,
+                help: format!(
+                    "Launch account: {} · {}",
+                    profile.label, profile.config_home
+                ),
+                checks: None,
+            });
+        }
         let artifacts = session.artifacts.as_deref().unwrap_or_default();
         let statuses = session.pull_requests.as_deref().unwrap_or_default();
         let pull_requests = artifacts

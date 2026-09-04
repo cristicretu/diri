@@ -1519,6 +1519,7 @@ mod tests {
             git_branch: Some(format!("feature/session-{index:02}")),
             title: format!("Overflowing session {index:02}"),
             title_source: TitleSource::AgentProvided,
+            account_profile: None,
             originating_prompt: None,
             agent_session_id: None,
             transcript_path: None,

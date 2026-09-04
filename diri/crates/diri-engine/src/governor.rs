@@ -968,6 +968,7 @@ mod tests {
             git_branch: None,
             title: "Session".into(),
             title_source: TitleSource::Placeholder,
+            account_profile: None,
             originating_prompt: None,
             agent_session_id: None,
             transcript_path: None,

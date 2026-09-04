@@ -134,6 +134,7 @@ mod tests {
             git_branch: None,
             title: title.into(),
             title_source: diri_proto::TitleSource::Placeholder,
+            account_profile: None,
             originating_prompt: None,
             agent_session_id: None,
             transcript_path: None,

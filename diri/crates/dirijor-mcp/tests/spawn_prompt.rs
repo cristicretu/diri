@@ -97,6 +97,7 @@ fn start_server(temp: &Path, fixture: &Path, parent_cwd: &Path) -> Arc<ControlSe
         git_branch: None,
         title: "parent".into(),
         title_source: TitleSource::Placeholder,
+        account_profile: None,
         originating_prompt: None,
         agent_session_id: None,
         transcript_path: None,

@@ -741,6 +741,9 @@ pub struct ActivityEntry {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRecord {
+    /// Immutable launch binding: later catalog edits do not retarget resume or fork.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_profile: Option<crate::AgentAccountProfile>,
     pub id: SessionId,
     pub kind: AgentKind,
     pub cwd: String,

@@ -137,7 +137,17 @@ pub fn scan_roots(claude_root: &Path, codex_root: &Path, tracked: &[String]) -> 
 /// the thread id in both the rollout filename and its first `session_meta`
 /// record. We inspect only the newest bounded set of strict YYYY/MM/DD
 /// directories and require both identities plus the launch cwd to match.
+#[cfg(test)]
 pub(crate) fn find_live_codex_transcript(
+    home: &Path,
+    agent_id: &str,
+    cwd: &str,
+) -> Option<TrustedTranscript> {
+    find_profile_codex_transcript(None, home, agent_id, cwd)
+}
+
+pub(crate) fn find_profile_codex_transcript(
+    profile: Option<&diri_proto::AgentAccountProfile>,
     home: &Path,
     agent_id: &str,
     cwd: &str,
@@ -145,7 +155,9 @@ pub(crate) fn find_live_codex_transcript(
     if !safe_agent_id(agent_id) {
         return None;
     }
-    let root = home.join(".codex/sessions");
+    let root = profile
+        .map_or_else(|| home.join(".codex"), |p| PathBuf::from(&p.config_home))
+        .join("sessions");
     let suffix = format!("-{agent_id}.jsonl");
     let mut seen = 0usize;
     let mut matches = Vec::new();
@@ -164,9 +176,14 @@ pub(crate) fn find_live_codex_transcript(
                 continue;
             }
             let path = entry.path();
-            if let Some(transcript) =
-                validate_transcript_path(home, &AgentKind::CODEX, agent_id, cwd, &path)
-            {
+            if let Some(transcript) = validate_profile_transcript_path(
+                profile,
+                home,
+                &AgentKind::CODEX,
+                agent_id,
+                cwd,
+                &path,
+            ) {
                 let modified = transcript
                     .file
                     .metadata()
@@ -188,7 +205,19 @@ pub(crate) fn find_live_codex_transcript(
 /// The path must resolve inside the provider's transcript root, must not be a
 /// symlink or non-regular file, must belong to this user, and must be tied to
 /// the provider conversation identity.
+#[cfg(test)]
 pub(crate) fn validate_transcript_path(
+    home: &Path,
+    kind: &AgentKind,
+    agent_id: &str,
+    cwd: &str,
+    path: &Path,
+) -> Option<TrustedTranscript> {
+    validate_profile_transcript_path(None, home, kind, agent_id, cwd, path)
+}
+
+pub(crate) fn validate_profile_transcript_path(
+    profile: Option<&diri_proto::AgentAccountProfile>,
     home: &Path,
     kind: &AgentKind,
     agent_id: &str,
@@ -198,10 +227,21 @@ pub(crate) fn validate_transcript_path(
     if !safe_agent_id(agent_id) {
         return None;
     }
-    let root = match kind.id() {
-        AgentKind::CLAUDE_CODE_ID => home.join(".claude/projects"),
-        AgentKind::CODEX_ID => home.join(".codex/sessions"),
-        _ => return None,
+    let root = if let Some(profile) = profile {
+        if profile.agent != kind.id() || profile.host.is_some() {
+            return None;
+        }
+        PathBuf::from(&profile.config_home).join(match kind.id() {
+            AgentKind::CLAUDE_CODE_ID => "projects",
+            AgentKind::CODEX_ID => "sessions",
+            _ => return None,
+        })
+    } else {
+        match kind.id() {
+            AgentKind::CLAUDE_CODE_ID => home.join(".claude/projects"),
+            AgentKind::CODEX_ID => home.join(".codex/sessions"),
+            _ => return None,
+        }
     };
     let mut file = open_trusted_regular_file(&root, path)?;
     match kind.id() {
@@ -759,11 +799,20 @@ struct CodexTitleCandidates {
 /// the provider's own priority: an explicit `/rename`, then the append-only
 /// session index, then Codex's generated title or first prompt in its state
 /// database. All files are local, read-only, owner-controlled, and bounded.
+#[cfg(test)]
 pub(crate) fn codex_title(home: &Path, thread_id: &str) -> Option<String> {
+    profile_codex_title(None, home, thread_id)
+}
+
+pub(crate) fn profile_codex_title(
+    profile: Option<&diri_proto::AgentAccountProfile>,
+    home: &Path,
+    thread_id: &str,
+) -> Option<String> {
     if !safe_agent_id(thread_id) {
         return None;
     }
-    let codex_home = home.join(".codex");
+    let codex_home = profile.map_or_else(|| home.join(".codex"), |p| PathBuf::from(&p.config_home));
     let database = codex_database_titles(&codex_home, thread_id).unwrap_or_default();
     database
         .explicit
@@ -1282,6 +1331,49 @@ mod tests {
         );
         assert!(find_live_codex_transcript(home.path(), "thread-9", "/wrong").is_none());
         assert!(find_live_codex_transcript(home.path(), "../escape", "/work/app").is_none());
+    }
+
+    #[test]
+    fn profile_transcripts_and_titles_use_only_the_bound_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("work-codex");
+        let profile = diri_proto::AgentAccountProfile {
+            id: "work".into(),
+            label: "Work".into(),
+            agent: "codex".into(),
+            host: None,
+            config_home: config.to_string_lossy().into_owned(),
+            is_default: false,
+        };
+        let transcript = config.join("sessions/2026/09/04/rollout-now-thread-9.jsonl");
+        write(
+            &transcript,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-9\",\"cwd\":\"/work/app\"}}\n",
+        );
+        write(
+            &config.join("session_index.jsonl"),
+            "{\"id\":\"thread-9\",\"thread_name\":\"Work title\"}\n",
+        );
+        assert_eq!(
+            find_profile_codex_transcript(Some(&profile), home.path(), "thread-9", "/work/app")
+                .map(|t| t.path().to_path_buf()),
+            Some(transcript.clone())
+        );
+        assert!(
+            validate_transcript_path(
+                home.path(),
+                &AgentKind::CODEX,
+                "thread-9",
+                "/work/app",
+                &transcript
+            )
+            .is_none()
+        );
+        assert_eq!(
+            profile_codex_title(Some(&profile), home.path(), "thread-9").as_deref(),
+            Some("Work title")
+        );
+        assert_eq!(codex_title(home.path(), "thread-9"), None);
     }
 
     #[cfg(unix)]

@@ -205,8 +205,17 @@ fn a_capsule_and_hook_seed_recover_a_holder_when_global_state_is_gone() {
 
     let recovery_dir = root.join("sessions/s_recover");
     let store = diri_proto::recovery::SessionRecoveryStore::new(&recovery_dir);
+    let profile = diri_proto::AgentAccountProfile {
+        id: "work".into(),
+        label: "Work".into(),
+        agent: "claude-code".into(),
+        host: None,
+        config_home: "/tmp/work-claude".into(),
+        is_default: false,
+    };
     store
         .write_capsule(&diri_proto::recovery::SessionRecoveryCapsule {
+            account_profile: Some(profile.clone()),
             version: diri_proto::recovery::SessionRecoveryCapsule::VERSION,
             session_id: diri_proto::SessionId::new("s_recover"),
             manifest_id: AgentKind::CLAUDE_CODE_ID.into(),
@@ -234,6 +243,7 @@ fn a_capsule_and_hook_seed_recover_a_holder_when_global_state_is_gone() {
     assert_eq!(adopted, ["s_recover"]);
     let recovered = registry.record("s_recover").expect("recovered record");
     assert_eq!(recovered.kind, AgentKind::CLAUDE_CODE);
+    assert_eq!(recovered.account_profile, Some(profile));
     assert_eq!(recovered.cwd, "/tmp/recovered-project");
     assert_eq!(
         recovered.agent_session_id.as_deref(),
@@ -291,6 +301,7 @@ fn record(id: &str) -> diri_proto::SessionRecord {
         git_branch: None,
         title: "test".into(),
         title_source: TitleSource::Placeholder,
+        account_profile: None,
         originating_prompt: None,
         agent_session_id: None,
         transcript_path: None,

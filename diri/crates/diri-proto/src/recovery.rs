@@ -28,6 +28,8 @@ pub const LAST_ACTIVITY_FILE: &str = "last-activity.json";
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRecoveryCapsule {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_profile: Option<crate::AgentAccountProfile>,
     pub version: u32,
     pub session_id: SessionId,
     pub manifest_id: String,
@@ -189,6 +191,7 @@ mod tests {
 
     fn capsule() -> SessionRecoveryCapsule {
         SessionRecoveryCapsule {
+            account_profile: None,
             version: SessionRecoveryCapsule::VERSION,
             session_id: SessionId::new("s_one"),
             manifest_id: "claude-code".into(),

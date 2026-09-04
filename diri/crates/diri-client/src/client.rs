@@ -829,6 +829,28 @@ impl DaemonClient {
         self.no_params(Method::DAEMON_SHUTDOWN_IF_IDLE).await
     }
 
+    pub async fn account_profiles(&self) -> Result<diri_proto::AgentAccountCatalog, ClientError> {
+        self.no_params(Method::ACCOUNT_PROFILES_LIST).await
+    }
+
+    pub async fn save_account_profile(
+        &self,
+        profile: &diri_proto::AgentAccountProfile,
+    ) -> Result<diri_proto::AgentAccountCatalog, ClientError> {
+        self.typed(Method::ACCOUNT_PROFILES_SAVE, profile).await
+    }
+
+    pub async fn remove_account_profile(
+        &self,
+        id: String,
+    ) -> Result<diri_proto::AgentAccountCatalog, ClientError> {
+        self.typed(
+            Method::ACCOUNT_PROFILES_REMOVE,
+            &diri_proto::AgentAccountId { id },
+        )
+        .await
+    }
+
     async fn typed<P, R>(&self, method: &str, params: &P) -> Result<R, ClientError>
     where
         P: Serialize + ?Sized,
@@ -1089,6 +1111,7 @@ mod tests {
                     initial_cols: Some(80),
                     initial_rows: Some(24),
                     host: None,
+                    account_profile_id: None,
                     same_repo_as: None,
                 })
                 .await?;

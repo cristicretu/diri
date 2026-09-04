@@ -372,6 +372,7 @@ fn migration_and_host_methods_use_the_swift_wire_names() {
         serde_json::from_value(json!({"kind": {"shell": {}}, "cwd": "/tmp"})).unwrap();
     assert_eq!(legacy.same_repo_as, None);
     let preserving = diri_proto::SessionSpawnParams {
+        account_profile_id: None,
         same_repo_as: Some(diri_proto::SessionId::new("s_ref")),
         ..legacy
     };

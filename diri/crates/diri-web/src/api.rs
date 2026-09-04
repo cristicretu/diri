@@ -233,6 +233,7 @@ impl Api {
             initial_cols: Some(120),
             initial_rows: Some(32),
             host: body.get("host").and_then(Value::as_str).map(str::to_string),
+            account_profile_id: None,
             same_repo_as: None,
         };
 
