@@ -36,8 +36,9 @@ use crate::events::EventBus;
 use crate::holder::process_tree;
 use crate::registry::Registry;
 
-/// Tunables, defaulting to the Swift daemon's values. `governor.configure`
-/// overrides the two the app exposes.
+/// Tunables. `governor.configure` overrides the two the app exposes; the
+/// rest are the daemon's own, and err towards leaving sessions alone: a
+/// freeze the user did not ask for costs far more than the memory it saves.
 #[derive(Clone, Debug)]
 pub struct GovernorConfig {
     pub idle_threshold_seconds: f64,
@@ -62,10 +63,10 @@ pub struct GovernorConfig {
 impl Default for GovernorConfig {
     fn default() -> Self {
         Self {
-            idle_threshold_seconds: 900.0,
-            hard_memory_bytes: 6 << 30,
-            global_budget_fraction: 0.75,
-            budget_min_idle_seconds: 300.0,
+            idle_threshold_seconds: 3600.0,
+            hard_memory_bytes: 16 << 30,
+            global_budget_fraction: 0.9,
+            budget_min_idle_seconds: 1800.0,
             hibernated_sample_every: 5,
             port_scan_enabled: true,
             scan_interval: Duration::from_secs(30),

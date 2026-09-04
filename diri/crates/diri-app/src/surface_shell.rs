@@ -2744,14 +2744,14 @@ impl UtilitySurfaces {
                         .flex_col()
                         .child(setting_row(
                             "Hibernate idle sessions",
-                            "Freeze inactive sessions after this amount of time.",
+                            "Freeze a session once it has sat idle, with no output or CPU activity, for this long.",
                             self.hibernate_dropdown(cx),
                             colors,
                         ))
                         .child(setting_divider(colors))
                         .child(setting_row(
                             "Memory limit",
-                            "Freeze an individual session when it reaches this size.",
+                            "Freeze an idle session when its process tree reaches this size.",
                             self.memory_dropdown(cx),
                             colors,
                         )),
@@ -3624,12 +3624,13 @@ impl UtilitySurfaces {
     }
 
     fn hibernate_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
-        const OPTIONS: [(u32, &str); 5] = [
+        const OPTIONS: [(u32, &str); 6] = [
             (0, "Off"),
-            (5, "5 minutes"),
             (15, "15 minutes"),
             (30, "30 minutes"),
             (60, "1 hour"),
+            (120, "2 hours"),
+            (240, "4 hours"),
         ];
         let colors = self.settings_colors();
         let selected_label = OPTIONS
@@ -3674,7 +3675,7 @@ impl UtilitySurfaces {
     }
 
     fn memory_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
-        const OPTIONS: [u64; 4] = [2, 4, 6, 8];
+        const OPTIONS: [u64; 6] = [4, 8, 16, 32, 64, 128];
         let colors = self.settings_colors();
         let open = self.settings_menu == Some(SettingsMenu::MemoryLimit);
         let mut control = div()

@@ -93,6 +93,15 @@ pub struct Prefs {
     pub skipped_update_version: String,
     pub hibernate_after_minutes: u32,
     pub memory_hard_limit_gb: u64,
+    /// Which generation of hibernation defaults this file was last brought
+    /// up to. Prefs are written wholesale, so an old default is
+    /// indistinguishable from a choice; this lets a raised default reach
+    /// users who never touched the setting, once, without ever moving a
+    /// value that differs from the old default. Field-level default so a
+    /// file written before the field existed reads as revision 0, not as
+    /// whatever `Prefs::default()` currently carries.
+    #[serde(default)]
+    pub hibernation_defaults_revision: u32,
     pub terminal_theme: String,
     pub terminal_font_size: f32,
     /// Last size, position, and presentation mode of the main window.
@@ -136,8 +145,9 @@ impl Default for Prefs {
             status_sounds: true,
             automatic_updates: true,
             skipped_update_version: String::new(),
-            hibernate_after_minutes: 15,
-            memory_hard_limit_gb: 6,
+            hibernate_after_minutes: 60,
+            memory_hard_limit_gb: 16,
+            hibernation_defaults_revision: Self::HIBERNATION_DEFAULTS_REVISION,
             terminal_theme: DEFAULT_THEME.to_owned(),
             terminal_font_size: 13.0,
             window_placement: None,
@@ -176,11 +186,16 @@ impl Prefs {
         DirijorPaths::prefs_file(home)
     }
 
+    /// Bump when a hibernation default changes, and teach
+    /// [`Self::migrate_hibernation_defaults`] the old value to move.
+    pub const HIBERNATION_DEFAULTS_REVISION: u32 = 1;
+
     pub fn load(path: &Path) -> io::Result<Self> {
         match fs::read(path) {
             Ok(bytes) => {
                 let mut prefs: Self = serde_json::from_slice(&bytes)
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                prefs.migrate_hibernation_defaults();
                 prefs.normalize();
                 Ok(prefs)
             }
@@ -210,6 +225,22 @@ impl Prefs {
 
     pub fn reset_terminal_zoom(&mut self) {
         self.terminal_font_size = 13.0;
+    }
+
+    /// Moves values still sitting on a superseded default onto the current
+    /// one. Anything the user changed from the old default is left alone.
+    pub fn migrate_hibernation_defaults(&mut self) {
+        if self.hibernation_defaults_revision < 1 {
+            // Revision 1 (2026-09): 15 min → 1 h, 6 GB → 16 GB. Sessions
+            // were being frozen mid-work far too readily.
+            if self.hibernate_after_minutes == 15 {
+                self.hibernate_after_minutes = 60;
+            }
+            if self.memory_hard_limit_gb == 6 {
+                self.memory_hard_limit_gb = 16;
+            }
+        }
+        self.hibernation_defaults_revision = Self::HIBERNATION_DEFAULTS_REVISION;
     }
 
     pub fn normalize(&mut self) {
@@ -256,6 +287,45 @@ impl Prefs {
 mod tests {
     use super::*;
     use crate::launch_recipe::{LaunchRecipe, RecipeProject};
+
+    fn prefs_with_hibernation(minutes: u32, gb: u64, revision: Option<u32>) -> Prefs {
+        let mut value = serde_json::to_value(Prefs::default()).expect("serialize prefs");
+        value["hibernateAfterMinutes"] = serde_json::json!(minutes);
+        value["memoryHardLimitGb"] = serde_json::json!(gb);
+        match revision {
+            Some(revision) => value["hibernationDefaultsRevision"] = serde_json::json!(revision),
+            None => {
+                value
+                    .as_object_mut()
+                    .expect("prefs object")
+                    .remove("hibernationDefaultsRevision");
+            }
+        }
+        let mut prefs: Prefs = serde_json::from_value(value).expect("readable");
+        prefs.migrate_hibernation_defaults();
+        prefs
+    }
+
+    #[test]
+    fn stale_hibernation_defaults_move_to_the_current_ones_once() {
+        // A file written before the revision field existed, still on the
+        // old defaults: both move.
+        let migrated = prefs_with_hibernation(15, 6, None);
+        assert_eq!(migrated.hibernate_after_minutes, 60);
+        assert_eq!(migrated.memory_hard_limit_gb, 16);
+        assert_eq!(
+            migrated.hibernation_defaults_revision,
+            Prefs::HIBERNATION_DEFAULTS_REVISION
+        );
+        // A deliberate choice away from the old defaults is untouched.
+        let chosen = prefs_with_hibernation(30, 8, None);
+        assert_eq!(chosen.hibernate_after_minutes, 30);
+        assert_eq!(chosen.memory_hard_limit_gb, 8);
+        // Choosing the old default AFTER the migration ran sticks.
+        let rechosen = prefs_with_hibernation(15, 6, Some(1));
+        assert_eq!(rechosen.hibernate_after_minutes, 15);
+        assert_eq!(rechosen.memory_hard_limit_gb, 6);
+    }
 
     #[test]
     fn older_preferences_migrate_to_an_empty_recipe_book() {
