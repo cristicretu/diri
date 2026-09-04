@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -131,6 +132,12 @@ pub struct Prefs {
     /// Versioned, locally owned one-action Agent workflows.
     #[serde(default, deserialize_with = "deserialize_recipe_book")]
     pub launch_recipes: LaunchRecipeBook,
+    /// Per-command keyboard overrides keyed by the command registry's stable
+    /// id. A missing entry uses the shipped binding, `null` leaves the command
+    /// unassigned, and a string contains a GPUI keystroke such as `cmd-shift-p`.
+    /// Unknown ids are retained so opening these preferences in an older diri
+    /// build does not erase settings written by a newer one.
+    pub shortcut_overrides: BTreeMap<String, Option<String>>,
     /// Session that should regain focus after the daemon's initial hydrate.
     pub last_selected_session: Option<SessionId>,
 }
@@ -166,6 +173,7 @@ impl Default for Prefs {
             sidebar_collapsed_sessions: Vec::new(),
             sidebar_expanded_archives: Vec::new(),
             launch_recipes: LaunchRecipeBook::default(),
+            shortcut_overrides: BTreeMap::new(),
             last_selected_session: None,
         }
     }
@@ -336,6 +344,17 @@ mod tests {
             .remove("launchRecipes");
         let prefs: Prefs = serde_json::from_value(value).expect("old preferences remain readable");
         assert!(prefs.launch_recipes.items().is_empty());
+    }
+
+    #[test]
+    fn older_preferences_migrate_to_default_shortcuts() {
+        let mut value = serde_json::to_value(Prefs::default()).expect("serialize prefs");
+        value
+            .as_object_mut()
+            .expect("prefs object")
+            .remove("shortcutOverrides");
+        let prefs: Prefs = serde_json::from_value(value).expect("old preferences remain readable");
+        assert!(prefs.shortcut_overrides.is_empty());
     }
 
     #[test]
