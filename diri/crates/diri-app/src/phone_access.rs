@@ -68,6 +68,50 @@ impl Drop for PhoneAccess {
 }
 
 async fn tailscale_address() -> Result<Ipv4Addr, String> {
+    match check_tailscale().await {
+        TailscaleSetup::Ready(address) => Ok(address),
+        state => Err(state.message().into()),
+    }
+}
+
+/// Sanitized setup facts only. Never surface status JSON, login URLs or profiles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TailscaleSetup {
+    NotInstalled,
+    NeedsLogin,
+    NeedsApproval,
+    Stopped,
+    Unavailable,
+    Ready(Ipv4Addr),
+}
+
+impl TailscaleSetup {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::NotInstalled => {
+                "Install Tailscale on this Mac. It creates a private connection to your iPhone, even away from home."
+            }
+            Self::NeedsLogin => {
+                "Tailscale is installed. Open it and sign in with the account you’ll use on your iPhone."
+            }
+            Self::NeedsApproval => {
+                "This Mac needs approval from your Tailscale administrator. Ask them to approve it, then check again."
+            }
+            Self::Stopped => {
+                "Tailscale is signed in but disconnected. Open its menu and turn it on, then check again."
+            }
+            Self::Unavailable => {
+                "Diri couldn’t confirm the Tailscale connection. Open Tailscale, finish its setup and check again."
+            }
+            Self::Ready(_) => {
+                "Tailscale is connected on this Mac. Next, connect your iPhone using the same account."
+            }
+        }
+    }
+}
+
+pub async fn check_tailscale() -> TailscaleSetup {
+    let mut result = TailscaleSetup::NotInstalled;
     for executable in [
         "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
         "/opt/homebrew/bin/tailscale",
@@ -77,6 +121,7 @@ async fn tailscale_address() -> Result<Ipv4Addr, String> {
         if !std::path::Path::new(executable).is_file() {
             continue;
         }
+        result = TailscaleSetup::Unavailable;
         let output = tokio::time::timeout(
             Duration::from_secs(5),
             tokio::process::Command::new(executable)
@@ -90,14 +135,28 @@ async fn tailscale_address() -> Result<Ipv4Addr, String> {
         )
         .await;
         if let Ok(Ok(output)) = output
-            && output.status.success()
             && let Ok(status) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
-            && let Some(address) = address_from_status(&status)
         {
-            return Ok(address);
+            // `status` may exit nonzero while still reporting NeedsLogin.
+            result = setup_from_status(&status);
+            if result != TailscaleSetup::Unavailable {
+                return result;
+            }
         }
     }
-    Err("Open Tailscale on this Mac and sign in. Then connect Tailscale on your iPhone with the same account and try again.".into())
+    result
+}
+
+fn setup_from_status(status: &serde_json::Value) -> TailscaleSetup {
+    match status["BackendState"].as_str() {
+        Some("NeedsLogin") => TailscaleSetup::NeedsLogin,
+        Some("NeedsMachineAuth") => TailscaleSetup::NeedsApproval,
+        Some("Stopped") => TailscaleSetup::Stopped,
+        Some("Running") => address_from_status(status)
+            .map(TailscaleSetup::Ready)
+            .unwrap_or(TailscaleSetup::Unavailable),
+        _ => TailscaleSetup::Unavailable,
+    }
 }
 
 fn address_from_status(status: &serde_json::Value) -> Option<Ipv4Addr> {
@@ -117,6 +176,34 @@ fn address_from_status(status: &serde_json::Value) -> Option<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn setup_distinguishes_actionable_states_without_exposing_status_data() {
+        for (state, expected) in [
+            ("NeedsLogin", TailscaleSetup::NeedsLogin),
+            ("NeedsMachineAuth", TailscaleSetup::NeedsApproval),
+            ("Stopped", TailscaleSetup::Stopped),
+            ("Starting", TailscaleSetup::Unavailable),
+            ("Running", TailscaleSetup::Unavailable),
+        ] {
+            assert_eq!(
+                setup_from_status(&serde_json::json!({
+                    "BackendState": state, "AuthURL": "secret", "TailscaleIPs": ["192.168.1.2"]
+                })),
+                expected
+            );
+            assert!(!expected.message().contains("secret"));
+        }
+        assert_eq!(
+            setup_from_status(&serde_json::json!({
+                "BackendState": "Running", "TailscaleIPs": ["100.90.0.2"]
+            })),
+            TailscaleSetup::Ready(Ipv4Addr::new(100, 90, 0, 2))
+        );
+        assert_eq!(
+            setup_from_status(&serde_json::json!({})),
+            TailscaleSetup::Unavailable
+        );
+    }
     #[test]
     fn only_a_running_private_tailnet_is_eligible() {
         for state in ["Stopped", "NeedsLogin"] {

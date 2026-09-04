@@ -58,6 +58,18 @@ actor DiriClient {
     private let endpoint: Endpoint
     private let session: URLSession
 
+    /// Enrollment must fail promptly with actionable setup guidance. Normal
+    /// session traffic can wait across network changes; a first-time pairing
+    /// must not inherit URLSession's multi-day resource timeout.
+    static func pairingConfiguration() -> URLSessionConfiguration {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 15
+        configuration.timeoutIntervalForResource = 20
+        configuration.waitsForConnectivity = false
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return configuration
+    }
+
     /// `configuration` exists so tests can install a stub `URLProtocol`. The
     /// requests this builds are a contract with `diri-web` — a wrong path or a
     /// missing header fails identically to the daemon being down, which is the

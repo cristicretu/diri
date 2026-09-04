@@ -34,9 +34,14 @@ xcodebuild -project DiriPhone.xcodeproj -scheme DiriPhone \
 ## Set up phone access (no terminal required)
 
 1. Install a signed Diri iPhone build. Distribution is described below.
-2. Install/connect Tailscale on the Mac and iPhone, using the same account.
-3. In Diri on the Mac, open **Settings → Phone access → Enable phone access**.
-4. In Diri on the phone, tap **Scan pairing code**. Alternatively copy the
+2. In Diri on the Mac, open **Settings → Phone access → Check this Mac**.
+   Follow the install/sign-in/connect guidance, then check again. Diri only
+   reads Tailscale's status; installation and VPN permissions stay in Tailscale.
+3. Follow the iPhone setup guide. It links directly to Tailscale in the App
+   Store: sign in with the same account, allow the VPN configuration, and return
+   to Diri. No exit node, Tailscale SSH, router changes or commands are needed.
+4. On the Mac, **Enable phone access & show code**. On the phone, tap
+   **Scan pairing code**. Alternatively copy the
    pairing link from the Mac and paste it on the phone. Connection is verified
    before saving credentials in Keychain.
 5. Keep Diri open and the Mac plugged in with its lid open. Diri prevents idle
@@ -139,25 +144,18 @@ keeps the original value visible next to it.
 
 ## Distribution
 
-The simulator is the only target this repository can verify on its own — CI has
-no signing identity, so `CODE_SIGNING_ALLOWED` is off. Getting this onto a
-physical phone needs a development team set in Xcode, and a free provisioning
-profile expires after seven days. Until that is sorted, the
-[web frontend](../diri/crates/diri-web) serves the same daemon to mobile Safari
-and installs to the home screen with no signing at all.
-
-For a device archive, supply the team's signing configuration rather than
-changing the simulator defaults:
+See [TESTFLIGHT.md](TESTFLIGHT.md) for owner setup, signing, privacy/review
+notes, upload steps, and the physical-device checklist. Simulator signing is
+off; device builds use automatic signing with your explicit development team.
 
 ```sh
-xcodebuild -project DiriPhone.xcodeproj -scheme DiriPhone \
-  -destination 'generic/platform=iOS' -archivePath build/DiriPhone.xcarchive \
-  CODE_SIGNING_ALLOWED=YES DEVELOPMENT_TEAM=YOUR_TEAM_ID archive
+bash scripts/testflight.sh check
+DIRI_APPLE_TEAM_ID=YOURTEAMID DIRI_BUILD_NUMBER=2 \
+  bash scripts/testflight.sh archive
 ```
 
-No App Store/TestFlight upload is performed by this repository. Before a phone
-release, verify camera pairing on a real signed device, then turn Wi-Fi off and
-create/send to both a local session and an initialized SSH-host session over
-cellular/Tailscale. Lock/unlock the phone, reconnect, review changes, and confirm
-that disabling access immediately disconnects it. Verify a fresh workspace's
-HEAD equals main while the original repository remains on a different branch.
+The scripts never upload, invite testers, or overwrite an existing archive.
+The committed app icon is generated from the code-native Diri terminal mark;
+run `xcrun swift scripts/render-app-icon.swift` only when updating that artwork.
+A successful unsigned build is not proof of signing, TestFlight acceptance,
+camera permission behavior, or real cellular/Tailscale connectivity.

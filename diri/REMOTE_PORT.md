@@ -648,6 +648,16 @@ Tailscale enrollment remain external setup requirements. Push notifications,
 shared users, unattended gateway startup, and rich terminal rendering are
 not included in this feature.
 
+Setup guides users through Mac readiness, iPhone Tailscale sign-in and QR
+pairing. The Mac performs a read-only, bounded status check and distinguishes
+missing installation, sign-in, administrator approval, disconnection and an
+eligible private IPv4 address. Install/open links hand off to Tailscale; Diri
+does not approve permissions, change routes, enroll devices or handle account
+credentials. The iPhone verifies authenticated gateway access after scanning;
+its checklist alone never claims verified connectivity. Release preparation,
+owner signing requirements and physical-device gates are in
+`../ios/TESTFLIGHT.md`; unsigned archives do not satisfy distribution gates.
+
 `host.list` is a read-only Engine catalog projection (id, name, defaultCwd),
 excluding SSH/node credentials. `/api/agents?host=…` and
 `/api/directories?host=…&path=…` use existing Engine discovery/browse operations.

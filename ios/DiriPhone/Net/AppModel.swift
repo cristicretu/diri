@@ -161,7 +161,7 @@ final class AppModel {
             throw DiriClient.Failure.http(400, "Use the pairing code or link in Diri → Settings → Phone access on your Mac.")
         }
         // Verify authenticated Engine access before replacing saved credentials.
-        _ = try await DiriClient(endpoint: candidate).sessions()
+        _ = try await DiriClient(endpoint: candidate, configuration: DiriClient.pairingConfiguration()).sessions()
         try Task.checkCancellation()
         endpoint = candidate
     }

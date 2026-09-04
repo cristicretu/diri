@@ -12,9 +12,9 @@ settings:
     ENABLE_USER_SCRIPT_SANDBOXING: YES
     SWIFT_STRICT_CONCURRENCY: complete
     CODE_SIGN_STYLE: Automatic
-    # The simulator is the only target this repository can verify on its own;
-    # a device build needs a signing identity the CI machine does not have.
-    CODE_SIGNING_ALLOWED: NO
+    "CODE_SIGNING_ALLOWED[sdk=iphonesimulator*]": NO
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
 
 targets:
   DiriPhone:
@@ -26,8 +26,8 @@ targets:
       path: DiriPhone/Info.plist
       properties:
         CFBundleDisplayName: diri
-        CFBundleShortVersionString: "0.1.0"
-        CFBundleVersion: "1"
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSCameraUsageDescription: Scan the private pairing code shown in Diri on your Mac.
         NSLocalNetworkUsageDescription: Connect to Diri on your Mac to control your coding sessions.
         UILaunchScreen:
@@ -77,3 +77,5 @@ schemes:
     test:
       targets:
         - DiriPhoneTests
+    archive:
+      config: Release
