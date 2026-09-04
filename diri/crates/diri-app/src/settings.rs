@@ -45,15 +45,17 @@ pub enum SettingsTab {
     General,
     Agents,
     Terminal,
+    Usage,
     Resources,
     Remote,
 }
 
 impl SettingsTab {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::General,
         Self::Agents,
         Self::Terminal,
+        Self::Usage,
         Self::Resources,
         Self::Remote,
     ];
@@ -63,6 +65,7 @@ impl SettingsTab {
             Self::General => "General",
             Self::Agents => "Agents",
             Self::Terminal => "Terminal",
+            Self::Usage => "Usage",
             Self::Resources => "Resources",
             Self::Remote => "Remote",
         }
@@ -73,6 +76,7 @@ impl SettingsTab {
             Self::General => "Startup, sessions, and updates",
             Self::Agents => "Installed CLIs and quick create",
             Self::Terminal => "Appearance and text size",
+            Self::Usage => "Costs, tokens, and cache savings",
             Self::Resources => "Idle sessions and memory",
             Self::Remote => "SSH execution hosts",
         }
@@ -82,7 +86,9 @@ impl SettingsTab {
     /// describe the machines and resources sessions run on.
     pub const fn section(self) -> SettingsSection {
         match self {
-            Self::General | Self::Agents | Self::Terminal => SettingsSection::Personal,
+            Self::General | Self::Agents | Self::Terminal | Self::Usage => {
+                SettingsSection::Personal
+            }
             Self::Resources | Self::Remote => SettingsSection::System,
         }
     }
@@ -92,6 +98,7 @@ impl SettingsTab {
             Self::General => "gearshape",
             Self::Agents => "sparkles",
             Self::Terminal => "terminal",
+            Self::Usage => "chart.bar.xaxis",
             Self::Resources => "server.rack",
             Self::Remote => "network",
         }

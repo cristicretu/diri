@@ -2605,6 +2605,7 @@ impl Sidebar {
             Some(PREVIEW_USAGE)
         } else {
             self.usage
+                .as_ref()
                 .map(|snapshot| snapshot.today().cost)
                 .filter(|cost| *cost > 0.0)
         };
@@ -3624,7 +3625,7 @@ impl Sidebar {
                     "$86.40",
                     colors,
                 ));
-        } else if let Some(snapshot) = self.usage {
+        } else if let Some(snapshot) = &self.usage {
             usage = usage
                 .child(usage_menu_row(
                     "account-usage-session",
