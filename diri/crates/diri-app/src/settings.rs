@@ -48,16 +48,18 @@ pub enum SettingsTab {
     Terminal,
     Resources,
     Remote,
+    Phone,
 }
 
 impl SettingsTab {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::General,
         Self::Agents,
         Self::Shortcuts,
         Self::Terminal,
         Self::Resources,
         Self::Remote,
+        Self::Phone,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -68,6 +70,7 @@ impl SettingsTab {
             Self::Terminal => "Appearance",
             Self::Resources => "Resources",
             Self::Remote => "Remote",
+            Self::Phone => "Phone access",
         }
     }
 
@@ -79,6 +82,7 @@ impl SettingsTab {
             Self::Terminal => "Themes and terminal type",
             Self::Resources => "Idle sessions and memory",
             Self::Remote => "SSH execution hosts",
+            Self::Phone => "Code from your iPhone",
         }
     }
 
@@ -89,7 +93,7 @@ impl SettingsTab {
             Self::General | Self::Agents | Self::Shortcuts | Self::Terminal => {
                 SettingsSection::Personal
             }
-            Self::Resources | Self::Remote => SettingsSection::System,
+            Self::Resources | Self::Remote | Self::Phone => SettingsSection::System,
         }
     }
 
@@ -101,6 +105,7 @@ impl SettingsTab {
             Self::Terminal => "terminal",
             Self::Resources => "server.rack",
             Self::Remote => "network",
+            Self::Phone => "iphone",
         }
     }
 }

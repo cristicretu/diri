@@ -27,6 +27,7 @@ mod menu_inbox;
 pub mod navigation;
 pub mod notifications;
 pub mod palette;
+mod phone_access;
 mod platform;
 pub mod query_editor;
 pub mod quick_open;

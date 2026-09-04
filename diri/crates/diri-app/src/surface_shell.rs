@@ -248,6 +248,9 @@ impl HostEditor {
 }
 
 pub struct UtilitySurfaces {
+    phone_access: Option<crate::phone_access::PhoneAccess>,
+    phone_loading: bool,
+    phone_error: Option<String>,
     focus: FocusHandle,
     surface: Surface,
     history: Vec<HistoryEntry>,
@@ -316,6 +319,7 @@ impl UtilitySurfaces {
             Some("shortcuts") => SettingsTab::Shortcuts,
             Some("resources") => SettingsTab::Resources,
             Some("remote") => SettingsTab::Remote,
+            Some("phone") => SettingsTab::Phone,
             _ => SettingsTab::General,
         };
         let diagnostics_preview = settings_preview.as_deref() == Some("diagnostics");
@@ -357,6 +361,9 @@ impl UtilitySurfaces {
         };
         Self {
             focus,
+            phone_access: None,
+            phone_loading: false,
+            phone_error: None,
             surface: if diagnostics_preview {
                 Surface::Diagnostics
             } else if settings_preview.is_some() {
@@ -2035,6 +2042,7 @@ impl UtilitySurfaces {
             SettingsTab::Terminal => self.terminal_settings(cx).into_any_element(),
             SettingsTab::Resources => self.resource_settings(cx).into_any_element(),
             SettingsTab::Remote => self.remote_settings(cx).into_any_element(),
+            SettingsTab::Phone => self.phone_settings(cx).into_any_element(),
         };
         let pane = div()
             .id("settings-pane")
@@ -2088,6 +2096,63 @@ impl UtilitySurfaces {
                 }),
             )
             .child(pane)
+    }
+
+    fn phone_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        let content = div().flex().flex_col().gap(px(20.0))
+            .child(setting_section("Your Mac does the work. Your phone is the remote.",
+                div().flex().flex_col().gap(px(10.0))
+                    .child("1. Connect Tailscale on your Mac and iPhone with the same account.")
+                    .child("2. Enable access below, then scan the code in Diri on your iPhone.")
+                    .child("3. Keep Diri open, your Mac plugged in, and its lid open.")
+                    .child("While enabled, Diri prevents idle sleep. Closing the lid or deliberately sleeping the Mac disconnects your phone.")
+                    .child(surface_button("Open Tailscale setup", "phone-tailscale", colors, cx, |_, cx| {
+                        cx.open_url("https://tailscale.com/download");
+                    })), colors))
+            .when_some(self.phone_error.clone(), |view, error| view.child(error))
+            .when(self.phone_loading, |view| view.child("Connecting securely…"))
+            .when(!self.phone_loading && self.phone_access.is_none(), |view| {
+                view.child(settings_primary_button("Enable phone access", "phone-enable", Some("iphone"), cx, |this, _, cx| {
+                    this.phone_loading = true;
+                    this.phone_error = None;
+                    let client = Arc::clone(this.store_runtime.client());
+                    let task = this.runtime.spawn(crate::phone_access::PhoneAccess::start(client));
+                    cx.spawn(async move |this, cx| {
+                        let result = task.await.map_err(|error| error.to_string()).and_then(|result| result);
+                        let _ = this.update(cx, |this, cx| {
+                            this.phone_loading = false;
+                            match result {
+                                Ok(access) => this.phone_access = Some(access),
+                                Err(error) => this.phone_error = Some(error),
+                            }
+                            cx.notify();
+                        });
+                    }).detach();
+                    cx.notify();
+                }))
+            })
+            .when_some(self.phone_access.as_ref(), |view, access| {
+                let size = access.qr.width();
+                let module = (240.0 / (size + 8) as f32).floor();
+                let qr = div().flex().flex_col().p(px(module * 4.0)).bg(gpui::white())
+                    .children((0..size).map(|y| div().flex().children((0..size).map(|x| {
+                        div().w(px(module)).h(px(module)).bg(if access.qr[(x,y)] == qrcode::Color::Dark { gpui::black() } else { gpui::white() })
+                    }))));
+                view.child(if access.is_running() { "Phone access is on" } else { "Phone access stopped. Disable it and enable again." })
+                    .child(div().flex().child(qr))
+                    .child("This code grants control of your sessions. Treat it like a password. Turning access off disconnects all phones; enabling again creates a new code.")
+                    .child(surface_button("Copy pairing link", "phone-copy", colors, cx, |this, cx| {
+                        if let Some(access) = &this.phone_access {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(access.url.clone()));
+                        }
+                    }))
+                    .child(settings_danger_button("Turn off phone access", "phone-disable", cx, |this, cx| {
+                        this.phone_access = None;
+                        cx.notify();
+                    }))
+            });
+        settings_page("Phone access", content, colors)
     }
 
     fn general_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -5152,6 +5217,7 @@ fn settings_tab_matches(tab: SettingsTab, query: &str) -> bool {
         SettingsTab::Remote => {
             "remote ssh openssh hosts machines connections execution tailscale network"
         }
+        SettingsTab::Phone => "phone iphone ios mobile pairing qr tailscale awake",
     };
     query
         .split_whitespace()

@@ -28,6 +28,8 @@ targets:
         CFBundleDisplayName: diri
         CFBundleShortVersionString: "0.1.0"
         CFBundleVersion: "1"
+        NSCameraUsageDescription: Scan the private pairing code shown in Diri on your Mac.
+        NSLocalNetworkUsageDescription: Connect to Diri on your Mac to control your coding sessions.
         UILaunchScreen:
           UIColorName: LaunchBackground
         UISupportedInterfaceOrientations:

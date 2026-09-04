@@ -31,13 +31,46 @@ xcodebuild -project DiriPhone.xcodeproj -scheme DiriPhone \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
-## Running it against a real daemon
+## Set up phone access (no terminal required)
 
-Start `diri-web` on the host and open the link it prints:
+1. Install a signed Diri iPhone build. Distribution is described below.
+2. Install/connect Tailscale on the Mac and iPhone, using the same account.
+3. In Diri on the Mac, open **Settings → Phone access → Enable phone access**.
+4. In Diri on the phone, tap **Scan pairing code**. Alternatively copy the
+   pairing link from the Mac and paste it on the phone. Connection is verified
+   before saving credentials in Keychain.
+5. Keep Diri open and the Mac plugged in with its lid open. Diri prevents idle
+   sleep while access is enabled; closing the lid or explicitly sleeping still
+   disconnects the phone. The display can turn off.
+
+The gateway is embedded in the Mac app, so there is no separate server binary
+to install or launch. Its bind is Tailscale-only, not your public/LAN address.
+The [Tailscale CLI](https://tailscale.com/docs/reference/tailscale-cli?tab=macos)
+is probed read-only with `TAILSCALE_BE_CLI=1`; Diri does not change VPN settings.
+The pairing code controls all sessions exposed by this Mac: do not share it.
+Turning access off closes existing connections; enabling again produces a new
+code, and the phone must be paired again. Quitting Diri turns access off.
+
+On the phone, **New session** lets you choose this Mac or a configured SSH
+host, a known project or a browsable folder, and an agent installed on that
+computer. **Separate workspace** defaults to a fresh worktree from `main`.
+The base must already exist on the selected computer; no implicit fetch/pull
+or fallback to the currently checked-out feature branch occurs. Use **Branch
+options** for a different base. The original checkout is left unchanged.
+Remote SSH hosts and agent login should first be initialized from the Mac.
+
+The session menu offers **Review changes** (tracked diff against HEAD) and
+**Follow output**. Network errors preserve the prompt draft and show a stale
+screen warning. Mutations are never automatically retried: after a dropped
+connection, inspect the session before sending or starting again.
+
+## Developer CLI / standalone gateway
+
+Start `diri-web` on the host and explicitly print its pairing link:
 
 ```sh
 diri-web --listen forge.your-tailnet.ts.net:7380 --label forge
-diri-web url          # prints http://…/?token=…
+diri-web url --listen forge.your-tailnet.ts.net:7380
 ```
 
 Paste that link into the app's first screen. It is split into a base URL and a
@@ -112,3 +145,19 @@ physical phone needs a development team set in Xcode, and a free provisioning
 profile expires after seven days. Until that is sorted, the
 [web frontend](../diri/crates/diri-web) serves the same daemon to mobile Safari
 and installs to the home screen with no signing at all.
+
+For a device archive, supply the team's signing configuration rather than
+changing the simulator defaults:
+
+```sh
+xcodebuild -project DiriPhone.xcodeproj -scheme DiriPhone \
+  -destination 'generic/platform=iOS' -archivePath build/DiriPhone.xcarchive \
+  CODE_SIGNING_ALLOWED=YES DEVELOPMENT_TEAM=YOUR_TEAM_ID archive
+```
+
+No App Store/TestFlight upload is performed by this repository. Before a phone
+release, verify camera pairing on a real signed device, then turn Wi-Fi off and
+create/send to both a local session and an initialized SSH-host session over
+cellular/Tailscale. Lock/unlock the phone, reconnect, review changes, and confirm
+that disabling access immediately disconnects it. Verify a fresh workspace's
+HEAD equals main while the original repository remains on a different branch.

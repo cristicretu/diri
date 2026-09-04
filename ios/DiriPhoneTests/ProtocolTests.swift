@@ -19,6 +19,11 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(try decode(AgentKind.self, #"{"shell":{}}"#).id, "shell")
     }
 
+    func testReadinessCatalogUsesPlainManifestIDs() throws {
+        XCTAssertEqual(try decode(AgentKind.self, #""claude-code""#).id, "claude-code")
+        XCTAssertEqual(try decode(AgentKind.self, #""amp""#).id, "amp")
+    }
+
     func testManifestAgentsDecodeFromTheOpenCase() throws {
         let kind = try decode(AgentKind.self, #"{"agent":{"id":"amp"}}"#)
         XCTAssertEqual(kind.id, "amp")

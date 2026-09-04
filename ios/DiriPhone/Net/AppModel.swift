@@ -37,6 +37,7 @@ final class AppModel {
     private var client: DiriClient?
     private var eventTask: Task<Void, Never>?
     private var pollTask: Task<Void, Never>?
+    private var refreshingClient: DiriClient?
 
     /// How often the list is refetched when the event stream is quiet. The
     /// stream is the fast path; this only exists so a silently dropped
@@ -81,6 +82,10 @@ final class AppModel {
             client = nil
             groups = []
             sessions = []
+            agents = []
+            projects = [:]
+            selectedSessionID = nil
+            banner = nil
             return
         }
 
@@ -119,8 +124,12 @@ final class AppModel {
 
     func refresh() async {
         guard let client else { return }
+        guard refreshingClient !== client else { return }
+        refreshingClient = client
+        defer { if refreshingClient === client { refreshingClient = nil } }
         do {
             let payload = try await client.sessions()
+            guard self.client === client, !Task.isCancelled else { return }
             host = payload.host
             sessions = payload.sessions
             projects = Dictionary(
@@ -129,17 +138,47 @@ final class AppModel {
             )
             reproject()
             connection = .online(host: payload.host)
+            banner = nil
         } catch DiriClient.Failure.unauthorized {
+            guard self.client === client, !Task.isCancelled else { return }
             connection = .offline("Token rejected")
             banner = "That token was not accepted."
         } catch {
+            guard self.client === client, !Task.isCancelled else { return }
             connection = .offline(error.localizedDescription)
         }
     }
 
     private func loadAgents() async {
         guard let client else { return }
-        agents = (try? await client.agents()) ?? []
+        let result = (try? await client.agents()) ?? []
+        guard self.client === client, !Task.isCancelled else { return }
+        agents = result
+    }
+
+    func connect(link: String) async throws {
+        guard let candidate = DiriClient.Endpoint(enrolmentURL: link) else {
+            throw DiriClient.Failure.http(400, "Use the pairing code or link in Diri → Settings → Phone access on your Mac.")
+        }
+        // Verify authenticated Engine access before replacing saved credentials.
+        _ = try await DiriClient(endpoint: candidate).sessions()
+        try Task.checkCancellation()
+        endpoint = candidate
+    }
+
+    func hosts() async throws -> [DiriClient.Host] {
+        guard let client else { throw DiriClient.Failure.unauthorized }
+        return try await client.hosts()
+    }
+
+    func agents(host: String?) async throws -> [DiriClient.AgentReadiness.Item] {
+        guard let client else { throw DiriClient.Failure.unauthorized }
+        return try await client.agents(host: host)
+    }
+
+    func directories(host: String?, path: String) async throws -> DiriClient.DirectoryListing {
+        guard let client else { throw DiriClient.Failure.unauthorized }
+        return try await client.directories(host: host, path: path)
     }
 
     private func reproject() {
@@ -184,18 +223,28 @@ final class AppModel {
         reproject()
     }
 
-    func screen(for id: String) async -> DiriClient.Screen? {
-        guard let client else { return nil }
-        return try? await client.screen(sessionID: id)
+    func screen(for id: String) async throws -> DiriClient.Screen {
+        guard let client else { throw DiriClient.Failure.daemonUnreachable("Connect to your Mac first.") }
+        return try await client.screen(sessionID: id)
+    }
+
+    func diff(for id: String) async throws -> DiriClient.Diff {
+        guard let client else { throw DiriClient.Failure.daemonUnreachable("Connect to your Mac first.") }
+        return try await client.diff(sessionID: id)
+    }
+
+    func setActive(_ active: Bool) {
+        if active { restart() }
+        else { eventTask?.cancel(); pollTask?.cancel() }
     }
 
     func send(_ text: String, to id: String) async throws {
-        guard let client else { return }
+        guard let client else { throw DiriClient.Failure.daemonUnreachable("Connect to your Mac first.") }
         try await client.send(text: text, to: id)
     }
 
     func send(_ key: TerminalKey, to id: String) async throws {
-        guard let client else { return }
+        guard let client else { throw DiriClient.Failure.daemonUnreachable("Connect to your Mac first.") }
         try await client.send(key: key, to: id)
     }
 
@@ -210,9 +259,11 @@ final class AppModel {
         await refresh()
     }
 
-    func spawn(kind: String, cwd: String, prompt: String?) async throws -> SessionRecord {
+    func spawn(kind: String, cwd: String, prompt: String?, host: String? = nil,
+               worktree: Bool = false, branch: String? = nil, base: String? = nil) async throws -> SessionRecord {
         guard let client else { throw DiriClient.Failure.daemonUnreachable("not configured") }
-        let record = try await client.spawn(kind: kind, cwd: cwd, prompt: prompt)
+        let record = try await client.spawn(kind: kind, cwd: cwd, prompt: prompt,
+            host: host, worktree: worktree, branch: branch, base: base)
         await refresh()
         return record
     }
