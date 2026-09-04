@@ -20,12 +20,13 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
 use diri_proto::AgentKind;
+use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
 use serde_json::Value;
 
 /// Defensive cap on returned entries.
@@ -33,8 +34,12 @@ const MAX_ENTRIES: usize = 500;
 /// How far into a Claude transcript to read looking for the first line with a
 /// `cwd`. That is the first user message, which can be large.
 const CLAUDE_HEAD_CAP: usize = 8 << 20;
-/// Tail window scanned for the newest Claude `ai-title`.
+/// Tail window scanned for Claude's generated and custom titles.
 const CLAUDE_TAIL_BYTES: usize = 16 << 10;
+/// Tail of Codex's append-only title index considered for live sessions.
+const CODEX_INDEX_BYTES: usize = 4 << 20;
+/// Provider databases considered, newest first. Codex normally has one.
+const CODEX_STATE_FILES: usize = 16;
 /// Tail window for Cursor's last jsonl object (turn working/idle).
 const CURSOR_TAIL_BYTES: usize = 64 << 10;
 /// Candidate transcript directories considered while associating a live
@@ -97,8 +102,8 @@ impl TrustedTranscript {
         &self.path
     }
 
-    pub(crate) fn latest_claude_ai_title(&mut self) -> Option<String> {
-        latest_claude_ai_title_from(&mut self.file)
+    pub(crate) fn latest_claude_title(&mut self) -> Option<String> {
+        latest_claude_title_from(&mut self.file)
     }
 }
 
@@ -347,7 +352,7 @@ fn claude_entry(path: &Path) -> Option<HistoryEntry> {
     // No cwd means nothing to resume into.
     let cwd = cwd?;
 
-    let title = latest_claude_ai_title(path).or_else(|| first_prompt.map(|text| title_from(&text)));
+    let title = latest_claude_title(path).or_else(|| first_prompt.map(|text| title_from(&text)));
 
     Some(HistoryEntry {
         id: uuid,
@@ -411,14 +416,14 @@ fn read_claude_head(path: &Path) -> Vec<String> {
         .collect()
 }
 
-/// The newest `ai-title` in the tail — the title Claude generated for the
-/// conversation.
-pub(crate) fn latest_claude_ai_title(path: &Path) -> Option<String> {
+/// Claude's current native conversation title from the bounded transcript
+/// tail. A `/rename` `custom-title` wins over any generated `ai-title`.
+pub(crate) fn latest_claude_title(path: &Path) -> Option<String> {
     let mut handle = open_regular_readonly(path)?;
-    latest_claude_ai_title_from(&mut handle)
+    latest_claude_title_from(&mut handle)
 }
 
-fn latest_claude_ai_title_from(handle: &mut File) -> Option<String> {
+fn latest_claude_title_from(handle: &mut File) -> Option<String> {
     let end = handle.seek(SeekFrom::End(0)).ok()?;
     let start = end.saturating_sub(CLAUDE_TAIL_BYTES as u64);
     handle.seek(SeekFrom::Start(start)).ok()?;
@@ -430,22 +435,38 @@ fn latest_claude_ai_title_from(handle: &mut File) -> Option<String> {
         .read_to_end(&mut data)
         .ok()?;
 
-    let mut newest = None;
+    let mut newest_ai = None;
+    let mut newest_custom = None;
     for line in String::from_utf8_lossy(&data).split('\n') {
-        if !line.contains("\"ai-title\"") {
+        if !line.contains("\"ai-title\"") && !line.contains("\"custom-title\"") {
             continue;
         }
         let Ok(object) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if object.get("type").and_then(Value::as_str) == Some("ai-title")
-            && let Some(title) = object.get("aiTitle").and_then(Value::as_str)
-            && !title.is_empty()
-        {
-            newest = Some(title.to_string());
+        match object.get("type").and_then(Value::as_str) {
+            Some("custom-title") => {
+                if let Some(title) = object
+                    .get("customTitle")
+                    .and_then(Value::as_str)
+                    .filter(|title| !title.is_empty())
+                {
+                    newest_custom = Some(title.to_owned());
+                }
+            }
+            Some("ai-title") => {
+                if let Some(title) = object
+                    .get("aiTitle")
+                    .and_then(Value::as_str)
+                    .filter(|title| !title.is_empty())
+                {
+                    newest_ai = Some(title.to_owned());
+                }
+            }
+            _ => {}
         }
     }
-    newest
+    newest_custom.or(newest_ai)
 }
 
 /// Cursor conversation identity plus the generated title Cursor writes to
@@ -728,6 +749,176 @@ fn system_time_ms(time: SystemTime) -> f64 {
 
 // MARK: Codex
 
+#[derive(Default)]
+struct CodexTitleCandidates {
+    explicit: Option<String>,
+    fallback: Option<String>,
+}
+
+/// Resolves the title Codex currently exposes for `thread_id`. This follows
+/// the provider's own priority: an explicit `/rename`, then the append-only
+/// session index, then Codex's generated title or first prompt in its state
+/// database. All files are local, read-only, owner-controlled, and bounded.
+pub(crate) fn codex_title(home: &Path, thread_id: &str) -> Option<String> {
+    if !safe_agent_id(thread_id) {
+        return None;
+    }
+    let codex_home = home.join(".codex");
+    let database = codex_database_titles(&codex_home, thread_id).unwrap_or_default();
+    database
+        .explicit
+        .or_else(|| codex_indexed_title(&codex_home, thread_id))
+        .or(database.fallback)
+}
+
+fn codex_database_titles(codex_home: &Path, thread_id: &str) -> Option<CodexTitleCandidates> {
+    for path in newest_codex_state_files(codex_home) {
+        if let Some(titles) = codex_database_title(&path, thread_id) {
+            return Some(titles);
+        }
+    }
+    None
+}
+
+fn newest_codex_state_files(codex_home: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(codex_home) else {
+        return Vec::new();
+    };
+    let mut paths = entries
+        .take(256)
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            (name.starts_with("state_") && name.ends_with(".sqlite")).then(|| entry.path())
+        })
+        .filter(|path| owner_regular_file(path))
+        .collect::<Vec<_>>();
+    paths.sort_by_key(|path| {
+        std::cmp::Reverse(
+            std::fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH),
+        )
+    });
+    paths.truncate(CODEX_STATE_FILES);
+    paths
+}
+
+fn codex_database_title(path: &Path, thread_id: &str) -> Option<CodexTitleCandidates> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let _ = connection.busy_timeout(Duration::from_millis(50));
+    let columns = {
+        let mut statement = connection.prepare("PRAGMA table_info(threads)").ok()?;
+        statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .ok()?
+            .filter_map(Result::ok)
+            .collect::<HashSet<_>>()
+    };
+    if !columns.contains("id") {
+        return None;
+    }
+    let field = |name: &str| {
+        if columns.contains(name) {
+            name.to_owned()
+        } else {
+            "NULL".to_owned()
+        }
+    };
+    let query = format!(
+        "SELECT {}, {}, {} FROM threads WHERE id = ?1 LIMIT 1",
+        field("name"),
+        field("title"),
+        field("first_user_message"),
+    );
+    connection
+        .query_row(&query, params![thread_id], |row| {
+            let explicit = row.get::<_, Option<String>>(0)?;
+            let generated = row.get::<_, Option<String>>(1)?;
+            let first_prompt = row.get::<_, Option<String>>(2)?;
+            Ok(CodexTitleCandidates {
+                explicit: explicit.and_then(clean_provider_title),
+                fallback: generated
+                    .and_then(clean_provider_title)
+                    .or_else(|| first_prompt.and_then(clean_provider_title)),
+            })
+        })
+        .optional()
+        .ok()?
+}
+
+fn codex_indexed_title(codex_home: &Path, thread_id: &str) -> Option<String> {
+    let mut handle = open_regular_readonly(&codex_home.join("session_index.jsonl"))?;
+    let end = handle.seek(SeekFrom::End(0)).ok()?;
+    let start = end.saturating_sub(CODEX_INDEX_BYTES as u64);
+    handle.seek(SeekFrom::Start(start)).ok()?;
+    let mut data = Vec::new();
+    handle
+        .take((CODEX_INDEX_BYTES + (4 << 10)) as u64)
+        .read_to_end(&mut data)
+        .ok()?;
+    let text = String::from_utf8_lossy(&data);
+    let mut lines = text.split('\n').filter(|line| !line.is_empty());
+    if start > 0 {
+        lines.next();
+    }
+    let mut newest = None;
+    for line in lines {
+        if !line.contains(thread_id) {
+            continue;
+        }
+        let Ok(object) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if object.get("id").and_then(Value::as_str) == Some(thread_id)
+            && let Some(title) = object
+                .get("thread_name")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .and_then(clean_provider_title)
+        {
+            newest = Some(title);
+        }
+    }
+    newest
+}
+
+fn clean_provider_title(title: String) -> Option<String> {
+    let title = title
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    let title = title.chars().take(160).collect::<String>();
+    (!title.is_empty()).then_some(title)
+}
+
+fn owner_regular_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return false;
+    }
+    true
+}
+
 fn scan_codex(root: &Path) -> Vec<HistoryEntry> {
     let mut result = Vec::new();
     // A bounded YYYY/MM/DD walk, not a general recursive one.
@@ -947,6 +1138,24 @@ mod tests {
     }
 
     #[test]
+    fn the_latest_custom_title_wins_over_claudes_generated_title() {
+        let temp = tempfile::tempdir().expect("temp");
+        let claude = temp.path().join("claude");
+        let uuid = "0199f2c4-1a2b-4c3d-8e9f-000000000010";
+        write(
+            &claude.join(format!("-p/{uuid}.jsonl")),
+            &format!(
+                "{}{}\n",
+                claude_transcript("/tmp", "vague first prompt", Some("Generated title")),
+                r#"{"type":"custom-title","customTitle":"My chosen title"}"#,
+            ),
+        );
+
+        let entries = scan_roots(&claude, &temp.path().join("codex"), &[]);
+        assert_eq!(entries[0].title.as_deref(), Some("My chosen title"));
+    }
+
+    #[test]
     fn a_transcript_without_a_cwd_is_not_resumable() {
         // There is nowhere to resume it into, so offering it would only fail.
         let temp = tempfile::tempdir().expect("temp");
@@ -1002,6 +1211,54 @@ mod tests {
         assert_eq!(entries[0].id, "thread-9");
         assert_eq!(entries[0].kind, HistoryKind::Codex);
         assert_eq!(entries[0].cwd, "/tmp");
+    }
+
+    #[test]
+    fn codex_title_prefers_explicit_name_then_index_then_database_fallback() {
+        let home = tempfile::tempdir().expect("home");
+        let codex_home = home.path().join(".codex");
+        std::fs::create_dir_all(&codex_home).expect("codex home");
+        let database = codex_home.join("state_5.sqlite");
+        let connection = Connection::open(&database).expect("database");
+        connection
+            .execute_batch(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    name TEXT,
+                    title TEXT,
+                    first_user_message TEXT
+                );
+                INSERT INTO threads VALUES (
+                    'thread-9',
+                    'Explicit slash rename',
+                    'Generated database title',
+                    'First prompt fallback'
+                );",
+            )
+            .expect("schema");
+        write(
+            &codex_home.join("session_index.jsonl"),
+            "{\"id\":\"thread-9\",\"thread_name\":\"Indexed title\",\"updated_at\":1}\n",
+        );
+
+        assert_eq!(
+            codex_title(home.path(), "thread-9").as_deref(),
+            Some("Explicit slash rename")
+        );
+
+        connection
+            .execute("UPDATE threads SET name = NULL WHERE id = 'thread-9'", [])
+            .expect("clear name");
+        assert_eq!(
+            codex_title(home.path(), "thread-9").as_deref(),
+            Some("Indexed title")
+        );
+
+        std::fs::remove_file(codex_home.join("session_index.jsonl")).expect("remove index");
+        assert_eq!(
+            codex_title(home.path(), "thread-9").as_deref(),
+            Some("Generated database title")
+        );
     }
 
     #[test]
@@ -1098,7 +1355,7 @@ mod tests {
         symlink(&replacement, &path).expect("swap final component");
 
         assert_eq!(
-            trusted.latest_claude_ai_title().as_deref(),
+            trusted.latest_claude_title().as_deref(),
             Some("validated inode")
         );
     }

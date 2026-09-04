@@ -62,6 +62,7 @@ pub struct Registry {
     dirty: bool,
     last_persist: Option<std::time::Instant>,
     cursor_title_refresh_at: Option<std::time::Instant>,
+    native_title_refresh_at: Option<std::time::Instant>,
 }
 
 /// Immutable input for a Cursor provider-store scan. The events watcher builds
@@ -80,6 +81,21 @@ pub(crate) struct CursorRefreshResult {
     request: CursorRefreshRequest,
     conversation: Option<crate::history::CursorConversation>,
     turn: Option<CursorTranscriptTurn>,
+}
+
+/// Immutable input for a local provider-title refresh. Like Cursor metadata,
+/// provider file/database reads happen after releasing the Registry lock.
+pub(crate) struct NativeTitleRefreshRequest {
+    id: String,
+    kind: AgentKind,
+    cwd: String,
+    agent_session_id: String,
+    transcript_path: Option<String>,
+}
+
+pub(crate) struct NativeTitleRefreshResult {
+    request: NativeTitleRefreshRequest,
+    title: Option<String>,
 }
 
 /// How long consecutive persists coalesce. Matches the Swift daemon's
@@ -132,6 +148,7 @@ impl Registry {
             dirty: false,
             last_persist: None,
             cursor_title_refresh_at: None,
+            native_title_refresh_at: None,
         }
     }
 
@@ -688,6 +705,77 @@ impl Registry {
         changed
     }
 
+    /// Captures live local Claude/Codex sessions due for a native title read.
+    /// The one-second bound mirrors provider title-generation cadence while
+    /// keeping transcript/database I/O off the 150 ms state watcher path.
+    pub(crate) fn native_title_refresh_requests(&mut self) -> Vec<NativeTitleRefreshRequest> {
+        let now = std::time::Instant::now();
+        if self.native_title_refresh_at.is_some_and(|previous| {
+            now.duration_since(previous) < std::time::Duration::from_secs(1)
+        }) {
+            return Vec::new();
+        }
+        self.native_title_refresh_at = Some(now);
+        self.sessions
+            .keys()
+            .filter_map(|id| {
+                let record = self.records.get(id)?;
+                if record.host.is_some()
+                    || !matches!(
+                        record.kind.id(),
+                        AgentKind::CLAUDE_CODE_ID | AgentKind::CODEX_ID
+                    )
+                    || !accepts_native_title(record.title_source)
+                {
+                    return None;
+                }
+                Some(NativeTitleRefreshRequest {
+                    id: id.clone(),
+                    kind: record.kind.clone(),
+                    cwd: record.cwd.clone(),
+                    agent_session_id: record.agent_session_id.clone()?,
+                    transcript_path: record.transcript_path.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// Applies a title only if the request still describes the same live
+    /// local conversation. Diri/user renames always remain authoritative.
+    pub(crate) fn apply_native_title_refreshes(
+        &mut self,
+        refreshes: Vec<NativeTitleRefreshResult>,
+    ) -> Vec<(String, SessionRecord)> {
+        let mut changed = Vec::new();
+        for refresh in refreshes {
+            let request = refresh.request;
+            if !self.sessions.contains_key(&request.id) {
+                continue;
+            }
+            let Some(record) = self.records.get_mut(&request.id) else {
+                continue;
+            };
+            if record.host.is_some()
+                || record.kind != request.kind
+                || record.cwd != request.cwd
+                || record.agent_session_id.as_deref() != Some(&request.agent_session_id)
+                || !accepts_native_title(record.title_source)
+            {
+                continue;
+            }
+            let Some(title) = refresh.title else {
+                continue;
+            };
+            if !apply_native_title(record, &title) {
+                continue;
+            }
+            record.updated_at = DateMillis::from(std::time::SystemTime::now());
+            self.dirty = true;
+            changed.push((request.id, record.clone()));
+        }
+        changed
+    }
+
     /// Ends a session but keeps its record, which is what archiving means here.
     pub fn terminate(
         &mut self,
@@ -830,8 +918,8 @@ impl Registry {
     /// Folds identity a hook payload carried into the record: the agent-side
     /// conversation id (what makes resume possible), the live transcript path
     /// (it MOVES when the agent enters a worktree), a first-prompt fallback,
-    /// and Claude's generated `ai-title` when it becomes available. Returns
-    /// whether anything changed.
+    /// and the provider's native conversation title when it becomes available.
+    /// Returns whether anything changed.
     pub fn apply_hook_metadata(&mut self, id: &str, meta: &crate::hooks::HookMetadata) -> bool {
         let Ok(home) = std::env::var("HOME") else {
             return self.apply_hook_metadata_with_home(id, meta, None);
@@ -877,17 +965,25 @@ impl Registry {
                         .flatten()
                 })
         });
-        let generated_title = self.records.get(id).and_then(|record| {
-            let accepts_generated_title = record.kind == diri_proto::AgentKind::CLAUDE_CODE
-                && matches!(
-                    record.title_source,
-                    TitleSource::Placeholder | TitleSource::FirstPrompt | TitleSource::Unknown
-                );
-            accepts_generated_title
-                .then_some(transcript.as_mut())
-                .flatten()
-                .and_then(|transcript| transcript.latest_claude_ai_title())
-                .and_then(|title| normalize_agent_title(&title))
+        let native_title = self.records.get(id).and_then(|record| {
+            if record.host.is_some() || !accepts_native_title(record.title_source) {
+                return None;
+            }
+            let title = match record.kind.id() {
+                diri_proto::AgentKind::CLAUDE_CODE_ID => transcript
+                    .as_mut()
+                    .and_then(|transcript| transcript.latest_claude_title()),
+                diri_proto::AgentKind::CODEX_ID => {
+                    let home = home?;
+                    let agent_id = meta
+                        .agent_session_id
+                        .as_deref()
+                        .or(record.agent_session_id.as_deref())?;
+                    crate::history::codex_title(home, agent_id)
+                }
+                _ => None,
+            }?;
+            normalize_agent_title(&title).filter(|title| !is_generic_terminal_title(title, record))
         });
         let cursor = self.records.get(id).and_then(|record| {
             if !is_local_cursor_record(record) {
@@ -934,7 +1030,7 @@ impl Registry {
             record.title_source = TitleSource::FirstPrompt;
             changed = true;
         }
-        if let Some(title) = generated_title
+        if let Some(title) = native_title
             && (record.title != title || record.title_source != TitleSource::AgentProvided)
         {
             record.title = title;
@@ -1285,6 +1381,39 @@ pub(crate) fn scan_cursor_refreshes(
         .collect()
 }
 
+pub(crate) fn scan_native_title_refreshes(
+    requests: Vec<NativeTitleRefreshRequest>,
+) -> Vec<NativeTitleRefreshResult> {
+    let Some(home) = user_home() else {
+        return Vec::new();
+    };
+    requests
+        .into_iter()
+        .map(|request| {
+            let title = match request.kind.id() {
+                AgentKind::CLAUDE_CODE_ID => request
+                    .transcript_path
+                    .as_deref()
+                    .and_then(|path| {
+                        crate::history::validate_transcript_path(
+                            &home,
+                            &request.kind,
+                            &request.agent_session_id,
+                            &request.cwd,
+                            Path::new(path),
+                        )
+                    })
+                    .and_then(|mut transcript| transcript.latest_claude_title()),
+                AgentKind::CODEX_ID => {
+                    crate::history::codex_title(&home, &request.agent_session_id)
+                }
+                _ => None,
+            };
+            NativeTitleRefreshResult { request, title }
+        })
+        .collect()
+}
+
 fn apply_cursor_conversation(
     record: &mut SessionRecord,
     conversation: crate::history::CursorConversation,
@@ -1317,6 +1446,33 @@ fn apply_cursor_conversation(
         changed = true;
     }
     changed
+}
+
+fn accepts_native_title(source: TitleSource) -> bool {
+    matches!(
+        source,
+        TitleSource::Placeholder
+            | TitleSource::FirstPrompt
+            | TitleSource::AgentProvided
+            | TitleSource::Unknown
+    )
+}
+
+fn apply_native_title(record: &mut SessionRecord, title: &str) -> bool {
+    if !accepts_native_title(record.title_source) {
+        return false;
+    }
+    let Some(title) =
+        normalize_agent_title(title).filter(|title| !is_generic_terminal_title(title, record))
+    else {
+        return false;
+    };
+    if record.title == title && record.title_source == TitleSource::AgentProvided {
+        return false;
+    }
+    record.title = title;
+    record.title_source = TitleSource::AgentProvided;
+    true
 }
 
 fn is_local_cursor_record(record: &SessionRecord) -> bool {
@@ -2160,6 +2316,58 @@ mod tests {
     }
 
     #[test]
+    fn codex_native_titles_promote_and_follow_rename() {
+        let temp = tempfile::tempdir().expect("temp");
+        let transcript = temp
+            .path()
+            .join(".codex/sessions/2026/08/13/rollout-now-thread-9.jsonl");
+        std::fs::create_dir_all(transcript.parent().expect("parent")).expect("mkdir");
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-9\",\"cwd\":\"/tmp\"}}\n",
+        )
+        .expect("write transcript");
+        let index = temp.path().join(".codex/session_index.jsonl");
+        std::fs::write(
+            &index,
+            "{\"id\":\"thread-9\",\"thread_name\":\"Repair chat titles\",\"updated_at\":1}\n",
+        )
+        .expect("write index");
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let mut session = record("codex");
+        session.kind = AgentKind::CODEX;
+        session.agent_session_id = Some("thread-9".to_owned());
+        session.title = "initial vague prompt".to_owned();
+        session.title_source = TitleSource::FirstPrompt;
+        registry.insert_record(session);
+
+        assert!(registry.apply_hook_metadata_with_home(
+            "codex",
+            &crate::hooks::HookMetadata::default(),
+            Some(temp.path()),
+        ));
+        let titled = registry.record("codex").expect("record");
+        assert_eq!(titled.title, "Repair chat titles");
+        assert_eq!(titled.title_source, TitleSource::AgentProvided);
+
+        std::fs::write(
+            &index,
+            "{\"id\":\"thread-9\",\"thread_name\":\"Repair chat titles\",\"updated_at\":1}\n\
+             {\"id\":\"thread-9\",\"thread_name\":\"Chosen with slash rename\",\"updated_at\":2}\n",
+        )
+        .expect("rename index");
+        assert!(registry.apply_hook_metadata_with_home(
+            "codex",
+            &crate::hooks::HookMetadata::default(),
+            Some(temp.path()),
+        ));
+        assert_eq!(
+            registry.record("codex").expect("record").title,
+            "Chosen with slash rename"
+        );
+    }
+
+    #[test]
     fn arbitrary_hook_transcript_paths_never_enter_the_record() {
         let temp = tempfile::tempdir().expect("temp");
         let outside = temp.path().join("outside.jsonl");
@@ -2327,6 +2535,26 @@ mod tests {
         fold_session_view(&mut cursor, &named_working);
         assert_eq!(cursor.title, "Fix the cursor session title");
         assert_eq!(cursor.title_source, TitleSource::FirstPrompt);
+    }
+
+    #[test]
+    fn native_title_updates_follow_the_provider_but_respect_diri_renames() {
+        let mut session = record("codex");
+        session.kind = AgentKind::CODEX;
+        session.title = "first prompt".into();
+        session.title_source = TitleSource::FirstPrompt;
+
+        assert!(apply_native_title(&mut session, "Generated title"));
+        assert_eq!(session.title, "Generated title");
+        assert_eq!(session.title_source, TitleSource::AgentProvided);
+
+        assert!(apply_native_title(&mut session, "Chosen with slash rename"));
+        assert_eq!(session.title, "Chosen with slash rename");
+
+        session.title = "Diri sidebar rename".into();
+        session.title_source = TitleSource::UserRename;
+        assert!(!apply_native_title(&mut session, "Provider changed again"));
+        assert_eq!(session.title, "Diri sidebar rename");
     }
 
     #[test]

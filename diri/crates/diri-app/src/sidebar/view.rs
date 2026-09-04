@@ -34,6 +34,7 @@ use crate::settings::{SettingsNav, SettingsSection, SettingsTab};
 use crate::store::{
     ClickModifiers, DirectoryListingState, SessionStore, SpawnOptions, StoreEffect, StoreRuntime,
 };
+use crate::switcher::display_title;
 use crate::updates::{UpdateCommand, UpdatePhase, UpdateState};
 use crate::usage::{UsageFormat, UsageSnapshot};
 
@@ -5746,23 +5747,6 @@ fn hover_detail(icon: &str, text: &str, mono: bool, colors: SemanticColors) -> A
         .into_any_element()
 }
 
-fn display_title(session: &SessionRecord) -> String {
-    if session.title_source == diri_proto::TitleSource::Placeholder {
-        if matches!(
-            session.status,
-            diri_proto::SessionStatus::Starting
-                | diri_proto::SessionStatus::Working
-                | diri_proto::SessionStatus::NeedsInput(_)
-        ) {
-            "Untitled".into()
-        } else {
-            "Ended".into()
-        }
-    } else {
-        session.title.clone()
-    }
-}
-
 fn status_state(session: &SessionRecord, migrating: bool) -> StatusState {
     if migrating {
         return StatusState::Working;
@@ -6020,6 +6004,27 @@ mod tests {
     fn compact_duration_matches_usage_copy() {
         assert_eq!(compact_duration(8_040), "2h 14m");
         assert_eq!(compact_duration(540), "9m");
+    }
+
+    #[test]
+    fn a_placeholder_named_live_session_is_untitled_not_ended() {
+        let mut session = SidebarPreviewFixture::make(PreviewScenario::Typical)
+            .list
+            .sessions
+            .into_iter()
+            .next()
+            .expect("fixture session");
+        session.title_source = diri_proto::TitleSource::Placeholder;
+        session.status = diri_proto::SessionStatus::Idle;
+
+        assert_eq!(display_title(&session), "Untitled");
+
+        session.status = diri_proto::SessionStatus::Exited(diri_proto::ExitInfo {
+            reason: diri_proto::ExitReason::Exited,
+            code: Some(0),
+            signal: None,
+        });
+        assert_eq!(display_title(&session), "Ended");
     }
 
     #[test]
