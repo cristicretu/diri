@@ -41,6 +41,7 @@ pub(crate) enum ExternalPathRejection {
     RequiresDirectory,
     AdditionalPath,
     RemoteTarget,
+    RemoteDirectory,
 }
 
 impl ExternalPathRejection {
@@ -54,6 +55,7 @@ impl ExternalPathRejection {
             Self::RequiresDirectory => "is not a directory",
             Self::AdditionalPath => "only the first directory starts the session",
             Self::RemoteTarget => "is local, but the target runs on another host",
+            Self::RemoteDirectory => "is a folder, and only files can be sent to another host",
         }
     }
 }
@@ -95,34 +97,134 @@ impl ExternalDropPlan {
 
     /// Short, visible copy for the inline sidebar/composer feedback surface.
     pub fn feedback(&self) -> Option<String> {
-        if self.rejected.is_empty() {
-            return None;
-        }
-        let prefix = if self.action.is_some() {
-            "Ignored"
-        } else {
-            "Couldn't use"
-        };
-        let details = self
-            .rejected
-            .iter()
-            .take(3)
-            .map(|rejection| {
-                format!(
-                    "“{}” {}",
-                    rejection.path.to_string_lossy(),
-                    rejection.reason.explanation()
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        let remaining = self.rejected.len().saturating_sub(3);
-        Some(if remaining == 0 {
-            format!("{prefix}: {details}.")
-        } else {
-            format!("{prefix}: {details}; and {remaining} more.")
-        })
+        describe_rejections(self.action.is_some(), &self.rejected)
     }
+}
+
+/// One line naming up to three rejected paths and why, or `None` when every
+/// path was accepted. `partial` picks the softer prefix used when the drop
+/// still did something with the other paths.
+fn describe_rejections(partial: bool, rejected: &[RejectedExternalPath]) -> Option<String> {
+    if rejected.is_empty() {
+        return None;
+    }
+    let prefix = if partial { "Ignored" } else { "Couldn't use" };
+    let details = rejected
+        .iter()
+        .take(3)
+        .map(|rejection| {
+            format!(
+                "“{}” {}",
+                rejection.path.to_string_lossy(),
+                rejection.reason.explanation()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let remaining = rejected.len().saturating_sub(3);
+    Some(if remaining == 0 {
+        format!("{prefix}: {details}.")
+    } else {
+        format!("{prefix}: {details}; and {remaining} more.")
+    })
+}
+
+/// What a drop released directly on a terminal grid should do.
+///
+/// A terminal drop behaves like Terminal.app or iTerm2: the paths are typed
+/// into the foreground program as one paste, which is how Claude Code, Codex
+/// and Cursor pick up dropped images and attach them. Local sessions paste
+/// immediately; sessions on another host first copy each file over so the
+/// pasted path exists where the Agent runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TerminalDropAction {
+    /// Paste this text into the PTY as one paste.
+    Paste(String),
+    /// Copy these files to the session's host, then paste the remote paths.
+    Upload(Vec<PathBuf>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TerminalDropPlan {
+    pub action: Option<TerminalDropAction>,
+    pub rejected: Vec<RejectedExternalPath>,
+}
+
+impl TerminalDropPlan {
+    pub fn feedback(&self) -> Option<String> {
+        describe_rejections(self.action.is_some(), &self.rejected)
+    }
+}
+
+pub(crate) fn plan_terminal_drop(paths: &[PathBuf], remote: bool) -> TerminalDropPlan {
+    plan_terminal_drop_with(paths, remote, &FileSystemProbe)
+}
+
+fn plan_terminal_drop_with(
+    paths: &[PathBuf],
+    remote: bool,
+    probe: &impl PathProbe,
+) -> TerminalDropPlan {
+    let mut accepted = Vec::new();
+    let mut rejected = Vec::new();
+    for result in stage_external_paths_with(paths, probe) {
+        match result {
+            Ok(path) if remote && path.kind == ExternalPathKind::Directory => {
+                rejected.push(RejectedExternalPath {
+                    path: path.path,
+                    reason: ExternalPathRejection::RemoteDirectory,
+                });
+            }
+            Ok(path) => accepted.push(path),
+            Err(error) => rejected.push(error),
+        }
+    }
+    let action = if accepted.is_empty() {
+        None
+    } else if remote {
+        Some(TerminalDropAction::Upload(
+            accepted.into_iter().map(|path| path.path).collect(),
+        ))
+    } else {
+        Some(TerminalDropAction::Paste(terminal_drop_text(
+            accepted
+                .iter()
+                .map(|path| path.path.to_str().expect("staged paths are unicode")),
+        )))
+    };
+    TerminalDropPlan { action, rejected }
+}
+
+/// The text a desktop terminal pastes when files land on it: every path
+/// backslash-escaped and followed by a space, matching Terminal.app and iTerm2.
+/// Agents that attach dropped images (Claude Code, Codex) recognise exactly
+/// this shape and strip the escapes themselves; the trailing space keeps a
+/// second drop or typed text from fusing with the path.
+pub(crate) fn terminal_drop_text<'a>(paths: impl IntoIterator<Item = &'a str>) -> String {
+    let mut text = String::new();
+    for path in paths {
+        text.push_str(&escape_path_for_terminal(path));
+        text.push(' ');
+    }
+    text
+}
+
+/// Backslash-escape a path the way macOS terminals do on drop. Alphanumerics,
+/// non-ASCII text and the safe punctuation common in paths pass through;
+/// everything a shell could interpret is escaped so the path survives even if
+/// the foreground program is a plain shell.
+pub(crate) fn escape_path_for_terminal(path: &str) -> String {
+    let mut escaped = String::with_capacity(path.len());
+    for ch in path.chars() {
+        let plain = ch.is_alphanumeric()
+            || !ch.is_ascii()
+            || matches!(ch, '/' | '.' | '_' | '-' | '+' | ',' | ':' | '@');
+        if !plain {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 /// Validate and route a Finder payload for one sidebar target.
@@ -537,6 +639,67 @@ mod tests {
         assert!(plan.action.is_none());
         assert_eq!(plan.rejected[0].reason, ExternalPathRejection::RemoteTarget);
         assert!(plan.feedback().unwrap().contains("another host"));
+    }
+
+    #[test]
+    fn a_terminal_drop_pastes_escaped_paths_in_order_with_trailing_spaces() {
+        let probe = FakeProbe::default()
+            .file("/tmp/Screen Shot 2026.png")
+            .directory("/tmp/a folder")
+            .dataless("/tmp/cloud.png");
+        let plan = plan_terminal_drop_with(
+            &paths(&[
+                "/tmp/Screen Shot 2026.png",
+                "/tmp/a folder",
+                "/tmp/cloud.png",
+            ]),
+            false,
+            &probe,
+        );
+        assert_eq!(
+            plan.action,
+            Some(TerminalDropAction::Paste(
+                "/tmp/Screen\\ Shot\\ 2026.png /tmp/a\\ folder ".into()
+            ))
+        );
+        assert_eq!(plan.rejected.len(), 1);
+        assert!(plan.feedback().unwrap().starts_with("Ignored:"));
+    }
+
+    #[test]
+    fn a_terminal_drop_on_a_remote_session_uploads_files_and_refuses_folders() {
+        let probe = FakeProbe::default()
+            .file("/tmp/shot.png")
+            .directory("/tmp/a folder");
+        let plan =
+            plan_terminal_drop_with(&paths(&["/tmp/shot.png", "/tmp/a folder"]), true, &probe);
+        assert_eq!(
+            plan.action,
+            Some(TerminalDropAction::Upload(vec![PathBuf::from(
+                "/tmp/shot.png"
+            )]))
+        );
+        assert_eq!(
+            plan.rejected[0].reason,
+            ExternalPathRejection::RemoteDirectory
+        );
+
+        let nothing = plan_terminal_drop_with(&paths(&["/tmp/missing"]), true, &probe);
+        assert!(nothing.action.is_none());
+        assert!(nothing.feedback().unwrap().starts_with("Couldn't use:"));
+    }
+
+    #[test]
+    fn terminal_escaping_matches_what_macos_terminals_paste_on_drop() {
+        assert_eq!(
+            escape_path_for_terminal("/tmp/a b/$HOME;$(touch nope)'\"`x"),
+            "/tmp/a\\ b/\\$HOME\\;\\$\\(touch\\ nope\\)\\'\\\"\\`x"
+        );
+        assert_eq!(
+            escape_path_for_terminal("/Users/giga/Desktop/Ștampilă-2026_v1.png"),
+            "/Users/giga/Desktop/Ștampilă-2026_v1.png"
+        );
+        assert_eq!(terminal_drop_text(["/a", "/b c"]), "/a /b\\ c ");
     }
 
     #[test]
