@@ -44,6 +44,7 @@ pub enum SettingsTab {
     #[default]
     General,
     Agents,
+    Shortcuts,
     Terminal,
     Usage,
     Resources,
@@ -51,9 +52,10 @@ pub enum SettingsTab {
 }
 
 impl SettingsTab {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::General,
         Self::Agents,
+        Self::Shortcuts,
         Self::Terminal,
         Self::Usage,
         Self::Resources,
@@ -64,7 +66,8 @@ impl SettingsTab {
         match self {
             Self::General => "General",
             Self::Agents => "Agents",
-            Self::Terminal => "Terminal",
+            Self::Shortcuts => "Shortcuts",
+            Self::Terminal => "Appearance",
             Self::Usage => "Usage",
             Self::Resources => "Resources",
             Self::Remote => "Remote",
@@ -75,7 +78,8 @@ impl SettingsTab {
         match self {
             Self::General => "Startup, sessions, and updates",
             Self::Agents => "Installed CLIs and quick create",
-            Self::Terminal => "Appearance and text size",
+            Self::Shortcuts => "Keyboard commands and bindings",
+            Self::Terminal => "Themes and terminal type",
             Self::Usage => "Costs, tokens, and cache savings",
             Self::Resources => "Idle sessions and memory",
             Self::Remote => "SSH execution hosts",
@@ -86,7 +90,7 @@ impl SettingsTab {
     /// describe the machines and resources sessions run on.
     pub const fn section(self) -> SettingsSection {
         match self {
-            Self::General | Self::Agents | Self::Terminal | Self::Usage => {
+            Self::General | Self::Agents | Self::Shortcuts | Self::Terminal | Self::Usage => {
                 SettingsSection::Personal
             }
             Self::Resources | Self::Remote => SettingsSection::System,
@@ -97,6 +101,7 @@ impl SettingsTab {
         match self {
             Self::General => "gearshape",
             Self::Agents => "sparkles",
+            Self::Shortcuts => "keyboard",
             Self::Terminal => "terminal",
             Self::Usage => "chart.bar.xaxis",
             Self::Resources => "server.rack",
@@ -271,6 +276,7 @@ mod tests {
         assert_eq!(cycle_hibernate_minutes(60), 0);
         assert_eq!(cycle_memory_limit(2), 4);
         assert_eq!(cycle_memory_limit(8), 2);
+        assert_eq!(SettingsTab::Terminal.label(), "Appearance");
         assert!(
             SettingsTab::ALL
                 .into_iter()

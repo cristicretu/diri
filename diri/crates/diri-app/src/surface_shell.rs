@@ -24,7 +24,7 @@ use diri_ui::{
     Radius, SemanticColors, Typo,
 };
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, Bounds, ClickEvent, Context, CursorStyle,
+    Animation, AnimationExt, AnyElement, App, Bounds, BoxShadow, ClickEvent, Context, CursorStyle,
     FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton, PathPromptOptions,
     Pixels, Render, Rgba, ScrollHandle, SharedString, Task, TextRun, Window, canvas, deferred, div,
     ease_out_quint, font, point, prelude::*, px, rgba,
@@ -32,8 +32,8 @@ use gpui::{
 use tokio::runtime::Runtime;
 
 use crate::commands::{
-    Activate, CloseSurface, CommandId, MoveDown, MoveUp, OpenSettings, OpenWorktrees,
-    ToggleHistory, UTILITY_CONTEXT,
+    Activate, COMMANDS, CloseSurface, CommandId, MoveDown, MoveUp, OpenSettings, OpenWorktrees,
+    ShortcutCategory, ToggleHistory, UTILITY_CONTEXT,
 };
 const SETTINGS_CONTENT_MAX_WIDTH: f32 = 760.0;
 const SETTINGS_TRANSITION_DURATION: Duration = Duration::from_millis(190);
@@ -125,6 +125,12 @@ struct AgentPathEditor {
     host: Option<String>,
     path: QueryEditor,
     show_in_quick_create: bool,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ShortcutEditor {
+    command: CommandId,
     error: Option<String>,
 }
 
@@ -261,6 +267,9 @@ pub struct UtilitySurfaces {
     settings_scroll: ScrollHandle,
     settings_search: QueryEditor,
     settings_search_active: bool,
+    shortcut_search: QueryEditor,
+    shortcut_search_active: bool,
+    shortcut_editor: Option<ShortcutEditor>,
     settings_transition_generation: u64,
     settings_menu: Option<SettingsMenu>,
     agents_host: Option<String>,
@@ -309,8 +318,9 @@ impl UtilitySurfaces {
             .ok()
             .map(|value| value.to_ascii_lowercase());
         let settings_tab = match settings_preview.as_deref() {
-            Some("terminal") => SettingsTab::Terminal,
+            Some("terminal" | "appearance") => SettingsTab::Terminal,
             Some("agents") => SettingsTab::Agents,
+            Some("shortcuts") => SettingsTab::Shortcuts,
             Some("resources") => SettingsTab::Resources,
             Some("remote") => SettingsTab::Remote,
             Some("usage") => SettingsTab::Usage,
@@ -376,6 +386,9 @@ impl UtilitySurfaces {
             settings_scroll: ScrollHandle::new(),
             settings_search: QueryEditor::default(),
             settings_search_active: false,
+            shortcut_search: QueryEditor::default(),
+            shortcut_search_active: false,
+            shortcut_editor: None,
             settings_transition_generation: 0,
             settings_menu: None,
             agents_host,
@@ -566,7 +579,7 @@ impl UtilitySurfaces {
         cx.notify();
     }
 
-    fn persist_prefs(&mut self) {
+    fn persist_prefs(&mut self) -> bool {
         self.prefs.normalize();
         let prefs = self.prefs.clone();
         if let Err(error) = self
@@ -576,9 +589,11 @@ impl UtilitySurfaces {
             .update_preferences(|shared| *shared = prefs)
         {
             self.activity = format!("Could not save settings: {error}");
+            false
         } else {
             self.store_runtime.publish_local_change();
             self.activity = "Settings saved for diri".to_owned();
+            true
         }
     }
 
@@ -1050,6 +1065,9 @@ impl UtilitySurfaces {
         self.settings_menu = None;
         self.host_editor = None;
         self.agent_path_editor = None;
+        self.shortcut_search.clear();
+        self.shortcut_search_active = false;
+        self.shortcut_editor = None;
         cx.notify();
     }
 
@@ -1123,6 +1141,8 @@ impl UtilitySurfaces {
         self.settings_menu = None;
         self.host_editor = None;
         self.agent_path_editor = None;
+        self.shortcut_search_active = false;
+        self.shortcut_editor = None;
         if tab == SettingsTab::Remote {
             self.reload_hosts();
         } else if tab == SettingsTab::Agents {
@@ -1132,6 +1152,199 @@ impl UtilitySurfaces {
                 .request_agent_catalog(self.agents_host.clone(), false);
         }
         cx.notify();
+    }
+
+    fn begin_shortcut_edit(
+        &mut self,
+        command: CommandId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings_search_active = false;
+        self.shortcut_search_active = false;
+        self.shortcut_editor = Some(ShortcutEditor {
+            command,
+            error: None,
+        });
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn focus_shortcut_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.shortcut_editor = None;
+        self.settings_search_active = false;
+        self.shortcut_search_active = true;
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn clear_shortcut_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.shortcut_search.clear();
+        self.focus_shortcut_search(window, cx);
+    }
+
+    fn save_shortcut_override(
+        &mut self,
+        command: CommandId,
+        value: Option<Option<String>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let stable_id = crate::commands::command(command).stable_id.to_owned();
+        let previous = match value {
+            Some(value) => self
+                .prefs
+                .shortcut_overrides
+                .insert(stable_id.clone(), value),
+            None => self.prefs.shortcut_overrides.remove(&stable_id),
+        };
+        if !self.persist_prefs() {
+            match previous {
+                Some(previous) => {
+                    self.prefs.shortcut_overrides.insert(stable_id, previous);
+                }
+                None => {
+                    self.prefs.shortcut_overrides.remove(&stable_id);
+                }
+            }
+            return false;
+        }
+
+        crate::commands::rebind_keys(cx, &self.prefs.shortcut_overrides);
+        crate::refresh_app_menus(cx);
+        self.activity = format!("Updated {}", command.shortcut_metadata().title);
+        true
+    }
+
+    fn assign_shortcut(&mut self, command: CommandId, binding: String, cx: &mut Context<Self>) {
+        if let Some(conflict) =
+            crate::commands::shortcut_conflict(command, &binding, &self.prefs.shortcut_overrides)
+        {
+            if let Some(editor) = &mut self.shortcut_editor {
+                editor.error = Some(format!(
+                    "Already used by {}.",
+                    conflict.id.shortcut_metadata().title
+                ));
+            }
+            cx.notify();
+            return;
+        }
+        if self.save_shortcut_override(command, Some(Some(binding)), cx) {
+            self.shortcut_editor = None;
+        } else if let Some(editor) = &mut self.shortcut_editor {
+            editor.error = Some("Could not save this shortcut.".to_owned());
+        }
+        cx.notify();
+    }
+
+    fn unassign_shortcut(&mut self, command: CommandId, cx: &mut Context<Self>) {
+        if self.save_shortcut_override(command, Some(None), cx) {
+            self.shortcut_editor = None;
+        }
+        cx.notify();
+    }
+
+    fn restore_shortcut(&mut self, command: CommandId, cx: &mut Context<Self>) {
+        if self.save_shortcut_override(command, None, cx) {
+            self.shortcut_editor = None;
+        }
+        cx.notify();
+    }
+
+    fn restore_all_shortcuts(&mut self, cx: &mut Context<Self>) {
+        if self.prefs.shortcut_overrides.is_empty() {
+            return;
+        }
+        let previous = std::mem::take(&mut self.prefs.shortcut_overrides);
+        if self.persist_prefs() {
+            crate::commands::rebind_keys(cx, &self.prefs.shortcut_overrides);
+            crate::refresh_app_menus(cx);
+            self.shortcut_editor = None;
+            self.activity = "Restored every keyboard shortcut".to_owned();
+        } else {
+            self.prefs.shortcut_overrides = previous;
+        }
+        cx.notify();
+    }
+
+    fn handle_shortcut_editor_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.surface != Surface::Settings || self.settings_tab != SettingsTab::Shortcuts {
+            return false;
+        }
+        let Some(command) = self.shortcut_editor.as_ref().map(|editor| editor.command) else {
+            return false;
+        };
+        let key = &event.keystroke;
+        if key.key == "escape" {
+            self.shortcut_editor = None;
+            cx.notify();
+            return true;
+        }
+        if matches!(key.key.as_str(), "backspace" | "delete") && !key.modifiers.modified() {
+            self.unassign_shortcut(command, cx);
+            return true;
+        }
+        if matches!(
+            key.key.as_str(),
+            "shift" | "control" | "ctrl" | "alt" | "platform" | "function" | "fn"
+        ) {
+            return true;
+        }
+        let function_key = key
+            .key
+            .strip_prefix('f')
+            .and_then(|number| number.parse::<u8>().ok())
+            .is_some_and(|number| (1..=35).contains(&number));
+        if !key.modifiers.modified() && !function_key {
+            if let Some(editor) = &mut self.shortcut_editor {
+                editor.error = Some("Include Command, Control, Option, or a function key.".into());
+            }
+            cx.notify();
+            return true;
+        }
+        self.assign_shortcut(command, key.unparse(), cx);
+        true
+    }
+
+    fn handle_shortcut_search_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.surface != Surface::Settings
+            || self.settings_tab != SettingsTab::Shortcuts
+            || !self.shortcut_search_active
+        {
+            return false;
+        }
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                if self.shortcut_search.is_empty() {
+                    self.shortcut_search_active = false;
+                } else {
+                    self.shortcut_search.clear();
+                }
+                cx.notify();
+            }
+            _ => {
+                let Some(edit) = query_editor::edit_for(&event.keystroke) else {
+                    return true;
+                };
+                match edit {
+                    Edit::Local(local) => {
+                        self.shortcut_search.apply(local);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Copy) => {
+                        query_editor::copy_selection(&self.shortcut_search, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Cut) => {
+                        query_editor::cut_selection(&mut self.shortcut_search, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Paste) => {
+                        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                            self.shortcut_search.insert(&text);
+                        }
+                    }
+                }
+                cx.notify();
+            }
+        }
+        true
     }
 
     fn handle_settings_search_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
@@ -1221,6 +1434,11 @@ impl UtilitySurfaces {
         cx: &mut Context<Self>,
     ) {
         if self.surface == Surface::None {
+            return;
+        }
+        if self.handle_shortcut_editor_key(event, cx) || self.handle_shortcut_search_key(event, cx)
+        {
+            cx.stop_propagation();
             return;
         }
         if self.handle_agent_path_key(event, cx) || self.handle_host_editor_key(event, cx) {
@@ -1825,6 +2043,7 @@ impl UtilitySurfaces {
         let pane = match self.settings_tab {
             SettingsTab::General => self.general_settings(cx).into_any_element(),
             SettingsTab::Agents => self.agents_settings(cx).into_any_element(),
+            SettingsTab::Shortcuts => self.shortcuts_settings(cx).into_any_element(),
             SettingsTab::Terminal => self.terminal_settings(cx).into_any_element(),
             SettingsTab::Resources => self.resource_settings(cx).into_any_element(),
             SettingsTab::Remote => self.remote_settings(cx).into_any_element(),
@@ -2031,6 +2250,181 @@ impl UtilitySurfaces {
                         ),
                     colors,
                 )),
+            colors,
+        )
+    }
+
+    fn shortcuts_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        let query = self.shortcut_search.text();
+        let search_content = if self.shortcut_search_active {
+            query_label(&self.shortcut_search)
+        } else if self.shortcut_search.is_empty() {
+            div()
+                .text_color(colors.tertiary)
+                .child("Search shortcuts…")
+                .into_any_element()
+        } else {
+            div()
+                .text_color(colors.primary)
+                .child(query.to_owned())
+                .into_any_element()
+        };
+
+        let search = div()
+            .id("shortcut-search")
+            .debug_selector(|| "shortcut-search".into())
+            .relative()
+            .h(px(34.0))
+            .flex_1()
+            .min_w(px(0.0))
+            .px(px(10.0))
+            .rounded(px(17.0))
+            .border_1()
+            .border_color(colors.primary.alpha(if self.shortcut_search_active {
+                0.22
+            } else {
+                0.10
+            }))
+            .bg(colors.primary.alpha(0.025))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .cursor(CursorStyle::IBeam)
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.focus_shortcut_search(window, cx);
+            }))
+            .child(sf_symbol("magnifyingglass", 12.0, colors.tertiary))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_size(px(Typo::ROW.size))
+                    .child(search_content),
+            )
+            .when(!self.shortcut_search.is_empty(), |search| {
+                search.child(
+                    div()
+                        .id("clear-shortcut-search")
+                        .debug_selector(|| "clear-shortcut-search".into())
+                        .size(px(18.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(Fill::subtle(colors)))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.clear_shortcut_search(window, cx);
+                        }))
+                        .child(sf_symbol("xmark", 8.0, colors.tertiary)),
+                )
+            })
+            .child(sf_symbol("keyboard", 12.0, colors.tertiary));
+
+        let mut groups = div()
+            .debug_selector(|| "shortcut-groups".into())
+            .flex()
+            .flex_col()
+            .gap(px(SETTINGS_SECTION_GAP));
+        let mut found = false;
+        for category in ShortcutCategory::ALL {
+            let commands = COMMANDS
+                .iter()
+                .filter(|command| {
+                    command.id.shortcut_metadata().category == category
+                        && shortcut_matches(command, query, &self.prefs.shortcut_overrides)
+                })
+                .collect::<Vec<_>>();
+            if commands.is_empty() {
+                continue;
+            }
+            found = true;
+            let mut rows = div().flex().flex_col();
+            for (index, command) in commands.into_iter().enumerate() {
+                if index > 0 {
+                    rows = rows.child(setting_divider(colors));
+                }
+                rows = rows.child(shortcut_row(
+                    command,
+                    self.shortcut_editor.as_ref(),
+                    &self.prefs.shortcut_overrides,
+                    colors,
+                    cx,
+                ));
+            }
+            groups = groups.child(setting_section(category.label(), rows, colors));
+        }
+
+        let results = if found {
+            groups.into_any_element()
+        } else {
+            div()
+                .min_h(px(180.0))
+                .rounded(px(Radius::ROW))
+                .border_1()
+                .border_color(colors.primary.alpha(0.065))
+                .bg(colors.primary.alpha(0.02))
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(8.0))
+                .child(sf_symbol("keyboard", 22.0, colors.tertiary))
+                .child(
+                    div()
+                        .text_size(px(Typo::ROW_EMPHASIZED.size))
+                        .font_weight(Typo::ROW_EMPHASIZED.weight)
+                        .text_color(colors.primary)
+                        .child("No shortcuts found"),
+                )
+                .child(
+                    div()
+                        .text_size(px(Typo::META.size))
+                        .text_color(colors.tertiary)
+                        .child("Try an action name, description, or key."),
+                )
+                .into_any_element()
+        };
+
+        let modified_count = self.prefs.shortcut_overrides.len();
+        settings_page(
+            "Keyboard shortcuts",
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(16.0))
+                .child(
+                    div()
+                        .text_size(px(Typo::ROW.size))
+                        .line_height(px(18.0))
+                        .text_color(colors.secondary)
+                        .child(
+                            "Choose an action, then press a new key combination. Changes apply immediately.",
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.0))
+                        .child(search)
+                        .when(modified_count > 0, |toolbar| {
+                            toolbar.child(surface_button(
+                                format!("Reset all ({modified_count})"),
+                                "reset-all-shortcuts",
+                                colors,
+                                cx,
+                                |this, cx| this.restore_all_shortcuts(cx),
+                            ))
+                        }),
+                )
+                .child(results),
             colors,
         )
     }
@@ -2653,95 +3047,258 @@ impl UtilitySurfaces {
     fn terminal_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.settings_colors();
         let selected = theme(&self.prefs.terminal_theme);
+        let can_make_smaller = self.prefs.terminal_font_size > 10.0;
+        let can_make_larger = self.prefs.terminal_font_size < 20.0;
         let font_control = div()
-            .h(px(28.0))
-            .rounded(px(Radius::BADGE))
+            .h(px(32.0))
+            .rounded(px(Radius::ROW))
             .border_1()
-            .border_color(colors.primary.alpha(0.11))
-            .bg(colors.primary.alpha(0.045))
+            .border_color(colors.primary.alpha(0.12))
+            .bg(colors.primary.alpha(0.04))
+            .overflow_hidden()
             .flex()
             .items_center()
             .child(
                 div()
                     .id("font-smaller")
-                    .w(px(30.0))
+                    .w(px(34.0))
                     .h_full()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(15.0))
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(colors.primary.alpha(0.08)))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.prefs.zoom_terminal(-1.0);
-                        this.persist_prefs();
-                        cx.notify();
-                    }))
+                    .text_size(px(16.0))
+                    .text_color(if can_make_smaller {
+                        colors.primary
+                    } else {
+                        colors.tertiary
+                    })
+                    .when(can_make_smaller, |button| {
+                        button
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(colors.primary.alpha(0.08)))
+                            .active(move |style| style.bg(colors.primary.alpha(0.12)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.prefs.zoom_terminal(-1.0);
+                                this.persist_prefs();
+                                cx.notify();
+                            }))
+                    })
                     .child("−"),
             )
             .child(HairlineDivider::vertical(colors))
             .child(
                 div()
-                    .w(px(52.0))
+                    .w(px(58.0))
                     .flex()
                     .items_center()
                     .justify_center()
                     .font_family(crate::fonts::mono_family())
                     .text_size(px(11.0))
-                    .text_color(colors.secondary)
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(colors.primary)
                     .child(format!("{:.0} pt", self.prefs.terminal_font_size)),
             )
             .child(HairlineDivider::vertical(colors))
             .child(
                 div()
                     .id("font-larger")
-                    .w(px(30.0))
+                    .w(px(34.0))
                     .h_full()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(15.0))
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(colors.primary.alpha(0.08)))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.prefs.zoom_terminal(1.0);
-                        this.persist_prefs();
-                        cx.notify();
-                    }))
+                    .text_size(px(16.0))
+                    .text_color(if can_make_larger {
+                        colors.primary
+                    } else {
+                        colors.tertiary
+                    })
+                    .when(can_make_larger, |button| {
+                        button
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(colors.primary.alpha(0.08)))
+                            .active(move |style| style.bg(colors.primary.alpha(0.12)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.prefs.zoom_terminal(1.0);
+                                this.persist_prefs();
+                                cx.notify();
+                            }))
+                    })
                     .child("+"),
             );
 
-        settings_page(
-            "Terminal",
+        let mut featured_themes = div().w_full().flex().flex_wrap().gap(px(9.0));
+        for (index, candidate) in [
+            TermTheme::DIRIJOR_DARK,
+            TermTheme::VESPER,
+            TermTheme::DIRIJOR_LIGHT,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            featured_themes = featured_themes.child(featured_theme_card(
+                index,
+                candidate,
+                candidate.id == selected.id,
+                colors,
+                cx,
+            ));
+        }
+
+        appearance_settings_page(
             div()
                 .flex()
                 .flex_col()
-                .gap(px(SETTINGS_SECTION_GAP))
-                .child(setting_section(
-                    "Appearance",
+                .gap(px(18.0))
+                .child(
                     div()
+                        .relative()
+                        .rounded(px(Radius::PANEL))
+                        .border_1()
+                        .border_color(colors.primary.alpha(0.085))
+                        .bg(colors.primary.alpha(0.022))
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .min_h(px(62.0))
+                                .p(px(13.0))
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(12.0))
+                                .child(
+                                    div()
+                                        .min_w(px(230.0))
+                                        .flex_1()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(10.0))
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .size(px(32.0))
+                                                .rounded(px(Radius::ROW))
+                                                .bg(selected.cursor.alpha(0.13))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .child(sf_symbol(
+                                                    "sparkles",
+                                                    13.0,
+                                                    selected.cursor,
+                                                )),
+                                        )
+                                        .child(setting_text_stack(
+                                            "Color theme".into(),
+                                            "One palette for Diri, every terminal, and all app chrome."
+                                                .into(),
+                                            colors,
+                                        )),
+                                )
+                                .child(self.terminal_theme_dropdown(cx)),
+                        )
+                        .child(setting_divider(colors))
+                        .child(
+                            div()
+                                .p(px(12.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(9.0))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .child(
+                                            div()
+                                                .text_size(px(Typo::META.size))
+                                                .font_weight(Typo::META.weight)
+                                                .text_color(colors.secondary)
+                                                .child("Quick themes"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(Typo::META.size - 1.0))
+                                                .text_color(colors.tertiary)
+                                                .child("Select to preview instantly"),
+                                        ),
+                                )
+                                .child(featured_themes),
+                        )
+                        .child(setting_divider(colors))
+                        .child(
+                            div()
+                                .p(px(12.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(9.0))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap(px(12.0))
+                                        .child(
+                                            div()
+                                                .text_size(px(Typo::META.size))
+                                                .font_weight(Typo::META.weight)
+                                                .text_color(colors.secondary)
+                                                .child("Live workspace preview"),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(5.0))
+                                                .child(
+                                                    div()
+                                                        .size(px(5.0))
+                                                        .rounded_full()
+                                                        .bg(Ink::FRESH),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .font_family(crate::fonts::mono_family())
+                                                        .text_size(px(10.0))
+                                                        .text_color(colors.tertiary)
+                                                        .child(format!(
+                                                            "{} · {:.0} pt",
+                                                            selected.name,
+                                                            self.prefs.terminal_font_size
+                                                        )),
+                                                ),
+                                        ),
+                                )
+                                .child(workspace_theme_preview(
+                                    selected,
+                                    self.prefs.terminal_font_size,
+                                    colors,
+                                )),
+                        ),
+                )
+                .child(
+                    div()
+                        .rounded(px(Radius::PANEL))
+                        .border_1()
+                        .border_color(colors.primary.alpha(0.085))
+                        .bg(colors.primary.alpha(0.022))
+                        .overflow_hidden()
                         .flex()
                         .flex_col()
                         .child(setting_row(
-                            "Color theme",
-                            "Applies immediately across the app and every open terminal.",
-                            self.terminal_theme_dropdown(cx),
+                            "Terminal text",
+                            "Keep code comfortable without scaling the rest of the interface.",
+                            font_control,
                             colors,
                         ))
                         .child(setting_divider(colors))
-                        .child(div().p(px(12.0)).child(theme_preview(selected, colors))),
-                    colors,
-                ))
-                .child(setting_section(
-                    "Text",
-                    setting_row(
-                        "Font size",
-                        "Adjust terminal text without changing the rest of the app.",
-                        font_control,
-                        colors,
-                    ),
-                    colors,
-                )),
+                        .child(terminal_type_specimen(
+                            selected,
+                            self.prefs.terminal_font_size,
+                        )),
+                ),
             colors,
         )
     }
@@ -2761,14 +3318,14 @@ impl UtilitySurfaces {
                         .flex_col()
                         .child(setting_row(
                             "Hibernate idle sessions",
-                            "Freeze inactive sessions after this amount of time.",
+                            "Freeze a session once it has sat idle, with no output or CPU activity, for this long.",
                             self.hibernate_dropdown(cx),
                             colors,
                         ))
                         .child(setting_divider(colors))
                         .child(setting_row(
                             "Memory limit",
-                            "Freeze an individual session when it reaches this size.",
+                            "Freeze an idle session when its process tree reaches this size.",
                             self.memory_dropdown(cx),
                             colors,
                         )),
@@ -3641,12 +4198,13 @@ impl UtilitySurfaces {
     }
 
     fn hibernate_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
-        const OPTIONS: [(u32, &str); 5] = [
+        const OPTIONS: [(u32, &str); 6] = [
             (0, "Off"),
-            (5, "5 minutes"),
             (15, "15 minutes"),
             (30, "30 minutes"),
             (60, "1 hour"),
+            (120, "2 hours"),
+            (240, "4 hours"),
         ];
         let colors = self.settings_colors();
         let selected_label = OPTIONS
@@ -3691,7 +4249,7 @@ impl UtilitySurfaces {
     }
 
     fn memory_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
-        const OPTIONS: [u64; 4] = [2, 4, 6, 8];
+        const OPTIONS: [u64; 6] = [4, 8, 16, 32, 64, 128];
         let colors = self.settings_colors();
         let open = self.settings_menu == Some(SettingsMenu::MemoryLimit);
         let mut control = div()
@@ -4245,6 +4803,241 @@ fn setting_row(
         .child(control)
 }
 
+fn shortcut_matches(
+    command: &crate::commands::CommandSpec,
+    query: &str,
+    overrides: &crate::commands::ShortcutOverrides,
+) -> bool {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let metadata = command.id.shortcut_metadata();
+    let searchable = format!(
+        "{} {} {} {} {}",
+        metadata.title,
+        metadata.description,
+        metadata.category.label(),
+        command.stable_id,
+        command.shortcut_label_for(overrides).unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    query
+        .split_whitespace()
+        .all(|word| searchable.contains(word))
+}
+
+fn shortcut_row(
+    command: &'static crate::commands::CommandSpec,
+    editor: Option<&ShortcutEditor>,
+    overrides: &crate::commands::ShortcutOverrides,
+    colors: SemanticColors,
+    cx: &mut Context<UtilitySurfaces>,
+) -> AnyElement {
+    let metadata = command.id.shortcut_metadata();
+    let editing = editor.is_some_and(|editor| editor.command == command.id);
+    let error = editor
+        .filter(|editor| editor.command == command.id)
+        .and_then(|editor| editor.error.as_deref());
+    let assignment = command.shortcut_label_for(overrides);
+    let modified = command.is_overridden(overrides);
+    let command_id = command.id;
+    let binding_label: SharedString = if editing {
+        "Press keys…".into()
+    } else {
+        assignment
+            .as_deref()
+            .unwrap_or("Unassigned")
+            .to_owned()
+            .into()
+    };
+    let detail: SharedString = error.unwrap_or(metadata.description).to_owned().into();
+
+    let binding = div()
+        .id(SharedString::from(format!(
+            "shortcut-binding-{}",
+            command.stable_id
+        )))
+        .debug_selector({
+            let stable_id = command.stable_id;
+            move || format!("SHORTCUT_BINDING_{stable_id}")
+        })
+        .h(px(27.0))
+        .min_w(px(if editing { 92.0 } else { 42.0 }))
+        .px(px(9.0))
+        .rounded(px(Radius::BADGE))
+        .border_1()
+        .border_color(if error.is_some() {
+            Ink::DANGER.alpha(0.60)
+        } else if editing {
+            Palette::CLAY.alpha(0.72)
+        } else {
+            colors.primary.alpha(0.09)
+        })
+        .bg(if editing {
+            Palette::CLAY.alpha(0.10)
+        } else {
+            colors.primary.alpha(0.045)
+        })
+        .flex()
+        .items_center()
+        .justify_center()
+        .font_family(crate::fonts::mono_family())
+        .text_size(px(11.0))
+        .text_color(if assignment.is_none() && !editing {
+            colors.tertiary
+        } else {
+            colors.primary
+        })
+        .cursor_pointer()
+        .hover(move |style| style.bg(colors.primary.alpha(0.08)))
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.begin_shortcut_edit(command_id, window, cx);
+        }))
+        .child(binding_label);
+
+    let mut actions = div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(4.0))
+        .child(binding)
+        .child(
+            div()
+                .id(SharedString::from(format!(
+                    "edit-shortcut-{}",
+                    command.stable_id
+                )))
+                .size(px(26.0))
+                .rounded(px(Radius::BADGE))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(move |style| style.bg(colors.primary.alpha(0.07)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if editing {
+                        this.shortcut_editor = None;
+                        cx.notify();
+                    } else {
+                        this.begin_shortcut_edit(command_id, window, cx);
+                    }
+                }))
+                .child(sf_symbol(
+                    if editing { "xmark" } else { "pencil" },
+                    10.0,
+                    if editing {
+                        colors.secondary
+                    } else {
+                        colors.tertiary
+                    },
+                )),
+        );
+
+    if modified {
+        actions = actions.child(
+            div()
+                .id(SharedString::from(format!(
+                    "restore-shortcut-{}",
+                    command.stable_id
+                )))
+                .debug_selector({
+                    let stable_id = command.stable_id;
+                    move || format!("RESTORE_SHORTCUT_{stable_id}")
+                })
+                .size(px(26.0))
+                .rounded(px(Radius::BADGE))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(move |style| style.bg(colors.primary.alpha(0.07)))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.restore_shortcut(command_id, cx);
+                }))
+                .child(sf_symbol("arrow.counterclockwise", 10.0, colors.tertiary)),
+        );
+    }
+    if assignment.is_some() {
+        actions = actions.child(
+            div()
+                .id(SharedString::from(format!(
+                    "clear-shortcut-{}",
+                    command.stable_id
+                )))
+                .debug_selector({
+                    let stable_id = command.stable_id;
+                    move || format!("CLEAR_SHORTCUT_{stable_id}")
+                })
+                .size(px(26.0))
+                .rounded(px(Radius::BADGE))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(move |style| style.bg(Ink::DANGER.alpha(0.10)))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.unassign_shortcut(command_id, cx);
+                }))
+                .child(sf_symbol("trash", 10.0, colors.tertiary)),
+        );
+    }
+
+    div()
+        .id(SharedString::from(format!(
+            "shortcut-row-{}",
+            command.stable_id
+        )))
+        .debug_selector({
+            let stable_id = command.stable_id;
+            move || format!("SHORTCUT_ROW_{stable_id}")
+        })
+        .min_h(px(58.0))
+        .px(px(12.0))
+        .py(px(8.0))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(12.0))
+        .bg(if editing {
+            Palette::CLAY.alpha(0.035)
+        } else {
+            colors.background.alpha(0.0)
+        })
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .whitespace_normal()
+                        .text_size(px(Typo::ROW_EMPHASIZED.size))
+                        .font_weight(Typo::ROW_EMPHASIZED.weight)
+                        .text_color(colors.primary)
+                        .child(metadata.title),
+                )
+                .child(
+                    div()
+                        .whitespace_normal()
+                        .text_size(px(Typo::META.size))
+                        .line_height(px(14.0))
+                        .text_color(if error.is_some() {
+                            Ink::DANGER
+                        } else {
+                            colors.tertiary
+                        })
+                        .child(wrappable_setting_copy(detail)),
+                ),
+        )
+        .child(actions)
+        .into_any_element()
+}
+
 fn setting_text_stack(
     label: SharedString,
     detail: SharedString,
@@ -4366,6 +5159,9 @@ fn settings_tab_matches(tab: SettingsTab, query: &str) -> bool {
         SettingsTab::Agents => {
             "agents codex claude cursor gemini executable installed command line quick create default"
         }
+        SettingsTab::Shortcuts => {
+            "shortcuts keyboard bindings hotkeys commands keys navigation sessions workspace terminal"
+        }
         SettingsTab::Terminal => "terminal appearance color theme font text size zoom",
         SettingsTab::Usage => "usage cost tokens spending cache savings model daily claude codex",
         SettingsTab::Resources => {
@@ -4403,6 +5199,72 @@ fn settings_page(
                 .font_weight(Typo::DISPLAY_TITLE.weight)
                 .text_color(colors.primary)
                 .child(title),
+        )
+        .child(content)
+}
+
+fn appearance_settings_page(content: impl IntoElement, colors: SemanticColors) -> impl IntoElement {
+    div()
+        .w_full()
+        .px(px(24.0))
+        .pt(px(22.0))
+        .pb(px(32.0))
+        .flex()
+        .flex_col()
+        .gap(px(22.0))
+        .child(
+            div()
+                .pr(px(34.0))
+                .min_h(px(44.0))
+                .flex()
+                .flex_wrap()
+                .items_end()
+                .justify_between()
+                .gap(px(12.0))
+                .child(
+                    div()
+                        .min_w(px(260.0))
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap(px(5.0))
+                        .child(
+                            div()
+                                .text_size(px(21.0))
+                                .line_height(px(24.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(colors.primary)
+                                .child("Appearance"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .line_height(px(17.0))
+                                .text_color(colors.secondary)
+                                .child("Shape a workspace that feels focused, legible, and yours."),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .h(px(26.0))
+                        .px(px(9.0))
+                        .rounded(px(Radius::CHIP))
+                        .border_1()
+                        .border_color(Ink::FRESH.alpha(0.22))
+                        .bg(Ink::FRESH.alpha(0.08))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(div().size(px(5.0)).rounded_full().bg(Ink::FRESH))
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(colors.secondary)
+                                .child("Changes apply instantly"),
+                        ),
+                ),
         )
         .child(content)
 }
@@ -4509,34 +5371,433 @@ fn settings_choice_row(
         })
 }
 
-fn theme_preview(theme: TermTheme, colors: SemanticColors) -> impl IntoElement {
+fn featured_theme_card(
+    index: usize,
+    theme: TermTheme,
+    selected: bool,
+    colors: SemanticColors,
+    cx: &mut Context<UtilitySurfaces>,
+) -> impl IntoElement {
+    let selection_tint = if theme.cursor.a > 0.0 {
+        theme.cursor
+    } else {
+        theme.foreground
+    };
+
     div()
-        .p(px(10.0))
-        .rounded(px(Radius::BADGE))
+        .id(SharedString::from(format!("featured-theme-{index}")))
+        .debug_selector(move || format!("FEATURED_THEME_{index}"))
+        .relative()
+        .min_w(px(176.0))
+        .h(px(108.0))
+        .flex_1()
+        .rounded(px(Radius::CARD))
+        .overflow_hidden()
         .border_1()
-        .border_color(colors.primary.alpha(0.10))
+        .border_color(if selected {
+            selection_tint.alpha(0.76)
+        } else {
+            colors.primary.alpha(0.11)
+        })
         .bg(theme.background)
+        .shadow(if selected {
+            vec![BoxShadow {
+                color: selection_tint.alpha(0.14).into(),
+                offset: point(px(0.0), px(5.0)),
+                blur_radius: px(16.0),
+                spread_radius: px(-3.0),
+                inset: false,
+            }]
+        } else {
+            Vec::new()
+        })
+        .cursor_pointer()
+        .hover(move |card| card.border_color(colors.primary.alpha(0.34)))
+        .active(|card| card.opacity(0.84))
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.prefs.terminal_theme = theme.id.to_owned();
+            this.settings_menu = None;
+            this.persist_prefs();
+            cx.notify();
+        }))
         .flex()
         .flex_col()
-        .gap(px(6.0))
-        .font_family(crate::fonts::mono_family())
-        .text_size(px(11.0))
         .child(
             div()
+                .h(px(30.0))
+                .px(px(9.0))
                 .flex()
-                .child(div().text_color(theme.ansi[2]).child("❯ "))
-                .child(div().text_color(theme.foreground).child("cargo test"))
-                .child(div().text_color(theme.cursor).child("█")),
+                .items_center()
+                .justify_between()
+                .bg(theme.foreground.alpha(0.045))
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .text_ellipsis()
+                        .text_size(px(10.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme.foreground)
+                        .child(theme.name),
+                )
+                .when(selected, |bar| {
+                    bar.child(sf_symbol("checkmark.circle.fill", 11.0, selection_tint))
+                }),
         )
-        .child(div().text_color(theme.ansi[8]).child("test result: ok"))
         .child(
-            div().flex().gap(px(3.0)).children(
-                theme
-                    .ansi
-                    .into_iter()
-                    .map(|color| div().flex_1().h(px(10.0)).rounded(px(2.0)).bg(color)),
-            ),
+            div()
+                .flex_1()
+                .px(px(10.0))
+                .py(px(8.0))
+                .flex()
+                .flex_col()
+                .gap(px(5.0))
+                .font_family(crate::fonts::mono_family())
+                .text_size(px(9.5))
+                .child(
+                    div()
+                        .flex()
+                        .child(div().text_color(theme.ansi[2]).child("❯ "))
+                        .child(div().text_color(theme.foreground).child("diri --continue"))
+                        .child(div().ml(px(2.0)).text_color(theme.cursor).child("█")),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(5.0))
+                        .text_color(theme.ansi[8])
+                        .child(div().size(px(4.0)).rounded_full().bg(Ink::FRESH))
+                        .child("workspace ready"),
+                )
+                .child(
+                    div().mt_auto().flex().gap(px(3.0)).children(
+                        [theme.ansi[1], theme.ansi[2], theme.ansi[3], theme.ansi[4]]
+                            .map(|color| div().flex_1().h(px(4.0)).rounded(px(2.0)).bg(color)),
+                    ),
+                ),
         )
+}
+
+fn preview_sidebar_row(
+    label: &'static str,
+    tint: Rgba,
+    active: bool,
+    theme: TermTheme,
+) -> impl IntoElement {
+    div()
+        .h(px(25.0))
+        .px(px(8.0))
+        .rounded(px(5.0))
+        .bg(if active {
+            theme.foreground.alpha(0.085)
+        } else {
+            theme.foreground.alpha(0.0)
+        })
+        .flex()
+        .items_center()
+        .gap(px(7.0))
+        .child(div().size(px(5.0)).rounded_full().bg(tint))
+        .child(
+            div()
+                .min_w(px(0.0))
+                .text_ellipsis()
+                .text_size(px(9.0))
+                .font_weight(if active {
+                    FontWeight::MEDIUM
+                } else {
+                    FontWeight::NORMAL
+                })
+                .text_color(if active {
+                    theme.foreground
+                } else {
+                    theme.foreground.alpha(0.58)
+                })
+                .child(label),
+        )
+}
+
+fn preview_code_line(
+    number: &'static str,
+    content: impl IntoElement,
+    highlighted: bool,
+    theme: TermTheme,
+) -> impl IntoElement {
+    div()
+        .h(px(21.0))
+        .px(px(9.0))
+        .flex()
+        .items_center()
+        .when(highlighted, |line| {
+            line.bg(theme.ansi[4].alpha(0.11))
+                .border_l_2()
+                .border_color(theme.ansi[4].alpha(0.80))
+        })
+        .child(
+            div()
+                .flex_none()
+                .w(px(24.0))
+                .text_color(theme.ansi[8].alpha(0.76))
+                .child(number),
+        )
+        .child(content)
+}
+
+fn workspace_theme_preview(
+    theme: TermTheme,
+    font_size: f32,
+    colors: SemanticColors,
+) -> impl IntoElement {
+    let preview_font_size = (font_size - 2.0).clamp(9.0, 13.0);
+    div()
+        .debug_selector(|| "APPEARANCE_WORKSPACE_PREVIEW".into())
+        .w_full()
+        .h(px(176.0))
+        .rounded(px(Radius::CARD))
+        .overflow_hidden()
+        .border_1()
+        .border_color(colors.primary.alpha(0.13))
+        .bg(theme.background)
+        .shadow(vec![BoxShadow {
+            color: rgba(0x00000042).into(),
+            offset: point(px(0.0), px(8.0)),
+            blur_radius: px(22.0),
+            spread_radius: px(-7.0),
+            inset: false,
+        }])
+        .flex()
+        .child(
+            div()
+                .flex_none()
+                .w(px(128.0))
+                .h_full()
+                .p(px(9.0))
+                .bg(theme.foreground.alpha(0.045))
+                .flex()
+                .flex_col()
+                .gap(px(5.0))
+                .child(
+                    div()
+                        .h(px(20.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .children(
+                            [theme.ansi[1], theme.ansi[3], theme.ansi[2]].map(|color| {
+                                div().size(px(5.0)).rounded_full().bg(color.alpha(0.88))
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .mt(px(3.0))
+                        .mb(px(2.0))
+                        .text_size(px(8.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.foreground.alpha(0.38))
+                        .child("WORKSPACE"),
+                )
+                .child(preview_sidebar_row(
+                    "Appearance",
+                    theme.ansi[4],
+                    true,
+                    theme,
+                ))
+                .child(preview_sidebar_row(
+                    "Refactor UI",
+                    theme.ansi[5],
+                    false,
+                    theme,
+                ))
+                .child(preview_sidebar_row(
+                    "Run tests",
+                    theme.ansi[2],
+                    false,
+                    theme,
+                ))
+                .child(
+                    div()
+                        .mt_auto()
+                        .h(px(23.0))
+                        .px(px(7.0))
+                        .rounded(px(5.0))
+                        .bg(theme.foreground.alpha(0.045))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(div().size(px(5.0)).rounded_full().bg(Ink::FRESH))
+                        .child(
+                            div()
+                                .text_size(px(8.5))
+                                .text_color(theme.foreground.alpha(0.66))
+                                .child("3 agents ready"),
+                        ),
+                ),
+        )
+        .child(div().w(px(1.0)).h_full().bg(theme.foreground.alpha(0.09)))
+        .child(
+            div()
+                .min_w(px(0.0))
+                .flex_1()
+                .h_full()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex_none()
+                        .h(px(31.0))
+                        .px(px(10.0))
+                        .bg(theme.foreground.alpha(0.025))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .font_family(crate::fonts::mono_family())
+                                .text_size(px(9.0))
+                                .text_color(theme.foreground.alpha(0.68))
+                                .child("appearance.rs"),
+                        )
+                        .child(
+                            div()
+                                .px(px(5.0))
+                                .py(px(2.0))
+                                .rounded(px(4.0))
+                                .bg(theme.ansi[2].alpha(0.12))
+                                .text_size(px(8.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme.ansi[2])
+                                .child("LIVE"),
+                        ),
+                )
+                .child(div().h(px(1.0)).bg(theme.foreground.alpha(0.08)))
+                .child(
+                    div()
+                        .flex_1()
+                        .py(px(7.0))
+                        .font_family(crate::fonts::mono_family())
+                        .text_size(px(preview_font_size))
+                        .text_color(theme.foreground)
+                        .child(preview_code_line(
+                            "1",
+                            div()
+                                .flex()
+                                .child(div().text_color(theme.ansi[5]).child("const "))
+                                .child(div().text_color(theme.ansi[3]).child("appearance"))
+                                .child(div().text_color(theme.foreground).child(" = {")),
+                            false,
+                            theme,
+                        ))
+                        .child(preview_code_line(
+                            "2",
+                            div()
+                                .flex()
+                                .child(div().text_color(theme.foreground).child("  theme: "))
+                                .child(div().text_color(theme.ansi[2]).child(theme.name))
+                                .child(div().text_color(theme.foreground).child(",")),
+                            true,
+                            theme,
+                        ))
+                        .child(preview_code_line(
+                            "3",
+                            div()
+                                .flex()
+                                .child(div().text_color(theme.foreground).child("  type: "))
+                                .child(
+                                    div()
+                                        .text_color(theme.ansi[6])
+                                        .child(format!("{font_size:.0}pt")),
+                                )
+                                .child(div().text_color(theme.foreground).child(",")),
+                            false,
+                            theme,
+                        ))
+                        .child(preview_code_line(
+                            "4",
+                            div()
+                                .flex()
+                                .child(div().text_color(theme.foreground).child("  status: "))
+                                .child(div().text_color(theme.ansi[2]).child("focused"))
+                                .child(div().text_color(theme.foreground).child(",")),
+                            false,
+                            theme,
+                        ))
+                        .child(preview_code_line(
+                            "5",
+                            div().text_color(theme.foreground).child("};"),
+                            false,
+                            theme,
+                        )),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .h(px(24.0))
+                        .px(px(10.0))
+                        .bg(theme.foreground.alpha(0.04))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .font_family(crate::fonts::mono_family())
+                        .text_size(px(8.0))
+                        .text_color(theme.foreground.alpha(0.52))
+                        .child("main  +1 −1")
+                        .child("diri · ready"),
+                ),
+        )
+}
+
+fn terminal_type_specimen(theme: TermTheme, font_size: f32) -> impl IntoElement {
+    div().p(px(12.0)).child(
+        div()
+            .w_full()
+            .min_h(px(58.0))
+            .px(px(12.0))
+            .py(px(9.0))
+            .rounded(px(Radius::ROW))
+            .border_1()
+            .border_color(theme.foreground.alpha(0.10))
+            .bg(theme.background)
+            .flex()
+            .items_center()
+            .gap(px(11.0))
+            .child(
+                div()
+                    .flex_none()
+                    .size(px(36.0))
+                    .rounded(px(Radius::BADGE))
+                    .bg(theme.ansi[4].alpha(0.15))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .font_family(crate::fonts::mono_family())
+                    .text_size(px(13.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.ansi[4])
+                    .child("Aa"),
+            )
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.0))
+                    .font_family(crate::fonts::mono_family())
+                    .child(
+                        div()
+                            .text_size(px(font_size.clamp(10.0, 17.0)))
+                            .line_height(px((font_size + 4.0).clamp(14.0, 21.0)))
+                            .text_color(theme.foreground)
+                            .child("cargo test --workspace"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .text_color(theme.ansi[8])
+                            .child("A live specimen at your selected terminal size"),
+                    ),
+            ),
+    )
 }
 
 fn chip(label: String, colors: SemanticColors) -> impl IntoElement {
@@ -4777,6 +6038,14 @@ mod tests {
         let output = std::env::var_os("DIRI_VISUAL_OUTPUT")
             .map(PathBuf::from)
             .expect("set DIRI_VISUAL_OUTPUT to the target PNG path");
+        let tab = match std::env::var("DIRI_VISUAL_SETTINGS_TAB").as_deref() {
+            Ok("shortcuts") => SettingsTab::Shortcuts,
+            Ok("general") => SettingsTab::General,
+            Ok("agents") => SettingsTab::Agents,
+            Ok("terminal") => SettingsTab::Terminal,
+            Ok("resources") => SettingsTab::Resources,
+            _ => SettingsTab::Remote,
+        };
         let platform = gpui_platform::current_platform(true);
         let mut cx = HeadlessAppContext::with_platform(
             platform.text_system(),
@@ -4793,10 +6062,9 @@ mod tests {
 
         let window = cx
             .open_window(size(px(1200.0), px(800.0)), move |window, cx| {
-                // Exercise the user-reported state: Remote selected, from a
-                // sidebar the user had previously widened.
-                let harness =
-                    cx.new(|cx| SettingsWorkbenchHarness::open_at(SettingsTab::Remote, window, cx));
+                // Exercise the requested destination from a sidebar the user
+                // had previously widened. Remote remains the default capture.
+                let harness = cx.new(|cx| SettingsWorkbenchHarness::open_at(tab, window, cx));
                 harness.update(cx, |harness, cx| {
                     harness
                         .sidebar
@@ -4949,6 +6217,61 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         screenshot.save(output).expect("save usage settings");
+    }
+
+    /// Renders the Appearance destination at a realistic desktop size so the
+    /// theme cards, live workspace, and typography specimen can be reviewed as
+    /// one composition instead of as isolated components.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes the deterministic appearance-settings screenshot artifact"]
+    fn render_appearance_settings_preview_screenshot() {
+        let output = std::env::var_os("DIRI_VISUAL_OUTPUT")
+            .map(PathBuf::from)
+            .expect("set DIRI_VISUAL_OUTPUT to the target PNG path");
+        let preview_theme = std::env::var("DIRI_APPEARANCE_THEME").ok();
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+
+        let window = cx
+            .open_window(size(px(1200.0), px(900.0)), move |window, cx| {
+                let harness = cx
+                    .new(|cx| SettingsWorkbenchHarness::open_at(SettingsTab::Terminal, window, cx));
+                harness.update(cx, |harness, cx| {
+                    harness
+                        .sidebar
+                        .update(cx, |sidebar, cx| sidebar.set_width(292.0, cx));
+                    if let Some(theme_id) = &preview_theme {
+                        harness.surfaces.update(cx, |surfaces, cx| {
+                            surfaces.prefs.terminal_theme.clone_from(theme_id);
+                            surfaces.persist_prefs();
+                            cx.notify();
+                        });
+                    }
+                });
+                harness
+            })
+            .expect("open headless appearance settings window");
+        cx.run_until_parked();
+        cx.advance_clock(SETTINGS_TRANSITION_DURATION + Duration::from_millis(300));
+        cx.update_window(window.into(), |_, window, _| window.refresh())
+            .expect("refresh appearance settings window");
+        cx.run_until_parked();
+        let screenshot = cx
+            .capture_screenshot(window.into())
+            .expect("capture appearance settings screenshot");
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent).expect("create screenshot directory");
+        }
+        screenshot.save(output).expect("save appearance screenshot");
     }
 
     struct SettingsModalHarness {
@@ -5700,7 +7023,112 @@ mod tests {
         assert!(settings_tab_matches(SettingsTab::Remote, "ssh"));
         assert!(settings_tab_matches(SettingsTab::Resources, "memory"));
         assert!(settings_tab_matches(SettingsTab::General, "login"));
+        assert!(settings_tab_matches(SettingsTab::Shortcuts, "keyboard"));
+        assert!(settings_tab_matches(SettingsTab::Terminal, "appearance"));
         assert!(!settings_tab_matches(SettingsTab::Terminal, "ssh"));
+    }
+
+    #[gpui::test]
+    fn shortcut_page_searches_edits_unassigns_and_restores(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.open_settings_tab(SettingsTab::Shortcuts, cx);
+        });
+
+        let search = cx
+            .debug_bounds("shortcut-search")
+            .expect("shortcut search should render");
+        cx.simulate_click(search.center(), Modifiers::default());
+        cx.simulate_input("new session");
+        assert!(cx.debug_bounds("SHORTCUT_ROW_open-launcher").is_some());
+        assert!(cx.debug_bounds("SHORTCUT_ROW_terminal-paste").is_none());
+
+        let binding = cx
+            .debug_bounds("SHORTCUT_BINDING_open-launcher")
+            .expect("filtered shortcut binding should render");
+        cx.simulate_click(binding.center(), Modifiers::default());
+        cx.simulate_keystrokes("cmd-shift-y");
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(
+                surfaces
+                    .prefs
+                    .shortcut_overrides
+                    .get("open-launcher")
+                    .and_then(|binding| binding.as_deref()),
+                Some("cmd-shift-y")
+            );
+            assert!(surfaces.shortcut_editor.is_none());
+        });
+
+        let clear = cx
+            .debug_bounds("CLEAR_SHORTCUT_open-launcher")
+            .expect("assigned shortcut should offer unassign");
+        cx.simulate_click(clear.center(), Modifiers::default());
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(
+                surfaces.prefs.shortcut_overrides.get("open-launcher"),
+                Some(&None)
+            );
+        });
+
+        let restore = cx
+            .debug_bounds("RESTORE_SHORTCUT_open-launcher")
+            .expect("modified shortcut should offer restore");
+        cx.simulate_click(restore.center(), Modifiers::default());
+        surfaces.read_with(cx, |surfaces, _| {
+            assert!(
+                !surfaces
+                    .prefs
+                    .shortcut_overrides
+                    .contains_key("open-launcher")
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn appearance_quick_themes_update_the_live_preview(cx: &mut TestAppContext) {
+        let (harness, cx) = cx.add_window_view(|window, cx| {
+            SettingsWorkbenchHarness::open_at(SettingsTab::Terminal, window, cx)
+        });
+        cx.simulate_resize(size(px(1200.0), px(800.0)));
+        cx.run_until_parked();
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+
+        let vesper = cx
+            .debug_bounds("FEATURED_THEME_1")
+            .expect("Vesper quick theme should render");
+        cx.simulate_click(vesper.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(surfaces.prefs.terminal_theme, TermTheme::VESPER.id);
+        });
+        assert!(
+            cx.debug_bounds("APPEARANCE_WORKSPACE_PREVIEW").is_some(),
+            "the live preview must remain mounted after changing theme"
+        );
+    }
+
+    #[gpui::test]
+    fn appearance_theme_cards_wrap_inside_a_narrow_settings_pane(cx: &mut TestAppContext) {
+        let (_harness, cx) = cx.add_window_view(|window, cx| {
+            SettingsWorkbenchHarness::open_at(SettingsTab::Terminal, window, cx)
+        });
+        cx.simulate_resize(size(px(760.0), px(760.0)));
+        cx.run_until_parked();
+
+        let pane = cx.debug_bounds("settings-pane").expect("settings pane");
+        for (index, selector) in ["FEATURED_THEME_0", "FEATURED_THEME_1", "FEATURED_THEME_2"]
+            .into_iter()
+            .enumerate()
+        {
+            let card = cx.debug_bounds(selector).expect("quick theme card");
+            assert!(
+                card.left() >= pane.left() && card.right() <= pane.right(),
+                "theme card {index} escaped the narrow pane: {card:?} vs {pane:?}"
+            );
+        }
     }
 
     #[gpui::test]

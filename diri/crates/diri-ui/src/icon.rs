@@ -69,6 +69,7 @@ pub enum IconName {
     ExternalLink,
     Folder,
     Grid,
+    Keyboard,
     LocalAgents,
     Merge,
     Monitor,
@@ -76,6 +77,7 @@ pub enum IconName {
     More,
     Network,
     NewAgent,
+    Pencil,
     Plus,
     Pointer,
     Power,
@@ -97,7 +99,7 @@ pub enum IconName {
 }
 
 impl IconName {
-    pub const ALL: [Self; 48] = [
+    pub const ALL: [Self; 50] = [
         Self::Activity,
         Self::Archive,
         Self::ArrowDown,
@@ -121,6 +123,7 @@ impl IconName {
         Self::ExternalLink,
         Self::Folder,
         Self::Grid,
+        Self::Keyboard,
         Self::LocalAgents,
         Self::Merge,
         Self::Monitor,
@@ -128,6 +131,7 @@ impl IconName {
         Self::More,
         Self::Network,
         Self::NewAgent,
+        Self::Pencil,
         Self::Plus,
         Self::Pointer,
         Self::Power,
@@ -173,6 +177,7 @@ impl IconName {
             Self::ExternalLink => "icons/external-link.svg",
             Self::Folder => "icons/folder.svg",
             Self::Grid => "icons/grid.svg",
+            Self::Keyboard => "icons/keyboard.svg",
             Self::LocalAgents => "icons/local-agents.svg",
             Self::Merge => "icons/merge.svg",
             Self::Monitor => "icons/monitor.svg",
@@ -180,6 +185,7 @@ impl IconName {
             Self::More => "icons/more.svg",
             Self::Network => "icons/network.svg",
             Self::NewAgent => "icons/new-agent.svg",
+            Self::Pencil => "icons/pencil.svg",
             Self::Plus => "icons/plus.svg",
             Self::Pointer => "icons/pointer.svg",
             Self::Power => "icons/power.svg",
@@ -228,6 +234,7 @@ impl IconName {
             "link" => Self::ExternalLink,
             "folder" | "folder.fill" => Self::Folder,
             "square.grid.2x2" | "terminal.grid" => Self::Grid,
+            "keyboard" => Self::Keyboard,
             "person.crop.circle" => Self::LocalAgents,
             "arrow.triangle.merge" => Self::Merge,
             "desktopcomputer" => Self::Monitor,
@@ -235,11 +242,14 @@ impl IconName {
             "ellipsis" => Self::More,
             "network" => Self::Network,
             "square.and.pencil" => Self::NewAgent,
+            "pencil" => Self::Pencil,
             "plus" => Self::Plus,
             "cursorarrow.rays" | "cursorarrow.click.2" => Self::Pointer,
             "power" => Self::Power,
             "arrow.triangle.pull" => Self::PullRequest,
-            "arrow.triangle.2.circlepath" | "arrow.clockwise.circle" => Self::Refresh,
+            "arrow.triangle.2.circlepath" | "arrow.clockwise.circle" | "arrow.counterclockwise" => {
+                Self::Refresh
+            }
             "arrow.left.and.right" | "arrow.left.arrow.right" => Self::ResizeHorizontal,
             "magnifyingglass" => Self::Search,
             "server.rack" => Self::Server,
@@ -333,6 +343,7 @@ fn embedded_svg(path: &str) -> Option<&'static [u8]> {
         "icons/external-link.svg" => include_bytes!("../assets/icons/external-link.svg"),
         "icons/folder.svg" => include_bytes!("../assets/icons/folder.svg"),
         "icons/grid.svg" => include_bytes!("../assets/icons/grid.svg"),
+        "icons/keyboard.svg" => include_bytes!("../assets/icons/keyboard.svg"),
         "icons/local-agents.svg" => include_bytes!("../assets/icons/local-agents.svg"),
         "icons/merge.svg" => include_bytes!("../assets/icons/merge.svg"),
         "icons/monitor.svg" => include_bytes!("../assets/icons/monitor.svg"),
@@ -340,6 +351,7 @@ fn embedded_svg(path: &str) -> Option<&'static [u8]> {
         "icons/more.svg" => include_bytes!("../assets/icons/more.svg"),
         "icons/network.svg" => include_bytes!("../assets/icons/network.svg"),
         "icons/new-agent.svg" => include_bytes!("../assets/icons/new-agent.svg"),
+        "icons/pencil.svg" => include_bytes!("../assets/icons/pencil.svg"),
         "icons/plus.svg" => include_bytes!("../assets/icons/plus.svg"),
         "icons/pointer.svg" => include_bytes!("../assets/icons/pointer.svg"),
         "icons/power.svg" => include_bytes!("../assets/icons/power.svg"),

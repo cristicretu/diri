@@ -107,6 +107,12 @@ fn install_app_menus(cx: &mut App) {
             let _ = window.update(cx, |_, window, _| window.remove_window());
         }
     });
+    refresh_app_menus(cx);
+}
+
+/// Rebuild native menu shortcut labels after the user edits the live keymap.
+/// Action handlers are installed only once by `install_app_menus`.
+pub(crate) fn refresh_app_menus(cx: &mut App) {
     #[cfg(target_os = "macos")]
     cx.set_menus([
         Menu::new("diri").items([
@@ -354,7 +360,15 @@ fn main() {
         load_system_fonts(cx);
         #[cfg(target_os = "macos")]
         diri_ui::set_mark_rasterizer(macos::brand_raster::raster_mark);
-        commands::bind_default_keys(cx);
+        let shortcut_overrides = services
+            .store
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .shortcut_overrides
+            .clone();
+        commands::bind_keys(cx, &shortcut_overrides);
         install_app_menus(cx);
         let quit_services = Arc::clone(&services);
         let quit_updates = services.updates.clone();
