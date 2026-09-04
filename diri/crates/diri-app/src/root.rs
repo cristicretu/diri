@@ -283,14 +283,18 @@ impl RootView {
             });
         }
         if let Some(terminal) = &terminal {
-            cx.subscribe(terminal, |this, _, event, cx| {
-                let TerminalPaneEvent::OpenFileReference { reference, cwd, .. } = event;
-                let inspector = this.inspector.clone();
-                this.reveal_inspector(cx);
-                if let Some(inspector) = inspector {
-                    inspector.update(cx, |inspector, cx| {
-                        inspector.open_file_reference(cwd.clone(), reference.clone(), cx);
-                    });
+            cx.subscribe(terminal, |this, _, event, cx| match event {
+                TerminalPaneEvent::OpenFileReference { reference, cwd, .. } => {
+                    let inspector = this.inspector.clone();
+                    this.reveal_inspector(cx);
+                    if let Some(inspector) = inspector {
+                        inspector.update(cx, |inspector, cx| {
+                            inspector.open_file_reference(cwd.clone(), reference.clone(), cx);
+                        });
+                    }
+                }
+                TerminalPaneEvent::ExternalDropFeedback { message } => {
+                    this.show_quote_feedback("Dropped files", message.clone(), cx);
                 }
             })
             .detach();

@@ -35,18 +35,19 @@ use diri_ui::{
 };
 use gpui::{
     AnyElement, ClickEvent, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter,
-    FocusHandle, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton, Render, Role,
-    ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Task, Window, div,
-    font, prelude::*, px, rgba,
+    ExternalPaths, FocusHandle, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton,
+    Render, Role, ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Task,
+    Window, div, font, prelude::*, px, rgba,
 };
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
-use crate::clipboard_transfer::StagedClipboardImage;
+use crate::clipboard_transfer::{StagedClipboardImage, upload_dropped_file};
 use crate::commands::{
     CloseFind, CopySelection, FindNext, FindPrevious, OpenFind, Paste, ResetZoom, TERMINAL_CONTEXT,
     ToggleInspector, ToggleSidebar, ZoomIn, ZoomOut,
 };
+use crate::external_drop::{TerminalDropAction, plan_terminal_drop, terminal_drop_text};
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::{NavigationOverlay, query_label};
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
@@ -109,6 +110,8 @@ pub enum TerminalPaneEvent {
         cwd: String,
         session_id: SessionId,
     },
+    /// Files were dropped on the grid and some (or all) could not be used.
+    ExternalDropFeedback { message: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -529,6 +532,9 @@ enum PaneEvent {
     ScrollbackCells(SessionId, diri_proto::ReadScrollbackCellsResult, usize),
     ScrollbackFailed(SessionId),
     ClipboardUploadFinished(SessionId, Result<String, String>),
+    /// Files dropped on a remote session finished copying; on success the
+    /// remote paths are ready to paste in drop order.
+    DroppedFilesUploaded(SessionId, Result<Vec<String>, String>),
 }
 
 /// Identifies one attachment task, not the durable session it reads. A session
@@ -1381,7 +1387,116 @@ impl TerminalPane {
                 }
                 Err(error) => eprintln!("diri: clipboard image upload failed: {error}"),
             },
+            PaneEvent::DroppedFilesUploaded(id, result) => match result {
+                Ok(remote_paths) => {
+                    let text = terminal_drop_text(remote_paths.iter().map(String::as_str));
+                    self.paste_into_session(&id, &text);
+                }
+                Err(error) => {
+                    eprintln!("diri: dropped file upload failed: {error}");
+                    cx.emit(TerminalPaneEvent::ExternalDropFeedback {
+                        message: format!(
+                            "Couldn't copy the dropped files to the session's host: {error}"
+                        ),
+                    });
+                }
+            },
         }
+    }
+
+    /// Writes `text` to a resident session as one paste, honouring the
+    /// child's bracketed-paste mode exactly like Command-V does.
+    fn paste_into_session(&self, id: &SessionId, text: &str) {
+        if let Some(resident) = self.residents.get(id) {
+            resident
+                .attachment
+                .input(terminal_paste(text, resident.bracketed_paste));
+        }
+    }
+
+    /// Finder released files over the grid. Behaves like a desktop terminal:
+    /// the paths are pasted into the foreground program, which is how Claude
+    /// Code, Codex and Cursor attach dropped images. Sessions on another host
+    /// get the files copied over first so the pasted path exists there.
+    fn external_drop(
+        &mut self,
+        paths: &ExternalPaths,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.selected_id() else {
+            return;
+        };
+        if !self.residents.contains_key(&id) {
+            return;
+        }
+        let ssh = {
+            let store = self
+                .runtime
+                .store
+                .read()
+                .expect("session store lock poisoned");
+            store
+                .sessions()
+                .get(&id)
+                .and_then(|session| session.host.as_deref())
+                .and_then(|host_id| store.host(host_id))
+                .map(|host| host.ssh.clone())
+        };
+
+        let plan = plan_terminal_drop(paths.paths(), ssh.is_some());
+        if let Some(message) = plan.feedback() {
+            cx.emit(TerminalPaneEvent::ExternalDropFeedback { message });
+        }
+        match plan.action {
+            None => {}
+            Some(TerminalDropAction::Paste(text)) => {
+                self.paste_into_session(&id, &text);
+            }
+            Some(TerminalDropAction::Upload(files)) => {
+                let Some(ssh) = ssh else {
+                    return;
+                };
+                let pane_tx = self.pane_tx.clone();
+                let upload_id = id.clone();
+                self.tokio.spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        files
+                            .iter()
+                            .map(|file| upload_dropped_file(file, &ssh))
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .await
+                    .unwrap_or_else(|error| Err(format!("upload task failed: {error}")));
+                    let _ = pane_tx.send(PaneEvent::DroppedFilesUploaded(upload_id, result));
+                });
+            }
+        }
+        // The drop lands where the caret is, so the next keystroke should too.
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    /// Present only while a drag is in flight, so it never sits between the
+    /// pointer and the grid during normal use. Styled only when what is being
+    /// dragged is a set of desktop files: other in-app drags pass through it.
+    fn external_drop_overlay(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("diri-terminal-external-drop")
+            .absolute()
+            .inset_0()
+            .rounded(px(Radius::PANEL))
+            .drag_over::<ExternalPaths>(|overlay, _, _, _| {
+                overlay
+                    .bg(Ink::FRESH.alpha(0.07))
+                    .border_2()
+                    .border_color(Ink::FRESH.alpha(0.5))
+            })
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                cx.stop_propagation();
+                this.external_drop(paths, window, cx);
+            }))
+            .into_any_element()
     }
 
     fn attachment_is_current(&self, id: &SessionId, generation: AttachmentGeneration) -> bool {
@@ -3442,10 +3557,16 @@ impl Render for TerminalPane {
             SessionSource::FollowSelection => SharedString::from("diri-terminal-root"),
             SessionSource::Fixed(id) => SharedString::from(format!("diri-terminal-root-{}", id.0)),
         };
+        let has_resident = self
+            .selected_id()
+            .is_some_and(|id| self.residents.contains_key(&id));
+        let drop_overlay =
+            (has_resident && cx.has_active_drag()).then(|| self.external_drop_overlay(cx));
         div()
             .id(root_id)
             .key_context(TERMINAL_CONTEXT)
             .track_focus(&self.focus)
+            .relative()
             .flex()
             .size_full()
             .text_color(colors.primary)
@@ -3462,6 +3583,7 @@ impl Render for TerminalPane {
             .on_key_up(cx.listener(Self::handle_key_up))
             .on_modifiers_changed(cx.listener(Self::handle_modifiers_changed))
             .child(content)
+            .children(drop_overlay)
     }
 }
 
