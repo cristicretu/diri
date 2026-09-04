@@ -1615,9 +1615,9 @@ impl UtilitySurfaces {
                         .when(empty, |view| {
                             view.child(empty_label(
                                 if self.history_query.is_empty() {
-                                    "No past conversations"
+                                    "Past Claude and Codex conversations will appear here."
                                 } else {
-                                    "No matches"
+                                    "No conversations match. Try a different search."
                                 },
                                 colors,
                             ))
@@ -1832,7 +1832,7 @@ impl UtilitySurfaces {
                         })
                         .when(
                             self.worktrees.entries.is_empty() && !self.worktrees.loading,
-                            |view| view.child(empty_label("No worktrees", colors)),
+                            |view| view.child(empty_label("No worktrees yet. Start a session with a new worktree to work on a separate branch.", colors)),
                         )
                         .children(cards),
                 )
@@ -6388,7 +6388,12 @@ mod tests {
             // The mirror runs on notifies; settings was already open before
             // anything was watching it.
             let nav = surfaces.read(cx).settings_nav();
-            sidebar.update(cx, |sidebar, cx| sidebar.set_settings_nav(nav, cx));
+            sidebar.update(cx, |sidebar, cx| {
+                // Match RootView: opening Settings reveals its navigation even
+                // when fresh preferences start with the sidebar closed.
+                sidebar.reveal(cx);
+                sidebar.set_settings_nav(nav, cx);
+            });
             Self {
                 sidebar,
                 surfaces,

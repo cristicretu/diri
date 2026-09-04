@@ -368,6 +368,7 @@ tokio::spawn(async move { clone_repository(request).await });
         }
 
         let mut prefs = Prefs {
+            sidebar_visible: true,
             sidebar_project_order: vec![dirijor.id.clone(), anara.id.clone(), settings.id.clone()],
             sidebar_session_order: sessions.iter().map(|session| session.id.clone()).collect(),
             sidebar_pinned_sessions: vec![claude.id.clone()],
