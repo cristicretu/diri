@@ -242,7 +242,7 @@ impl RootView {
     ) -> Self {
         let sidebar_runtime = (!preview).then(|| Arc::clone(&services.store));
         let sidebar = cx.new(|cx| Sidebar::new(sidebar_runtime, preview, preview_scenario, cx));
-        let terminal = (!preview).then(|| {
+        let terminal = (!preview || preview_scenario == PreviewScenario::Empty).then(|| {
             let runtime = Arc::clone(&services.store);
             let tokio = Arc::clone(&services.tokio);
             cx.new(|cx| TerminalPane::new(runtime, tokio, window, cx))
@@ -1954,7 +1954,7 @@ impl RootView {
             .border_1()
             .border_color(terminal.primary.alpha(0.10));
 
-        if self.preview {
+        if self.preview && self.preview_scenario != PreviewScenario::Empty {
             card = card.child(self.preview_workbench(terminal));
         } else if split_open {
             let available_height = (card_height - 1.0).max(0.0);
