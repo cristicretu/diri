@@ -24,9 +24,12 @@ in [Issues](https://github.com/cristicretu/diri/issues).
 - Continue publishing signed, notarized releases and the maintained Homebrew
   tap.
 - Submit Diri to the official Homebrew cask repository once it is eligible.
-  Homebrew normally requires a repository to be at least 30 days old and applies
-  a higher notability threshold to owner submissions. Until then, the supported
-  command is `brew install --cask cristicretu/diri/diri`.
+  The owner-submission notability threshold is met; the remaining normal policy
+  gate opens on September 3, 2026, at 10:08:23 UTC, when the repository is 30
+  days old. The [submission runbook](docs/HOMEBREW_CASK_SUBMISSION.md) keeps the
+  candidate, checksum verification, and validation commands ready. Until
+  acceptance, the supported command is
+  `brew install --cask cristicretu/diri/diri`.
 
 ## Not planned
 
