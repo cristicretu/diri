@@ -51,6 +51,7 @@ rusqlite = { version = "0.40.1", features = ["bundled"] }
 sha2 = "0.11"
 tempfile = "3"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "0.8.23"
 unicode-segmentation = "1"
 url = "2"
 zeroize = { version = "1", features = ["derive"] }

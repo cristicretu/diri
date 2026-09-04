@@ -2,6 +2,11 @@
 
 `diri-node` makes a VPS (or another workstation) a first-party Dirijor execution host. It is a per-user service: provider credentials remain on the machine where Claude Code or Codex runs, while Dirijor gets one versioned management interface for accounts, usage, provider sessions, and handoff.
 
+The [handoff design](HANDOFF.md) explains exactly which settings, MCP state,
+authentication, conversation data, and working-tree data move between nodes,
+including why Jujutsu is an optional code adapter rather than a credential
+synchronizer.
+
 SSH is still configured. It is the install/recovery path and the compatibility terminal path; it is no longer the source of truth for identity, usage, or movement.
 
 ## Install on the VPS
@@ -86,6 +91,21 @@ diri-node account login --id personal \
 Codex uses the official app-server device-code/browser flow. The URL and one-time code are printed where the command runs, so a VPS login completes in the local browser without copying `auth.json`. Claude's supported interactive auth command is streamed through the node; open the emitted URL locally. On Linux, each Claude installation uses its own `CLAUDE_CONFIG_DIR`. Claude Code's macOS Keychain credential is host-wide, so multiple simultaneous Claude subscription identities on one Mac are intentionally not claimed as isolated.
 
 Codex installations use a separate `CODEX_HOME`. Sessions bind to an explicit profile; changing a node default affects new sessions, not a running session. This is identity selection for legitimate personal/work contexts—not automatic rate-limit failover.
+
+Provider settings can follow the profile without its credentials:
+
+```sh
+diri-node account sync-config --id work \
+  --target-endpoint tcp://100.64.0.2:7337 \
+  --target-token-file ~/.config/dirijor/forge.token \
+  --target-node-id node-a1b2c3d4
+```
+
+The handoff command runs the same sync automatically when both nodes advertise
+`portable-config.v1`. Target conflicts are kept and reported; known inline MCP
+credential fields are omitted, and provider login state never crosses the node
+boundary. See [Local ↔ VPS handoff design](HANDOFF.md) for the allowlist and
+security model.
 
 ## Instant move and fork
 

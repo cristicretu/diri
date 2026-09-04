@@ -6,7 +6,7 @@ use diri_proto::{
     BlobPutParams, BlobReadParams, CheckpointIdParams, CheckpointManifestParams,
     CheckpointPrepareParams, EmptyParams, LoginInputParams, LoginSessionParams, MoveAbortParams,
     MoveCommitParams, NodeCapability, NodeHelloResult, NodeMethod, NodeStatusResult,
-    ProviderCallParams, UsageQueryParams, UsageRecordParams,
+    PortableConfigApplyParams, ProviderCallParams, UsageQueryParams, UsageRecordParams,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -66,6 +66,7 @@ impl NodeService {
                 NodeCapability::FLEET_USAGE.into(),
                 NodeCapability::CHECKPOINTS.into(),
                 NodeCapability::MOVE_LEASES.into(),
+                NodeCapability::PORTABLE_CONFIG.into(),
             ],
         }
     }
@@ -139,6 +140,28 @@ impl NodeService {
                 let params: LoginSessionParams = decode(params)?;
                 self.providers.lock().await.cancel_login(params).await?;
                 encode(json!({"ok": true}))
+            }
+            NodeMethod::ACCOUNT_PORTABLE_CONFIG_EXPORT => {
+                let params: AccountProfileParams = decode(params)?;
+                let accounts = self.accounts.lock().await;
+                let profile = accounts.profile(&params.profile_id)?;
+                encode(crate::portable::capture(
+                    profile,
+                    &accounts.config_home(profile),
+                )?)
+            }
+            NodeMethod::ACCOUNT_PORTABLE_CONFIG_APPLY => {
+                let params: PortableConfigApplyParams = decode(params)?;
+                let profile_id = params.bundle.profile_id.clone();
+                let result = {
+                    let accounts = self.accounts.lock().await;
+                    let profile = accounts.profile(&profile_id)?;
+                    crate::portable::apply(profile, &accounts.config_home(profile), params.bundle)?
+                };
+                if !result.installed.is_empty() {
+                    self.providers.lock().await.reset_profile(&profile_id);
+                }
+                encode(result)
             }
             NodeMethod::PROVIDER_CALL => {
                 let params: ProviderCallParams = decode(params)?;
@@ -261,15 +284,16 @@ fn encode<T: Serialize>(value: T) -> NodeResult<JsonValue> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use diri_proto::{ProviderKind, UsageEvent, UsageSource, UsageValueKind};
+    use std::fs;
+    use std::path::Path;
 
-    #[tokio::test]
-    async fn service_exposes_accounts_and_fleet_usage_without_secrets() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let paths = NodePaths::for_root(directory.path().join("node"));
-        let config = NodeConfig::load_or_initialize(&paths).expect("config");
-        let service = NodeService::open(paths, config).expect("service");
+    use super::*;
+    use diri_proto::{
+        PortableConfigApplyParams, PortableConfigBundle, ProviderKind, UsageEvent, UsageSource,
+        UsageValueKind,
+    };
+
+    async fn add_codex_profile(service: &NodeService) {
         service
             .dispatch(
                 NodeMethod::ACCOUNT_UPSERT,
@@ -281,6 +305,15 @@ mod tests {
             )
             .await
             .expect("account");
+    }
+
+    #[tokio::test]
+    async fn service_exposes_accounts_and_fleet_usage_without_secrets() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = NodePaths::for_root(directory.path().join("node"));
+        let config = NodeConfig::load_or_initialize(&paths).expect("config");
+        let service = NodeService::open(paths, config).expect("service");
+        add_codex_profile(&service).await;
         service
             .dispatch(
                 NodeMethod::USAGE_RECORD,
@@ -319,5 +352,74 @@ mod tests {
             .await
             .expect("usage query");
         assert_eq!(usage["totals"]["inputTokens"], 5);
+    }
+
+    #[tokio::test]
+    async fn portable_config_rebases_from_a_mac_home_to_the_remote_node_home() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source_paths = NodePaths::for_root(
+            directory
+                .path()
+                .join("Users/alice/Library/Application Support/Dirijor/node"),
+        );
+        let target_paths = NodePaths::for_root(
+            directory
+                .path()
+                .join("home/alice/.local/share/dirijor/node"),
+        );
+        let source = NodeService::open(
+            source_paths.clone(),
+            NodeConfig::load_or_initialize(&source_paths).expect("source config"),
+        )
+        .expect("source service");
+        let target = NodeService::open(
+            target_paths.clone(),
+            NodeConfig::load_or_initialize(&target_paths).expect("target config"),
+        )
+        .expect("target service");
+        add_codex_profile(&source).await;
+        add_codex_profile(&target).await;
+
+        let source_home = source_paths.accounts_root.join("codex/work");
+        let target_home = target_paths.accounts_root.join("codex/work");
+        assert_ne!(source_home, target_home);
+        fs::write(source_home.join("AGENTS.md"), "portable instructions\n")
+            .expect("source settings");
+
+        let exported = source
+            .dispatch(
+                NodeMethod::ACCOUNT_PORTABLE_CONFIG_EXPORT,
+                Some(json!({"profileId": "work"})),
+            )
+            .await
+            .expect("export");
+        let bundle: PortableConfigBundle =
+            serde_json::from_value(exported).expect("portable bundle");
+        assert!(
+            bundle
+                .files
+                .iter()
+                .all(|file| Path::new(&file.path).is_relative())
+        );
+        assert!(
+            !serde_json::to_string(&bundle)
+                .expect("bundle json")
+                .contains(&source_home.to_string_lossy().to_string())
+        );
+
+        target
+            .dispatch(
+                NodeMethod::ACCOUNT_PORTABLE_CONFIG_APPLY,
+                Some(
+                    serde_json::to_value(PortableConfigApplyParams { bundle })
+                        .expect("apply params"),
+                ),
+            )
+            .await
+            .expect("apply");
+        assert_eq!(
+            fs::read_to_string(target_home.join("AGENTS.md")).expect("target settings"),
+            "portable instructions\n"
+        );
     }
 }
