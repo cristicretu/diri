@@ -130,7 +130,7 @@ fn aggregates_costs_dedupes_claude_and_preserves_provider_totals() {
     assert_eq!(snapshot.session_remaining_seconds, Some(3 * 3_600));
 
     let cache: Value = serde_json::from_slice(&fs::read(&fixture.cache).unwrap()).unwrap();
-    assert_eq!(cache["version"], 2);
+    assert_eq!(cache["version"], super::cache::CACHE_VERSION);
     assert_eq!(
         cache["seen"]
             .as_object()
@@ -510,4 +510,160 @@ fn append(path: &Path, bytes: &[u8]) {
 
 fn assert_close(actual: f64, expected: f64) {
     assert!((actual - expected).abs() < 1e-12, "{actual} != {expected}");
+}
+
+#[test]
+fn dashboard_preserves_deduplication_model_changes_and_cached_history() {
+    let fixture = Fixture::new();
+    let message = claude_line(
+        "2026-07-22T10:00:00Z",
+        "claude-sonnet-5",
+        "m",
+        "r",
+        100,
+        20,
+        1_000,
+        50,
+        None,
+    );
+    write_lines(
+        &fixture.claude.join("a.jsonl"),
+        std::slice::from_ref(&message),
+    );
+    write_lines(&fixture.claude.join("b.jsonl"), &[message]);
+    let codex = fixture.codex.join("rollout.jsonl");
+    write_lines(
+        &codex,
+        &[
+            json!({"type":"turn_context","payload":{"model":"gpt-5.4"}}),
+            json!({"timestamp":"2026-07-22T10:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":50,"output_tokens":20,"reasoning_output_tokens":8}}}}),
+            json!({"type":"turn_context","payload":{"model":"unrecognized-model"}}),
+            json!({"timestamp":"2026-07-22T11:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":200,"output_tokens":30}}}}),
+        ],
+    );
+    let mut store = fixture.store(
+        "2026-07-22T12:00:00Z",
+        "2026-07-22T00:00:00Z",
+        "2026-07-01T00:00:00Z",
+    );
+    let snapshot = store.refresh();
+    let report = snapshot.history.report(snapshot.updated_at, 30);
+    assert_eq!(report.total.totals(), snapshot.today());
+    assert_eq!(report.models.len(), 3);
+    assert_eq!(report.active_days, 1);
+    assert_eq!(report.total.reasoning, 8); // Already a subset of output.
+    assert_eq!(report.total.priced_tokens, 1_290);
+    assert_eq!(
+        report.total.totals().total_tokens() - report.total.priced_tokens,
+        230
+    );
+    assert_close(report.total.read_savings, 0.002_812_5);
+    assert_eq!(report.days.last().unwrap().total(), report.total);
+    let warm = store.refresh();
+    assert_eq!(warm.history, snapshot.history);
+    assert_eq!(store.last_stats().bytes_parsed, 0);
+    let mut restarted = fixture.store(
+        "2026-07-22T12:00:00Z",
+        "2026-07-22T00:00:00Z",
+        "2026-07-01T00:00:00Z",
+    );
+    assert_eq!(restarted.refresh().history, snapshot.history);
+    assert_eq!(restarted.last_stats().bytes_parsed, 0);
+    append(
+        &codex,
+        &line_bytes(
+            &json!({"timestamp":"2026-07-22T12:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":1}}}}),
+        ),
+    );
+    let appended = restarted.refresh_paths(&[codex]);
+    let report = appended.history.report(appended.updated_at, 7);
+    assert_eq!(report.total.totals(), appended.today());
+    assert_eq!(report.total.totals().total_tokens(), 1_531);
+}
+
+#[test]
+fn dashboard_ranges_zero_fill_and_rebuild_old_caches_for_ninety_days() {
+    let fixture = Fixture::new();
+    write_lines(
+        &fixture.claude.join("history.jsonl"),
+        &[
+            claude_line(
+                "2026-04-24T00:00:00Z",
+                "claude-sonnet",
+                "a",
+                "a",
+                10,
+                0,
+                0,
+                0,
+                None,
+            ),
+            claude_line(
+                "2026-06-23T00:00:00Z",
+                "claude-sonnet",
+                "b",
+                "b",
+                20,
+                0,
+                0,
+                0,
+                None,
+            ),
+            claude_line(
+                "2026-07-16T00:00:00Z",
+                "claude-sonnet",
+                "c",
+                "c",
+                30,
+                0,
+                0,
+                0,
+                None,
+            ),
+            claude_line(
+                "2026-07-23T00:00:00Z",
+                "claude-sonnet",
+                "future",
+                "future",
+                99,
+                0,
+                0,
+                0,
+                None,
+            ),
+        ],
+    );
+    let mut store = fixture.store(
+        "2026-07-22T12:00:00Z",
+        "2026-07-22T00:00:00Z",
+        "2026-07-01T00:00:00Z",
+    );
+    let first = store.refresh();
+    for (days, tokens, active) in [(7, 30, 1), (30, 50, 2), (90, 60, 3)] {
+        let report = first.history.report(first.updated_at, days);
+        assert_eq!(report.days.len(), days);
+        assert_eq!(report.total.totals().total_tokens(), tokens);
+        assert_eq!(report.active_days, active);
+        assert_eq!(
+            report.days.last().unwrap().total().totals().total_tokens(),
+            0
+        );
+    }
+    let mut cache: Value = serde_json::from_slice(&fs::read(&fixture.cache).unwrap()).unwrap();
+    cache["version"] = json!(2);
+    for entry in cache["files"].as_object_mut().unwrap().values_mut() {
+        entry.as_object_mut().unwrap().remove("details");
+    }
+    fs::write(&fixture.cache, serde_json::to_vec(&cache).unwrap()).unwrap();
+    let mut restarted = fixture.store(
+        "2026-07-22T12:00:00Z",
+        "2026-07-22T00:00:00Z",
+        "2026-07-01T00:00:00Z",
+    );
+    assert_eq!(restarted.refresh().history, first.history);
+    assert!(restarted.last_stats().bytes_parsed > 0);
+    assert_eq!(
+        super::dashboard::date_label(timestamp("2024-02-29T00:00:00Z") / 86400),
+        "2024-02-29"
+    );
 }

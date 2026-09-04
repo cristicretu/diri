@@ -50,7 +50,7 @@ pub struct ProviderUsage {
 }
 
 /// The UI-facing usage projection. Dates are Unix seconds.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UsageSnapshot {
     pub claude: ProviderUsage,
     pub codex: ProviderUsage,
@@ -59,18 +59,20 @@ pub struct UsageSnapshot {
     pub session_ends_at: Option<i64>,
     pub session_remaining_seconds: Option<i64>,
     pub updated_at: i64,
+    /// Local transcript history; fleet summaries do not provide this detail.
+    pub history: std::sync::Arc<super::dashboard::UsageHistory>,
 }
 
 impl UsageSnapshot {
     #[must_use]
-    pub fn today(self) -> UsageTotals {
+    pub fn today(&self) -> UsageTotals {
         let mut totals = self.claude.today;
         totals += self.codex.today;
         totals
     }
 
     #[must_use]
-    pub fn month(self) -> UsageTotals {
+    pub fn month(&self) -> UsageTotals {
         let mut totals = self.claude.month;
         totals += self.codex.month;
         totals

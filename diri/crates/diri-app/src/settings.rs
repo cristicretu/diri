@@ -46,16 +46,18 @@ pub enum SettingsTab {
     Agents,
     Shortcuts,
     Terminal,
+    Usage,
     Resources,
     Remote,
 }
 
 impl SettingsTab {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::General,
         Self::Agents,
         Self::Shortcuts,
         Self::Terminal,
+        Self::Usage,
         Self::Resources,
         Self::Remote,
     ];
@@ -66,6 +68,7 @@ impl SettingsTab {
             Self::Agents => "Agents",
             Self::Shortcuts => "Shortcuts",
             Self::Terminal => "Appearance",
+            Self::Usage => "Usage",
             Self::Resources => "Resources",
             Self::Remote => "Remote",
         }
@@ -77,6 +80,7 @@ impl SettingsTab {
             Self::Agents => "Installed CLIs and quick create",
             Self::Shortcuts => "Keyboard commands and bindings",
             Self::Terminal => "Themes and terminal type",
+            Self::Usage => "Costs, tokens, and cache savings",
             Self::Resources => "Idle sessions and memory",
             Self::Remote => "SSH execution hosts",
         }
@@ -86,7 +90,7 @@ impl SettingsTab {
     /// describe the machines and resources sessions run on.
     pub const fn section(self) -> SettingsSection {
         match self {
-            Self::General | Self::Agents | Self::Shortcuts | Self::Terminal => {
+            Self::General | Self::Agents | Self::Shortcuts | Self::Terminal | Self::Usage => {
                 SettingsSection::Personal
             }
             Self::Resources | Self::Remote => SettingsSection::System,
@@ -99,6 +103,7 @@ impl SettingsTab {
             Self::Agents => "sparkles",
             Self::Shortcuts => "keyboard",
             Self::Terminal => "terminal",
+            Self::Usage => "chart.bar.xaxis",
             Self::Resources => "server.rack",
             Self::Remote => "network",
         }

@@ -1,3 +1,6 @@
+#[path = "usage_page.rs"]
+mod usage_page;
+
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -257,6 +260,10 @@ pub struct UtilitySurfaces {
     history_error: Option<String>,
     worktrees: WorktreesSheet,
     settings_tab: SettingsTab,
+    usage: crate::usage::UsageSnapshot,
+    usage_days: usize,
+    usage_tokens: bool,
+    usage_by_day: bool,
     settings_scroll: ScrollHandle,
     settings_search: QueryEditor,
     settings_search_active: bool,
@@ -316,6 +323,7 @@ impl UtilitySurfaces {
             Some("shortcuts") => SettingsTab::Shortcuts,
             Some("resources") => SettingsTab::Resources,
             Some("remote") => SettingsTab::Remote,
+            Some("usage") => SettingsTab::Usage,
             _ => SettingsTab::General,
         };
         let diagnostics_preview = settings_preview.as_deref() == Some("diagnostics");
@@ -371,6 +379,10 @@ impl UtilitySurfaces {
             history_error: None,
             worktrees: WorktreesSheet::default(),
             settings_tab,
+            usage: crate::usage::UsageSnapshot::default(),
+            usage_days: 30,
+            usage_tokens: false,
+            usage_by_day: false,
             settings_scroll: ScrollHandle::new(),
             settings_search: QueryEditor::default(),
             settings_search_active: false,
@@ -2035,6 +2047,7 @@ impl UtilitySurfaces {
             SettingsTab::Terminal => self.terminal_settings(cx).into_any_element(),
             SettingsTab::Resources => self.resource_settings(cx).into_any_element(),
             SettingsTab::Remote => self.remote_settings(cx).into_any_element(),
+            SettingsTab::Usage => self.usage_settings(cx).into_any_element(),
         };
         let pane = div()
             .id("settings-pane")
@@ -2049,7 +2062,11 @@ impl UtilitySurfaces {
             .child(
                 div()
                     .w_full()
-                    .max_w(px(SETTINGS_CONTENT_MAX_WIDTH))
+                    .max_w(px(if self.settings_tab == SettingsTab::Usage {
+                        1040.0
+                    } else {
+                        SETTINGS_CONTENT_MAX_WIDTH
+                    }))
                     .mx_auto()
                     .child(pane),
             );
@@ -5146,6 +5163,7 @@ fn settings_tab_matches(tab: SettingsTab, query: &str) -> bool {
             "shortcuts keyboard bindings hotkeys commands keys navigation sessions workspace terminal"
         }
         SettingsTab::Terminal => "terminal appearance color theme font text size zoom",
+        SettingsTab::Usage => "usage cost tokens spending cache savings model daily claude codex",
         SettingsTab::Resources => {
             "resources idle sessions hibernate freeze memory limit performance"
         }
@@ -6067,6 +6085,138 @@ mod tests {
             std::fs::create_dir_all(parent).expect("create screenshot directory");
         }
         screenshot.save(output).expect("save settings screenshot");
+    }
+
+    #[gpui::test]
+    fn usage_settings_controls_and_search(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.open_settings_tab(SettingsTab::Usage, cx);
+            surfaces.usage.updated_at = 1_788_523_200;
+        });
+        cx.run_until_parked();
+        for selector in ["usage-range-7", "usage-tokens", "usage-by-day"] {
+            let bounds = cx.debug_bounds(selector).expect("visible usage control");
+            cx.simulate_click(bounds.center(), Modifiers::default());
+            cx.run_until_parked();
+        }
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(surfaces.usage_days, 7);
+            assert!(surfaces.usage_tokens);
+            assert!(surfaces.usage_by_day);
+        });
+        assert!(settings_tab_matches(SettingsTab::Usage, "cache savings"));
+        assert!(settings_tab_matches(SettingsTab::Usage, "cost"));
+    }
+
+    /// Fixture-only visual review, never populates the live usage tracker.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes the usage settings screenshot artifact"]
+    fn render_usage_settings_preview_screenshot() {
+        let output = std::env::var_os("DIRI_VISUAL_OUTPUT")
+            .map(PathBuf::from)
+            .expect("output PNG path");
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let width = std::env::var("DIRI_VISUAL_WIDTH")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(1200.0);
+        let window = cx
+            .open_window(size(px(width), px(900.0)), move |window, cx| {
+                let harness =
+                    cx.new(|cx| SettingsWorkbenchHarness::open_at(SettingsTab::Usage, window, cx));
+                harness.update(cx, |harness, cx| {
+                    harness.surfaces.update(cx, |surfaces, cx| {
+                        let mut history = crate::usage::dashboard::UsageHistory::default();
+                        let mut models = crate::usage::dashboard::ModelHours::default();
+                        let now = 1_788_523_200;
+                        for day in 0..30 {
+                            if day % 5 == 0 {
+                                continue;
+                            }
+                            for (index, model) in ["claude-opus-4-6", "claude-sonnet-4-6"]
+                                .into_iter()
+                                .enumerate()
+                            {
+                                let volume = ((day * 7 + index * 11) % 19 + 1) as i64;
+                                crate::usage::dashboard::record(
+                                    &mut models,
+                                    model,
+                                    now / 3600 - day as i64 * 24,
+                                    crate::usage::UsageHourAgg {
+                                        i: volume * 1000,
+                                        o: volume * 10_000,
+                                        cr: volume * 1_000_000,
+                                        cw: volume * 100_000,
+                                        c: volume as f64 * 0.9,
+                                    },
+                                    diri_usage::match_claude(model),
+                                    0,
+                                );
+                            }
+                        }
+                        history.merge(crate::usage::UsageProvider::Claude, &models);
+                        models.clear();
+                        for day in 0..30 {
+                            let volume = (day * 3) % 13 + 1;
+                            crate::usage::dashboard::record(
+                                &mut models,
+                                "gpt-5.4",
+                                now / 3600 - day * 24,
+                                crate::usage::UsageHourAgg {
+                                    i: volume * 2000,
+                                    o: volume * 8000,
+                                    cr: volume * 200_000,
+                                    cw: 0,
+                                    c: volume as f64 * 0.3,
+                                },
+                                diri_usage::match_openai("gpt-5.4"),
+                                volume * 3000,
+                            );
+                        }
+                        history.merge(crate::usage::UsageProvider::Codex, &models);
+                        if std::env::var_os("DIRI_VISUAL_EMPTY").is_some() {
+                            history = Default::default();
+                        }
+                        if std::env::var_os("DIRI_VISUAL_LIGHT").is_some() {
+                            surfaces.prefs.terminal_theme = "dirijor-light".into();
+                        }
+                        surfaces.usage_days = std::env::var("DIRI_VISUAL_DAYS")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(30);
+                        surfaces.set_usage(
+                            crate::usage::UsageSnapshot {
+                                updated_at: now,
+                                history: Arc::new(history),
+                                ..Default::default()
+                            },
+                            cx,
+                        );
+                    });
+                });
+                harness
+            })
+            .expect("open usage screenshot");
+        cx.run_until_parked();
+        let screenshot = cx
+            .capture_screenshot(window.into())
+            .expect("capture usage settings");
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        screenshot.save(output).expect("save usage settings");
     }
 
     /// Renders the Appearance destination at a realistic desktop size so the
