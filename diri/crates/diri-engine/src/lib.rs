@@ -39,6 +39,7 @@ pub mod hosts;
 pub mod inject;
 pub mod legacy_remote;
 mod lifecycle;
+pub mod limits;
 pub mod log;
 pub mod migrate;
 pub mod pr_monitor;
