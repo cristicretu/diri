@@ -997,6 +997,16 @@ impl RootView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // A sidebar drag rarely has sidebar focus (the press left it in the
+        // terminal), so Escape is caught here, on the window's capture path.
+        if event.keystroke.key == "escape"
+            && self
+                .sidebar
+                .update(cx, |sidebar, cx| sidebar.cancel_active_drag(cx))
+        {
+            cx.stop_propagation();
+            return;
+        }
         if self.quote_target_picker.is_some() {
             let target_count = self
                 .quote_target_picker

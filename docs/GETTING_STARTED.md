@@ -26,6 +26,15 @@ Claude Code and Codex have first-class status detection and resume support.
 Other agents may offer partial detection; every agent can still run as a normal
 terminal.
 
+## Drag and drop in the sidebar
+
+Drag a session between two rows to reorder it among its siblings; an insertion
+line shows where it will land. Drop it onto another session's row to review a
+handoff of its work to that session, or onto the zone that appears below the
+last project to fan out a sibling with the same prompt. Project headers reorder
+the same way. Escape cancels a drag, and releasing where nothing accepts the
+drop does nothing.
+
 ## Working from the keyboard
 
 ⌘N opens the launcher, ⌘T starts a session with the default agent, ⌘K is the
