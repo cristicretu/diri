@@ -1,5 +1,5 @@
 use diri_proto::{ProjectId, SessionId};
-use gpui::{Pixels, Point};
+use gpui::{Bounds, Pixels, Point};
 
 use crate::delegation::SiblingProposal;
 use crate::query_editor::QueryEditor;
@@ -29,6 +29,37 @@ pub enum DragItem {
         archived: bool,
     },
     Sessions(Vec<SessionId>),
+}
+
+/// Where the pointer sits inside a row during a drag. Outline views split a
+/// row into two insertion bands and a core: the bands mean "put the dragged
+/// row beside this one", the core means "drop it onto this one". Reordering
+/// and delegation share the same rows, and this is what keeps them apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropZone {
+    Before,
+    Onto,
+    After,
+}
+
+/// Classifies `position` against a row's bounds. `band` is the height of each
+/// insertion band; `None` when the pointer is not over the row at all.
+pub fn drop_zone(
+    bounds: Bounds<Pixels>,
+    position: Point<Pixels>,
+    band: Pixels,
+) -> Option<DropZone> {
+    if !bounds.contains(&position) {
+        return None;
+    }
+    let offset = position.y - bounds.origin.y;
+    if offset < band {
+        Some(DropZone::Before)
+    } else if offset > bounds.size.height - band {
+        Some(DropZone::After)
+    } else {
+        Some(DropZone::Onto)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -66,6 +97,9 @@ pub struct SidebarUiState {
     pub hover_card: Option<(SessionId, f32)>,
     pub drag: Option<DragItem>,
     pub drag_target: Option<String>,
+    /// Project order when a header drag began. Headers reorder live under the
+    /// pointer, so cancelling the gesture has to put them back.
+    pub project_order_at_drag_start: Option<Vec<ProjectId>>,
     /// Keyboard source for the two-step mark-then-delegate equivalent.
     pub delegation_mark: Option<SessionId>,
     /// Empty-space drops stop here until the user confirms the sibling spawn.
@@ -98,6 +132,7 @@ impl SidebarUiState {
             hover_card: None,
             drag: None,
             drag_target: None,
+            project_order_at_drag_start: None,
             delegation_mark: None,
             pending_sibling: None,
             delegation_notice: None,
@@ -223,6 +258,22 @@ pub fn move_before<T: Clone + PartialEq>(order: &mut Vec<T>, moved: &T, target: 
     order.insert(target_index, item);
 }
 
+/// Moves `moved` to the far side of `target`: below it when it came from
+/// above, above it when it came from below. Live reordering under a pointer
+/// needs this rather than [`move_before`]: a row already sits before its
+/// lower neighbour, so "move before it" could never move anything down.
+pub fn move_past<T: Clone + PartialEq>(order: &mut Vec<T>, moved: &T, target: &T) {
+    let position = |item: &T| order.iter().position(|candidate| candidate == item);
+    let (Some(from), Some(to)) = (position(moved), position(target)) else {
+        return;
+    };
+    if from == to {
+        return;
+    }
+    let item = order.remove(from);
+    order.insert(to, item);
+}
+
 pub fn move_to_end<T: Clone + PartialEq>(order: &mut Vec<T>, moved: &T) {
     let Some(index) = order.iter().position(|item| item == moved) else {
         return;
@@ -252,6 +303,44 @@ mod tests {
         assert_eq!(values, [1, 4, 2, 3]);
         move_to_end(&mut values, &1);
         assert_eq!(values, [4, 2, 3, 1]);
+    }
+
+    #[test]
+    fn move_past_crosses_the_target_in_either_direction() {
+        let mut values = vec![1, 2, 3];
+        move_past(&mut values, &1, &2);
+        assert_eq!(
+            values,
+            [2, 1, 3],
+            "dragging down by one lands below the neighbour"
+        );
+        move_past(&mut values, &3, &2);
+        assert_eq!(
+            values,
+            [3, 2, 1],
+            "dragging up by one lands above the neighbour"
+        );
+        move_past(&mut values, &3, &1);
+        assert_eq!(values, [2, 1, 3]);
+        move_past(&mut values, &2, &2);
+        assert_eq!(values, [2, 1, 3], "a row over itself stays put");
+    }
+
+    #[test]
+    fn drop_zone_splits_a_row_into_bands_and_a_core() {
+        use gpui::{px, size};
+        let bounds = Bounds::new(gpui::point(px(0.0), px(100.0)), size(px(200.0), px(28.0)));
+        let band = px(7.0);
+        let at = |y: f32| drop_zone(bounds, gpui::point(px(20.0), px(y)), band);
+        assert_eq!(at(99.0), None);
+        assert_eq!(at(100.0), Some(DropZone::Before));
+        assert_eq!(at(106.0), Some(DropZone::Before));
+        assert_eq!(at(107.0), Some(DropZone::Onto));
+        assert_eq!(at(114.0), Some(DropZone::Onto));
+        assert_eq!(at(121.0), Some(DropZone::Onto));
+        assert_eq!(at(122.0), Some(DropZone::After));
+        assert_eq!(at(127.9), Some(DropZone::After));
+        assert_eq!(at(128.0), None);
     }
 
     #[test]

@@ -41,6 +41,19 @@ fn main() {
         env!("CARGO_PKG_VERSION")
     );
 
+    // The app also launches us with launchd's 256-descriptor soft limit. One
+    // PTY holder, one ssh child, and one client each cost several, so a
+    // working fleet blows through that within a few dozen sessions and every
+    // attach after that fails before its first frame.
+    match diri_engine::limits::raise_fd_limit() {
+        Some(limit) => eprintln!(
+            "dirijord-rs: file descriptor limit soft={} hard={}",
+            limit.soft,
+            limit.hard_label()
+        ),
+        None => eprintln!("dirijord-rs: file descriptor limit could not be read"),
+    }
+
     // The app launches us with launchd's generic SHELL and minimal PATH.
     // Normalize both from the user's account before any session snapshots the
     // inherited environment: wrapped agents must return to the user's actual
@@ -213,9 +226,13 @@ fn main() {
                     });
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            // Never leave the accept loop: exiting here strands every
+            // attached terminal, and the usual cause (descriptor exhaustion)
+            // clears the moment a session or client goes away.
             Err(error) => {
-                eprintln!("dirijord-rs: accept: {error}");
-                break;
+                let delay = diri_engine::limits::accept_retry_delay(&error);
+                eprintln!("dirijord-rs: accept: {error}; retrying in {delay:?}");
+                std::thread::sleep(delay);
             }
         }
     }

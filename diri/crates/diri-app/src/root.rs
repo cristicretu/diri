@@ -283,14 +283,18 @@ impl RootView {
             });
         }
         if let Some(terminal) = &terminal {
-            cx.subscribe(terminal, |this, _, event, cx| {
-                let TerminalPaneEvent::OpenFileReference { reference, cwd, .. } = event;
-                let inspector = this.inspector.clone();
-                this.reveal_inspector(cx);
-                if let Some(inspector) = inspector {
-                    inspector.update(cx, |inspector, cx| {
-                        inspector.open_file_reference(cwd.clone(), reference.clone(), cx);
-                    });
+            cx.subscribe(terminal, |this, _, event, cx| match event {
+                TerminalPaneEvent::OpenFileReference { reference, cwd, .. } => {
+                    let inspector = this.inspector.clone();
+                    this.reveal_inspector(cx);
+                    if let Some(inspector) = inspector {
+                        inspector.update(cx, |inspector, cx| {
+                            inspector.open_file_reference(cwd.clone(), reference.clone(), cx);
+                        });
+                    }
+                }
+                TerminalPaneEvent::ExternalDropFeedback { message } => {
+                    this.show_quote_feedback("Dropped files", message.clone(), cx);
                 }
             })
             .detach();
@@ -997,6 +1001,16 @@ impl RootView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // A sidebar drag rarely has sidebar focus (the press left it in the
+        // terminal), so Escape is caught here, on the window's capture path.
+        if event.keystroke.key == "escape"
+            && self
+                .sidebar
+                .update(cx, |sidebar, cx| sidebar.cancel_active_drag(cx))
+        {
+            cx.stop_propagation();
+            return;
+        }
         if self.quote_target_picker.is_some() {
             let target_count = self
                 .quote_target_picker

@@ -303,15 +303,27 @@ impl ControlServer {
             return Vec::new();
         };
         let hosts = diri_proto::HostsConfig::load(self.hosts_file());
-        let mut registry = match self.registry.lock() {
-            Ok(registry) => registry,
-            Err(_) => return Vec::new(),
+        // Snapshot under the lock, then let it go. Every step below is an SSH
+        // round trip, and a delegated fleet is dozens of bindings on one host:
+        // holding the Registry across all of them blocked attaches, hook
+        // reports, and readiness probes for minutes after boot, which the app
+        // showed as a blank pane for every session, local ones included.
+        let (records, engine) = {
+            let Ok(registry) = self.registry.lock() else {
+                return Vec::new();
+            };
+            let records = registry
+                .records()
+                .into_iter()
+                .map(|record| (record.id.0.clone(), record))
+                .collect::<std::collections::HashMap<_, _>>();
+            (records, registry.engine())
         };
-        let records = registry
-            .records()
-            .into_iter()
-            .map(|record| (record.id.0.clone(), record))
-            .collect::<std::collections::HashMap<_, _>>();
+        // One Helper probe per host and build rather than one per session.
+        let mut helpers = std::collections::HashMap::<
+            (String, String, u16),
+            Option<crate::remote::manager::InstalledHelper>,
+        >::new();
         let mut adopted = Vec::new();
         for binding in bindings {
             let Some(record) = records.get(&binding.session_id) else {
@@ -323,9 +335,17 @@ impl ControlServer {
             let Some(host) = hosts.host(&binding.host_id) else {
                 continue;
             };
-            let Ok(helper) =
-                manager.existing_helper(host, &binding.helper_build_id, binding.protocol)
-            else {
+            let helper_key = (
+                binding.host_id.clone(),
+                binding.helper_build_id.clone(),
+                binding.protocol.major,
+            );
+            let helper = helpers.entry(helper_key).or_insert_with(|| {
+                manager
+                    .existing_helper(host, &binding.helper_build_id, binding.protocol)
+                    .ok()
+            });
+            let Some(helper) = helper.clone() else {
                 continue;
             };
             let selector = diri_proto::remote_pty::SessionSelector {
@@ -358,7 +378,7 @@ impl ControlServer {
                 pty: crate::pty::PtySpec::new(Vec::new(), &record.cwd)
                     .size(inspection.cols, inspection.rows),
                 manifest_id: manifest_id.clone(),
-                authority: crate::session::authority_for(&manifest_id, &registry.engine()),
+                authority: crate::session::authority_for(&manifest_id, &engine),
                 logs_dir: self.logs_dir.clone(),
                 holder: None,
                 remote: None,
@@ -371,6 +391,13 @@ impl ControlServer {
                 incarnation: binding.session_incarnation,
                 binding_store: store.clone(),
                 output_offset: binding.last_output_offset,
+            };
+            // Adoption itself is local (the attach channel opens on the
+            // session's own pump thread), so the lock is held only here.
+            // `adopt_remote` re-checks the record, which covers a session
+            // removed while its inspection was in flight.
+            let Ok(mut registry) = self.registry.lock() else {
+                break;
             };
             if registry.adopt_remote(spec, remote).is_ok() {
                 adopted.push(binding.session_id);
