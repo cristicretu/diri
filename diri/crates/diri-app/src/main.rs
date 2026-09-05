@@ -158,6 +158,7 @@ pub(crate) struct AppServices {
     // StoreRuntime drops/aborts its client tasks before the executor is dropped.
     pub(crate) store: Arc<StoreRuntime>,
     pub(crate) usage_tx: tokio::sync::watch::Sender<UsageSnapshot>,
+    pub(crate) usage_limits_refresh: tokio::sync::mpsc::Sender<()>,
     pub(crate) updates: UpdateHandle,
     pub(crate) dev_build: Option<DevBuildIdentity>,
     #[cfg(unix)]
@@ -321,6 +322,37 @@ fn main() {
             }
         });
     }
+    let (usage_limits_refresh, mut limits_requests) = tokio::sync::mpsc::channel(1);
+    if !preview && std::env::var_os("DIRI_SETTINGS_PREVIEW").is_none() {
+        let usage_tx = usage_tx.clone();
+        let client = Arc::clone(&client);
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/nonexistent"));
+        tokio.spawn(async move {
+            let mut last_request: Option<std::time::Instant> = None;
+            while limits_requests.recv().await.is_some() {
+                if last_request.is_some_and(|last| last.elapsed() < Duration::from_secs(10)) {
+                    continue;
+                }
+                last_request = Some(std::time::Instant::now());
+                // Read credentials only after opening the account menu or
+                // explicitly refreshing it. Never during startup/preview.
+                if client
+                    .wait_until_connected(Duration::from_secs(5))
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+                let Ok(accounts) = client.account_profiles().await else {
+                    continue;
+                };
+                let limits = usage::limits::refresh(&home, &accounts).await;
+                usage_tx.send_modify(|snapshot| snapshot.limits = limits);
+            }
+        });
+    }
     let updates = if preview {
         updates::inert()
     } else {
@@ -340,6 +372,7 @@ fn main() {
     let services = Arc::new(AppServices {
         store: store_runtime,
         usage_tx,
+        usage_limits_refresh,
         updates,
         dev_build,
         #[cfg(unix)]
@@ -459,7 +492,11 @@ async fn publish_usage_refresh(
     .await
     .ok()?;
     let snapshot = merge_fleet_usage(snapshot, home).await;
-    usage_tx.send_replace(snapshot);
+    usage_tx.send_modify(|current| {
+        let limits = std::mem::take(&mut current.limits);
+        *current = snapshot;
+        current.limits = limits;
+    });
     Some(store)
 }
 

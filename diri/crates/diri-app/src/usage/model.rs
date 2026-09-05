@@ -59,6 +59,8 @@ pub struct UsageSnapshot {
     pub session_ends_at: Option<i64>,
     pub session_remaining_seconds: Option<i64>,
     pub updated_at: i64,
+    /// Default local account quotas; never inferred from transcript costs.
+    pub limits: Vec<super::limits::AccountLimits>,
     /// Local transcript history; fleet summaries do not provide this detail.
     pub history: std::sync::Arc<super::dashboard::UsageHistory>,
 }
