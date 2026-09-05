@@ -2,7 +2,7 @@
 
 ## Install
 
-Diri requires macOS 15 or newer. Install the signed, notarized universal build:
+On macOS 15 or newer, install the signed and notarized universal build:
 
 ```sh
 brew install --cask cristicretu/diri/diri
@@ -11,6 +11,11 @@ brew install --cask cristicretu/diri/diri
 Alternatively, download the latest DMG from [GitHub Releases](https://github.com/cristicretu/diri/releases/latest),
 open it, and drag Diri to Applications. The app checks the same release feed for
 updates; it never installs one until you click restart.
+
+On x86_64 Ubuntu 22.04 or 24.04, download the AppImage or Debian package from
+[GitHub Releases](https://github.com/cristicretu/diri/releases/latest). The
+[Linux beta guide](../diri/LINUX.md) covers installation and current platform
+limits.
 
 ## Your first session
 
@@ -58,9 +63,17 @@ it to agents you trust and review requested actions.
 
 ## Remote hosts
 
-Remote sessions use SSH and tmux; Diri does not run a hosted relay. Start with
-the [remote-node guide](../diri/NODE.md), use a dedicated non-admin account when
-possible, and avoid forwarding credentials the remote job does not need.
+Remote sessions connect directly over SSH; Diri does not run a hosted relay.
+On first use, Diri probes the host and installs a verified matching Helper in
+the remote user's private cache. Each session gets an independent PTY Holder,
+so the remote host needs neither `tmux` nor a preinstalled Diri service.
+
+Diri reports whether the host can keep user processes alive after logout. Use
+a dedicated non-admin account when possible, and avoid forwarding credentials
+the remote job does not need. The [remote architecture](../diri/REMOTE_PORT.md)
+documents the transport and persistence model. The
+[remote-node guide](../diri/NODE.md) covers the optional enhanced mode for VPS
+accounts, fleet usage, and transactional handoff.
 
 ## Diagnostics
 

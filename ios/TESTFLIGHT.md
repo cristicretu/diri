@@ -90,16 +90,17 @@ has no offline demo mode today; plan reviewer access before submitting.
 
 Suggested beta description:
 
-> Diri lets you control coding sessions on your Mac from your iPhone. Requires
-> Diri running on a powered Mac and Tailscale connected on both devices. Start
-> a session, send a prompt, answer an agent question, and review tracked changes.
+> Run and monitor coding agents on your Mac from your iPhone. See which sessions
+> need you, start work in a separate git worktree, send prompts, answer agent
+> questions, follow output, and review tracked changes. Requires Diri running on
+> a powered Mac and Tailscale connected on both devices.
 
 Suggested “What to test”:
 
-> Follow setup without using Terminal. Scan the pairing code, start a session
-> in a separate workspace, and send a prompt. Switch from Wi-Fi to mobile data,
-> lock and unlock your phone, and continue the same session. Report any unclear
-> step or lost draft. Please remove prompts, code, and pairing keys from feedback
+> Complete setup without using Terminal. Scan the pairing code, start a session
+> in a separate worktree, and send a prompt. Switch from Wi-Fi to mobile data,
+> lock and unlock your phone, then continue the same session. Report unclear
+> steps or lost drafts. Remove prompts, code, and pairing keys from feedback
 > screenshots. Push notifications are not available in this beta.
 
 ## Real-device gate before inviting nontechnical testers

@@ -1,18 +1,22 @@
 # diri for iPhone
 
-A native SwiftUI client for a Dirijor daemon. It talks to [`diri-web`](../diri/crates/diri-web),
-which is a frontend on a `dirijord` control socket — the phone never speaks the
-daemon's unix-socket protocol itself.
+Start, monitor, and control Diri coding-agent sessions from an iPhone. The
+native SwiftUI client can create local or preconfigured SSH sessions, send
+prompts, answer agent questions, follow terminal output, and review tracked
+changes.
+
+The client talks to [`diri-web`](../diri/crates/diri-web), a small HTTP frontend
+on the local `dirijord` control socket. The phone never speaks the daemon's Unix
+socket protocol itself.
 
 ```
 iPhone ──http──▶ diri-web ──unix socket──▶ dirijord ──pty──▶ claude/codex
        (tailnet)
 ```
 
-That indirection is the point. The control protocol assumes a persistent
-connection and an event cursor, both of which a phone loses every time it
-changes cell tower. HTTP against `diri-web` is stateless per request, so
-reconnecting is just the next request succeeding.
+The control protocol assumes a persistent connection and an event cursor, both
+of which a phone can lose as its network changes. HTTP requests to `diri-web`
+are stateless, so the next successful request reconnects the client.
 
 ## Build
 

@@ -35,7 +35,7 @@ def main() -> int:
         "productName": "diri",
         "version": args.version,
         "identifier": "com.dirijor.diri",
-        "description": "A focused desktop orchestrator for coding agents",
+        "description": "Run and monitor coding agents in local and direct SSH sessions",
         "homepage": "https://github.com/cristicretu/diri",
         "authors": ["Cristi Cretu"],
         "licenseFile": str(repository / "LICENSE"),

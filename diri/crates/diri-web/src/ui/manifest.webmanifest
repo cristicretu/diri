@@ -1,7 +1,7 @@
 {
   "name": "diri",
   "short_name": "diri",
-  "description": "Your agent sessions, from a phone.",
+  "description": "Monitor and control your Diri agent sessions from your phone.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
