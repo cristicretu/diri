@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use super::model::UsageHourAgg;
 
-pub(crate) const CACHE_VERSION: u32 = 3;
+pub(crate) const CACHE_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct UsageFileEntry {
@@ -21,6 +21,7 @@ pub(crate) struct UsageFileEntry {
     pub hours: BTreeMap<i64, UsageHourAgg>,
     pub details: super::dashboard::ModelHours,
     pub model: Option<String>,
+    pub codex_total: Option<super::parser::CodexTotal>,
 }
 
 impl UsageFileEntry {
@@ -35,6 +36,7 @@ impl UsageFileEntry {
             hours: BTreeMap::new(),
             details: BTreeMap::new(),
             model: None,
+            codex_total: None,
         }
     }
 }

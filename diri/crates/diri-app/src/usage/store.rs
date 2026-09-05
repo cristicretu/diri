@@ -358,6 +358,7 @@ fn scan(
                 &mut live.hours,
                 &mut live.details,
                 &mut live.model,
+                &mut live.codex_total,
             ),
         };
         let Ok(consumed) = parsed else {
