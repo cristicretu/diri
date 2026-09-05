@@ -104,6 +104,15 @@ pub(crate) fn parse_claude(
     Ok(consumed)
 }
 
+/// Cumulative counters identify a re-emitted usage event without confusing it
+/// with a separate request that happens to have the same token counts.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct CodexTotal {
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    output_tokens: i64,
+}
+
 pub(crate) fn parse_codex(
     path: &Path,
     offset: u64,
@@ -111,6 +120,7 @@ pub(crate) fn parse_codex(
     hours: &mut BTreeMap<i64, UsageHourAgg>,
     details: &mut super::dashboard::ModelHours,
     model: &mut Option<String>,
+    previous_total: &mut Option<CodexTotal>,
 ) -> io::Result<u64> {
     let Some((data, consumed)) = read_complete_lines(path, offset)? else {
         return Ok(0);
@@ -161,6 +171,26 @@ pub(crate) fn parse_codex(
         let Some(timestamp) = parse_timestamp(timestamp) else {
             continue;
         };
+        // Update even outside retention, so a recent re-emission of old usage
+        // cannot become new spend. Persist across incremental scans.
+        if let Some(total) = payload
+            .pointer("/info/total_token_usage")
+            .filter(|total| total.is_object())
+        {
+            let current = CodexTotal {
+                input_tokens: integer(total.get("input_tokens")),
+                cached_input_tokens: integer(total.get("cached_input_tokens")),
+                output_tokens: integer(total.get("output_tokens")),
+            };
+            if previous_total.as_ref() == Some(&current) {
+                continue;
+            }
+            *previous_total = Some(current);
+        } else {
+            // Old rollouts have only per-request usage. Equal-sized requests
+            // are legitimate; don't deduplicate by token counts alone.
+            *previous_total = None;
+        }
         let hour = timestamp / 3_600;
         if hour < cutoff_hour {
             continue;

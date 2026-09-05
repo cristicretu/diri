@@ -667,3 +667,39 @@ fn dashboard_ranges_zero_fill_and_rebuild_old_caches_for_ninety_days() {
         "2024-02-29"
     );
 }
+
+#[test]
+fn codex_repeated_usage_is_not_billed_again_after_cache_reload() {
+    let fixture = Fixture::new();
+    let path = fixture.codex.join("rollout.jsonl");
+    let event = |total: i64| json!({"timestamp":"2026-07-22T09:05:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":total,"cached_input_tokens":0,"output_tokens":total / 10},"last_token_usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":10}}}});
+    write_lines(
+        &path,
+        &[
+            json!({"type":"turn_context","payload":{"model":"gpt-5.4"}}),
+            event(100),
+        ],
+    );
+    let make_store = || {
+        fixture.store(
+            "2026-07-22T10:00:00Z",
+            "2026-07-22T00:00:00Z",
+            "2026-07-01T00:00:00Z",
+        )
+    };
+    let first = make_store().refresh();
+    append(&path, &line_bytes(&event(100)));
+    let mut reloaded = make_store();
+    let repeated = reloaded.refresh();
+    assert_eq!(
+        repeated.codex.today, first.codex.today,
+        "re-emitted cumulative counters are not a second request"
+    );
+    append(&path, &line_bytes(&event(200)));
+    let second_request = reloaded.refresh();
+    assert_eq!(
+        second_request.codex.today.total_tokens(),
+        220,
+        "equal-sized real requests must both count when cumulative usage advances"
+    );
+}
