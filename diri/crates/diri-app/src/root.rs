@@ -242,7 +242,7 @@ impl RootView {
     ) -> Self {
         let sidebar_runtime = (!preview).then(|| Arc::clone(&services.store));
         let sidebar = cx.new(|cx| Sidebar::new(sidebar_runtime, preview, preview_scenario, cx));
-        let terminal = (!preview).then(|| {
+        let terminal = (!preview || preview_scenario == PreviewScenario::Empty).then(|| {
             let runtime = Arc::clone(&services.store);
             let tokio = Arc::clone(&services.tokio);
             cx.new(|cx| TerminalPane::new(runtime, tokio, window, cx))
@@ -443,7 +443,14 @@ impl RootView {
         let mut snapshots = services.store.snapshots();
         let mut usage = services.usage_tx.subscribe();
         let mut updates = services.updates.subscribe();
-        sidebar.update(cx, |sidebar, cx| sidebar.set_usage(*usage.borrow(), cx));
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_usage(usage.borrow().clone(), cx)
+        });
+        if let Some(surfaces) = &utility_surfaces {
+            surfaces.update(cx, |surfaces, cx| {
+                surfaces.set_usage(usage.borrow().clone(), cx)
+            });
+        }
         // Seed the current state: `watch` only wakes on changes, and an
         // unsupported build settles before this view exists.
         let initial_update = services.updates.state();
@@ -538,9 +545,14 @@ impl RootView {
                     }
                     changed = usage.changed() => {
                         if changed.is_err() { break; }
-                        let snapshot = *usage.borrow_and_update();
+                        let snapshot = usage.borrow_and_update().clone();
                         service_sidebar.update(cx, |sidebar, cx| {
-                            sidebar.set_usage(snapshot, cx);
+                            sidebar.set_usage(snapshot.clone(), cx);
+                        });
+                        let _ = this.update(cx, |this, cx| {
+                            if let Some(surfaces) = &this.utility_surfaces {
+                                surfaces.update(cx, |surfaces, cx| surfaces.set_usage(snapshot, cx));
+                            }
                         });
                     }
                     changed = updates.changed() => {
@@ -1954,7 +1966,7 @@ impl RootView {
             .border_1()
             .border_color(terminal.primary.alpha(0.10));
 
-        if self.preview {
+        if self.preview && self.preview_scenario != PreviewScenario::Empty {
             card = card.child(self.preview_workbench(terminal));
         } else if split_open {
             let available_height = (card_height - 1.0).max(0.0);

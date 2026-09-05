@@ -18,6 +18,7 @@ pub(crate) fn parse_claude(
     offset: u64,
     cutoff_hour: i64,
     hours: &mut BTreeMap<i64, UsageHourAgg>,
+    details: &mut super::dashboard::ModelHours,
     seen_all: &mut HashSet<u64>,
     seen_by_hour: &mut BTreeMap<i64, Vec<u64>>,
 ) -> io::Result<u64> {
@@ -97,6 +98,7 @@ pub(crate) fn parse_claude(
                 + write_1h as f64 * pricing.cache_write_1h())
                 / 1_000_000.0;
         }
+        super::dashboard::record(details, model, hour, aggregate, match_claude(model), 0);
         hours.entry(hour).or_default().merge(aggregate);
     }
     Ok(consumed)
@@ -107,6 +109,7 @@ pub(crate) fn parse_codex(
     offset: u64,
     cutoff_hour: i64,
     hours: &mut BTreeMap<i64, UsageHourAgg>,
+    details: &mut super::dashboard::ModelHours,
     model: &mut Option<String>,
 ) -> io::Result<u64> {
     let Some((data, consumed)) = read_complete_lines(path, offset)? else {
@@ -183,6 +186,14 @@ pub(crate) fn parse_codex(
                 + output as f64 * pricing.output)
                 / 1_000_000.0;
         }
+        super::dashboard::record(
+            details,
+            model.as_deref().unwrap_or("Unknown model"),
+            hour,
+            aggregate,
+            model.as_deref().and_then(match_openai),
+            integer(last.get("reasoning_output_tokens")).min(output),
+        );
         hours.entry(hour).or_default().merge(aggregate);
     }
     Ok(consumed)
@@ -222,7 +233,7 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 fn integer(value: Option<&Value>) -> i64 {
-    value.and_then(Value::as_i64).unwrap_or(0)
+    value.and_then(Value::as_i64).unwrap_or(0).max(0)
 }
 
 pub(crate) fn fnv1a(value: &str) -> u64 {
