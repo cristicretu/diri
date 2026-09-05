@@ -1123,6 +1123,14 @@ impl Session {
 
     /// Monotonic counter that moves exactly when status, needs-input, or
     /// title change. Poll this before paying for [`Self::view`].
+    pub fn take_notifications(&self) -> Vec<diri_terminal_state::TerminalNotification> {
+        self.shared
+            .screen
+            .lock()
+            .expect("screen")
+            .take_notifications()
+    }
+
     pub fn state_version(&self) -> u64 {
         self.shared.state_version.load(Ordering::SeqCst)
     }
@@ -1762,10 +1770,10 @@ fn new_shared(spec: &SessionSpec, log: OutputLog, engine: &ManifestEngine) -> Ar
         prompt_title: Mutex::new(None),
         prompt_input: Mutex::new(PromptInputState::default()),
         log: Mutex::new(log),
-        screen: Mutex::new(HeadlessScreen::new(
-            spec.pty.cols as usize,
-            spec.pty.rows as usize,
-        )),
+        screen: Mutex::new(
+            HeadlessScreen::new(spec.pty.cols as usize, spec.pty.rows as usize)
+                .with_notifications(),
+        ),
         reducer: Mutex::new(
             StatusReducer::new(spec.authority, SystemTime::now())
                 .with_manifest(spec.manifest_id.clone(), manifest_version),
@@ -2107,6 +2115,11 @@ fn handle_remote_message(
         }
         RemoteMessage::Terminal(frame) => match frame.frame_type {
             FrameType::ReplayBegin => {
+                shared
+                    .screen
+                    .lock()
+                    .expect("screen")
+                    .reset_notification_sequence();
                 *replaying = true;
                 RemoteConnectionDisposition::Continue
             }
@@ -2209,6 +2222,9 @@ fn apply_remote_output(
         .then(|| {
             let mut screen = shared.screen.lock().expect("screen");
             screen.feed(bytes);
+            if screen.has_notifications() {
+                shared.bump_state_version();
+            }
             evaluate_if_screen_changed(shared, &mut screen, engine, manifest_id, last_eval_seq)
         })
         .flatten();
@@ -2528,6 +2544,9 @@ fn feed_output_batch(
             let mut screen = shared.screen.lock().expect("screen");
             let before = *filled_before.get_or_insert_with(|| screen.filled_cells());
             screen.feed(&buffer[..count]);
+            if screen.has_notifications() {
+                shared.bump_state_version();
+            }
             let after = screen.filled_cells();
             (after < before, after == 0 && before != 0)
         };
@@ -2962,7 +2981,12 @@ fn pump_held(
             eval_dirty = !evaluate_now;
             let (observation, replies) = {
                 let mut screen = shared.screen.lock().expect("screen");
-                screen.feed(output);
+                let historical_bytes =
+                    replay_until.saturating_sub(start).min(output.len() as u64) as usize;
+                screen.feed_with_history(output, historical_bytes);
+                if screen.has_notifications() {
+                    shared.bump_state_version();
+                }
                 let replies = screen.take_replies();
                 let observation = if evaluate_now {
                     last_eval_at = Some(Instant::now());
@@ -3415,5 +3439,40 @@ mod grid_wake_tests {
         wake.notify();
         let background = wake.wait_for_change(trailing.generation, Duration::from_secs(1));
         assert!(!background.interactive);
+    }
+}
+
+#[cfg(test)]
+mod notification_tests {
+    use super::*;
+
+    #[test]
+    fn remote_notifications_ignore_replay_and_duplicate_offsets_without_changing_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let (engine, _) = ManifestEngine::load_dir(&crate::detect::bundled_manifest_dir()).unwrap();
+        let spec = SessionSpec {
+            id: "notification-replay".into(),
+            pty: PtySpec::new(vec!["/bin/sh".into()], "/tmp"),
+            manifest_id: "shell".into(),
+            authority: Authority::ProcessOnly,
+            logs_dir: temp.path().to_path_buf(),
+            holder: None,
+            remote: None,
+            defer_launch: false,
+        };
+        let log = OutputLog::open(temp.path(), &spec.id, 4096, 8192, false).unwrap();
+        let shared = new_shared(&spec, log, &engine);
+        let mut seq = 0;
+        let bytes = b"\x1b]777;notify;Build;Passed\x07";
+        let end = apply_remote_output(&shared, &engine, "shell", &mut seq, 0, bytes, true).unwrap();
+        assert!(!shared.screen.lock().unwrap().has_notifications());
+        apply_remote_output(&shared, &engine, "shell", &mut seq, end, bytes, false).unwrap();
+        let events = shared.screen.lock().unwrap().take_notifications();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].body, "Passed");
+        assert!(shared.state_version.load(Ordering::SeqCst) > 0);
+        apply_remote_output(&shared, &engine, "shell", &mut seq, end, bytes, false).unwrap();
+        assert!(!shared.screen.lock().unwrap().has_notifications());
+        assert_eq!(*shared.status.lock().unwrap(), SessionStatus::Working);
     }
 }

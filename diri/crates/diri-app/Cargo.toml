@@ -67,6 +67,7 @@ objc2 = "=0.6.4"
 objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
     "NSAppearance",
     "NSApplication",
+    "NSDockTile",
     "NSAttributedString",
     "NSBezierPath",
     "NSBitmapImageRep",
@@ -131,6 +132,7 @@ objc2-user-notifications = { version = "=0.3.2", default-features = false, featu
     "UNNotificationRequest",
     "UNNotificationResponse",
     "UNNotificationSound",
+    "UNNotificationSettings",
     "UNNotificationTrigger",
     "UNUserNotificationCenter",
     "block2",

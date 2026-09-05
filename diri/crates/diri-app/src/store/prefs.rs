@@ -108,6 +108,8 @@ pub struct Prefs {
     pub start_at_login: bool,
     pub confirm_before_closing_session: bool,
     pub status_sounds: bool,
+    pub status_notifications: bool,
+    pub muted_notification_sessions: std::collections::BTreeSet<String>,
     /// Check, download, and verify releases in the background. A staged update
     /// installs on quit or when the user requests a restart.
     pub automatic_updates: bool,
@@ -177,6 +179,8 @@ impl Default for Prefs {
             start_at_login: false,
             confirm_before_closing_session: true,
             status_sounds: true,
+            status_notifications: true,
+            muted_notification_sessions: Default::default(),
             automatic_updates: true,
             skipped_update_version: String::new(),
             hibernate_after_minutes: 60,

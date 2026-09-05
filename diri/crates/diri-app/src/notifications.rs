@@ -10,8 +10,11 @@ use diri_proto::{
     SessionRecord,
 };
 
-pub const PERMISSION_CATEGORY_ID: &str = "needs-input-permission";
+#[cfg(target_os = "macos")]
+pub const OPEN_ACTION_ID: &str = "open-session";
+#[cfg(test)]
 pub const APPROVE_ACTION_ID: &str = "approve";
+#[cfg(test)]
 pub const DENY_ACTION_ID: &str = "deny";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,6 +49,8 @@ pub struct NotificationRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StatusTransition {
+    /// Native alerts withdrawn after read, resolution, or session removal.
+    pub dismiss: Vec<String>,
     pub sound: Option<NotificationSound>,
     pub notification: Option<NotificationRequest>,
     /// Foreground feedback for user-initiated operations. System
@@ -78,6 +83,7 @@ fn one_shot_identifier(prefix: &str) -> String {
 
 fn plain_banner(prefix: &str, title: String, body: String) -> StatusTransition {
     StatusTransition {
+        dismiss: Vec::new(),
         sound: None,
         notification: Some(NotificationRequest {
             identifier: one_shot_identifier(prefix),
@@ -93,6 +99,7 @@ fn plain_banner(prefix: &str, title: String, body: String) -> StatusTransition {
 
 fn foreground_banner(title: String, body: String) -> StatusTransition {
     StatusTransition {
+        dismiss: Vec::new(),
         sound: None,
         notification: None,
         in_app_banner: Some(InAppBanner { title, body }),
@@ -187,6 +194,7 @@ pub fn migration_transition(
 #[must_use]
 pub fn reach_failure_transition() -> StatusTransition {
     StatusTransition {
+        dismiss: Vec::new(),
         sound: None,
         notification: Some(NotificationRequest {
             identifier: format!(
@@ -256,7 +264,9 @@ fn deny_answer(descriptor: Option<&AgentDescriptor>) -> Answer {
         )
 }
 
-/// Resolve an actionable notification response into a daemon `send_text` call.
+/// Legacy key mapping. Native actions now open the session: captured terminal
+/// keystrokes cannot safely approve a prompt after it changes.
+#[cfg(test)]
 #[must_use]
 pub fn command_for_action(action_id: &str, data: &ActionData) -> Option<SendTextCommand> {
     let answer = match action_id {
@@ -330,6 +340,7 @@ pub fn immediate_transitions_for_update(
         .is_some_and(|info| info.reason == HibernationReason::MemoryPressure);
     if !was_memory_frozen && is_memory_frozen {
         transitions.push(StatusTransition {
+            dismiss: Vec::new(),
             sound: status_sounds_enabled.then_some(NotificationSound::Frozen),
             notification: Some(memory_pressure_request(current, status_sounds_enabled)),
             in_app_banner: None,
@@ -376,8 +387,8 @@ impl PendingAttention {
 /// The attention state this update entered, if any — the trigger that arms a
 /// settle window.
 ///
-/// Entering the state is what counts. A session already blocked that swaps
-/// blockers is still the same interruption and does not re-arm.
+/// A distinct prompt or completion is a new event even if its attention
+/// level is unchanged. Repeated observations of the same prompt are not.
 #[must_use]
 pub fn attention_signal(
     previous: Option<&SessionRecord>,
@@ -387,9 +398,15 @@ pub fn attention_signal(
     let current_attention = current.attention();
     let entered =
         |level: AttentionLevel| previous_attention != Some(level) && current_attention == level;
-    if entered(AttentionLevel::NeedsInput) {
+    let changed_blocker = current_attention == AttentionLevel::NeedsInput
+        && previous.is_some_and(|previous| blocker_key(previous) != blocker_key(current));
+    let new_completion = current_attention == AttentionLevel::DoneUnseen
+        && previous.is_some_and(|previous| {
+            previous.last_turn_completed_at != current.last_turn_completed_at
+        });
+    if entered(AttentionLevel::NeedsInput) || changed_blocker {
         Some(AttentionLevel::NeedsInput)
-    } else if entered(AttentionLevel::DoneUnseen) {
+    } else if entered(AttentionLevel::DoneUnseen) || new_completion {
         Some(AttentionLevel::DoneUnseen)
     } else {
         None
@@ -410,7 +427,7 @@ pub fn attention_still_holds(current: &SessionRecord, pending: AttentionLevel) -
 ///
 /// Returns `None` when the session no longer holds the state that armed it.
 ///
-/// Chimes are emitted even for the focused session. Banners are suppressed only
+/// Chimes and banners are suppressed
 /// when that same session is selected and the app is active — both judged
 /// against where the user is *now*, so selecting the session during the window
 /// is enough to stop the banner.
@@ -440,16 +457,17 @@ pub fn settled_attention_transition(
     }
     let is_focused = selected_session_id == Some(&current.id) && app_is_active;
     Some(StatusTransition {
-        sound: status_sounds_enabled.then_some(sound),
+        dismiss: Vec::new(),
+        sound: (status_sounds_enabled && !is_focused).then_some(sound),
         notification: (!is_focused)
             .then(|| attention_request(current, status_sounds_enabled, descriptor)),
         in_app_banner: None,
     })
 }
 
-fn attention_request(
+pub fn attention_request(
     session: &SessionRecord,
-    status_sounds_enabled: bool,
+    _status_sounds_enabled: bool,
     descriptor: Option<&AgentDescriptor>,
 ) -> NotificationRequest {
     let (title, body, suffix, action_data) = match session.attention() {
@@ -461,8 +479,20 @@ fn attention_request(
                     "{} needs you",
                     display_name(session.effective_kind(), descriptor)
                 ),
-                detail.map_or_else(|| session.title.clone(), |detail| detail.summary.clone()),
-                detail.map_or_else(|| "needs-input".to_owned(), blocker_identity),
+                detail.map_or_else(
+                    || session.title.clone(),
+                    |detail| format!("{} · {}", session.title, detail.summary),
+                ),
+                detail.map_or_else(
+                    || "needs-input".to_owned(),
+                    |detail| {
+                        format!(
+                            "{}-{}",
+                            blocker_identity(detail),
+                            detail.occurred_at.0.to_bits()
+                        )
+                    },
+                ),
                 action_data,
             )
         }
@@ -472,7 +502,12 @@ fn attention_request(
                 display_name(session.effective_kind(), descriptor)
             ),
             session.title.clone(),
-            "done".to_owned(),
+            format!(
+                "done-{}",
+                session
+                    .last_turn_completed_at
+                    .map_or(0, |date| date.0.to_bits())
+            ),
             None,
         ),
         _ => unreachable!("attention requests are only built for noteworthy states"),
@@ -484,13 +519,13 @@ fn attention_request(
         body,
         thread_identifier: Some(session.id.0.clone()),
         action_data,
-        use_system_sound: !status_sounds_enabled,
+        use_system_sound: false,
     }
 }
 
 fn memory_pressure_request(
     session: &SessionRecord,
-    status_sounds_enabled: bool,
+    _status_sounds_enabled: bool,
 ) -> NotificationRequest {
     let body = session.memory_bytes.map_or_else(
         || {
@@ -513,7 +548,7 @@ fn memory_pressure_request(
         body,
         thread_identifier: Some(session.id.0.clone()),
         action_data: None,
-        use_system_sound: !status_sounds_enabled,
+        use_system_sound: false,
     }
 }
 
@@ -537,6 +572,40 @@ where
         AgentKind::SHELL_ID => "Terminal",
         _ => "Agent",
     }
+}
+
+/// Repaints refresh timestamps; semantic prompt content is the dedupe key.
+pub fn blocker_key(session: &SessionRecord) -> String {
+    session
+        .needs_input
+        .as_ref()
+        .map_or_else(String::new, blocker_identity)
+}
+
+pub fn failed_request(session: &SessionRecord) -> Option<NotificationRequest> {
+    let diri_proto::SessionStatus::Exited(exit) = &session.status else {
+        return None;
+    };
+    if session.is_archived() || (exit.code == Some(0) && exit.signal.is_none()) {
+        return None;
+    }
+    Some(NotificationRequest {
+        identifier: format!("{}-exit-{}", session.id.0, session.created_at.0.to_bits()),
+        title: format!("{} stopped", session.title),
+        body: exit.signal.map_or_else(
+            || {
+                format!(
+                    "Exited with code {}. Open the session to inspect its output.",
+                    exit.code
+                        .map_or_else(|| "unknown".into(), |code| code.to_string())
+                )
+            },
+            |signal| format!("Stopped by signal {signal}. Open the session to inspect its output."),
+        ),
+        thread_identifier: Some(session.id.0.clone()),
+        action_data: None,
+        use_system_sound: false,
+    })
 }
 
 fn blocker_identity(detail: &diri_proto::NeedsInputDetail) -> String {
@@ -753,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn hidden_needs_input_chimes_and_posts_but_focused_only_chimes() {
+    fn hidden_needs_input_chimes_and_posts_but_focused_is_quiet() {
         let current = session(
             AgentKind::CODEX,
             SessionStatus::NeedsInput(NeedsInputKind::Permission),
@@ -763,7 +832,7 @@ mod tests {
         assert!(hidden.notification.is_some());
 
         let focused = settled(&current, Some(&current.id), true, true, None);
-        assert_eq!(focused.sound, Some(NotificationSound::NeedsInput));
+        assert_eq!(focused.sound, None);
         assert!(focused.notification.is_none());
 
         let inactive = settled(&current, Some(&current.id), false, true, None);
@@ -866,7 +935,7 @@ mod tests {
 
         let transition = settled(&replaced, None, true, true, None);
         let notification = transition.notification.as_ref().unwrap();
-        assert_eq!(notification.body, "Delete the branch?");
+        assert_eq!(notification.body, "Refactor parser · Delete the branch?");
         assert_ne!(
             notification.identifier,
             settled(&armed, None, true, true, None)
@@ -968,13 +1037,13 @@ mod tests {
     }
 
     #[test]
-    fn disabled_synth_uses_the_system_notification_sound_instead() {
+    fn disabled_chimes_are_silent_including_native_notifications() {
         let current = session(
             AgentKind::CODEX,
             SessionStatus::NeedsInput(NeedsInputKind::Permission),
         );
         let transition = settled(&current, None, true, false, None);
         assert_eq!(transition.sound, None);
-        assert!(transition.notification.as_ref().unwrap().use_system_sound);
+        assert!(!transition.notification.as_ref().unwrap().use_system_sound);
     }
 }

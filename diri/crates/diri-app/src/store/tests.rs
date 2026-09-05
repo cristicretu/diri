@@ -749,18 +749,15 @@ fn spawn_response_focuses_session_when_event_arrives_first() {
     assert!(store.terminal_residency().contains(&id("spawned")));
 }
 
-/// The menu-bar panel header tints from this, so an archived blocker still
-/// colours the glyph even though its row is not in the list. Documented rather
-/// than fixed: the rollup carries one level, and dropping archived sessions
-/// here would also drop a live `DoneUnseen` sitting behind one.
+/// An archived prompt must not keep the menu-bar attention indicator lit.
 #[test]
-fn global_attention_ranks_across_archived_sessions_too() {
+fn archived_sessions_do_not_keep_the_menu_bar_in_attention() {
     let mut shelved = session("shelved", "p", 1.0);
     shelved.status = SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Question);
     shelved.archived_at = Some(DateMillis(10.0));
     let (store, _) = hydrated(vec![shelved], vec![project("p", "P")], Prefs::default());
 
-    assert_eq!(store.global_attention(), AttentionLevel::NeedsInput);
+    assert_eq!(store.global_attention(), AttentionLevel::None);
 }
 
 #[test]
@@ -909,8 +906,8 @@ fn selecting_a_session_inside_its_window_leaves_the_chime_but_drops_the_banner()
             .next_attention_deadline()
             .expect("needs-input update should arm a settle window"),
     );
-    let transition = transitions.first().expect("the chime still fires");
-    assert_eq!(transition.sound, Some(NotificationSound::NeedsInput));
+    let transition = transitions.first().expect("the inbox records the event");
+    assert_eq!(transition.sound, None);
     assert!(
         transition.notification.is_none(),
         "the session the user is looking at needs no system banner"
@@ -2230,4 +2227,111 @@ fn the_menu_bar_projection_is_cached_per_revision() {
         !Arc::ptr_eq(&first, &store.menu_bar_projection()),
         "a mutation must invalidate the cache, not serve a stale tree"
     );
+}
+
+fn custom_notification(session: &SessionRecord, event_id: &str) -> EventEnvelope {
+    EventEnvelope {
+        name: diri_proto::EventName::SESSION_NOTIFICATION.into(),
+        params: serde_json::to_value(diri_proto::SessionNotificationEvent {
+            id: event_id.into(),
+            session_id: session.id.clone(),
+            session_created_at: session.created_at,
+            occurred_at: DateMillis(10_000.0),
+            title: "Build finished".into(),
+            body: "All tests passed".into(),
+        })
+        .unwrap(),
+        seq: 1,
+    }
+}
+
+#[test]
+fn terminal_notifications_are_unread_events_not_execution_states() {
+    let record = session("hidden", "p", 1.0);
+    let (mut store, mut effects) = hydrated(
+        vec![session("visible", "p", 2.0), record.clone()],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    store.select(id("visible"));
+    drain(&mut effects);
+    assert!(store.handle_event(custom_notification(&record, "custom-one")));
+    assert_eq!(store.notifications().unread_count(), 1);
+    assert_eq!(
+        store.sessions().get(&record.id).unwrap().status,
+        SessionStatus::Idle
+    );
+    assert_eq!(store.next_unread_notification(), Some(record.id.clone()));
+    assert!(drain(&mut effects).iter().any(|effect| matches!(effect, StoreEffect::StatusTransition(transition) if transition.notification.is_some())));
+    assert!(!store.handle_event(custom_notification(&record, "custom-one")));
+    assert!(!store.handle_event(custom_notification(&record, "duplicate-redraw")));
+    store.select(record.id.clone());
+    assert_eq!(store.notifications().unread_count(), 0);
+    assert!(drain(&mut effects).iter().any(|effect| matches!(effect, StoreEffect::StatusTransition(transition) if transition.dismiss == ["custom-one"])));
+}
+
+#[test]
+fn selected_session_behind_settings_still_notifies_and_focus_acknowledges() {
+    let record = session("visible", "p", 1.0);
+    let (mut store, mut effects) = hydrated(
+        vec![record.clone()],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    store.select(record.id.clone());
+    store.set_notification_surface_visible(false);
+    drain(&mut effects);
+    store.handle_event(custom_notification(&record, "settings"));
+    assert_eq!(store.notifications().unread_count(), 1);
+    assert!(drain(&mut effects).iter().any(|effect| matches!(effect, StoreEffect::StatusTransition(transition) if transition.notification.is_some())));
+    store.set_notification_surface_visible(true);
+    assert_eq!(store.notifications().unread_count(), 0);
+}
+
+#[test]
+fn clearing_history_does_not_redeliver_replayed_notifications() {
+    let record = session("visible", "p", 1.0);
+    let (mut store, _) = hydrated(
+        vec![record.clone()],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    store.handle_event(custom_notification(&record, "cleared"));
+    store.clear_notifications();
+    assert!(!store.handle_event(custom_notification(&record, "cleared")));
+    assert!(store.notifications().entries().is_empty());
+    let mut stale = record.clone();
+    stale.created_at = DateMillis(999.0);
+    assert!(!store.handle_event(custom_notification(&stale, "wrong-incarnation")));
+}
+
+#[test]
+fn delivery_rechecks_read_focus_and_mute_after_the_event_was_queued() {
+    let record = session("hidden", "p", 1.0);
+    let (mut store, mut effects) = hydrated(
+        vec![session("visible", "p", 2.0), record.clone()],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    store.select(id("visible"));
+    drain(&mut effects);
+    store.handle_event(custom_notification(&record, "queued"));
+    let request = drain(&mut effects)
+        .into_iter()
+        .find_map(|effect| match effect {
+            StoreEffect::StatusTransition(transition) => transition.notification,
+            _ => None,
+        })
+        .unwrap();
+    assert!(store.should_deliver_notification(&request));
+    store.toggle_notification_mute(record.id.clone());
+    assert!(!store.should_deliver_notification(&request));
+    assert_eq!(store.notifications().unread_count(), 1);
+    store.toggle_notification_mute(record.id.clone());
+    assert!(store.should_deliver_notification(&request));
+    store.toggle_notification_alerts();
+    assert!(!store.should_deliver_notification(&request));
+    store.toggle_notification_alerts();
+    store.mark_notifications_read(&record.id);
+    assert!(!store.should_deliver_notification(&request));
 }

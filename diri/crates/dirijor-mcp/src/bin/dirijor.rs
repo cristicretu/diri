@@ -86,7 +86,7 @@ fn print_help() {
          Usage:\n  dirijor status [--json]\n  dirijor activity [--limit N] [--json]\n  dirijor session <list|get|read|send|wait|spawn|fork|release|archive> ...\n  \
          dirijor worktree <list|create|remove> ...\n  dirijor artifacts <session> [--json]\n  \
          dirijor events <subscribe|wait> ...\n  dirijor ports [--json]\n  dirijor doctor\n  \
-         dirijor hook <event>\n  dirijor notify <json>\n  dirijor mcp-tools\n  \
+         dirijor hook <event>\n  dirijor notify <json>\n  dirijor notify --title TEXT --body TEXT\n  dirijor mcp-tools\n  \
          dirijor mcp-call --tool <name> < input.json\n\n\
          Deferred on Linux: companion forwarding (dirijor forward)."
     );
@@ -152,6 +152,37 @@ fn hook(event: Option<&str>) -> Result<(), CliError> {
 }
 
 fn notify(arguments: &[String]) -> Result<(), CliError> {
+    if arguments
+        .first()
+        .is_some_and(|argument| argument.starts_with("--"))
+    {
+        let mut title = String::from("Diri");
+        let mut body = String::new();
+        let mut arguments = arguments.iter();
+        while let Some(flag) = arguments.next() {
+            let Some(value) = arguments.next() else {
+                return Err(CliError::failure(
+                    "notify expects --title TEXT and --body TEXT",
+                ));
+            };
+            let clean: String = value
+                .chars()
+                .filter(|ch| !ch.is_control())
+                .take(1000)
+                .collect();
+            match flag.as_str() {
+                "--title" => title = clean.replace(';', " "),
+                "--body" => body = clean,
+                _ => return Err(CliError::failure("notify supports --title and --body")),
+            }
+        }
+        // Works inside local and remote terminals without a socket or hook.
+        print!("\x1b]777;notify;{title};{body}\x07");
+        io::stdout()
+            .flush()
+            .map_err(|error| CliError::failure(error.to_string()))?;
+        return Ok(());
+    }
     let Some(raw) = arguments.last() else {
         return Ok(());
     };

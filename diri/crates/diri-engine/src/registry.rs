@@ -573,6 +573,13 @@ impl Registry {
     /// The steady-state cost — the events watcher polls this several times a
     /// second — is one integer compare per live session: no clones, no
     /// serialization.
+    pub fn take_notifications(&self, id: &str) -> Vec<diri_terminal_state::TerminalNotification> {
+        self.sessions
+            .get(id)
+            .map(|session| session.take_notifications())
+            .unwrap_or_default()
+    }
+
     pub fn changed_since(
         &mut self,
         published: &mut HashMap<String, u64>,

@@ -177,9 +177,7 @@ pub fn parse_activity_seed(
 fn needs_input_kind(notification_type: Option<&str>) -> Option<NeedsInputKind> {
     match notification_type {
         Some("permission_prompt") => Some(NeedsInputKind::Permission),
-        Some("idle_prompt") | Some("agent_needs_input") | Some("elicitation_dialog") => {
-            Some(NeedsInputKind::Question)
-        }
+        Some("agent_needs_input") | Some("elicitation_dialog") => Some(NeedsInputKind::Question),
         _ => None,
     }
 }
@@ -378,7 +376,7 @@ mod tests {
     fn a_notification_asking_for_input_carries_a_detail() {
         let payload = json!({
             "session_id": "s",
-            "notification_type": "idle_prompt",
+            "notification_type": "agent_needs_input",
             "message": "Waiting for your answer",
         });
         let (_, meta) = parse_claude_hook("Notification", &payload, now()).expect("parsed");

@@ -292,6 +292,7 @@ fn repo_target_key(host: Option<&str>) -> String {
 /// Pure application model. Side effects are emitted onto a channel for the daemon adapter.
 pub struct SessionStore {
     daemon_state: DaemonState,
+    session_list_hydrated: bool,
     daemon_identity: Option<HelloResult>,
     sessions: HashMap<SessionId, Arc<SessionRecord>>,
     projects: HashMap<ProjectId, Project>,
@@ -318,6 +319,7 @@ pub struct SessionStore {
     prefs: Prefs,
     terminal_residency: TerminalResidency,
     app_is_active: bool,
+    notification_surface_visible: bool,
     last_action_failure: Option<ActionFailure>,
     sidebar_selection_anchor: Option<SessionId>,
     mru_order: Vec<SessionId>,
@@ -350,6 +352,7 @@ pub struct SessionStore {
     /// Drained by the settle task in `StoreHandle`, which is what turns one of
     /// these into a chime and a banner — see `drain_settled_attention`.
     attention_settle: HashMap<SessionId, PendingAttention>,
+    notification_feed: crate::notification_feed::NotificationFeed,
     /// Wakes the settle task when a window is armed early enough to beat the
     /// one it is currently sleeping on.
     attention_wake: Arc<Notify>,
@@ -377,9 +380,19 @@ impl SessionStore {
     ) -> (Self, mpsc::UnboundedReceiver<StoreEffect>) {
         let (effects, receiver) = mpsc::unbounded_channel();
         let selected_session_id = prefs.last_selected_session.clone();
+        let notification_feed = prefs_path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(|parent| {
+                crate::notification_feed::NotificationFeed::load(&parent.join("notifications.json"))
+            })
+            .transpose()
+            .unwrap_or_default()
+            .unwrap_or_default();
         (
             Self {
                 daemon_state: DaemonState::Connecting,
+                session_list_hydrated: false,
                 daemon_identity: None,
                 sessions: HashMap::new(),
                 projects: HashMap::new(),
@@ -397,6 +410,7 @@ impl SessionStore {
                 prefs,
                 terminal_residency: TerminalResidency::default(),
                 app_is_active: true,
+                notification_surface_visible: true,
                 last_action_failure: None,
                 sidebar_selection_anchor: None,
                 mru_order: selected_session_id.into_iter().collect(),
@@ -414,11 +428,161 @@ impl SessionStore {
                 agent_catalog_scans: HashMap::new(),
                 agent_catalog_errors: HashMap::new(),
                 attention_settle: HashMap::new(),
+                notification_feed,
                 attention_wake: Arc::new(Notify::new()),
                 effects,
             },
             receiver,
         )
+    }
+
+    pub fn notifications(&self) -> &crate::notification_feed::NotificationFeed {
+        &self.notification_feed
+    }
+
+    fn notification_change(&self, dismiss: Vec<String>) {
+        if let Some(parent) = self.prefs_path.as_ref().and_then(|path| path.parent())
+            && let Err(error) = self
+                .notification_feed
+                .save(&parent.join("notifications.json"))
+        {
+            eprintln!("diri: could not save notification history: {error}");
+        }
+        if !dismiss.is_empty() {
+            self.emit(StoreEffect::StatusTransition(StatusTransition {
+                dismiss,
+                sound: None,
+                notification: None,
+                in_app_banner: None,
+            }));
+        }
+        self.emit(StoreEffect::PublishSnapshot);
+    }
+
+    fn reconcile_notifications(&mut self) {
+        let sessions: Vec<_> = self.sessions.values().map(Arc::as_ref).collect();
+        let dismissed = self.notification_feed.reconcile(&sessions);
+        if !dismissed.is_empty() {
+            self.notification_change(dismissed);
+        }
+    }
+
+    pub fn mark_notifications_read(&mut self, id: &SessionId) {
+        let dismissed = self.notification_feed.mark_session_read(id);
+        if !dismissed.is_empty() {
+            self.notification_change(dismissed);
+        }
+    }
+
+    pub fn mark_all_notifications_read(&mut self) {
+        let dismissed = self.notification_feed.mark_all_read();
+        self.notification_change(dismissed);
+    }
+
+    pub fn clear_notifications(&mut self) {
+        let dismissed = self.notification_feed.clear();
+        self.notification_change(dismissed);
+    }
+
+    pub fn set_notification_read(&mut self, id: &str, read: bool) {
+        if self.notification_feed.set_read(id, read) {
+            self.notification_change(if read {
+                vec![id.to_owned()]
+            } else {
+                Vec::new()
+            });
+        }
+    }
+
+    /// Recheck at delivery time: a queued transition may already be read,
+    /// resolved, or muted by the time the main thread receives it.
+    pub fn should_deliver_notification(
+        &self,
+        request: &crate::notifications::NotificationRequest,
+    ) -> bool {
+        if !self.prefs.status_notifications {
+            return false;
+        }
+        if let Some(session) = &request.thread_identifier {
+            let id = SessionId::new(session.clone());
+            if self.prefs.muted_notification_sessions.contains(&id.0)
+                || self.notification_is_focused(&id)
+            {
+                return false;
+            }
+        }
+        self.notification_feed
+            .entries()
+            .iter()
+            .find(|entry| entry.id == request.identifier)
+            .is_none_or(|entry| !entry.read && !entry.resolved)
+    }
+
+    pub fn toggle_notification_alerts(&mut self) {
+        self.prefs.status_notifications = !self.prefs.status_notifications;
+        if !self.prefs.status_notifications {
+            self.notification_change(
+                self.notification_feed
+                    .entries()
+                    .iter()
+                    .map(|entry| entry.id.clone())
+                    .collect(),
+            );
+        }
+        let _ = self.persist_preferences();
+        self.emit(StoreEffect::PublishSnapshot);
+    }
+
+    pub fn toggle_notification_mute(&mut self, session: SessionId) {
+        if !self.prefs.muted_notification_sessions.remove(&session.0) {
+            self.prefs
+                .muted_notification_sessions
+                .insert(session.0.clone());
+            let ids = self
+                .notification_feed
+                .entries()
+                .iter()
+                .filter(|entry| entry.session_id == session)
+                .map(|entry| entry.id.clone())
+                .collect();
+            self.notification_change(ids);
+        }
+        let _ = self.persist_preferences();
+        self.emit(StoreEffect::PublishSnapshot);
+    }
+
+    pub fn set_notification_surface_visible(&mut self, visible: bool) {
+        if self.notification_surface_visible == visible {
+            return;
+        }
+        self.notification_surface_visible = visible;
+        if visible
+            && self.app_is_active
+            && let Some(id) = self.selected_session_id.clone()
+        {
+            self.mark_notifications_read(&id);
+            self.emit(StoreEffect::MarkSeen(id));
+        }
+    }
+
+    fn notification_is_focused(&self, id: &SessionId) -> bool {
+        self.app_is_active
+            && self.notification_surface_visible
+            && self.selected_session_id.as_ref() == Some(id)
+    }
+
+    pub fn next_unread_notification(&self) -> Option<SessionId> {
+        self.notification_feed
+            .entries()
+            .iter()
+            .find(|entry| {
+                !entry.read
+                    && self.sessions.get(&entry.session_id).is_some_and(|session| {
+                        !session.is_archived()
+                            && session.created_at.0.to_bits() == entry.incarnation
+                    })
+            })
+            .map(|entry| entry.session_id.clone())
     }
 
     /// Re-reads hosts.json (daemon-owned, same machine). Called at startup and
@@ -1138,7 +1302,12 @@ impl SessionStore {
             .map(Arc::as_ref)
     }
 
+    pub fn has_hydrated_sessions(&self) -> bool {
+        self.session_list_hydrated
+    }
+
     pub fn hydrate(&mut self, result: SessionListResult) {
+        self.session_list_hydrated = true;
         // A full resync is the authority: anything still listed here outlived
         // its close (daemon restart, failed terminate) and belongs on screen.
         self.closing.clear();
@@ -1177,6 +1346,42 @@ impl SessionStore {
             }
         }
         self.auto_resume_selected_if_needed();
+        self.reconcile_notifications();
+        // Reconnect seeds unread current attention without replaying desktop
+        // alerts. Existing event read state wins over repeated snapshots.
+        let sessions: Vec<_> = self.sessions.values().cloned().collect();
+        let mut added = false;
+        for session in sessions {
+            let request = match session.attention() {
+                AttentionLevel::NeedsInput | AttentionLevel::DoneUnseen => {
+                    Some(crate::notifications::attention_request(
+                        &session,
+                        false,
+                        self.agent_descriptor(session.effective_kind()),
+                    ))
+                }
+                _ => crate::notifications::failed_request(&session),
+            };
+            if let Some(request) = request {
+                added |= self.notification_feed.record(&session, &request, false);
+            }
+        }
+        let dismissed = self
+            .notification_feed
+            .entries()
+            .iter()
+            .filter(|entry| entry.read)
+            .map(|entry| entry.id.clone())
+            .collect();
+        if added || !self.notification_feed.entries().is_empty() {
+            self.notification_change(dismissed);
+        }
+        if self.app_is_active
+            && self.notification_surface_visible
+            && let Some(id) = self.selected_session_id.clone()
+        {
+            self.mark_notifications_read(&id);
+        }
         self.reconcile_navigation();
     }
 
@@ -1190,6 +1395,44 @@ impl SessionStore {
 
     fn handle_event_change(&mut self, event: EventEnvelope) -> StoreEventChange {
         match event.name.as_str() {
+            EventName::SESSION_NOTIFICATION => {
+                if let Ok(mut event) =
+                    serde_json::from_value::<diri_proto::SessionNotificationEvent>(event.params)
+                    && let Some(session) = self.sessions.get(&event.session_id)
+                    && !session.is_archived()
+                    && session.created_at == event.session_created_at
+                {
+                    if event.title.is_empty() {
+                        event.title = session.title.clone();
+                    }
+                    let focused = self.notification_is_focused(&session.id);
+                    if self
+                        .notification_feed
+                        .record_custom(session, &event, focused)
+                    {
+                        self.notification_change(Vec::new());
+                        if !focused {
+                            self.emit(StoreEffect::StatusTransition(StatusTransition {
+                                dismiss: Vec::new(),
+                                in_app_banner: None,
+                                sound: self
+                                    .prefs
+                                    .status_sounds
+                                    .then_some(crate::notifications::NotificationSound::Done),
+                                notification: Some(crate::notifications::NotificationRequest {
+                                    identifier: event.id,
+                                    title: event.title,
+                                    body: event.body,
+                                    thread_identifier: Some(event.session_id.0),
+                                    action_data: None,
+                                    use_system_sound: false,
+                                }),
+                            }));
+                        }
+                        return StoreEventChange::Model;
+                    }
+                }
+            }
             EventName::SESSION_UPDATED => {
                 if let Ok(session) = serde_json::from_value::<SessionRecord>(event.params) {
                     if self
@@ -1295,7 +1538,32 @@ impl SessionStore {
             && previous
                 .as_deref()
                 .is_none_or(|record| !matches!(record.status, SessionStatus::Exited(_)));
+        let failure = (!self.closing.contains(&id)
+            && previous
+                .as_ref()
+                .is_some_and(|old| !matches!(old.status, SessionStatus::Exited(_))))
+        .then(|| crate::notifications::failed_request(&session))
+        .flatten();
         self.sessions.insert(id.clone(), Arc::new(session));
+        self.reconcile_notifications();
+        if let Some(request) = failure {
+            let current = self.sessions.get(&id).expect("inserted");
+            let focused = self.notification_is_focused(&id);
+            if self.notification_feed.record(current, &request, focused) {
+                self.notification_change(Vec::new());
+                if !focused {
+                    self.emit(StoreEffect::StatusTransition(StatusTransition {
+                        dismiss: Vec::new(),
+                        sound: self
+                            .prefs
+                            .status_sounds
+                            .then_some(crate::notifications::NotificationSound::NeedsInput),
+                        notification: Some(request),
+                        in_app_banner: None,
+                    }));
+                }
+            }
+        }
         self.settle_attention(&id, attention, arriving_attention, arriving_archived);
         // Spawn selects the id before the authoritative record arrives, and
         // only focus_session grants terminal residency -- without this, a
@@ -1403,11 +1671,20 @@ impl SessionStore {
                 session,
                 pending.level,
                 self.selected_session_id.as_ref(),
-                self.app_is_active,
+                self.app_is_active && self.notification_surface_visible,
                 self.prefs.status_sounds,
                 self.agent_descriptor(session.effective_kind()),
             ) {
-                transitions.push(transition);
+                let request = crate::notifications::attention_request(
+                    session,
+                    false,
+                    self.agent_descriptor(session.effective_kind()),
+                );
+                let focused = self.notification_is_focused(&id);
+                if self.notification_feed.record(session, &request, focused) {
+                    self.notification_change(Vec::new());
+                    transitions.push(transition);
+                }
             }
         }
         transitions
@@ -1418,6 +1695,7 @@ impl SessionStore {
             self.focus_neighbor(&HashSet::from([id.clone()]));
         }
         self.sessions.remove(id);
+        self.reconcile_notifications();
         self.attention_settle.remove(id);
         self.closing.remove(id);
         self.sidebar_selection.remove(id);
@@ -1689,6 +1967,7 @@ impl SessionStore {
     pub fn global_attention(&self) -> AttentionLevel {
         self.sessions
             .values()
+            .filter(|session| !session.is_archived())
             .fold(AttentionLevel::None, |rollup, session| {
                 let attention = session.attention();
                 if attention_rank(&attention) > attention_rank(&rollup) {
@@ -2128,12 +2407,22 @@ impl SessionStore {
             return;
         }
         self.app_is_active = active;
+        if active
+            && self.notification_surface_visible
+            && let Some(id) = self.selected_session_id.clone()
+        {
+            self.mark_notifications_read(&id);
+            self.emit(StoreEffect::MarkSeen(id));
+        }
         self.emit(StoreEffect::SetActive(active));
     }
 
     fn focus_session(&mut self, id: SessionId) {
         let selection_changed = self.selected_session_id.as_ref() != Some(&id);
         self.selected_session_id = Some(id.clone());
+        if self.notification_is_focused(&id) {
+            self.mark_notifications_read(&id);
+        }
         let revealed = self.reveal(&id);
         if selection_changed || revealed || self.prefs.last_selected_session.as_ref() != Some(&id) {
             self.prefs.last_selected_session = Some(id.clone());

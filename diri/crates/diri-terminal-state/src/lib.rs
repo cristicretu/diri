@@ -13,6 +13,9 @@
 //! emulator does not model, so it is scanned out of the byte stream directly —
 //! see [`scan_progress`].
 
+mod notifications;
+pub use notifications::TerminalNotification;
+
 use std::sync::mpsc::{self, Receiver, SyncSender};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
@@ -309,6 +312,7 @@ pub struct HeadlessScreen {
     /// Trailing bytes of the previous chunk, so an OSC split across a read
     /// boundary is still recognized.
     progress_carry: Vec<u8>,
+    notifications: Option<notifications::NotificationParser>,
     /// Answers the emulator owes the child: a cursor-position report, a device
     /// attributes reply, and anything else generated in response to a query.
     /// A program that asks and is never answered blocks until its own timeout,
@@ -354,6 +358,7 @@ impl HeadlessScreen {
             current_damage_rows: vec![false; geometry.rows],
             pending_damage_rows: vec![true; geometry.rows],
             progress_carry: Vec::new(),
+            notifications: None,
             replies: Vec::new(),
             title_changed: false,
             last_cells: Vec::new(),
@@ -364,13 +369,50 @@ impl HeadlessScreen {
         screen
     }
 
+    /// Opt in only in the local Engine. Holders do not interpret product alerts.
+    pub fn with_notifications(mut self) -> Self {
+        self.notifications = Some(Default::default());
+        self
+    }
+
+    pub fn reset_notification_sequence(&mut self) {
+        if let Some(parser) = &mut self.notifications {
+            parser.reset_sequence();
+        }
+    }
+
+    pub fn has_notifications(&self) -> bool {
+        self.notifications
+            .as_ref()
+            .is_some_and(|parser| !parser.ready.is_empty())
+    }
+
+    pub fn take_notifications(&mut self) -> Vec<TerminalNotification> {
+        self.notifications
+            .as_mut()
+            .map(|parser| parser.ready.drain(..).collect())
+            .unwrap_or_default()
+    }
+
     /// Feeds raw PTY output into the emulator.
     ///
     /// The whole chunk goes to the parser in one call — vte has a batched
     /// fast path for plain text that byte-at-a-time feeding defeats, and the
     /// difference is multi-x on heavy output like build logs.
     pub fn feed(&mut self, bytes: &[u8]) {
+        self.feed_with_history(bytes, 0);
+    }
+
+    /// Parses all terminal bytes while excluding a replay prefix from product
+    /// notifications. A partial historical OSC cannot leak into live output.
+    pub fn feed_with_history(&mut self, bytes: &[u8], historical_bytes: usize) {
         self.scan_progress(bytes);
+        if let Some(parser) = &mut self.notifications {
+            if historical_bytes != 0 {
+                parser.reset_sequence();
+            }
+            parser.feed(&bytes[historical_bytes.min(bytes.len())..]);
+        }
         self.parser.advance(&mut self.term, bytes);
         self.settle();
     }

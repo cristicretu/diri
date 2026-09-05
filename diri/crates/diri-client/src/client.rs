@@ -118,8 +118,9 @@ impl ClientCore {
     /// IF YOU ADD AN EVENT KIND THAT DIRI NEEDS, ADD IT HERE TOO. Server-side
     /// filtering means an unlisted kind never reaches `route_message`, and the
     /// symptom is silence, not an error.
-    const EVENT_KINDS: [&'static str; 4] = [
+    const EVENT_KINDS: [&'static str; 5] = [
         EventName::SESSION_UPDATED,
+        EventName::SESSION_NOTIFICATION,
         EventName::SESSION_RESOURCES,
         EventName::SESSION_REMOVED,
         EventName::PROJECT_UPDATED,
