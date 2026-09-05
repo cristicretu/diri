@@ -2001,13 +2001,11 @@ impl Sidebar {
         &mut self,
         projection: &crate::store::SidebarProjection,
         ordering: SidebarOrdering,
-        pinned: &HashSet<SessionId>,
-        today: i64,
+        rows: Vec<(RecencyBucket, crate::store::SidebarRow)>,
         colors: SemanticColors,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
-        let rows = recency_rows(projection, ordering, pinned, today);
         let mut buckets = RecencyBucket::ALL.to_vec();
         if ordering == SidebarOrdering::OldestFirst {
             buckets.reverse();
@@ -6093,8 +6091,7 @@ impl Render for Sidebar {
                     list = list.children(self.recency_sections(
                         &projection,
                         ordering,
-                        &pinned_sessions,
-                        today,
+                        recency_rows(&projection, ordering, &pinned_sessions, today),
                         colors,
                         window,
                         cx,
