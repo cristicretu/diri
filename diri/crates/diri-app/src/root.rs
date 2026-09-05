@@ -25,8 +25,10 @@ use crate::commands::{
 };
 use crate::external_drop::ExternalDropAction;
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
-use crate::inspector::{InspectorEvent, WorkbenchInspector};
+use crate::inspector::{BrowserAction, InspectorEvent, WorkbenchInspector};
 use crate::launcher::{LauncherEvent, LauncherOverlay};
+#[cfg(target_os = "macos")]
+use crate::macos::browser::{BrowserFrame, NativeBrowser};
 use crate::navigation::NavigationOverlay;
 use crate::notifications::{InAppBanner, NotificationSound};
 use crate::quote::Quote;
@@ -174,6 +176,8 @@ pub struct RootView {
     utility_surfaces: Option<Entity<UtilitySurfaces>>,
     launcher: Entity<LauncherOverlay>,
     inspector: Option<Entity<WorkbenchInspector>>,
+    #[cfg(target_os = "macos")]
+    browser: NativeBrowser,
     services: Arc<AppServices>,
     focus: FocusHandle,
     resize_origin: Option<(f32, f32)>,
@@ -224,6 +228,8 @@ pub struct RootView {
     _service_events: Task<()>,
     _surface_sync: Option<Task<()>>,
     _workbench_sync: Task<()>,
+    #[cfg(target_os = "macos")]
+    _browser_state_sync: Task<()>,
 }
 
 impl Focusable for RootView {
@@ -456,11 +462,51 @@ impl RootView {
         )
         .detach();
         if let Some(inspector) = &inspector {
-            cx.subscribe(inspector, |this, _, event, cx| {
-                if matches!(event, InspectorEvent::Close) {
-                    this.set_inspector_open(false, cx);
-                }
-            })
+            cx.subscribe_in(
+                inspector,
+                window,
+                |this, _, event, window, cx| match event {
+                    InspectorEvent::Close => this.set_inspector_open(false, cx),
+                    InspectorEvent::WorkspaceChanged(surface) => {
+                        if let Some(terminal) = &this.auxiliary_terminal
+                            && *surface == crate::inspector::WorkspaceSurface::Terminal
+                        {
+                            terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+                        }
+                        cx.notify();
+                    }
+                    InspectorEvent::RequestTerminal => {
+                        this.ensure_auxiliary_terminal(window, cx);
+                    }
+                    InspectorEvent::WorkspaceClosed(surface) => {
+                        #[cfg(target_os = "macos")]
+                        if *surface == crate::inspector::WorkspaceSurface::Browser {
+                            this.browser.clear();
+                        }
+                        if *surface == crate::inspector::WorkspaceSurface::Terminal {
+                            this.hide_auxiliary_terminal(window, cx);
+                        }
+                        cx.notify();
+                    }
+                    InspectorEvent::Browser(action) => {
+                        #[cfg(target_os = "macos")]
+                        match action {
+                            BrowserAction::Navigate(url) => this.browser.load(url.clone()),
+                            BrowserAction::Back => this.browser.go_back(),
+                            BrowserAction::Forward => this.browser.go_forward(),
+                            BrowserAction::Reload => this.browser.reload(),
+                            BrowserAction::OpenExternal(url) => cx.open_url(url),
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        if let BrowserAction::Navigate(url) | BrowserAction::OpenExternal(url) =
+                            action
+                        {
+                            cx.open_url(url);
+                        }
+                        cx.notify();
+                    }
+                },
+            )
             .detach();
         }
 
@@ -692,6 +738,26 @@ impl RootView {
             0.0
         };
         let inspector_seam = if inspector_open { inspector_width } else { 0.0 };
+        #[cfg(target_os = "macos")]
+        let (browser, mut browser_events) = NativeBrowser::new();
+        #[cfg(target_os = "macos")]
+        let browser_state_sync = cx.spawn_in(window, async move |this, cx| {
+            while browser_events.recv().await.is_some() {
+                if this
+                    .update_in(cx, |this, _window, cx| {
+                        if let Some(inspector) = this.inspector.clone() {
+                            let state = this.browser.state();
+                            inspector
+                                .update(cx, |inspector, cx| inspector.set_browser_state(state, cx));
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
         let mut root = Self {
             sidebar,
             terminal,
@@ -700,6 +766,8 @@ impl RootView {
             utility_surfaces,
             launcher,
             inspector,
+            #[cfg(target_os = "macos")]
+            browser,
             services,
             focus: cx.focus_handle(),
             resize_origin: None,
@@ -737,6 +805,8 @@ impl RootView {
             _service_events: service_events,
             _surface_sync: surface_sync,
             _workbench_sync: workbench_sync,
+            #[cfg(target_os = "macos")]
+            _browser_state_sync: browser_state_sync,
         };
         root.sync_auxiliary_terminal(window, cx);
         if !preview {
@@ -1330,7 +1400,29 @@ impl RootView {
         if self.preview {
             return false;
         }
+        if let Some(inspector) = &self.inspector
+            && inspector.read(cx).workspace_needs_terminal()
+        {
+            inspector.update(cx, |inspector, cx| {
+                inspector.select_workspace(crate::inspector::WorkspaceSurface::Terminal, cx);
+            });
+            self.reveal_inspector(cx);
+            return self.ensure_auxiliary_terminal(window, cx);
+        }
         self.sync_auxiliary_terminal(window, cx);
+        if self.auxiliary_terminal.is_some() {
+            self.hide_auxiliary_terminal(window, cx);
+            true
+        } else {
+            self.ensure_auxiliary_terminal(window, cx)
+        }
+    }
+
+    /// Tab activation is idempotent: it never toggles an already-open shell.
+    fn ensure_auxiliary_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.preview {
+            return false;
+        }
         let selected = self
             .services
             .store
@@ -1342,23 +1434,11 @@ impl RootView {
         let Some(parent) = selected else {
             return false;
         };
-        if self.auxiliary_parent.as_ref() == Some(&parent) && self.auxiliary_terminal.is_some() {
-            self.collapsed_auxiliary_parents.insert(parent);
-            self.auxiliary_terminal = None;
-            self.auxiliary_id = None;
-            self.auxiliary_parent = None;
-            if let Some(primary) = &self.terminal {
-                primary.update(cx, |terminal, cx| terminal.focus(window, cx));
-            }
-            cx.notify();
+        self.collapsed_auxiliary_parents.remove(&parent);
+        self.sync_auxiliary_terminal(window, cx);
+        if let Some(terminal) = &self.auxiliary_terminal {
+            terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
             return true;
-        }
-        if self.collapsed_auxiliary_parents.remove(&parent) {
-            self.sync_auxiliary_terminal(window, cx);
-            if let Some(terminal) = &self.auxiliary_terminal {
-                terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
-                return true;
-            }
         }
         if self.auxiliary_spawn_parent.as_ref() == Some(&parent) {
             return true;
@@ -1375,6 +1455,32 @@ impl RootView {
             cx.notify();
         }
         spawned
+    }
+
+    /// Hide the pane without starting or stopping the Engine-owned child shell.
+    fn hide_auxiliary_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(parent) = self
+            .services
+            .store
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .selected_session_id()
+            .cloned()
+        {
+            self.collapsed_auxiliary_parents.insert(parent);
+        }
+        self.auxiliary_terminal = None;
+        self.auxiliary_id = None;
+        self.auxiliary_parent = None;
+        self.auxiliary_spawn_parent = None;
+        if let Some(inspector) = &self.inspector {
+            inspector.update(cx, |inspector, cx| inspector.set_terminal_surface(None, cx));
+        }
+        if let Some(primary) = &self.terminal {
+            primary.update(cx, |terminal, cx| terminal.focus(window, cx));
+        }
+        cx.notify();
     }
 
     /// Reconciles the UI-owned pane entity with the daemon-owned child shell.
@@ -1407,6 +1513,9 @@ impl RootView {
             self.auxiliary_terminal = None;
             self.auxiliary_id = None;
             self.auxiliary_parent = None;
+            if let Some(inspector) = &self.inspector {
+                inspector.update(cx, |inspector, cx| inspector.set_terminal_surface(None, cx));
+            }
             return;
         }
 
@@ -1439,6 +1548,12 @@ impl RootView {
             self.auxiliary_parent = Some(parent);
             self.auxiliary_terminal = Some(terminal.clone());
             self.auxiliary_spawn_parent = None;
+            if let Some(inspector) = &self.inspector {
+                let terminal = terminal.clone();
+                inspector.update(cx, |inspector, cx| {
+                    inspector.set_terminal_surface(Some(terminal), cx)
+                });
+            }
             if should_focus {
                 terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
             }
@@ -1461,6 +1576,9 @@ impl RootView {
         self.auxiliary_id = None;
         self.auxiliary_parent = None;
         self.auxiliary_spawn_parent = None;
+        if let Some(inspector) = &self.inspector {
+            inspector.update(cx, |inspector, cx| inspector.set_terminal_surface(None, cx));
+        }
         if had_auxiliary_state {
             cx.notify();
         }
@@ -1642,6 +1760,21 @@ impl RootView {
                     .w(px(9.0))
                     .h_full()
                     .cursor(CursorStyle::ResizeLeftRight)
+                    .group("sidebar-resize")
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(3.5))
+                            .top_0()
+                            .w(px(2.0))
+                            .h_full()
+                            .bg(if self.resize_origin.is_some() {
+                                rgba(0x4f83f1ff)
+                            } else {
+                                rgba(0x4f83f100)
+                            })
+                            .group_hover("sidebar-resize", |line| line.bg(rgba(0x4f83f1ff))),
+                    )
                     .occlude()
                     .on_drag(DraggedSidebarEdge, |edge, _, _, cx| {
                         cx.stop_propagation();
@@ -1652,6 +1785,7 @@ impl RootView {
                         cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
                             let width = this.sidebar.read(cx).width();
                             this.resize_origin = Some((f32::from(event.position.x), width));
+                            cx.notify();
                             cx.stop_propagation();
                         }),
                     )
@@ -1691,6 +1825,21 @@ impl RootView {
                     .h(px(9.0))
                     .w_full()
                     .cursor(CursorStyle::ResizeUpDown)
+                    .group("terminal-resize")
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(3.5))
+                            .left_0()
+                            .h(px(2.0))
+                            .w_full()
+                            .bg(if self.terminal_resize_origin.is_some() {
+                                rgba(0x4f83f1ff)
+                            } else {
+                                rgba(0x4f83f100)
+                            })
+                            .group_hover("terminal-resize", |line| line.bg(rgba(0x4f83f1ff))),
+                    )
                     .occlude()
                     .on_drag(DraggedTerminalEdge, |edge, _, _, cx| {
                         cx.stop_propagation();
@@ -1705,6 +1854,7 @@ impl RootView {
                                 .primary;
                             this.terminal_resize_origin =
                                 Some((f32::from(event.position.y), primary));
+                            cx.notify();
                             cx.stop_propagation();
                         }),
                     )
@@ -1828,6 +1978,21 @@ impl RootView {
                     .w(px(9.0))
                     .h_full()
                     .cursor(CursorStyle::ResizeLeftRight)
+                    .group("inspector-resize")
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(3.5))
+                            .top_0()
+                            .w(px(2.0))
+                            .h_full()
+                            .bg(if self.inspector_resize_origin.is_some() {
+                                rgba(0x4f83f1ff)
+                            } else {
+                                rgba(0x4f83f100)
+                            })
+                            .group_hover("inspector-resize", |line| line.bg(rgba(0x4f83f1ff))),
+                    )
                     .occlude()
                     .on_drag(DraggedInspectorEdge, |edge, _, _, cx| {
                         cx.stop_propagation();
@@ -1838,6 +2003,7 @@ impl RootView {
                         cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
                             this.inspector_resize_origin =
                                 Some((f32::from(event.position.x), this.inspector_width));
+                            cx.notify();
                             cx.stop_propagation();
                         }),
                     )
@@ -1957,10 +2123,20 @@ impl RootView {
             .expect("session store lock poisoned")
             .selected_session_id()
             .cloned();
-        let split_open = self.auxiliary_terminal.is_some()
-            || selected
+        let terminal_in_workspace_panel = inspector_seam > 0.5
+            && self
+                .inspector
                 .as_ref()
-                .is_some_and(|id| self.auxiliary_spawn_parent.as_ref() == Some(id));
+                .is_some_and(|inspector| inspector.read(cx).is_terminal_tab());
+        let workspace_owns_terminal = self
+            .inspector
+            .as_ref()
+            .is_some_and(|inspector| inspector.read(cx).workspace_needs_terminal());
+        let split_open = !workspace_owns_terminal
+            && (self.auxiliary_terminal.is_some()
+                || selected
+                    .as_ref()
+                    .is_some_and(|id| self.auxiliary_spawn_parent.as_ref() == Some(id)));
         let mut card = div()
             .relative()
             .flex_1()
@@ -1990,6 +2166,21 @@ impl RootView {
             .rounded_bl(px(Radius::CARD))
             .border_1()
             .border_color(terminal.primary.alpha(0.10));
+
+        if terminal_in_workspace_panel && let Some(auxiliary) = &self.auxiliary_terminal {
+            auxiliary.update(cx, |terminal, cx| {
+                terminal.set_shell_chrome(visible_sidebar, true, cx);
+                terminal.set_viewport(
+                    TerminalViewport {
+                        x: sidebar_width + card_width,
+                        y: Metrics::TITLE_BAR,
+                        width: inspector_width,
+                        height: card_height.max(0.0),
+                    },
+                    cx,
+                );
+            });
+        }
 
         if self.preview && self.preview_scenario != PreviewScenario::Empty {
             card = card.child(self.preview_workbench(terminal));
@@ -2718,6 +2909,52 @@ impl Render for RootView {
         self.inspector_seam = advance_seam(&mut self.inspector_slide, inspector_width, now, window);
         let seam = self.sidebar_seam;
         let inspector_seam = self.inspector_seam;
+        #[cfg(target_os = "macos")]
+        {
+            let utility_open = self
+                .utility_surfaces
+                .as_ref()
+                .is_some_and(|surfaces| surfaces.read(cx).is_open());
+            let navigation_open = self
+                .navigation
+                .as_ref()
+                .is_some_and(|navigation| navigation.read(cx).is_open());
+            let inspector_blocks_browser = self
+                .inspector
+                .as_ref()
+                .is_some_and(|inspector| inspector.read(cx).blocks_native_browser());
+            let browser_active = self.browser.has_page()
+                && self.resize_origin.is_none()
+                && self.inspector_resize_origin.is_none()
+                && !launcher_open
+                && !utility_open
+                && !navigation_open
+                && !self.arrow_surface_visible()
+                && self.quote_target_picker.is_none()
+                && self.sidebar.read(cx).pending_close_copy().is_none()
+                && !inspector_blocks_browser
+                && self.inspector_open
+                && inspector_seam >= inspector_panel_width - 0.5
+                && self
+                    .inspector
+                    .as_ref()
+                    .is_some_and(|inspector| inspector.read(cx).is_browser_tab());
+            let height = f32::from(window.inner_window_bounds().get_bounds().size.height);
+            self.browser.sync(
+                window,
+                browser_active,
+                BrowserFrame {
+                    x: window_width - inspector_panel_width,
+                    y: recovery_height + Metrics::TITLE_BAR + 42.0,
+                    width: inspector_panel_width,
+                    height: (height - recovery_height - Metrics::TITLE_BAR - 42.0).max(0.0),
+                },
+            );
+            let state = self.browser.state();
+            if let Some(inspector) = &self.inspector {
+                inspector.update(cx, |inspector, cx| inspector.set_browser_state(state, cx));
+            }
+        }
         let mut key_context = KeyContext::new_with_defaults();
         key_context.add(APP_CONTEXT);
         key_context.add(SESSION_NAVIGATION_CONTEXT);
