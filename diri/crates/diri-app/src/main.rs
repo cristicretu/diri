@@ -171,6 +171,11 @@ pub(crate) struct AppServices {
 }
 
 fn main() {
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    if std::env::var_os("DIRI_NATIVE_BROWSER_SMOKE").is_some() {
+        macos::browser::smoke_test();
+        return;
+    }
     if std::env::var_os("DIRI_PROBE_SYMBOLS").is_some() {
         icons::probe();
         return;
