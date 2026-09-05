@@ -33,6 +33,14 @@ pub struct TranscriptTurn {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TranscriptDocument {
     pub turns: Vec<TranscriptTurn>,
+    pub context_usage: Option<ContextUsage>,
+}
+
+/// Last request occupancy reported by the provider, never cumulative spend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContextUsage {
+    pub tokens: i64,
+    pub window: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,11 +122,21 @@ pub fn load(
     }
 
     let mut turns = Vec::new();
+    let mut context_usage = None;
     for (index, line) in reader.lines().enumerate() {
         let Ok(line) = line else { continue };
         let Ok(record) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+        if kind.id() == AgentKind::CODEX_ID {
+            if let Some(usage) = codex_context_usage(&record) {
+                context_usage = Some(usage);
+            } else if record.pointer("/payload/type").and_then(Value::as_str)
+                == Some("context_compacted")
+            {
+                context_usage = None;
+            }
+        }
         let parsed = match kind.id() {
             AgentKind::CLAUDE_CODE_ID => claude_turn(&record),
             AgentKind::CODEX_ID => codex_turn(&record),
@@ -145,7 +163,10 @@ pub fn load(
         }
     }
     Ok(Some(TranscriptSnapshot {
-        document: TranscriptDocument { turns },
+        document: TranscriptDocument {
+            turns,
+            context_usage,
+        },
         version,
     }))
 }
@@ -234,6 +255,18 @@ fn validate_opened_identity(
         ));
     }
     Ok(())
+}
+
+fn codex_context_usage(record: &Value) -> Option<ContextUsage> {
+    if record.get("type").and_then(Value::as_str) != Some("event_msg")
+        || record.pointer("/payload/type").and_then(Value::as_str) != Some("token_count")
+    {
+        return None;
+    }
+    let info = record.pointer("/payload/info")?;
+    let tokens = info.pointer("/last_token_usage/total_tokens")?.as_i64()?;
+    let window = info.get("model_context_window")?.as_i64()?;
+    (tokens >= 0 && window > 0).then_some(ContextUsage { tokens, window })
 }
 
 fn claude_turn(record: &Value) -> Option<(&'static str, String)> {
@@ -339,6 +372,25 @@ mod tests {
         )
         .unwrap();
         (file, path)
+    }
+
+    #[test]
+    fn context_uses_last_request_instead_of_cumulative_billing() {
+        let record = serde_json::json!({"type":"event_msg", "payload":{"type":"token_count", "info":{
+            "total_token_usage":{"total_tokens":9_000_000},
+            "last_token_usage":{"total_tokens":17_800},
+            "model_context_window":258_400
+        }}});
+        assert_eq!(
+            codex_context_usage(&record),
+            Some(ContextUsage {
+                tokens: 17_800,
+                window: 258_400
+            })
+        );
+        let mut missing_window = record;
+        missing_window["payload"]["info"]["model_context_window"] = serde_json::Value::Null;
+        assert_eq!(codex_context_usage(&missing_window), None);
     }
 
     #[test]

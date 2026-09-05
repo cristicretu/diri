@@ -307,6 +307,9 @@ impl RootView {
             .detach();
         }
         cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
+            if matches!(event, SidebarEvent::RefreshUsageLimits) {
+                let _ = this.services.usage_limits_refresh.try_send(());
+            }
             if let SidebarEvent::ContinueAccount(id) = event
                 && let Some(surfaces) = &this.utility_surfaces
             {

@@ -1,11 +1,13 @@
 //! Incremental, daemon-free usage accounting for Claude Code and Codex transcripts.
 //!
 //! Costs are computed locally from the transcripts on disk; nothing is sent
-//! anywhere and no provider API is queried.
+//! anywhere. The separate limits reader queries provider-reported subscription
+//! windows without deriving quota percentages from these estimates.
 
 mod cache;
 pub mod dashboard;
 mod fleet;
+pub(crate) mod limits;
 mod model;
 mod parser;
 mod pricing;

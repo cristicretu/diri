@@ -4110,6 +4110,7 @@ mod tests {
         Arc::new(AppServices {
             store,
             usage_tx,
+            usage_limits_refresh: tokio::sync::mpsc::channel(1).0,
             updates: crate::updates::inert(),
             tokio,
             dev_build: None,
@@ -4330,6 +4331,7 @@ mod tests {
         let services = Arc::new(AppServices {
             store,
             usage_tx,
+            usage_limits_refresh: tokio::sync::mpsc::channel(1).0,
             updates: crate::updates::inert(),
             tokio,
             dev_build: None,
@@ -4382,6 +4384,7 @@ mod tests {
         let services = Arc::new(AppServices {
             store: Arc::clone(&store),
             usage_tx,
+            usage_limits_refresh: tokio::sync::mpsc::channel(1).0,
             updates: crate::updates::inert(),
             tokio,
             dev_build: None,
@@ -5056,6 +5059,7 @@ mod tests {
         let services = Arc::new(AppServices {
             store: runtime,
             usage_tx,
+            usage_limits_refresh: tokio::sync::mpsc::channel(1).0,
             updates: crate::updates::inert(),
             tokio,
             dev_build: None,
@@ -5344,6 +5348,7 @@ mod tests {
         let services = Arc::new(AppServices {
             store: Arc::clone(&runtime),
             usage_tx,
+            usage_limits_refresh: tokio::sync::mpsc::channel(1).0,
             updates: crate::updates::inert(),
             tokio,
             dev_build: None,

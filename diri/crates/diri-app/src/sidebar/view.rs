@@ -118,6 +118,7 @@ enum HorizontalFocusAction {
 
 #[derive(Clone, Debug)]
 pub(crate) enum SidebarEvent {
+    RefreshUsageLimits,
     ContinueAccount(SessionId),
     VisibilityChanged,
     WidthChanged,
@@ -238,6 +239,9 @@ pub struct Sidebar {
     focus_handle: FocusHandle,
     hover_generation: u64,
     usage: Option<UsageSnapshot>,
+    account_context: Option<crate::transcript::ContextUsage>,
+    account_context_session: Option<SessionId>,
+    account_context_task: Option<Task<()>>,
     update: UpdateState,
     /// When visibility last flipped, so a held ⌘B cannot outrun the slide.
     last_toggle: Option<Instant>,
@@ -317,7 +321,13 @@ impl Sidebar {
                 loop {
                     match changes.recv().await {
                         Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            if this.update(cx, |_, cx| cx.notify()).is_err() {
+                            if this
+                                .update(cx, |this, cx| {
+                                    this.refresh_account_context(false, cx);
+                                    cx.notify();
+                                })
+                                .is_err()
+                            {
                                 return;
                             }
                         }
@@ -342,6 +352,9 @@ impl Sidebar {
             focus_handle: cx.focus_handle(),
             hover_generation: 0,
             usage: None,
+            account_context: None,
+            account_context_session: None,
+            account_context_task: None,
             update: UpdateState::default(),
             last_toggle: None,
             preview,
@@ -398,8 +411,74 @@ impl Sidebar {
     }
 
     pub fn set_usage(&mut self, snapshot: UsageSnapshot, cx: &mut Context<Self>) {
+        let now = crate::usage::Clock::read(&crate::usage::SystemClock).unix_seconds;
+        if !self.preview
+            && self.ui.popover == Some(Popover::Account)
+            && snapshot
+                .limits
+                .iter()
+                .all(|limits| now - limits.checked_at >= 180)
+        {
+            cx.emit(SidebarEvent::RefreshUsageLimits);
+        }
         self.usage = Some(snapshot);
+        self.refresh_account_context(true, cx);
         cx.notify();
+    }
+
+    fn refresh_account_context(&mut self, force: bool, cx: &mut Context<Self>) {
+        if self.preview || self.ui.popover != Some(Popover::Account) {
+            return;
+        }
+        let session = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .selected_session()
+            .cloned();
+        let id = session.as_ref().map(|session| session.id.clone());
+        if !force && self.account_context_session == id {
+            return;
+        }
+        self.account_context_task = None;
+        if self.account_context_session != id {
+            self.account_context = None;
+        }
+        self.account_context_session = id.clone();
+        let Some(session) = session.filter(|session| session.host.is_none()) else {
+            self.account_context = None;
+            return;
+        };
+        let Some((path, agent_id)) = session.transcript_path.zip(session.agent_session_id) else {
+            self.account_context = None;
+            return;
+        };
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/nonexistent"));
+        self.account_context_task = Some(cx.spawn(async move |this, cx| {
+            let context = cx
+                .background_spawn(async move {
+                    crate::transcript::load(
+                        &home,
+                        std::path::Path::new(&path),
+                        &session.kind,
+                        &agent_id,
+                        &session.cwd,
+                        None,
+                    )
+                    .ok()
+                    .flatten()
+                    .and_then(|snapshot| snapshot.document.context_usage)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.account_context_session == id {
+                    this.account_context = context;
+                    cx.notify();
+                }
+            });
+        }));
     }
 
     pub fn pending_close_copy(&self) -> Option<(String, String)> {
@@ -2821,6 +2900,10 @@ impl Sidebar {
                         } else {
                             Some(Popover::Account)
                         };
+                        this.refresh_account_context(true, cx);
+                        if !this.preview && this.ui.popover == Some(Popover::Account) {
+                            cx.emit(SidebarEvent::RefreshUsageLimits);
+                        }
                         cx.notify();
                     }))
                     .child(account_avatar(&account_label, 20.0, colors))
@@ -2886,7 +2969,7 @@ impl Sidebar {
         self.popover_shell_at(
             point(px(12.0), px(top)),
             Anchor::TopLeft,
-            244.0,
+            276.0,
             child,
             colors,
             cx,
@@ -2905,7 +2988,7 @@ impl Sidebar {
         self.popover_shell_at(
             point(px(12.0), px(footer_top)),
             Anchor::BottomLeft,
-            244.0,
+            276.0,
             child,
             colors,
             cx,
@@ -2965,7 +3048,8 @@ impl Sidebar {
                                     // GPUI has no per-element backdrop blur.
                                     // Preserve the material without leaving
                                     // terminal text legible through the menu.
-                                    .surface_opacity(0.975),
+                                    .surface_opacity(0.975)
+                                    .animate_entry(!self.preview),
                                 ),
                         ),
                 )
@@ -3798,14 +3882,40 @@ impl Sidebar {
          * animate independently: this is a frequent, keyboard-adjacent menu.
          * ───────────────────────────────────────────────────────── */
         let account_label = local_account_label(self.preview);
-        let mut usage = div().flex().flex_col().py(px(3.0));
+        let context = if self.preview {
+            Some(crate::transcript::ContextUsage {
+                tokens: 17_800,
+                window: 258_400,
+            })
+        } else {
+            let store = self.store.read().expect("session store lock poisoned");
+            (store.selected_session_id() == self.account_context_session.as_ref())
+                .then_some(self.account_context)
+                .flatten()
+        };
+        let limits = if self.preview {
+            crate::usage::limits::preview()
+        } else {
+            self.usage
+                .as_ref()
+                .map_or_else(Vec::new, |usage| usage.limits.clone())
+        };
+        let mut usage = div().flex().flex_col().py(px(3.0)).child(
+            div()
+                .px(px(14.0))
+                .pt(px(3.0))
+                .pb(px(2.0))
+                .text_size(px(Typo::META.size))
+                .text_color(colors.tertiary)
+                .child("Usage cost · estimates included"),
+        );
         if self.preview {
             usage = usage
                 .child(usage_menu_row(
                     "account-usage-session",
                     "clock",
-                    "Session",
-                    "resets in 2h 14m",
+                    "5h block",
+                    "estimated",
                     "$2.31",
                     colors,
                 ))
@@ -3830,12 +3940,8 @@ impl Sidebar {
                 .child(usage_menu_row(
                     "account-usage-session",
                     "clock",
-                    "Session",
-                    snapshot
-                        .session_remaining_seconds
-                        .map(|seconds| format!("resets in {}", compact_duration(seconds)))
-                        .as_deref()
-                        .unwrap_or("idle"),
+                    "5h block",
+                    "estimated",
                     &snapshot
                         .session_cost
                         .map(UsageFormat::money)
@@ -3888,6 +3994,10 @@ impl Sidebar {
         let content = div()
             .id("account-menu")
             .debug_selector(|| "account-menu".into())
+            .max_h(px(
+                (f32::from(window.viewport_size().height) - 64.0).max(200.0)
+            ))
+            .overflow_y_scroll()
             .flex()
             .flex_col()
             .child(
@@ -3932,6 +4042,12 @@ impl Sidebar {
                             .child("This Mac"),
                     ),
             )
+            .child(menu_divider(colors))
+            .when_some(context, |menu, context| {
+                menu.child(account_context_menu(context, colors))
+                    .child(menu_divider(colors))
+            })
+            .child(account_limits_menu(&limits, colors, cx))
             .child(menu_divider(colors))
             .child(usage)
             .child(menu_divider(colors))
@@ -5767,6 +5883,216 @@ fn account_avatar(label: &str, size: f32, colors: SemanticColors) -> AnyElement 
         .into_any_element()
 }
 
+fn account_context_menu(
+    context: crate::transcript::ContextUsage,
+    colors: SemanticColors,
+) -> AnyElement {
+    let percent = (context.tokens as f64 / context.window as f64 * 100.0).clamp(0.0, 100.0);
+    div()
+        .id("account-context-window")
+        .debug_selector(|| "account-context-window".into())
+        .flex_none()
+        .px(px(14.0))
+        .py(px(8.0))
+        .flex()
+        .flex_col()
+        .gap(px(5.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(px(Typo::ROW.size))
+                        .text_color(colors.primary)
+                        .child("Context window"),
+                )
+                .child(
+                    div()
+                        .text_size(px(Typo::META.size))
+                        .text_color(colors.secondary)
+                        .child(format!("{percent:.0}%")),
+                ),
+        )
+        .child(
+            div()
+                .h(px(3.0))
+                .w_full()
+                .rounded_full()
+                .bg(colors.primary.alpha(0.09))
+                .child(
+                    div()
+                        .h_full()
+                        .w(gpui::relative(percent as f32 / 100.0))
+                        .rounded_full()
+                        .bg(Palette::GEMINI_BLUE),
+                ),
+        )
+        .child(
+            div()
+                .text_size(px(10.0))
+                .text_color(colors.tertiary)
+                .child(format!(
+                    "{} / {} · selected session",
+                    UsageFormat::tokens(context.tokens),
+                    UsageFormat::tokens(context.window)
+                )),
+        )
+        .into_any_element()
+}
+
+/// Subscription quotas are provider facts, separate from cost estimates below.
+fn account_limits_menu(
+    limits: &[crate::usage::limits::AccountLimits],
+    colors: SemanticColors,
+    cx: &mut Context<Sidebar>,
+) -> AnyElement {
+    let now = crate::usage::Clock::read(&crate::usage::SystemClock).unix_seconds;
+    let mut content = div()
+        .id("account-plan-limits")
+        .debug_selector(|| "account-plan-limits".into())
+        .flex_none()
+        .px(px(14.0))
+        .py(px(8.0))
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_size(px(Typo::META.size))
+                        .text_color(colors.secondary)
+                        .child("Plan limits"),
+                )
+                .child(
+                    div()
+                        .id("account-refresh-limits")
+                        .cursor_pointer()
+                        .rounded(px(4.0))
+                        .p(px(2.0))
+                        .hover(move |row| row.bg(colors.primary.alpha(0.06)))
+                        .child(sf_symbol(
+                            "arrow.triangle.2.circlepath",
+                            11.0,
+                            colors.secondary,
+                        ))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if !this.preview {
+                                cx.emit(SidebarEvent::RefreshUsageLimits);
+                            }
+                        })),
+                ),
+        );
+    if limits.is_empty() {
+        return content
+            .child(
+                div()
+                    .text_size(px(Typo::META.size))
+                    .text_color(colors.tertiary)
+                    .child("Checking provider limits…"),
+            )
+            .into_any_element();
+    }
+    for account in limits {
+        let mut provider = div().flex().flex_col().gap(px(7.0)).child(
+            div()
+                .text_size(px(Typo::META.size))
+                .text_color(colors.secondary)
+                .child(format!("{} · {}", account.provider, account.account)),
+        );
+        for limit in &account.windows {
+            let expired = limit.resets_at.is_some_and(|reset| reset <= now);
+            let stale = expired || account.error.is_some() || now - account.checked_at > 360;
+            let reset = match limit.resets_at {
+                Some(reset) if reset > now => {
+                    let seconds = reset - now;
+                    if seconds >= 86_400 {
+                        format!(
+                            "Resets in {}d {}h",
+                            seconds / 86_400,
+                            seconds % 86_400 / 3_600
+                        )
+                    } else {
+                        format!("Resets in {}", compact_duration(seconds))
+                    }
+                }
+                Some(_) => "Awaiting refresh".into(),
+                None => "Reset time unavailable".into(),
+            };
+            provider = provider.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(px(Typo::ROW.size))
+                                    .text_color(colors.primary)
+                                    .child(limit.label.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(Typo::META.size))
+                                    .text_color(colors.secondary)
+                                    .child(format!(
+                                        "{:.0}%{}",
+                                        limit.used_percent,
+                                        if stale { " · last" } else { "" }
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .h(px(3.0))
+                            .w_full()
+                            .rounded_full()
+                            .bg(colors.primary.alpha(0.09))
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(gpui::relative(limit.used_percent as f32 / 100.0))
+                                    .rounded_full()
+                                    .bg(if stale {
+                                        colors.tertiary
+                                    } else {
+                                        Palette::GEMINI_BLUE
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(colors.tertiary)
+                            .child(reset),
+                    ),
+            );
+        }
+        if let Some(error) = account.error {
+            provider = provider.child(
+                div()
+                    .text_size(px(Typo::META.size))
+                    .text_color(colors.tertiary)
+                    .child(error),
+            );
+        }
+        content = content.child(provider);
+    }
+    content.into_any_element()
+}
+
 fn usage_menu_row(
     id: &'static str,
     icon: &'static str,
@@ -6837,6 +7163,8 @@ mod tests {
         });
 
         assert!(cx.debug_bounds("account-menu").is_some());
+        assert!(cx.debug_bounds("account-context-window").is_some());
+        assert!(cx.debug_bounds("account-plan-limits").is_some());
         assert!(cx.debug_bounds("account-usage-session").is_some());
         assert!(cx.debug_bounds("account-usage-today").is_some());
         assert!(cx.debug_bounds("account-usage-month").is_some());
