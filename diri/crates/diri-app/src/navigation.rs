@@ -101,6 +101,7 @@ enum CommandSelection {
 
 pub struct NavigationOverlay {
     focus_handle: FocusHandle,
+    previous_focus_handle: Option<FocusHandle>,
     store: Arc<RwLock<SessionStore>>,
     _runtime: Arc<StoreRuntime>,
     overlay: Option<Overlay>,
@@ -152,6 +153,7 @@ impl NavigationOverlay {
         });
         let mut overlay = Self {
             focus_handle,
+            previous_focus_handle: None,
             store: Arc::clone(&runtime.store),
             _runtime: runtime,
             overlay: None,
@@ -182,6 +184,7 @@ impl NavigationOverlay {
     fn opened_for_test(runtime: Arc<StoreRuntime>, cx: &mut Context<Self>) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
+            previous_focus_handle: None,
             store: Arc::clone(&runtime.store),
             _runtime: runtime,
             overlay: Some(Overlay::CommandPalette),
@@ -264,7 +267,7 @@ impl NavigationOverlay {
         cx: &mut Context<Self>,
     ) {
         if self.overlay == Some(Overlay::CommandPalette) {
-            self.close_overlay(cx);
+            self.close_overlay(window, cx);
         } else {
             self.open_overlay(Overlay::CommandPalette, window, cx);
         }
@@ -277,7 +280,7 @@ impl NavigationOverlay {
         cx: &mut Context<Self>,
     ) {
         if self.overlay == Some(Overlay::QuickOpen) {
-            self.close_overlay(cx);
+            self.close_overlay(window, cx);
         } else {
             self.open_overlay(Overlay::QuickOpen, window, cx);
             self.refresh_directory_index(cx);
@@ -285,6 +288,11 @@ impl NavigationOverlay {
     }
 
     fn open_overlay(&mut self, overlay: Overlay, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlay.is_none() {
+            self.previous_focus_handle = window
+                .focused(cx)
+                .filter(|handle| handle != &self.focus_handle);
+        }
         self.overlay = Some(overlay);
         self.query.clear();
         self.reset_selection();
@@ -292,11 +300,11 @@ impl NavigationOverlay {
         if overlay == Overlay::CommandPalette {
             self.refresh_command_items();
         }
-        let _ = window;
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
-    fn close_overlay(&mut self, cx: &mut Context<Self>) {
+    fn clear_overlay(&mut self, cx: &mut Context<Self>) {
         self.overlay = None;
         self.query.clear();
         self.highlight = 0;
@@ -306,9 +314,18 @@ impl NavigationOverlay {
         cx.notify();
     }
 
+    fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let previous_focus = self.previous_focus_handle.take();
+        self.clear_overlay(cx);
+        if let Some(previous_focus) = previous_focus {
+            previous_focus.focus(window, cx);
+        }
+    }
+
     pub(crate) fn dismiss(&mut self, cx: &mut Context<Self>) {
         if self.overlay.is_some() {
-            self.close_overlay(cx);
+            self.previous_focus_handle = None;
+            self.clear_overlay(cx);
         }
     }
 
@@ -467,7 +484,7 @@ impl NavigationOverlay {
         }
         let modifiers = event.keystroke.modifiers;
         match event.keystroke.key.as_str() {
-            "escape" => self.close_overlay(cx),
+            "escape" => self.close_overlay(window, cx),
             "up" => self.move_highlight(-1, cx),
             "down" => self.move_highlight(1, cx),
             "p" if modifiers.control => self.move_highlight(-1, cx),
@@ -611,7 +628,7 @@ impl NavigationOverlay {
                                 ..SpawnOptions::default()
                             });
                     }
-                    self.close_overlay(cx);
+                    self.close_overlay(window, cx);
                 }
             }
             None => {}
@@ -630,7 +647,7 @@ impl NavigationOverlay {
                     .write()
                     .expect("session store lock poisoned")
                     .select(id);
-                self.close_overlay(cx);
+                self.close_overlay(window, cx);
             }
             CommandSelection::Action(command) => self.run_palette_command(command, window, cx),
         }
@@ -644,7 +661,7 @@ impl NavigationOverlay {
     ) {
         match command {
             PaletteCommand::Action(id) => {
-                self.close_overlay(cx);
+                self.close_overlay(window, cx);
                 window.dispatch_action(id.action(), cx);
             }
             PaletteCommand::SpawnAgent { agent, cwd, host } => {
@@ -671,7 +688,7 @@ impl NavigationOverlay {
                     }
                     store.spawn_kind(agent, options);
                 }
-                self.close_overlay(cx);
+                self.close_overlay(window, cx);
             }
             PaletteCommand::MigrateSelected { target_host } => {
                 {
@@ -680,14 +697,14 @@ impl NavigationOverlay {
                         store.migrate_session(id, target_host);
                     }
                 }
-                self.close_overlay(cx);
+                self.close_overlay(window, cx);
             }
             PaletteCommand::SyncPrefs { host } => {
                 self.store
                     .write()
                     .expect("session store lock poisoned")
                     .sync_prefs(host);
-                self.close_overlay(cx);
+                self.close_overlay(window, cx);
             }
         }
     }
@@ -796,15 +813,15 @@ impl NavigationOverlay {
                     .bg(rgba(0x00000040))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.close_overlay(cx);
+                        cx.listener(|this, _, window, cx| {
+                            this.close_overlay(window, cx);
                         }),
                     ),
             )
             .child(
                 div()
-                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                        this.close_overlay(cx);
+                    .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                        this.close_overlay(window, cx);
                     }))
                     .child(surface),
             )
@@ -1162,7 +1179,7 @@ impl NavigationOverlay {
                     cx.notify();
                 }
             }))
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_click(cx.listener(move |this, _, window, cx| {
                 let cwd = path.to_string_lossy().into_owned();
                 this.store
                     .write()
@@ -1171,7 +1188,7 @@ impl NavigationOverlay {
                         cwd: Some(cwd.clone()),
                         ..SpawnOptions::default()
                     });
-                this.close_overlay(cx);
+                this.close_overlay(window, cx);
             }));
         row.into_any_element()
     }
@@ -1508,6 +1525,24 @@ mod tests {
     use gpui::HeadlessAppContext;
     use gpui::{Entity, ScrollDelta, ScrollWheelEvent, TestAppContext, point};
 
+    struct OverlayFocusHarness {
+        previous_focus: FocusHandle,
+        overlay: Entity<NavigationOverlay>,
+    }
+
+    impl Render for OverlayFocusHarness {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(
+                    div()
+                        .id("previous-focus-surface")
+                        .track_focus(&self.previous_focus),
+                )
+                .child(crate::root::cached_window_overlay(self.overlay.clone()))
+        }
+    }
+
     /// Mounted only by the screenshot fixture, which is macOS-only.
     #[cfg(target_os = "macos")]
     struct CommandPalettePreviewHarness {
@@ -1636,6 +1671,51 @@ mod tests {
                 overlay.highlighted_command(),
                 Some(CommandSelection::Session(_))
             ));
+        });
+    }
+
+    #[gpui::test]
+    fn opening_command_palette_claims_input_from_the_previous_surface(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let runtime_for_view = Arc::clone(&runtime);
+        let (view, cx) = cx.add_window_view(move |window, cx| {
+            let previous_focus = cx.focus_handle();
+            previous_focus.focus(window, cx);
+            let overlay = cx.new(|cx| {
+                let mut overlay = NavigationOverlay::opened_for_test(runtime_for_view, cx);
+                overlay.clear_overlay(cx);
+                overlay
+            });
+            OverlayFocusHarness {
+                previous_focus,
+                overlay,
+            }
+        });
+        let overlay = view.read_with(cx, |view, _| view.overlay.clone());
+
+        overlay.update_in(cx, |overlay, window, cx| {
+            overlay.open_overlay(Overlay::CommandPalette, window, cx);
+        });
+        cx.simulate_keystrokes("x");
+
+        overlay.read_with(cx, |overlay, _| {
+            assert_eq!(
+                overlay.query.text(),
+                "x",
+                "the first palette keystroke must not remain trapped in the previous surface"
+            );
+        });
+
+        cx.simulate_keystrokes("escape");
+        assert!(
+            !overlay.read_with(cx, |overlay, _| overlay.is_open()),
+            "the first Escape should close the command palette"
+        );
+        view.update_in(cx, |view, window, _| {
+            assert!(
+                view.previous_focus.is_focused(window),
+                "closing the palette should return keyboard input to its previous surface"
+            );
         });
     }
 
