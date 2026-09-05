@@ -5,22 +5,30 @@ struct SessionDetailView: View {
     let sessionID: String
 
     @Environment(AppModel.self) private var model
+    @Environment(\.scenePhase) private var scenePhase
     @State private var screen: DiriClient.Screen?
     @State private var draft = ""
     @State private var wrapped = true
     @State private var busy = false
     @State private var error: String?
+    @State private var screenError: String?
+    @State private var showingChanges = false
+    @State private var followOutput = true
     @FocusState private var composerFocused: Bool
 
     /// The screen is polled rather than streamed. `read_screen` is a cheap
     /// snapshot of the grid, and a snapshot cannot drift the way an applied
     /// delta can when a phone sleeps mid-stream.
-    private let pollInterval: Duration = .milliseconds(1100)
+    private let pollInterval: Duration = .milliseconds(500)
 
     private var session: SessionRecord? { model.session(sessionID) }
 
     var body: some View {
         VStack(spacing: 0) {
+            if screen == nil && screenError == nil { ProgressView("Loading session…").padding() }
+            if let screenError {
+                Text("Reconnecting… \(screenError)").font(.caption).foregroundStyle(.orange).padding(8)
+            }
             terminal
             if let detail = session?.needsInput, session?.attention == .needsInput {
                 NeedsInputBanner(detail: detail)
@@ -37,6 +45,8 @@ struct SessionDetailView: View {
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
+                    Button { showingChanges = true } label: { Label("Review changes", systemImage: "doc.text.magnifyingglass") }
+                    Toggle("Follow output", isOn: $followOutput)
                     Button {
                         wrapped.toggle()
                     } label: {
@@ -52,10 +62,12 @@ struct SessionDetailView: View {
                 }
             }
         }
-        .task(id: sessionID) {
+        .task(id: "\(sessionID)-\(scenePhase == .active)") {
+            guard scenePhase == .active else { return }
             await model.markSeen(sessionID)
             await poll()
         }
+        .sheet(isPresented: $showingChanges) { SessionChangesView(sessionID: sessionID) }
         .alert("Couldn't send", isPresented: .init(
             get: { error != nil }, set: { if !$0 { error = nil } }
         )) {
@@ -81,8 +93,7 @@ struct SessionDetailView: View {
                     .id(Anchor.bottom)
             }
             .onChange(of: screen?.text) { _, _ in
-                // Only follow the tail; a reader who scrolled up is reading.
-                withAnimation(.none) { proxy.scrollTo(Anchor.bottom, anchor: .bottom) }
+                if followOutput { proxy.scrollTo(Anchor.bottom, anchor: .bottom) }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -95,13 +106,17 @@ struct SessionDetailView: View {
     private var composer: some View {
         VStack(spacing: 8) {
             KeyRowView { key in
+                guard !busy else { return }
+                busy = true
                 Task {
                     do { try await model.send(key, to: sessionID) } catch {
                         self.error = error.localizedDescription
                     }
+                    busy = false
                     await refreshSoon()
                 }
             }
+            .disabled(busy || screenError != nil || screen == nil)
 
             HStack(alignment: .bottom, spacing: 8) {
                 TextField("Message…", text: $draft, axis: .vertical)
@@ -126,7 +141,7 @@ struct SessionDetailView: View {
                         .frame(width: 40, height: 40)
                         .background(Circle().fill(Tokens.Ink.clay))
                 }
-                .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || busy)
+                .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || busy || screenError != nil || screen == nil)
                 .opacity(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? 0.35 : 1)
                 .accessibilityLabel("Send")
             }
@@ -142,16 +157,14 @@ struct SessionDetailView: View {
 
     private func submit() {
         let text = draft
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        draft = ""
+        guard !busy, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         busy = true
         Task {
             do {
                 try await model.send(text, to: sessionID)
+                if draft == text { draft = "" }
             } catch {
-                // Never silently eat a prompt: put it back so it can be resent.
-                draft = text
-                self.error = error.localizedDescription
+                self.error = "\(error.localizedDescription) Your draft is saved. Check the session before resending; delivery may have succeeded."
             }
             busy = false
             await refreshSoon()
@@ -162,16 +175,26 @@ struct SessionDetailView: View {
 
     private func poll() async {
         while !Task.isCancelled {
-            if let fetched = await model.screen(for: sessionID) {
-                screen = fetched
-            }
+            await fetchScreen()
             try? await Task.sleep(for: pollInterval)
         }
     }
 
     private func refreshSoon() async {
         try? await Task.sleep(for: .milliseconds(150))
-        if let fetched = await model.screen(for: sessionID) { screen = fetched }
+        await fetchScreen()
+    }
+
+    private func fetchScreen() async {
+        do {
+            let fetched = try await model.screen(for: sessionID)
+            try Task.checkCancellation()
+            screen = fetched
+            screenError = nil
+        } catch {
+            guard !Task.isCancelled else { return }
+            screenError = error.localizedDescription
+        }
     }
 
     private func title(_ session: SessionRecord) -> String {

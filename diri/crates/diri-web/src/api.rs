@@ -39,7 +39,30 @@ impl Api {
         match (request.method.as_str(), segments.as_slice()) {
             ("GET" | "HEAD", ["api", "health"]) => self.health().await,
             ("GET", ["api", "sessions"]) => self.sessions().await,
-            ("GET", ["api", "agents"]) => self.agents().await,
+            ("GET", ["api", "agents"]) => self.agents(request).await,
+            ("GET", ["api", "hosts"]) => match self
+                .client
+                .request::<()>(diri_proto::Method::HOST_LIST, None, Some(CALL_TIMEOUT))
+                .await
+            {
+                Ok(value) => Response::json(&value),
+                Err(error) => daemon_error(&error),
+            },
+            ("GET", ["api", "directories"]) => match self
+                .client
+                .list_directories(
+                    request.query.get("host").cloned(),
+                    request
+                        .query
+                        .get("path")
+                        .cloned()
+                        .unwrap_or_else(|| "~".into()),
+                )
+                .await
+            {
+                Ok(value) => Response::json(&serde_json::to_value(value).unwrap_or(Value::Null)),
+                Err(error) => daemon_error(&error),
+            },
             ("POST", ["api", "spawn"]) => self.spawn(request).await,
 
             ("GET", ["api", "session", id, "screen"]) => self.screen(id).await,
@@ -85,13 +108,13 @@ impl Api {
         }
     }
 
-    async fn agents(&self) -> Response {
+    async fn agents(&self, request: &Request) -> Response {
         // This frontend always serves the daemon it is attached to, so the
         // catalog is this host's. `force_refresh` stays false: the phone asks
         // on every sheet open, and re-probing PATH each time would make the
         // picker slow for a list that changes about once a month.
         let params = diri_proto::AgentReadinessParams {
-            host: None,
+            host: request.query.get("host").cloned(),
             force_refresh: false,
         };
         match self.client.agent_readiness(params).await {
@@ -174,7 +197,7 @@ impl Api {
         let body = request.json();
         let cols = body.get("cols").and_then(Value::as_i64).unwrap_or(0);
         let rows = body.get("rows").and_then(Value::as_i64).unwrap_or(0);
-        if cols < 20 || rows < 8 {
+        if !(20..=500).contains(&cols) || !(8..=300).contains(&rows) {
             return Response::error(400, "implausible terminal size");
         }
         match self.client.resize(&session_id(id), cols, rows).await {
@@ -216,6 +239,7 @@ impl Api {
             kind: AgentKind::new(kind),
             cwd: cwd.to_string(),
             new_worktree: body.get("worktree").and_then(Value::as_bool),
+            worktree_base: body.get("base").and_then(Value::as_str).map(str::to_owned),
             worktree_branch: body
                 .get("branch")
                 .and_then(Value::as_str)
@@ -242,7 +266,8 @@ impl Api {
             .request(
                 diri_proto::Method::SESSION_SPAWN,
                 Some(&params),
-                Some(CALL_TIMEOUT),
+                // Outlast the Engine's 180s first-prompt readiness window.
+                Some(Duration::from_secs(300)),
             )
             .await
         {
@@ -303,6 +328,128 @@ fn key_sequence(name: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn phone_routes_preserve_engine_host_and_workspace_semantics() {
+        use diri_proto::{ControlMessage, Method};
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = temp.path().join("engine.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (calls_tx, mut calls_rx) = tokio::sync::mpsc::channel(16);
+        let engine = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let ControlMessage::Request { id, method, params } =
+                    serde_json::from_str(&line).unwrap()
+                else {
+                    continue;
+                };
+                let result = if method == Method::HELLO {
+                    json!({"proto": diri_proto::WIRE_VERSION, "build":"test", "pid":1, "engineKind":diri_proto::RUST_ENGINE_KIND})
+                } else {
+                    calls_tx
+                        .send((method.clone(), params.clone()))
+                        .await
+                        .unwrap();
+                    match method.as_str() {
+                        Method::HOST_LIST => {
+                            json!({"hosts":[{"id":"remote-a","name":"Remote","defaultCwd":"/repo"}]})
+                        }
+                        Method::AGENT_READINESS => json!({"agents":[]}),
+                        Method::HOST_LIST_DIRECTORIES => {
+                            json!({"path":"/repo", "entries":[], "truncated":false})
+                        }
+                        Method::SESSION_SPAWN => params.unwrap(),
+                        _ => json!({}),
+                    }
+                };
+                let mut bytes = serde_json::to_vec(&ControlMessage::Response {
+                    id,
+                    result: Ok(result),
+                })
+                .unwrap();
+                bytes.push(b'\n');
+                writer.write_all(&bytes).await.unwrap();
+            }
+        });
+        let client = Arc::new(DaemonClient::with_socket_path(socket));
+        client.connect();
+        client
+            .wait_until_connected(Duration::from_secs(2))
+            .await
+            .unwrap();
+        let api = Api {
+            client,
+            auth: Auth::temporary().unwrap(),
+            host_label: "Mac".into(),
+        };
+        for (path, method, body, expected) in [
+            ("/api/hosts", "GET", "", Method::HOST_LIST),
+            (
+                "/api/agents?host=remote-a",
+                "GET",
+                "",
+                Method::AGENT_READINESS,
+            ),
+            (
+                "/api/directories?host=remote-a&path=%2Frepo%20name",
+                "GET",
+                "",
+                Method::HOST_LIST_DIRECTORIES,
+            ),
+            (
+                "/api/spawn",
+                "POST",
+                r#"{"kind":"shell","cwd":"/repo","host":"remote-a","worktree":true,"base":"main","branch":"phone/fix"}"#,
+                Method::SESSION_SPAWN,
+            ),
+        ] {
+            let raw = format!(
+                "{method} {path} HTTP/1.1\r\nHost: test\r\nX-Diri-Token: {}\r\nContent-Length: {}\r\n\r\n{body}",
+                api.auth.token(),
+                body.len()
+            );
+            let request = crate::http::read_request(&mut BufReader::new(raw.as_bytes()))
+                .await
+                .unwrap()
+                .unwrap();
+            let response = api.route(&request).await;
+            assert_eq!(response.status, 200, "{path}");
+            let (method, params) = calls_rx.recv().await.unwrap();
+            assert_eq!(method, expected);
+            if expected != Method::HOST_LIST {
+                assert_eq!(params.as_ref().unwrap()["host"], "remote-a");
+            }
+            if expected == Method::HOST_LIST_DIRECTORIES {
+                assert_eq!(params.unwrap()["path"], "/repo name");
+            }
+            if expected == Method::SESSION_SPAWN {
+                let result: SessionSpawnParams = serde_json::from_slice(&response.body).unwrap();
+                assert_eq!(result.worktree_base.as_deref(), Some("main"));
+                assert_eq!(result.worktree_branch.as_deref(), Some("phone/fix"));
+                assert_eq!(result.new_worktree, Some(true));
+            }
+        }
+        for path in [
+            "/api/hosts",
+            "/api/directories",
+            "/api/agents",
+            "/api/spawn",
+        ] {
+            let raw = format!("POST {path} HTTP/1.1\r\nHost: test\r\n\r\n");
+            let request = crate::http::read_request(&mut BufReader::new(raw.as_bytes()))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(api.route(&request).await.status, 401);
+        }
+        assert!(calls_rx.try_recv().is_err());
+        api.client.begin_shutdown();
+        engine.abort();
+    }
 
     #[test]
     fn every_key_the_frontend_offers_has_a_sequence() {

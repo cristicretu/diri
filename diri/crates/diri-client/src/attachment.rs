@@ -512,6 +512,7 @@ mod tests {
             cwd: scratch.path().to_string_lossy().into_owned(),
             new_worktree: None,
             worktree_branch: None,
+            worktree_base: None,
             title: Some(scratch_title()),
             initial_prompt: None,
             parent: None,

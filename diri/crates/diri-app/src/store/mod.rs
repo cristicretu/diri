@@ -1439,7 +1439,7 @@ impl SessionStore {
         self.focus_session(id);
     }
 
-    fn apply_spawn_result(&mut self, id: SessionId) {
+    pub(crate) fn apply_spawn_result(&mut self, id: SessionId) {
         // session.updated and the spawn response travel on separate channels,
         // so either can arrive first. focus_session handles both orderings:
         // if the record is already present it grants terminal residency now;
@@ -2005,6 +2005,7 @@ impl SessionStore {
             cwd: session.cwd.clone(),
             new_worktree: None,
             worktree_branch: None,
+            worktree_base: None,
             title: Some(AUXILIARY_TERMINAL_TITLE.to_owned()),
             initial_prompt: None,
             parent: Some(parent),
@@ -2044,6 +2045,7 @@ impl SessionStore {
             cwd,
             new_worktree,
             worktree_branch,
+            worktree_base: None,
             title: options.title,
             initial_prompt: options.initial_prompt,
             parent: options.parent,

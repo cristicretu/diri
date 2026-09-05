@@ -1122,6 +1122,7 @@ mod tests {
                     cwd: scratch.to_string_lossy().into_owned(),
                     new_worktree: None,
                     worktree_branch: None,
+                    worktree_base: None,
                     title: Some("diri-client integration scratch".to_owned()),
                     initial_prompt: None,
                     parent: None,

@@ -42,6 +42,7 @@ impl Method {
     pub const HOST_LOCATE_REPO: &'static str = "host.locate_repo";
     pub const HOST_INITIALIZE: &'static str = "host.initialize";
     pub const HOST_LIST_DIRECTORIES: &'static str = "host.list_directories";
+    pub const HOST_LIST: &'static str = "host.list";
     pub const SESSION_HISTORY: &'static str = "session.history";
     pub const ACTIVITY_LIST: &'static str = "activity.list";
     pub const SESSION_RESUME_FROM_HISTORY: &'static str = "session.resume_from_history";
@@ -371,6 +372,9 @@ pub struct SessionSpawnParams {
     pub new_worktree: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree_branch: Option<String>,
+    /// Explicit starting ref for a new worktree. Absent preserves HEAD semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_base: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

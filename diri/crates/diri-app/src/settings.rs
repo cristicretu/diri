@@ -47,19 +47,23 @@ pub enum SettingsTab {
     Accounts,
     Shortcuts,
     Terminal,
+    Usage,
     Resources,
     Remote,
+    Phone,
 }
 
 impl SettingsTab {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
         Self::General,
         Self::Agents,
         Self::Accounts,
         Self::Shortcuts,
         Self::Terminal,
+        Self::Usage,
         Self::Resources,
         Self::Remote,
+        Self::Phone,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -69,8 +73,10 @@ impl SettingsTab {
             Self::Accounts => "Accounts",
             Self::Shortcuts => "Shortcuts",
             Self::Terminal => "Appearance",
+            Self::Usage => "Usage",
             Self::Resources => "Resources",
             Self::Remote => "Remote",
+            Self::Phone => "Phone access",
         }
     }
 
@@ -81,8 +87,10 @@ impl SettingsTab {
             Self::Accounts => "Profiles for work and personal accounts",
             Self::Shortcuts => "Keyboard commands and bindings",
             Self::Terminal => "Themes and terminal type",
+            Self::Usage => "Costs, tokens, and cache savings",
             Self::Resources => "Idle sessions and memory",
             Self::Remote => "SSH execution hosts",
+            Self::Phone => "Code from your iPhone",
         }
     }
 
@@ -90,10 +98,13 @@ impl SettingsTab {
     /// describe the machines and resources sessions run on.
     pub const fn section(self) -> SettingsSection {
         match self {
-            Self::General | Self::Agents | Self::Accounts | Self::Shortcuts | Self::Terminal => {
-                SettingsSection::Personal
-            }
-            Self::Resources | Self::Remote => SettingsSection::System,
+            Self::General
+            | Self::Agents
+            | Self::Accounts
+            | Self::Shortcuts
+            | Self::Terminal
+            | Self::Usage => SettingsSection::Personal,
+            Self::Resources | Self::Remote | Self::Phone => SettingsSection::System,
         }
     }
 
@@ -104,8 +115,10 @@ impl SettingsTab {
             Self::Accounts => "account.circle",
             Self::Shortcuts => "keyboard",
             Self::Terminal => "terminal",
+            Self::Usage => "chart.bar.xaxis",
             Self::Resources => "server.rack",
             Self::Remote => "network",
+            Self::Phone => "iphone",
         }
     }
 }

@@ -468,7 +468,14 @@ impl RootView {
         let mut snapshots = services.store.snapshots();
         let mut usage = services.usage_tx.subscribe();
         let mut updates = services.updates.subscribe();
-        sidebar.update(cx, |sidebar, cx| sidebar.set_usage(*usage.borrow(), cx));
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_usage(usage.borrow().clone(), cx)
+        });
+        if let Some(surfaces) = &utility_surfaces {
+            surfaces.update(cx, |surfaces, cx| {
+                surfaces.set_usage(usage.borrow().clone(), cx)
+            });
+        }
         // Seed the current state: `watch` only wakes on changes, and an
         // unsupported build settles before this view exists.
         let initial_update = services.updates.state();
@@ -563,9 +570,14 @@ impl RootView {
                     }
                     changed = usage.changed() => {
                         if changed.is_err() { break; }
-                        let snapshot = *usage.borrow_and_update();
+                        let snapshot = usage.borrow_and_update().clone();
                         service_sidebar.update(cx, |sidebar, cx| {
-                            sidebar.set_usage(snapshot, cx);
+                            sidebar.set_usage(snapshot.clone(), cx);
+                        });
+                        let _ = this.update(cx, |this, cx| {
+                            if let Some(surfaces) = &this.utility_surfaces {
+                                surfaces.update(cx, |surfaces, cx| surfaces.set_usage(snapshot, cx));
+                            }
                         });
                     }
                     changed = updates.changed() => {

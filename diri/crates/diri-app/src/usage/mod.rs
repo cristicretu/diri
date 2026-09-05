@@ -4,6 +4,7 @@
 //! anywhere and no provider API is queried.
 
 mod cache;
+pub mod dashboard;
 mod fleet;
 mod model;
 mod parser;

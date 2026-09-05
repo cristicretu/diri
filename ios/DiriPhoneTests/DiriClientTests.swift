@@ -33,6 +33,61 @@ final class DiriClientTests: XCTestCase {
         XCTAssertEqual(request.httpMethod, "GET")
     }
 
+    func testPairingRejectsUnsafeOrAmbiguousURLs() {
+        for link in ["file:///tmp?token=t", "ftp://host?token=t", "http://user:pass@host?token=t",
+                     "http://host?token=a&token=b", "http://host?token=t#secret", "http://host"] {
+            XCTAssertNil(DiriClient.Endpoint(enrolmentURL: link), link)
+        }
+        let endpoint = DiriClient.Endpoint(enrolmentURL: " http://100.90.0.2:7380/?token=test \n")
+        XCTAssertEqual(endpoint?.token, "test")
+        XCTAssertEqual(endpoint?.baseURL.absoluteString, "http://100.90.0.2:7380")
+    }
+
+    func testRemoteWorktreeSpawnCarriesHostAndMainExplicitly() async throws {
+        StubProtocol.respond(json: """
+        {"id":"s_9","kind":{"shell":{}},"cwd":"/r-wt","projectID":"p","title":"shell",
+         "host":"remote-a","status":{"starting":{}},"pinned":false,"createdAt":1,"updatedAt":1}
+        """)
+        let record = try await client.spawn(kind: "shell", cwd: "/r", prompt: "build",
+            host: "remote-a", worktree: true, branch: "phone/fix")
+        XCTAssertEqual(record.host, "remote-a")
+        let body = try XCTUnwrap(StubProtocol.lastBody)
+        let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: body) as? [String: Any])
+        XCTAssertEqual(json["host"] as? String, "remote-a")
+        XCTAssertEqual(json["worktree"] as? Bool, true)
+        XCTAssertEqual(json["base"] as? String, "main")
+        XCTAssertEqual(json["branch"] as? String, "phone/fix")
+        XCTAssertEqual(StubProtocol.lastRequest?.timeoutInterval, 330)
+    }
+
+    func testReadinessUsesTheSelectedHostAndIncludesShell() async throws {
+        StubProtocol.respond(json: #"{"agents":[{"kind":"shell","binary":""},{"kind":"codex","binary":"codex","path":"/bin/codex"},{"kind":"claude-code","binary":"claude"}]}"#)
+        let agents = try await client.agents(host: "remote-a")
+        XCTAssertEqual(agents.map(\.kind.id), ["shell", "codex"])
+        XCTAssertEqual(StubProtocol.lastRequest?.url?.query, "host=remote-a")
+    }
+
+    func testDirectoryPathsAreEncodedAsQueryData() async throws {
+        StubProtocol.respond(json: #"{"path":"/repo","entries":[],"truncated":false}"#)
+        _ = try await client.directories(host: "remote-a", path: "/repo & other/#folder")
+        let components = try XCTUnwrap(URLComponents(url: try XCTUnwrap(StubProtocol.lastRequest?.url), resolvingAgainstBaseURL: true))
+        XCTAssertEqual(components.path, "/api/directories")
+        XCTAssertEqual(components.queryItems?.first { $0.name == "path" }?.value, "/repo & other/#folder")
+        XCTAssertEqual(components.queryItems?.first { $0.name == "host" }?.value, "remote-a")
+    }
+
+    func testRemoteProjectRetainsHostIdentity() throws {
+        let project = try JSONDecoder().decode(Project.self, from: Data(#"{"id":"p1","root":"/repo","name":"Project","host":"remote-a"}"#.utf8))
+        XCTAssertEqual(project.host, "remote-a")
+    }
+
+    func testChangesUsesTheSessionEndpoint() async throws {
+        StubProtocol.respond(json: #"{"patch":"+new","repoRoot":"/repo","truncated":false}"#)
+        let diff = try await client.diff(sessionID: "s_1")
+        XCTAssertEqual(diff.patch, "+new")
+        XCTAssertEqual(StubProtocol.lastRequest?.url?.path, "/api/session/s_1/diff")
+    }
+
     func testProjectsAreOptionalForOlderServers() async throws {
         // A `diri-web` that predates the projects field must not break the app.
         StubProtocol.respond(json: #"{"host":"forge","sessions":[]}"#)

@@ -145,6 +145,7 @@ impl Bridge {
             cwd: required_string(arguments, "cwd")?,
             new_worktree: optional_bool(arguments, "worktree"),
             worktree_branch: optional_string(arguments, "branch"),
+            worktree_base: optional_string(arguments, "base"),
             title: optional_string(arguments, "name"),
             initial_prompt: optional_string(arguments, "prompt"),
             parent,

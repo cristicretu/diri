@@ -798,6 +798,7 @@ mod tests {
                 cwd: root,
                 new_worktree: Some(true),
                 worktree_branch: Some(branch),
+                worktree_base: None,
                 title: Some("Review lane".into()),
                 initial_prompt: Some("Review this branch".into()),
                 parent: None,

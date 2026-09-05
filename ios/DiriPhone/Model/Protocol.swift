@@ -46,6 +46,12 @@ struct AgentKind: Codable, Hashable, Sendable {
     }
 
     init(from decoder: Decoder) throws {
+        // Readiness catalogs use compact manifest IDs; session records use
+        // the keyed enum below. Both are authoritative Engine wire shapes.
+        if let id = try? decoder.singleValueContainer().decode(String.self) {
+            self.init(id: id)
+            return
+        }
         let container = try decoder.container(keyedBy: AnyKey.self)
         guard let key = container.allKeys.first else {
             self = .unknown
@@ -281,6 +287,7 @@ struct Project: Codable, Hashable, Sendable {
     var id: String
     var name: String?
     var root: String?
+    var host: String?
 
     var displayName: String {
         name ?? root.map { ($0 as NSString).lastPathComponent } ?? id

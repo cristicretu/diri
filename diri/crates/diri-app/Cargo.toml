@@ -29,6 +29,8 @@ entitlements = "../../assets/diri.entitlements"
 background-app = false
 
 [dependencies]
+diri-web = { path = "../diri-web" }
+qrcode = { version = "0.14", default-features = false }
 diri-client.workspace = true
 diri-proto.workspace = true
 diri-term.workspace = true
@@ -41,6 +43,7 @@ image.workspace = true
 libc = "0.2"
 nucleo-matcher.workspace = true
 notify.workspace = true
+rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

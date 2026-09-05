@@ -59,6 +59,7 @@ pub struct ControlServer {
     governor: std::sync::Arc<Mutex<crate::governor::GovernorConfig>>,
     browser: std::sync::OnceLock<crate::browser::BrowserPool>,
     active_connections: Arc<AtomicUsize>,
+    background_requests: Arc<AtomicUsize>,
     agent_catalog: Arc<Mutex<crate::agent_catalog::AgentCatalogStore>>,
     accounts: Mutex<crate::accounts::AccountStore>,
     session_operations: Mutex<std::collections::HashSet<String>>,
@@ -152,6 +153,7 @@ impl ControlServer {
             governor: std::sync::Arc::new(Mutex::new(crate::governor::GovernorConfig::default())),
             browser: std::sync::OnceLock::new(),
             active_connections: Arc::new(AtomicUsize::new(0)),
+            background_requests: Arc::new(AtomicUsize::new(0)),
             agent_catalog: Arc::new(Mutex::new(agent_catalog)),
             accounts,
             session_operations: Mutex::new(std::collections::HashSet::new()),
@@ -551,26 +553,41 @@ impl ControlServer {
                 })
             }
             ControlMessage::Request { id, method, params }
-                if (method == Method::AGENT_READINESS || method == Method::AGENT_CONFIGURE)
+                if matches!(
+                    method.as_str(),
+                    Method::SESSION_SPAWN
+                        | Method::SESSION_CONTINUE_ACCOUNT
+                        | Method::HOST_INITIALIZE
+                        | Method::HOST_LIST_DIRECTORIES
+                        | Method::SESSION_READ_DIFF
+                ) || ((method == Method::AGENT_READINESS
+                    || method == Method::AGENT_CONFIGURE)
                     && params
                         .as_ref()
                         .and_then(|value| value.get("host"))
                         .and_then(Value::as_str)
-                        .is_some() =>
+                        .is_some()) =>
             {
-                // A remote catalog scan can hold an SSH connection for
-                // minutes, and the app multiplexes every RPC over this one
-                // connection; answering inline would stall spawns, kills, and
-                // list refreshes behind an unreachable host. The scan runs on
-                // its own thread and writes its response when done — clients
-                // match responses by id, and per-target single-flight inside
-                // `agent_catalog` keeps concurrent scans deduplicated. Local
-                // scans stay inline: they are PATH lookups, not connections.
+                // These operations can wait on SSH, Git, or the agent's first
+                // prompt. Keep this connection readable for input, snapshots
+                // and Hello; otherwise even a private client hits its heartbeat
+                // timeout, and cannot answer the prompt that spawn is waiting on.
+                // The cap bounds cold-path threads; no PTY hot path changes.
+                let Some(permit) = BackgroundRequest::acquire(&self.background_requests) else {
+                    return Some(ControlMessage::Response {
+                        id,
+                        result: Err(ControlError::new(
+                            "busy",
+                            "Too many operations are starting. Wait for one to finish and retry.",
+                        )),
+                    });
+                };
                 let server = Arc::clone(self);
                 let writer = Arc::clone(writer);
                 let spawned = std::thread::Builder::new()
-                    .name("dirijord-agent-scan".into())
+                    .name("dirijord-background-request".into())
                     .spawn(move || {
+                        let _permit = permit;
                         let response = ControlMessage::Response {
                             id,
                             result: server.dispatch(&method, params),
@@ -582,7 +599,7 @@ impl ControlServer {
                     Err(error) => Some(ControlMessage::Response {
                         id,
                         result: Err(ControlError::internal(format!(
-                            "could not start the catalog scan: {error}"
+                            "could not start the background request: {error}"
                         ))),
                     }),
                 }
@@ -752,6 +769,12 @@ impl ControlServer {
             Method::HOST_SYNC_PREFS => self.host_sync_prefs(params),
             Method::HOST_INITIALIZE => self.host_initialize(params),
             Method::HOST_LIST_DIRECTORIES => self.host_list_directories(params),
+            Method::HOST_LIST => Ok(
+                json!({"hosts": diri_proto::HostsConfig::load(self.hosts_file())
+                .hosts.iter().map(|host| json!({
+                    "id": host.id, "name": host.display_name(), "defaultCwd": host.default_cwd
+                })).collect::<Vec<_>>() }),
+            ),
             Method::SESSION_MIGRATE => self.session_migrate(params),
             Method::SESSION_REPARENT_WORKTREE => self.session_reparent_worktree(params),
             Method::HOST_LOCATE_REPO => self.host_locate_repo(params),
@@ -852,9 +875,12 @@ impl ControlServer {
         let mut worktree_path = None;
         let mut git_branch = None;
         if p.new_worktree.unwrap_or(false) {
-            let info =
-                crate::git::create_worktree(Path::new(&p.cwd), p.worktree_branch.as_deref(), None)
-                    .map_err(io_control_error)?;
+            let info = crate::git::create_worktree(
+                Path::new(&p.cwd),
+                p.worktree_branch.as_deref(),
+                p.worktree_base.as_deref(),
+            )
+            .map_err(io_control_error)?;
             git_branch.clone_from(&info.branch);
             cwd.clone_from(&info.path);
             worktree_path = Some(info.path);
@@ -1084,11 +1110,6 @@ impl ControlServer {
             .as_deref()
             .ok_or_else(|| ControlError::bad_request("remote host is required"))?;
         let host = self.resolve_host(host_id)?;
-        if p.new_worktree.unwrap_or(false) {
-            return Err(ControlError::bad_request(
-                "remote worktree creation requires the structured workspace RPC",
-            ));
-        }
         if p.same_repo_as.is_some() {
             return Err(ControlError::bad_request(
                 "sameRepoAs requires the structured remote workspace RPC",
@@ -1099,10 +1120,24 @@ impl ControlServer {
         let persistence = manager
             .probe_persistence(&host, &helper)
             .map_err(io_control_error)?;
-        let requested_cwd = if p.cwd.trim().is_empty() {
+        let mut requested_cwd = if p.cwd.trim().is_empty() {
             host.default_cwd.clone().unwrap_or_else(|| "~".into())
         } else {
             p.cwd.clone()
+        };
+        let worktree = if p.new_worktree.unwrap_or(false) {
+            let info = crate::git::create_worktree_remote(
+                &manager,
+                &host,
+                &requested_cwd,
+                p.worktree_branch.as_deref(),
+                p.worktree_base.as_deref(),
+            )
+            .map_err(io_control_error)?;
+            requested_cwd.clone_from(&info.path);
+            Some(info)
+        } else {
+            None
         };
         let kind = p.kind.id().to_string();
         let (mut descriptor, engine) = {
@@ -1243,6 +1278,10 @@ impl ControlServer {
         record.host = Some(host.id.clone());
         record.project_id = crate::registry::session_project_id(&captured.cwd, Some(&host.id));
         record.remote_persistence = Some(persistence);
+        if let Some(info) = worktree {
+            record.worktree_path = Some(info.path);
+            record.git_branch = info.branch;
+        }
         record.parent = p.parent.clone();
         record.agent_session_id = agent_session_id;
         if let Some(title) = &p.title {
@@ -3154,6 +3193,25 @@ impl Drop for SubscriptionHandle {
     }
 }
 
+struct BackgroundRequest(Arc<AtomicUsize>);
+
+impl BackgroundRequest {
+    fn acquire(counter: &Arc<AtomicUsize>) -> Option<Self> {
+        counter
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < 32).then_some(active + 1)
+            })
+            .ok()?;
+        Some(Self(Arc::clone(counter)))
+    }
+}
+
+impl Drop for BackgroundRequest {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
 struct ActiveConnectionGuard {
     connections: Arc<AtomicUsize>,
 }
@@ -3704,6 +3762,18 @@ const MAX_PROBE_CHARS: usize = 20;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_request_capacity_is_bounded_and_released() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let permits: Vec<_> = (0..32)
+            .map(|_| BackgroundRequest::acquire(&counter).unwrap())
+            .collect();
+        assert!(BackgroundRequest::acquire(&counter).is_none());
+        drop(permits);
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+        assert!(BackgroundRequest::acquire(&counter).is_some());
+    }
     use crate::detect::ManifestEngine;
 
     fn engine() -> Arc<ManifestEngine> {
@@ -3824,7 +3894,19 @@ mod tests {
             params,
         };
         let line = serde_json::to_vec(&request).expect("encode");
-        handle(server, &line).expect("a request gets a response")
+        let (writer, peer) = UnixStream::pair().expect("socketpair");
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        if let Some(response) = server.handle_line(&line, &Arc::new(Mutex::new(writer)), &mut None)
+        {
+            return response;
+        }
+        // Slow RPCs now respond on the socket instead of blocking handle_line.
+        let mut response = String::new();
+        BufReader::new(peer)
+            .read_line(&mut response)
+            .expect("background response");
+        serde_json::from_str(&response).expect("a request gets a response")
     }
 
     fn ok_of(message: ControlMessage) -> JsonValue {
