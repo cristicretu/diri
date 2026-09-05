@@ -199,6 +199,16 @@ impl SemanticColors {
         }
     }
 
+    /// Hairline separating persistent sidebar material from the work surface.
+    /// It follows the active theme's foreground hue and stays quieter than a
+    /// floating menu outline because the panel already has tonal separation.
+    pub const fn sidebar_stroke(self) -> Rgba {
+        match self.appearance {
+            Appearance::Dark => rgba_f32(self.primary.r, self.primary.g, self.primary.b, 0.075),
+            Appearance::Light => rgba_f32(self.primary.r, self.primary.g, self.primary.b, 0.095),
+        }
+    }
+
     /// Denser material for transient UI layered over live content.
     ///
     /// Menus, popovers, and dialogs need stronger separation than persistent
@@ -408,6 +418,15 @@ mod tests {
             let colors = SemanticColors::new(appearance);
             assert!(colors.floating_surface().a > colors.sidebar_surface().a);
             assert_eq!(colors.floating_surface().a, 1.0);
+        }
+    }
+
+    #[test]
+    fn sidebar_stroke_is_theme_tinted_and_quieter_than_floating_chrome() {
+        for appearance in [Appearance::Light, Appearance::Dark] {
+            let colors = SemanticColors::new(appearance);
+            assert_eq!(colors.sidebar_stroke().r, colors.primary.r);
+            assert!(colors.sidebar_stroke().a < colors.floating_stroke().a);
         }
     }
 

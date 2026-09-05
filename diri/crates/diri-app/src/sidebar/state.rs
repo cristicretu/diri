@@ -70,6 +70,7 @@ pub enum Popover {
         host: Option<String>,
     },
     Account,
+    SidebarLayout,
     ProjectActions {
         id: ProjectId,
         /// Window position of a right-click; `None` anchors below the header
@@ -90,6 +91,8 @@ pub struct SidebarUiState {
     pub hovered_session: Option<SessionId>,
     pub hovered_control: Option<&'static str>,
     pub popover: Option<Popover>,
+    /// Keyboard cursor within the compact grouping/ordering menu.
+    pub layout_menu_index: usize,
     pub renaming: Option<SessionId>,
     pub rename_draft: QueryEditor,
     /// Session whose hover card is showing, plus the pointer's window y at
@@ -127,6 +130,7 @@ impl SidebarUiState {
             hovered_session: None,
             hovered_control: None,
             popover: None,
+            layout_menu_index: 0,
             renaming: None,
             rename_draft: QueryEditor::default(),
             hover_card: None,

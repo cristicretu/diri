@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use diri_proto::{Project, ProjectId, SessionId, SessionRecord};
 
-use super::{Prefs, is_auxiliary_terminal};
+use super::{Prefs, SidebarOrdering, is_auxiliary_terminal};
 
 /// Rank given to an item the manual order has never seen. Reconciliation
 /// normally appends every live id (see [`super::SessionStore::reconcile_sidebar_order`]),
@@ -120,6 +120,10 @@ pub(super) fn build_projection(
             .iter()
             .map(|session| session.created_at.0)
             .fold(f64::INFINITY, f64::min);
+        let recent_activity = group
+            .iter()
+            .map(|session| session.updated_at.0)
+            .fold(f64::NEG_INFINITY, f64::max);
         let (mut archived, active): (Vec<_>, Vec<_>) =
             group.into_iter().partition(|session| session.is_archived());
         // Most recently archived first: the bucket is a recovery surface, and
@@ -138,9 +142,11 @@ pub(super) fn build_projection(
             &pinned_sessions,
             &collapsed_sessions,
             expanded,
+            prefs.sidebar_ordering,
         );
         ranked.push((
             arrival,
+            recent_activity,
             SidebarProject {
                 pinned: pinned_projects.contains(&project.id),
                 project,
@@ -152,21 +158,26 @@ pub(super) fn build_projection(
         ));
     }
 
-    ranked.sort_by(|(left_arrival, left), (right_arrival, right)| {
-        // Pinned projects lead, then the manual order, then arrival. The last
-        // two agree by construction, so a project keeps its place whether or
-        // not the manual order has been materialised yet.
-        right
-            .pinned
-            .cmp(&left.pinned)
-            .then_with(|| {
-                rank_of(&project_rank, &left.project.id)
+    ranked.sort_by(
+        |(left_arrival, left_activity, left), (right_arrival, right_activity, right)| {
+            // Pinned projects lead, then the manual order, then arrival. The last
+            // two agree by construction, so a project keeps its place whether or
+            // not the manual order has been materialised yet.
+            let pinned = right.pinned.cmp(&left.pinned);
+            if pinned != Ordering::Equal {
+                return pinned;
+            }
+            match prefs.sidebar_ordering {
+                SidebarOrdering::Custom => rank_of(&project_rank, &left.project.id)
                     .cmp(&rank_of(&project_rank, &right.project.id))
-            })
-            .then_with(|| left_arrival.total_cmp(right_arrival))
+                    .then_with(|| left_arrival.total_cmp(right_arrival)),
+                SidebarOrdering::NewestFirst => right_activity.total_cmp(left_activity),
+                SidebarOrdering::OldestFirst => left_activity.total_cmp(right_activity),
+            }
             .then_with(|| left.project.id.0.cmp(&right.project.id.0))
-    });
-    let result: Vec<SidebarProject> = ranked.into_iter().map(|(_, group)| group).collect();
+        },
+    );
+    let result: Vec<SidebarProject> = ranked.into_iter().map(|(_, _, group)| group).collect();
 
     let display_order = result
         .iter()
@@ -210,6 +221,7 @@ fn build_tree(
     pinned: &HashSet<&SessionId>,
     collapsed: &HashSet<&SessionId>,
     project_expanded: bool,
+    ordering: SidebarOrdering,
 ) -> (Vec<SidebarRow>, Vec<Arc<SessionRecord>>) {
     let parents = resolve_parents(&active);
     let mut children: Vec<Vec<usize>> = vec![Vec::new(); active.len()];
@@ -222,7 +234,13 @@ fn build_tree(
     }
 
     let order = |left: &usize, right: &usize| {
-        sibling_cmp(&active[*left], &active[*right], session_rank, pinned)
+        sibling_cmp(
+            &active[*left],
+            &active[*right],
+            session_rank,
+            pinned,
+            ordering,
+        )
     };
     roots.sort_by(order);
     for list in &mut children {
@@ -313,13 +331,28 @@ fn sibling_cmp(
     right: &SessionRecord,
     ranks: &HashMap<&SessionId, usize>,
     pinned: &HashSet<&SessionId>,
+    ordering: SidebarOrdering,
 ) -> Ordering {
-    pinned
-        .contains(&right.id)
-        .cmp(&pinned.contains(&left.id))
-        .then_with(|| rank_of(ranks, &left.id).cmp(&rank_of(ranks, &right.id)))
-        .then_with(|| left.created_at.0.total_cmp(&right.created_at.0))
-        .then_with(|| left.id.0.cmp(&right.id.0))
+    let pinned_order = pinned.contains(&right.id).cmp(&pinned.contains(&left.id));
+    if pinned_order != Ordering::Equal {
+        return pinned_order;
+    }
+    match ordering {
+        SidebarOrdering::Custom => rank_of(ranks, &left.id)
+            .cmp(&rank_of(ranks, &right.id))
+            .then_with(|| left.created_at.0.total_cmp(&right.created_at.0)),
+        SidebarOrdering::NewestFirst => right
+            .updated_at
+            .0
+            .total_cmp(&left.updated_at.0)
+            .then_with(|| rank_of(ranks, &left.id).cmp(&rank_of(ranks, &right.id))),
+        SidebarOrdering::OldestFirst => left
+            .updated_at
+            .0
+            .total_cmp(&right.updated_at.0)
+            .then_with(|| rank_of(ranks, &left.id).cmp(&rank_of(ranks, &right.id))),
+    }
+    .then_with(|| left.id.0.cmp(&right.id.0))
 }
 
 fn rank_map<T: Eq + std::hash::Hash>(order: &[T]) -> HashMap<&T, usize> {

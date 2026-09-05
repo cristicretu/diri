@@ -15,8 +15,8 @@ use crate::notifications::NotificationSound;
 
 use super::{
     ClickModifiers, ClientStartup, EventEnvelope, InspectorTab, Prefs, SessionStore,
-    SidebarProjection, StoreEffect, StoreEventChange, StoreRuntime, TerminalResidency, WindowMode,
-    WindowPlacement, event_publication_policy,
+    SidebarOrdering, SidebarProjection, StoreEffect, StoreEventChange, StoreRuntime,
+    TerminalResidency, WindowMode, WindowPlacement, event_publication_policy,
 };
 use crate::switcher::{OverviewFilter, OverviewLane, SwitcherKey};
 
@@ -225,6 +225,43 @@ fn projection_keeps_manual_ranks_and_appends_the_rest_in_arrival_order() {
         // belongs at the bottom, not wherever its timestamp happens to sort.
         vec![id("old-ranked"), id("middle"), id("new")]
     );
+}
+
+#[test]
+fn chronological_sidebar_order_uses_recent_activity_without_erasing_custom_ranks() {
+    let mut alpha_old = session("alpha-old", "a", 1.0);
+    alpha_old.updated_at = DateMillis(10.0);
+    let mut alpha_recent = session("alpha-recent", "a", 2.0);
+    alpha_recent.updated_at = DateMillis(40.0);
+    let mut beta = session("beta", "b", 3.0);
+    beta.updated_at = DateMillis(30.0);
+    let custom_session_order = vec![id("alpha-old"), id("alpha-recent"), id("beta")];
+    let prefs = Prefs {
+        sidebar_ordering: SidebarOrdering::NewestFirst,
+        sidebar_session_order: custom_session_order.clone(),
+        ..Prefs::default()
+    };
+    let (mut store, _) = hydrated(
+        vec![alpha_old, alpha_recent, beta],
+        vec![project("a", "Alpha"), project("b", "Beta")],
+        prefs,
+    );
+
+    let newest = store.sidebar_projection();
+    assert_eq!(newest.projects[0].project.id, pid("a"));
+    assert_eq!(rows(&newest, 0), vec![id("alpha-recent"), id("alpha-old")]);
+    assert_eq!(
+        store.preferences().sidebar_session_order,
+        custom_session_order,
+        "choosing a chronological view must preserve the drag order"
+    );
+
+    store
+        .update_preferences(|prefs| prefs.sidebar_ordering = SidebarOrdering::OldestFirst)
+        .expect("headless preferences update");
+    let oldest = store.sidebar_projection();
+    assert_eq!(oldest.projects[0].project.id, pid("b"));
+    assert_eq!(rows(&oldest, 1), vec![id("alpha-old"), id("alpha-recent")]);
 }
 
 /// The reported bug, from both ends: a session and a project created after the
