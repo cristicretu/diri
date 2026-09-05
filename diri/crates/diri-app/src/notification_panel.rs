@@ -12,6 +12,9 @@ impl RootView {
         }
         if self.notification_panel_open {
             self.notification_focus.focus(window, cx);
+        } else if self.split_workbench.read(cx).active_for_selection() {
+            self.split_workbench
+                .update(cx, |splits, cx| splits.focus_selected(window, cx));
         } else if let Some(terminal) = &self.terminal {
             terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
         }
@@ -100,9 +103,17 @@ impl RootView {
         }
         cx.activate(true);
         window.activate_window();
-        if let Some(terminal) = &self.terminal {
+        // Native clicks can arrive before the store-change subscription has
+        // mounted the saved workspace. Transfer attachment ownership first,
+        // then focus the exact pane selected by the notification.
+        self.sync_auxiliary_terminal(window, cx);
+        if self.split_workbench.read(cx).active_for_selection() {
+            self.split_workbench
+                .update(cx, |splits, cx| splits.focus_selected(window, cx));
+        } else if let Some(terminal) = &self.terminal {
             terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
         }
+        self.services.store.publish_local_change();
         cx.notify();
     }
 

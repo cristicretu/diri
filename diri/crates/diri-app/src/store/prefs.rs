@@ -121,6 +121,12 @@ pub struct Prefs {
     /// Fraction of the terminal workbench reserved for the primary pane when
     /// the lower terminal is open.
     pub workbench_primary_fraction: f32,
+    /// Versioned desktop pane layout; sessions remain Engine-owned.
+    #[serde(
+        default,
+        deserialize_with = "crate::split_layout::deserialize_split_layouts"
+    )]
+    pub split_layouts: crate::split_layout::SplitLayouts,
     /// Newline-separated roots, matching the Swift settings text field.
     pub quick_open_roots: String,
     pub sidebar_project_order: Vec<ProjectId>,
@@ -168,6 +174,7 @@ impl Default for Prefs {
             inspector_width: 440.0,
             inspector_tab: InspectorTab::Info,
             workbench_primary_fraction: crate::workbench::DEFAULT_PRIMARY_FRACTION,
+            split_layouts: crate::split_layout::SplitLayouts::default(),
             quick_open_roots: String::new(),
             sidebar_project_order: Vec::new(),
             sidebar_session_order: Vec::new(),
