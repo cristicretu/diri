@@ -31,7 +31,9 @@ use crate::switcher::{
     SessionSwitcherState, SwitcherKey, SwitcherOutcome,
 };
 
-pub use prefs::{InspectorTab, Prefs, WindowMode, WindowPlacement};
+pub use prefs::{
+    InspectorTab, Prefs, SidebarGrouping, SidebarOrdering, WindowMode, WindowPlacement,
+};
 pub use projection::{SidebarProject, SidebarProjection, SidebarRow};
 pub use residency::{ResidencyUpdate, TerminalResidency};
 

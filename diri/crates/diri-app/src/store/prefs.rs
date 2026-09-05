@@ -44,6 +44,28 @@ pub enum InspectorTab {
     Artifacts,
 }
 
+/// How the leading sidebar presents sessions. This is deliberately a view
+/// preference: projects remain attached to every session even when their
+/// headers are hidden by the recency view.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SidebarGrouping {
+    #[default]
+    Project,
+    Recency,
+}
+
+/// Sort policy for sidebar sessions. `Custom` preserves the long-standing
+/// drag order; the chronological choices never overwrite that saved order.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SidebarOrdering {
+    #[default]
+    Custom,
+    NewestFirst,
+    OldestFirst,
+}
+
 /// Preferences intentionally persist the manifest id as a plain string. The
 /// four pre-catalog enum spellings are accepted forever because prefs survive
 /// upgrades; new saves use the canonical manifest ids (for example
@@ -110,6 +132,11 @@ pub struct Prefs {
     /// Whether the leading sidebar was mounted when the app last ran.
     pub sidebar_visible: bool,
     pub sidebar_width: f32,
+    pub sidebar_grouping: SidebarGrouping,
+    pub sidebar_ordering: SidebarOrdering,
+    /// The projectless recency view has one shared archive disclosure rather
+    /// than one disclosure per hidden project header.
+    pub sidebar_recency_archives_expanded: bool,
     /// Whether the trailing workbench inspector is mounted.
     pub inspector_open: bool,
     /// Width of the trailing workbench inspector in points.
@@ -160,6 +187,9 @@ impl Default for Prefs {
             window_placement: None,
             sidebar_visible: false,
             sidebar_width: 248.0,
+            sidebar_grouping: SidebarGrouping::Project,
+            sidebar_ordering: SidebarOrdering::Custom,
+            sidebar_recency_archives_expanded: false,
             inspector_open: false,
             inspector_width: 440.0,
             inspector_tab: InspectorTab::Info,
@@ -280,6 +310,11 @@ impl Prefs {
             self.inspector_width = 440.0;
         }
         self.inspector_width = self.inspector_width.clamp(300.0, 720.0);
+        if self.sidebar_grouping == SidebarGrouping::Recency
+            && self.sidebar_ordering == SidebarOrdering::Custom
+        {
+            self.sidebar_ordering = SidebarOrdering::NewestFirst;
+        }
         if !self.workbench_primary_fraction.is_finite() {
             self.workbench_primary_fraction = crate::workbench::DEFAULT_PRIMARY_FRACTION;
         }
@@ -340,6 +375,8 @@ mod tests {
         let fresh: Prefs = serde_json::from_str("{}").expect("missing preferences use defaults");
         assert!(!fresh.sidebar_visible);
         assert!(!fresh.inspector_open);
+        assert_eq!(fresh.sidebar_grouping, SidebarGrouping::Project);
+        assert_eq!(fresh.sidebar_ordering, SidebarOrdering::Custom);
         for sidebar in [false, true] {
             for inspector in [false, true] {
                 let saved = Prefs {
@@ -353,6 +390,17 @@ mod tests {
                 assert_eq!(restored.inspector_open, inspector);
             }
         }
+
+        let saved = Prefs {
+            sidebar_grouping: SidebarGrouping::Recency,
+            sidebar_ordering: SidebarOrdering::OldestFirst,
+            sidebar_recency_archives_expanded: true,
+            ..Prefs::default()
+        };
+        let restored: Prefs = serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert_eq!(restored.sidebar_grouping, SidebarGrouping::Recency);
+        assert_eq!(restored.sidebar_ordering, SidebarOrdering::OldestFirst);
+        assert!(restored.sidebar_recency_archives_expanded);
     }
 
     #[test]

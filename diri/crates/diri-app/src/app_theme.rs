@@ -21,7 +21,14 @@ pub(crate) fn sidebar_colors(id: &str) -> SemanticColors {
 fn semantic_colors(theme: TermTheme, sidebar_tones: bool) -> SemanticColors {
     // A small foreground tint keeps chrome neutral and legible while making
     // each terminal theme visibly continuous across the whole application.
-    let sidebar_surface = mix(theme.background, theme.foreground, 0.08, 0.92);
+    // Dark themes can carry a little more translucency without losing label
+    // contrast; light themes keep a denser tint so desktop highlights do not
+    // wash the navigation out.
+    let sidebar_alpha = match theme.appearance {
+        ThemeAppearance::Dark => 0.86,
+        ThemeAppearance::Light => 0.90,
+    };
+    let sidebar_surface = mix(theme.background, theme.foreground, 0.08, sidebar_alpha);
     let floating_surface = mix(theme.background, theme.foreground, 0.13, 1.0);
     SemanticColors::themed(
         match theme.appearance {

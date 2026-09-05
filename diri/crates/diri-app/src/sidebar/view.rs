@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use diri_proto::remote_pty::PersistenceCapability;
 use diri_proto::{
@@ -17,7 +17,7 @@ use diri_ui::{
 use gpui::{
     Anchor, Animation, AnimationExt, AnyElement, App, AppContext as _, Bounds, Context,
     CursorStyle, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, FontWeight, Hsla,
-    IntoElement, MouseButton, PathPromptOptions, Pixels, Point, Render, Rgba, ScrollHandle,
+    IntoElement, MouseButton, PathPromptOptions, Pixels, Point, Render, Rgba, Role, ScrollHandle,
     SharedString, Task, Window, anchored, deferred, div, linear_color_stop, linear_gradient, point,
     prelude::*, px,
 };
@@ -32,7 +32,8 @@ use crate::query_editor::{self, ClipboardEdit, Edit};
 use crate::seam::toggle_has_settled;
 use crate::settings::{SettingsNav, SettingsSection, SettingsTab};
 use crate::store::{
-    ClickModifiers, DirectoryListingState, SessionStore, SpawnOptions, StoreEffect, StoreRuntime,
+    ClickModifiers, DirectoryListingState, SessionStore, SidebarGrouping, SidebarOrdering,
+    SpawnOptions, StoreEffect, StoreRuntime,
 };
 use crate::switcher::display_title;
 use crate::updates::{UpdateCommand, UpdatePhase, UpdateState};
@@ -362,6 +363,7 @@ impl Sidebar {
                     });
                 }
                 Ok("account") => sidebar.ui.popover = Some(Popover::Account),
+                Ok("layout") => sidebar.ui.popover = Some(Popover::SidebarLayout),
                 _ => {}
             }
         }
@@ -791,9 +793,29 @@ impl Sidebar {
     fn focus_rows_snapshot(&self) -> (Vec<FocusRow>, Option<SessionId>) {
         let mut store = self.store.write().expect("session store lock poisoned");
         let expanded_archives = store.preferences().sidebar_expanded_archives.clone();
+        let grouping = store.preferences().sidebar_grouping;
+        let ordering = store.preferences().sidebar_ordering;
+        let recency_archives_expanded = store.preferences().sidebar_recency_archives_expanded;
+        let pinned = store
+            .preferences()
+            .sidebar_pinned_sessions
+            .iter()
+            .cloned()
+            .collect();
         let selected = store.selected_session_id().cloned();
         let projection = store.sidebar_projection();
-        (focus_rows(&projection, &expanded_archives), selected)
+        let today = local_day_ordinal(wall_clock_millis()).unwrap_or(0);
+        let rows = match grouping {
+            SidebarGrouping::Project => focus_rows(&projection, &expanded_archives),
+            SidebarGrouping::Recency => recency_focus_rows(
+                &projection,
+                recency_archives_expanded,
+                ordering,
+                &pinned,
+                today,
+            ),
+        };
+        (rows, selected)
     }
 
     fn move_focus_cursor(
@@ -922,6 +944,70 @@ impl Sidebar {
         }
 
         let key = event.keystroke.key.as_str();
+        let modifiers = event.keystroke.modifiers;
+        if self.ui.popover == Some(Popover::SidebarLayout)
+            && !modifiers.platform
+            && !modifiers.control
+            && !modifiers.alt
+        {
+            let handled = match key {
+                "up" => {
+                    self.move_layout_menu_cursor(-1);
+                    true
+                }
+                "down" => {
+                    self.move_layout_menu_cursor(1);
+                    true
+                }
+                "home" => {
+                    self.ui.layout_menu_index = 0;
+                    true
+                }
+                "end" => {
+                    self.ui.layout_menu_index = self.layout_menu_item_count().saturating_sub(1);
+                    true
+                }
+                "enter" | "space" => {
+                    self.activate_layout_menu_cursor();
+                    true
+                }
+                "p" => {
+                    self.set_sidebar_grouping(SidebarGrouping::Project);
+                    true
+                }
+                "r" => {
+                    self.set_sidebar_grouping(SidebarGrouping::Recency);
+                    true
+                }
+                "c" => {
+                    let project_grouped = self
+                        .store
+                        .read()
+                        .expect("session store lock poisoned")
+                        .preferences()
+                        .sidebar_grouping
+                        == SidebarGrouping::Project;
+                    if project_grouped {
+                        self.set_sidebar_ordering(SidebarOrdering::Custom);
+                    }
+                    project_grouped
+                }
+                "n" => {
+                    self.set_sidebar_ordering(SidebarOrdering::NewestFirst);
+                    true
+                }
+                "o" => {
+                    self.set_sidebar_ordering(SidebarOrdering::OldestFirst);
+                    true
+                }
+                _ => false,
+            };
+            if handled {
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+        }
         if key == "escape" && self.cancel_delegation(cx) {
             cx.stop_propagation();
             return;
@@ -934,7 +1020,6 @@ impl Sidebar {
             cx.notify();
             return;
         }
-        let modifiers = event.keystroke.modifiers;
         if modifiers.platform || modifiers.control || modifiers.alt {
             return;
         }
@@ -946,6 +1031,11 @@ impl Sidebar {
             "left" => self.move_focus_horizontally(false, window, cx),
             "right" => self.move_focus_horizontally(true, window, cx),
             "enter" => self.activate_focus_cursor(cx),
+            "g" => {
+                self.open_sidebar_layout_popover();
+                cx.notify();
+                true
+            }
             // Deliberately consumed but unbound. Hold-to-peek owns Space in
             // the follow-up issue, and activation must remain Enter-only.
             "space" => true,
@@ -1078,12 +1168,15 @@ impl Sidebar {
         let in_settings = self.settings_nav.is_some();
         let primary_control = if in_settings { "settings" } else { "search" };
         let primary_hover = self.ui.hovered_control == Some(primary_control);
+        let layout_open = self.ui.popover == Some(Popover::SidebarLayout);
+        let layout_hover = self.ui.hovered_control == Some("sidebar-layout") || layout_open;
         let toggle_hover = self.ui.hovered_control == Some("sidebar-toggle");
         // Search and Settings back share one fixed slot. Settings itself lives
         // in the account menu, keeping the everyday chrome to two controls.
         let primary_button = if in_settings {
             icon_button(
                 "close-settings",
+                "Back to sessions",
                 "chevron.left",
                 primary_hover,
                 colors,
@@ -1099,6 +1192,7 @@ impl Sidebar {
         } else {
             icon_button(
                 "sidebar-search",
+                "Search sessions",
                 "magnifyingglass",
                 primary_hover,
                 colors,
@@ -1120,9 +1214,32 @@ impl Sidebar {
             .justify_end()
             .pr(px(Metrics::TOOLBAR_EDGE_INSET))
             .gap(px(Metrics::TOOLBAR_COMPACT_GAP))
+            .when(!in_settings, |bar| {
+                bar.child(icon_button(
+                    "sidebar-layout",
+                    "Group and order sessions",
+                    "line.3.horizontal.decrease",
+                    layout_hover,
+                    colors,
+                    cx.listener(|this, _, window, cx| {
+                        this.focus_handle.focus(window, cx);
+                        if this.ui.popover == Some(Popover::SidebarLayout) {
+                            this.ui.popover = None;
+                        } else {
+                            this.open_sidebar_layout_popover();
+                        }
+                        cx.notify();
+                    }),
+                    cx.listener(|this, hovered: &bool, _, cx| {
+                        this.ui.hovered_control = hovered.then_some("sidebar-layout");
+                        cx.notify();
+                    }),
+                ))
+            })
             .child(primary_button)
             .child(icon_button(
                 "sidebar-toggle",
+                "Hide sidebar",
                 "sidebar.left",
                 toggle_hover,
                 colors,
@@ -1880,6 +1997,154 @@ impl Sidebar {
         section.into_any_element()
     }
 
+    fn recency_sections(
+        &mut self,
+        projection: &crate::store::SidebarProjection,
+        ordering: SidebarOrdering,
+        pinned: &HashSet<SessionId>,
+        today: i64,
+        colors: SemanticColors,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let rows = recency_rows(projection, ordering, pinned, today);
+        let mut buckets = RecencyBucket::ALL.to_vec();
+        if ordering == SidebarOrdering::OldestFirst {
+            buckets.reverse();
+        }
+        let mut sections = Vec::new();
+        for bucket in buckets {
+            let bucket_rows: Vec<_> = rows
+                .iter()
+                .filter(|(candidate, _)| *candidate == bucket)
+                .map(|(_, row)| row)
+                .collect();
+            if bucket_rows.is_empty() {
+                continue;
+            }
+            let mut section = div().flex().flex_col().gap(px(2.0)).child(
+                div()
+                    .px(px(Space::ROW_H))
+                    .h(px(24.0))
+                    .flex()
+                    .items_center()
+                    .text_size(px(Typo::SECTION_HEADER.size))
+                    .font_weight(Typo::SECTION_HEADER.weight)
+                    .text_color(colors.tertiary)
+                    .child(bucket.label()),
+            );
+            for row in bucket_rows {
+                let shortcut = self.shortcut_for(row.id());
+                let id = row.id().clone();
+                let drop = self.row_drop_feedback(row, window, cx);
+                let rendered = self.session_row(row, shortcut, drop, colors, window, cx);
+                section = section.child(self.track_row_bounds(id, rendered, None));
+            }
+            sections.push(section.into_any_element());
+        }
+        if let Some(archives) = self.recency_archive_section(projection, colors, window, cx) {
+            sections.push(archives);
+        }
+        sections
+    }
+
+    fn recency_archive_section(
+        &mut self,
+        projection: &crate::store::SidebarProjection,
+        colors: SemanticColors,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let mut archived: Vec<_> = projection
+            .projects
+            .iter()
+            .flat_map(|group| group.archived.iter().cloned())
+            .collect();
+        if archived.is_empty() {
+            return None;
+        }
+        archived.sort_by(|left, right| {
+            right
+                .archived_at
+                .partial_cmp(&left.archived_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.id.0.cmp(&right.id.0))
+        });
+        let expanded = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .sidebar_recency_archives_expanded;
+        let count = archived.len();
+        let mut section = div().flex().flex_col().gap(px(2.0)).child(
+            div()
+                .id("recency-archive-header")
+                .role(Role::Button)
+                .aria_label(if expanded {
+                    "Hide archived sessions"
+                } else {
+                    "Show archived sessions"
+                })
+                .aria_description(format!("{count} archived sessions"))
+                .mt(px(4.0))
+                .px(px(Space::ROW_H))
+                .h(px(SIDEBAR_NAV_ROW_HEIGHT))
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .rounded(px(SIDEBAR_ROW_RADIUS))
+                .cursor_pointer()
+                .text_size(px(Typo::SECTION_HEADER.size))
+                .font_weight(Typo::SECTION_HEADER.weight)
+                .text_color(colors.tertiary)
+                .hover(move |header| header.bg(colors.primary.alpha(0.05)))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    let _ = this
+                        .store
+                        .write()
+                        .expect("session store lock poisoned")
+                        .update_preferences(|prefs| {
+                            prefs.sidebar_recency_archives_expanded =
+                                !prefs.sidebar_recency_archives_expanded;
+                        });
+                    cx.notify();
+                }))
+                .child(div().min_w(px(0.0)).flex_1().child("Archived"))
+                .child(
+                    div()
+                        .font_weight(FontWeight::NORMAL)
+                        .child(count.to_string()),
+                )
+                .child(
+                    div()
+                        .size(px(SIDEBAR_ACTION_SLOT))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(sf_symbol_weighted(
+                            if expanded {
+                                "chevron.down"
+                            } else {
+                                "chevron.right"
+                            },
+                            8.0,
+                            SymbolWeight::Bold,
+                            colors.tertiary,
+                        )),
+                ),
+        );
+        if expanded {
+            for session in archived {
+                let id = session.id.clone();
+                let rendered = self.archived_row(&session, colors, window, cx);
+                section = section.child(self.track_row_bounds(id, rendered, None));
+            }
+        }
+        Some(section.into_any_element())
+    }
+
     fn track_row_bounds(
         &self,
         id: SessionId,
@@ -1935,7 +2200,8 @@ impl Sidebar {
         // run boundary too. Anywhere else the bands fall back to the handoff
         // the core offers rather than drawing a marker the drop cannot honour.
         let store = self.store.read().expect("session store lock poisoned");
-        let sibling = !archived
+        let sibling = store.preferences().sidebar_ordering == SidebarOrdering::Custom
+            && !archived
             && project == &target.project_id
             && parent == &target.parent
             && store.preferences().sidebar_pinned_sessions.contains(source) == row.pinned;
@@ -2867,6 +3133,7 @@ impl Sidebar {
                 Some(self.new_agent_popover(directory, host, colors, cx))
             }
             Popover::Account => Some(self.account_popover(colors, window, cx)),
+            Popover::SidebarLayout => Some(self.sidebar_layout_popover(colors, cx)),
             Popover::ProjectActions { id, position } => {
                 Some(self.project_actions_popover(id, position, colors, cx))
             }
@@ -2874,6 +3141,189 @@ impl Sidebar {
                 Some(self.session_actions_popover(id, position, colors, cx))
             }
         }
+    }
+
+    fn sidebar_layout_popover(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        let (grouping, ordering) = {
+            let store = self.store.read().expect("session store lock poisoned");
+            (
+                store.preferences().sidebar_grouping,
+                store.preferences().sidebar_ordering,
+            )
+        };
+        let section_label = |label: &'static str| {
+            div()
+                .px(px(9.0))
+                .pt(px(7.0))
+                .pb(px(3.0))
+                .text_size(px(Typo::SECTION_HEADER.size))
+                .font_weight(Typo::SECTION_HEADER.weight)
+                .text_color(colors.tertiary)
+                .child(label)
+        };
+        let mut content = div()
+            .id("sidebar-view-options")
+            .flex()
+            .flex_col()
+            .role(Role::Menu)
+            .aria_label("Sidebar view options")
+            .p(px(4.0))
+            .child(section_label("Grouping"))
+            .child(choice_menu_row(
+                "sidebar-group-project",
+                "Project",
+                "P",
+                grouping == SidebarGrouping::Project,
+                self.ui.layout_menu_index == 0,
+                colors,
+                cx.listener(|this, _, _, cx| {
+                    this.set_sidebar_grouping(SidebarGrouping::Project);
+                    cx.notify();
+                }),
+            ))
+            .child(choice_menu_row(
+                "sidebar-group-recency",
+                "Recency",
+                "R",
+                grouping == SidebarGrouping::Recency,
+                self.ui.layout_menu_index == 1,
+                colors,
+                cx.listener(|this, _, _, cx| {
+                    this.set_sidebar_grouping(SidebarGrouping::Recency);
+                    cx.notify();
+                }),
+            ))
+            .child(menu_divider(colors))
+            .child(section_label("Ordering"));
+        if grouping == SidebarGrouping::Project {
+            content = content.child(choice_menu_row(
+                "sidebar-order-custom",
+                "Custom",
+                "C",
+                ordering == SidebarOrdering::Custom,
+                self.ui.layout_menu_index == 2,
+                colors,
+                cx.listener(|this, _, _, cx| {
+                    this.set_sidebar_ordering(SidebarOrdering::Custom);
+                    cx.notify();
+                }),
+            ));
+        }
+        content = content
+            .child(choice_menu_row(
+                "sidebar-order-newest",
+                "Newest first",
+                "N",
+                ordering == SidebarOrdering::NewestFirst,
+                self.ui.layout_menu_index
+                    == if grouping == SidebarGrouping::Project {
+                        3
+                    } else {
+                        2
+                    },
+                colors,
+                cx.listener(|this, _, _, cx| {
+                    this.set_sidebar_ordering(SidebarOrdering::NewestFirst);
+                    cx.notify();
+                }),
+            ))
+            .child(choice_menu_row(
+                "sidebar-order-oldest",
+                "Oldest first",
+                "O",
+                ordering == SidebarOrdering::OldestFirst,
+                self.ui.layout_menu_index
+                    == if grouping == SidebarGrouping::Project {
+                        4
+                    } else {
+                        3
+                    },
+                colors,
+                cx.listener(|this, _, _, cx| {
+                    this.set_sidebar_ordering(SidebarOrdering::OldestFirst);
+                    cx.notify();
+                }),
+            ));
+        self.popover_shell(Metrics::TITLE_BAR - 2.0, content, colors, cx)
+    }
+
+    fn set_sidebar_grouping(&mut self, grouping: SidebarGrouping) {
+        let _ = self
+            .store
+            .write()
+            .expect("session store lock poisoned")
+            .update_preferences(|prefs| {
+                prefs.sidebar_grouping = grouping;
+                if grouping == SidebarGrouping::Recency
+                    && prefs.sidebar_ordering == SidebarOrdering::Custom
+                {
+                    prefs.sidebar_ordering = SidebarOrdering::NewestFirst;
+                }
+            });
+        self.ui.popover = None;
+        self.list_scroll.set_offset(point(px(0.0), px(0.0)));
+    }
+
+    fn open_sidebar_layout_popover(&mut self) {
+        let grouping = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .sidebar_grouping;
+        self.ui.layout_menu_index = usize::from(grouping == SidebarGrouping::Recency);
+        self.ui.popover = Some(Popover::SidebarLayout);
+    }
+
+    fn layout_menu_item_count(&self) -> usize {
+        let project_grouped = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .sidebar_grouping
+            == SidebarGrouping::Project;
+        if project_grouped { 5 } else { 4 }
+    }
+
+    fn move_layout_menu_cursor(&mut self, delta: isize) {
+        let count = self.layout_menu_item_count();
+        if count == 0 {
+            return;
+        }
+        self.ui.layout_menu_index =
+            (self.ui.layout_menu_index as isize + delta).rem_euclid(count as isize) as usize;
+    }
+
+    fn activate_layout_menu_cursor(&mut self) {
+        let grouping = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .sidebar_grouping;
+        match (grouping, self.ui.layout_menu_index) {
+            (_, 0) => self.set_sidebar_grouping(SidebarGrouping::Project),
+            (_, 1) => self.set_sidebar_grouping(SidebarGrouping::Recency),
+            (SidebarGrouping::Project, 2) => self.set_sidebar_ordering(SidebarOrdering::Custom),
+            (SidebarGrouping::Project, 3) | (SidebarGrouping::Recency, 2) => {
+                self.set_sidebar_ordering(SidebarOrdering::NewestFirst)
+            }
+            (SidebarGrouping::Project, 4) | (SidebarGrouping::Recency, 3) => {
+                self.set_sidebar_ordering(SidebarOrdering::OldestFirst)
+            }
+            _ => {}
+        }
+    }
+
+    fn set_sidebar_ordering(&mut self, ordering: SidebarOrdering) {
+        let _ = self
+            .store
+            .write()
+            .expect("session store lock poisoned")
+            .update_preferences(|prefs| prefs.sidebar_ordering = ordering);
+        self.ui.popover = None;
+        self.list_scroll.set_offset(point(px(0.0), px(0.0)));
     }
 
     fn popover_shell(
@@ -4740,6 +5190,25 @@ impl Sidebar {
     }
 
     fn begin_drag(&mut self, item: DragItem, preview: Entity<DragPreview>, cx: &mut Context<Self>) {
+        let custom_ordering = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .sidebar_ordering
+            == SidebarOrdering::Custom;
+        if matches!(item, DragItem::Project(_)) && !custom_ordering {
+            preview.update(cx, |preview, cx| {
+                preview.hidden = true;
+                cx.notify();
+            });
+            self.ui.delegation_notice =
+                Some("Choose Custom ordering to rearrange projects.".to_owned());
+            self.ui.drag = None;
+            self.drag_preview = None;
+            cx.notify();
+            return;
+        }
         if matches!(item, DragItem::Project(_)) {
             let order = self
                 .store
@@ -4885,6 +5354,9 @@ impl Sidebar {
     /// run.
     fn reorder_session_beside(&mut self, moved: &SessionId, target: &SessionId, zone: DropZone) {
         let mut store = self.store.write().expect("session store lock poisoned");
+        if store.preferences().sidebar_ordering != SidebarOrdering::Custom {
+            return;
+        }
         let anchor = match zone {
             DropZone::Before | DropZone::Onto => Some(target.clone()),
             DropZone::After => {
@@ -4948,6 +5420,9 @@ impl Sidebar {
     /// Live header reorder; returns whether the order changed.
     fn reorder_project(&mut self, moved: &ProjectId, target: &ProjectId) -> bool {
         let mut store = self.store.write().expect("session store lock poisoned");
+        if store.preferences().sidebar_ordering != SidebarOrdering::Custom {
+            return false;
+        }
         let mut order = store.sidebar_project_order();
         move_past(&mut order, moved, target);
         let changed = store.stage_project_order(order);
@@ -5115,6 +5590,19 @@ impl Sidebar {
     /// session, which is the daemon's call to make, not a keystroke's.
     pub fn reorder_selected(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
         self.commit_rename();
+        if self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .sidebar_ordering
+            != SidebarOrdering::Custom
+        {
+            self.ui.delegation_notice =
+                Some("Choose Custom ordering before moving sessions.".to_owned());
+            cx.notify();
+            return true;
+        }
         let (moved, target) = {
             let mut store = self.store.write().expect("session store lock poisoned");
             let Some(selected) = store.selected_session_id().cloned() else {
@@ -5269,6 +5757,172 @@ fn focus_rows(
     result
 }
 
+fn recency_focus_rows(
+    projection: &crate::store::SidebarProjection,
+    archives_expanded: bool,
+    ordering: SidebarOrdering,
+    pinned: &HashSet<SessionId>,
+    today: i64,
+) -> Vec<FocusRow> {
+    let mut rows: Vec<_> = recency_rows(projection, ordering, pinned, today)
+        .into_iter()
+        .map(|(_, row)| FocusRow {
+            id: row.id().clone(),
+            parent: None,
+            has_children: false,
+            collapsed: false,
+        })
+        .collect();
+    if archives_expanded {
+        let mut archived: Vec<_> = projection
+            .projects
+            .iter()
+            .flat_map(|group| group.archived.iter())
+            .collect();
+        archived.sort_by(|left, right| {
+            right
+                .archived_at
+                .partial_cmp(&left.archived_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.id.0.cmp(&right.id.0))
+        });
+        rows.extend(archived.into_iter().map(|session| FocusRow {
+            id: session.id.clone(),
+            parent: None,
+            has_children: false,
+            collapsed: false,
+        }));
+    }
+    rows
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum RecencyBucket {
+    Today,
+    Yesterday,
+    PreviousSevenDays,
+    Earlier,
+}
+
+impl RecencyBucket {
+    const ALL: [Self; 4] = [
+        Self::Today,
+        Self::Yesterday,
+        Self::PreviousSevenDays,
+        Self::Earlier,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Today => "Today",
+            Self::Yesterday => "Yesterday",
+            Self::PreviousSevenDays => "Previous 7 days",
+            Self::Earlier => "Earlier",
+        }
+    }
+
+    const fn for_day(session_day: i64, today: i64) -> Self {
+        let age = today.saturating_sub(session_day);
+        if age <= 0 {
+            Self::Today
+        } else if age == 1 {
+            Self::Yesterday
+        } else if age <= 7 {
+            Self::PreviousSevenDays
+        } else {
+            Self::Earlier
+        }
+    }
+}
+
+fn wall_clock_millis() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |duration| duration.as_secs_f64() * 1_000.0)
+}
+
+/// Local Gregorian day ordinal. Calendar ordinals keep Today/Yesterday honest
+/// across midnight and daylight-saving transitions, where elapsed 24-hour
+/// windows do not line up with the labels people read.
+fn local_day_ordinal(timestamp_ms: f64) -> Option<i64> {
+    if !timestamp_ms.is_finite() {
+        return None;
+    }
+    let seconds = (timestamp_ms / 1_000.0).floor();
+    if seconds < libc::time_t::MIN as f64 || seconds > libc::time_t::MAX as f64 {
+        return None;
+    }
+    let timestamp = seconds as libc::time_t;
+    // SAFETY: `timestamp` and `local` are valid for the duration of the call;
+    // `localtime_r` writes only to the provided `tm` and reports failure with
+    // a null pointer. No returned pointer escapes this function.
+    let local = unsafe {
+        let mut local = std::mem::zeroed::<libc::tm>();
+        if libc::localtime_r(&timestamp, &mut local).is_null() {
+            return None;
+        }
+        local
+    };
+    let year = i64::from(local.tm_year) + 1900;
+    Some(days_before_year(year) + i64::from(local.tm_yday))
+}
+
+const fn days_before_year(year: i64) -> i64 {
+    let previous = year - 1;
+    365 * previous + previous.div_euclid(4) - previous.div_euclid(100) + previous.div_euclid(400)
+}
+
+fn recency_rows(
+    projection: &crate::store::SidebarProjection,
+    ordering: SidebarOrdering,
+    pinned: &HashSet<SessionId>,
+    today: i64,
+) -> Vec<(RecencyBucket, crate::store::SidebarRow)> {
+    let mut rows: Vec<_> = projection
+        .projects
+        .iter()
+        .flat_map(|group| &group.active)
+        .map(|session| {
+            (
+                RecencyBucket::for_day(
+                    local_day_ordinal(session.updated_at.0).unwrap_or(i64::MIN),
+                    today,
+                ),
+                crate::store::SidebarRow {
+                    session: Arc::clone(session),
+                    depth: 0,
+                    has_children: false,
+                    collapsed: false,
+                    pinned: pinned.contains(&session.id),
+                    rails: 0,
+                },
+            )
+        })
+        .collect();
+    rows.sort_by(|(left_bucket, left), (right_bucket, right)| {
+        (if ordering == SidebarOrdering::OldestFirst {
+            right_bucket.cmp(left_bucket)
+        } else {
+            left_bucket.cmp(right_bucket)
+        })
+        .then_with(|| right.pinned.cmp(&left.pinned))
+        .then_with(|| match ordering {
+            SidebarOrdering::OldestFirst => left
+                .session
+                .updated_at
+                .0
+                .total_cmp(&right.session.updated_at.0),
+            SidebarOrdering::Custom | SidebarOrdering::NewestFirst => right
+                .session
+                .updated_at
+                .0
+                .total_cmp(&left.session.updated_at.0),
+        })
+        .then_with(|| left.id().0.cmp(&right.id().0))
+    });
+    rows
+}
+
 fn focus_row_ids(rows: &[FocusRow]) -> Vec<SessionId> {
     rows.iter().map(|row| row.id.clone()).collect()
 }
@@ -5346,13 +6000,48 @@ fn reveal_tracked_row(
 impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.colors();
-        let (projection, expanded_archives, selected) = {
+        let (
+            projection,
+            expanded_archives,
+            selected,
+            grouping,
+            ordering,
+            pinned_sessions,
+            recency_archives_expanded,
+        ) = {
             let mut store = self.store.write().expect("session store lock poisoned");
             let expanded = store.preferences().sidebar_expanded_archives.clone();
             let selected = store.selected_session_id().cloned();
-            (store.sidebar_projection(), expanded, selected)
+            let grouping = store.preferences().sidebar_grouping;
+            let ordering = store.preferences().sidebar_ordering;
+            let pinned = store
+                .preferences()
+                .sidebar_pinned_sessions
+                .iter()
+                .cloned()
+                .collect();
+            let recency_archives_expanded = store.preferences().sidebar_recency_archives_expanded;
+            (
+                store.sidebar_projection(),
+                expanded,
+                selected,
+                grouping,
+                ordering,
+                pinned,
+                recency_archives_expanded,
+            )
         };
-        let focus_rows = focus_rows(&projection, &expanded_archives);
+        let today = local_day_ordinal(wall_clock_millis()).unwrap_or(0);
+        let focus_rows = match grouping {
+            SidebarGrouping::Project => focus_rows(&projection, &expanded_archives),
+            SidebarGrouping::Recency => recency_focus_rows(
+                &projection,
+                recency_archives_expanded,
+                ordering,
+                &pinned_sessions,
+                today,
+            ),
+        };
         let visible = focus_row_ids(&focus_rows);
         self.ui.reconcile_focus_cursor(&visible, selected.as_ref());
         let visible_set: HashSet<_> = visible.iter().collect();
@@ -5360,8 +6049,8 @@ impl Render for Sidebar {
             .borrow_mut()
             .retain(|id, _| visible_set.contains(id));
         self.shortcut_ranks.clear();
-        let session_count = projection.ordered_sessions.len();
-        for (index, session) in projection.ordered_sessions.iter().enumerate() {
+        let session_count = visible.len();
+        for (index, id) in visible.iter().enumerate() {
             let shortcut = if index < 8 {
                 Some(index + 1)
             } else if index + 1 == session_count {
@@ -5370,7 +6059,7 @@ impl Render for Sidebar {
                 None
             };
             if let Some(shortcut) = shortcut {
-                self.shortcut_ranks.insert(session.id.clone(), shortcut);
+                self.shortcut_ranks.insert(id.clone(), shortcut);
             }
         }
         retain_live_glyphs(&mut self.glyphs, &projection.display_order);
@@ -5389,8 +6078,23 @@ impl Render for Sidebar {
                 .flex()
                 .flex_col()
                 .gap(px(8.0));
-            for group in &projection.projects {
-                list = list.child(self.project_section(group, colors, window, cx));
+            match grouping {
+                SidebarGrouping::Project => {
+                    for group in &projection.projects {
+                        list = list.child(self.project_section(group, colors, window, cx));
+                    }
+                }
+                SidebarGrouping::Recency => {
+                    list = list.children(self.recency_sections(
+                        &projection,
+                        ordering,
+                        &pinned_sessions,
+                        today,
+                        colors,
+                        window,
+                        cx,
+                    ));
+                }
             }
             list = list.child(self.empty_space_drop_target(colors, cx));
             list
@@ -5405,6 +6109,8 @@ impl Render for Sidebar {
             .flex_col()
             .text_color(colors.primary)
             .bg(Self::surface_fill(colors))
+            .border_r_1()
+            .border_color(colors.sidebar_stroke())
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_up_out(
@@ -5481,6 +6187,7 @@ impl Render for Sidebar {
 
 fn icon_button(
     id: &'static str,
+    label: &'static str,
     system_image: &'static str,
     hovering: bool,
     colors: SemanticColors,
@@ -5490,6 +6197,8 @@ fn icon_button(
     div()
         .id(id)
         .debug_selector(move || id.into())
+        .role(Role::Button)
+        .aria_label(label)
         .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
         .flex()
         .items_center()
@@ -5636,6 +6345,72 @@ fn menu_row(
         .text_size(px(Typo::ROW.size))
         .text_color(colors.primary)
         .child(label)
+        .on_click(on_click)
+        .into_any_element()
+}
+
+fn choice_menu_row(
+    id: &'static str,
+    label: &'static str,
+    shortcut: &'static str,
+    selected: bool,
+    focused: bool,
+    colors: SemanticColors,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    div()
+        .id(id)
+        .debug_selector(move || id.into())
+        .role(Role::MenuItem)
+        .aria_label(label)
+        .aria_description(if selected { "Selected" } else { "Not selected" })
+        .aria_keyshortcuts(shortcut)
+        .px(px(8.0))
+        .h(px(30.0))
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
+        .cursor_pointer()
+        .bg(if focused {
+            colors.primary.alpha(0.075)
+        } else {
+            Fill::selected(colors, selected)
+        })
+        .border_1()
+        .border_color(if focused {
+            colors.primary.alpha(0.18)
+        } else {
+            colors.primary.alpha(0.0)
+        })
+        .hover(move |element| element.bg(colors.primary.alpha(0.07)))
+        .active(|element| element.opacity(0.74))
+        .text_size(px(Typo::ROW.size))
+        .text_color(colors.primary)
+        .child(
+            div()
+                .size(px(14.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .when(selected, |slot| {
+                    slot.child(sf_symbol_weighted(
+                        "checkmark",
+                        9.0,
+                        SymbolWeight::Bold,
+                        colors.primary,
+                    ))
+                }),
+        )
+        .child(div().min_w(px(0.0)).flex_1().child(label))
+        .child(
+            div()
+                .font_family(crate::fonts::mono_family())
+                .text_size(px(Typo::META_MONO.size))
+                .text_color(colors.tertiary)
+                .child(shortcut),
+        )
         .on_click(on_click)
         .into_any_element()
 }
@@ -6072,6 +6847,46 @@ mod tests {
     use gpui::{Modifiers, TestAppContext, VisualTestContext};
 
     use super::*;
+
+    #[test]
+    fn recency_buckets_follow_calendar_days_instead_of_elapsed_hours() {
+        fn local_timestamp_ms(year: i32, month: i32, day: i32, hour: i32, minute: i32) -> f64 {
+            // SAFETY: `tm` is fully initialized, and mktime only mutates that
+            // local value. `tm_isdst = -1` asks the platform to resolve DST.
+            let seconds = unsafe {
+                let mut local = std::mem::zeroed::<libc::tm>();
+                local.tm_year = year - 1900;
+                local.tm_mon = month - 1;
+                local.tm_mday = day;
+                local.tm_hour = hour;
+                local.tm_min = minute;
+                local.tm_isdst = -1;
+                libc::mktime(&mut local)
+            };
+            assert_ne!(seconds, -1);
+            seconds as f64 * 1_000.0
+        }
+
+        let just_after_midnight = local_timestamp_ms(2026, 9, 5, 0, 5);
+        let just_before_midnight = local_timestamp_ms(2026, 9, 4, 23, 55);
+        assert!((just_after_midnight - just_before_midnight) < 24.0 * 60.0 * 60.0 * 1_000.0);
+        let today = local_day_ordinal(just_after_midnight).expect("local day");
+        let recent_yesterday = local_day_ordinal(just_before_midnight).expect("local day");
+
+        assert_eq!(RecencyBucket::for_day(today, today), RecencyBucket::Today);
+        assert_eq!(
+            RecencyBucket::for_day(recent_yesterday, today),
+            RecencyBucket::Yesterday
+        );
+        assert_eq!(
+            RecencyBucket::for_day(today - 7, today),
+            RecencyBucket::PreviousSevenDays
+        );
+        assert_eq!(
+            RecencyBucket::for_day(today - 8, today),
+            RecencyBucket::Earlier
+        );
+    }
 
     struct SidebarPopoverHarness {
         sidebar: Entity<Sidebar>,
@@ -6884,6 +7699,92 @@ mod tests {
         screenshot
             .save(output)
             .expect("save account-menu screenshot");
+    }
+
+    /// Produces the sidebar layout variants used for material and hierarchy
+    /// review without touching a running Diri instance. Set
+    /// `DIRI_VISUAL_GROUPING=recency`, `DIRI_VISUAL_LIGHT=1`, or
+    /// `DIRI_VISUAL_POPOVER=none` to select the state to capture.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes a deterministic sidebar screenshot artifact"]
+    fn render_sidebar_preview_screenshot() {
+        let output = std::env::var_os("DIRI_VISUAL_OUTPUT")
+            .map(PathBuf::from)
+            .expect("set DIRI_VISUAL_OUTPUT to the target PNG path");
+        let recency = std::env::var_os("DIRI_VISUAL_GROUPING")
+            .is_some_and(|value| value.to_string_lossy().eq_ignore_ascii_case("recency"));
+        let light = std::env::var_os("DIRI_VISUAL_LIGHT").is_some();
+        let show_popover = std::env::var_os("DIRI_VISUAL_POPOVER")
+            .is_none_or(|value| !value.to_string_lossy().eq_ignore_ascii_case("none"));
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| crate::fonts::init(cx));
+
+        let window = cx
+            .open_window(size(px(300.0), px(720.0)), |_, cx| {
+                let sidebar = cx.new(|cx| {
+                    let mut sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                    let now = wall_clock_millis();
+                    let mut store = sidebar.store.write().expect("preview session store");
+                    let sessions: Vec<_> = store
+                        .sessions()
+                        .values()
+                        .map(|session| (**session).clone())
+                        .collect();
+                    for (index, mut session) in sessions.into_iter().enumerate() {
+                        let age = [
+                            2.0 * 60.0 * 60.0 * 1_000.0,
+                            26.0 * 60.0 * 60.0 * 1_000.0,
+                            3.0 * 24.0 * 60.0 * 60.0 * 1_000.0,
+                            10.0 * 24.0 * 60.0 * 60.0 * 1_000.0,
+                        ][index % 4];
+                        session.updated_at = diri_proto::DateMillis(now - age);
+                        store.upsert_session(session);
+                    }
+                    store
+                        .update_preferences(|prefs| {
+                            prefs.terminal_theme = if light {
+                                "dirijor-light".into()
+                            } else {
+                                "dirijor-dark".into()
+                            };
+                            prefs.sidebar_grouping = if recency {
+                                SidebarGrouping::Recency
+                            } else {
+                                SidebarGrouping::Project
+                            };
+                            prefs.sidebar_ordering = if recency {
+                                SidebarOrdering::NewestFirst
+                            } else {
+                                SidebarOrdering::Custom
+                            };
+                        })
+                        .expect("preview preferences");
+                    drop(store);
+                    if show_popover {
+                        sidebar.ui.popover = Some(Popover::SidebarLayout);
+                    }
+                    sidebar
+                });
+                cx.new(|_| SidebarPopoverHarness { sidebar })
+            })
+            .expect("open headless sidebar window");
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, _| window.refresh())
+            .expect("refresh sidebar window");
+        cx.run_until_parked();
+        let screenshot = cx
+            .capture_screenshot(window.into())
+            .expect("capture sidebar screenshot");
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent).expect("create screenshot directory");
+        }
+        screenshot.save(output).expect("save sidebar screenshot");
     }
 
     #[gpui::test]
