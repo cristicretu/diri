@@ -19,12 +19,17 @@ pub const COOKIE: &str = "diri_web_token";
 /// 256 bits of `getrandom` entropy, hex-encoded.
 const TOKEN_BYTES: usize = 32;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Auth {
     token: String,
 }
 
 impl Auth {
+    pub fn temporary() -> io::Result<Self> {
+        Ok(Self {
+            token: mint_token()?,
+        })
+    }
     /// Loads the token at `path`, creating one if the file does not exist.
     ///
     /// Returns the token and whether it was freshly minted, so `main` can

@@ -82,14 +82,21 @@ jobs:
       # a stale checked-in pbxproj cannot drift from the source list.
       - name: Install XcodeGen
         run: brew install xcodegen
-      - name: Generate project
-        run: xcodegen generate
-      # Simulator only: this runner has no signing identity, and the target
-      # sets CODE_SIGNING_ALLOWED=NO to match.
+      - name: Check release inputs and generate project
+        run: bash scripts/testflight.sh check
+      # This runner has no signing identity. Device archive below is a build
+      # gate only, not proof of signing or TestFlight acceptance.
       - name: Test
         run: |
           xcodebuild -project DiriPhone.xcodeproj -scheme DiriPhone \
-            -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
+            -destination 'platform=iOS Simulator,name=iPhone 17 Pro' CODE_SIGNING_ALLOWED=NO test
+      - name: Build unsigned device archive
+        run: |
+          xcodebuild -project DiriPhone.xcodeproj -scheme DiriPhone -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/DiriPhone.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO archive
+          test -f "$RUNNER_TEMP/DiriPhone.xcarchive/Products/Applications/DiriPhone.app/PrivacyInfo.xcprivacy"
+          test -f "$RUNNER_TEMP/DiriPhone.xcarchive/Products/Applications/DiriPhone.app/Assets.car"
 
   lints:
     name: Lints

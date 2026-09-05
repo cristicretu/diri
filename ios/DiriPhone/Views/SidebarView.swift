@@ -9,6 +9,8 @@ import SwiftUI
 struct SidebarView: View {
     @Environment(AppModel.self) private var model
     @State private var spawning = false
+    @State private var pairing = false
+    @State private var actionError: String?
     @State private var confirmingKill: SessionRecord?
     @State private var path: [String] = []
 
@@ -44,6 +46,13 @@ struct SidebarView: View {
                 path.append(record.id)
             }
         }
+        .sheet(isPresented: $pairing) {
+            ConnectView(onConnected: { pairing = false; path = [] })
+        }
+        .alert("Couldn't stop the session", isPresented: .init(
+            get: { actionError != nil }, set: { if !$0 { actionError = nil } }
+        )) { Button("OK", role: .cancel) { actionError = nil } }
+        message: { Text(actionError ?? "") }
         .confirmationDialog(
             confirmingKill.map { "Kill “\(displayTitle($0))”?" } ?? "",
             isPresented: .init(
@@ -55,7 +64,10 @@ struct SidebarView: View {
             Button("Kill session", role: .destructive) {
                 guard let target = confirmingKill else { return }
                 confirmingKill = nil
-                Task { try? await model.kill(target.id) }
+                Task {
+                    do { try await model.kill(target.id) }
+                    catch { actionError = error.localizedDescription }
+                }
             }
             Button("Cancel", role: .cancel) { confirmingKill = nil }
         }
@@ -155,7 +167,17 @@ struct SidebarView: View {
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
         ToolbarItem(placement: .topBarLeading) {
-            ConnectionDot(connection: model.connection, host: model.host)
+            Menu {
+                Button("Retry connection") { Task { await model.refresh() } }
+                Button("Pair with your Mac…") { pairing = true }
+                Button("Disconnect this phone", role: .destructive) { model.endpoint = nil }
+            } label: {
+                HStack(spacing: 5) {
+                    ConnectionDot(connection: model.connection, host: model.host)
+                    Image(systemName: "chevron.down").font(.caption2)
+                }
+            }
+            .accessibilityLabel("Mac connection options")
         }
         ToolbarItemGroup(placement: .topBarTrailing) {
             if !model.needingInput.isEmpty {
@@ -283,14 +305,14 @@ struct EmptyStateView: View {
                 Image(systemName: "wifi.exclamationmark")
                     .font(.system(size: 28))
                     .foregroundStyle(Tokens.Ink.danger)
-                Text("Can't reach the daemon")
+                Text("Can’t reach your Mac")
                     .font(Tokens.Typo.displayTitle)
                     .foregroundStyle(Tokens.Ink.primary)
                 Text(detail)
                     .font(Tokens.Typo.meta)
                     .foregroundStyle(Tokens.Ink.tertiary)
                     .multilineTextAlignment(.center)
-                Text("Check that Tailscale is on.")
+                Text("Keep your Mac awake with Diri open and Tailscale connected. If access was restarted, use the connection menu to pair again.")
                     .font(Tokens.Typo.meta)
                     .foregroundStyle(Tokens.Ink.tertiary)
             case .connecting:

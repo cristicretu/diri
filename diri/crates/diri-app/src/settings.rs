@@ -49,10 +49,11 @@ pub enum SettingsTab {
     Usage,
     Resources,
     Remote,
+    Phone,
 }
 
 impl SettingsTab {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::General,
         Self::Agents,
         Self::Shortcuts,
@@ -60,6 +61,7 @@ impl SettingsTab {
         Self::Usage,
         Self::Resources,
         Self::Remote,
+        Self::Phone,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -71,6 +73,7 @@ impl SettingsTab {
             Self::Usage => "Usage",
             Self::Resources => "Resources",
             Self::Remote => "Remote",
+            Self::Phone => "Phone access",
         }
     }
 
@@ -83,6 +86,7 @@ impl SettingsTab {
             Self::Usage => "Costs, tokens, and cache savings",
             Self::Resources => "Idle sessions and memory",
             Self::Remote => "SSH execution hosts",
+            Self::Phone => "Code from your iPhone",
         }
     }
 
@@ -93,7 +97,7 @@ impl SettingsTab {
             Self::General | Self::Agents | Self::Shortcuts | Self::Terminal | Self::Usage => {
                 SettingsSection::Personal
             }
-            Self::Resources | Self::Remote => SettingsSection::System,
+            Self::Resources | Self::Remote | Self::Phone => SettingsSection::System,
         }
     }
 
@@ -106,6 +110,7 @@ impl SettingsTab {
             Self::Usage => "chart.bar.xaxis",
             Self::Resources => "server.rack",
             Self::Remote => "network",
+            Self::Phone => "iphone",
         }
     }
 }

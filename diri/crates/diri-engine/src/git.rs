@@ -240,6 +240,27 @@ pub fn create_worktree(
     let branch_name = branch
         .map(str::to_string)
         .unwrap_or_else(generated_branch_name);
+    validate_worktree_field(&branch_name)?;
+    run(&["check-ref-format", "--branch", &branch_name], repo)?;
+    let base_commit = base
+        .map(|reference| {
+            validate_worktree_field(reference)?;
+            run(
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--end-of-options",
+                    &format!("{reference}^{{commit}}"),
+                ],
+                repo,
+            )
+            .map(|value| value.trim().to_owned())
+            .map_err(|error| std::io::Error::other(format!(
+                "Cannot start a worktree from {reference:?} on this computer. Choose an existing base branch. {error}")))
+        })
+        .transpose()?;
+    let root = run(&["rev-parse", "--show-toplevel"], repo)?;
+    let repo = Path::new(root.trim());
     let slug = branch_to_path_slug(&branch_name);
     let parent = repo.parent().unwrap_or(Path::new("."));
     let repo_name = repo
@@ -250,7 +271,7 @@ pub fn create_worktree(
     let worktree_str = worktree_path.to_string_lossy().to_string();
 
     let mut args = vec!["worktree", "add", "-b", &branch_name, &worktree_str];
-    if let Some(base) = base {
+    if let Some(base) = base_commit.as_deref() {
         args.push(base);
     }
     run(&args, repo)?;
@@ -267,6 +288,99 @@ pub fn create_worktree(
     Ok(WorktreeInfo {
         path: resolved,
         branch: Some(branch_name),
+        is_bare: false,
+        is_detached: false,
+        is_prunable: false,
+    })
+}
+
+fn validate_worktree_field(value: &str) -> std::io::Result<()> {
+    if value.is_empty() || value.starts_with('-') || value.chars().any(char::is_control) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "worktree branch, base and directory must be nonempty and contain no control characters or leading dash",
+        ));
+    }
+    Ok(())
+}
+
+// Workspace policy stays in the local Engine, not the Remote PTY Holder.
+// All caller data is framed on stdin; this command is fixed for every request.
+const CREATE_WORKTREE_SCRIPT: &str = r#"set -eu
+export LC_ALL=C GIT_TERMINAL_PROMPT=0
+IFS= read -r cwd
+IFS= read -r branch
+IFS= read -r base
+IFS= read -r slug
+case "$cwd" in
+  "~") cwd=$HOME ;;
+  "~/"*) cwd=$HOME/${cwd#\~/} ;;
+esac
+cd "$cwd"
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+git check-ref-format --branch "$branch" >/dev/null
+commit=$(git rev-parse --verify --end-of-options "${base}^{commit}") || {
+  printf 'Cannot start a worktree from %s on this host. Choose an existing base branch.\n' "$base" >&2
+  exit 1
+}
+destination="${root}-${slug}"
+git worktree add -b "$branch" -- "$destination" "$commit" >&2
+cd "$destination"
+printf 'DIRI_WORKTREE_V1\000%s\000' "$(pwd -P)"
+"#;
+
+pub fn create_worktree_remote(
+    manager: &RemoteManager,
+    host: &HostEntry,
+    cwd: &str,
+    branch: Option<&str>,
+    base: Option<&str>,
+) -> std::io::Result<WorktreeInfo> {
+    let branch = branch
+        .map(str::to_owned)
+        .unwrap_or_else(generated_branch_name);
+    let input = worktree_input(cwd, &branch, base.unwrap_or("HEAD"))?;
+    let output = manager.run_fixed_script(
+        host,
+        CREATE_WORKTREE_SCRIPT,
+        input,
+        Duration::from_secs(60),
+        16 * 1024,
+    )?;
+    if !output.status.success() {
+        return Err(diff_failure(&output.stderr));
+    }
+    if output.stdout_truncated {
+        return Err(std::io::Error::other(
+            "remote worktree response exceeded its limit",
+        ));
+    }
+    parse_worktree_result(&output.stdout, branch)
+}
+
+fn worktree_input(cwd: &str, branch: &str, base: &str) -> std::io::Result<Vec<u8>> {
+    for field in [cwd, branch, base] {
+        validate_worktree_field(field)?;
+    }
+    Ok(format!("{cwd}\n{branch}\n{base}\n{}\n", branch_to_path_slug(branch)).into_bytes())
+}
+
+fn parse_worktree_result(output: &[u8], branch: String) -> std::io::Result<WorktreeInfo> {
+    const MARKER: &[u8] = b"DIRI_WORKTREE_V1\0";
+    let start = output
+        .windows(MARKER.len())
+        .rposition(|bytes| bytes == MARKER)
+        .ok_or_else(|| std::io::Error::other("remote worktree response is missing"))?
+        + MARKER.len();
+    let path = output[start..]
+        .strip_suffix(&[0])
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .filter(|path| path.starts_with('/') && !path.chars().any(char::is_control))
+        .ok_or_else(|| std::io::Error::other("remote worktree returned an invalid path"))?;
+    Ok(WorktreeInfo {
+        path: path.to_owned(),
+        branch: Some(branch),
         is_bare: false,
         is_detached: false,
         is_prunable: false,
@@ -461,6 +575,117 @@ fn diff_failure(stderr: &[u8]) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn main_and_feature_repo() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo with 'quotes' and $dollars");
+        std::fs::create_dir_all(repo.join("nested")).unwrap();
+        run(&["init", "--initial-branch=main"], &repo).unwrap();
+        run(
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "main",
+            ],
+            &repo,
+        )
+        .unwrap();
+        run(&["checkout", "-b", "feature"], &repo).unwrap();
+        run(
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "feature",
+            ],
+            &repo,
+        )
+        .unwrap();
+        std::fs::write(repo.join("uncommitted.txt"), "keep me").unwrap();
+        (temp, repo)
+    }
+
+    #[test]
+    fn explicit_main_worktree_never_inherits_checked_out_feature() {
+        let (_temp, repo) = main_and_feature_repo();
+        let info = create_worktree(&repo.join("nested"), Some("phone/fix"), Some("main")).unwrap();
+        assert_eq!(
+            run(&["rev-parse", "HEAD"], Path::new(&info.path)).unwrap(),
+            run(&["rev-parse", "main"], &repo).unwrap()
+        );
+        assert_eq!(branch(&repo).as_deref(), Some("feature"));
+        assert_eq!(
+            std::fs::read_to_string(repo.join("uncommitted.txt")).unwrap(),
+            "keep me"
+        );
+        assert_eq!(
+            Path::new(&info.path).parent(),
+            std::fs::canonicalize(&repo).unwrap().parent()
+        );
+        assert!(create_worktree(&repo, Some("phone/fix"), Some("main")).is_err());
+    }
+
+    #[test]
+    fn invalid_worktree_base_fails_without_creating_a_branch() {
+        let (_temp, repo) = main_and_feature_repo();
+        for base in ["missing-main", "--help", "main\nother"] {
+            assert!(create_worktree(&repo, Some("phone/fail"), Some(base)).is_err());
+        }
+        assert!(run(&["rev-parse", "--verify", "refs/heads/phone/fail"], &repo).is_err());
+        assert_eq!(list_worktrees(&repo).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn remote_workspace_script_uses_stdin_and_preserves_the_original_checkout() {
+        use std::io::Write as _;
+        let (_temp, repo) = main_and_feature_repo();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", CREATE_WORKTREE_SCRIPT])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&worktree_input(repo.to_str().unwrap(), "phone/remote", "main").unwrap())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let info = parse_worktree_result(&output.stdout, "phone/remote".into()).unwrap();
+        assert_eq!(
+            run(&["rev-parse", "HEAD"], Path::new(&info.path)).unwrap(),
+            run(&["rev-parse", "main"], &repo).unwrap()
+        );
+        assert_eq!(branch(&repo).as_deref(), Some("feature"));
+        assert!(repo.join("uncommitted.txt").is_file());
+    }
+
+    #[test]
+    fn remote_workspace_framing_rejects_control_characters_and_options() {
+        for field in ["", "--help", "main\nnext", "main\rnext", "main\0next"] {
+            assert!(worktree_input("/repo", field, "main").is_err());
+            assert!(worktree_input("/repo", "phone/fix", field).is_err());
+            assert!(worktree_input(field, "phone/fix", "main").is_err());
+        }
+        assert!(parse_worktree_result(b"noise\nDIRI_WORKTREE_V1\0/tmp/repo\0", "b".into()).is_ok());
+        assert!(parse_worktree_result(b"DIRI_WORKTREE_V1\0relative\0", "b".into()).is_err());
+    }
 
     #[test]
     fn remote_diff_parser_ignores_login_shell_noise_before_its_marker() {

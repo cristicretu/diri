@@ -251,6 +251,10 @@ impl HostEditor {
 }
 
 pub struct UtilitySurfaces {
+    phone_access: Option<crate::phone_access::PhoneAccess>,
+    phone_loading: bool,
+    phone_error: Option<String>,
+    phone_setup: Option<crate::phone_access::TailscaleSetup>,
     focus: FocusHandle,
     surface: Surface,
     history: Vec<HistoryEntry>,
@@ -328,6 +332,7 @@ impl UtilitySurfaces {
             Some("shortcuts") => SettingsTab::Shortcuts,
             Some("resources") => SettingsTab::Resources,
             Some("remote") => SettingsTab::Remote,
+            Some("phone") => SettingsTab::Phone,
             Some("usage") => SettingsTab::Usage,
             _ => SettingsTab::General,
         };
@@ -370,6 +375,10 @@ impl UtilitySurfaces {
         };
         Self {
             focus,
+            phone_access: None,
+            phone_loading: false,
+            phone_error: None,
+            phone_setup: None,
             surface: if diagnostics_preview {
                 Surface::Diagnostics
             } else if settings_preview.is_some() {
@@ -2184,6 +2193,7 @@ impl UtilitySurfaces {
             SettingsTab::Terminal => self.terminal_settings(cx).into_any_element(),
             SettingsTab::Resources => self.resource_settings(cx).into_any_element(),
             SettingsTab::Remote => self.remote_settings(cx).into_any_element(),
+            SettingsTab::Phone => self.phone_settings(cx).into_any_element(),
             SettingsTab::Usage => self.usage_settings(cx).into_any_element(),
         };
         let pane = div()
@@ -2242,6 +2252,92 @@ impl UtilitySurfaces {
                 }),
             )
             .child(pane)
+    }
+
+    fn phone_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::phone_access::TailscaleSetup;
+        let colors = self.settings_colors();
+        let content = div().flex().flex_col().gap(px(20.0))
+            .child(setting_section("Your Mac does the work. Your phone is the remote.",
+                div().flex().flex_col().gap(px(10.0))
+                    .child("A one-time setup, with no commands, router settings or addresses to type.")
+                    .child("Keep Diri running and your Mac plugged in with its lid open. The display can turn off; closing the lid or choosing Sleep disconnects your phone."), colors))
+            .when(self.phone_access.is_none(), |view| {
+                view.child(setting_section("1. Connect this Mac", div().flex().flex_col().gap(px(10.0))
+                    .child(self.phone_setup.map(TailscaleSetup::message).unwrap_or("We’ll check whether Tailscale is ready. It keeps the connection between your devices private."))
+                    .when(self.phone_setup.is_some() && !matches!(self.phone_setup, Some(TailscaleSetup::Ready(_))), |view| {
+                        view.child(surface_button("Get Tailscale for Mac", "phone-install-tailscale", colors, cx, |_, cx| {
+                            cx.open_url("https://tailscale.com/download/mac");
+                        }))
+                        .when(self.phone_setup != Some(TailscaleSetup::NotInstalled), |view| view.child(surface_button("Open Tailscale", "phone-open-tailscale", colors, cx, |_, cx| {
+                            cx.open_url("file:///Applications/Tailscale.app");
+                        })))
+                        .child("In Tailscale, follow the setup prompts and sign in. Diri never asks for your Tailscale password.")
+                    })
+                    .when(!self.phone_loading, |view| view.child(surface_button(
+                        if self.phone_setup.is_none() { "Check this Mac" } else { "Check again" }, "phone-check", colors, cx, |this, cx| {
+                            this.phone_loading = true;
+                            this.phone_error = None;
+                            let task = this.runtime.spawn(crate::phone_access::check_tailscale());
+                            cx.spawn(async move |this, cx| {
+                                let state = task.await.unwrap_or(TailscaleSetup::Unavailable);
+                                let _ = this.update(cx, |this, cx| {
+                                    this.phone_loading = false;
+                                    this.phone_setup = Some(state);
+                                    cx.notify();
+                                });
+                            }).detach();
+                            cx.notify();
+                        }
+                    ))), colors))
+            })
+            .when_some(self.phone_error.clone(), |view, error| view.child(error))
+            .when(self.phone_loading, |view| view.child("Checking your Mac…"))
+            .when(!self.phone_loading && self.phone_access.is_none() && matches!(self.phone_setup, Some(TailscaleSetup::Ready(_))), |view| {
+                view.child(setting_section("2. Connect your iPhone", div().flex().flex_col().gap(px(10.0))
+                    .child("Open Diri on your iPhone. Its setup guide links to Tailscale in the App Store. Sign in there with the same account as this Mac and allow the VPN connection.")
+                    .child("No exit node, Tailscale SSH, port forwarding or other advanced settings are needed.")
+                    .child(settings_primary_button("Enable phone access & show code", "phone-enable", Some("iphone"), cx, |this, _, cx| {
+                    this.phone_loading = true;
+                    this.phone_error = None;
+                    let client = Arc::clone(this.store_runtime.client());
+                    let task = this.runtime.spawn(crate::phone_access::PhoneAccess::start(client));
+                    cx.spawn(async move |this, cx| {
+                        let result = task.await.map_err(|error| error.to_string()).and_then(|result| result);
+                        let _ = this.update(cx, |this, cx| {
+                            this.phone_loading = false;
+                            match result {
+                                Ok(access) => this.phone_access = Some(access),
+                                Err(error) => this.phone_error = Some(error),
+                            }
+                            cx.notify();
+                        });
+                    }).detach();
+                    cx.notify();
+                })), colors))
+            })
+            .when_some(self.phone_access.as_ref(), |view, access| {
+                let size = access.qr.width();
+                let module = (240.0 / (size + 8) as f32).floor();
+                let qr = div().flex().flex_col().p(px(module * 4.0)).bg(gpui::white())
+                    .children((0..size).map(|y| div().flex().children((0..size).map(|x| {
+                        div().w(px(module)).h(px(module)).bg(if access.qr[(x,y)] == qrcode::Color::Dark { gpui::black() } else { gpui::white() })
+                    }))));
+                view.child(if access.is_running() { "Phone access is on" } else { "Phone access stopped. Disable it and enable again." })
+                    .child("In Diri on your iPhone, tap Scan pairing code. We’ll check the connection before saving it.")
+                    .child(div().flex().child(qr))
+                    .child("This code grants control of your sessions. Treat it like a password. Turning access off disconnects all phones; enabling again creates a new code.")
+                    .child(surface_button("Copy pairing link", "phone-copy", colors, cx, |this, cx| {
+                        if let Some(access) = &this.phone_access {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(access.url.clone()));
+                        }
+                    }))
+                    .child(settings_danger_button("Turn off phone access", "phone-disable", cx, |this, cx| {
+                        this.phone_access = None;
+                        cx.notify();
+                    }))
+            });
+        settings_page("Phone access", content, colors)
     }
 
     fn general_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -5307,6 +5403,7 @@ fn settings_tab_matches(tab: SettingsTab, query: &str) -> bool {
         SettingsTab::Remote => {
             "remote ssh openssh hosts machines connections execution tailscale network"
         }
+        SettingsTab::Phone => "phone iphone ios mobile pairing qr tailscale awake",
     };
     query
         .split_whitespace()

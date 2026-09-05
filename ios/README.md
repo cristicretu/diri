@@ -31,13 +31,51 @@ xcodebuild -project DiriPhone.xcodeproj -scheme DiriPhone \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
-## Running it against a real daemon
+## Set up phone access (no terminal required)
 
-Start `diri-web` on the host and open the link it prints:
+1. Install a signed Diri iPhone build. Distribution is described below.
+2. In Diri on the Mac, open **Settings → Phone access → Check this Mac**.
+   Follow the install/sign-in/connect guidance, then check again. Diri only
+   reads Tailscale's status; installation and VPN permissions stay in Tailscale.
+3. Follow the iPhone setup guide. It links directly to Tailscale in the App
+   Store: sign in with the same account, allow the VPN configuration, and return
+   to Diri. No exit node, Tailscale SSH, router changes or commands are needed.
+4. On the Mac, **Enable phone access & show code**. On the phone, tap
+   **Scan pairing code**. Alternatively copy the
+   pairing link from the Mac and paste it on the phone. Connection is verified
+   before saving credentials in Keychain.
+5. Keep Diri open and the Mac plugged in with its lid open. Diri prevents idle
+   sleep while access is enabled; closing the lid or explicitly sleeping still
+   disconnects the phone. The display can turn off.
+
+The gateway is embedded in the Mac app, so there is no separate server binary
+to install or launch. Its bind is Tailscale-only, not your public/LAN address.
+The [Tailscale CLI](https://tailscale.com/docs/reference/tailscale-cli?tab=macos)
+is probed read-only with `TAILSCALE_BE_CLI=1`; Diri does not change VPN settings.
+The pairing code controls all sessions exposed by this Mac: do not share it.
+Turning access off closes existing connections; enabling again produces a new
+code, and the phone must be paired again. Quitting Diri turns access off.
+
+On the phone, **New session** lets you choose this Mac or a configured SSH
+host, a known project or a browsable folder, and an agent installed on that
+computer. **Separate workspace** defaults to a fresh worktree from `main`.
+The base must already exist on the selected computer; no implicit fetch/pull
+or fallback to the currently checked-out feature branch occurs. Use **Branch
+options** for a different base. The original checkout is left unchanged.
+Remote SSH hosts and agent login should first be initialized from the Mac.
+
+The session menu offers **Review changes** (tracked diff against HEAD) and
+**Follow output**. Network errors preserve the prompt draft and show a stale
+screen warning. Mutations are never automatically retried: after a dropped
+connection, inspect the session before sending or starting again.
+
+## Developer CLI / standalone gateway
+
+Start `diri-web` on the host and explicitly print its pairing link:
 
 ```sh
 diri-web --listen forge.your-tailnet.ts.net:7380 --label forge
-diri-web url          # prints http://…/?token=…
+diri-web url --listen forge.your-tailnet.ts.net:7380
 ```
 
 Paste that link into the app's first screen. It is split into a base URL and a
@@ -106,9 +144,18 @@ keeps the original value visible next to it.
 
 ## Distribution
 
-The simulator is the only target this repository can verify on its own — CI has
-no signing identity, so `CODE_SIGNING_ALLOWED` is off. Getting this onto a
-physical phone needs a development team set in Xcode, and a free provisioning
-profile expires after seven days. Until that is sorted, the
-[web frontend](../diri/crates/diri-web) serves the same daemon to mobile Safari
-and installs to the home screen with no signing at all.
+See [TESTFLIGHT.md](TESTFLIGHT.md) for owner setup, signing, privacy/review
+notes, upload steps, and the physical-device checklist. Simulator signing is
+off; device builds use automatic signing with your explicit development team.
+
+```sh
+bash scripts/testflight.sh check
+DIRI_APPLE_TEAM_ID=YOURTEAMID DIRI_BUILD_NUMBER=2 \
+  bash scripts/testflight.sh archive
+```
+
+The scripts never upload, invite testers, or overwrite an existing archive.
+The committed app icon is generated from the code-native Diri terminal mark;
+run `xcrun swift scripts/render-app-icon.swift` only when updating that artwork.
+A successful unsigned build is not proof of signing, TestFlight acceptance,
+camera permission behavior, or real cellular/Tailscale connectivity.
