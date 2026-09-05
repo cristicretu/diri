@@ -235,6 +235,7 @@ pub struct WorktreeSpawn {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SpawnOptions {
+    pub account_profile_id: Option<String>,
     pub cwd: Option<String>,
     pub worktree: Option<WorktreeSpawn>,
     pub title: Option<String>,
@@ -1438,7 +1439,7 @@ impl SessionStore {
         self.focus_session(id);
     }
 
-    fn apply_spawn_result(&mut self, id: SessionId) {
+    pub(crate) fn apply_spawn_result(&mut self, id: SessionId) {
         // session.updated and the spawn response travel on separate channels,
         // so either can arrive first. focus_session handles both orderings:
         // if the record is already present it grants terminal residency now;
@@ -2004,12 +2005,14 @@ impl SessionStore {
             cwd: session.cwd.clone(),
             new_worktree: None,
             worktree_branch: None,
+            worktree_base: None,
             title: Some(AUXILIARY_TERMINAL_TITLE.to_owned()),
             initial_prompt: None,
             parent: Some(parent),
             initial_cols: None,
             initial_rows: None,
             host: session.host.clone(),
+            account_profile_id: None,
             same_repo_as: None,
         }));
         true
@@ -2042,12 +2045,14 @@ impl SessionStore {
             cwd,
             new_worktree,
             worktree_branch,
+            worktree_base: None,
             title: options.title,
             initial_prompt: options.initial_prompt,
             parent: options.parent,
             initial_cols: options.initial_cols,
             initial_rows: options.initial_rows,
             host,
+            account_profile_id: options.account_profile_id,
             same_repo_as: options.same_repo_as,
         }));
     }

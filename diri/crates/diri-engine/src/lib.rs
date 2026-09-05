@@ -18,6 +18,7 @@
 //!   it can be built and tested while the existing daemon keeps serving live
 //!   sessions.
 
+pub mod accounts;
 pub mod activity;
 pub mod agent;
 pub mod agent_catalog;
@@ -39,6 +40,7 @@ pub mod hosts;
 pub mod inject;
 pub mod legacy_remote;
 mod lifecycle;
+pub mod limits;
 pub mod log;
 pub mod migrate;
 pub mod pr_monitor;

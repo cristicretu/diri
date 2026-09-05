@@ -829,6 +829,45 @@ impl DaemonClient {
         self.no_params(Method::DAEMON_SHUTDOWN_IF_IDLE).await
     }
 
+    pub async fn account_profiles(&self) -> Result<diri_proto::AgentAccountCatalog, ClientError> {
+        self.no_params(Method::ACCOUNT_PROFILES_LIST).await
+    }
+
+    pub async fn continue_with_account(
+        &self,
+        session_id: &SessionId,
+        account_profile_id: String,
+    ) -> Result<SessionRecord, ClientError> {
+        self.core
+            .request_typed(
+                Method::SESSION_CONTINUE_ACCOUNT,
+                Some(&diri_proto::ContinueAccountParams {
+                    session_id: session_id.clone(),
+                    account_profile_id,
+                }),
+                Some(std::time::Duration::from_secs(120)),
+            )
+            .await
+    }
+
+    pub async fn save_account_profile(
+        &self,
+        profile: &diri_proto::AgentAccountProfile,
+    ) -> Result<diri_proto::AgentAccountCatalog, ClientError> {
+        self.typed(Method::ACCOUNT_PROFILES_SAVE, profile).await
+    }
+
+    pub async fn remove_account_profile(
+        &self,
+        id: String,
+    ) -> Result<diri_proto::AgentAccountCatalog, ClientError> {
+        self.typed(
+            Method::ACCOUNT_PROFILES_REMOVE,
+            &diri_proto::AgentAccountId { id },
+        )
+        .await
+    }
+
     async fn typed<P, R>(&self, method: &str, params: &P) -> Result<R, ClientError>
     where
         P: Serialize + ?Sized,
@@ -1083,12 +1122,14 @@ mod tests {
                     cwd: scratch.to_string_lossy().into_owned(),
                     new_worktree: None,
                     worktree_branch: None,
+                    worktree_base: None,
                     title: Some("diri-client integration scratch".to_owned()),
                     initial_prompt: None,
                     parent: None,
                     initial_cols: Some(80),
                     initial_rows: Some(24),
                     host: None,
+                    account_profile_id: None,
                     same_repo_as: None,
                 })
                 .await?;

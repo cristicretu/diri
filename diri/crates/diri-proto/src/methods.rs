@@ -42,6 +42,7 @@ impl Method {
     pub const HOST_LOCATE_REPO: &'static str = "host.locate_repo";
     pub const HOST_INITIALIZE: &'static str = "host.initialize";
     pub const HOST_LIST_DIRECTORIES: &'static str = "host.list_directories";
+    pub const HOST_LIST: &'static str = "host.list";
     pub const SESSION_HISTORY: &'static str = "session.history";
     pub const ACTIVITY_LIST: &'static str = "activity.list";
     pub const SESSION_RESUME_FROM_HISTORY: &'static str = "session.resume_from_history";
@@ -54,6 +55,10 @@ impl Method {
     pub const GOVERNOR_CONFIGURE: &'static str = "governor.configure";
     pub const AGENT_READINESS: &'static str = "agent.readiness";
     pub const AGENT_CONFIGURE: &'static str = "agent.configure";
+    pub const ACCOUNT_PROFILES_LIST: &'static str = "account.profiles.list";
+    pub const ACCOUNT_PROFILES_SAVE: &'static str = "account.profiles.save";
+    pub const ACCOUNT_PROFILES_REMOVE: &'static str = "account.profiles.remove";
+    pub const SESSION_CONTINUE_ACCOUNT: &'static str = "session.continue_with_account";
     pub const EVENTS_SUBSCRIBE: &'static str = "events.subscribe";
     pub const EVENTS_WAIT: &'static str = "events.wait";
     pub const HOOK_REPORT: &'static str = "hook.report";
@@ -92,6 +97,14 @@ pub struct EmptyParams {}
 pub type EmptyResult = EmptyParams;
 pub type SessionForkParams = SessionIdParams;
 pub type SessionForkResult = SessionRecord;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContinueAccountParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    pub account_profile_id: String,
+}
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -350,12 +363,18 @@ pub type AgentConfigureResult = AgentReadinessResult;
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionSpawnParams {
+    /// None uses the target's configured default; an empty id uses the CLI environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_profile_id: Option<String>,
     pub kind: AgentKind,
     pub cwd: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_worktree: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree_branch: Option<String>,
+    /// Explicit starting ref for a new worktree. Absent preserves HEAD semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_base: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

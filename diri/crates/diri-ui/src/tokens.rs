@@ -18,6 +18,7 @@ impl Radius {
     pub const ROW: f32 = 7.0;
     pub const CARD: f32 = 10.0;
     pub const PANEL: f32 = 12.0;
+    pub const FLOATING_MENU: f32 = 16.0;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

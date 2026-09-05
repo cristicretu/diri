@@ -16,7 +16,13 @@ actor DiriClient {
         /// exactly what `diri-web url` prints, so the whole setup is one paste.
         init?(enrolmentURL: String) {
             let trimmed = enrolmentURL.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard var components = URLComponents(string: trimmed) else { return nil }
+            guard var components = URLComponents(string: trimmed),
+                  ["http", "https"].contains(components.scheme?.lowercased() ?? ""),
+                  let host = components.host, !host.isEmpty,
+                  components.user == nil, components.password == nil,
+                  components.fragment == nil,
+                  components.queryItems?.filter({ $0.name == "token" }).count == 1
+            else { return nil }
             let token = components.queryItems?.first { $0.name == "token" }?.value
             guard let token, !token.isEmpty else { return nil }
             components.queryItems = nil
@@ -52,6 +58,18 @@ actor DiriClient {
     private let endpoint: Endpoint
     private let session: URLSession
 
+    /// Enrollment must fail promptly with actionable setup guidance. Normal
+    /// session traffic can wait across network changes; a first-time pairing
+    /// must not inherit URLSession's multi-day resource timeout.
+    static func pairingConfiguration() -> URLSessionConfiguration {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 15
+        configuration.timeoutIntervalForResource = 20
+        configuration.waitsForConnectivity = false
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return configuration
+    }
+
     /// `configuration` exists so tests can install a stub `URLProtocol`. The
     /// requests this builds are a contract with `diri-web` — a wrong path or a
     /// missing header fails identically to the daemon being down, which is the
@@ -68,7 +86,7 @@ actor DiriClient {
             configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
             return configuration
         }()
-        session = URLSession(configuration: configuration)
+        session = URLSession(configuration: configuration, delegate: NoRedirects(), delegateQueue: nil)
     }
 
     // MARK: - Requests
@@ -79,6 +97,7 @@ actor DiriClient {
         }
         var request = URLRequest(url: url)
         request.httpMethod = method
+        if path == "/api/spawn" { request.timeoutInterval = 330 }
         request.setValue(endpoint.token, forHTTPHeaderField: "X-Diri-Token")
         if let body {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -149,6 +168,16 @@ actor DiriClient {
         return try decode(Screen.self, from: try await send(try request(path)))
     }
 
+    struct Diff: Decodable, Sendable {
+        var patch: String
+        var repoRoot: String
+        var truncated: Bool
+    }
+
+    func diff(sessionID: String) async throws -> Diff {
+        try decode(Diff.self, from: try await send(try request("/api/session/\(escape(sessionID))/diff")))
+    }
+
     struct AgentReadiness: Decodable {
         struct Item: Decodable {
             var kind: AgentKind
@@ -159,13 +188,51 @@ actor DiriClient {
         var agents: [Item]
     }
 
-    func agents() async throws -> [AgentReadiness.Item] {
+    func agents(host: String? = nil) async throws -> [AgentReadiness.Item] {
         let payload = try decode(
-            AgentReadiness.self, from: try await send(try request("/api/agents"))
+            AgentReadiness.self, from: try await send(try request(queryPath("/api/agents", ["host": host])))
         )
         // `path` is set only when the daemon actually found the binary, so this
         // offers what this host can really start rather than the whole catalog.
-        return payload.agents.filter { $0.path != nil }
+        return payload.agents.filter { $0.path != nil || $0.kind.id == "shell" }
+    }
+
+    struct Host: Decodable, Identifiable, Sendable {
+        var id: String
+        var name: String
+        var defaultCwd: String?
+    }
+
+    func hosts() async throws -> [Host] {
+        struct Payload: Decodable { var hosts: [Host] }
+        return try decode(Payload.self, from: try await send(try request("/api/hosts"))).hosts
+    }
+
+    struct DirectoryListing: Decodable, Sendable {
+        struct Entry: Decodable, Identifiable, Sendable {
+            var name: String
+            var path: String
+            var id: String { path }
+        }
+        var path: String
+        var parent: String?
+        var entries: [Entry]
+        var truncated: Bool
+    }
+
+    func directories(host: String?, path: String) async throws -> DirectoryListing {
+        try decode(DirectoryListing.self, from: try await send(try request(
+            queryPath("/api/directories", ["host": host, "path": path])
+        )))
+    }
+
+    private func queryPath(_ path: String, _ values: [String: String?]) -> String {
+        var components = URLComponents()
+        components.path = path
+        components.queryItems = values.sorted { $0.key < $1.key }.compactMap { key, value in
+            value.map { URLQueryItem(name: key, value: $0) }
+        }
+        return components.string ?? path
     }
 
     func send(text: String, to sessionID: String, submit: Bool = true) async throws {
@@ -186,8 +253,15 @@ actor DiriClient {
         _ = try await send(try request("/api/session/\(escape(sessionID))/seen", method: "POST"))
     }
 
-    func spawn(kind: String, cwd: String, prompt: String?) async throws -> SessionRecord {
+    func spawn(kind: String, cwd: String, prompt: String?, host: String? = nil,
+               worktree: Bool = false, branch: String? = nil, base: String? = nil) async throws -> SessionRecord {
         var body: [String: Any] = ["kind": kind, "cwd": cwd]
+        if let host { body["host"] = host }
+        if worktree {
+            body["worktree"] = true
+            body["base"] = base ?? "main"
+            if let branch, !branch.isEmpty { body["branch"] = branch }
+        }
         if let prompt, !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             body["prompt"] = prompt
         }
@@ -230,7 +304,7 @@ actor DiriClient {
     }
 
     private func escape(_ value: String) -> String {
-        value.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? value
+        value.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? value
     }
 }
 

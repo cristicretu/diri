@@ -4,7 +4,8 @@
 //! presentation live together here. Views execute actions; they do not decode
 //! keystrokes or maintain their own copies of shortcut labels.
 
-use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::sync::{OnceLock, RwLock};
 
 use gpui::{Action, App, KeyBinding, Keystroke, actions};
 
@@ -13,6 +14,10 @@ pub const SESSION_NAVIGATION_CONTEXT: &str = "DiriSessionNavigation";
 pub const TERMINAL_CONTEXT: &str = "DiriTerminal";
 pub const NAVIGATION_CONTEXT: &str = "DiriNavigation";
 pub const UTILITY_CONTEXT: &str = "DiriUtility";
+
+pub type ShortcutOverrides = BTreeMap<String, Option<String>>;
+
+static ACTIVE_SHORTCUT_OVERRIDES: OnceLock<RwLock<ShortcutOverrides>> = OnceLock::new();
 
 actions!(diri_app, [Quit, HideApp, CloseWindow]);
 
@@ -126,6 +131,42 @@ pub enum CommandId {
     ResetZoom,
     Paste,
     CopySelection,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShortcutCategory {
+    Sessions,
+    Navigation,
+    Workspace,
+    Terminal,
+    Application,
+}
+
+impl ShortcutCategory {
+    pub const ALL: [Self; 5] = [
+        Self::Sessions,
+        Self::Navigation,
+        Self::Workspace,
+        Self::Terminal,
+        Self::Application,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Sessions => "Sessions",
+            Self::Navigation => "Navigation",
+            Self::Workspace => "Workspace",
+            Self::Terminal => "Terminal",
+            Self::Application => "Application",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShortcutMetadata {
+    pub title: &'static str,
+    pub description: &'static str,
+    pub category: ShortcutCategory,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -550,11 +591,12 @@ pub fn command(id: CommandId) -> &'static CommandSpec {
 /// bindings. Modal surfaces use this to decide which application commands may
 /// continue through capture without duplicating raw shortcut strings.
 pub fn matches_keystroke(id: CommandId, keystroke: &Keystroke) -> bool {
+    let overrides = active_shortcut_overrides()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     command(id)
-        .keystroke
+        .effective_keystrokes(&overrides)
         .into_iter()
-        .chain(command(id).alternate_keystrokes.iter().copied())
-        .filter_map(|binding| platform_keystroke(id, binding))
         .filter_map(|binding| Keystroke::parse(&binding).ok())
         .any(|binding| {
             binding.modifiers == keystroke.modifiers
@@ -563,22 +605,82 @@ pub fn matches_keystroke(id: CommandId, keystroke: &Keystroke) -> bool {
         })
 }
 
-pub fn bind_default_keys(cx: &mut App) {
-    cx.bind_keys(COMMANDS.iter().flat_map(CommandSpec::key_bindings));
+/// Installs the shipped keymap plus persisted user overrides at app startup.
+pub fn bind_keys(cx: &mut App, overrides: &ShortcutOverrides) {
+    set_active_shortcut_overrides(overrides);
+    bind_active_keys(cx, overrides);
+}
+
+/// Replaces the live keymap after an edit. Diri is the only owner of GPUI key
+/// bindings in this application, so rebuilding avoids leaving stale custom
+/// bindings active after a user changes or clears one.
+pub fn rebind_keys(cx: &mut App, overrides: &ShortcutOverrides) {
+    set_active_shortcut_overrides(overrides);
+    cx.clear_key_bindings();
+    bind_active_keys(cx, overrides);
+}
+
+fn bind_active_keys(cx: &mut App, overrides: &ShortcutOverrides) {
+    cx.bind_keys(
+        COMMANDS
+            .iter()
+            .flat_map(|command| command.key_bindings(overrides)),
+    );
+}
+
+fn active_shortcut_overrides() -> &'static RwLock<ShortcutOverrides> {
+    ACTIVE_SHORTCUT_OVERRIDES.get_or_init(|| RwLock::new(ShortcutOverrides::new()))
+}
+
+fn set_active_shortcut_overrides(overrides: &ShortcutOverrides) {
+    *active_shortcut_overrides()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = overrides.clone();
 }
 
 impl CommandSpec {
-    fn key_bindings(&self) -> Vec<KeyBinding> {
-        self.keystroke
+    fn key_bindings(&self, overrides: &ShortcutOverrides) -> Vec<KeyBinding> {
+        self.effective_keystrokes(overrides)
             .into_iter()
-            .chain(self.alternate_keystrokes.iter().copied())
-            .filter_map(|key| platform_keystroke(self.id, key))
             .map(|key| self.key_binding(&key))
             .collect()
     }
 
     pub fn shortcut_label(&self) -> Option<String> {
-        self.shortcut.map(platform_shortcut_label)
+        let overrides = active_shortcut_overrides()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.shortcut_label_for(&overrides)
+    }
+
+    pub fn shortcut_label_for(&self, overrides: &ShortcutOverrides) -> Option<String> {
+        match overrides.get(self.stable_id) {
+            Some(None) => None,
+            Some(Some(binding)) if Keystroke::parse(binding).is_ok() => Keystroke::parse(binding)
+                .ok()
+                .map(|key| shortcut_label_for_keystroke(&key)),
+            _ => self
+                .keystroke
+                .and_then(|binding| platform_keystroke(self.id, binding))
+                .and_then(|_| self.shortcut.map(platform_shortcut_label)),
+        }
+    }
+
+    pub fn is_overridden(&self, overrides: &ShortcutOverrides) -> bool {
+        overrides.contains_key(self.stable_id)
+    }
+
+    pub fn effective_keystrokes(&self, overrides: &ShortcutOverrides) -> Vec<String> {
+        match overrides.get(self.stable_id) {
+            Some(None) => Vec::new(),
+            Some(Some(binding)) if Keystroke::parse(binding).is_ok() => vec![binding.clone()],
+            _ => self
+                .keystroke
+                .into_iter()
+                .chain(self.alternate_keystrokes.iter().copied())
+                .filter_map(|key| platform_keystroke(self.id, key))
+                .collect(),
+        }
     }
 
     fn key_binding(&self, key: &str) -> KeyBinding {
@@ -654,19 +756,19 @@ impl CommandSpec {
 }
 
 #[cfg(target_os = "macos")]
-fn platform_keystroke(_id: CommandId, key: &'static str) -> Option<Cow<'static, str>> {
-    Some(Cow::Borrowed(key))
+fn platform_keystroke(_id: CommandId, key: &str) -> Option<String> {
+    Some(key.to_owned())
 }
 
 #[cfg(not(target_os = "macos"))]
-fn platform_keystroke(id: CommandId, key: &'static str) -> Option<Cow<'static, str>> {
+fn platform_keystroke(id: CommandId, key: &str) -> Option<String> {
     if id == CommandId::HideApp {
         return None;
     }
     let key = key
         .replace("cmd-ctrl-", "ctrl-shift-")
         .replace("cmd-", "ctrl-");
-    Some(Cow::Owned(key))
+    Some(key)
 }
 
 #[cfg(target_os = "macos")]
@@ -688,6 +790,67 @@ fn platform_shortcut_label(label: &str) -> String {
     modifiers.join("+")
 }
 
+#[cfg(target_os = "macos")]
+fn shortcut_label_for_keystroke(keystroke: &Keystroke) -> String {
+    let mut label = String::new();
+    if keystroke.modifiers.function {
+        label.push_str("fn");
+    }
+    if keystroke.modifiers.control {
+        label.push('⌃');
+    }
+    if keystroke.modifiers.alt {
+        label.push('⌥');
+    }
+    if keystroke.modifiers.shift {
+        label.push('⇧');
+    }
+    if keystroke.modifiers.platform {
+        label.push('⌘');
+    }
+    label.push_str(match keystroke.key.as_str() {
+        "backspace" => "⌫",
+        "delete" => "⌦",
+        "enter" => "↩",
+        "tab" => "⇥",
+        "escape" => "⎋",
+        "space" => "Space",
+        "up" => "↑",
+        "down" => "↓",
+        "left" => "←",
+        "right" => "→",
+        key => return format!("{label}{}", key.to_ascii_uppercase()),
+    });
+    label
+}
+
+#[cfg(not(target_os = "macos"))]
+fn shortcut_label_for_keystroke(keystroke: &Keystroke) -> String {
+    let mut parts = Vec::new();
+    if keystroke.modifiers.control {
+        parts.push("Ctrl".to_owned());
+    }
+    if keystroke.modifiers.alt {
+        parts.push("Alt".to_owned());
+    }
+    if keystroke.modifiers.shift {
+        parts.push("Shift".to_owned());
+    }
+    if keystroke.modifiers.platform {
+        parts.push("Super".to_owned());
+    }
+    if keystroke.modifiers.function {
+        parts.push("Fn".to_owned());
+    }
+    let key = match keystroke.key.as_str() {
+        "escape" => "Esc".to_owned(),
+        "space" => "Space".to_owned(),
+        key => key.to_ascii_uppercase(),
+    };
+    parts.push(key);
+    parts.join("+")
+}
+
 pub fn primary_shortcut_label(key: &str) -> String {
     platform_shortcut_label(&format!("⌘{key}"))
 }
@@ -697,6 +860,262 @@ pub fn primary_click_label() -> &'static str {
         "Command-click"
     } else {
         "Ctrl-click"
+    }
+}
+
+/// Finds another command that already owns `binding`. Contexts are
+/// deliberately treated as overlapping: application shortcuts remain active
+/// while terminal and navigation contexts are focused, so allowing a duplicate
+/// would make the result depend on focus in ways the settings row cannot show.
+pub fn shortcut_conflict(
+    id: CommandId,
+    binding: &str,
+    overrides: &ShortcutOverrides,
+) -> Option<&'static CommandSpec> {
+    let candidate = Keystroke::parse(binding).ok()?;
+    COMMANDS.iter().find(|command| {
+        command.id != id
+            && command
+                .effective_keystrokes(overrides)
+                .iter()
+                .any(|current| {
+                    Keystroke::parse(current).is_ok_and(|current| {
+                        current.modifiers == candidate.modifiers && current.key == candidate.key
+                    })
+                })
+    })
+}
+
+impl CommandId {
+    pub const fn shortcut_metadata(self) -> ShortcutMetadata {
+        use ShortcutCategory::{Application, Navigation, Sessions, Terminal, Workspace};
+        match self {
+            Self::CloseSession => ShortcutMetadata {
+                title: "Close session",
+                description: "Close the selected session",
+                category: Sessions,
+            },
+            Self::ReopenSession => ShortcutMetadata {
+                title: "Reopen closed session",
+                description: "Restore the most recently closed session",
+                category: Sessions,
+            },
+            Self::OpenLauncher => ShortcutMetadata {
+                title: "New session",
+                description: "Open the new session picker",
+                category: Sessions,
+            },
+            Self::NewDefaultSession => ShortcutMetadata {
+                title: "New default session",
+                description: "Start a session with the default agent",
+                category: Sessions,
+            },
+            Self::NewTerminal => ShortcutMetadata {
+                title: "New terminal",
+                description: "Start a standalone shell session",
+                category: Sessions,
+            },
+            Self::NewCodexSession => ShortcutMetadata {
+                title: "New Codex session",
+                description: "Start a new Codex session",
+                category: Sessions,
+            },
+            Self::ArchiveSelectedSession => ShortcutMetadata {
+                title: "Archive session",
+                description: "Archive the selected session",
+                category: Sessions,
+            },
+            Self::RenameSelectedSession => ShortcutMetadata {
+                title: "Rename session",
+                description: "Rename the selected session",
+                category: Sessions,
+            },
+            Self::DelegateSelectedSession => ShortcutMetadata {
+                title: "Delegate session",
+                description: "Hand off work from the selected session",
+                category: Sessions,
+            },
+            Self::SelectNextAttentionSession => ShortcutMetadata {
+                title: "Next session needing attention",
+                description: "Jump to the next session waiting for you",
+                category: Sessions,
+            },
+            Self::QuoteSelection => ShortcutMetadata {
+                title: "Quote selection",
+                description: "Add the terminal selection to this session's composer",
+                category: Sessions,
+            },
+            Self::QuoteSelectionToSession => ShortcutMetadata {
+                title: "Quote selection to session",
+                description: "Send the terminal selection to another session",
+                category: Sessions,
+            },
+            Self::ToggleHistory => ShortcutMetadata {
+                title: "Conversation history",
+                description: "Open or close conversation history",
+                category: Navigation,
+            },
+            Self::ToggleOverview => ShortcutMetadata {
+                title: "Session overview",
+                description: "Open or close the session overview",
+                category: Navigation,
+            },
+            Self::OpenWorktrees => ShortcutMetadata {
+                title: "Worktrees overview",
+                description: "Open the Git worktrees overview",
+                category: Navigation,
+            },
+            Self::ToggleCommandPalette => ShortcutMetadata {
+                title: "Command palette",
+                description: "Search all available commands",
+                category: Navigation,
+            },
+            Self::ToggleQuickOpen => ShortcutMetadata {
+                title: "Quick Open",
+                description: "Find and open a project folder",
+                category: Navigation,
+            },
+            Self::SelectPreviousSession => ShortcutMetadata {
+                title: "Previous session",
+                description: "Select the previous session in the sidebar",
+                category: Navigation,
+            },
+            Self::SelectNextSession => ShortcutMetadata {
+                title: "Next session",
+                description: "Select the next session in the sidebar",
+                category: Navigation,
+            },
+            Self::MoveSelectedSessionUp => ShortcutMetadata {
+                title: "Move session up",
+                description: "Move the selected session up in the sidebar",
+                category: Navigation,
+            },
+            Self::MoveSelectedSessionDown => ShortcutMetadata {
+                title: "Move session down",
+                description: "Move the selected session down in the sidebar",
+                category: Navigation,
+            },
+            Self::SelectSession1 => {
+                session_slot_metadata("Select session 1", "Select the first session")
+            }
+            Self::SelectSession2 => {
+                session_slot_metadata("Select session 2", "Select the second session")
+            }
+            Self::SelectSession3 => {
+                session_slot_metadata("Select session 3", "Select the third session")
+            }
+            Self::SelectSession4 => {
+                session_slot_metadata("Select session 4", "Select the fourth session")
+            }
+            Self::SelectSession5 => {
+                session_slot_metadata("Select session 5", "Select the fifth session")
+            }
+            Self::SelectSession6 => {
+                session_slot_metadata("Select session 6", "Select the sixth session")
+            }
+            Self::SelectSession7 => {
+                session_slot_metadata("Select session 7", "Select the seventh session")
+            }
+            Self::SelectSession8 => {
+                session_slot_metadata("Select session 8", "Select the eighth session")
+            }
+            Self::SelectLastSession => {
+                session_slot_metadata("Select last session", "Select the last session")
+            }
+            Self::ToggleSidebar => ShortcutMetadata {
+                title: "Toggle sidebar",
+                description: "Show or hide the sessions sidebar",
+                category: Workspace,
+            },
+            Self::FocusSidebar => ShortcutMetadata {
+                title: "Focus sidebar",
+                description: "Move keyboard focus to the sessions sidebar",
+                category: Workspace,
+            },
+            Self::ToggleInspector => ShortcutMetadata {
+                title: "Toggle inspector",
+                description: "Show or hide the session inspector",
+                category: Workspace,
+            },
+            Self::ToggleAuxiliaryTerminal => ShortcutMetadata {
+                title: "Toggle auxiliary terminal",
+                description: "Show or hide the lower terminal pane",
+                category: Workspace,
+            },
+            Self::OpenFind => ShortcutMetadata {
+                title: "Find in terminal",
+                description: "Search the active terminal output",
+                category: Terminal,
+            },
+            Self::FindNext => ShortcutMetadata {
+                title: "Find next",
+                description: "Move to the next terminal search result",
+                category: Terminal,
+            },
+            Self::FindPrevious => ShortcutMetadata {
+                title: "Find previous",
+                description: "Move to the previous terminal search result",
+                category: Terminal,
+            },
+            Self::ZoomIn => ShortcutMetadata {
+                title: "Increase text size",
+                description: "Make terminal text larger",
+                category: Terminal,
+            },
+            Self::ZoomOut => ShortcutMetadata {
+                title: "Decrease text size",
+                description: "Make terminal text smaller",
+                category: Terminal,
+            },
+            Self::ResetZoom => ShortcutMetadata {
+                title: "Reset text size",
+                description: "Restore the default terminal text size",
+                category: Terminal,
+            },
+            Self::Paste => ShortcutMetadata {
+                title: "Paste",
+                description: "Paste clipboard contents into the terminal",
+                category: Terminal,
+            },
+            Self::CopySelection => ShortcutMetadata {
+                title: "Copy selection",
+                description: "Copy the terminal selection",
+                category: Terminal,
+            },
+            Self::OpenSettings => ShortcutMetadata {
+                title: "Open settings",
+                description: "Open or close Diri settings",
+                category: Application,
+            },
+            Self::CheckForUpdates => ShortcutMetadata {
+                title: "Check for updates",
+                description: "Look for a newer version of Diri",
+                category: Application,
+            },
+            Self::CloseWindow => ShortcutMetadata {
+                title: "Close window",
+                description: "Close the current Diri window",
+                category: Application,
+            },
+            Self::HideApp => ShortcutMetadata {
+                title: "Hide Diri",
+                description: "Hide all Diri windows",
+                category: Application,
+            },
+            Self::Quit => ShortcutMetadata {
+                title: "Quit Diri",
+                description: "Close Diri and leave no windows open",
+                category: Application,
+            },
+        }
+    }
+}
+
+const fn session_slot_metadata(title: &'static str, description: &'static str) -> ShortcutMetadata {
+    ShortcutMetadata {
+        title,
+        description,
+        category: ShortcutCategory::Navigation,
     }
 }
 
@@ -853,9 +1272,51 @@ mod tests {
     fn every_registered_keystroke_parses() {
         let binding_count: usize = COMMANDS
             .iter()
-            .map(|command| command.key_bindings().len())
+            .map(|command| command.key_bindings(&ShortcutOverrides::new()).len())
             .sum();
         assert!(binding_count > COMMANDS.len());
+    }
+
+    #[test]
+    fn overrides_replace_all_shipped_bindings_and_can_unassign_a_command() {
+        let previous = command(CommandId::SelectPreviousSession);
+        let mut overrides = ShortcutOverrides::new();
+        overrides.insert(
+            previous.stable_id.to_owned(),
+            Some("cmd-shift-y".to_owned()),
+        );
+        assert_eq!(previous.effective_keystrokes(&overrides), ["cmd-shift-y"]);
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            previous.shortcut_label_for(&overrides).as_deref(),
+            Some("⇧⌘Y")
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(
+            previous.shortcut_label_for(&overrides).as_deref(),
+            Some("Shift+Super+Y")
+        );
+
+        overrides.insert(previous.stable_id.to_owned(), None);
+        assert!(previous.effective_keystrokes(&overrides).is_empty());
+        assert_eq!(previous.shortcut_label_for(&overrides), None);
+    }
+
+    #[test]
+    fn conflicts_include_alternate_bindings() {
+        let overrides = ShortcutOverrides::new();
+        let conflict = shortcut_conflict(CommandId::OpenLauncher, "cmd-[", &overrides)
+            .expect("navigation alternate should be reserved");
+        assert_eq!(conflict.id, CommandId::SelectPreviousSession);
+    }
+
+    #[test]
+    fn every_command_has_shortcut_page_copy() {
+        for command in COMMANDS {
+            let metadata = command.id.shortcut_metadata();
+            assert!(!metadata.title.is_empty());
+            assert!(!metadata.description.is_empty());
+        }
     }
 
     #[test]

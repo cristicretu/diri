@@ -1131,6 +1131,13 @@ impl Session {
         self.shared.status.lock().expect("status").clone()
     }
 
+    /// Total bytes the child has ever written. The governor compares this
+    /// across sweeps: a growing tail is a working session, whatever the
+    /// status heuristics currently believe.
+    pub fn output_tail(&self) -> u64 {
+        self.shared.log.lock().expect("log").tail_offset()
+    }
+
     /// Reads recorded output by absolute stream offset, for attach and replay.
     pub fn read_output(&self, from_offset: u64, max_bytes: usize) -> (u64, Vec<u8>) {
         self.shared
@@ -1654,7 +1661,11 @@ impl Session {
                 // The holder escalates TERM → KILL itself; wait for the exit
                 // marker to land in the log so the recorded exit is the real
                 // one.
-                let _ = client.kill_tree();
+                if let Err(error) = client.kill_tree()
+                    && !self.shared.exited.load(Ordering::SeqCst)
+                {
+                    return Err(holder_io_error(error));
+                }
                 let deadline = std::time::Instant::now() + grace + Duration::from_secs(1);
                 while std::time::Instant::now() < deadline {
                     if self.shared.exited.load(Ordering::SeqCst) {
@@ -1662,11 +1673,12 @@ impl Session {
                     }
                     std::thread::sleep(Duration::from_millis(20));
                 }
-                self.shared
-                    .exit
-                    .lock()
-                    .expect("exit")
-                    .unwrap_or(Exit::Signal(libc::SIGKILL))
+                self.shared.exit.lock().expect("exit").ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Holder did not confirm Agent exit; the session remains tracked",
+                    )
+                })?
             }
             Transport::Remote(client) => {
                 if !self.shared.exited.load(Ordering::SeqCst) {

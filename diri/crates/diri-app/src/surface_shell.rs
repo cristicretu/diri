@@ -1,3 +1,6 @@
+#[path = "usage_page.rs"]
+mod usage_page;
+
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -10,10 +13,12 @@ use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::query_label;
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
 use crate::settings::{HostDraft, SettingsNav, SettingsTab, theme};
+mod account_settings;
 use crate::sidebar::DraggedSidebarItem;
 use crate::store::{Prefs, SessionStore, StoreRuntime};
 use crate::updates::{UpdateCommand, UpdateHandle, UpdatePhase};
 use crate::worktrees::WorktreesSheet;
+use account_settings::AccountsState;
 use diri_proto::{AgentKind as ProtoAgentKind, HistoryEntry, HostEntry, HostsConfig};
 use diri_term::theme::{TermTheme, ThemeAppearance};
 use diri_ui::{
@@ -21,22 +26,22 @@ use diri_ui::{
     Radius, SemanticColors, Typo,
 };
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, Bounds, ClickEvent, Context, CursorStyle,
+    Animation, AnimationExt, AnyElement, App, Bounds, BoxShadow, ClickEvent, Context, CursorStyle,
     FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton, PathPromptOptions,
-    Pixels, Render, Rgba, ScrollHandle, SharedString, Task, TextRun, Window, canvas, deferred, div,
-    ease_out_quint, font, point, prelude::*, px, rgba,
+    Pixels, Render, Rgba, ScrollHandle, ScrollStrategy, SharedString, Task, TextRun,
+    UniformListScrollHandle, Window, canvas, deferred, div, ease_out_quint, font, point,
+    prelude::*, px, rgba, uniform_list,
 };
 use tokio::runtime::Runtime;
 
 use crate::commands::{
-    Activate, CloseSurface, CommandId, MoveDown, MoveUp, OpenSettings, OpenWorktrees,
-    ToggleHistory, UTILITY_CONTEXT,
+    Activate, COMMANDS, CloseSurface, CommandId, MoveDown, MoveUp, OpenSettings, OpenWorktrees,
+    ShortcutCategory, ToggleHistory, UTILITY_CONTEXT,
 };
 const SETTINGS_CONTENT_MAX_WIDTH: f32 = 760.0;
 const SETTINGS_TRANSITION_DURATION: Duration = Duration::from_millis(190);
 const SETTINGS_SECTION_GAP: f32 = 16.0;
 const SETTINGS_ROW_HEIGHT: f32 = 50.0;
-const RESULT_LIMIT: usize = 200;
 const HOST_FIELD_HORIZONTAL_PADDING: f32 = 10.0;
 /// Reinstall success is confirmation, not persistent host state. Errors stay
 /// actionable and first-time setup keeps its "Use by default" action.
@@ -122,6 +127,12 @@ struct AgentPathEditor {
     host: Option<String>,
     path: QueryEditor,
     show_in_quick_create: bool,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ShortcutEditor {
+    command: CommandId,
     error: Option<String>,
 }
 
@@ -242,6 +253,11 @@ impl HostEditor {
 }
 
 pub struct UtilitySurfaces {
+    accounts: AccountsState,
+    phone_access: Option<crate::phone_access::PhoneAccess>,
+    phone_loading: bool,
+    phone_error: Option<String>,
+    phone_setup: Option<crate::phone_access::TailscaleSetup>,
     focus: FocusHandle,
     surface: Surface,
     history: Vec<HistoryEntry>,
@@ -249,11 +265,23 @@ pub struct UtilitySurfaces {
     history_highlight: usize,
     history_loading: bool,
     history_error: Option<String>,
+    history_scanner: Option<crate::history::HistoryScanner>,
+    history_search: crate::history::HistorySearch,
+    history_matches: Vec<usize>,
+    history_scroll: UniformListScrollHandle,
+    history_resuming: Option<String>,
     worktrees: WorktreesSheet,
     settings_tab: SettingsTab,
+    usage: crate::usage::UsageSnapshot,
+    usage_days: usize,
+    usage_tokens: bool,
+    usage_by_day: bool,
     settings_scroll: ScrollHandle,
     settings_search: QueryEditor,
     settings_search_active: bool,
+    shortcut_search: QueryEditor,
+    shortcut_search_active: bool,
+    shortcut_editor: Option<ShortcutEditor>,
     settings_transition_generation: u64,
     settings_menu: Option<SettingsMenu>,
     agents_host: Option<String>,
@@ -302,10 +330,14 @@ impl UtilitySurfaces {
             .ok()
             .map(|value| value.to_ascii_lowercase());
         let settings_tab = match settings_preview.as_deref() {
-            Some("terminal") => SettingsTab::Terminal,
+            Some("terminal" | "appearance") => SettingsTab::Terminal,
             Some("agents") => SettingsTab::Agents,
+            Some("accounts") => SettingsTab::Accounts,
+            Some("shortcuts") => SettingsTab::Shortcuts,
             Some("resources") => SettingsTab::Resources,
             Some("remote") => SettingsTab::Remote,
+            Some("phone") => SettingsTab::Phone,
+            Some("usage") => SettingsTab::Usage,
             _ => SettingsTab::General,
         };
         let diagnostics_preview = settings_preview.as_deref() == Some("diagnostics");
@@ -347,6 +379,11 @@ impl UtilitySurfaces {
         };
         Self {
             focus,
+            accounts: AccountsState::default(),
+            phone_access: None,
+            phone_loading: false,
+            phone_error: None,
+            phone_setup: None,
             surface: if diagnostics_preview {
                 Surface::Diagnostics
             } else if settings_preview.is_some() {
@@ -359,11 +396,23 @@ impl UtilitySurfaces {
             history_highlight: 0,
             history_loading: false,
             history_error: None,
+            history_scanner: Some(crate::history::HistoryScanner::default()),
+            history_search: crate::history::HistorySearch::default(),
+            history_matches: Vec::new(),
+            history_scroll: UniformListScrollHandle::new(),
+            history_resuming: None,
             worktrees: WorktreesSheet::default(),
             settings_tab,
+            usage: crate::usage::UsageSnapshot::default(),
+            usage_days: 30,
+            usage_tokens: false,
+            usage_by_day: false,
             settings_scroll: ScrollHandle::new(),
             settings_search: QueryEditor::default(),
             settings_search_active: false,
+            shortcut_search: QueryEditor::default(),
+            shortcut_search_active: false,
+            shortcut_editor: None,
             settings_transition_generation: 0,
             settings_menu: None,
             agents_host,
@@ -397,37 +446,41 @@ impl UtilitySurfaces {
         self.surface = Surface::History;
         self.history_query.clear();
         self.history_highlight = 0;
+        self.history_scroll = UniformListScrollHandle::new();
+        self.filter_history();
+        self.history_error = None;
+        cx.notify();
+        self.refresh_history(cx);
+    }
+
+    fn refresh_history(&mut self, cx: &mut Context<Self>) {
+        // Reopening uses the last result immediately and shares any in-flight
+        // scan. History is local data: a disconnected Engine must not delay it.
+        let Some(mut scanner) = self.history_scanner.take() else {
+            return;
+        };
         self.history_loading = true;
         self.history_error = None;
         cx.notify();
 
         let roots = crate::history::HistoryRoots::current_user();
-        let client = Arc::clone(self.store_runtime.client());
+        let tracked = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .sessions()
+            .values()
+            .filter_map(|session| session.agent_session_id.clone())
+            .collect();
         let runtime = Arc::clone(&self.runtime);
         cx.spawn(async move |this, cx| {
             let task = runtime.spawn(async move {
-                let tracked = if client
-                    .wait_until_connected(Duration::from_secs(5))
-                    .await
-                    .is_ok()
-                {
-                    client
-                        .sessions()
-                        .await
-                        .map(|result| {
-                            result
-                                .sessions
-                                .into_iter()
-                                .filter_map(|session| session.agent_session_id)
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                } else {
-                    HashSet::new()
-                };
-                tokio::task::spawn_blocking(move || crate::history::scan(&roots, &tracked))
-                    .await
-                    .map_err(|error| error.to_string())
+                tokio::task::spawn_blocking(move || {
+                    let entries = scanner.scan(&roots, &tracked);
+                    (scanner, entries)
+                })
+                .await
+                .map_err(|error| error.to_string())
             });
             let result = task
                 .await
@@ -436,11 +489,34 @@ impl UtilitySurfaces {
             let _ = this.update(cx, |this, cx| {
                 this.history_loading = false;
                 match result {
-                    Ok(entries) => {
+                    Ok((scanner, mut entries)) => {
+                        // A session can become tracked while the disk scan is
+                        // running. Reconcile against the current store as well.
+                        let tracked = this
+                            .store
+                            .read()
+                            .expect("session store lock poisoned")
+                            .sessions()
+                            .values()
+                            .filter_map(|session| session.agent_session_id.clone())
+                            .collect::<HashSet<_>>();
+                        entries.retain(|entry| !tracked.contains(&entry.id));
+                        let selected_id = this.highlighted_history().map(|entry| entry.id.clone());
+                        this.history_scanner = Some(scanner);
                         this.activity = format!("{} past conversations found", entries.len());
                         this.history = entries;
+                        this.history_search.rebuild(&this.history);
+                        this.filter_history();
+                        if let Some(index) = this.history_matches.iter().position(|index| {
+                            Some(&this.history[*index].id) == selected_id.as_ref()
+                        }) {
+                            this.history_highlight = index;
+                        }
                     }
-                    Err(error) => this.history_error = Some(error),
+                    Err(error) => {
+                        this.history_scanner = Some(crate::history::HistoryScanner::default());
+                        this.history_error = Some(error);
+                    }
                 }
                 cx.notify();
             });
@@ -483,15 +559,39 @@ impl UtilitySurfaces {
     }
 
     fn resume_history(&mut self, entry: HistoryEntry, cx: &mut Context<Self>) {
+        if self.history_resuming.is_some() {
+            return;
+        }
+        let existing = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .sessions()
+            .values()
+            .find(|session| {
+                session.agent_session_id.as_deref() == Some(&entry.id) && session.kind == entry.kind
+            })
+            .map(|session| session.id.clone());
+        if let Some(id) = existing {
+            self.store
+                .write()
+                .expect("session store lock poisoned")
+                .select(id);
+            self.surface = Surface::None;
+            cx.notify();
+            return;
+        }
         if !entry.cwd_exists || !Path::new(&entry.cwd).is_dir() {
             self.history_error = Some("The conversation folder is no longer available".to_owned());
             cx.notify();
             return;
         }
-        self.history_loading = true;
+        self.history_resuming = Some(entry.id.clone());
         self.history_error = None;
+        cx.notify();
         let client = Arc::clone(self.store_runtime.client());
         let runtime = Arc::clone(&self.runtime);
+        let conversation_id = entry.id.clone();
         cx.spawn(async move |this, cx| {
             let task = runtime.spawn(async move {
                 client.wait_until_connected(Duration::from_secs(5)).await?;
@@ -502,10 +602,19 @@ impl UtilitySurfaces {
                 Err(error) => Err(error.to_string()),
             };
             let _ = this.update(cx, |this, cx| {
-                this.history_loading = false;
+                this.history_resuming = None;
                 match result {
                     Ok(id) => {
-                        this.surface = Surface::None;
+                        this.history.retain(|entry| entry.id != conversation_id);
+                        this.history_search.rebuild(&this.history);
+                        this.filter_history();
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .apply_spawn_result(id.clone());
+                        if this.surface == Surface::History {
+                            this.surface = Surface::None;
+                        }
                         this.activity = format!("Resumed conversation in session {id}");
                     }
                     Err(error) => this.history_error = Some(error),
@@ -554,7 +663,7 @@ impl UtilitySurfaces {
         cx.notify();
     }
 
-    fn persist_prefs(&mut self) {
+    fn persist_prefs(&mut self) -> bool {
         self.prefs.normalize();
         let prefs = self.prefs.clone();
         if let Err(error) = self
@@ -564,9 +673,11 @@ impl UtilitySurfaces {
             .update_preferences(|shared| *shared = prefs)
         {
             self.activity = format!("Could not save settings: {error}");
+            false
         } else {
             self.store_runtime.publish_local_change();
             self.activity = "Settings saved for diri".to_owned();
+            true
         }
     }
 
@@ -968,25 +1079,31 @@ impl UtilitySurfaces {
         true
     }
 
-    fn visible_history(&self) -> Vec<HistoryEntry> {
-        self.history
-            .iter()
-            .filter(|entry| crate::history::matches_query(entry, self.history_query.text()))
-            .take(RESULT_LIMIT)
-            .cloned()
-            .collect()
+    fn filter_history(&mut self) {
+        self.history_matches = self.history_search.rank(self.history_query.text());
+        self.history_highlight = self
+            .history_highlight
+            .min(self.history_matches.len().saturating_sub(1));
+    }
+
+    fn highlighted_history(&self) -> Option<&HistoryEntry> {
+        self.history_matches
+            .get(self.history_highlight)
+            .and_then(|index| self.history.get(*index))
     }
 
     fn move_history(&mut self, delta: isize, cx: &mut Context<Self>) {
         if self.surface != Surface::History {
             return;
         }
-        let count = self.visible_history().len();
+        let count = self.history_matches.len();
         if count == 0 {
             return;
         }
         self.history_highlight =
             (self.history_highlight as isize + delta).rem_euclid(count as isize) as usize;
+        self.history_scroll
+            .scroll_to_item(self.history_highlight, ScrollStrategy::Nearest);
         cx.notify();
     }
 
@@ -994,7 +1111,7 @@ impl UtilitySurfaces {
         if self.surface != Surface::History {
             return;
         }
-        if let Some(entry) = self.visible_history().get(self.history_highlight).cloned() {
+        if let Some(entry) = self.highlighted_history().cloned() {
             self.resume_history(entry, cx);
         }
     }
@@ -1006,6 +1123,7 @@ impl UtilitySurfaces {
             self.worktrees.cancel_move();
         } else {
             self.surface = Surface::None;
+            self.clear_account_continuation();
             self.settings_menu = None;
             self.host_editor = None;
             self.agent_path_editor = None;
@@ -1038,6 +1156,9 @@ impl UtilitySurfaces {
         self.settings_menu = None;
         self.host_editor = None;
         self.agent_path_editor = None;
+        self.shortcut_search.clear();
+        self.shortcut_search_active = false;
+        self.shortcut_editor = None;
         cx.notify();
     }
 
@@ -1103,14 +1224,22 @@ impl UtilitySurfaces {
     }
 
     fn select_settings_tab(&mut self, tab: SettingsTab, cx: &mut Context<Self>) {
+        if tab != SettingsTab::Accounts {
+            self.clear_account_continuation();
+        }
         if self.settings_tab != tab {
             self.settings_scroll.set_offset(point(px(0.0), px(0.0)));
         }
         self.settings_tab = tab;
+        if tab == SettingsTab::Accounts {
+            self.refresh_accounts(cx);
+        }
         self.settings_search_active = false;
         self.settings_menu = None;
         self.host_editor = None;
         self.agent_path_editor = None;
+        self.shortcut_search_active = false;
+        self.shortcut_editor = None;
         if tab == SettingsTab::Remote {
             self.reload_hosts();
         } else if tab == SettingsTab::Agents {
@@ -1120,6 +1249,199 @@ impl UtilitySurfaces {
                 .request_agent_catalog(self.agents_host.clone(), false);
         }
         cx.notify();
+    }
+
+    fn begin_shortcut_edit(
+        &mut self,
+        command: CommandId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings_search_active = false;
+        self.shortcut_search_active = false;
+        self.shortcut_editor = Some(ShortcutEditor {
+            command,
+            error: None,
+        });
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn focus_shortcut_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.shortcut_editor = None;
+        self.settings_search_active = false;
+        self.shortcut_search_active = true;
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn clear_shortcut_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.shortcut_search.clear();
+        self.focus_shortcut_search(window, cx);
+    }
+
+    fn save_shortcut_override(
+        &mut self,
+        command: CommandId,
+        value: Option<Option<String>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let stable_id = crate::commands::command(command).stable_id.to_owned();
+        let previous = match value {
+            Some(value) => self
+                .prefs
+                .shortcut_overrides
+                .insert(stable_id.clone(), value),
+            None => self.prefs.shortcut_overrides.remove(&stable_id),
+        };
+        if !self.persist_prefs() {
+            match previous {
+                Some(previous) => {
+                    self.prefs.shortcut_overrides.insert(stable_id, previous);
+                }
+                None => {
+                    self.prefs.shortcut_overrides.remove(&stable_id);
+                }
+            }
+            return false;
+        }
+
+        crate::commands::rebind_keys(cx, &self.prefs.shortcut_overrides);
+        crate::refresh_app_menus(cx);
+        self.activity = format!("Updated {}", command.shortcut_metadata().title);
+        true
+    }
+
+    fn assign_shortcut(&mut self, command: CommandId, binding: String, cx: &mut Context<Self>) {
+        if let Some(conflict) =
+            crate::commands::shortcut_conflict(command, &binding, &self.prefs.shortcut_overrides)
+        {
+            if let Some(editor) = &mut self.shortcut_editor {
+                editor.error = Some(format!(
+                    "Already used by {}.",
+                    conflict.id.shortcut_metadata().title
+                ));
+            }
+            cx.notify();
+            return;
+        }
+        if self.save_shortcut_override(command, Some(Some(binding)), cx) {
+            self.shortcut_editor = None;
+        } else if let Some(editor) = &mut self.shortcut_editor {
+            editor.error = Some("Could not save this shortcut.".to_owned());
+        }
+        cx.notify();
+    }
+
+    fn unassign_shortcut(&mut self, command: CommandId, cx: &mut Context<Self>) {
+        if self.save_shortcut_override(command, Some(None), cx) {
+            self.shortcut_editor = None;
+        }
+        cx.notify();
+    }
+
+    fn restore_shortcut(&mut self, command: CommandId, cx: &mut Context<Self>) {
+        if self.save_shortcut_override(command, None, cx) {
+            self.shortcut_editor = None;
+        }
+        cx.notify();
+    }
+
+    fn restore_all_shortcuts(&mut self, cx: &mut Context<Self>) {
+        if self.prefs.shortcut_overrides.is_empty() {
+            return;
+        }
+        let previous = std::mem::take(&mut self.prefs.shortcut_overrides);
+        if self.persist_prefs() {
+            crate::commands::rebind_keys(cx, &self.prefs.shortcut_overrides);
+            crate::refresh_app_menus(cx);
+            self.shortcut_editor = None;
+            self.activity = "Restored every keyboard shortcut".to_owned();
+        } else {
+            self.prefs.shortcut_overrides = previous;
+        }
+        cx.notify();
+    }
+
+    fn handle_shortcut_editor_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.surface != Surface::Settings || self.settings_tab != SettingsTab::Shortcuts {
+            return false;
+        }
+        let Some(command) = self.shortcut_editor.as_ref().map(|editor| editor.command) else {
+            return false;
+        };
+        let key = &event.keystroke;
+        if key.key == "escape" {
+            self.shortcut_editor = None;
+            cx.notify();
+            return true;
+        }
+        if matches!(key.key.as_str(), "backspace" | "delete") && !key.modifiers.modified() {
+            self.unassign_shortcut(command, cx);
+            return true;
+        }
+        if matches!(
+            key.key.as_str(),
+            "shift" | "control" | "ctrl" | "alt" | "platform" | "function" | "fn"
+        ) {
+            return true;
+        }
+        let function_key = key
+            .key
+            .strip_prefix('f')
+            .and_then(|number| number.parse::<u8>().ok())
+            .is_some_and(|number| (1..=35).contains(&number));
+        if !key.modifiers.modified() && !function_key {
+            if let Some(editor) = &mut self.shortcut_editor {
+                editor.error = Some("Include Command, Control, Option, or a function key.".into());
+            }
+            cx.notify();
+            return true;
+        }
+        self.assign_shortcut(command, key.unparse(), cx);
+        true
+    }
+
+    fn handle_shortcut_search_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.surface != Surface::Settings
+            || self.settings_tab != SettingsTab::Shortcuts
+            || !self.shortcut_search_active
+        {
+            return false;
+        }
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                if self.shortcut_search.is_empty() {
+                    self.shortcut_search_active = false;
+                } else {
+                    self.shortcut_search.clear();
+                }
+                cx.notify();
+            }
+            _ => {
+                let Some(edit) = query_editor::edit_for(&event.keystroke) else {
+                    return true;
+                };
+                match edit {
+                    Edit::Local(local) => {
+                        self.shortcut_search.apply(local);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Copy) => {
+                        query_editor::copy_selection(&self.shortcut_search, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Cut) => {
+                        query_editor::cut_selection(&mut self.shortcut_search, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Paste) => {
+                        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                            self.shortcut_search.insert(&text);
+                        }
+                    }
+                }
+                cx.notify();
+            }
+        }
+        true
     }
 
     fn handle_settings_search_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
@@ -1211,7 +1533,15 @@ impl UtilitySurfaces {
         if self.surface == Surface::None {
             return;
         }
-        if self.handle_agent_path_key(event, cx) || self.handle_host_editor_key(event, cx) {
+        if self.handle_shortcut_editor_key(event, cx) || self.handle_shortcut_search_key(event, cx)
+        {
+            cx.stop_propagation();
+            return;
+        }
+        if self.handle_account_key(event, cx)
+            || self.handle_agent_path_key(event, cx)
+            || self.handle_host_editor_key(event, cx)
+        {
             return;
         }
         if self.handle_settings_search_key(event, cx) {
@@ -1258,143 +1588,204 @@ impl UtilitySurfaces {
             };
             if changed {
                 self.history_highlight = 0;
+                self.filter_history();
+                self.history_scroll.scroll_to_item(0, ScrollStrategy::Top);
             }
             cx.notify();
         }
     }
 
-    fn render_history(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = self.colors();
-        let entries = self.visible_history();
-        let empty = entries.is_empty() && !self.history_loading;
-        let rows = entries.into_iter().enumerate().map(|(index, entry)| {
-            let selected = index == self.history_highlight;
-            let resumable = entry.cwd_exists;
-            let folder = folder_name(&entry.cwd).to_owned();
-            let parent = relative_parent(&entry.cwd);
-            let title = entry
-                .title
-                .clone()
-                .unwrap_or_else(|| "Untitled conversation".to_owned());
-            let age = relative_time(entry.last_active_at.0);
-            let agent = ui_agent(&entry.kind);
-            div()
-                .id(("history-row", index))
-                .h(px(46.0))
-                .px(px(10.0))
-                .rounded(px(Radius::ROW))
-                .flex()
-                .items_center()
-                .gap(px(9.0))
-                .opacity(if resumable { 1.0 } else { 0.45 })
-                .bg(Fill::selected(colors, selected))
-                .cursor_pointer()
-                .hover(move |style| style.bg(Fill::hover(colors, true)))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if resumable {
+    fn render_history_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let entry = self.history[self.history_matches[index]].clone();
+        let selected = index == self.history_highlight;
+        let resumable = entry.cwd_exists;
+        let opening = self.history_resuming.as_deref() == Some(&entry.id);
+        let busy = self.history_resuming.is_some();
+        let folder = folder_name(&entry.cwd).to_owned();
+        let parent = relative_parent(&entry.cwd);
+        let title = entry
+            .title
+            .clone()
+            .unwrap_or_else(|| "Untitled conversation".to_owned());
+        let age = relative_time(entry.last_active_at.0);
+        let agent = ui_agent(&entry.kind);
+        div()
+            .h(px(56.0))
+            .px(px(8.0))
+            .py(px(2.0))
+            .child(
+                div()
+                    .id(("history-row", index))
+                    .debug_selector(move || format!("history-row-{index}"))
+                    .h_full()
+                    .px(px(10.0))
+                    .rounded(px(Radius::CARD))
+                    .flex()
+                    .items_center()
+                    .gap(px(9.0))
+                    .bg(Fill::selected(colors, selected))
+                    .when(resumable && !busy, |row| row.cursor_pointer())
+                    .when(!resumable, |row| {
+                        row.cursor(CursorStyle::OperationNotAllowed)
+                    })
+                    .hover(move |style| {
+                        style.bg(if selected {
+                            Fill::selected(colors, true)
+                        } else {
+                            Fill::hover(colors, true)
+                        })
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.history_highlight = index;
                         this.resume_history(entry.clone(), cx);
-                    }
-                }))
-                .child(AgentLogo::new(agent, 18.0, colors))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .gap(px(2.0))
-                        .child(
-                            div()
-                                .text_size(px(13.0))
-                                .text_color(colors.primary)
-                                .overflow_hidden()
-                                .child(title),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .gap(px(5.0))
-                                .text_size(px(11.0))
-                                .child(div().text_color(colors.secondary).child(folder))
-                                .child(div().text_color(colors.tertiary).child(parent)),
-                        ),
-                )
-                .child(chip(
-                    if !resumable {
-                        "folder gone".to_owned()
-                    } else if selected {
-                        "↵ resume".to_owned()
-                    } else {
-                        age
-                    },
-                    colors,
-                ))
-        });
+                    }))
+                    .child(AgentLogo::new(agent, 24.0, colors))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .font_weight(if selected {
+                                        FontWeight::MEDIUM
+                                    } else {
+                                        FontWeight::NORMAL
+                                    })
+                                    .text_color(colors.primary)
+                                    .truncate()
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .overflow_hidden()
+                                    .gap(px(5.0))
+                                    .text_size(px(11.0))
+                                    .child(div().text_color(colors.secondary).child(folder))
+                                    .child(
+                                        div().text_color(colors.tertiary).truncate().child(parent),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(11.0))
+                            .text_color(colors.secondary)
+                            .child(if opening {
+                                "Opening…".to_owned()
+                            } else if !resumable {
+                                "Folder unavailable".to_owned()
+                            } else {
+                                age
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_history(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        let count = self.history_matches.len();
+        let entity = cx.entity();
+        let selected = self.highlighted_history();
+        let status = if self.history_resuming.is_some() {
+            "Opening conversation…".to_owned()
+        } else if self.history_loading {
+            "Updating history…".to_owned()
+        } else if self.history_query.is_empty() {
+            format!("{count} conversations · Recent first")
+        } else {
+            format!("{count} matches · Best match first")
+        };
 
         FloatingSurface::new(
-            self.colors(),
+            colors,
             div()
-                .w(px(560.0))
-                .max_h(px(440.0))
+                .id("conversation-history")
+                .debug_selector(|| "conversation-history".into())
+                .w(px(620.0))
+                .max_w_full()
                 .flex()
                 .flex_col()
                 .child(
+                    div().px(px(18.0)).pt(px(14.0)).pb(px(10.0)).flex().items_center().justify_between()
+                        .child(div().text_size(px(13.0)).font_weight(FontWeight::SEMIBOLD).child("Past conversations"))
+                        .child(div().id("close-history").cursor_pointer().rounded(px(Radius::ROW))
+                            .px(px(7.0)).py(px(4.0)).text_size(px(11.0)).text_color(colors.secondary)
+                            .hover(move |style| style.bg(Fill::hover(colors, true)))
+                            .on_click(cx.listener(|this, _, _, cx| this.close_surface(cx)))
+                            .child("esc")),
+                )
+                .child(div().px(px(12.0)).pb(px(10.0)).child(
                     div()
-                        .h(px(48.0))
-                        .px(px(16.0))
+                        .h(px(40.0))
+                        .px(px(12.0))
+                        .rounded(px(Radius::CARD))
+                        .bg(Fill::subtle(colors))
+                        .border_1().border_color(colors.primary.alpha(0.10))
                         .flex()
                         .items_center()
                         .gap(px(10.0))
-                        .text_size(px(15.0))
+                        .text_size(px(13.0))
                         .child(sf_symbol("magnifyingglass", 13.0, colors.tertiary))
                         .child(
                             div()
                                 .flex_1()
+                                .min_w(px(0.0))
+                                .overflow_hidden()
                                 .text_color(if self.history_query.is_empty() {
                                     colors.tertiary
                                 } else {
                                     colors.primary
                                 })
                                 .child(if self.history_query.is_empty() {
-                                    div().child("Search past conversations…").into_any_element()
+                                    div().child("Search by title, project, or agent…").into_any_element()
                                 } else {
                                     query_label(&self.history_query)
                                 }),
                         )
-                        .child(chip("esc".to_owned(), colors)),
-                )
+                        .when(!self.history_query.is_empty(), |view| view.child(
+                            div().id("clear-history-search").cursor_pointer().text_color(colors.secondary)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.history_query.clear(); this.history_highlight = 0;
+                                    this.filter_history(); this.history_scroll.scroll_to_item(0, ScrollStrategy::Top); cx.notify();
+                                })).child(sf_symbol("xmark.circle.fill", 13.0, colors.tertiary))
+                        )),
+                ))
+                .child(div().px(px(18.0)).pb(px(8.0)).flex().items_center().justify_between()
+                    .child(div().text_size(px(11.0)).text_color(colors.secondary).child(status))
+                    .when(!self.history_loading, |view| view.child(div().id("refresh-history").cursor_pointer()
+                        .text_size(px(11.0)).text_color(colors.secondary)
+                        .on_click(cx.listener(|this, _, _, cx| this.refresh_history(cx))).child("Refresh"))))
+                .when_some(self.history_error.clone(), |view, error| view.child(
+                    div().px(px(18.0)).py(px(8.0)).text_size(px(12.0)).text_color(Ink::DANGER).child(error)))
+                .child(div().h(px(336.0)).when(count > 0, |view| view.child(
+                    uniform_list("history-results", count, move |range, _, cx| {
+                        entity.update(cx, |this, cx| range.map(|index| this.render_history_row(index, cx)).collect())
+                    }).track_scroll(&self.history_scroll).size_full()
+                )).when(count == 0, |view| view.child(
+                    div().size_full().flex().flex_col().items_center().justify_center().gap(px(10.0))
+                        .child(sf_symbol("magnifyingglass", 24.0, colors.tertiary))
+                        .child(div().text_size(px(13.0)).text_color(colors.primary).child(
+                            if self.history_loading { "Finding your conversations…" } else if self.history_query.is_empty() { "Your next conversation starts here" } else { "No matching conversations" }))
+                        .child(div().text_size(px(12.0)).text_color(colors.secondary).child(
+                            if self.history_query.is_empty() { "Past Claude and Codex chats appear here automatically." } else { "Try a project name, agent, or a few words from the title." }))
+                )))
                 .child(HairlineDivider::horizontal(colors))
-                .child(
-                    div()
-                        .id("history-results")
-                        .max_h(px(380.0))
-                        .overflow_y_scroll()
-                        .p(px(6.0))
-                        .flex()
-                        .flex_col()
-                        .gap(px(1.0))
-                        .when(self.history_loading, |view| {
-                            view.child(empty_label(
-                                "Scanning Claude and Codex transcripts…",
-                                colors,
-                            ))
-                        })
-                        .when_some(self.history_error.clone(), |view, error| {
-                            view.child(empty_label(&error, colors))
-                        })
-                        .when(empty, |view| {
-                            view.child(empty_label(
-                                if self.history_query.is_empty() {
-                                    "No past conversations"
-                                } else {
-                                    "No matches"
-                                },
-                                colors,
-                            ))
-                        })
-                        .children(rows),
-                ),
-        )
+                .child(div().px(px(18.0)).py(px(10.0)).h(px(88.0)).flex().flex_col().justify_between().gap(px(5.0))
+                    .child(div().text_size(px(12.0)).text_color(colors.primary).max_h(px(36.0)).overflow_hidden()
+                        .child(selected.and_then(|entry| entry.title.clone()).unwrap_or_else(|| "Pick up where you left off".to_owned())))
+                    .child(div().flex().items_center().justify_between().gap(px(12.0))
+                        .child(div().min_w(px(0.0)).flex_1().text_size(px(11.0)).text_color(colors.secondary).truncate()
+                            .child(selected.map(|entry| entry.cwd.clone()).unwrap_or_else(|| "Search all your local conversations".to_owned())))
+                        .child(div().flex_none().text_size(px(11.0)).text_color(colors.secondary).child("↑ ↓ navigate    ↵ open"))))
+        ).radius(Radius::FLOATING_MENU)
     }
 
     fn render_worktrees(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1602,7 +1993,7 @@ impl UtilitySurfaces {
                         })
                         .when(
                             self.worktrees.entries.is_empty() && !self.worktrees.loading,
-                            |view| view.child(empty_label("No worktrees", colors)),
+                            |view| view.child(empty_label("No worktrees yet. Start a session with a new worktree to work on a separate branch.", colors)),
                         )
                         .children(cards),
                 )
@@ -1813,9 +2204,13 @@ impl UtilitySurfaces {
         let pane = match self.settings_tab {
             SettingsTab::General => self.general_settings(cx).into_any_element(),
             SettingsTab::Agents => self.agents_settings(cx).into_any_element(),
+            SettingsTab::Accounts => self.accounts_settings(cx).into_any_element(),
+            SettingsTab::Shortcuts => self.shortcuts_settings(cx).into_any_element(),
             SettingsTab::Terminal => self.terminal_settings(cx).into_any_element(),
             SettingsTab::Resources => self.resource_settings(cx).into_any_element(),
             SettingsTab::Remote => self.remote_settings(cx).into_any_element(),
+            SettingsTab::Phone => self.phone_settings(cx).into_any_element(),
+            SettingsTab::Usage => self.usage_settings(cx).into_any_element(),
         };
         let pane = div()
             .id("settings-pane")
@@ -1830,7 +2225,11 @@ impl UtilitySurfaces {
             .child(
                 div()
                     .w_full()
-                    .max_w(px(SETTINGS_CONTENT_MAX_WIDTH))
+                    .max_w(px(if self.settings_tab == SettingsTab::Usage {
+                        1040.0
+                    } else {
+                        SETTINGS_CONTENT_MAX_WIDTH
+                    }))
                     .mx_auto()
                     .child(pane),
             );
@@ -1869,6 +2268,92 @@ impl UtilitySurfaces {
                 }),
             )
             .child(pane)
+    }
+
+    fn phone_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::phone_access::TailscaleSetup;
+        let colors = self.settings_colors();
+        let content = div().flex().flex_col().gap(px(20.0))
+            .child(setting_section("Your Mac does the work. Your phone is the remote.",
+                div().flex().flex_col().gap(px(10.0))
+                    .child("A one-time setup, with no commands, router settings or addresses to type.")
+                    .child("Keep Diri running and your Mac plugged in with its lid open. The display can turn off; closing the lid or choosing Sleep disconnects your phone."), colors))
+            .when(self.phone_access.is_none(), |view| {
+                view.child(setting_section("1. Connect this Mac", div().flex().flex_col().gap(px(10.0))
+                    .child(self.phone_setup.map(TailscaleSetup::message).unwrap_or("We’ll check whether Tailscale is ready. It keeps the connection between your devices private."))
+                    .when(self.phone_setup.is_some() && !matches!(self.phone_setup, Some(TailscaleSetup::Ready(_))), |view| {
+                        view.child(surface_button("Get Tailscale for Mac", "phone-install-tailscale", colors, cx, |_, cx| {
+                            cx.open_url("https://tailscale.com/download/mac");
+                        }))
+                        .when(self.phone_setup != Some(TailscaleSetup::NotInstalled), |view| view.child(surface_button("Open Tailscale", "phone-open-tailscale", colors, cx, |_, cx| {
+                            cx.open_url("file:///Applications/Tailscale.app");
+                        })))
+                        .child("In Tailscale, follow the setup prompts and sign in. Diri never asks for your Tailscale password.")
+                    })
+                    .when(!self.phone_loading, |view| view.child(surface_button(
+                        if self.phone_setup.is_none() { "Check this Mac" } else { "Check again" }, "phone-check", colors, cx, |this, cx| {
+                            this.phone_loading = true;
+                            this.phone_error = None;
+                            let task = this.runtime.spawn(crate::phone_access::check_tailscale());
+                            cx.spawn(async move |this, cx| {
+                                let state = task.await.unwrap_or(TailscaleSetup::Unavailable);
+                                let _ = this.update(cx, |this, cx| {
+                                    this.phone_loading = false;
+                                    this.phone_setup = Some(state);
+                                    cx.notify();
+                                });
+                            }).detach();
+                            cx.notify();
+                        }
+                    ))), colors))
+            })
+            .when_some(self.phone_error.clone(), |view, error| view.child(error))
+            .when(self.phone_loading, |view| view.child("Checking your Mac…"))
+            .when(!self.phone_loading && self.phone_access.is_none() && matches!(self.phone_setup, Some(TailscaleSetup::Ready(_))), |view| {
+                view.child(setting_section("2. Connect your iPhone", div().flex().flex_col().gap(px(10.0))
+                    .child("Open Diri on your iPhone. Its setup guide links to Tailscale in the App Store. Sign in there with the same account as this Mac and allow the VPN connection.")
+                    .child("No exit node, Tailscale SSH, port forwarding or other advanced settings are needed.")
+                    .child(settings_primary_button("Enable phone access & show code", "phone-enable", Some("iphone"), cx, |this, _, cx| {
+                    this.phone_loading = true;
+                    this.phone_error = None;
+                    let client = Arc::clone(this.store_runtime.client());
+                    let task = this.runtime.spawn(crate::phone_access::PhoneAccess::start(client));
+                    cx.spawn(async move |this, cx| {
+                        let result = task.await.map_err(|error| error.to_string()).and_then(|result| result);
+                        let _ = this.update(cx, |this, cx| {
+                            this.phone_loading = false;
+                            match result {
+                                Ok(access) => this.phone_access = Some(access),
+                                Err(error) => this.phone_error = Some(error),
+                            }
+                            cx.notify();
+                        });
+                    }).detach();
+                    cx.notify();
+                })), colors))
+            })
+            .when_some(self.phone_access.as_ref(), |view, access| {
+                let size = access.qr.width();
+                let module = (240.0 / (size + 8) as f32).floor();
+                let qr = div().flex().flex_col().p(px(module * 4.0)).bg(gpui::white())
+                    .children((0..size).map(|y| div().flex().children((0..size).map(|x| {
+                        div().w(px(module)).h(px(module)).bg(if access.qr[(x,y)] == qrcode::Color::Dark { gpui::black() } else { gpui::white() })
+                    }))));
+                view.child(if access.is_running() { "Phone access is on" } else { "Phone access stopped. Disable it and enable again." })
+                    .child("In Diri on your iPhone, tap Scan pairing code. We’ll check the connection before saving it.")
+                    .child(div().flex().child(qr))
+                    .child("This code grants control of your sessions. Treat it like a password. Turning access off disconnects all phones; enabling again creates a new code.")
+                    .child(surface_button("Copy pairing link", "phone-copy", colors, cx, |this, cx| {
+                        if let Some(access) = &this.phone_access {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(access.url.clone()));
+                        }
+                    }))
+                    .child(settings_danger_button("Turn off phone access", "phone-disable", cx, |this, cx| {
+                        this.phone_access = None;
+                        cx.notify();
+                    }))
+            });
+        settings_page("Phone access", content, colors)
     }
 
     fn general_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2014,6 +2499,181 @@ impl UtilitySurfaces {
                         ),
                     colors,
                 )),
+            colors,
+        )
+    }
+
+    fn shortcuts_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        let query = self.shortcut_search.text();
+        let search_content = if self.shortcut_search_active {
+            query_label(&self.shortcut_search)
+        } else if self.shortcut_search.is_empty() {
+            div()
+                .text_color(colors.tertiary)
+                .child("Search shortcuts…")
+                .into_any_element()
+        } else {
+            div()
+                .text_color(colors.primary)
+                .child(query.to_owned())
+                .into_any_element()
+        };
+
+        let search = div()
+            .id("shortcut-search")
+            .debug_selector(|| "shortcut-search".into())
+            .relative()
+            .h(px(34.0))
+            .flex_1()
+            .min_w(px(0.0))
+            .px(px(10.0))
+            .rounded(px(17.0))
+            .border_1()
+            .border_color(colors.primary.alpha(if self.shortcut_search_active {
+                0.22
+            } else {
+                0.10
+            }))
+            .bg(colors.primary.alpha(0.025))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .cursor(CursorStyle::IBeam)
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.focus_shortcut_search(window, cx);
+            }))
+            .child(sf_symbol("magnifyingglass", 12.0, colors.tertiary))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_size(px(Typo::ROW.size))
+                    .child(search_content),
+            )
+            .when(!self.shortcut_search.is_empty(), |search| {
+                search.child(
+                    div()
+                        .id("clear-shortcut-search")
+                        .debug_selector(|| "clear-shortcut-search".into())
+                        .size(px(18.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(Fill::subtle(colors)))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.clear_shortcut_search(window, cx);
+                        }))
+                        .child(sf_symbol("xmark", 8.0, colors.tertiary)),
+                )
+            })
+            .child(sf_symbol("keyboard", 12.0, colors.tertiary));
+
+        let mut groups = div()
+            .debug_selector(|| "shortcut-groups".into())
+            .flex()
+            .flex_col()
+            .gap(px(SETTINGS_SECTION_GAP));
+        let mut found = false;
+        for category in ShortcutCategory::ALL {
+            let commands = COMMANDS
+                .iter()
+                .filter(|command| {
+                    command.id.shortcut_metadata().category == category
+                        && shortcut_matches(command, query, &self.prefs.shortcut_overrides)
+                })
+                .collect::<Vec<_>>();
+            if commands.is_empty() {
+                continue;
+            }
+            found = true;
+            let mut rows = div().flex().flex_col();
+            for (index, command) in commands.into_iter().enumerate() {
+                if index > 0 {
+                    rows = rows.child(setting_divider(colors));
+                }
+                rows = rows.child(shortcut_row(
+                    command,
+                    self.shortcut_editor.as_ref(),
+                    &self.prefs.shortcut_overrides,
+                    colors,
+                    cx,
+                ));
+            }
+            groups = groups.child(setting_section(category.label(), rows, colors));
+        }
+
+        let results = if found {
+            groups.into_any_element()
+        } else {
+            div()
+                .min_h(px(180.0))
+                .rounded(px(Radius::ROW))
+                .border_1()
+                .border_color(colors.primary.alpha(0.065))
+                .bg(colors.primary.alpha(0.02))
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(8.0))
+                .child(sf_symbol("keyboard", 22.0, colors.tertiary))
+                .child(
+                    div()
+                        .text_size(px(Typo::ROW_EMPHASIZED.size))
+                        .font_weight(Typo::ROW_EMPHASIZED.weight)
+                        .text_color(colors.primary)
+                        .child("No shortcuts found"),
+                )
+                .child(
+                    div()
+                        .text_size(px(Typo::META.size))
+                        .text_color(colors.tertiary)
+                        .child("Try an action name, description, or key."),
+                )
+                .into_any_element()
+        };
+
+        let modified_count = self.prefs.shortcut_overrides.len();
+        settings_page(
+            "Keyboard shortcuts",
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(16.0))
+                .child(
+                    div()
+                        .text_size(px(Typo::ROW.size))
+                        .line_height(px(18.0))
+                        .text_color(colors.secondary)
+                        .child(
+                            "Choose an action, then press a new key combination. Changes apply immediately.",
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.0))
+                        .child(search)
+                        .when(modified_count > 0, |toolbar| {
+                            toolbar.child(surface_button(
+                                format!("Reset all ({modified_count})"),
+                                "reset-all-shortcuts",
+                                colors,
+                                cx,
+                                |this, cx| this.restore_all_shortcuts(cx),
+                            ))
+                        }),
+                )
+                .child(results),
             colors,
         )
     }
@@ -2636,95 +3296,258 @@ impl UtilitySurfaces {
     fn terminal_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.settings_colors();
         let selected = theme(&self.prefs.terminal_theme);
+        let can_make_smaller = self.prefs.terminal_font_size > 10.0;
+        let can_make_larger = self.prefs.terminal_font_size < 20.0;
         let font_control = div()
-            .h(px(28.0))
-            .rounded(px(Radius::BADGE))
+            .h(px(32.0))
+            .rounded(px(Radius::ROW))
             .border_1()
-            .border_color(colors.primary.alpha(0.11))
-            .bg(colors.primary.alpha(0.045))
+            .border_color(colors.primary.alpha(0.12))
+            .bg(colors.primary.alpha(0.04))
+            .overflow_hidden()
             .flex()
             .items_center()
             .child(
                 div()
                     .id("font-smaller")
-                    .w(px(30.0))
+                    .w(px(34.0))
                     .h_full()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(15.0))
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(colors.primary.alpha(0.08)))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.prefs.zoom_terminal(-1.0);
-                        this.persist_prefs();
-                        cx.notify();
-                    }))
+                    .text_size(px(16.0))
+                    .text_color(if can_make_smaller {
+                        colors.primary
+                    } else {
+                        colors.tertiary
+                    })
+                    .when(can_make_smaller, |button| {
+                        button
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(colors.primary.alpha(0.08)))
+                            .active(move |style| style.bg(colors.primary.alpha(0.12)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.prefs.zoom_terminal(-1.0);
+                                this.persist_prefs();
+                                cx.notify();
+                            }))
+                    })
                     .child("−"),
             )
             .child(HairlineDivider::vertical(colors))
             .child(
                 div()
-                    .w(px(52.0))
+                    .w(px(58.0))
                     .flex()
                     .items_center()
                     .justify_center()
                     .font_family(crate::fonts::mono_family())
                     .text_size(px(11.0))
-                    .text_color(colors.secondary)
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(colors.primary)
                     .child(format!("{:.0} pt", self.prefs.terminal_font_size)),
             )
             .child(HairlineDivider::vertical(colors))
             .child(
                 div()
                     .id("font-larger")
-                    .w(px(30.0))
+                    .w(px(34.0))
                     .h_full()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(15.0))
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(colors.primary.alpha(0.08)))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.prefs.zoom_terminal(1.0);
-                        this.persist_prefs();
-                        cx.notify();
-                    }))
+                    .text_size(px(16.0))
+                    .text_color(if can_make_larger {
+                        colors.primary
+                    } else {
+                        colors.tertiary
+                    })
+                    .when(can_make_larger, |button| {
+                        button
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(colors.primary.alpha(0.08)))
+                            .active(move |style| style.bg(colors.primary.alpha(0.12)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.prefs.zoom_terminal(1.0);
+                                this.persist_prefs();
+                                cx.notify();
+                            }))
+                    })
                     .child("+"),
             );
 
-        settings_page(
-            "Terminal",
+        let mut featured_themes = div().w_full().flex().flex_wrap().gap(px(9.0));
+        for (index, candidate) in [
+            TermTheme::DIRIJOR_DARK,
+            TermTheme::VESPER,
+            TermTheme::DIRIJOR_LIGHT,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            featured_themes = featured_themes.child(featured_theme_card(
+                index,
+                candidate,
+                candidate.id == selected.id,
+                colors,
+                cx,
+            ));
+        }
+
+        appearance_settings_page(
             div()
                 .flex()
                 .flex_col()
-                .gap(px(SETTINGS_SECTION_GAP))
-                .child(setting_section(
-                    "Appearance",
+                .gap(px(18.0))
+                .child(
                     div()
+                        .relative()
+                        .rounded(px(Radius::PANEL))
+                        .border_1()
+                        .border_color(colors.primary.alpha(0.085))
+                        .bg(colors.primary.alpha(0.022))
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .min_h(px(62.0))
+                                .p(px(13.0))
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(12.0))
+                                .child(
+                                    div()
+                                        .min_w(px(230.0))
+                                        .flex_1()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(10.0))
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .size(px(32.0))
+                                                .rounded(px(Radius::ROW))
+                                                .bg(selected.cursor.alpha(0.13))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .child(sf_symbol(
+                                                    "sparkles",
+                                                    13.0,
+                                                    selected.cursor,
+                                                )),
+                                        )
+                                        .child(setting_text_stack(
+                                            "Color theme".into(),
+                                            "One palette for Diri, every terminal, and all app chrome."
+                                                .into(),
+                                            colors,
+                                        )),
+                                )
+                                .child(self.terminal_theme_dropdown(cx)),
+                        )
+                        .child(setting_divider(colors))
+                        .child(
+                            div()
+                                .p(px(12.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(9.0))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .child(
+                                            div()
+                                                .text_size(px(Typo::META.size))
+                                                .font_weight(Typo::META.weight)
+                                                .text_color(colors.secondary)
+                                                .child("Quick themes"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(Typo::META.size - 1.0))
+                                                .text_color(colors.tertiary)
+                                                .child("Select to preview instantly"),
+                                        ),
+                                )
+                                .child(featured_themes),
+                        )
+                        .child(setting_divider(colors))
+                        .child(
+                            div()
+                                .p(px(12.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(9.0))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap(px(12.0))
+                                        .child(
+                                            div()
+                                                .text_size(px(Typo::META.size))
+                                                .font_weight(Typo::META.weight)
+                                                .text_color(colors.secondary)
+                                                .child("Live workspace preview"),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(5.0))
+                                                .child(
+                                                    div()
+                                                        .size(px(5.0))
+                                                        .rounded_full()
+                                                        .bg(Ink::FRESH),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .font_family(crate::fonts::mono_family())
+                                                        .text_size(px(10.0))
+                                                        .text_color(colors.tertiary)
+                                                        .child(format!(
+                                                            "{} · {:.0} pt",
+                                                            selected.name,
+                                                            self.prefs.terminal_font_size
+                                                        )),
+                                                ),
+                                        ),
+                                )
+                                .child(workspace_theme_preview(
+                                    selected,
+                                    self.prefs.terminal_font_size,
+                                    colors,
+                                )),
+                        ),
+                )
+                .child(
+                    div()
+                        .rounded(px(Radius::PANEL))
+                        .border_1()
+                        .border_color(colors.primary.alpha(0.085))
+                        .bg(colors.primary.alpha(0.022))
+                        .overflow_hidden()
                         .flex()
                         .flex_col()
                         .child(setting_row(
-                            "Color theme",
-                            "Applies immediately across the app and every open terminal.",
-                            self.terminal_theme_dropdown(cx),
+                            "Terminal text",
+                            "Keep code comfortable without scaling the rest of the interface.",
+                            font_control,
                             colors,
                         ))
                         .child(setting_divider(colors))
-                        .child(div().p(px(12.0)).child(theme_preview(selected, colors))),
-                    colors,
-                ))
-                .child(setting_section(
-                    "Text",
-                    setting_row(
-                        "Font size",
-                        "Adjust terminal text without changing the rest of the app.",
-                        font_control,
-                        colors,
-                    ),
-                    colors,
-                )),
+                        .child(terminal_type_specimen(
+                            selected,
+                            self.prefs.terminal_font_size,
+                        )),
+                ),
             colors,
         )
     }
@@ -2744,14 +3567,14 @@ impl UtilitySurfaces {
                         .flex_col()
                         .child(setting_row(
                             "Hibernate idle sessions",
-                            "Freeze inactive sessions after this amount of time.",
+                            "Freeze a session once it has sat idle, with no output or CPU activity, for this long.",
                             self.hibernate_dropdown(cx),
                             colors,
                         ))
                         .child(setting_divider(colors))
                         .child(setting_row(
                             "Memory limit",
-                            "Freeze an individual session when it reaches this size.",
+                            "Freeze an idle session when its process tree reaches this size.",
                             self.memory_dropdown(cx),
                             colors,
                         )),
@@ -3624,12 +4447,13 @@ impl UtilitySurfaces {
     }
 
     fn hibernate_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
-        const OPTIONS: [(u32, &str); 5] = [
+        const OPTIONS: [(u32, &str); 6] = [
             (0, "Off"),
-            (5, "5 minutes"),
             (15, "15 minutes"),
             (30, "30 minutes"),
             (60, "1 hour"),
+            (120, "2 hours"),
+            (240, "4 hours"),
         ];
         let colors = self.settings_colors();
         let selected_label = OPTIONS
@@ -3674,7 +4498,7 @@ impl UtilitySurfaces {
     }
 
     fn memory_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
-        const OPTIONS: [u64; 4] = [2, 4, 6, 8];
+        const OPTIONS: [u64; 6] = [4, 8, 16, 32, 64, 128];
         let colors = self.settings_colors();
         let open = self.settings_menu == Some(SettingsMenu::MemoryLimit);
         let mut control = div()
@@ -4228,6 +5052,241 @@ fn setting_row(
         .child(control)
 }
 
+fn shortcut_matches(
+    command: &crate::commands::CommandSpec,
+    query: &str,
+    overrides: &crate::commands::ShortcutOverrides,
+) -> bool {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let metadata = command.id.shortcut_metadata();
+    let searchable = format!(
+        "{} {} {} {} {}",
+        metadata.title,
+        metadata.description,
+        metadata.category.label(),
+        command.stable_id,
+        command.shortcut_label_for(overrides).unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    query
+        .split_whitespace()
+        .all(|word| searchable.contains(word))
+}
+
+fn shortcut_row(
+    command: &'static crate::commands::CommandSpec,
+    editor: Option<&ShortcutEditor>,
+    overrides: &crate::commands::ShortcutOverrides,
+    colors: SemanticColors,
+    cx: &mut Context<UtilitySurfaces>,
+) -> AnyElement {
+    let metadata = command.id.shortcut_metadata();
+    let editing = editor.is_some_and(|editor| editor.command == command.id);
+    let error = editor
+        .filter(|editor| editor.command == command.id)
+        .and_then(|editor| editor.error.as_deref());
+    let assignment = command.shortcut_label_for(overrides);
+    let modified = command.is_overridden(overrides);
+    let command_id = command.id;
+    let binding_label: SharedString = if editing {
+        "Press keys…".into()
+    } else {
+        assignment
+            .as_deref()
+            .unwrap_or("Unassigned")
+            .to_owned()
+            .into()
+    };
+    let detail: SharedString = error.unwrap_or(metadata.description).to_owned().into();
+
+    let binding = div()
+        .id(SharedString::from(format!(
+            "shortcut-binding-{}",
+            command.stable_id
+        )))
+        .debug_selector({
+            let stable_id = command.stable_id;
+            move || format!("SHORTCUT_BINDING_{stable_id}")
+        })
+        .h(px(27.0))
+        .min_w(px(if editing { 92.0 } else { 42.0 }))
+        .px(px(9.0))
+        .rounded(px(Radius::BADGE))
+        .border_1()
+        .border_color(if error.is_some() {
+            Ink::DANGER.alpha(0.60)
+        } else if editing {
+            Palette::CLAY.alpha(0.72)
+        } else {
+            colors.primary.alpha(0.09)
+        })
+        .bg(if editing {
+            Palette::CLAY.alpha(0.10)
+        } else {
+            colors.primary.alpha(0.045)
+        })
+        .flex()
+        .items_center()
+        .justify_center()
+        .font_family(crate::fonts::mono_family())
+        .text_size(px(11.0))
+        .text_color(if assignment.is_none() && !editing {
+            colors.tertiary
+        } else {
+            colors.primary
+        })
+        .cursor_pointer()
+        .hover(move |style| style.bg(colors.primary.alpha(0.08)))
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.begin_shortcut_edit(command_id, window, cx);
+        }))
+        .child(binding_label);
+
+    let mut actions = div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(4.0))
+        .child(binding)
+        .child(
+            div()
+                .id(SharedString::from(format!(
+                    "edit-shortcut-{}",
+                    command.stable_id
+                )))
+                .size(px(26.0))
+                .rounded(px(Radius::BADGE))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(move |style| style.bg(colors.primary.alpha(0.07)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if editing {
+                        this.shortcut_editor = None;
+                        cx.notify();
+                    } else {
+                        this.begin_shortcut_edit(command_id, window, cx);
+                    }
+                }))
+                .child(sf_symbol(
+                    if editing { "xmark" } else { "pencil" },
+                    10.0,
+                    if editing {
+                        colors.secondary
+                    } else {
+                        colors.tertiary
+                    },
+                )),
+        );
+
+    if modified {
+        actions = actions.child(
+            div()
+                .id(SharedString::from(format!(
+                    "restore-shortcut-{}",
+                    command.stable_id
+                )))
+                .debug_selector({
+                    let stable_id = command.stable_id;
+                    move || format!("RESTORE_SHORTCUT_{stable_id}")
+                })
+                .size(px(26.0))
+                .rounded(px(Radius::BADGE))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(move |style| style.bg(colors.primary.alpha(0.07)))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.restore_shortcut(command_id, cx);
+                }))
+                .child(sf_symbol("arrow.counterclockwise", 10.0, colors.tertiary)),
+        );
+    }
+    if assignment.is_some() {
+        actions = actions.child(
+            div()
+                .id(SharedString::from(format!(
+                    "clear-shortcut-{}",
+                    command.stable_id
+                )))
+                .debug_selector({
+                    let stable_id = command.stable_id;
+                    move || format!("CLEAR_SHORTCUT_{stable_id}")
+                })
+                .size(px(26.0))
+                .rounded(px(Radius::BADGE))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(move |style| style.bg(Ink::DANGER.alpha(0.10)))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.unassign_shortcut(command_id, cx);
+                }))
+                .child(sf_symbol("trash", 10.0, colors.tertiary)),
+        );
+    }
+
+    div()
+        .id(SharedString::from(format!(
+            "shortcut-row-{}",
+            command.stable_id
+        )))
+        .debug_selector({
+            let stable_id = command.stable_id;
+            move || format!("SHORTCUT_ROW_{stable_id}")
+        })
+        .min_h(px(58.0))
+        .px(px(12.0))
+        .py(px(8.0))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(12.0))
+        .bg(if editing {
+            Palette::CLAY.alpha(0.035)
+        } else {
+            colors.background.alpha(0.0)
+        })
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .whitespace_normal()
+                        .text_size(px(Typo::ROW_EMPHASIZED.size))
+                        .font_weight(Typo::ROW_EMPHASIZED.weight)
+                        .text_color(colors.primary)
+                        .child(metadata.title),
+                )
+                .child(
+                    div()
+                        .whitespace_normal()
+                        .text_size(px(Typo::META.size))
+                        .line_height(px(14.0))
+                        .text_color(if error.is_some() {
+                            Ink::DANGER
+                        } else {
+                            colors.tertiary
+                        })
+                        .child(wrappable_setting_copy(detail)),
+                ),
+        )
+        .child(actions)
+        .into_any_element()
+}
+
 fn setting_text_stack(
     label: SharedString,
     detail: SharedString,
@@ -4349,13 +5408,21 @@ fn settings_tab_matches(tab: SettingsTab, query: &str) -> bool {
         SettingsTab::Agents => {
             "agents codex claude cursor gemini executable installed command line quick create default"
         }
+        SettingsTab::Accounts => {
+            "accounts profiles work personal login authentication codex claude default config home"
+        }
+        SettingsTab::Shortcuts => {
+            "shortcuts keyboard bindings hotkeys commands keys navigation sessions workspace terminal"
+        }
         SettingsTab::Terminal => "terminal appearance color theme font text size zoom",
+        SettingsTab::Usage => "usage cost tokens spending cache savings model daily claude codex",
         SettingsTab::Resources => {
             "resources idle sessions hibernate freeze memory limit performance"
         }
         SettingsTab::Remote => {
             "remote ssh openssh hosts machines connections execution tailscale network"
         }
+        SettingsTab::Phone => "phone iphone ios mobile pairing qr tailscale awake",
     };
     query
         .split_whitespace()
@@ -4385,6 +5452,72 @@ fn settings_page(
                 .font_weight(Typo::DISPLAY_TITLE.weight)
                 .text_color(colors.primary)
                 .child(title),
+        )
+        .child(content)
+}
+
+fn appearance_settings_page(content: impl IntoElement, colors: SemanticColors) -> impl IntoElement {
+    div()
+        .w_full()
+        .px(px(24.0))
+        .pt(px(22.0))
+        .pb(px(32.0))
+        .flex()
+        .flex_col()
+        .gap(px(22.0))
+        .child(
+            div()
+                .pr(px(34.0))
+                .min_h(px(44.0))
+                .flex()
+                .flex_wrap()
+                .items_end()
+                .justify_between()
+                .gap(px(12.0))
+                .child(
+                    div()
+                        .min_w(px(260.0))
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap(px(5.0))
+                        .child(
+                            div()
+                                .text_size(px(21.0))
+                                .line_height(px(24.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(colors.primary)
+                                .child("Appearance"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .line_height(px(17.0))
+                                .text_color(colors.secondary)
+                                .child("Shape a workspace that feels focused, legible, and yours."),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .h(px(26.0))
+                        .px(px(9.0))
+                        .rounded(px(Radius::CHIP))
+                        .border_1()
+                        .border_color(Ink::FRESH.alpha(0.22))
+                        .bg(Ink::FRESH.alpha(0.08))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(div().size(px(5.0)).rounded_full().bg(Ink::FRESH))
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(colors.secondary)
+                                .child("Changes apply instantly"),
+                        ),
+                ),
         )
         .child(content)
 }
@@ -4491,34 +5624,433 @@ fn settings_choice_row(
         })
 }
 
-fn theme_preview(theme: TermTheme, colors: SemanticColors) -> impl IntoElement {
+fn featured_theme_card(
+    index: usize,
+    theme: TermTheme,
+    selected: bool,
+    colors: SemanticColors,
+    cx: &mut Context<UtilitySurfaces>,
+) -> impl IntoElement {
+    let selection_tint = if theme.cursor.a > 0.0 {
+        theme.cursor
+    } else {
+        theme.foreground
+    };
+
     div()
-        .p(px(10.0))
-        .rounded(px(Radius::BADGE))
+        .id(SharedString::from(format!("featured-theme-{index}")))
+        .debug_selector(move || format!("FEATURED_THEME_{index}"))
+        .relative()
+        .min_w(px(176.0))
+        .h(px(108.0))
+        .flex_1()
+        .rounded(px(Radius::CARD))
+        .overflow_hidden()
         .border_1()
-        .border_color(colors.primary.alpha(0.10))
+        .border_color(if selected {
+            selection_tint.alpha(0.76)
+        } else {
+            colors.primary.alpha(0.11)
+        })
         .bg(theme.background)
+        .shadow(if selected {
+            vec![BoxShadow {
+                color: selection_tint.alpha(0.14).into(),
+                offset: point(px(0.0), px(5.0)),
+                blur_radius: px(16.0),
+                spread_radius: px(-3.0),
+                inset: false,
+            }]
+        } else {
+            Vec::new()
+        })
+        .cursor_pointer()
+        .hover(move |card| card.border_color(colors.primary.alpha(0.34)))
+        .active(|card| card.opacity(0.84))
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.prefs.terminal_theme = theme.id.to_owned();
+            this.settings_menu = None;
+            this.persist_prefs();
+            cx.notify();
+        }))
         .flex()
         .flex_col()
-        .gap(px(6.0))
-        .font_family(crate::fonts::mono_family())
-        .text_size(px(11.0))
         .child(
             div()
+                .h(px(30.0))
+                .px(px(9.0))
                 .flex()
-                .child(div().text_color(theme.ansi[2]).child("❯ "))
-                .child(div().text_color(theme.foreground).child("cargo test"))
-                .child(div().text_color(theme.cursor).child("█")),
+                .items_center()
+                .justify_between()
+                .bg(theme.foreground.alpha(0.045))
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .text_ellipsis()
+                        .text_size(px(10.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme.foreground)
+                        .child(theme.name),
+                )
+                .when(selected, |bar| {
+                    bar.child(sf_symbol("checkmark.circle.fill", 11.0, selection_tint))
+                }),
         )
-        .child(div().text_color(theme.ansi[8]).child("test result: ok"))
         .child(
-            div().flex().gap(px(3.0)).children(
-                theme
-                    .ansi
-                    .into_iter()
-                    .map(|color| div().flex_1().h(px(10.0)).rounded(px(2.0)).bg(color)),
-            ),
+            div()
+                .flex_1()
+                .px(px(10.0))
+                .py(px(8.0))
+                .flex()
+                .flex_col()
+                .gap(px(5.0))
+                .font_family(crate::fonts::mono_family())
+                .text_size(px(9.5))
+                .child(
+                    div()
+                        .flex()
+                        .child(div().text_color(theme.ansi[2]).child("❯ "))
+                        .child(div().text_color(theme.foreground).child("diri --continue"))
+                        .child(div().ml(px(2.0)).text_color(theme.cursor).child("█")),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(5.0))
+                        .text_color(theme.ansi[8])
+                        .child(div().size(px(4.0)).rounded_full().bg(Ink::FRESH))
+                        .child("workspace ready"),
+                )
+                .child(
+                    div().mt_auto().flex().gap(px(3.0)).children(
+                        [theme.ansi[1], theme.ansi[2], theme.ansi[3], theme.ansi[4]]
+                            .map(|color| div().flex_1().h(px(4.0)).rounded(px(2.0)).bg(color)),
+                    ),
+                ),
         )
+}
+
+fn preview_sidebar_row(
+    label: &'static str,
+    tint: Rgba,
+    active: bool,
+    theme: TermTheme,
+) -> impl IntoElement {
+    div()
+        .h(px(25.0))
+        .px(px(8.0))
+        .rounded(px(5.0))
+        .bg(if active {
+            theme.foreground.alpha(0.085)
+        } else {
+            theme.foreground.alpha(0.0)
+        })
+        .flex()
+        .items_center()
+        .gap(px(7.0))
+        .child(div().size(px(5.0)).rounded_full().bg(tint))
+        .child(
+            div()
+                .min_w(px(0.0))
+                .text_ellipsis()
+                .text_size(px(9.0))
+                .font_weight(if active {
+                    FontWeight::MEDIUM
+                } else {
+                    FontWeight::NORMAL
+                })
+                .text_color(if active {
+                    theme.foreground
+                } else {
+                    theme.foreground.alpha(0.58)
+                })
+                .child(label),
+        )
+}
+
+fn preview_code_line(
+    number: &'static str,
+    content: impl IntoElement,
+    highlighted: bool,
+    theme: TermTheme,
+) -> impl IntoElement {
+    div()
+        .h(px(21.0))
+        .px(px(9.0))
+        .flex()
+        .items_center()
+        .when(highlighted, |line| {
+            line.bg(theme.ansi[4].alpha(0.11))
+                .border_l_2()
+                .border_color(theme.ansi[4].alpha(0.80))
+        })
+        .child(
+            div()
+                .flex_none()
+                .w(px(24.0))
+                .text_color(theme.ansi[8].alpha(0.76))
+                .child(number),
+        )
+        .child(content)
+}
+
+fn workspace_theme_preview(
+    theme: TermTheme,
+    font_size: f32,
+    colors: SemanticColors,
+) -> impl IntoElement {
+    let preview_font_size = (font_size - 2.0).clamp(9.0, 13.0);
+    div()
+        .debug_selector(|| "APPEARANCE_WORKSPACE_PREVIEW".into())
+        .w_full()
+        .h(px(176.0))
+        .rounded(px(Radius::CARD))
+        .overflow_hidden()
+        .border_1()
+        .border_color(colors.primary.alpha(0.13))
+        .bg(theme.background)
+        .shadow(vec![BoxShadow {
+            color: rgba(0x00000042).into(),
+            offset: point(px(0.0), px(8.0)),
+            blur_radius: px(22.0),
+            spread_radius: px(-7.0),
+            inset: false,
+        }])
+        .flex()
+        .child(
+            div()
+                .flex_none()
+                .w(px(128.0))
+                .h_full()
+                .p(px(9.0))
+                .bg(theme.foreground.alpha(0.045))
+                .flex()
+                .flex_col()
+                .gap(px(5.0))
+                .child(
+                    div()
+                        .h(px(20.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .children(
+                            [theme.ansi[1], theme.ansi[3], theme.ansi[2]].map(|color| {
+                                div().size(px(5.0)).rounded_full().bg(color.alpha(0.88))
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .mt(px(3.0))
+                        .mb(px(2.0))
+                        .text_size(px(8.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.foreground.alpha(0.38))
+                        .child("WORKSPACE"),
+                )
+                .child(preview_sidebar_row(
+                    "Appearance",
+                    theme.ansi[4],
+                    true,
+                    theme,
+                ))
+                .child(preview_sidebar_row(
+                    "Refactor UI",
+                    theme.ansi[5],
+                    false,
+                    theme,
+                ))
+                .child(preview_sidebar_row(
+                    "Run tests",
+                    theme.ansi[2],
+                    false,
+                    theme,
+                ))
+                .child(
+                    div()
+                        .mt_auto()
+                        .h(px(23.0))
+                        .px(px(7.0))
+                        .rounded(px(5.0))
+                        .bg(theme.foreground.alpha(0.045))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(div().size(px(5.0)).rounded_full().bg(Ink::FRESH))
+                        .child(
+                            div()
+                                .text_size(px(8.5))
+                                .text_color(theme.foreground.alpha(0.66))
+                                .child("3 agents ready"),
+                        ),
+                ),
+        )
+        .child(div().w(px(1.0)).h_full().bg(theme.foreground.alpha(0.09)))
+        .child(
+            div()
+                .min_w(px(0.0))
+                .flex_1()
+                .h_full()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex_none()
+                        .h(px(31.0))
+                        .px(px(10.0))
+                        .bg(theme.foreground.alpha(0.025))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .font_family(crate::fonts::mono_family())
+                                .text_size(px(9.0))
+                                .text_color(theme.foreground.alpha(0.68))
+                                .child("appearance.rs"),
+                        )
+                        .child(
+                            div()
+                                .px(px(5.0))
+                                .py(px(2.0))
+                                .rounded(px(4.0))
+                                .bg(theme.ansi[2].alpha(0.12))
+                                .text_size(px(8.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme.ansi[2])
+                                .child("LIVE"),
+                        ),
+                )
+                .child(div().h(px(1.0)).bg(theme.foreground.alpha(0.08)))
+                .child(
+                    div()
+                        .flex_1()
+                        .py(px(7.0))
+                        .font_family(crate::fonts::mono_family())
+                        .text_size(px(preview_font_size))
+                        .text_color(theme.foreground)
+                        .child(preview_code_line(
+                            "1",
+                            div()
+                                .flex()
+                                .child(div().text_color(theme.ansi[5]).child("const "))
+                                .child(div().text_color(theme.ansi[3]).child("appearance"))
+                                .child(div().text_color(theme.foreground).child(" = {")),
+                            false,
+                            theme,
+                        ))
+                        .child(preview_code_line(
+                            "2",
+                            div()
+                                .flex()
+                                .child(div().text_color(theme.foreground).child("  theme: "))
+                                .child(div().text_color(theme.ansi[2]).child(theme.name))
+                                .child(div().text_color(theme.foreground).child(",")),
+                            true,
+                            theme,
+                        ))
+                        .child(preview_code_line(
+                            "3",
+                            div()
+                                .flex()
+                                .child(div().text_color(theme.foreground).child("  type: "))
+                                .child(
+                                    div()
+                                        .text_color(theme.ansi[6])
+                                        .child(format!("{font_size:.0}pt")),
+                                )
+                                .child(div().text_color(theme.foreground).child(",")),
+                            false,
+                            theme,
+                        ))
+                        .child(preview_code_line(
+                            "4",
+                            div()
+                                .flex()
+                                .child(div().text_color(theme.foreground).child("  status: "))
+                                .child(div().text_color(theme.ansi[2]).child("focused"))
+                                .child(div().text_color(theme.foreground).child(",")),
+                            false,
+                            theme,
+                        ))
+                        .child(preview_code_line(
+                            "5",
+                            div().text_color(theme.foreground).child("};"),
+                            false,
+                            theme,
+                        )),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .h(px(24.0))
+                        .px(px(10.0))
+                        .bg(theme.foreground.alpha(0.04))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .font_family(crate::fonts::mono_family())
+                        .text_size(px(8.0))
+                        .text_color(theme.foreground.alpha(0.52))
+                        .child("main  +1 −1")
+                        .child("diri · ready"),
+                ),
+        )
+}
+
+fn terminal_type_specimen(theme: TermTheme, font_size: f32) -> impl IntoElement {
+    div().p(px(12.0)).child(
+        div()
+            .w_full()
+            .min_h(px(58.0))
+            .px(px(12.0))
+            .py(px(9.0))
+            .rounded(px(Radius::ROW))
+            .border_1()
+            .border_color(theme.foreground.alpha(0.10))
+            .bg(theme.background)
+            .flex()
+            .items_center()
+            .gap(px(11.0))
+            .child(
+                div()
+                    .flex_none()
+                    .size(px(36.0))
+                    .rounded(px(Radius::BADGE))
+                    .bg(theme.ansi[4].alpha(0.15))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .font_family(crate::fonts::mono_family())
+                    .text_size(px(13.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.ansi[4])
+                    .child("Aa"),
+            )
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.0))
+                    .font_family(crate::fonts::mono_family())
+                    .child(
+                        div()
+                            .text_size(px(font_size.clamp(10.0, 17.0)))
+                            .line_height(px((font_size + 4.0).clamp(14.0, 21.0)))
+                            .text_color(theme.foreground)
+                            .child("cargo test --workspace"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .text_color(theme.ansi[8])
+                            .child("A live specimen at your selected terminal size"),
+                    ),
+            ),
+    )
 }
 
 fn chip(label: String, colors: SemanticColors) -> impl IntoElement {
@@ -4693,6 +6225,174 @@ mod tests {
         }
     }
 
+    fn seed_history(surfaces: &mut UtilitySurfaces) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64()
+            * 1000.0;
+        let titles = [
+            "Make conversation search fast and useful",
+            "Polish sidebar navigation and rounded popovers",
+            "Keep remote sessions alive after reconnecting",
+            "Fix terminal rendering when switching projects",
+            "Add keyboard shortcuts for quick navigation",
+            "Explore a simpler onboarding flow",
+            "A longer conversation title about investigating search results across multiple projects and keeping useful names visible",
+        ];
+        surfaces.surface = Surface::History;
+        surfaces.history = (0..640)
+            .map(|index| HistoryEntry {
+                id: format!("conversation-{index}"),
+                kind: if index % 2 == 0 {
+                    ProtoAgentKind::CODEX
+                } else {
+                    ProtoAgentKind::CLAUDE_CODE
+                },
+                cwd: if index == 4 {
+                    "/work/old-worktree".to_owned()
+                } else {
+                    "/work/diri".to_owned()
+                },
+                title: Some(titles[index % titles.len()].to_owned()),
+                transcript_path: String::new(),
+                last_active_at: diri_proto::DateMillis(now - index as f64 * 3600000.0),
+                created_at: None,
+                cwd_exists: index != 4,
+            })
+            .collect();
+        surfaces.history_search.rebuild(&surfaces.history);
+        surfaces.filter_history();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn history_virtualizes_results_and_keeps_keyboard_selection_visible(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let runtime = Arc::new(StoreRuntime::inert());
+            let tokio = Arc::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap(),
+            );
+            let surfaces = cx.new(|cx| {
+                let mut surfaces =
+                    UtilitySurfaces::new(runtime, tokio, crate::updates::inert(), window, cx);
+                seed_history(&mut surfaces);
+                surfaces.focus.focus(window, cx);
+                surfaces
+            });
+            CachedOverlayHarness { surfaces }
+        });
+        cx.simulate_resize(size(px(800.0), px(700.0)));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("history-row-0").is_some());
+        assert!(
+            cx.debug_bounds("history-row-639").is_none(),
+            "offscreen rows must not be rendered"
+        );
+        let surfaces = view.read_with(cx, |view, _| view.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| surfaces.move_history(-1, cx));
+        cx.run_until_parked();
+        let row = cx
+            .debug_bounds("history-row-639")
+            .expect("keyboard selection scrolled into view");
+        let dialog = cx.debug_bounds("conversation-history").unwrap();
+        assert!(row.top() >= dialog.top() && row.bottom() <= dialog.bottom());
+        cx.simulate_keystrokes("s e a r c h");
+        cx.run_until_parked();
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(surfaces.history_query.text(), "search");
+            assert_eq!(surfaces.history_highlight, 0);
+            assert!(surfaces.history_matches.len() < 640);
+        });
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.history_query.clear();
+            surfaces.history_query.insert("zzzzzz");
+            surfaces.filter_history();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let empty_dialog = cx.debug_bounds("conversation-history").unwrap();
+        assert_eq!(
+            empty_dialog.size.width, dialog.size.width,
+            "empty results preserve dialog width"
+        );
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.history_resuming = Some("already-opening".to_owned());
+            let entry = surfaces.history[0].clone();
+            surfaces.resume_history(entry, cx);
+            assert_eq!(
+                surfaces.history_resuming.as_deref(),
+                Some("already-opening")
+            );
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "renders deterministic history UI without a live daemon"]
+    fn render_history_preview_screenshot() {
+        let output =
+            PathBuf::from(std::env::var_os("DIRI_VISUAL_OUTPUT").expect("set DIRI_VISUAL_OUTPUT"));
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let narrow = std::env::var_os("DIRI_VISUAL_NARROW").is_some();
+        let window = cx
+            .open_window(
+                size(px(if narrow { 680.0 } else { 1000.0 }), px(720.0)),
+                move |window, cx| {
+                    let surfaces = cx.new(|cx| {
+                        let runtime = Arc::new(StoreRuntime::inert());
+                        let tokio = Arc::new(
+                            tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .unwrap(),
+                        );
+                        let mut surfaces = UtilitySurfaces::new(
+                            runtime,
+                            tokio,
+                            crate::updates::inert(),
+                            window,
+                            cx,
+                        );
+                        seed_history(&mut surfaces);
+                        if std::env::var_os("DIRI_VISUAL_LIGHT").is_some() {
+                            surfaces.prefs.terminal_theme = TermTheme::DIRIJOR_LIGHT.id.to_owned();
+                        }
+                        if let Ok(query) = std::env::var("DIRI_VISUAL_QUERY") {
+                            surfaces.history_query.insert(&query);
+                            surfaces.filter_history();
+                        }
+                        if std::env::var_os("DIRI_VISUAL_OPENING").is_some() {
+                            surfaces.history_resuming = Some(surfaces.history[0].id.clone());
+                        }
+                        surfaces
+                    });
+                    cx.new(|_| CachedOverlayHarness { surfaces })
+                },
+            )
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, _| window.refresh())
+            .unwrap();
+        cx.run_until_parked();
+        cx.capture_screenshot(window.into())
+            .unwrap()
+            .save(output)
+            .unwrap();
+    }
+
     /// Regenerates the issue/PR screenshot without Screen Recording access or
     /// live user state. It is ignored because its only output is an artifact;
     /// the ordinary layout assertions below remain part of every test run.
@@ -4759,6 +6459,15 @@ mod tests {
         let output = std::env::var_os("DIRI_VISUAL_OUTPUT")
             .map(PathBuf::from)
             .expect("set DIRI_VISUAL_OUTPUT to the target PNG path");
+        let tab = match std::env::var("DIRI_VISUAL_SETTINGS_TAB").as_deref() {
+            Ok("shortcuts") => SettingsTab::Shortcuts,
+            Ok("general") => SettingsTab::General,
+            Ok("agents") => SettingsTab::Agents,
+            Ok("accounts") => SettingsTab::Accounts,
+            Ok("terminal") => SettingsTab::Terminal,
+            Ok("resources") => SettingsTab::Resources,
+            _ => SettingsTab::Remote,
+        };
         let platform = gpui_platform::current_platform(true);
         let mut cx = HeadlessAppContext::with_platform(
             platform.text_system(),
@@ -4775,10 +6484,9 @@ mod tests {
 
         let window = cx
             .open_window(size(px(1200.0), px(800.0)), move |window, cx| {
-                // Exercise the user-reported state: Remote selected, from a
-                // sidebar the user had previously widened.
-                let harness =
-                    cx.new(|cx| SettingsWorkbenchHarness::open_at(SettingsTab::Remote, window, cx));
+                // Exercise the requested destination from a sidebar the user
+                // had previously widened. Remote remains the default capture.
+                let harness = cx.new(|cx| SettingsWorkbenchHarness::open_at(tab, window, cx));
                 harness.update(cx, |harness, cx| {
                     harness
                         .sidebar
@@ -4799,6 +6507,193 @@ mod tests {
             std::fs::create_dir_all(parent).expect("create screenshot directory");
         }
         screenshot.save(output).expect("save settings screenshot");
+    }
+
+    #[gpui::test]
+    fn usage_settings_controls_and_search(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.open_settings_tab(SettingsTab::Usage, cx);
+            surfaces.usage.updated_at = 1_788_523_200;
+        });
+        cx.run_until_parked();
+        for selector in ["usage-range-7", "usage-tokens", "usage-by-day"] {
+            let bounds = cx.debug_bounds(selector).expect("visible usage control");
+            cx.simulate_click(bounds.center(), Modifiers::default());
+            cx.run_until_parked();
+        }
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(surfaces.usage_days, 7);
+            assert!(surfaces.usage_tokens);
+            assert!(surfaces.usage_by_day);
+        });
+        assert!(settings_tab_matches(SettingsTab::Usage, "cache savings"));
+        assert!(settings_tab_matches(SettingsTab::Usage, "cost"));
+    }
+
+    /// Fixture-only visual review, never populates the live usage tracker.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes the usage settings screenshot artifact"]
+    fn render_usage_settings_preview_screenshot() {
+        let output = std::env::var_os("DIRI_VISUAL_OUTPUT")
+            .map(PathBuf::from)
+            .expect("output PNG path");
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let width = std::env::var("DIRI_VISUAL_WIDTH")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(1200.0);
+        let window = cx
+            .open_window(size(px(width), px(900.0)), move |window, cx| {
+                let harness =
+                    cx.new(|cx| SettingsWorkbenchHarness::open_at(SettingsTab::Usage, window, cx));
+                harness.update(cx, |harness, cx| {
+                    harness.surfaces.update(cx, |surfaces, cx| {
+                        let mut history = crate::usage::dashboard::UsageHistory::default();
+                        let mut models = crate::usage::dashboard::ModelHours::default();
+                        let now = 1_788_523_200;
+                        for day in 0..30 {
+                            if day % 5 == 0 {
+                                continue;
+                            }
+                            for (index, model) in ["claude-opus-4-6", "claude-sonnet-4-6"]
+                                .into_iter()
+                                .enumerate()
+                            {
+                                let volume = ((day * 7 + index * 11) % 19 + 1) as i64;
+                                crate::usage::dashboard::record(
+                                    &mut models,
+                                    model,
+                                    now / 3600 - day as i64 * 24,
+                                    crate::usage::UsageHourAgg {
+                                        i: volume * 1000,
+                                        o: volume * 10_000,
+                                        cr: volume * 1_000_000,
+                                        cw: volume * 100_000,
+                                        c: volume as f64 * 0.9,
+                                    },
+                                    diri_usage::match_claude(model),
+                                    0,
+                                );
+                            }
+                        }
+                        history.merge(crate::usage::UsageProvider::Claude, &models);
+                        models.clear();
+                        for day in 0..30 {
+                            let volume = (day * 3) % 13 + 1;
+                            crate::usage::dashboard::record(
+                                &mut models,
+                                "gpt-5.4",
+                                now / 3600 - day * 24,
+                                crate::usage::UsageHourAgg {
+                                    i: volume * 2000,
+                                    o: volume * 8000,
+                                    cr: volume * 200_000,
+                                    cw: 0,
+                                    c: volume as f64 * 0.3,
+                                },
+                                diri_usage::match_openai("gpt-5.4"),
+                                volume * 3000,
+                            );
+                        }
+                        history.merge(crate::usage::UsageProvider::Codex, &models);
+                        if std::env::var_os("DIRI_VISUAL_EMPTY").is_some() {
+                            history = Default::default();
+                        }
+                        if std::env::var_os("DIRI_VISUAL_LIGHT").is_some() {
+                            surfaces.prefs.terminal_theme = "dirijor-light".into();
+                        }
+                        surfaces.usage_days = std::env::var("DIRI_VISUAL_DAYS")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(30);
+                        surfaces.set_usage(
+                            crate::usage::UsageSnapshot {
+                                updated_at: now,
+                                history: Arc::new(history),
+                                ..Default::default()
+                            },
+                            cx,
+                        );
+                    });
+                });
+                harness
+            })
+            .expect("open usage screenshot");
+        cx.run_until_parked();
+        let screenshot = cx
+            .capture_screenshot(window.into())
+            .expect("capture usage settings");
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        screenshot.save(output).expect("save usage settings");
+    }
+
+    /// Renders the Appearance destination at a realistic desktop size so the
+    /// theme cards, live workspace, and typography specimen can be reviewed as
+    /// one composition instead of as isolated components.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes the deterministic appearance-settings screenshot artifact"]
+    fn render_appearance_settings_preview_screenshot() {
+        let output = std::env::var_os("DIRI_VISUAL_OUTPUT")
+            .map(PathBuf::from)
+            .expect("set DIRI_VISUAL_OUTPUT to the target PNG path");
+        let preview_theme = std::env::var("DIRI_APPEARANCE_THEME").ok();
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+
+        let window = cx
+            .open_window(size(px(1200.0), px(900.0)), move |window, cx| {
+                let harness = cx
+                    .new(|cx| SettingsWorkbenchHarness::open_at(SettingsTab::Terminal, window, cx));
+                harness.update(cx, |harness, cx| {
+                    harness
+                        .sidebar
+                        .update(cx, |sidebar, cx| sidebar.set_width(292.0, cx));
+                    if let Some(theme_id) = &preview_theme {
+                        harness.surfaces.update(cx, |surfaces, cx| {
+                            surfaces.prefs.terminal_theme.clone_from(theme_id);
+                            surfaces.persist_prefs();
+                            cx.notify();
+                        });
+                    }
+                });
+                harness
+            })
+            .expect("open headless appearance settings window");
+        cx.run_until_parked();
+        cx.advance_clock(SETTINGS_TRANSITION_DURATION + Duration::from_millis(300));
+        cx.update_window(window.into(), |_, window, _| window.refresh())
+            .expect("refresh appearance settings window");
+        cx.run_until_parked();
+        let screenshot = cx
+            .capture_screenshot(window.into())
+            .expect("capture appearance settings screenshot");
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent).expect("create screenshot directory");
+        }
+        screenshot.save(output).expect("save appearance screenshot");
     }
 
     struct SettingsModalHarness {
@@ -4901,6 +6796,14 @@ mod tests {
                 );
                 surfaces.open_settings(cx);
                 surfaces.settings_tab = tab;
+                if tab == SettingsTab::Accounts {
+                    surfaces.seed_account_preview(
+                        std::env::var_os("DIRI_VISUAL_ACCOUNT_EDITOR").is_some(),
+                    );
+                    if std::env::var_os("DIRI_VISUAL_ACCOUNT_HANDOFF").is_some() {
+                        surfaces.seed_account_handoff_preview();
+                    }
+                }
                 surfaces
             });
             // RootView re-renders on the sidebar's own events; this harness
@@ -4915,7 +6818,12 @@ mod tests {
             // The mirror runs on notifies; settings was already open before
             // anything was watching it.
             let nav = surfaces.read(cx).settings_nav();
-            sidebar.update(cx, |sidebar, cx| sidebar.set_settings_nav(nav, cx));
+            sidebar.update(cx, |sidebar, cx| {
+                // Match RootView: opening Settings reveals its navigation even
+                // when fresh preferences start with the sidebar closed.
+                sidebar.reveal(cx);
+                sidebar.set_settings_nav(nav, cx);
+            });
             Self {
                 sidebar,
                 surfaces,
@@ -5550,7 +7458,112 @@ mod tests {
         assert!(settings_tab_matches(SettingsTab::Remote, "ssh"));
         assert!(settings_tab_matches(SettingsTab::Resources, "memory"));
         assert!(settings_tab_matches(SettingsTab::General, "login"));
+        assert!(settings_tab_matches(SettingsTab::Shortcuts, "keyboard"));
+        assert!(settings_tab_matches(SettingsTab::Terminal, "appearance"));
         assert!(!settings_tab_matches(SettingsTab::Terminal, "ssh"));
+    }
+
+    #[gpui::test]
+    fn shortcut_page_searches_edits_unassigns_and_restores(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.open_settings_tab(SettingsTab::Shortcuts, cx);
+        });
+
+        let search = cx
+            .debug_bounds("shortcut-search")
+            .expect("shortcut search should render");
+        cx.simulate_click(search.center(), Modifiers::default());
+        cx.simulate_input("new session");
+        assert!(cx.debug_bounds("SHORTCUT_ROW_open-launcher").is_some());
+        assert!(cx.debug_bounds("SHORTCUT_ROW_terminal-paste").is_none());
+
+        let binding = cx
+            .debug_bounds("SHORTCUT_BINDING_open-launcher")
+            .expect("filtered shortcut binding should render");
+        cx.simulate_click(binding.center(), Modifiers::default());
+        cx.simulate_keystrokes("cmd-shift-y");
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(
+                surfaces
+                    .prefs
+                    .shortcut_overrides
+                    .get("open-launcher")
+                    .and_then(|binding| binding.as_deref()),
+                Some("cmd-shift-y")
+            );
+            assert!(surfaces.shortcut_editor.is_none());
+        });
+
+        let clear = cx
+            .debug_bounds("CLEAR_SHORTCUT_open-launcher")
+            .expect("assigned shortcut should offer unassign");
+        cx.simulate_click(clear.center(), Modifiers::default());
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(
+                surfaces.prefs.shortcut_overrides.get("open-launcher"),
+                Some(&None)
+            );
+        });
+
+        let restore = cx
+            .debug_bounds("RESTORE_SHORTCUT_open-launcher")
+            .expect("modified shortcut should offer restore");
+        cx.simulate_click(restore.center(), Modifiers::default());
+        surfaces.read_with(cx, |surfaces, _| {
+            assert!(
+                !surfaces
+                    .prefs
+                    .shortcut_overrides
+                    .contains_key("open-launcher")
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn appearance_quick_themes_update_the_live_preview(cx: &mut TestAppContext) {
+        let (harness, cx) = cx.add_window_view(|window, cx| {
+            SettingsWorkbenchHarness::open_at(SettingsTab::Terminal, window, cx)
+        });
+        cx.simulate_resize(size(px(1200.0), px(800.0)));
+        cx.run_until_parked();
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+
+        let vesper = cx
+            .debug_bounds("FEATURED_THEME_1")
+            .expect("Vesper quick theme should render");
+        cx.simulate_click(vesper.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(surfaces.prefs.terminal_theme, TermTheme::VESPER.id);
+        });
+        assert!(
+            cx.debug_bounds("APPEARANCE_WORKSPACE_PREVIEW").is_some(),
+            "the live preview must remain mounted after changing theme"
+        );
+    }
+
+    #[gpui::test]
+    fn appearance_theme_cards_wrap_inside_a_narrow_settings_pane(cx: &mut TestAppContext) {
+        let (_harness, cx) = cx.add_window_view(|window, cx| {
+            SettingsWorkbenchHarness::open_at(SettingsTab::Terminal, window, cx)
+        });
+        cx.simulate_resize(size(px(760.0), px(760.0)));
+        cx.run_until_parked();
+
+        let pane = cx.debug_bounds("settings-pane").expect("settings pane");
+        for (index, selector) in ["FEATURED_THEME_0", "FEATURED_THEME_1", "FEATURED_THEME_2"]
+            .into_iter()
+            .enumerate()
+        {
+            let card = cx.debug_bounds(selector).expect("quick theme card");
+            assert!(
+                card.left() >= pane.left() && card.right() <= pane.right(),
+                "theme card {index} escaped the narrow pane: {card:?} vs {pane:?}"
+            );
+        }
     }
 
     #[gpui::test]

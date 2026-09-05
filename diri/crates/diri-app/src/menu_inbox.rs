@@ -6,6 +6,7 @@
 use diri_proto::{AttentionLevel, SessionRecord};
 
 use crate::store::{SidebarProject, SidebarProjection};
+use crate::switcher::display_title;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TrailingStatus {
@@ -94,7 +95,7 @@ fn session_row(session: &SessionRecord, depth: u16) -> InboxSessionRow {
         .is_some_and(|detail| detail.risk_hint == diri_proto::RiskHint::Destructive);
     InboxSessionRow {
         session_id: session.id.0.clone(),
-        title: display_title(session).to_owned(),
+        title: display_title(session),
         agent_id: session.effective_kind().id().to_owned(),
         depth,
         trailing,
@@ -102,14 +103,6 @@ fn session_row(session: &SessionRecord, depth: u16) -> InboxSessionRow {
             && !session.effective_kind().is_terminal()
             && attention == AttentionLevel::Working,
         destructive,
-    }
-}
-
-fn display_title(session: &SessionRecord) -> &str {
-    if session.title.is_empty() {
-        "Untitled"
-    } else {
-        &session.title
     }
 }
 
@@ -141,6 +134,7 @@ mod tests {
             git_branch: None,
             title: title.into(),
             title_source: diri_proto::TitleSource::Placeholder,
+            account_profile: None,
             originating_prompt: None,
             agent_session_id: None,
             transcript_path: None,

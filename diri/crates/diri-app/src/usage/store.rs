@@ -14,7 +14,7 @@ use super::{
     timestamp::days_from_civil,
 };
 
-const RETENTION_DAYS: i64 = 35;
+const RETENTION_DAYS: i64 = 91;
 const BLOCK_HOURS: i64 = 5;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -347,6 +347,7 @@ fn scan(
                 live.offset,
                 cutoff_hour,
                 &mut live.hours,
+                &mut live.details,
                 &mut seen_all,
                 &mut cache.seen,
             ),
@@ -355,6 +356,7 @@ fn scan(
                 live.offset,
                 cutoff_hour,
                 &mut live.hours,
+                &mut live.details,
                 &mut live.model,
             ),
         };
@@ -379,6 +381,10 @@ fn scan(
     for entry in cache.files.values_mut() {
         let hours_before_retain = entry.hours.len();
         entry.hours.retain(|hour, _| *hour >= cutoff_hour);
+        entry.details.retain(|_, hours| {
+            hours.retain(|hour, _| *hour >= cutoff_hour);
+            !hours.is_empty()
+        });
         changed |= hours_before_retain != entry.hours.len();
     }
     if full_scan {
@@ -413,11 +419,15 @@ fn scan(
         }
     }
 
-    (
-        snapshot(&claude_hours, &codex_hours, reading),
-        stats,
-        changed,
-    )
+    let mut result = snapshot(&claude_hours, &codex_hours, reading);
+    let mut history = super::dashboard::UsageHistory::default();
+    for (path, entry) in &cache.files {
+        if let Some(provider) = provider_for_path(Path::new(path), &paths.roots) {
+            history.merge(provider, &entry.details);
+        }
+    }
+    result.history = std::sync::Arc::new(history);
+    (result, stats, changed)
 }
 
 #[derive(Clone, Copy, Debug)]

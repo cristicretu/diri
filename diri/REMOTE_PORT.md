@@ -72,6 +72,36 @@ The current baseline:
   capability-compatible Helper is available;
 - retains orchestration and user-facing state in the local Rust Engine.
 
+## Account-profile enhancement
+
+The local Engine owns the account-profile catalog and durable per-session
+launch binding described in [ACCOUNTS.md](ACCOUNTS.md). A remote profile is scoped
+to one Agent and saved host. Its directory resolves against the remote login
+environment; credentials never move between machines. The Engine prepares a
+missing provider directory with its existing bounded, authenticated fixed-script
+SSH seam (the directory travels as stdin data), then sends the selected provider
+environment through the existing structured LaunchRequest. Resume and fork use
+the recorded binding, not the current catalog default. Cross-host migration of
+bound sessions fails until an explicit destination-account mapping exists.
+
+An explicit same-host Claude account continuation is also owned by the local
+Engine. It preflights the source and destination, stops the existing Holder's
+Agent tree, reads the final main JSONL transcript through bounded fixed-script
+SSH, installs it atomically in the selected profile, and resumes the same
+conversation through the existing Holder launch path. Only transcript bytes
+travel through Engine memory; credentials and provider configuration never move.
+The transcript is bounded to 64 MiB. Symlinks and conflicting destination history
+fail closed; an existing byte-prefix copy permits switching back. The updated
+profile binding is durable before relaunch. Preflight errors leave the original
+session running; later failures keep the saved conversation recoverable and
+report the stopped session. This does not implement cross-host handoff, file
+rewind/subagent checkpoint transfer, or provider usage/authentication discovery.
+
+The Helper protocol and Holder ownership remain unchanged. Account settings,
+directory preparation, and profile resolution belong to the local Engine;
+the Holder receives only the resulting argv/environment/cwd. This enhancement
+adds no remote service, credential store, or transport dependency.
+
 ## Why the old transport was replaced
 
 `tmux` provided a practical PTY, process survival, and reconnection mechanism,
@@ -610,8 +640,78 @@ These features are separate from Remote Holder transport:
   bootstrap dependency;
 - the old iPhone companion path is not part of the Rust remote architecture and
   its obsolete UI entry points are removed;
-- any future companion implementation requires a separately designed protocol,
-  security model, lifecycle, and product scope.
+- the phone gateway below is a separate client feature, not a new Remote
+  Holder capability or a dependency of SSH sessions.
+
+### Phone gateway and workspace creation (September 2026)
+
+The Mac app embeds `diri-web` as an opt-in Settings → Phone access service.
+The SwiftUI iPhone client uses authenticated HTTP JSON and SSE through this
+gateway. The local Rust Engine remains authoritative for sessions, host
+catalog, installed-agent discovery, folder browsing, worktrees and input.
+Phone access never attaches directly to a Holder, so it does not introduce a
+second controller lease or read-only observer protocol.
+
+Slow spawn/bootstrap/folder/diff RPCs and remote agent scans run outside the
+control connection's read loop, with at most 32 background requests per Engine.
+Excess requests fail with `busy` before dispatch. This preserves Hello, screen
+reads and input while a first prompt or SSH operation is pending; it adds no
+Holder threads, supervisor or terminal hot-path fan-out. A socket regression
+test requires Hello to overtake a deliberately slow Git worktree spawn.
+
+The app binds only the connected Tailscale IPv4 address reported by the local
+Tailscale client, never a wildcard, LAN, or public interface. Tailscale provides
+encrypted transport; Diri does not install, configure or alter it. An additional
+256-bit bearer token is minted in memory for each enable. Its QR is generated
+locally (`qrcode`, with default features disabled); no pairing secret goes to
+an image service, log, or preferences file. The iPhone stores its credential
+in Keychain and refuses HTTP redirects. Anyone with this credential and
+tailnet reachability can control all sessions exposed by that Engine.
+
+Turning access off aborts the listener and all accepted HTTP/SSE connections.
+Re-enabling rotates the credential. The gateway lives only as long as the Mac
+app; disabling it does not kill sessions. On macOS an app-lifetime `caffeinate`
+child prevents idle sleep while enabled, but cannot promise connectivity after
+closing the lid, explicit sleep, loss of power or a network outage. No service
+or login item is installed by phone setup. Phone distribution/signing and
+Tailscale enrollment remain external setup requirements. Push notifications,
+shared users, unattended gateway startup, and rich terminal rendering are
+not included in this feature.
+
+Setup guides users through Mac readiness, iPhone Tailscale sign-in and QR
+pairing. The Mac performs a read-only, bounded status check and distinguishes
+missing installation, sign-in, administrator approval, disconnection and an
+eligible private IPv4 address. Install/open links hand off to Tailscale; Diri
+does not approve permissions, change routes, enroll devices or handle account
+credentials. The iPhone verifies authenticated gateway access after scanning;
+its checklist alone never claims verified connectivity. Release preparation,
+owner signing requirements and physical-device gates are in
+`../ios/TESTFLIGHT.md`; unsigned archives do not satisfy distribution gates.
+
+`host.list` is a read-only Engine catalog projection (id, name, defaultCwd),
+excluding SSH/node credentials. `/api/agents?host=…` and
+`/api/directories?host=…&path=…` use existing Engine discovery/browse operations.
+`session.spawn.worktreeBase` is additive: absent retains HEAD behavior; the
+phone explicitly selects `main` for a separate workspace. Git resolves and
+pins that ref on the selected host; missing refs fail, without silently using
+HEAD. No fetch, pull, checkout/reset of the original tree, or remote repository
+clone is performed. Branch names and framed fields are validated; Git receives
+argv values, not caller-generated shell code.
+
+Remote worktree creation is Engine-owned workspace policy using the existing
+bounded `RemoteManager::run_fixed_script` SSH seam, independent of Helper
+versions. The fixed script receives validated cwd/branch/base/slug fields over
+stdin and emits a bounded marker-framed canonical path. The resulting session
+records its remote host, worktree path and branch, and launches via the existing
+verified Helper. No workspace orchestration is added to `diri-remote`. A failed
+or interrupted launch may leave the new worktree for recovery; do not delete
+user data or automatically retry an ambiguous mutation.
+
+Acceptance: authenticated catalog/browse/spawn contract tests, main-versus-HEAD
+worktree tests (local and remote script), hostile field rejection, gateway
+revocation tests and iOS build/tests. Real-device camera pairing and a cellular
+round trip through Tailscale require a signed device build and an enrolled
+phone; they must be checked before claiming a distributable phone release.
 
 ## Verification and release gates
 
@@ -709,7 +809,7 @@ refactor work:
 - remote conversation/thread identifiers;
 - MCP forwarding;
 - artifact, port, usage, and resource discovery;
-- handoff and checkpoint migration;
+- cross-host handoff and checkpoint migration;
 - cross-host or post-reboot process recovery;
 - multiple read-only observers;
 - deeper, explicitly configured `diri-node` integration.

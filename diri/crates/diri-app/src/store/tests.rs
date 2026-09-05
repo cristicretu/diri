@@ -38,6 +38,7 @@ fn session(value: &str, project: &str, created: f64) -> SessionRecord {
         git_branch: None,
         title: value.to_owned(),
         title_source: TitleSource::Placeholder,
+        account_profile: None,
         originating_prompt: None,
         agent_session_id: None,
         transcript_path: None,
@@ -711,7 +712,7 @@ fn spawn_response_focuses_session_when_event_arrives_first() {
     assert!(store.terminal_residency().contains(&id("spawned")));
 }
 
-/// The menu-bar status item tints from this, so an archived blocker still
+/// The menu-bar panel header tints from this, so an archived blocker still
 /// colours the glyph even though its row is not in the list. Documented rather
 /// than fixed: the rollup carries one level, and dropping archived sessions
 /// here would also drop a live `DoneUnseen` sitting behind one.

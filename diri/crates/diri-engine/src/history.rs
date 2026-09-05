@@ -16,15 +16,17 @@
 //!
 //! Ported from the Swift `HistoryScanner`.
 
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
 use diri_proto::AgentKind;
+use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
 use serde_json::Value;
 
 /// Defensive cap on returned entries.
@@ -32,8 +34,24 @@ const MAX_ENTRIES: usize = 500;
 /// How far into a Claude transcript to read looking for the first line with a
 /// `cwd`. That is the first user message, which can be large.
 const CLAUDE_HEAD_CAP: usize = 8 << 20;
-/// Tail window scanned for the newest Claude `ai-title`.
+/// Tail window scanned for Claude's generated and custom titles.
 const CLAUDE_TAIL_BYTES: usize = 16 << 10;
+/// Tail of Codex's append-only title index considered for live sessions.
+const CODEX_INDEX_BYTES: usize = 4 << 20;
+/// Provider databases considered, newest first. Codex normally has one.
+const CODEX_STATE_FILES: usize = 16;
+/// Tail window for Cursor's last jsonl object (turn working/idle).
+const CURSOR_TAIL_BYTES: usize = 64 << 10;
+/// Candidate transcript directories considered while associating a live
+/// Cursor session. Association is best-effort and must not turn the registry
+/// watcher into an unbounded filesystem crawl.
+const CURSOR_ASSOCIATION_ENTRIES: usize = 1_024;
+/// Cursor chat workspaces considered while resolving generated metadata.
+const CURSOR_CHAT_WORKSPACES: usize = 256;
+/// Total conversation directories considered across those workspaces.
+const CURSOR_CHAT_ENTRIES: usize = 4_096;
+/// `meta.json` is tiny; reject an unexpectedly large provider file.
+const CURSOR_META_BYTES: usize = 64 << 10;
 /// Cap on a Codex `session_meta` first line.
 const CODEX_FIRST_LINE_CAP: usize = 512 << 10;
 const CHUNK: usize = 64 << 10;
@@ -84,8 +102,8 @@ impl TrustedTranscript {
         &self.path
     }
 
-    pub(crate) fn latest_claude_ai_title(&mut self) -> Option<String> {
-        latest_claude_ai_title_from(&mut self.file)
+    pub(crate) fn latest_claude_title(&mut self) -> Option<String> {
+        latest_claude_title_from(&mut self.file)
     }
 }
 
@@ -119,7 +137,17 @@ pub fn scan_roots(claude_root: &Path, codex_root: &Path, tracked: &[String]) -> 
 /// the thread id in both the rollout filename and its first `session_meta`
 /// record. We inspect only the newest bounded set of strict YYYY/MM/DD
 /// directories and require both identities plus the launch cwd to match.
+#[cfg(test)]
 pub(crate) fn find_live_codex_transcript(
+    home: &Path,
+    agent_id: &str,
+    cwd: &str,
+) -> Option<TrustedTranscript> {
+    find_profile_codex_transcript(None, home, agent_id, cwd)
+}
+
+pub(crate) fn find_profile_codex_transcript(
+    profile: Option<&diri_proto::AgentAccountProfile>,
     home: &Path,
     agent_id: &str,
     cwd: &str,
@@ -127,7 +155,9 @@ pub(crate) fn find_live_codex_transcript(
     if !safe_agent_id(agent_id) {
         return None;
     }
-    let root = home.join(".codex/sessions");
+    let root = profile
+        .map_or_else(|| home.join(".codex"), |p| PathBuf::from(&p.config_home))
+        .join("sessions");
     let suffix = format!("-{agent_id}.jsonl");
     let mut seen = 0usize;
     let mut matches = Vec::new();
@@ -146,9 +176,14 @@ pub(crate) fn find_live_codex_transcript(
                 continue;
             }
             let path = entry.path();
-            if let Some(transcript) =
-                validate_transcript_path(home, &AgentKind::CODEX, agent_id, cwd, &path)
-            {
+            if let Some(transcript) = validate_profile_transcript_path(
+                profile,
+                home,
+                &AgentKind::CODEX,
+                agent_id,
+                cwd,
+                &path,
+            ) {
                 let modified = transcript
                     .file
                     .metadata()
@@ -170,7 +205,19 @@ pub(crate) fn find_live_codex_transcript(
 /// The path must resolve inside the provider's transcript root, must not be a
 /// symlink or non-regular file, must belong to this user, and must be tied to
 /// the provider conversation identity.
+#[cfg(test)]
 pub(crate) fn validate_transcript_path(
+    home: &Path,
+    kind: &AgentKind,
+    agent_id: &str,
+    cwd: &str,
+    path: &Path,
+) -> Option<TrustedTranscript> {
+    validate_profile_transcript_path(None, home, kind, agent_id, cwd, path)
+}
+
+pub(crate) fn validate_profile_transcript_path(
+    profile: Option<&diri_proto::AgentAccountProfile>,
     home: &Path,
     kind: &AgentKind,
     agent_id: &str,
@@ -180,10 +227,21 @@ pub(crate) fn validate_transcript_path(
     if !safe_agent_id(agent_id) {
         return None;
     }
-    let root = match kind.id() {
-        AgentKind::CLAUDE_CODE_ID => home.join(".claude/projects"),
-        AgentKind::CODEX_ID => home.join(".codex/sessions"),
-        _ => return None,
+    let root = if let Some(profile) = profile {
+        if profile.agent != kind.id() || profile.host.is_some() {
+            return None;
+        }
+        PathBuf::from(&profile.config_home).join(match kind.id() {
+            AgentKind::CLAUDE_CODE_ID => "projects",
+            AgentKind::CODEX_ID => "sessions",
+            _ => return None,
+        })
+    } else {
+        match kind.id() {
+            AgentKind::CLAUDE_CODE_ID => home.join(".claude/projects"),
+            AgentKind::CODEX_ID => home.join(".codex/sessions"),
+            _ => return None,
+        }
     };
     let mut file = open_trusted_regular_file(&root, path)?;
     match kind.id() {
@@ -334,7 +392,7 @@ fn claude_entry(path: &Path) -> Option<HistoryEntry> {
     // No cwd means nothing to resume into.
     let cwd = cwd?;
 
-    let title = latest_claude_ai_title(path).or_else(|| first_prompt.map(|text| title_from(&text)));
+    let title = latest_claude_title(path).or_else(|| first_prompt.map(|text| title_from(&text)));
 
     Some(HistoryEntry {
         id: uuid,
@@ -398,14 +456,14 @@ fn read_claude_head(path: &Path) -> Vec<String> {
         .collect()
 }
 
-/// The newest `ai-title` in the tail — the title Claude generated for the
-/// conversation.
-pub(crate) fn latest_claude_ai_title(path: &Path) -> Option<String> {
+/// Claude's current native conversation title from the bounded transcript
+/// tail. A `/rename` `custom-title` wins over any generated `ai-title`.
+pub(crate) fn latest_claude_title(path: &Path) -> Option<String> {
     let mut handle = open_regular_readonly(path)?;
-    latest_claude_ai_title_from(&mut handle)
+    latest_claude_title_from(&mut handle)
 }
 
-fn latest_claude_ai_title_from(handle: &mut File) -> Option<String> {
+fn latest_claude_title_from(handle: &mut File) -> Option<String> {
     let end = handle.seek(SeekFrom::End(0)).ok()?;
     let start = end.saturating_sub(CLAUDE_TAIL_BYTES as u64);
     handle.seek(SeekFrom::Start(start)).ok()?;
@@ -417,25 +475,498 @@ fn latest_claude_ai_title_from(handle: &mut File) -> Option<String> {
         .read_to_end(&mut data)
         .ok()?;
 
-    let mut newest = None;
+    let mut newest_ai = None;
+    let mut newest_custom = None;
     for line in String::from_utf8_lossy(&data).split('\n') {
-        if !line.contains("\"ai-title\"") {
+        if !line.contains("\"ai-title\"") && !line.contains("\"custom-title\"") {
             continue;
         }
         let Ok(object) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if object.get("type").and_then(Value::as_str) == Some("ai-title")
-            && let Some(title) = object.get("aiTitle").and_then(Value::as_str)
-            && !title.is_empty()
-        {
-            newest = Some(title.to_string());
+        match object.get("type").and_then(Value::as_str) {
+            Some("custom-title") => {
+                if let Some(title) = object
+                    .get("customTitle")
+                    .and_then(Value::as_str)
+                    .filter(|title| !title.is_empty())
+                {
+                    newest_custom = Some(title.to_owned());
+                }
+            }
+            Some("ai-title") => {
+                if let Some(title) = object
+                    .get("aiTitle")
+                    .and_then(Value::as_str)
+                    .filter(|title| !title.is_empty())
+                {
+                    newest_ai = Some(title.to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    newest_custom.or(newest_ai)
+}
+
+/// Cursor conversation identity plus the generated title Cursor writes to
+/// `~/.cursor/chats/<workspace>/<id>/meta.json`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CursorConversation {
+    pub id: String,
+    pub title: Option<String>,
+    pub transcript_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct CursorMetadata {
+    title: Option<String>,
+    created_at_ms: Option<f64>,
+}
+
+/// Last complete jsonl object in a Cursor transcript: in-flight or done.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CursorTranscriptTurn {
+    Working,
+    Idle,
+}
+
+/// Cursor writes `tool_use` while a turn is in flight and a text-only
+/// assistant line (or `turn_ended`) when it is done. `turn_ended` is the
+/// whole conversation, not each turn, so the last object is the signal.
+pub(crate) fn cursor_transcript_turn(path: &Path) -> Option<CursorTranscriptTurn> {
+    classify_cursor_transcript_object(&last_jsonl_object(path)?)
+}
+
+fn classify_cursor_transcript_object(object: &Value) -> Option<CursorTranscriptTurn> {
+    if object.get("type").and_then(Value::as_str) == Some("turn_ended") {
+        return Some(CursorTranscriptTurn::Idle);
+    }
+    match object.get("role").and_then(Value::as_str) {
+        Some("user") => Some(CursorTranscriptTurn::Working),
+        Some("assistant") => Some(if assistant_uses_tool(object) {
+            CursorTranscriptTurn::Working
+        } else {
+            CursorTranscriptTurn::Idle
+        }),
+        _ => None,
+    }
+}
+
+fn assistant_uses_tool(object: &Value) -> bool {
+    object
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)
+        .is_some_and(|content| {
+            content
+                .iter()
+                .any(|part| part.get("type").and_then(Value::as_str) == Some("tool_use"))
+        })
+}
+
+fn last_jsonl_object(path: &Path) -> Option<Value> {
+    let mut handle = open_regular_readonly(path)?;
+    let end = handle.seek(SeekFrom::End(0)).ok()?;
+    if end == 0 {
+        return None;
+    }
+    let start = end.saturating_sub(CURSOR_TAIL_BYTES as u64);
+    handle.seek(SeekFrom::Start(start)).ok()?;
+    let mut data = Vec::new();
+    handle
+        .take((CURSOR_TAIL_BYTES + (4 << 10)) as u64)
+        .read_to_end(&mut data)
+        .ok()?;
+    let text = String::from_utf8_lossy(&data);
+    let mut lines = text.split('\n').filter(|line| !line.is_empty());
+    if start > 0 {
+        lines.next();
+    }
+    let mut newest = None;
+    for line in lines {
+        if let Ok(value) = serde_json::from_str::<Value>(line) {
+            newest = Some(value);
         }
     }
     newest
 }
 
+/// `~/.cursor/projects/<slug>/` slug for a working directory: leading slash
+/// stripped, remaining `/` replaced by `-`.
+pub(crate) fn cursor_project_slug(cwd: &str) -> String {
+    cwd.trim_end_matches('/')
+        .trim_start_matches('/')
+        .replace('/', "-")
+}
+
+/// Resolve a Cursor conversation and its generated title.
+///
+/// `conversation_id` wins when the caller already knows it (hook payload).
+/// Otherwise the newest unclaimed transcript under the cwd's project whose
+/// `createdAtMs` is at or after `created_after_ms` is chosen.
+pub(crate) fn cursor_conversation(
+    home: &Path,
+    cwd: &str,
+    conversation_id: Option<&str>,
+    created_after_ms: f64,
+    claimed: &HashSet<String>,
+) -> Option<CursorConversation> {
+    if let Some(id) = conversation_id.filter(|id| is_cursor_conversation_id(id)) {
+        return Some(read_cursor_conversation(home, cwd, id));
+    }
+    discover_cursor_conversation(home, cwd, created_after_ms, claimed)
+}
+
+fn is_cursor_conversation_id(id: &str) -> bool {
+    (32..80).contains(&id.len())
+        && id
+            .chars()
+            .all(|character| character.is_ascii_hexdigit() || character == '-')
+}
+
+fn read_cursor_conversation(home: &Path, cwd: &str, id: &str) -> CursorConversation {
+    let transcript = cursor_transcript_path(home, cwd, id).filter(|path| path.is_file());
+    CursorConversation {
+        title: cursor_metadata_for_id(home, id).and_then(|metadata| metadata.title),
+        transcript_path: transcript.map(|path| path.to_string_lossy().into_owned()),
+        id: id.to_owned(),
+    }
+}
+
+fn discover_cursor_conversation(
+    home: &Path,
+    cwd: &str,
+    created_after_ms: f64,
+    claimed: &HashSet<String>,
+) -> Option<CursorConversation> {
+    let transcripts = cursor_transcripts_dir(home, cwd)?;
+    let floor = created_after_ms - 2_000.0;
+    let mut candidates = Vec::new();
+    for path in bounded_child_dirs(&transcripts, CURSOR_ASSOCIATION_ENTRIES) {
+        let id = path.file_name()?.to_string_lossy().into_owned();
+        if claimed.contains(&id) || !is_cursor_conversation_id(&id) {
+            continue;
+        }
+        let fallback_created_at_ms = std::fs::metadata(&path)
+            .and_then(|meta| meta.created().or_else(|_| meta.modified()))
+            .ok()
+            .map(system_time_ms)
+            .unwrap_or(0.0);
+        candidates.push((id, fallback_created_at_ms));
+    }
+    let wanted = candidates
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect::<HashSet<_>>();
+    let metadata = cursor_metadata_index(home, &wanted);
+    let mut best: Option<(f64, CursorConversation)> = None;
+    for (id, fallback_created_at_ms) in candidates {
+        let metadata = metadata.get(&id);
+        let created = metadata
+            .and_then(|metadata| metadata.created_at_ms)
+            .unwrap_or(fallback_created_at_ms);
+        if created < floor {
+            continue;
+        }
+        let conversation = CursorConversation {
+            transcript_path: cursor_transcript_path(home, cwd, &id)
+                .map(|path| path.to_string_lossy().into_owned()),
+            title: metadata.and_then(|metadata| metadata.title.clone()),
+            id,
+        };
+        let better = best.as_ref().is_none_or(|(best_created, _)| {
+            (created - created_after_ms).abs() < (best_created - created_after_ms).abs()
+        });
+        if better {
+            best = Some((created, conversation));
+        }
+    }
+    best.map(|(_, conversation)| conversation)
+}
+
+fn cursor_transcripts_dir(home: &Path, cwd: &str) -> Option<PathBuf> {
+    let dir = home
+        .join(".cursor/projects")
+        .join(cursor_project_slug(cwd))
+        .join("agent-transcripts");
+    confined_dir(home.join(".cursor"), &dir)
+}
+
+fn cursor_transcript_path(home: &Path, cwd: &str, id: &str) -> Option<PathBuf> {
+    let path = cursor_transcripts_dir(home, cwd)?
+        .join(id)
+        .join(format!("{id}.jsonl"));
+    confined_file(home.join(".cursor"), &path)
+}
+
+fn cursor_metadata_for_id(home: &Path, id: &str) -> Option<CursorMetadata> {
+    let chats = home.join(".cursor/chats");
+    for workspace in bounded_child_dirs(&chats, CURSOR_CHAT_WORKSPACES) {
+        if let Some(metadata) = read_cursor_metadata(&chats, &workspace.join(id).join("meta.json"))
+        {
+            return Some(metadata);
+        }
+    }
+    None
+}
+
+fn cursor_metadata_index(home: &Path, wanted: &HashSet<String>) -> HashMap<String, CursorMetadata> {
+    if wanted.is_empty() {
+        return HashMap::new();
+    }
+    let chats = home.join(".cursor/chats");
+    let mut found = HashMap::new();
+    let mut visited = 0usize;
+    for workspace in bounded_child_dirs(&chats, CURSOR_CHAT_WORKSPACES) {
+        let Ok(entries) = std::fs::read_dir(&workspace) else {
+            continue;
+        };
+        for entry in entries.take(CURSOR_CHAT_ENTRIES - visited) {
+            visited += 1;
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let id = entry.file_name().to_string_lossy().into_owned();
+            if !wanted.contains(&id) {
+                continue;
+            }
+            if let Some(metadata) = read_cursor_metadata(&chats, &entry.path().join("meta.json")) {
+                found.insert(id, metadata);
+                if found.len() == wanted.len() {
+                    return found;
+                }
+            }
+        }
+        if visited >= CURSOR_CHAT_ENTRIES {
+            break;
+        }
+    }
+    found
+}
+
+fn read_cursor_metadata(root: &Path, path: &Path) -> Option<CursorMetadata> {
+    let file = open_trusted_regular_file(root, path)?;
+    if file.metadata().ok()?.len() > CURSOR_META_BYTES as u64 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(CURSOR_META_BYTES as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    let title = value
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(str::to_owned);
+    let created_at_ms = value.get("createdAtMs").and_then(Value::as_f64);
+    Some(CursorMetadata {
+        title,
+        created_at_ms,
+    })
+}
+
+fn confined_dir(root: impl AsRef<Path>, path: &Path) -> Option<PathBuf> {
+    let root = root.as_ref().canonicalize().ok()?;
+    let canonical = path.canonicalize().ok()?;
+    canonical.starts_with(&root).then_some(canonical)
+}
+
+fn confined_file(root: impl AsRef<Path>, path: &Path) -> Option<PathBuf> {
+    if !path.is_file() {
+        return None;
+    }
+    confined_dir(root, path)
+}
+
+fn system_time_ms(time: SystemTime) -> f64 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|since| since.as_secs_f64() * 1000.0)
+        .unwrap_or(0.0)
+}
+
 // MARK: Codex
+
+#[derive(Default)]
+struct CodexTitleCandidates {
+    explicit: Option<String>,
+    fallback: Option<String>,
+}
+
+/// Resolves the title Codex currently exposes for `thread_id`. This follows
+/// the provider's own priority: an explicit `/rename`, then the append-only
+/// session index, then Codex's generated title or first prompt in its state
+/// database. All files are local, read-only, owner-controlled, and bounded.
+#[cfg(test)]
+pub(crate) fn codex_title(home: &Path, thread_id: &str) -> Option<String> {
+    profile_codex_title(None, home, thread_id)
+}
+
+pub(crate) fn profile_codex_title(
+    profile: Option<&diri_proto::AgentAccountProfile>,
+    home: &Path,
+    thread_id: &str,
+) -> Option<String> {
+    if !safe_agent_id(thread_id) {
+        return None;
+    }
+    let codex_home = profile.map_or_else(|| home.join(".codex"), |p| PathBuf::from(&p.config_home));
+    let database = codex_database_titles(&codex_home, thread_id).unwrap_or_default();
+    database
+        .explicit
+        .or_else(|| codex_indexed_title(&codex_home, thread_id))
+        .or(database.fallback)
+}
+
+fn codex_database_titles(codex_home: &Path, thread_id: &str) -> Option<CodexTitleCandidates> {
+    for path in newest_codex_state_files(codex_home) {
+        if let Some(titles) = codex_database_title(&path, thread_id) {
+            return Some(titles);
+        }
+    }
+    None
+}
+
+fn newest_codex_state_files(codex_home: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(codex_home) else {
+        return Vec::new();
+    };
+    let mut paths = entries
+        .take(256)
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            (name.starts_with("state_") && name.ends_with(".sqlite")).then(|| entry.path())
+        })
+        .filter(|path| owner_regular_file(path))
+        .collect::<Vec<_>>();
+    paths.sort_by_key(|path| {
+        std::cmp::Reverse(
+            std::fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH),
+        )
+    });
+    paths.truncate(CODEX_STATE_FILES);
+    paths
+}
+
+fn codex_database_title(path: &Path, thread_id: &str) -> Option<CodexTitleCandidates> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let _ = connection.busy_timeout(Duration::from_millis(50));
+    let columns = {
+        let mut statement = connection.prepare("PRAGMA table_info(threads)").ok()?;
+        statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .ok()?
+            .filter_map(Result::ok)
+            .collect::<HashSet<_>>()
+    };
+    if !columns.contains("id") {
+        return None;
+    }
+    let field = |name: &str| {
+        if columns.contains(name) {
+            name.to_owned()
+        } else {
+            "NULL".to_owned()
+        }
+    };
+    let query = format!(
+        "SELECT {}, {}, {} FROM threads WHERE id = ?1 LIMIT 1",
+        field("name"),
+        field("title"),
+        field("first_user_message"),
+    );
+    connection
+        .query_row(&query, params![thread_id], |row| {
+            let explicit = row.get::<_, Option<String>>(0)?;
+            let generated = row.get::<_, Option<String>>(1)?;
+            let first_prompt = row.get::<_, Option<String>>(2)?;
+            Ok(CodexTitleCandidates {
+                explicit: explicit.and_then(clean_provider_title),
+                fallback: generated
+                    .and_then(clean_provider_title)
+                    .or_else(|| first_prompt.and_then(clean_provider_title)),
+            })
+        })
+        .optional()
+        .ok()?
+}
+
+fn codex_indexed_title(codex_home: &Path, thread_id: &str) -> Option<String> {
+    let mut handle = open_regular_readonly(&codex_home.join("session_index.jsonl"))?;
+    let end = handle.seek(SeekFrom::End(0)).ok()?;
+    let start = end.saturating_sub(CODEX_INDEX_BYTES as u64);
+    handle.seek(SeekFrom::Start(start)).ok()?;
+    let mut data = Vec::new();
+    handle
+        .take((CODEX_INDEX_BYTES + (4 << 10)) as u64)
+        .read_to_end(&mut data)
+        .ok()?;
+    let text = String::from_utf8_lossy(&data);
+    let mut lines = text.split('\n').filter(|line| !line.is_empty());
+    if start > 0 {
+        lines.next();
+    }
+    let mut newest = None;
+    for line in lines {
+        if !line.contains(thread_id) {
+            continue;
+        }
+        let Ok(object) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if object.get("id").and_then(Value::as_str) == Some(thread_id)
+            && let Some(title) = object
+                .get("thread_name")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .and_then(clean_provider_title)
+        {
+            newest = Some(title);
+        }
+    }
+    newest
+}
+
+fn clean_provider_title(title: String) -> Option<String> {
+    let title = title
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    let title = title.chars().take(160).collect::<String>();
+    (!title.is_empty()).then_some(title)
+}
+
+fn owner_regular_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return false;
+    }
+    true
+}
 
 fn scan_codex(root: &Path) -> Vec<HistoryEntry> {
     let mut result = Vec::new();
@@ -511,6 +1042,18 @@ fn child_dirs(path: &Path) -> Vec<PathBuf> {
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.is_dir())
+        .collect()
+}
+
+fn bounded_child_dirs(path: &Path, limit: usize) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return Vec::new();
+    };
+    entries
+        .take(limit)
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path())
         .collect()
 }
 
@@ -644,6 +1187,24 @@ mod tests {
     }
 
     #[test]
+    fn the_latest_custom_title_wins_over_claudes_generated_title() {
+        let temp = tempfile::tempdir().expect("temp");
+        let claude = temp.path().join("claude");
+        let uuid = "0199f2c4-1a2b-4c3d-8e9f-000000000010";
+        write(
+            &claude.join(format!("-p/{uuid}.jsonl")),
+            &format!(
+                "{}{}\n",
+                claude_transcript("/tmp", "vague first prompt", Some("Generated title")),
+                r#"{"type":"custom-title","customTitle":"My chosen title"}"#,
+            ),
+        );
+
+        let entries = scan_roots(&claude, &temp.path().join("codex"), &[]);
+        assert_eq!(entries[0].title.as_deref(), Some("My chosen title"));
+    }
+
+    #[test]
     fn a_transcript_without_a_cwd_is_not_resumable() {
         // There is nowhere to resume it into, so offering it would only fail.
         let temp = tempfile::tempdir().expect("temp");
@@ -702,6 +1263,54 @@ mod tests {
     }
 
     #[test]
+    fn codex_title_prefers_explicit_name_then_index_then_database_fallback() {
+        let home = tempfile::tempdir().expect("home");
+        let codex_home = home.path().join(".codex");
+        std::fs::create_dir_all(&codex_home).expect("codex home");
+        let database = codex_home.join("state_5.sqlite");
+        let connection = Connection::open(&database).expect("database");
+        connection
+            .execute_batch(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    name TEXT,
+                    title TEXT,
+                    first_user_message TEXT
+                );
+                INSERT INTO threads VALUES (
+                    'thread-9',
+                    'Explicit slash rename',
+                    'Generated database title',
+                    'First prompt fallback'
+                );",
+            )
+            .expect("schema");
+        write(
+            &codex_home.join("session_index.jsonl"),
+            "{\"id\":\"thread-9\",\"thread_name\":\"Indexed title\",\"updated_at\":1}\n",
+        );
+
+        assert_eq!(
+            codex_title(home.path(), "thread-9").as_deref(),
+            Some("Explicit slash rename")
+        );
+
+        connection
+            .execute("UPDATE threads SET name = NULL WHERE id = 'thread-9'", [])
+            .expect("clear name");
+        assert_eq!(
+            codex_title(home.path(), "thread-9").as_deref(),
+            Some("Indexed title")
+        );
+
+        std::fs::remove_file(codex_home.join("session_index.jsonl")).expect("remove index");
+        assert_eq!(
+            codex_title(home.path(), "thread-9").as_deref(),
+            Some("Generated database title")
+        );
+    }
+
+    #[test]
     fn live_codex_transcript_resolution_is_bounded_and_identity_associated() {
         let home = tempfile::tempdir().expect("home");
         let root = home.path().join(".codex/sessions");
@@ -722,6 +1331,49 @@ mod tests {
         );
         assert!(find_live_codex_transcript(home.path(), "thread-9", "/wrong").is_none());
         assert!(find_live_codex_transcript(home.path(), "../escape", "/work/app").is_none());
+    }
+
+    #[test]
+    fn profile_transcripts_and_titles_use_only_the_bound_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("work-codex");
+        let profile = diri_proto::AgentAccountProfile {
+            id: "work".into(),
+            label: "Work".into(),
+            agent: "codex".into(),
+            host: None,
+            config_home: config.to_string_lossy().into_owned(),
+            is_default: false,
+        };
+        let transcript = config.join("sessions/2026/09/04/rollout-now-thread-9.jsonl");
+        write(
+            &transcript,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-9\",\"cwd\":\"/work/app\"}}\n",
+        );
+        write(
+            &config.join("session_index.jsonl"),
+            "{\"id\":\"thread-9\",\"thread_name\":\"Work title\"}\n",
+        );
+        assert_eq!(
+            find_profile_codex_transcript(Some(&profile), home.path(), "thread-9", "/work/app")
+                .map(|t| t.path().to_path_buf()),
+            Some(transcript.clone())
+        );
+        assert!(
+            validate_transcript_path(
+                home.path(),
+                &AgentKind::CODEX,
+                "thread-9",
+                "/work/app",
+                &transcript
+            )
+            .is_none()
+        );
+        assert_eq!(
+            profile_codex_title(Some(&profile), home.path(), "thread-9").as_deref(),
+            Some("Work title")
+        );
+        assert_eq!(codex_title(home.path(), "thread-9"), None);
     }
 
     #[cfg(unix)]
@@ -795,7 +1447,7 @@ mod tests {
         symlink(&replacement, &path).expect("swap final component");
 
         assert_eq!(
-            trusted.latest_claude_ai_title().as_deref(),
+            trusted.latest_claude_title().as_deref(),
             Some("validated inode")
         );
     }
@@ -933,5 +1585,127 @@ mod tests {
         );
         let entries = scan_roots(&claude, &temp.path().join("codex"), &[]);
         assert_eq!(entries[0].cwd, "/tmp");
+    }
+
+    #[test]
+    fn a_cursor_meta_title_is_the_generated_conversation_name() {
+        let temp = tempfile::tempdir().expect("temp");
+        let home = temp.path();
+        let id = "11111fcb-7655-4342-8b2f-88068c650200";
+        let cwd = "/Users/alex/GitHub/diri";
+        write_cursor_chat(home, cwd, id, "Cursor Integration Fix", 1_788_110_437_802.0);
+
+        let conversation =
+            cursor_conversation(home, cwd, Some(id), 0.0, &HashSet::new()).expect("found");
+        assert_eq!(conversation.id, id);
+        assert_eq!(
+            conversation.title.as_deref(),
+            Some("Cursor Integration Fix")
+        );
+    }
+
+    #[test]
+    fn an_unclaimed_cursor_transcript_is_matched_to_the_session_cwd() {
+        let temp = tempfile::tempdir().expect("temp");
+        let home = temp.path();
+        let cwd = "/Users/alex/GitHub/diri";
+        let claimed = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa".to_owned();
+        write_cursor_chat(home, cwd, &claimed, "Old chat", 1_000.0);
+        write_cursor_chat(
+            home,
+            cwd,
+            "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb",
+            "Cursor Integration Fix",
+            5_000.0,
+        );
+
+        let conversation = cursor_conversation(home, cwd, None, 4_500.0, &HashSet::from([claimed]))
+            .expect("found");
+        assert_eq!(conversation.id, "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb");
+        assert_eq!(
+            conversation.title.as_deref(),
+            Some("Cursor Integration Fix")
+        );
+    }
+
+    #[test]
+    fn cursor_live_association_directory_walks_are_bounded() {
+        let temp = tempfile::tempdir().expect("temp");
+        for index in 0..(CURSOR_ASSOCIATION_ENTRIES + 8) {
+            std::fs::create_dir(temp.path().join(format!("entry-{index:04}"))).expect("entry");
+        }
+
+        assert_eq!(
+            bounded_child_dirs(temp.path(), CURSOR_ASSOCIATION_ENTRIES).len(),
+            CURSOR_ASSOCIATION_ENTRIES
+        );
+    }
+
+    #[test]
+    fn cursor_transcript_last_object_is_working_or_idle() {
+        let temp = tempfile::tempdir().expect("temp");
+        let path = temp.path().join("chat.jsonl");
+
+        write(
+            &path,
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"hi"}]}}
+"#,
+        );
+        assert_eq!(
+            cursor_transcript_turn(&path),
+            Some(CursorTranscriptTurn::Working)
+        );
+
+        write(
+            &path,
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"hi"}]}}
+{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Grep"}]}}
+"#,
+        );
+        assert_eq!(
+            cursor_transcript_turn(&path),
+            Some(CursorTranscriptTurn::Working)
+        );
+
+        write(
+            &path,
+            r#"{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Grep"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"done"}]}}
+"#,
+        );
+        assert_eq!(
+            cursor_transcript_turn(&path),
+            Some(CursorTranscriptTurn::Idle)
+        );
+
+        write(
+            &path,
+            r#"{"role":"assistant","message":{"content":[{"type":"text","text":"done"}]}}
+{"type":"turn_ended","status":"success"}
+"#,
+        );
+        assert_eq!(
+            cursor_transcript_turn(&path),
+            Some(CursorTranscriptTurn::Idle)
+        );
+    }
+
+    fn write_cursor_chat(home: &Path, cwd: &str, id: &str, title: &str, created_at_ms: f64) {
+        let transcripts = home
+            .join(".cursor/projects")
+            .join(cursor_project_slug(cwd))
+            .join("agent-transcripts")
+            .join(id);
+        std::fs::create_dir_all(&transcripts).expect("transcripts");
+        std::fs::write(transcripts.join(format!("{id}.jsonl")), "{}\n").expect("jsonl");
+        let meta_dir = home.join(".cursor/chats/workspace").join(id);
+        std::fs::create_dir_all(&meta_dir).expect("meta");
+        std::fs::write(
+            meta_dir.join("meta.json"),
+            format!(
+                r#"{{"schemaVersion":1,"createdAtMs":{created_at_ms},"title":"{title}","cwd":"{cwd}"}}"#
+            ),
+        )
+        .expect("meta");
     }
 }

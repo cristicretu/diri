@@ -27,6 +27,8 @@ static LAUNCH_NONCE: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LaunchRecipe {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_profile_id: Option<String>,
     pub id: String,
     pub name: String,
     pub agent: AgentKind,
@@ -341,6 +343,7 @@ impl LaunchRecipe {
         initial_prompt: impl Into<String>,
     ) -> Self {
         let mut recipe = Self {
+            account_profile_id: None,
             id: String::new(),
             name: name.into(),
             agent,
@@ -376,6 +379,7 @@ impl LaunchRecipe {
         Ok(ResolvedRecipe {
             kind: self.agent.clone(),
             options: SpawnOptions {
+                account_profile_id: self.account_profile_id.clone(),
                 cwd: Some(cwd),
                 host: self.host.clone(),
                 worktree,
@@ -496,6 +500,7 @@ pub struct ResolvedRecipe {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecipeIssue {
+    AccountUnavailable,
     EmptyPrompt,
     PromptTooLong,
     MissingHost(String),
@@ -515,6 +520,10 @@ pub enum RecipeIssue {
 impl RecipeIssue {
     pub fn message(&self) -> String {
         match self {
+            Self::AccountUnavailable => {
+                "Account profile is unavailable on this Agent or host — choose an account"
+                    .to_owned()
+            }
             Self::EmptyPrompt => "Add an initial prompt to repair this recipe".to_owned(),
             Self::PromptTooLong => {
                 "Prompt exceeds 32,768 characters — shorten it before saving or running".to_owned()
@@ -859,12 +868,14 @@ mod tests {
                 cwd: root,
                 new_worktree: Some(true),
                 worktree_branch: Some(branch),
+                worktree_base: None,
                 title: Some("Review lane".into()),
                 initial_prompt: Some("Review this branch".into()),
                 parent: None,
                 initial_cols: None,
                 initial_rows: None,
                 host: None,
+                account_profile_id: None,
                 same_repo_as: None,
             })
         );

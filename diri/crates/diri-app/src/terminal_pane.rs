@@ -35,18 +35,19 @@ use diri_ui::{
 };
 use gpui::{
     AnyElement, ClickEvent, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter,
-    FocusHandle, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton, Render, Role,
-    ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Task, Window, div,
-    font, prelude::*, px, rgba,
+    ExternalPaths, FocusHandle, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton,
+    Render, Role, ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Task,
+    Window, div, font, prelude::*, px, rgba,
 };
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
-use crate::clipboard_transfer::StagedClipboardImage;
+use crate::clipboard_transfer::{StagedClipboardImage, upload_dropped_file};
 use crate::commands::{
     CloseFind, CopySelection, FindNext, FindPrevious, OpenFind, Paste, ResetZoom, TERMINAL_CONTEXT,
     ToggleInspector, ToggleSidebar, ZoomIn, ZoomOut,
 };
+use crate::external_drop::{TerminalDropAction, plan_terminal_drop, terminal_drop_text};
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::{NavigationOverlay, query_label};
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
@@ -104,10 +105,15 @@ const ANCHOR_SLACK: f32 = 1.0;
 const PARKED_GRID_CAP: usize = 12;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalPaneEvent {
+    ContinueAccount(SessionId),
     OpenFileReference {
         reference: String,
         cwd: String,
         session_id: SessionId,
+    },
+    /// Files were dropped on the grid and some (or all) could not be used.
+    ExternalDropFeedback {
+        message: String,
     },
 }
 
@@ -135,6 +141,21 @@ pub struct PaneChip {
 impl PaneChip {
     pub fn for_session(session: &SessionRecord) -> Vec<Self> {
         let mut result = Vec::new();
+        if let Some(profile) = &session.account_profile {
+            result.push(Self {
+                id: "account-profile".into(),
+                label: profile.label.clone(),
+                system_image: "account.circle",
+                open_url: None,
+                copy_string: profile.label.clone(),
+                tint: None,
+                help: format!(
+                    "Launch account: {} · {}",
+                    profile.label, profile.config_home
+                ),
+                checks: None,
+            });
+        }
         let artifacts = session.artifacts.as_deref().unwrap_or_default();
         let statuses = session.pull_requests.as_deref().unwrap_or_default();
         let pull_requests = artifacts
@@ -372,6 +393,22 @@ fn terminal_paste(text: &str, bracketed_paste: bool) -> Vec<u8> {
     paste(text, bracketed_paste)
 }
 
+/// Claude recognizes dropped image paths in its bracketed-paste handler.
+/// A recovered local screen can miss DECSET 2004 when checkpoint recovery
+/// falls back to a bounded log tail (Claude usually enables it only at startup).
+/// Its direct-launch session kind guarantees the recipient supports framing;
+/// shell and unknown sessions must still use only their negotiated mode.
+fn terminal_file_paste(
+    text: &str,
+    bracketed_paste: bool,
+    kind: Option<&ProtoAgentKind>,
+) -> Vec<u8> {
+    terminal_paste(
+        text,
+        bracketed_paste || kind == Some(&ProtoAgentKind::CLAUDE_CODE),
+    )
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PointerOwner {
     LocalSelection,
@@ -529,6 +566,9 @@ enum PaneEvent {
     ScrollbackCells(SessionId, diri_proto::ReadScrollbackCellsResult, usize),
     ScrollbackFailed(SessionId),
     ClipboardUploadFinished(SessionId, Result<String, String>),
+    /// Files dropped on a remote session finished copying; on success the
+    /// remote paths are ready to paste in drop order.
+    DroppedFilesUploaded(SessionId, Result<Vec<String>, String>),
 }
 
 /// Identifies one attachment task, not the durable session it reads. A session
@@ -1381,7 +1421,123 @@ impl TerminalPane {
                 }
                 Err(error) => eprintln!("diri: clipboard image upload failed: {error}"),
             },
+            PaneEvent::DroppedFilesUploaded(id, result) => match result {
+                Ok(remote_paths) => {
+                    let text = terminal_drop_text(remote_paths.iter().map(String::as_str));
+                    self.paste_into_session(&id, &text);
+                }
+                Err(error) => {
+                    eprintln!("diri: dropped file upload failed: {error}");
+                    cx.emit(TerminalPaneEvent::ExternalDropFeedback {
+                        message: format!(
+                            "Couldn't copy the dropped files to the session's host: {error}"
+                        ),
+                    });
+                }
+            },
         }
+    }
+
+    /// Writes dropped file paths to the target session's composer.
+    fn paste_into_session(&self, id: &SessionId, text: &str) {
+        if let Some(resident) = self.residents.get(id) {
+            let store = self
+                .runtime
+                .store
+                .read()
+                .expect("session store lock poisoned");
+            // Use the declared direct-launch kind, not foreground detection:
+            // a detected Claude inside a shell can return to that shell.
+            let kind = store.sessions().get(id).map(|session| &session.kind);
+            resident
+                .attachment
+                .input(terminal_file_paste(text, resident.bracketed_paste, kind));
+        }
+    }
+
+    /// Finder released files over the grid. Behaves like a desktop terminal:
+    /// the paths are pasted into the foreground program, which is how Claude
+    /// Code, Codex and Cursor attach dropped images. Sessions on another host
+    /// get the files copied over first so the pasted path exists there.
+    fn external_drop(
+        &mut self,
+        paths: &ExternalPaths,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.selected_id() else {
+            return;
+        };
+        if !self.residents.contains_key(&id) {
+            return;
+        }
+        let ssh = {
+            let store = self
+                .runtime
+                .store
+                .read()
+                .expect("session store lock poisoned");
+            store
+                .sessions()
+                .get(&id)
+                .and_then(|session| session.host.as_deref())
+                .and_then(|host_id| store.host(host_id))
+                .map(|host| host.ssh.clone())
+        };
+
+        let plan = plan_terminal_drop(paths.paths(), ssh.is_some());
+        if let Some(message) = plan.feedback() {
+            cx.emit(TerminalPaneEvent::ExternalDropFeedback { message });
+        }
+        match plan.action {
+            None => {}
+            Some(TerminalDropAction::Paste(text)) => {
+                self.paste_into_session(&id, &text);
+            }
+            Some(TerminalDropAction::Upload(files)) => {
+                let Some(ssh) = ssh else {
+                    return;
+                };
+                let pane_tx = self.pane_tx.clone();
+                let upload_id = id.clone();
+                self.tokio.spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        files
+                            .iter()
+                            .map(|file| upload_dropped_file(file, &ssh))
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .await
+                    .unwrap_or_else(|error| Err(format!("upload task failed: {error}")));
+                    let _ = pane_tx.send(PaneEvent::DroppedFilesUploaded(upload_id, result));
+                });
+            }
+        }
+        // The drop lands where the caret is, so the next keystroke should too.
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    /// Present only while a drag is in flight, so it never sits between the
+    /// pointer and the grid during normal use. Styled only when what is being
+    /// dragged is a set of desktop files: other in-app drags pass through it.
+    fn external_drop_overlay(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("diri-terminal-external-drop")
+            .absolute()
+            .inset_0()
+            .rounded(px(Radius::PANEL))
+            .drag_over::<ExternalPaths>(|overlay, _, _, _| {
+                overlay
+                    .bg(Ink::FRESH.alpha(0.07))
+                    .border_2()
+                    .border_color(Ink::FRESH.alpha(0.5))
+            })
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                cx.stop_propagation();
+                this.external_drop(paths, window, cx);
+            }))
+            .into_any_element()
     }
 
     fn attachment_is_current(&self, id: &SessionId, generation: AttachmentGeneration) -> bool {
@@ -1527,6 +1683,15 @@ impl TerminalPane {
                 .selected_session_id()
                 .cloned(),
             SessionSource::Fixed(id) => Some(id.clone()),
+        }
+    }
+
+    fn open_account_continuation(&self, cx: &mut Context<Self>) {
+        if let Some(session) = self.selected_session()
+            && session.kind == diri_proto::AgentKind::CLAUDE_CODE
+            && session.agent_session_id.is_some()
+        {
+            cx.emit(TerminalPaneEvent::ContinueAccount(session.id.clone()));
         }
     }
 
@@ -2641,6 +2806,8 @@ impl TerminalPane {
                     cx.write_to_clipboard(ClipboardItem::new_string(
                         activation.copy_string.clone(),
                     ));
+                } else if activation.id == "account-profile" {
+                    this.open_account_continuation(cx);
                 } else if activation.checks.is_some() {
                     this.open_checks_for = if this.open_checks_for.as_ref() == Some(&activation.id)
                     {
@@ -3271,7 +3438,9 @@ impl TerminalPane {
                     ))
                     .child(div().min_w(px(0.0)).flex_1().truncate().child(chip.label))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if checks {
+                        if chip_id == "account-profile" {
+                            this.open_account_continuation(cx);
+                        } else if checks {
                             this.open_checks_for = Some(chip_id.clone());
                         } else if let Some(url) = url.as_deref() {
                             cx.open_url(url);
@@ -3425,16 +3594,16 @@ impl Render for TerminalPane {
                             .child(control),
                     )
                 })
-                .child(
-                    div()
-                        .flex_1()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_size(px(13.0))
-                        .text_color(sidebar_colors.tertiary)
-                        .child("Start a terminal from the sidebar"),
-                )
+                .child(crate::empty_workbench::render(
+                    !self
+                        .runtime
+                        .store
+                        .read()
+                        .expect("session store lock poisoned")
+                        .sessions()
+                        .is_empty(),
+                    colors,
+                ))
                 .into_any_element()
         };
 
@@ -3442,10 +3611,16 @@ impl Render for TerminalPane {
             SessionSource::FollowSelection => SharedString::from("diri-terminal-root"),
             SessionSource::Fixed(id) => SharedString::from(format!("diri-terminal-root-{}", id.0)),
         };
+        let has_resident = self
+            .selected_id()
+            .is_some_and(|id| self.residents.contains_key(&id));
+        let drop_overlay =
+            (has_resident && cx.has_active_drag()).then(|| self.external_drop_overlay(cx));
         div()
             .id(root_id)
             .key_context(TERMINAL_CONTEXT)
             .track_focus(&self.focus)
+            .relative()
             .flex()
             .size_full()
             .text_color(colors.primary)
@@ -3462,6 +3637,7 @@ impl Render for TerminalPane {
             .on_key_up(cx.listener(Self::handle_key_up))
             .on_modifiers_changed(cx.listener(Self::handle_modifiers_changed))
             .child(content)
+            .children(drop_overlay)
     }
 }
 
@@ -4948,6 +5124,10 @@ mod tests {
             "fixture must exercise the empty terminal state"
         );
         assert!(
+            cx.debug_bounds("empty-start-session").is_some(),
+            "the empty pane offers a direct next action"
+        );
+        assert!(
             cx.debug_bounds("show-sidebar").is_some(),
             "collapsing the sidebar must leave a way to reveal it"
         );
@@ -5327,6 +5507,44 @@ mod tests {
             terminal_paste(text, true),
             b"\x1b[200~first command\nsecond command\x1b[201~"
         );
+    }
+
+    #[test]
+    fn claude_image_drop_is_a_paste_even_when_recovered_modes_are_missing() {
+        let directory = tempfile::tempdir().expect("drop fixture");
+        let path = directory
+            .path()
+            .join("CleanShot 2026-09-05 at 9\u{202f}.40.35@2x.png");
+        std::fs::write(&path, b"image fixture").expect("write fixture");
+        let plan = plan_terminal_drop(std::slice::from_ref(&path), false);
+        let Some(TerminalDropAction::Paste(text)) = plan.action else {
+            panic!("a readable local image must reach the terminal");
+        };
+        let expected = paste(&terminal_drop_text([path.to_str().unwrap()]), true);
+        for reported_mode in [false, true] {
+            assert_eq!(
+                terminal_file_paste(&text, reported_mode, Some(&ProtoAgentKind::CLAUDE_CODE)),
+                expected,
+                "Claude attaches images only on its paste path, including after bounded log recovery"
+            );
+        }
+    }
+
+    #[test]
+    fn other_file_drop_targets_keep_their_negotiated_paste_mode() {
+        let text = terminal_drop_text(["/tmp/Screen Shot.png", "/tmp/notes.txt"]);
+        for kind in [
+            None,
+            Some(&ProtoAgentKind::SHELL),
+            Some(&ProtoAgentKind::CODEX),
+        ] {
+            for reported_mode in [false, true] {
+                assert_eq!(
+                    terminal_file_paste(&text, reported_mode, kind),
+                    paste(&text, reported_mode),
+                );
+            }
+        }
     }
 
     #[test]

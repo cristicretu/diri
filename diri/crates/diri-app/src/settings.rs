@@ -44,27 +44,39 @@ pub enum SettingsTab {
     #[default]
     General,
     Agents,
+    Accounts,
+    Shortcuts,
     Terminal,
+    Usage,
     Resources,
     Remote,
+    Phone,
 }
 
 impl SettingsTab {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 9] = [
         Self::General,
         Self::Agents,
+        Self::Accounts,
+        Self::Shortcuts,
         Self::Terminal,
+        Self::Usage,
         Self::Resources,
         Self::Remote,
+        Self::Phone,
     ];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::General => "General",
             Self::Agents => "Agents",
-            Self::Terminal => "Terminal",
+            Self::Accounts => "Accounts",
+            Self::Shortcuts => "Shortcuts",
+            Self::Terminal => "Appearance",
+            Self::Usage => "Usage",
             Self::Resources => "Resources",
             Self::Remote => "Remote",
+            Self::Phone => "Phone access",
         }
     }
 
@@ -72,9 +84,13 @@ impl SettingsTab {
         match self {
             Self::General => "Startup, sessions, and updates",
             Self::Agents => "Installed CLIs and quick create",
-            Self::Terminal => "Appearance and text size",
+            Self::Accounts => "Profiles for work and personal accounts",
+            Self::Shortcuts => "Keyboard commands and bindings",
+            Self::Terminal => "Themes and terminal type",
+            Self::Usage => "Costs, tokens, and cache savings",
             Self::Resources => "Idle sessions and memory",
             Self::Remote => "SSH execution hosts",
+            Self::Phone => "Code from your iPhone",
         }
     }
 
@@ -82,8 +98,13 @@ impl SettingsTab {
     /// describe the machines and resources sessions run on.
     pub const fn section(self) -> SettingsSection {
         match self {
-            Self::General | Self::Agents | Self::Terminal => SettingsSection::Personal,
-            Self::Resources | Self::Remote => SettingsSection::System,
+            Self::General
+            | Self::Agents
+            | Self::Accounts
+            | Self::Shortcuts
+            | Self::Terminal
+            | Self::Usage => SettingsSection::Personal,
+            Self::Resources | Self::Remote | Self::Phone => SettingsSection::System,
         }
     }
 
@@ -91,9 +112,13 @@ impl SettingsTab {
         match self {
             Self::General => "gearshape",
             Self::Agents => "sparkles",
+            Self::Accounts => "account.circle",
+            Self::Shortcuts => "keyboard",
             Self::Terminal => "terminal",
+            Self::Usage => "chart.bar.xaxis",
             Self::Resources => "server.rack",
             Self::Remote => "network",
+            Self::Phone => "iphone",
         }
     }
 }
@@ -264,6 +289,7 @@ mod tests {
         assert_eq!(cycle_hibernate_minutes(60), 0);
         assert_eq!(cycle_memory_limit(2), 4);
         assert_eq!(cycle_memory_limit(8), 2);
+        assert_eq!(SettingsTab::Terminal.label(), "Appearance");
         assert!(
             SettingsTab::ALL
                 .into_iter()

@@ -41,6 +41,7 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
                     "host": {"type": "string"},
                     "worktree": {"type": "boolean"},
                     "branch": {"type": "string"},
+                    "base": {"type": "string", "description": "Starting ref for a new worktree, e.g. main. Omitted preserves HEAD behavior."},
                     "prompt": {"type": "string"},
                     "name": {"type": "string"}
                 },

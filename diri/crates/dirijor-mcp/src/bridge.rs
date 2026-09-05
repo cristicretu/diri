@@ -145,12 +145,14 @@ impl Bridge {
             cwd: required_string(arguments, "cwd")?,
             new_worktree: optional_bool(arguments, "worktree"),
             worktree_branch: optional_string(arguments, "branch"),
+            worktree_base: optional_string(arguments, "base"),
             title: optional_string(arguments, "name"),
             initial_prompt: optional_string(arguments, "prompt"),
             parent,
             initial_cols: None,
             initial_rows: None,
             host: optional_string(arguments, "host"),
+            account_profile_id: None,
             same_repo_as: None,
         };
         let params = serde_json::to_value(params).map_err(|error| error.to_string())?;
@@ -951,6 +953,7 @@ mod tests {
             git_branch: None,
             title: id.into(),
             title_source: TitleSource::Placeholder,
+            account_profile: None,
             originating_prompt: None,
             agent_session_id: None,
             transcript_path: None,

@@ -25,6 +25,106 @@ fn engine() -> Arc<ManifestEngine> {
 }
 
 #[test]
+fn hello_overtakes_a_slow_worktree_spawn_on_the_same_connection() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    for args in [
+        vec!["init", "--initial-branch=main"],
+        vec![
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "main",
+        ],
+    ] {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+    }
+    let hook = repo.join(".git/hooks/post-checkout");
+    std::fs::write(&hook, "#!/bin/sh\nsleep 1\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let registry = Arc::new(Mutex::new(Registry::new(
+        engine(),
+        temp.path().join("state.json"),
+    )));
+    let server = Arc::new(ControlServer::new(
+        Arc::clone(&registry),
+        temp.path().join("daemon.sock"),
+    ));
+    let listener = server.bind().unwrap();
+    let worker = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        server.serve(stream).unwrap();
+    });
+    let mut stream = UnixStream::connect(temp.path().join("daemon.sock")).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    for message in [
+        ControlMessage::Request {
+            id: 1,
+            method: "session.spawn".into(),
+            params: Some(json!({
+                "kind":{"shell":{}}, "cwd":repo, "newWorktree":true, "worktreeBase":"main", "worktreeBranch":"phone/test",
+                "argv":["/bin/sh", "-c", "printf ready; sleep 5"]
+            })),
+        },
+        ControlMessage::Request {
+            id: 2,
+            method: "hello".into(),
+            params: Some(json!({"proto":WIRE_VERSION,"build":"test"})),
+        },
+    ] {
+        let mut bytes = serde_json::to_vec(&message).unwrap();
+        bytes.push(b'\n');
+        stream.write_all(&bytes).unwrap();
+    }
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<ControlMessage>(&line).unwrap(),
+            ControlMessage::Response {
+                id: 2,
+                result: Ok(_)
+            }
+        ),
+        "Hello must not wait behind Git or a first-prompt wait: {line}"
+    );
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    let ControlMessage::Response {
+        id: 1,
+        result: Ok(record),
+    } = serde_json::from_str::<ControlMessage>(&line).unwrap()
+    else {
+        panic!("spawn failed: {line}");
+    };
+    registry
+        .lock()
+        .unwrap()
+        .terminate(
+            record["id"].as_str().unwrap(),
+            std::time::Duration::from_secs(2),
+        )
+        .unwrap();
+    drop(reader);
+    drop(stream);
+    worker.join().unwrap();
+}
+
+#[test]
 fn a_client_can_handshake_and_list_over_the_socket() {
     let temp = tempfile::tempdir().expect("temp");
     let registry = Registry::new(engine(), temp.path().join("state.json"));

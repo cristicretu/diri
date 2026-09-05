@@ -242,7 +242,7 @@ impl RootView {
     ) -> Self {
         let sidebar_runtime = (!preview).then(|| Arc::clone(&services.store));
         let sidebar = cx.new(|cx| Sidebar::new(sidebar_runtime, preview, preview_scenario, cx));
-        let terminal = (!preview).then(|| {
+        let terminal = (!preview || preview_scenario == PreviewScenario::Empty).then(|| {
             let runtime = Arc::clone(&services.store);
             let tokio = Arc::clone(&services.tokio);
             cx.new(|cx| TerminalPane::new(runtime, tokio, window, cx))
@@ -283,19 +283,37 @@ impl RootView {
             });
         }
         if let Some(terminal) = &terminal {
-            cx.subscribe(terminal, |this, _, event, cx| {
-                let TerminalPaneEvent::OpenFileReference { reference, cwd, .. } = event;
-                let inspector = this.inspector.clone();
-                this.reveal_inspector(cx);
-                if let Some(inspector) = inspector {
-                    inspector.update(cx, |inspector, cx| {
-                        inspector.open_file_reference(cwd.clone(), reference.clone(), cx);
-                    });
+            cx.subscribe_in(terminal, window, |this, _, event, window, cx| match event {
+                TerminalPaneEvent::ContinueAccount(id) => {
+                    if let Some(surfaces) = &this.utility_surfaces {
+                        surfaces.update(cx, |surfaces, cx| {
+                            surfaces.open_account_continuation(id.clone(), window, cx)
+                        });
+                    }
+                }
+                TerminalPaneEvent::OpenFileReference { reference, cwd, .. } => {
+                    let inspector = this.inspector.clone();
+                    this.reveal_inspector(cx);
+                    if let Some(inspector) = inspector {
+                        inspector.update(cx, |inspector, cx| {
+                            inspector.open_file_reference(cwd.clone(), reference.clone(), cx);
+                        });
+                    }
+                }
+                TerminalPaneEvent::ExternalDropFeedback { message } => {
+                    this.show_quote_feedback("Dropped files", message.clone(), cx);
                 }
             })
             .detach();
         }
         cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
+            if let SidebarEvent::ContinueAccount(id) = event
+                && let Some(surfaces) = &this.utility_surfaces
+            {
+                surfaces.update(cx, |surfaces, cx| {
+                    surfaces.open_account_continuation(id.clone(), window, cx)
+                });
+            }
             if let SidebarEvent::HandoffProposed(proposal) = event {
                 this.launcher.update(cx, |launcher, cx| {
                     launcher.open_handoff(proposal.clone(), window, cx);
@@ -408,6 +426,17 @@ impl RootView {
             &launcher,
             window,
             |this, _, event: &LauncherEvent, window, cx| {
+                if matches!(event, LauncherEvent::ManageAccounts)
+                    && let Some(surfaces) = &this.utility_surfaces
+                {
+                    surfaces.update(cx, |surfaces, cx| {
+                        surfaces.open_settings(cx);
+                        surfaces.open_settings_tab(crate::settings::SettingsTab::Accounts, cx);
+                        surfaces.focus_handle(cx).focus(window, cx);
+                    });
+                    cx.notify();
+                    return;
+                }
                 if let LauncherEvent::ManageAgents(host) = event
                     && let Some(surfaces) = &this.utility_surfaces
                 {
@@ -439,7 +468,14 @@ impl RootView {
         let mut snapshots = services.store.snapshots();
         let mut usage = services.usage_tx.subscribe();
         let mut updates = services.updates.subscribe();
-        sidebar.update(cx, |sidebar, cx| sidebar.set_usage(*usage.borrow(), cx));
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_usage(usage.borrow().clone(), cx)
+        });
+        if let Some(surfaces) = &utility_surfaces {
+            surfaces.update(cx, |surfaces, cx| {
+                surfaces.set_usage(usage.borrow().clone(), cx)
+            });
+        }
         // Seed the current state: `watch` only wakes on changes, and an
         // unsupported build settles before this view exists.
         let initial_update = services.updates.state();
@@ -534,9 +570,14 @@ impl RootView {
                     }
                     changed = usage.changed() => {
                         if changed.is_err() { break; }
-                        let snapshot = *usage.borrow_and_update();
+                        let snapshot = usage.borrow_and_update().clone();
                         service_sidebar.update(cx, |sidebar, cx| {
-                            sidebar.set_usage(snapshot, cx);
+                            sidebar.set_usage(snapshot.clone(), cx);
+                        });
+                        let _ = this.update(cx, |this, cx| {
+                            if let Some(surfaces) = &this.utility_surfaces {
+                                surfaces.update(cx, |surfaces, cx| surfaces.set_usage(snapshot, cx));
+                            }
                         });
                     }
                     changed = updates.changed() => {
@@ -997,6 +1038,16 @@ impl RootView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // A sidebar drag rarely has sidebar focus (the press left it in the
+        // terminal), so Escape is caught here, on the window's capture path.
+        if event.keystroke.key == "escape"
+            && self
+                .sidebar
+                .update(cx, |sidebar, cx| sidebar.cancel_active_drag(cx))
+        {
+            cx.stop_propagation();
+            return;
+        }
         if self.quote_target_picker.is_some() {
             let target_count = self
                 .quote_target_picker
@@ -1940,7 +1991,7 @@ impl RootView {
             .border_1()
             .border_color(terminal.primary.alpha(0.10));
 
-        if self.preview {
+        if self.preview && self.preview_scenario != PreviewScenario::Empty {
             card = card.child(self.preview_workbench(terminal));
         } else if split_open {
             let available_height = (card_height - 1.0).max(0.0);
