@@ -44,6 +44,7 @@ pub enum SettingsTab {
     #[default]
     General,
     Agents,
+    Skills,
     Accounts,
     Shortcuts,
     Terminal,
@@ -54,9 +55,10 @@ pub enum SettingsTab {
 }
 
 impl SettingsTab {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::General,
         Self::Agents,
+        Self::Skills,
         Self::Accounts,
         Self::Shortcuts,
         Self::Terminal,
@@ -70,6 +72,7 @@ impl SettingsTab {
         match self {
             Self::General => "General",
             Self::Agents => "Agents",
+            Self::Skills => "Skills",
             Self::Accounts => "Accounts",
             Self::Shortcuts => "Shortcuts",
             Self::Terminal => "Appearance",
@@ -84,6 +87,7 @@ impl SettingsTab {
         match self {
             Self::General => "Startup, sessions, and updates",
             Self::Agents => "Installed CLIs and quick create",
+            Self::Skills => "Browse local and project skills",
             Self::Accounts => "Profiles for work and personal accounts",
             Self::Shortcuts => "Keyboard commands and bindings",
             Self::Terminal => "Themes and terminal type",
@@ -100,6 +104,7 @@ impl SettingsTab {
         match self {
             Self::General
             | Self::Agents
+            | Self::Skills
             | Self::Accounts
             | Self::Shortcuts
             | Self::Terminal
@@ -112,6 +117,7 @@ impl SettingsTab {
         match self {
             Self::General => "gearshape",
             Self::Agents => "sparkles",
+            Self::Skills => "doc.text",
             Self::Accounts => "account.circle",
             Self::Shortcuts => "keyboard",
             Self::Terminal => "terminal",

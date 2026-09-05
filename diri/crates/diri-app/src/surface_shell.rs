@@ -253,6 +253,7 @@ impl HostEditor {
 }
 
 pub struct UtilitySurfaces {
+    skills: gpui::Entity<crate::skills_page::SkillsPage>,
     accounts: AccountsState,
     phone_access: Option<crate::phone_access::PhoneAccess>,
     phone_loading: bool,
@@ -332,6 +333,7 @@ impl UtilitySurfaces {
         let settings_tab = match settings_preview.as_deref() {
             Some("terminal" | "appearance") => SettingsTab::Terminal,
             Some("agents") => SettingsTab::Agents,
+            Some("skills") => SettingsTab::Skills,
             Some("accounts") => SettingsTab::Accounts,
             Some("shortcuts") => SettingsTab::Shortcuts,
             Some("resources") => SettingsTab::Resources,
@@ -377,8 +379,21 @@ impl UtilitySurfaces {
                 }
             })
         };
+        let skills =
+            cx.new(|cx| crate::skills_page::SkillsPage::new(Arc::clone(&store_runtime.store), cx));
+        if settings_tab == SettingsTab::Skills {
+            let project = store_runtime
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .selected_session()
+                .filter(|session| session.host.is_none())
+                .map(|session| PathBuf::from(&session.cwd));
+            skills.update(cx, |skills, cx| skills.open(project, cx));
+        }
         Self {
             focus,
+            skills,
             accounts: AccountsState::default(),
             phone_access: None,
             phone_loading: false,
@@ -1159,6 +1174,9 @@ impl UtilitySurfaces {
         self.shortcut_search.clear();
         self.shortcut_search_active = false;
         self.shortcut_editor = None;
+        if self.settings_tab == SettingsTab::Skills {
+            self.refresh_skills(cx);
+        }
         cx.notify();
     }
 
@@ -1231,6 +1249,9 @@ impl UtilitySurfaces {
             self.settings_scroll.set_offset(point(px(0.0), px(0.0)));
         }
         self.settings_tab = tab;
+        if tab == SettingsTab::Skills {
+            self.refresh_skills(cx);
+        }
         if tab == SettingsTab::Accounts {
             self.refresh_accounts(cx);
         }
@@ -1249,6 +1270,18 @@ impl UtilitySurfaces {
                 .request_agent_catalog(self.agents_host.clone(), false);
         }
         cx.notify();
+    }
+
+    fn refresh_skills(&mut self, cx: &mut Context<Self>) {
+        let project = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .selected_session()
+            .filter(|session| session.host.is_none())
+            .map(|session| PathBuf::from(&session.cwd));
+        self.skills
+            .update(cx, |skills, cx| skills.open(project, cx));
     }
 
     fn begin_shortcut_edit(
@@ -1546,6 +1579,14 @@ impl UtilitySurfaces {
         }
         if self.handle_settings_search_key(event, cx) {
             cx.stop_propagation();
+            return;
+        }
+        if self.surface == Surface::Settings
+            && self.settings_tab == SettingsTab::Skills
+            && self
+                .skills
+                .update(cx, |skills, cx| skills.handle_key(event, cx))
+        {
             return;
         }
         let key = &event.keystroke;
@@ -2204,6 +2245,7 @@ impl UtilitySurfaces {
         let pane = match self.settings_tab {
             SettingsTab::General => self.general_settings(cx).into_any_element(),
             SettingsTab::Agents => self.agents_settings(cx).into_any_element(),
+            SettingsTab::Skills => self.skills.clone().into_any_element(),
             SettingsTab::Accounts => self.accounts_settings(cx).into_any_element(),
             SettingsTab::Shortcuts => self.shortcuts_settings(cx).into_any_element(),
             SettingsTab::Terminal => self.terminal_settings(cx).into_any_element(),
@@ -5408,6 +5450,9 @@ fn settings_tab_matches(tab: SettingsTab, query: &str) -> bool {
         SettingsTab::Agents => {
             "agents codex claude cursor gemini executable installed command line quick create default"
         }
+        SettingsTab::Skills => {
+            "skills catalogue catalog instructions personal project plugins search SKILL.md"
+        }
         SettingsTab::Accounts => {
             "accounts profiles work personal login authentication codex claude default config home"
         }
@@ -6225,6 +6270,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn seed_history(surfaces: &mut UtilitySurfaces) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -6463,6 +6509,7 @@ mod tests {
             Ok("shortcuts") => SettingsTab::Shortcuts,
             Ok("general") => SettingsTab::General,
             Ok("agents") => SettingsTab::Agents,
+            Ok("skills") => SettingsTab::Skills,
             Ok("accounts") => SettingsTab::Accounts,
             Ok("terminal") => SettingsTab::Terminal,
             Ok("resources") => SettingsTab::Resources,
@@ -6772,6 +6819,14 @@ mod tests {
 
         fn open_at(tab: SettingsTab, window: &mut Window, cx: &mut Context<Self>) -> Self {
             let runtime = Arc::new(StoreRuntime::inert());
+            if std::env::var_os("DIRI_VISUAL_LIGHT").is_some() {
+                runtime
+                    .store
+                    .write()
+                    .expect("preview store")
+                    .update_preferences(|prefs| prefs.terminal_theme = "dirijor-light".into())
+                    .expect("preview theme");
+            }
             let tokio = Arc::new(
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -6796,6 +6851,11 @@ mod tests {
                 );
                 surfaces.open_settings(cx);
                 surfaces.settings_tab = tab;
+                if tab == SettingsTab::Skills {
+                    surfaces.skills.update(cx, |skills, _| {
+                        skills.seed_preview(std::env::var_os("DIRI_VISUAL_SKILL_DETAIL").is_some())
+                    });
+                }
                 if tab == SettingsTab::Accounts {
                     surfaces.seed_account_preview(
                         std::env::var_os("DIRI_VISUAL_ACCOUNT_EDITOR").is_some(),
