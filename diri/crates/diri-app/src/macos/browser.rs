@@ -11,13 +11,18 @@ use objc2::runtime::ProtocolObject;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::NSView;
 use objc2_foundation::{
-    NSError, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURL, NSURLRequest,
+    NSDictionary, NSError, NSKeyValueChangeKey, NSKeyValueObservingOptions, NSObject,
+    NSObjectNSKeyValueObserverRegistration, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
+    NSURL, NSURLRequest,
 };
 use objc2_web_kit::{WKNavigation, WKNavigationDelegate, WKWebView, WKWebViewConfiguration};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 use crate::inspector::BrowserState;
+
+const STATE_KEYS: [&str; 5] = ["URL", "title", "canGoBack", "canGoForward", "loading"];
 
 /// Top-left frame coordinates in GPUI points.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -30,12 +35,14 @@ pub struct BrowserFrame {
 
 /// A lazily-attached, single-tab WebKit view.
 pub struct NativeBrowser {
-    web_view: Option<objc2::rc::Retained<WKWebView>>,
+    web_view: Option<Retained<BrowserWebView>>,
     /// Non-owning: AppKit owns the GPUI root view for the window lifetime.
     parent: Option<*const NSView>,
     pending_url: Option<String>,
     delegate: Option<Retained<BrowserDelegate>>,
     events: tokio::sync::mpsc::Sender<()>,
+    visible: bool,
+    pointer_passthrough: bool,
 }
 
 impl NativeBrowser {
@@ -48,6 +55,8 @@ impl NativeBrowser {
                 pending_url: None,
                 delegate: None,
                 events,
+                visible: false,
+                pointer_passthrough: false,
             },
             receiver,
         )
@@ -55,6 +64,56 @@ impl NativeBrowser {
 
     pub fn has_page(&self) -> bool {
         self.pending_url.is_some()
+    }
+
+    /// Native content shares the measured GPUI body, including its borders,
+    /// toolbars and recovery banner. Apply the frame during paint, after layout
+    /// has resolved, without a bounds notification or a second layout pass.
+    pub fn surface(browser: Rc<RefCell<Self>>) -> impl gpui::IntoElement {
+        use gpui::prelude::*;
+        gpui::canvas(
+            |_, _, _| (),
+            move |bounds, (), window, _| {
+                let mut browser = browser.borrow_mut();
+                let visible = browser.visible;
+                browser.sync(
+                    window,
+                    visible,
+                    BrowserFrame {
+                        x: bounds.origin.x.into(),
+                        y: bounds.origin.y.into(),
+                        width: bounds.size.width.into(),
+                        height: bounds.size.height.into(),
+                    },
+                );
+            },
+        )
+        .absolute()
+        .inset_0()
+    }
+
+    pub fn set_visible(&mut self, visible: bool) {
+        if self.visible == visible {
+            return;
+        }
+        self.visible = visible;
+        if !visible {
+            self.hide();
+        } else if self.has_page()
+            && self.error().is_none()
+            && let Some(view) = &self.web_view
+        {
+            // Cached GPUI bodies may reuse their paint when only an overlay
+            // closes. Their native frame remains valid; no relayout is needed.
+            view.setHidden(false);
+        }
+    }
+
+    pub fn set_pointer_passthrough(&mut self, passthrough: bool) {
+        self.pointer_passthrough = passthrough;
+        if let Some(view) = &self.web_view {
+            view.ivars().pointer_passthrough.set(passthrough);
+        }
     }
 
     pub fn sync(&mut self, window: &impl HasWindowHandle, visible: bool, frame: BrowserFrame) {
@@ -84,11 +143,16 @@ impl NativeBrowser {
         } else {
             (bounds.size.height - f64::from(frame.y + frame.height)).max(0.0)
         };
-        view.setFrame(NSRect::new(
+        let frame = NSRect::new(
             NSPoint::new(f64::from(frame.x), y),
             NSSize::new(f64::from(frame.width), f64::from(frame.height)),
-        ));
-        view.setHidden(false);
+        );
+        if view.frame() != frame {
+            view.setFrame(frame);
+        }
+        if view.isHidden() {
+            view.setHidden(false);
+        }
     }
 
     pub fn load(&mut self, url: String) {
@@ -157,12 +221,14 @@ impl NativeBrowser {
     }
 
     pub fn hide(&mut self) {
-        if let Some(view) = &self.web_view {
+        if let Some(view) = &self.web_view
+            && !view.isHidden()
+        {
             view.setHidden(true);
         }
     }
 
-    fn ensure_view(&mut self, parent: *const NSView) -> Option<&WKWebView> {
+    fn ensure_view(&mut self, parent: *const NSView) -> Option<&BrowserWebView> {
         if self.parent != Some(parent) {
             self.detach();
             self.parent = Some(parent);
@@ -170,16 +236,18 @@ impl NativeBrowser {
         if self.web_view.is_none() {
             let mtm = MainThreadMarker::new()?;
             let configuration = unsafe { WKWebViewConfiguration::new(mtm) };
-            let view = unsafe {
-                WKWebView::initWithFrame_configuration(
-                    mtm.alloc(),
-                    NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 1.0)),
-                    &configuration,
-                )
-            };
+            let view = BrowserWebView::new(mtm, &configuration, self.pointer_passthrough);
             let delegate = BrowserDelegate::new(mtm, self.events.clone());
             unsafe {
                 view.setNavigationDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+                for key in STATE_KEYS {
+                    view.addObserver_forKeyPath_options_context(
+                        &delegate,
+                        &NSString::from_str(key),
+                        NSKeyValueObservingOptions::empty(),
+                        std::ptr::null_mut(),
+                    );
+                }
             }
             self.delegate = Some(delegate);
             // The parent receives its own retain. `self` retains the child so
@@ -198,6 +266,11 @@ impl NativeBrowser {
             // Remove while our retain still exists. The old parent also holds
             // the view, so dropping first could otherwise leave an overlay.
             unsafe {
+                if let Some(delegate) = &self.delegate {
+                    for key in STATE_KEYS {
+                        view.removeObserver_forKeyPath(delegate, &NSString::from_str(key));
+                    }
+                }
                 view.setNavigationDelegate(None);
                 view.stopLoading();
             }
@@ -211,6 +284,45 @@ impl NativeBrowser {
 impl Drop for NativeBrowser {
     fn drop(&mut self) {
         self.detach();
+    }
+}
+
+struct BrowserWebViewIvars {
+    pointer_passthrough: Cell<bool>,
+}
+
+define_class!(
+    #[unsafe(super(WKWebView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "DiriWorkspaceWebView"]
+    #[ivars = BrowserWebViewIvars]
+    struct BrowserWebView;
+
+    unsafe impl NSObjectProtocol for BrowserWebView {}
+
+    impl BrowserWebView {
+        #[unsafe(method_id(hitTest:))]
+        fn hit_test(&self, point: NSPoint) -> Option<Retained<NSView>> {
+            if self.ivars().pointer_passthrough.get() {
+                None
+            } else {
+                unsafe { msg_send![super(self), hitTest: point] }
+            }
+        }
+    }
+);
+
+impl BrowserWebView {
+    fn new(
+        mtm: MainThreadMarker,
+        configuration: &WKWebViewConfiguration,
+        passthrough: bool,
+    ) -> Retained<Self> {
+        let this = mtm.alloc().set_ivars(BrowserWebViewIvars {
+            pointer_passthrough: Cell::new(passthrough),
+        });
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 1.0));
+        unsafe { msg_send![super(this), initWithFrame: frame, configuration: configuration] }
     }
 }
 
@@ -241,6 +353,23 @@ define_class!(
     struct BrowserDelegate;
 
     unsafe impl NSObjectProtocol for BrowserDelegate {}
+
+    impl BrowserDelegate {
+        // WebKit marks these properties KVO-compliant, including same-document
+        // history and script-driven titles. Coalesce changes on the existing
+        // bounded notification channel instead of polling during root renders.
+        #[unsafe(method(observeValueForKeyPath:ofObject:change:context:))]
+        fn observed_state(
+            &self,
+            _key_path: Option<&NSString>,
+            _object: Option<&objc2::runtime::AnyObject>,
+            _change: Option<&NSDictionary<NSKeyValueChangeKey, objc2::runtime::AnyObject>>,
+            _context: *mut std::ffi::c_void,
+        ) {
+            self.changed();
+        }
+    }
+
     unsafe impl WKNavigationDelegate for BrowserDelegate {
         #[unsafe(method(webView:didStartProvisionalNavigation:))]
         fn started(&self, _view: &WKWebView, _navigation: Option<&WKNavigation>) {
@@ -311,8 +440,11 @@ impl BrowserDelegate {
 /// uses only an ephemeral loopback server; never connects to a Diri daemon.
 #[cfg(debug_assertions)]
 pub fn smoke_test() {
-    use objc2_app_kit::{NSApplication, NSBackingStoreType, NSWindow, NSWindowStyleMask};
-    use objc2_foundation::{NSDate, NSRunLoop};
+    use objc2_app_kit::{
+        NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSEventMask, NSWindow,
+        NSWindowStyleMask,
+    };
+    use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSRunLoop};
     use raw_window_handle::{AppKitWindowHandle, HandleError, WindowHandle};
     use std::io::{Read, Write};
     use std::sync::{
@@ -328,6 +460,20 @@ pub fn smoke_test() {
             Ok(unsafe { WindowHandle::borrow_raw(RawWindowHandle::AppKit(handle)) })
         }
     }
+    fn pump() {
+        let app = NSApplication::sharedApplication(MainThreadMarker::new().unwrap());
+        while let Some(event) = app.nextEventMatchingMask_untilDate_inMode_dequeue(
+            NSEventMask::Any,
+            Some(&NSDate::distantPast()),
+            unsafe { NSDefaultRunLoopMode },
+            true,
+        ) {
+            app.sendEvent(&event);
+        }
+        app.updateWindows();
+        NSRunLoop::currentRunLoop().runUntilDate(&NSDate::dateWithTimeIntervalSinceNow(0.008));
+    }
+    #[track_caller]
     fn until(mut condition: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(15);
         while !condition() {
@@ -335,7 +481,7 @@ pub fn smoke_test() {
                 Instant::now() < deadline,
                 "native browser fixture timed out"
             );
-            NSRunLoop::currentRunLoop().runUntilDate(&NSDate::dateWithTimeIntervalSinceNow(0.01));
+            pump();
         }
     }
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("fixture listener");
@@ -373,6 +519,7 @@ pub fn smoke_test() {
     });
     let mtm = MainThreadMarker::new().expect("fixture must run on the main thread");
     let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
     app.finishLaunching();
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -430,6 +577,123 @@ pub fn smoke_test() {
     until(|| {
         browser.state().title.as_deref() == Some("Fixture Two") && !browser.state().is_loading
     });
+    let mut resize_time = Duration::ZERO;
+    while events.try_recv().is_ok() {}
+    unsafe {
+        view.evaluateJavaScript_completionHandler(
+            &NSString::from_str("history.pushState({}, '', '/same-document')"),
+            None,
+        );
+    }
+    until(|| {
+        browser
+            .state()
+            .url
+            .as_deref()
+            .is_some_and(|url| url.ends_with("/same-document"))
+    });
+    assert!(
+        events.try_recv().is_ok(),
+        "same-document URLs must notify the toolbar"
+    );
+    let script_done = Rc::new(Cell::new(false));
+    let done = script_done.clone();
+    let completion = block2::RcBlock::new(
+        move |_: *mut objc2::runtime::AnyObject, error: *mut NSError| {
+            assert!(error.is_null(), "resize script failed: {:?}", unsafe {
+                error.as_ref()
+            });
+            done.set(true);
+        },
+    );
+    unsafe {
+        view.evaluateJavaScript_completionHandler(&NSString::from_str(
+            "window.resizeFrames = 0; window.resizeEvents = 0; addEventListener('resize', () => resizeEvents++); function tick() { resizeFrames++; document.title = innerWidth + ':' + resizeFrames + ':' + resizeEvents; requestAnimationFrame(tick); } requestAnimationFrame(tick);"
+        ), Some(&completion));
+    }
+    until(|| script_done.get());
+    until(|| {
+        browser
+            .state()
+            .title
+            .as_deref()
+            .is_some_and(|title| title.contains(':'))
+    });
+    while events.try_recv().is_ok() {}
+    until(|| events.try_recv().is_ok());
+    browser.set_pointer_passthrough(true);
+    assert!(
+        view.hitTest(NSPoint::new(20.0, 20.0)).is_none(),
+        "resize motion must reach GPUI"
+    );
+    for step in 0..240 {
+        let width = 320.0 + (step % 120) as f32 * 2.0;
+        let resized = BrowserFrame { width, ..frame };
+        let start = Instant::now();
+        // Repeated root paints without geometry changes are common while a
+        // terminal streams output next to the page.
+        for _ in 0..8 {
+            browser.sync(&host, true, resized);
+        }
+        resize_time += start.elapsed();
+        assert!(!view.isHidden(), "resize must keep the website painted");
+        assert_eq!(view.frame().size.width, f64::from(width));
+        assert!(std::ptr::eq(&**browser.web_view.as_ref().unwrap(), &*view));
+        pump();
+        if step == 119 || step == 239 {
+            until(|| {
+                browser
+                    .state()
+                    .title
+                    .as_deref()
+                    .is_some_and(|title| title.starts_with("558:"))
+            });
+            let title = browser.state().title.unwrap();
+            let values: Vec<u32> = title
+                .split(':')
+                .map(|value| value.parse().unwrap())
+                .collect();
+            assert!(
+                values[1] > 10 && values[2] > 10,
+                "page must keep painting and reflowing during the drag: {title}"
+            );
+        }
+    }
+    browser.set_pointer_passthrough(false);
+    assert!(
+        view.hitTest(NSPoint::new(20.0, 20.0)).is_some(),
+        "page interaction must resume after release"
+    );
+    println!(
+        "Native resize sweep: 240 sizes / 1920 syncs in {resize_time:?} of main-thread sync work"
+    );
+    // Window resizing also changes the AppKit coordinate conversion. Keep the
+    // page aligned below a toolbar, with no reload or visibility transition.
+    for step in 0..32 {
+        let width = 500.0 + f64::from(step) * 8.0;
+        let height = 380.0 + f64::from(step) * 4.0;
+        window.setContentSize(NSSize::new(width, height));
+        browser.sync(
+            &host,
+            true,
+            BrowserFrame {
+                x: 200.0,
+                y: 84.0,
+                width: (width - 200.0) as f32,
+                height: (height - 84.0) as f32,
+            },
+        );
+        pump();
+        assert!(!view.isHidden());
+        assert_eq!(view.frame().origin, NSPoint::new(200.0, 0.0));
+        assert_eq!(view.frame().size, NSSize::new(width - 200.0, height - 84.0));
+    }
+    // Overlay close may reuse the cached GPUI body without another paint.
+    browser.set_visible(true);
+    browser.set_visible(false);
+    assert!(view.isHidden());
+    browser.set_visible(true);
+    assert!(!view.isHidden());
     browser.sync(&host, false, frame);
     assert!(view.isHidden());
     browser.sync(&host, true, frame);
@@ -447,6 +711,6 @@ pub fn smoke_test() {
     browser.clear();
     window.close();
     println!(
-        "Native browser fixture passed: DOM load, link navigation, history, event delivery, hide/show, close, load failure."
+        "Native browser fixture passed: DOM load, navigation/history, live resize/animation frames, pointer passthrough/release, window resize alignment, cached overlay restoration, close, load failure."
     );
 }
