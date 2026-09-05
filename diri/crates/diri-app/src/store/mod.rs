@@ -1438,7 +1438,7 @@ impl SessionStore {
         self.focus_session(id);
     }
 
-    fn apply_spawn_result(&mut self, id: SessionId) {
+    pub(crate) fn apply_spawn_result(&mut self, id: SessionId) {
         // session.updated and the spawn response travel on separate channels,
         // so either can arrive first. focus_session handles both orderings:
         // if the record is already present it grants terminal residency now;
