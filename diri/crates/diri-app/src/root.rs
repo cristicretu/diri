@@ -13,15 +13,16 @@ use gpui::{
 
 use crate::AppServices;
 use crate::commands::{
-    self, APP_CONTEXT, ArchiveSelectedSession, CheckForUpdates, CloseSession, CommandId,
-    DelegateSelectedSession, FocusSidebar, MoveSelectedSessionDown, MoveSelectedSessionUp,
+    self, APP_CONTEXT, AddExistingPane, ArchiveSelectedSession, CheckForUpdates, ClosePane,
+    CloseSession, CommandId, DelegateSelectedSession, FocusNextPane, FocusPaneDown, FocusPaneLeft,
+    FocusPaneRight, FocusPaneUp, FocusSidebar, MoveSelectedSessionDown, MoveSelectedSessionUp,
     NewCodexSession, NewDefaultSession, NewTerminal, OpenLauncher, OpenSettings, OpenWorktrees,
     QuoteSelection, QuoteSelectionToSession, RenameSelectedSession, ReopenSession,
     SESSION_NAVIGATION_CONTEXT, SelectLastSession, SelectNextAttentionSession, SelectNextSession,
     SelectPreviousSession, SelectSession1, SelectSession2, SelectSession3, SelectSession4,
-    SelectSession5, SelectSession6, SelectSession7, SelectSession8, ToggleAuxiliaryTerminal,
-    ToggleCommandPalette, ToggleHistory, ToggleInspector, ToggleOverview, ToggleQuickOpen,
-    ToggleSidebar,
+    SelectSession5, SelectSession6, SelectSession7, SelectSession8, SplitBelow, SplitRight,
+    ToggleAuxiliaryTerminal, ToggleCommandPalette, ToggleHistory, ToggleInspector, ToggleOverview,
+    ToggleQuickOpen, ToggleSidebar,
 };
 use crate::external_drop::ExternalDropAction;
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
@@ -37,6 +38,8 @@ use crate::seam::{SeamSlide, toggle_has_settled};
 use crate::session_surfaces::SessionSurfaces;
 use crate::sidebar::{PreviewScenario, Sidebar, SidebarEvent};
 use crate::sounds::{self, PlatformPlayer, SoundGate, StatusSound};
+use crate::split_layout::{Direction, Rect, SplitAxis};
+use crate::split_workbench::SplitWorkbench;
 use crate::store::SpawnOptions;
 use crate::surface_shell::UtilitySurfaces;
 use crate::terminal_pane::{TerminalPane, TerminalPaneEvent, TerminalViewport};
@@ -171,6 +174,7 @@ enum QuoteSurface {
     #[default]
     PrimaryTerminal,
     AuxiliaryTerminal,
+    SplitTerminal,
     Inspector,
 }
 
@@ -232,6 +236,7 @@ pub struct RootView {
     auxiliary_spawn_parent: Option<SessionId>,
     collapsed_auxiliary_parents: HashSet<SessionId>,
     workbench_layout: WorkbenchLayout,
+    split_workbench: Entity<SplitWorkbench>,
     terminal_resize_origin: Option<(f32, f32)>,
     terminal_available_height: f32,
     inspector_open: bool,
@@ -346,31 +351,18 @@ impl RootView {
         }
         if let Some(terminal) = &terminal {
             let terminal = terminal.clone();
-            cx.defer_in(window, move |_, window, cx| {
-                terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+            cx.defer_in(window, move |this, window, cx| {
+                if this.split_workbench.read(cx).active_for_selection() {
+                    this.split_workbench
+                        .update(cx, |splits, cx| splits.focus_selected(window, cx));
+                } else {
+                    terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+                }
             });
         }
         if let Some(terminal) = &terminal {
-            cx.subscribe_in(terminal, window, |this, _, event, window, cx| match event {
-                TerminalPaneEvent::ContinueAccount(id) => {
-                    if let Some(surfaces) = &this.utility_surfaces {
-                        surfaces.update(cx, |surfaces, cx| {
-                            surfaces.open_account_continuation(id.clone(), window, cx)
-                        });
-                    }
-                }
-                TerminalPaneEvent::OpenFileReference { reference, cwd, .. } => {
-                    let inspector = this.inspector.clone();
-                    this.reveal_inspector(cx);
-                    if let Some(inspector) = inspector {
-                        inspector.update(cx, |inspector, cx| {
-                            inspector.open_file_reference(cwd.clone(), reference.clone(), cx);
-                        });
-                    }
-                }
-                TerminalPaneEvent::ExternalDropFeedback { message } => {
-                    this.show_quote_feedback("Dropped files", message.clone(), cx);
-                }
+            cx.subscribe_in(terminal, window, |this, _, event, window, cx| {
+                this.handle_terminal_event(event, window, cx)
             })
             .detach();
         }
@@ -431,12 +423,20 @@ impl RootView {
                 if let Some(terminal) = &this.terminal {
                     terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
                     this.sync_auxiliary_terminal(window, cx);
+                    if this.split_workbench.read(cx).active_for_selection() {
+                        this.split_workbench
+                            .update(cx, |splits, cx| splits.focus_selected(window, cx));
+                    }
                 }
             }
             if matches!(event, SidebarEvent::FocusTerminal) {
                 if let Some(terminal) = &this.terminal {
                     terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
                     this.sync_auxiliary_terminal(window, cx);
+                    if this.split_workbench.read(cx).active_for_selection() {
+                        this.split_workbench
+                            .update(cx, |splits, cx| splits.focus_selected(window, cx));
+                    }
                 } else {
                     window.focus(&this.focus, cx);
                 }
@@ -530,7 +530,10 @@ impl RootView {
                         surfaces.open_agent_settings(host.clone(), cx);
                     });
                 }
-                if let Some(terminal) = &this.terminal {
+                if this.split_workbench.read(cx).active_for_selection() {
+                    this.split_workbench
+                        .update(cx, |splits, cx| splits.focus_selected(window, cx));
+                } else if let Some(terminal) = &this.terminal {
                     terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
                 } else {
                     window.focus(&this.focus, cx);
@@ -947,6 +950,21 @@ impl RootView {
                 }
             }
         });
+        let split_workbench = cx.new(|cx| {
+            SplitWorkbench::new(
+                Arc::clone(&services.store),
+                Arc::clone(&services.tokio),
+                terminal.clone(),
+                navigation.clone(),
+                utility_surfaces.clone(),
+                cx,
+            )
+        });
+        cx.subscribe_in(&split_workbench, window, |this, _, event, window, cx| {
+            this.handle_terminal_event(event, window, cx)
+        })
+        .detach();
+        let split_observer = cx.observe(&split_workbench, |_, _, cx| cx.notify());
         let mut root = Self {
             sidebar,
             terminal,
@@ -975,6 +993,7 @@ impl RootView {
             auxiliary_spawn_parent: None,
             collapsed_auxiliary_parents: HashSet::new(),
             workbench_layout,
+            split_workbench,
             terminal_resize_origin: None,
             terminal_available_height: 0.0,
             inspector_open,
@@ -1012,6 +1031,7 @@ impl RootView {
             _subscriptions: std::iter::once(activation)
                 .chain(bounds_observer)
                 .chain(appearance_observer)
+                .chain(std::iter::once(split_observer))
                 .collect(),
             _service_events: service_events,
             _surface_sync: surface_sync,
@@ -1061,6 +1081,35 @@ impl RootView {
         }));
     }
 
+    fn handle_terminal_event(
+        &mut self,
+        event: &TerminalPaneEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            TerminalPaneEvent::ContinueAccount(id) => {
+                if let Some(surfaces) = &self.utility_surfaces {
+                    surfaces.update(cx, |surfaces, cx| {
+                        surfaces.open_account_continuation(id.clone(), window, cx)
+                    });
+                }
+            }
+            TerminalPaneEvent::OpenFileReference { reference, cwd, .. } => {
+                let inspector = self.inspector.clone();
+                self.reveal_inspector(cx);
+                if let Some(inspector) = inspector {
+                    inspector.update(cx, |inspector, cx| {
+                        inspector.open_file_reference(cwd.clone(), reference.clone(), cx);
+                    });
+                }
+            }
+            TerminalPaneEvent::ExternalDropFeedback { message } => {
+                self.show_quote_feedback("Dropped files", message.clone(), cx);
+            }
+        }
+    }
+
     fn colors(&self) -> SemanticColors {
         let store = self
             .services
@@ -1097,6 +1146,14 @@ impl RootView {
     }
 
     fn focused_quote_surface(&self, window: &Window, cx: &App) -> Option<QuoteSurface> {
+        if self
+            .split_workbench
+            .read(cx)
+            .focused_terminal(window, cx)
+            .is_some()
+        {
+            return Some(QuoteSurface::SplitTerminal);
+        }
         if let Some(auxiliary) = &self.auxiliary_terminal
             && auxiliary.read(cx).is_focused(window)
         {
@@ -1117,6 +1174,7 @@ impl RootView {
 
     fn quote_from_surface(&self, surface: QuoteSurface, cx: &App) -> Option<Quote> {
         match surface {
+            QuoteSurface::SplitTerminal => self.split_workbench.read(cx).quote_selection(cx),
             QuoteSurface::PrimaryTerminal => self
                 .terminal
                 .as_ref()
@@ -1144,7 +1202,13 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if surface == QuoteSurface::SplitTerminal {
+            self.split_workbench
+                .update(cx, |splits, cx| splits.focus_selected(window, cx));
+            return;
+        }
         let handle = match surface {
+            QuoteSurface::SplitTerminal => None,
             QuoteSurface::PrimaryTerminal => self
                 .terminal
                 .as_ref()
@@ -1549,6 +1613,46 @@ impl RootView {
             CommandId::ToggleAuxiliaryTerminal => {
                 self.open_auxiliary_terminal(window, cx);
             }
+            CommandId::SplitRight | CommandId::SplitBelow => {
+                let axis = if command == CommandId::SplitRight {
+                    SplitAxis::Right
+                } else {
+                    SplitAxis::Below
+                };
+                if let Some(auxiliary) = self.auxiliary_id.clone() {
+                    self.split_workbench
+                        .update(cx, |splits, _| splits.include_auxiliary(auxiliary));
+                }
+                self.split_workbench
+                    .update(cx, |splits, cx| splits.spawn(axis, window, cx));
+            }
+            CommandId::AddExistingPane => {
+                self.split_workbench.update(cx, |splits, cx| {
+                    splits.open_picker(SplitAxis::Right, window, cx)
+                });
+            }
+            CommandId::FocusNextPane => {
+                self.split_workbench
+                    .update(cx, |splits, cx| splits.focus_next(window, cx));
+            }
+            CommandId::FocusPaneLeft
+            | CommandId::FocusPaneRight
+            | CommandId::FocusPaneUp
+            | CommandId::FocusPaneDown => {
+                let direction = match command {
+                    CommandId::FocusPaneLeft => Direction::Left,
+                    CommandId::FocusPaneRight => Direction::Right,
+                    CommandId::FocusPaneUp => Direction::Up,
+                    _ => Direction::Down,
+                };
+                self.split_workbench.update(cx, |splits, cx| {
+                    splits.focus_direction(direction, window, cx)
+                });
+            }
+            CommandId::ClosePane => {
+                self.split_workbench
+                    .update(cx, |splits, cx| splits.close_selected(window, cx));
+            }
             CommandId::QuoteSelection => self.quote_selection(false, window, cx),
             CommandId::QuoteSelectionToSession => self.quote_selection(true, window, cx),
             CommandId::ArchiveSelectedSession => {
@@ -1677,6 +1781,11 @@ impl RootView {
             return self.ensure_auxiliary_terminal(window, cx);
         }
         self.sync_auxiliary_terminal(window, cx);
+        if self.split_workbench.read(cx).active_for_selection() {
+            self.split_workbench
+                .update(cx, |splits, cx| splits.toggle_auxiliary(window, cx));
+            return true;
+        }
         if self.auxiliary_terminal.is_some() {
             self.hide_auxiliary_terminal(window, cx);
             true
@@ -1702,6 +1811,7 @@ impl RootView {
             return false;
         };
         self.collapsed_auxiliary_parents.remove(&parent);
+        self.split_workbench.update(cx, |splits, _| splits.show_auxiliary_for(&parent));
         self.sync_auxiliary_terminal(window, cx);
         if let Some(terminal) = &self.auxiliary_terminal {
             terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
@@ -1764,6 +1874,23 @@ impl RootView {
         if self.preview {
             return;
         }
+        if self.split_workbench.read(cx).active_for_selection() {
+            if let Some(terminal) = &self.terminal {
+                terminal.update(cx, |terminal, cx| terminal.set_suspended(true, cx));
+            }
+            self.auxiliary_terminal = None;
+            self.auxiliary_id = None;
+            self.auxiliary_parent = None;
+        }
+        self.split_workbench
+            .update(cx, |splits, cx| splits.sync(window, cx));
+        let split_active = self.split_workbench.read(cx).active_for_selection();
+        if let Some(terminal) = &self.terminal {
+            terminal.update(cx, |terminal, cx| terminal.set_suspended(split_active, cx));
+        }
+        if split_active {
+            return;
+        }
         let slot = self
             .inspector
             .as_ref()
@@ -1785,10 +1912,10 @@ impl RootView {
             (selected, auxiliary, pending)
         };
 
-        if selected
-            .as_ref()
-            .is_some_and(|parent| self.collapsed_auxiliary_parents.contains(parent))
-        {
+        if selected.as_ref().is_some_and(|parent| {
+            self.collapsed_auxiliary_parents.contains(parent)
+                || self.split_workbench.read(cx).auxiliary_hidden_for(parent)
+        }) {
             // Collapsing a pane is UI-only: keep its daemon shell alive so
             // the next ⌘J restores the same scrollback and process state.
             self.auxiliary_terminal = None;
@@ -1882,6 +2009,11 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.split_workbench.read(cx).active_for_selection() {
+            self.split_workbench
+                .update(cx, |splits, cx| splits.close_selected(window, cx));
+            return;
+        }
         if self
             .auxiliary_terminal
             .as_ref()
@@ -2530,6 +2662,20 @@ impl RootView {
 
         if self.preview && self.preview_scenario != PreviewScenario::Empty {
             card = card.child(self.preview_workbench(terminal));
+        } else if self.split_workbench.read(cx).active_for_selection() {
+            self.split_workbench.update(cx, |splits, _| {
+                splits.set_viewport(
+                    Rect {
+                        x: sidebar_width,
+                        y: 0.0,
+                        width: card_width,
+                        height: card_height,
+                    },
+                    visible_sidebar,
+                    self.inspector_open,
+                )
+            });
+            card = card.child(self.split_workbench.clone());
         } else if split_open {
             let available_height = (card_height - 1.0).max(0.0);
             self.terminal_available_height = available_height;
@@ -2643,6 +2789,16 @@ impl RootView {
             card = card.child(primary.clone());
         }
 
+        if !self.split_workbench.read(cx).active_for_selection()
+            && self.split_workbench.read(cx).has_overlay()
+        {
+            card = card.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .child(self.split_workbench.clone()),
+            );
+        }
         card.child(card_outline).into_any_element()
     }
 
@@ -3575,6 +3731,33 @@ impl Render for RootView {
                     this.run_command(CommandId::ToggleAuxiliaryTerminal, window, cx);
                 }),
             )
+            .on_action(cx.listener(|this, _: &SplitRight, window, cx| {
+                this.run_command(CommandId::SplitRight, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SplitBelow, window, cx| {
+                this.run_command(CommandId::SplitBelow, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &AddExistingPane, window, cx| {
+                this.run_command(CommandId::AddExistingPane, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusNextPane, window, cx| {
+                this.run_command(CommandId::FocusNextPane, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusPaneLeft, window, cx| {
+                this.run_command(CommandId::FocusPaneLeft, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusPaneRight, window, cx| {
+                this.run_command(CommandId::FocusPaneRight, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusPaneUp, window, cx| {
+                this.run_command(CommandId::FocusPaneUp, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusPaneDown, window, cx| {
+                this.run_command(CommandId::FocusPaneDown, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ClosePane, window, cx| {
+                this.run_command(CommandId::ClosePane, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &QuoteSelection, window, cx| {
                 this.run_command(CommandId::QuoteSelection, window, cx);
             }))
