@@ -154,6 +154,15 @@ Removing the file leaves the app in local-only mode. Tailscale IPv4 addresses
 and MagicDNS names work like any other SSH destination when OpenSSH can resolve
 them; Diri neither requires nor configures Tailscale for Remote Holder sessions.
 
+## Skills
+
+**Settings → Skills** lists skills found in shared and provider skill directories
+on this Mac, the selected local session's project, and Claude/Codex plugin caches.
+Search by name, description, or provider; filter by Personal, Project, or Plugins;
+open a skill to read or copy its instructions and reveal its source file. Refresh
+after adding or removing skills. Cached plugin versions are labeled separately;
+the catalogue does not activate skills or change provider configuration.
+
 ## Agent preferences
 
 The default agent is stored in

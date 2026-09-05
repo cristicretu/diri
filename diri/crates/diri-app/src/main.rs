@@ -40,6 +40,8 @@ pub mod seam;
 mod session_surfaces;
 pub mod settings;
 pub mod sidebar;
+mod skills_catalog;
+mod skills_page;
 pub mod sounds;
 mod status_debug;
 mod surface_shell;
