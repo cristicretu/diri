@@ -44,8 +44,11 @@ impl WorkbenchLayout {
     pub fn pane_heights(&self, available_height: f32) -> PaneHeights {
         let available_height = available_height.max(0.0);
         if available_height <= MIN_PRIMARY_HEIGHT + MIN_AUXILIARY_HEIGHT {
+            // Compress both minimums proportionally. At the threshold this
+            // meets the normal clamp exactly, so a continuous window resize
+            // cannot jump the divider (or trigger an extra terminal reflow).
             let primary =
-                (available_height * DEFAULT_PRIMARY_FRACTION).clamp(0.0, available_height);
+                available_height * MIN_PRIMARY_HEIGHT / (MIN_PRIMARY_HEIGHT + MIN_AUXILIARY_HEIGHT);
             return PaneHeights {
                 primary,
                 auxiliary: available_height - primary,
@@ -61,14 +64,13 @@ impl WorkbenchLayout {
     }
 
     pub fn resize_primary(&mut self, primary_height: f32, available_height: f32) {
-        if available_height <= 0.0 {
+        // Below the combined minimum, pane_heights compresses both panes and
+        // the divider cannot move. Preserve the ratio restored on expansion.
+        if available_height <= MIN_PRIMARY_HEIGHT + MIN_AUXILIARY_HEIGHT {
             return;
         }
-        let clamped = if available_height > MIN_PRIMARY_HEIGHT + MIN_AUXILIARY_HEIGHT {
-            primary_height.clamp(MIN_PRIMARY_HEIGHT, available_height - MIN_AUXILIARY_HEIGHT)
-        } else {
-            primary_height.clamp(0.0, available_height)
-        };
+        let clamped =
+            primary_height.clamp(MIN_PRIMARY_HEIGHT, available_height - MIN_AUXILIARY_HEIGHT);
         self.primary_fraction = clamped / available_height;
     }
 
@@ -108,5 +110,36 @@ mod tests {
         layout.resize_primary(400.0, 600.0);
         layout.reset();
         assert_eq!(layout.pane_heights(600.0).primary, 372.0);
+    }
+
+    #[test]
+    fn resizing_window_has_no_jump_at_minimum_pane_heights() {
+        for fraction in [0.0, 0.3, DEFAULT_PRIMARY_FRACTION, 0.9, 1.0] {
+            let layout = WorkbenchLayout::from_fraction(fraction);
+            let mut previous = layout.pane_heights(359.0);
+            for step in 1..=200 {
+                let height = 359.0 + step as f32 * 0.01;
+                let next = layout.pane_heights(height);
+                assert!(
+                    (next.primary - previous.primary).abs() <= 0.011,
+                    "split jumped from {previous:?} to {next:?} at height {height}"
+                );
+                assert!((next.primary + next.auxiliary - height).abs() < 0.001);
+                previous = next;
+            }
+        }
+    }
+
+    #[test]
+    fn dragging_a_fully_compressed_split_preserves_the_restored_ratio() {
+        let mut layout = WorkbenchLayout::from_fraction(0.8);
+        let previous = layout;
+        for pointer in [0.0, 100.0, 250.0, 500.0] {
+            layout.resize_primary(pointer, 320.0);
+            assert_eq!(
+                layout, previous,
+                "an immovable divider must not change hidden layout intent"
+            );
+        }
     }
 }

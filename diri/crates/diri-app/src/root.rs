@@ -28,7 +28,7 @@ use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::inspector::{BrowserAction, InspectorEvent, WorkbenchInspector};
 use crate::launcher::{LauncherEvent, LauncherOverlay};
 #[cfg(target_os = "macos")]
-use crate::macos::browser::{BrowserFrame, NativeBrowser};
+use crate::macos::browser::NativeBrowser;
 use crate::navigation::NavigationOverlay;
 use crate::notifications::{InAppBanner, NotificationSound};
 use crate::quote::Quote;
@@ -180,7 +180,7 @@ pub struct RootView {
     launcher: Entity<LauncherOverlay>,
     inspector: Option<Entity<WorkbenchInspector>>,
     #[cfg(target_os = "macos")]
-    browser: NativeBrowser,
+    browser: std::rc::Rc<std::cell::RefCell<NativeBrowser>>,
     services: Arc<AppServices>,
     focus: FocusHandle,
     resize_origin: Option<(f32, f32)>,
@@ -495,7 +495,7 @@ impl RootView {
                     InspectorEvent::WorkspaceClosed(surface) => {
                         #[cfg(target_os = "macos")]
                         if *surface == crate::inspector::WorkspaceSurface::Browser {
-                            this.browser.clear();
+                            this.browser.borrow_mut().clear();
                         }
                         if *surface == crate::inspector::WorkspaceSurface::Terminal {
                             this.hide_auxiliary_terminal(window, cx);
@@ -505,10 +505,12 @@ impl RootView {
                     InspectorEvent::Browser(action) => {
                         #[cfg(target_os = "macos")]
                         match action {
-                            BrowserAction::Navigate(url) => this.browser.load(url.clone()),
-                            BrowserAction::Back => this.browser.go_back(),
-                            BrowserAction::Forward => this.browser.go_forward(),
-                            BrowserAction::Reload => this.browser.reload(),
+                            BrowserAction::Navigate(url) => {
+                                this.browser.borrow_mut().load(url.clone())
+                            }
+                            BrowserAction::Back => this.browser.borrow().go_back(),
+                            BrowserAction::Forward => this.browser.borrow().go_forward(),
+                            BrowserAction::Reload => this.browser.borrow().reload(),
                             BrowserAction::OpenExternal(url) => cx.open_url(url),
                         }
                         #[cfg(not(target_os = "macos"))]
@@ -803,12 +805,20 @@ impl RootView {
         #[cfg(target_os = "macos")]
         let (browser, mut browser_events) = NativeBrowser::new();
         #[cfg(target_os = "macos")]
+        let browser = std::rc::Rc::new(std::cell::RefCell::new(browser));
+        #[cfg(target_os = "macos")]
+        if let Some(inspector) = &inspector {
+            inspector.update(cx, |inspector, _| {
+                inspector.set_native_browser(browser.clone())
+            });
+        }
+        #[cfg(target_os = "macos")]
         let browser_state_sync = cx.spawn_in(window, async move |this, cx| {
             while browser_events.recv().await.is_some() {
                 if this
                     .update_in(cx, |this, _window, cx| {
                         if let Some(inspector) = this.inspector.clone() {
-                            let state = this.browser.state();
+                            let state = this.browser.borrow().state();
                             inspector
                                 .update(cx, |inspector, cx| inspector.set_browser_state(state, cx));
                             cx.notify();
@@ -1964,11 +1974,14 @@ impl RootView {
         let Some((origin_y, base_height)) = self.terminal_resize_origin else {
             return;
         };
+        let previous = self.workbench_layout;
         self.workbench_layout.resize_primary(
             base_height + pointer_y - origin_y,
             self.terminal_available_height,
         );
-        cx.notify();
+        if self.workbench_layout != previous {
+            cx.notify();
+        }
     }
 
     fn finish_terminal_resize(&mut self, cx: &mut Context<Self>) {
@@ -1995,6 +2008,9 @@ impl RootView {
         if self.resize_origin.take().is_some() {
             self.sidebar
                 .update(cx, |sidebar, cx| sidebar.commit_width(cx));
+            // Width persistence does not notify the sidebar. Retire the drag
+            // shield now, even when the last motion was beyond the clamp.
+            cx.notify();
         }
     }
 
@@ -2104,10 +2120,14 @@ impl RootView {
         let Some((origin_x, base_width)) = self.inspector_resize_origin else {
             return;
         };
-        self.inspector_width = (base_width - pointer_x + origin_x).clamp(
+        let width = (base_width - pointer_x + origin_x).clamp(
             300.0_f32.min(self.inspector_max_width),
             self.inspector_max_width,
         );
+        if self.inspector_width == width {
+            return;
+        }
+        self.inspector_width = width;
         cx.notify();
     }
 
@@ -2164,6 +2184,30 @@ impl RootView {
                 ),
         )
         .into_any_element()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn browser_visible(&self, launcher_open: bool, panel_width: f32, cx: &App) -> bool {
+        self.browser.borrow().has_page()
+            && panel_width > 1.0
+            && !launcher_open
+            && !self
+                .utility_surfaces
+                .as_ref()
+                .is_some_and(|view| view.read(cx).is_open())
+            && !self
+                .navigation
+                .as_ref()
+                .is_some_and(|view| view.read(cx).is_open())
+            && !self.arrow_surface_visible()
+            && self.quote_target_picker.is_none()
+            && self.sidebar.read(cx).pending_close_copy().is_none()
+            && self.inspector_open
+            && self.inspector_seam >= panel_width - 0.5
+            && self.inspector.as_ref().is_some_and(|view| {
+                let inspector = view.read(cx);
+                inspector.is_browser_tab() && !inspector.blocks_native_browser()
+            })
     }
 
     /// `visible_sidebar` and `inspector_width` are the settled layout and drive
@@ -3021,49 +3065,13 @@ impl Render for RootView {
         let inspector_seam = self.inspector_seam;
         #[cfg(target_os = "macos")]
         {
-            let utility_open = self
-                .utility_surfaces
-                .as_ref()
-                .is_some_and(|surfaces| surfaces.read(cx).is_open());
-            let navigation_open = self
-                .navigation
-                .as_ref()
-                .is_some_and(|navigation| navigation.read(cx).is_open());
-            let inspector_blocks_browser = self
-                .inspector
-                .as_ref()
-                .is_some_and(|inspector| inspector.read(cx).blocks_native_browser());
-            let browser_active = self.browser.has_page()
-                && self.resize_origin.is_none()
-                && self.inspector_resize_origin.is_none()
-                && !launcher_open
-                && !utility_open
-                && !navigation_open
-                && !self.arrow_surface_visible()
-                && self.quote_target_picker.is_none()
-                && self.sidebar.read(cx).pending_close_copy().is_none()
-                && !inspector_blocks_browser
-                && self.inspector_open
-                && inspector_seam >= inspector_panel_width - 0.5
-                && self
-                    .inspector
-                    .as_ref()
-                    .is_some_and(|inspector| inspector.read(cx).is_browser_tab());
-            let height = f32::from(window.inner_window_bounds().get_bounds().size.height);
-            self.browser.sync(
-                window,
-                browser_active,
-                BrowserFrame {
-                    x: window_width - inspector_panel_width,
-                    y: recovery_height + Metrics::TITLE_BAR + 42.0,
-                    width: inspector_panel_width,
-                    height: (height - recovery_height - Metrics::TITLE_BAR - 42.0).max(0.0),
-                },
+            let browser_active = self.browser_visible(launcher_open, inspector_panel_width, cx);
+            self.browser.borrow_mut().set_visible(browser_active);
+            self.browser.borrow_mut().set_pointer_passthrough(
+                self.resize_origin.is_some()
+                    || self.inspector_resize_origin.is_some()
+                    || self.terminal_resize_origin.is_some(),
             );
-            let state = self.browser.state();
-            if let Some(inspector) = &self.inspector {
-                inspector.update(cx, |inspector, cx| inspector.set_browser_state(state, cx));
-            }
         }
         let mut key_context = KeyContext::new_with_defaults();
         key_context.add(APP_CONTEXT);
@@ -3467,9 +3475,71 @@ fn preview_hint(system_image: &str, label: &str, colors: SemanticColors) -> AnyE
 }
 
 #[cfg(test)]
-mod quote_target_tests {
+mod tests {
     use super::*;
     use crate::sidebar::{PreviewScenario, SidebarPreviewFixture};
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn browser_stays_visible_through_every_resize(cx: &mut gpui::TestAppContext) {
+        let services = Arc::new(AppServices {
+            store: Arc::new(crate::store::StoreRuntime::inert()),
+            usage_tx: tokio::sync::watch::channel(crate::usage::UsageSnapshot::default()).0,
+            usage_limits_refresh: tokio::sync::mpsc::channel(1).0,
+            updates: crate::updates::inert(),
+            dev_build: None,
+            daemon_startup: None,
+            tokio: Arc::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap(),
+            ),
+        });
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, true, PreviewScenario::Artifacts, window, cx)
+        });
+        root.update(cx, |root, cx| {
+            root.inspector_open = true;
+            root.inspector_seam = 440.0;
+            root.browser
+                .borrow_mut()
+                .load("http://127.0.0.1:9/resize-fixture".into());
+            root.inspector
+                .as_ref()
+                .unwrap()
+                .update(cx, |inspector, cx| {
+                    inspector.select_workspace(crate::inspector::WorkspaceSurface::Browser, cx);
+                });
+            assert!(root.browser_visible(false, 440.0, cx));
+            root.resize_origin = Some((250.0, 250.0));
+            assert!(
+                root.browser_visible(false, 440.0, cx),
+                "left sidebar resize hid the website"
+            );
+            root.resize_origin = None;
+            root.inspector_resize_origin = Some((700.0, 440.0));
+            assert!(
+                root.browser_visible(false, 440.0, cx),
+                "right sidebar resize hid the website"
+            );
+            root.inspector_resize_origin = None;
+            root.terminal_resize_origin = Some((300.0, 300.0));
+            assert!(root.browser_visible(false, 440.0, cx));
+            root.terminal_resize_origin = None;
+            assert!(
+                !root.browser_visible(true, 440.0, cx),
+                "launcher must cover native content"
+            );
+            assert!(
+                !root.browser_visible(false, 0.0, cx),
+                "a collapsed panel must not leave a native overlay"
+            );
+            // TestWindow has no AppKit handle; the separate native fixture
+            // exercises painting and hit testing with an actual WKWebView.
+            root.browser.borrow_mut().clear();
+        });
+    }
 
     #[test]
     fn picker_resolves_the_chosen_target_without_changing_the_active_id() {

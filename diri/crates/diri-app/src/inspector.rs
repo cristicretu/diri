@@ -252,6 +252,8 @@ pub struct WorkbenchInspector {
     browser_query: QueryEditor,
     browser_address_focused: bool,
     browser_state: BrowserState,
+    #[cfg(target_os = "macos")]
+    native_browser: Option<std::rc::Rc<std::cell::RefCell<crate::macos::browser::NativeBrowser>>>,
     context: Option<DiffContext>,
     state: LoadState,
     review_state: ReviewLoadState,
@@ -363,6 +365,8 @@ impl WorkbenchInspector {
             browser_query: QueryEditor::default(),
             browser_address_focused: false,
             browser_state: BrowserState::default(),
+            #[cfg(target_os = "macos")]
+            native_browser: None,
             context: None,
             state: LoadState::NoSession,
             review_state: ReviewLoadState::NoSession,
@@ -448,6 +452,14 @@ impl WorkbenchInspector {
     #[cfg(target_os = "macos")]
     pub fn is_browser_tab(&self) -> bool {
         self.workspace_selected == Some(WorkspaceSurface::Browser)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn set_native_browser(
+        &mut self,
+        browser: std::rc::Rc<std::cell::RefCell<crate::macos::browser::NativeBrowser>>,
+    ) {
+        self.native_browser = Some(browser);
     }
 
     #[must_use]
@@ -1741,6 +1753,7 @@ impl WorkbenchInspector {
             .child(
                 div()
                     .id("workspace-browser-loading-space")
+                    .relative()
                     .min_h(px(0.0))
                     .flex_1()
                     .flex()
@@ -1755,7 +1768,14 @@ impl WorkbenchInspector {
                         .child(div().text_size(px(13.0)).font_weight(FontWeight::MEDIUM).text_color(colors.secondary).child("Open a page"))
                         .child(div().max_w(px(230.0)).text_size(px(11.0)).line_height(px(17.0)).child("Browse a local preview or any secure web address without leaving the workspace.")))
                     .when_some(self.browser_state.error.clone(), |body, error| body.child(div().max_w(px(260.0)).text_size(px(12.0)).child(error)))
-                    .when(self.browser_state.is_loading, |body| body.child(div().text_size(px(10.0)).child("Loading…"))),
+                    .when(self.browser_state.is_loading, |body| body.child(div().text_size(px(10.0)).child("Loading…")))
+                    .map(|body| {
+                        #[cfg(target_os = "macos")]
+                        let body = body.when_some(self.native_browser.clone(), |body, browser| {
+                            body.child(crate::macos::browser::NativeBrowser::surface(browser))
+                        });
+                        body
+                    }),
             )
             .into_any_element()
     }
@@ -4027,19 +4047,22 @@ impl Render for WorkbenchInspector {
         .then(|| self.render_ask_composer(colors, cx))
         .flatten();
         let body = div().relative().size_full().child(body);
-        let body = if cx.reduce_motion() {
-            body.into_any_element()
-        } else {
-            body.with_animation(
-                transition_id,
-                Animation::new(Duration::from_millis(190)).with_easing(ease_out_quint()),
-                move |body, delta| {
-                    body.left(px(direction * (1.0 - delta) * 8.0))
-                        .opacity(0.70 + 0.30 * delta)
-                },
-            )
-            .into_any_element()
-        };
+        // A native child cannot share GPUI's opacity or clipping animation.
+        // Keep its measured viewport stable when entering the Browser tab.
+        let body =
+            if cx.reduce_motion() || self.workspace_selected == Some(WorkspaceSurface::Browser) {
+                body.into_any_element()
+            } else {
+                body.with_animation(
+                    transition_id,
+                    Animation::new(Duration::from_millis(190)).with_easing(ease_out_quint()),
+                    move |body, delta| {
+                        body.left(px(direction * (1.0 - delta) * 8.0))
+                            .opacity(0.70 + 0.30 * delta)
+                    },
+                )
+                .into_any_element()
+            };
         div()
             .id("workbench-inspector")
             .size_full()
