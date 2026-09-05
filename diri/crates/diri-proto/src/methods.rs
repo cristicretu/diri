@@ -57,6 +57,7 @@ impl Method {
     pub const ACCOUNT_PROFILES_LIST: &'static str = "account.profiles.list";
     pub const ACCOUNT_PROFILES_SAVE: &'static str = "account.profiles.save";
     pub const ACCOUNT_PROFILES_REMOVE: &'static str = "account.profiles.remove";
+    pub const SESSION_CONTINUE_ACCOUNT: &'static str = "session.continue_with_account";
     pub const EVENTS_SUBSCRIBE: &'static str = "events.subscribe";
     pub const EVENTS_WAIT: &'static str = "events.wait";
     pub const HOOK_REPORT: &'static str = "hook.report";
@@ -95,6 +96,14 @@ pub struct EmptyParams {}
 pub type EmptyResult = EmptyParams;
 pub type SessionForkParams = SessionIdParams;
 pub type SessionForkResult = SessionRecord;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContinueAccountParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    pub account_profile_id: String,
+}
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]

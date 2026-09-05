@@ -74,7 +74,7 @@ The current baseline:
 
 ## Account-profile enhancement
 
-The local Engine owns the account-profile catalog and immutable per-session
+The local Engine owns the account-profile catalog and durable per-session
 launch binding described in [ACCOUNTS.md](ACCOUNTS.md). A remote profile is scoped
 to one Agent and saved host. Its directory resolves against the remote login
 environment; credentials never move between machines. The Engine prepares a
@@ -83,6 +83,19 @@ SSH seam (the directory travels as stdin data), then sends the selected provider
 environment through the existing structured LaunchRequest. Resume and fork use
 the recorded binding, not the current catalog default. Cross-host migration of
 bound sessions fails until an explicit destination-account mapping exists.
+
+An explicit same-host Claude account continuation is also owned by the local
+Engine. It preflights the source and destination, stops the existing Holder's
+Agent tree, reads the final main JSONL transcript through bounded fixed-script
+SSH, installs it atomically in the selected profile, and resumes the same
+conversation through the existing Holder launch path. Only transcript bytes
+travel through Engine memory; credentials and provider configuration never move.
+The transcript is bounded to 64 MiB. Symlinks and conflicting destination history
+fail closed; an existing byte-prefix copy permits switching back. The updated
+profile binding is durable before relaunch. Preflight errors leave the original
+session running; later failures keep the saved conversation recoverable and
+report the stopped session. This does not implement cross-host handoff, file
+rewind/subagent checkpoint transfer, or provider usage/authentication discovery.
 
 The Helper protocol and Holder ownership remain unchanged. Account settings,
 directory preparation, and profile resolution belong to the local Engine;
@@ -726,7 +739,7 @@ refactor work:
 - remote conversation/thread identifiers;
 - MCP forwarding;
 - artifact, port, usage, and resource discovery;
-- handoff and checkpoint migration;
+- cross-host handoff and checkpoint migration;
 - cross-host or post-reboot process recovery;
 - multiple read-only observers;
 - deeper, explicitly configured `diri-node` integration.

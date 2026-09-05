@@ -833,6 +833,23 @@ impl DaemonClient {
         self.no_params(Method::ACCOUNT_PROFILES_LIST).await
     }
 
+    pub async fn continue_with_account(
+        &self,
+        session_id: &SessionId,
+        account_profile_id: String,
+    ) -> Result<SessionRecord, ClientError> {
+        self.core
+            .request_typed(
+                Method::SESSION_CONTINUE_ACCOUNT,
+                Some(&diri_proto::ContinueAccountParams {
+                    session_id: session_id.clone(),
+                    account_profile_id,
+                }),
+                Some(std::time::Duration::from_secs(120)),
+            )
+            .await
+    }
+
     pub async fn save_account_profile(
         &self,
         profile: &diri_proto::AgentAccountProfile,

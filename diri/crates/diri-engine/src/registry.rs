@@ -256,7 +256,7 @@ impl Registry {
     }
 
     /// Writes the current state atomically, unconditionally.
-    fn persist_now(&mut self) -> std::io::Result<()> {
+    pub(crate) fn persist_now(&mut self) -> std::io::Result<()> {
         let state = PersistedState::current(self.records_for_persistence(), self.projects.clone());
         let known = serde_json::to_value(state)?;
         let known = known
@@ -788,7 +788,15 @@ impl Registry {
         let Some(mut session) = self.sessions.remove(id) else {
             return Ok(None);
         };
-        let exit = session.terminate(grace)?;
+        let exit = match session.terminate(grace) {
+            Ok(exit) => exit,
+            Err(error) => {
+                // A failed stop must not orphan a surviving Holder or let a replacement
+                // launch under the same identity (including account continuation).
+                self.sessions.insert(id.to_owned(), session);
+                return Err(error);
+            }
+        };
         if let Some(record) = self.records.get_mut(id) {
             record.status = SessionStatus::Exited(diri_proto::ExitInfo {
                 reason: match exit {

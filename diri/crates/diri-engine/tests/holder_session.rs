@@ -384,3 +384,35 @@ fn input_to_a_hibernated_session_queues_and_flushes_on_wake() {
         .terminate("s_hib", Duration::from_secs(2))
         .expect("terminate");
 }
+
+#[test]
+fn failed_holder_stop_keeps_the_live_session_tracked_until_retry() {
+    let root = holders_dir("failed-stop");
+    let logs = root.join("logs");
+    let holder = holder_config(&root);
+    let mut registry = Registry::new(engine(), root.join("state.json"));
+    registry
+        .spawn(
+            shell_spec("s_stop_retry", "cat", &logs, Some(holder.clone())),
+            record("s_stop_retry"),
+        )
+        .unwrap();
+    let pid = registry.get("s_stop_retry").unwrap().child_pid();
+    let paths = HolderPaths::new(&holder.holders_dir, "s_stop_retry");
+    let socket = paths.socket();
+    let parked = socket.with_extension("unavailable");
+    std::fs::rename(&socket, &parked).unwrap();
+    let stopped = registry.terminate("s_stop_retry", Duration::from_millis(100));
+    std::fs::rename(&parked, &socket).unwrap();
+    assert!(
+        stopped.is_err(),
+        "missing Holder acknowledgement must fail closed"
+    );
+    assert_eq!(registry.get("s_stop_retry").unwrap().child_pid(), pid);
+    assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+    registry
+        .terminate("s_stop_retry", Duration::from_secs(3))
+        .unwrap();
+    assert!(registry.get("s_stop_retry").is_none());
+    let _ = std::fs::remove_dir_all(root);
+}

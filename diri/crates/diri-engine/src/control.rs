@@ -24,6 +24,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::registry::Registry;
+mod account_handoff;
 
 /// Identifies this engine in the handshake, so a client can tell which
 /// implementation it reached.
@@ -60,6 +61,7 @@ pub struct ControlServer {
     active_connections: Arc<AtomicUsize>,
     agent_catalog: Arc<Mutex<crate::agent_catalog::AgentCatalogStore>>,
     accounts: Mutex<crate::accounts::AccountStore>,
+    session_operations: Mutex<std::collections::HashSet<String>>,
     agent_scans: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>>,
 }
 
@@ -152,6 +154,7 @@ impl ControlServer {
             active_connections: Arc::new(AtomicUsize::new(0)),
             agent_catalog: Arc::new(Mutex::new(agent_catalog)),
             accounts,
+            session_operations: Mutex::new(std::collections::HashSet::new()),
             agent_scans: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
@@ -706,7 +709,9 @@ impl ControlServer {
     }
 
     fn dispatch(&self, method: &str, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let _operation = account_handoff::SessionOperation::acquire(self, method, params.as_ref())?;
         match method {
+            Method::SESSION_CONTINUE_ACCOUNT => self.session_continue_account(params),
             Method::ACCOUNT_PROFILES_LIST => {
                 encode(&self.accounts.lock().map_err(poisoned)?.catalog()?)
             }
@@ -3709,7 +3714,7 @@ mod tests {
         Arc::new(engine)
     }
 
-    fn server(temp: &Path) -> Arc<ControlServer> {
+    pub(super) fn server(temp: &Path) -> Arc<ControlServer> {
         let registry = Registry::new(engine(), temp.join("state.json"));
         Arc::new(ControlServer::new(
             Arc::new(Mutex::new(registry)),

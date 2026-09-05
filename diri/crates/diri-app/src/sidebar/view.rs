@@ -110,6 +110,7 @@ enum HorizontalFocusAction {
 
 #[derive(Clone, Debug)]
 pub(crate) enum SidebarEvent {
+    ContinueAccount(SessionId),
     VisibilityChanged,
     WidthChanged,
     /// The Agents page of Settings, for one target host. Plain Settings goes
@@ -4106,6 +4107,20 @@ impl Sidebar {
                 .child(copy_session_id_row(id, colors, cx));
         } else {
             let running = !matches!(session.status, diri_proto::SessionStatus::Exited(_));
+            if session.kind == ProtoAgentKind::CLAUDE_CODE && session.agent_session_id.is_some() {
+                content = content.child(menu_row(
+                    "Continue with another account…",
+                    colors,
+                    cx.listener({
+                        let id = id.clone();
+                        move |this, _, _, cx| {
+                            this.ui.popover = None;
+                            cx.emit(SidebarEvent::ContinueAccount(id.clone()));
+                            cx.notify();
+                        }
+                    }),
+                ));
+            }
             if !running && session.can_resume() {
                 content = content.child(menu_row(
                     "Resume",

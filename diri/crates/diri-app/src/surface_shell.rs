@@ -1026,6 +1026,7 @@ impl UtilitySurfaces {
             self.worktrees.cancel_move();
         } else {
             self.surface = Surface::None;
+            self.clear_account_continuation();
             self.settings_menu = None;
             self.host_editor = None;
             self.agent_path_editor = None;
@@ -1126,6 +1127,9 @@ impl UtilitySurfaces {
     }
 
     fn select_settings_tab(&mut self, tab: SettingsTab, cx: &mut Context<Self>) {
+        if tab != SettingsTab::Accounts {
+            self.clear_account_continuation();
+        }
         if self.settings_tab != tab {
             self.settings_scroll.set_offset(point(px(0.0), px(0.0)));
         }
@@ -6244,6 +6248,9 @@ mod tests {
                     surfaces.seed_account_preview(
                         std::env::var_os("DIRI_VISUAL_ACCOUNT_EDITOR").is_some(),
                     );
+                    if std::env::var_os("DIRI_VISUAL_ACCOUNT_HANDOFF").is_some() {
+                        surfaces.seed_account_handoff_preview();
+                    }
                 }
                 surfaces
             });

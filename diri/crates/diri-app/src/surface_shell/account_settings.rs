@@ -10,6 +10,9 @@ pub(super) struct AccountsState {
     error: Option<String>,
     editor: Option<ProfileEditor>,
     sequence: u64,
+    continue_session: Option<diri_proto::SessionId>,
+    continue_highlight: usize,
+    continuing: bool,
 }
 
 struct ProfileEditor {
@@ -26,6 +29,216 @@ enum AccountAction {
 }
 
 impl UtilitySurfaces {
+    pub(crate) fn open_account_continuation(
+        &mut self,
+        id: diri_proto::SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.accounts.continuing {
+            return;
+        }
+        self.open_settings(cx);
+        self.accounts.continue_session = Some(id);
+        self.accounts.continue_highlight = 0;
+        self.accounts.editor = None;
+        self.open_settings_tab(SettingsTab::Accounts, cx);
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    pub(super) fn clear_account_continuation(&mut self) {
+        self.accounts.continue_session = None;
+    }
+
+    fn continuation_source(&self) -> Option<Arc<diri_proto::SessionRecord>> {
+        let id = self.accounts.continue_session.as_ref()?;
+        self.store.read().ok()?.sessions().get(id).cloned()
+    }
+
+    fn continuation_choices(&self) -> Vec<AgentAccountProfile> {
+        let Some(source) = self.continuation_source() else {
+            return Vec::new();
+        };
+        self.accounts
+            .catalog
+            .profiles
+            .iter()
+            .filter(|profile| {
+                profile.agent == "claude-code"
+                    && profile.host == source.host
+                    && source
+                        .account_profile
+                        .as_ref()
+                        .is_none_or(|current| current.id != profile.id)
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn continue_account(&mut self, profile_id: String, cx: &mut Context<Self>) {
+        if self.accounts.busy {
+            return;
+        }
+        let Some(id) = self.accounts.continue_session.clone() else {
+            return;
+        };
+        self.accounts.busy = true;
+        self.accounts.continuing = true;
+        self.accounts.error = None;
+        let runtime = Arc::clone(&self.runtime);
+        let client = Arc::clone(self.store_runtime.client());
+        cx.spawn(async move |this, cx| {
+            let result = runtime
+                .spawn(async move {
+                    client.wait_until_connected(Duration::from_secs(5)).await?;
+                    client.continue_with_account(&id, profile_id).await
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|r| r.map_err(|e| e.to_string()));
+            let _ = this.update(cx, |this, cx| {
+                this.accounts.busy = false;
+                this.accounts.continuing = false;
+                match result {
+                    Ok(record) => {
+                        let id = record.id.clone();
+                        let return_to_session =
+                            this.accounts.continue_session.as_ref() == Some(&id);
+                        {
+                            let mut store =
+                                this.store.write().expect("session store lock poisoned");
+                            store.upsert_session(record);
+                            if return_to_session {
+                                store.select(id);
+                            }
+                        }
+                        this.store_runtime.publish_local_change();
+                        if return_to_session {
+                            this.close_surface(cx);
+                        }
+                    }
+                    Err(error) => this.accounts.error = Some(error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn continue_account_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let source = self.continuation_source();
+        let mut content = div().flex().flex_col().gap(px(16.0))
+            .child(div().text_size(px(14.0)).child(source.as_ref().map_or("Session unavailable".to_owned(), |s| s.title.clone())))
+            .child(div().text_size(px(12.0)).text_color(colors.secondary).child("Choose a signed-in Claude account on the same machine. Diri restarts Claude with this conversation and keeps your working files in place."));
+        if let Some(source) = &source {
+            content = content.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(colors.secondary)
+                    .child(format!(
+                        "Current account: {}",
+                        source
+                            .account_profile
+                            .as_ref()
+                            .map_or("CLI account", |p| p.label.as_str())
+                    )),
+            );
+        }
+        if let Some(error) = &self.accounts.error {
+            content = content.child(
+                div()
+                    .id("account-continuation-error")
+                    .text_size(px(12.0))
+                    .text_color(Ink::DANGER)
+                    .child(error.clone()),
+            );
+        }
+        if self.accounts.busy {
+            content = content.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(colors.secondary)
+                    .child(if self.accounts.continuing {
+                        "Saving conversation and switching account…"
+                    } else {
+                        "Loading accounts…"
+                    }),
+            );
+        }
+        let choices = self.continuation_choices();
+        if choices.is_empty() && self.accounts.loaded && !self.accounts.busy {
+            content = content.child(div().text_size(px(12.0)).child("No other Claude account is set up for this machine. Add a profile and sign in through Open Agent, then return here."));
+        }
+        for (index, profile) in choices.into_iter().enumerate() {
+            let id = profile.id.clone();
+            content = content.child(
+                div()
+                    .p(px(14.0))
+                    .rounded(px(Radius::PANEL))
+                    .border_1()
+                    .border_color(colors.primary.alpha(
+                        if self.accounts.continue_highlight == index {
+                            0.25
+                        } else {
+                            0.09
+                        },
+                    ))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(14.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.0))
+                            .child(div().text_size(px(13.0)).child(profile.label.clone()))
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(colors.tertiary)
+                                    .text_ellipsis()
+                                    .child(profile.config_home),
+                            ),
+                    )
+                    .child(self.account_button(
+                        format!("continue-account-{id}"),
+                        format!("Continue with {}", profile.label),
+                        cx,
+                        move |this, _, cx| this.continue_account(id.clone(), cx),
+                    )),
+            );
+        }
+        content = content.child(
+            div()
+                .flex()
+                .gap(px(8.0))
+                .child(self.account_button(
+                    "manage-continuation-accounts",
+                    "Manage accounts",
+                    cx,
+                    |this, _, cx| {
+                        this.clear_account_continuation();
+                        this.accounts.error = None;
+                        this.refresh_accounts(cx);
+                        cx.notify();
+                    },
+                ))
+                .child(self.account_button(
+                    "cancel-account-continuation",
+                    "Back to session",
+                    cx,
+                    |this, _, cx| this.close_surface(cx),
+                )),
+        );
+        settings_page("Continue with another account", content, colors).into_any_element()
+    }
+
     #[cfg(test)]
     pub(super) fn seed_account_preview(&mut self, editor: bool) {
         let profile = AgentAccountProfile {
@@ -51,6 +264,45 @@ impl UtilitySurfaces {
                 path_active: false,
             });
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn seed_account_handoff_preview(&mut self) {
+        let mut source =
+            crate::sidebar::SidebarPreviewFixture::make(crate::sidebar::PreviewScenario::Typical)
+                .list
+                .sessions
+                .into_iter()
+                .find(|s| s.kind == diri_proto::AgentKind::CLAUDE_CODE)
+                .unwrap();
+        source.title = "Finish account settings".into();
+        source.agent_session_id = Some("preview-conversation".into());
+        source.host = None;
+        let work = AgentAccountProfile {
+            id: "work".into(),
+            label: "Work".into(),
+            agent: "claude-code".into(),
+            host: None,
+            config_home: "~/.claude-work".into(),
+            is_default: true,
+        };
+        let personal = AgentAccountProfile {
+            id: "personal".into(),
+            label: "Personal".into(),
+            config_home: "~/.claude-personal".into(),
+            is_default: false,
+            ..work.clone()
+        };
+        source.account_profile = Some(work.clone());
+        self.accounts = AccountsState {
+            loaded: true,
+            continue_session: Some(source.id.clone()),
+            catalog: AgentAccountCatalog {
+                profiles: vec![work, personal],
+            },
+            ..Default::default()
+        };
+        self.store.write().unwrap().upsert_session(source);
     }
 
     pub(super) fn refresh_accounts(&mut self, cx: &mut Context<Self>) {
@@ -162,6 +414,32 @@ impl UtilitySurfaces {
         {
             return false;
         }
+        if self.accounts.continue_session.is_some() {
+            if self.accounts.busy {
+                return true;
+            }
+            let choices = self.continuation_choices();
+            let count = choices.len();
+            match event.keystroke.key.as_str() {
+                "escape" => self.close_surface(cx),
+                "down" | "tab" if count > 0 && !event.keystroke.modifiers.shift => {
+                    self.accounts.continue_highlight =
+                        (self.accounts.continue_highlight + 1) % count
+                }
+                "up" | "tab" if count > 0 => {
+                    self.accounts.continue_highlight =
+                        (self.accounts.continue_highlight + count - 1) % count
+                }
+                "enter" => {
+                    if let Some(profile) = choices.get(self.accounts.continue_highlight) {
+                        self.continue_account(profile.id.clone(), cx);
+                    }
+                }
+                _ => return false,
+            }
+            cx.notify();
+            return true;
+        }
         if self.accounts.editor.is_none() {
             return false;
         }
@@ -208,7 +486,10 @@ impl UtilitySurfaces {
         true
     }
 
-    pub(super) fn accounts_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn accounts_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.accounts.continue_session.is_some() {
+            return self.continue_account_settings(cx);
+        }
         let colors = self.settings_colors();
         let mut content = div().flex().flex_col().gap(px(16.0))
             .child(div().text_size(px(12.0)).text_color(colors.secondary).child("Choose which Claude or Codex account each new session uses. Profiles keep their own provider configuration on the machine where the Agent runs."))
@@ -504,7 +785,7 @@ impl UtilitySurfaces {
             );
         }
         content = content.child(div().text_size(px(11.0)).text_color(colors.tertiary).child("Editing or removing a profile affects future launches. Existing sessions retain their account. Removing a profile leaves the provider’s files and credentials intact."));
-        settings_page("Accounts", content, colors)
+        settings_page("Accounts", content, colors).into_any_element()
     }
 
     fn account_button(
@@ -544,6 +825,65 @@ impl UtilitySurfaces {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[gpui::test]
+    fn continuation_picker_filters_agent_host_and_current_account(cx: &mut gpui::TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let (surfaces, cx) = cx.add_window_view(move |window, cx| {
+            let mut surfaces =
+                UtilitySurfaces::new(runtime, tokio, crate::updates::inert(), window, cx);
+            surfaces.open_settings(cx);
+            surfaces.settings_tab = SettingsTab::Accounts;
+            surfaces.seed_account_handoff_preview();
+            surfaces
+        });
+        surfaces.update_in(cx, |surfaces, _, cx| {
+            let personal = surfaces.accounts.catalog.profiles[1].clone();
+            surfaces.accounts.catalog.profiles.extend([
+                AgentAccountProfile {
+                    id: "remote".into(),
+                    host: Some("server".into()),
+                    ..personal.clone()
+                },
+                AgentAccountProfile {
+                    id: "codex".into(),
+                    agent: "codex".into(),
+                    ..personal.clone()
+                },
+                AgentAccountProfile {
+                    id: "third".into(),
+                    ..personal
+                },
+            ]);
+            let choices = surfaces.continuation_choices();
+            assert_eq!(
+                choices.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+                ["personal", "third"]
+            );
+            let key = |name| KeyDownEvent {
+                keystroke: gpui::Keystroke::parse(name).unwrap(),
+                is_held: false,
+                prefer_character_input: false,
+            };
+            surfaces.handle_account_key(&key("tab"), cx);
+            assert_eq!(surfaces.accounts.continue_highlight, 1);
+            surfaces.handle_account_key(&key("shift-tab"), cx);
+            assert_eq!(surfaces.accounts.continue_highlight, 0);
+            surfaces.accounts.busy = true;
+            surfaces.handle_account_key(&key("escape"), cx);
+            assert!(surfaces.accounts.continue_session.is_some());
+            surfaces.accounts.busy = false;
+            surfaces.handle_account_key(&key("escape"), cx);
+            assert!(surfaces.accounts.continue_session.is_none());
+            assert_eq!(surfaces.surface, Surface::None);
+        });
+    }
+
     #[gpui::test]
     fn account_editor_keeps_unsaved_changes_local_and_blocks_input_during_save(
         cx: &mut gpui::TestAppContext,
