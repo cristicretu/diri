@@ -1556,6 +1556,7 @@ dependencies = [
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
  "objc2-user-notifications",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.11.0",

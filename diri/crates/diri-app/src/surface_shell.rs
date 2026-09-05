@@ -26,8 +26,9 @@ use diri_ui::{
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Bounds, BoxShadow, ClickEvent, Context, CursorStyle,
     FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton, PathPromptOptions,
-    Pixels, Render, Rgba, ScrollHandle, SharedString, Task, TextRun, Window, canvas, deferred, div,
-    ease_out_quint, font, point, prelude::*, px, rgba,
+    Pixels, Render, Rgba, ScrollHandle, ScrollStrategy, SharedString, Task, TextRun,
+    UniformListScrollHandle, Window, canvas, deferred, div, ease_out_quint, font, point,
+    prelude::*, px, rgba, uniform_list,
 };
 use tokio::runtime::Runtime;
 
@@ -39,7 +40,6 @@ const SETTINGS_CONTENT_MAX_WIDTH: f32 = 760.0;
 const SETTINGS_TRANSITION_DURATION: Duration = Duration::from_millis(190);
 const SETTINGS_SECTION_GAP: f32 = 16.0;
 const SETTINGS_ROW_HEIGHT: f32 = 50.0;
-const RESULT_LIMIT: usize = 200;
 const HOST_FIELD_HORIZONTAL_PADDING: f32 = 10.0;
 /// Reinstall success is confirmation, not persistent host state. Errors stay
 /// actionable and first-time setup keeps its "Use by default" action.
@@ -258,6 +258,11 @@ pub struct UtilitySurfaces {
     history_highlight: usize,
     history_loading: bool,
     history_error: Option<String>,
+    history_scanner: Option<crate::history::HistoryScanner>,
+    history_search: crate::history::HistorySearch,
+    history_matches: Vec<usize>,
+    history_scroll: UniformListScrollHandle,
+    history_resuming: Option<String>,
     worktrees: WorktreesSheet,
     settings_tab: SettingsTab,
     usage: crate::usage::UsageSnapshot,
@@ -377,6 +382,11 @@ impl UtilitySurfaces {
             history_highlight: 0,
             history_loading: false,
             history_error: None,
+            history_scanner: Some(crate::history::HistoryScanner::default()),
+            history_search: crate::history::HistorySearch::default(),
+            history_matches: Vec::new(),
+            history_scroll: UniformListScrollHandle::new(),
+            history_resuming: None,
             worktrees: WorktreesSheet::default(),
             settings_tab,
             usage: crate::usage::UsageSnapshot::default(),
@@ -422,37 +432,41 @@ impl UtilitySurfaces {
         self.surface = Surface::History;
         self.history_query.clear();
         self.history_highlight = 0;
+        self.history_scroll = UniformListScrollHandle::new();
+        self.filter_history();
+        self.history_error = None;
+        cx.notify();
+        self.refresh_history(cx);
+    }
+
+    fn refresh_history(&mut self, cx: &mut Context<Self>) {
+        // Reopening uses the last result immediately and shares any in-flight
+        // scan. History is local data: a disconnected Engine must not delay it.
+        let Some(mut scanner) = self.history_scanner.take() else {
+            return;
+        };
         self.history_loading = true;
         self.history_error = None;
         cx.notify();
 
         let roots = crate::history::HistoryRoots::current_user();
-        let client = Arc::clone(self.store_runtime.client());
+        let tracked = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .sessions()
+            .values()
+            .filter_map(|session| session.agent_session_id.clone())
+            .collect();
         let runtime = Arc::clone(&self.runtime);
         cx.spawn(async move |this, cx| {
             let task = runtime.spawn(async move {
-                let tracked = if client
-                    .wait_until_connected(Duration::from_secs(5))
-                    .await
-                    .is_ok()
-                {
-                    client
-                        .sessions()
-                        .await
-                        .map(|result| {
-                            result
-                                .sessions
-                                .into_iter()
-                                .filter_map(|session| session.agent_session_id)
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                } else {
-                    HashSet::new()
-                };
-                tokio::task::spawn_blocking(move || crate::history::scan(&roots, &tracked))
-                    .await
-                    .map_err(|error| error.to_string())
+                tokio::task::spawn_blocking(move || {
+                    let entries = scanner.scan(&roots, &tracked);
+                    (scanner, entries)
+                })
+                .await
+                .map_err(|error| error.to_string())
             });
             let result = task
                 .await
@@ -461,11 +475,34 @@ impl UtilitySurfaces {
             let _ = this.update(cx, |this, cx| {
                 this.history_loading = false;
                 match result {
-                    Ok(entries) => {
+                    Ok((scanner, mut entries)) => {
+                        // A session can become tracked while the disk scan is
+                        // running. Reconcile against the current store as well.
+                        let tracked = this
+                            .store
+                            .read()
+                            .expect("session store lock poisoned")
+                            .sessions()
+                            .values()
+                            .filter_map(|session| session.agent_session_id.clone())
+                            .collect::<HashSet<_>>();
+                        entries.retain(|entry| !tracked.contains(&entry.id));
+                        let selected_id = this.highlighted_history().map(|entry| entry.id.clone());
+                        this.history_scanner = Some(scanner);
                         this.activity = format!("{} past conversations found", entries.len());
                         this.history = entries;
+                        this.history_search.rebuild(&this.history);
+                        this.filter_history();
+                        if let Some(index) = this.history_matches.iter().position(|index| {
+                            Some(&this.history[*index].id) == selected_id.as_ref()
+                        }) {
+                            this.history_highlight = index;
+                        }
                     }
-                    Err(error) => this.history_error = Some(error),
+                    Err(error) => {
+                        this.history_scanner = Some(crate::history::HistoryScanner::default());
+                        this.history_error = Some(error);
+                    }
                 }
                 cx.notify();
             });
@@ -508,15 +545,39 @@ impl UtilitySurfaces {
     }
 
     fn resume_history(&mut self, entry: HistoryEntry, cx: &mut Context<Self>) {
+        if self.history_resuming.is_some() {
+            return;
+        }
+        let existing = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .sessions()
+            .values()
+            .find(|session| {
+                session.agent_session_id.as_deref() == Some(&entry.id) && session.kind == entry.kind
+            })
+            .map(|session| session.id.clone());
+        if let Some(id) = existing {
+            self.store
+                .write()
+                .expect("session store lock poisoned")
+                .select(id);
+            self.surface = Surface::None;
+            cx.notify();
+            return;
+        }
         if !entry.cwd_exists || !Path::new(&entry.cwd).is_dir() {
             self.history_error = Some("The conversation folder is no longer available".to_owned());
             cx.notify();
             return;
         }
-        self.history_loading = true;
+        self.history_resuming = Some(entry.id.clone());
         self.history_error = None;
+        cx.notify();
         let client = Arc::clone(self.store_runtime.client());
         let runtime = Arc::clone(&self.runtime);
+        let conversation_id = entry.id.clone();
         cx.spawn(async move |this, cx| {
             let task = runtime.spawn(async move {
                 client.wait_until_connected(Duration::from_secs(5)).await?;
@@ -527,10 +588,19 @@ impl UtilitySurfaces {
                 Err(error) => Err(error.to_string()),
             };
             let _ = this.update(cx, |this, cx| {
-                this.history_loading = false;
+                this.history_resuming = None;
                 match result {
                     Ok(id) => {
-                        this.surface = Surface::None;
+                        this.history.retain(|entry| entry.id != conversation_id);
+                        this.history_search.rebuild(&this.history);
+                        this.filter_history();
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .apply_spawn_result(id.clone());
+                        if this.surface == Surface::History {
+                            this.surface = Surface::None;
+                        }
                         this.activity = format!("Resumed conversation in session {id}");
                     }
                     Err(error) => this.history_error = Some(error),
@@ -995,25 +1065,31 @@ impl UtilitySurfaces {
         true
     }
 
-    fn visible_history(&self) -> Vec<HistoryEntry> {
-        self.history
-            .iter()
-            .filter(|entry| crate::history::matches_query(entry, self.history_query.text()))
-            .take(RESULT_LIMIT)
-            .cloned()
-            .collect()
+    fn filter_history(&mut self) {
+        self.history_matches = self.history_search.rank(self.history_query.text());
+        self.history_highlight = self
+            .history_highlight
+            .min(self.history_matches.len().saturating_sub(1));
+    }
+
+    fn highlighted_history(&self) -> Option<&HistoryEntry> {
+        self.history_matches
+            .get(self.history_highlight)
+            .and_then(|index| self.history.get(*index))
     }
 
     fn move_history(&mut self, delta: isize, cx: &mut Context<Self>) {
         if self.surface != Surface::History {
             return;
         }
-        let count = self.visible_history().len();
+        let count = self.history_matches.len();
         if count == 0 {
             return;
         }
         self.history_highlight =
             (self.history_highlight as isize + delta).rem_euclid(count as isize) as usize;
+        self.history_scroll
+            .scroll_to_item(self.history_highlight, ScrollStrategy::Nearest);
         cx.notify();
     }
 
@@ -1021,7 +1097,7 @@ impl UtilitySurfaces {
         if self.surface != Surface::History {
             return;
         }
-        if let Some(entry) = self.visible_history().get(self.history_highlight).cloned() {
+        if let Some(entry) = self.highlighted_history().cloned() {
             self.resume_history(entry, cx);
         }
     }
@@ -1488,143 +1564,204 @@ impl UtilitySurfaces {
             };
             if changed {
                 self.history_highlight = 0;
+                self.filter_history();
+                self.history_scroll.scroll_to_item(0, ScrollStrategy::Top);
             }
             cx.notify();
         }
     }
 
-    fn render_history(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = self.colors();
-        let entries = self.visible_history();
-        let empty = entries.is_empty() && !self.history_loading;
-        let rows = entries.into_iter().enumerate().map(|(index, entry)| {
-            let selected = index == self.history_highlight;
-            let resumable = entry.cwd_exists;
-            let folder = folder_name(&entry.cwd).to_owned();
-            let parent = relative_parent(&entry.cwd);
-            let title = entry
-                .title
-                .clone()
-                .unwrap_or_else(|| "Untitled conversation".to_owned());
-            let age = relative_time(entry.last_active_at.0);
-            let agent = ui_agent(&entry.kind);
-            div()
-                .id(("history-row", index))
-                .h(px(46.0))
-                .px(px(10.0))
-                .rounded(px(Radius::ROW))
-                .flex()
-                .items_center()
-                .gap(px(9.0))
-                .opacity(if resumable { 1.0 } else { 0.45 })
-                .bg(Fill::selected(colors, selected))
-                .cursor_pointer()
-                .hover(move |style| style.bg(Fill::hover(colors, true)))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if resumable {
+    fn render_history_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let entry = self.history[self.history_matches[index]].clone();
+        let selected = index == self.history_highlight;
+        let resumable = entry.cwd_exists;
+        let opening = self.history_resuming.as_deref() == Some(&entry.id);
+        let busy = self.history_resuming.is_some();
+        let folder = folder_name(&entry.cwd).to_owned();
+        let parent = relative_parent(&entry.cwd);
+        let title = entry
+            .title
+            .clone()
+            .unwrap_or_else(|| "Untitled conversation".to_owned());
+        let age = relative_time(entry.last_active_at.0);
+        let agent = ui_agent(&entry.kind);
+        div()
+            .h(px(56.0))
+            .px(px(8.0))
+            .py(px(2.0))
+            .child(
+                div()
+                    .id(("history-row", index))
+                    .debug_selector(move || format!("history-row-{index}"))
+                    .h_full()
+                    .px(px(10.0))
+                    .rounded(px(Radius::CARD))
+                    .flex()
+                    .items_center()
+                    .gap(px(9.0))
+                    .bg(Fill::selected(colors, selected))
+                    .when(resumable && !busy, |row| row.cursor_pointer())
+                    .when(!resumable, |row| {
+                        row.cursor(CursorStyle::OperationNotAllowed)
+                    })
+                    .hover(move |style| {
+                        style.bg(if selected {
+                            Fill::selected(colors, true)
+                        } else {
+                            Fill::hover(colors, true)
+                        })
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.history_highlight = index;
                         this.resume_history(entry.clone(), cx);
-                    }
-                }))
-                .child(AgentLogo::new(agent, 18.0, colors))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .gap(px(2.0))
-                        .child(
-                            div()
-                                .text_size(px(13.0))
-                                .text_color(colors.primary)
-                                .overflow_hidden()
-                                .child(title),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .gap(px(5.0))
-                                .text_size(px(11.0))
-                                .child(div().text_color(colors.secondary).child(folder))
-                                .child(div().text_color(colors.tertiary).child(parent)),
-                        ),
-                )
-                .child(chip(
-                    if !resumable {
-                        "folder gone".to_owned()
-                    } else if selected {
-                        "↵ resume".to_owned()
-                    } else {
-                        age
-                    },
-                    colors,
-                ))
-        });
+                    }))
+                    .child(AgentLogo::new(agent, 24.0, colors))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .font_weight(if selected {
+                                        FontWeight::MEDIUM
+                                    } else {
+                                        FontWeight::NORMAL
+                                    })
+                                    .text_color(colors.primary)
+                                    .truncate()
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .overflow_hidden()
+                                    .gap(px(5.0))
+                                    .text_size(px(11.0))
+                                    .child(div().text_color(colors.secondary).child(folder))
+                                    .child(
+                                        div().text_color(colors.tertiary).truncate().child(parent),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(11.0))
+                            .text_color(colors.secondary)
+                            .child(if opening {
+                                "Opening…".to_owned()
+                            } else if !resumable {
+                                "Folder unavailable".to_owned()
+                            } else {
+                                age
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_history(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        let count = self.history_matches.len();
+        let entity = cx.entity();
+        let selected = self.highlighted_history();
+        let status = if self.history_resuming.is_some() {
+            "Opening conversation…".to_owned()
+        } else if self.history_loading {
+            "Updating history…".to_owned()
+        } else if self.history_query.is_empty() {
+            format!("{count} conversations · Recent first")
+        } else {
+            format!("{count} matches · Best match first")
+        };
 
         FloatingSurface::new(
-            self.colors(),
+            colors,
             div()
-                .w(px(560.0))
-                .max_h(px(440.0))
+                .id("conversation-history")
+                .debug_selector(|| "conversation-history".into())
+                .w(px(620.0))
+                .max_w_full()
                 .flex()
                 .flex_col()
                 .child(
+                    div().px(px(18.0)).pt(px(14.0)).pb(px(10.0)).flex().items_center().justify_between()
+                        .child(div().text_size(px(13.0)).font_weight(FontWeight::SEMIBOLD).child("Past conversations"))
+                        .child(div().id("close-history").cursor_pointer().rounded(px(Radius::ROW))
+                            .px(px(7.0)).py(px(4.0)).text_size(px(11.0)).text_color(colors.secondary)
+                            .hover(move |style| style.bg(Fill::hover(colors, true)))
+                            .on_click(cx.listener(|this, _, _, cx| this.close_surface(cx)))
+                            .child("esc")),
+                )
+                .child(div().px(px(12.0)).pb(px(10.0)).child(
                     div()
-                        .h(px(48.0))
-                        .px(px(16.0))
+                        .h(px(40.0))
+                        .px(px(12.0))
+                        .rounded(px(Radius::CARD))
+                        .bg(Fill::subtle(colors))
+                        .border_1().border_color(colors.primary.alpha(0.10))
                         .flex()
                         .items_center()
                         .gap(px(10.0))
-                        .text_size(px(15.0))
+                        .text_size(px(13.0))
                         .child(sf_symbol("magnifyingglass", 13.0, colors.tertiary))
                         .child(
                             div()
                                 .flex_1()
+                                .min_w(px(0.0))
+                                .overflow_hidden()
                                 .text_color(if self.history_query.is_empty() {
                                     colors.tertiary
                                 } else {
                                     colors.primary
                                 })
                                 .child(if self.history_query.is_empty() {
-                                    div().child("Search past conversations…").into_any_element()
+                                    div().child("Search by title, project, or agent…").into_any_element()
                                 } else {
                                     query_label(&self.history_query)
                                 }),
                         )
-                        .child(chip("esc".to_owned(), colors)),
-                )
+                        .when(!self.history_query.is_empty(), |view| view.child(
+                            div().id("clear-history-search").cursor_pointer().text_color(colors.secondary)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.history_query.clear(); this.history_highlight = 0;
+                                    this.filter_history(); this.history_scroll.scroll_to_item(0, ScrollStrategy::Top); cx.notify();
+                                })).child(sf_symbol("xmark.circle.fill", 13.0, colors.tertiary))
+                        )),
+                ))
+                .child(div().px(px(18.0)).pb(px(8.0)).flex().items_center().justify_between()
+                    .child(div().text_size(px(11.0)).text_color(colors.secondary).child(status))
+                    .when(!self.history_loading, |view| view.child(div().id("refresh-history").cursor_pointer()
+                        .text_size(px(11.0)).text_color(colors.secondary)
+                        .on_click(cx.listener(|this, _, _, cx| this.refresh_history(cx))).child("Refresh"))))
+                .when_some(self.history_error.clone(), |view, error| view.child(
+                    div().px(px(18.0)).py(px(8.0)).text_size(px(12.0)).text_color(Ink::DANGER).child(error)))
+                .child(div().h(px(336.0)).when(count > 0, |view| view.child(
+                    uniform_list("history-results", count, move |range, _, cx| {
+                        entity.update(cx, |this, cx| range.map(|index| this.render_history_row(index, cx)).collect())
+                    }).track_scroll(&self.history_scroll).size_full()
+                )).when(count == 0, |view| view.child(
+                    div().size_full().flex().flex_col().items_center().justify_center().gap(px(10.0))
+                        .child(sf_symbol("magnifyingglass", 24.0, colors.tertiary))
+                        .child(div().text_size(px(13.0)).text_color(colors.primary).child(
+                            if self.history_loading { "Finding your conversations…" } else if self.history_query.is_empty() { "Your next conversation starts here" } else { "No matching conversations" }))
+                        .child(div().text_size(px(12.0)).text_color(colors.secondary).child(
+                            if self.history_query.is_empty() { "Past Claude and Codex chats appear here automatically." } else { "Try a project name, agent, or a few words from the title." }))
+                )))
                 .child(HairlineDivider::horizontal(colors))
-                .child(
-                    div()
-                        .id("history-results")
-                        .max_h(px(380.0))
-                        .overflow_y_scroll()
-                        .p(px(6.0))
-                        .flex()
-                        .flex_col()
-                        .gap(px(1.0))
-                        .when(self.history_loading, |view| {
-                            view.child(empty_label(
-                                "Scanning Claude and Codex transcripts…",
-                                colors,
-                            ))
-                        })
-                        .when_some(self.history_error.clone(), |view, error| {
-                            view.child(empty_label(&error, colors))
-                        })
-                        .when(empty, |view| {
-                            view.child(empty_label(
-                                if self.history_query.is_empty() {
-                                    "Past Claude and Codex conversations will appear here."
-                                } else {
-                                    "No conversations match. Try a different search."
-                                },
-                                colors,
-                            ))
-                        })
-                        .children(rows),
-                ),
-        )
+                .child(div().px(px(18.0)).py(px(10.0)).h(px(88.0)).flex().flex_col().justify_between().gap(px(5.0))
+                    .child(div().text_size(px(12.0)).text_color(colors.primary).max_h(px(36.0)).overflow_hidden()
+                        .child(selected.and_then(|entry| entry.title.clone()).unwrap_or_else(|| "Pick up where you left off".to_owned())))
+                    .child(div().flex().items_center().justify_between().gap(px(12.0))
+                        .child(div().min_w(px(0.0)).flex_1().text_size(px(11.0)).text_color(colors.secondary).truncate()
+                            .child(selected.map(|entry| entry.cwd.clone()).unwrap_or_else(|| "Search all your local conversations".to_owned())))
+                        .child(div().flex_none().text_size(px(11.0)).text_color(colors.secondary).child("↑ ↓ navigate    ↵ open"))))
+        ).radius(Radius::FLOATING_MENU)
     }
 
     fn render_worktrees(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -5970,6 +6107,174 @@ mod tests {
                     .cached(StyleRefinement::default().absolute().inset_0()),
             )
         }
+    }
+
+    fn seed_history(surfaces: &mut UtilitySurfaces) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64()
+            * 1000.0;
+        let titles = [
+            "Make conversation search fast and useful",
+            "Polish sidebar navigation and rounded popovers",
+            "Keep remote sessions alive after reconnecting",
+            "Fix terminal rendering when switching projects",
+            "Add keyboard shortcuts for quick navigation",
+            "Explore a simpler onboarding flow",
+            "A longer conversation title about investigating search results across multiple projects and keeping useful names visible",
+        ];
+        surfaces.surface = Surface::History;
+        surfaces.history = (0..640)
+            .map(|index| HistoryEntry {
+                id: format!("conversation-{index}"),
+                kind: if index % 2 == 0 {
+                    ProtoAgentKind::CODEX
+                } else {
+                    ProtoAgentKind::CLAUDE_CODE
+                },
+                cwd: if index == 4 {
+                    "/work/old-worktree".to_owned()
+                } else {
+                    "/work/diri".to_owned()
+                },
+                title: Some(titles[index % titles.len()].to_owned()),
+                transcript_path: String::new(),
+                last_active_at: diri_proto::DateMillis(now - index as f64 * 3600000.0),
+                created_at: None,
+                cwd_exists: index != 4,
+            })
+            .collect();
+        surfaces.history_search.rebuild(&surfaces.history);
+        surfaces.filter_history();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn history_virtualizes_results_and_keeps_keyboard_selection_visible(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let runtime = Arc::new(StoreRuntime::inert());
+            let tokio = Arc::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap(),
+            );
+            let surfaces = cx.new(|cx| {
+                let mut surfaces =
+                    UtilitySurfaces::new(runtime, tokio, crate::updates::inert(), window, cx);
+                seed_history(&mut surfaces);
+                surfaces.focus.focus(window, cx);
+                surfaces
+            });
+            CachedOverlayHarness { surfaces }
+        });
+        cx.simulate_resize(size(px(800.0), px(700.0)));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("history-row-0").is_some());
+        assert!(
+            cx.debug_bounds("history-row-639").is_none(),
+            "offscreen rows must not be rendered"
+        );
+        let surfaces = view.read_with(cx, |view, _| view.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| surfaces.move_history(-1, cx));
+        cx.run_until_parked();
+        let row = cx
+            .debug_bounds("history-row-639")
+            .expect("keyboard selection scrolled into view");
+        let dialog = cx.debug_bounds("conversation-history").unwrap();
+        assert!(row.top() >= dialog.top() && row.bottom() <= dialog.bottom());
+        cx.simulate_keystrokes("s e a r c h");
+        cx.run_until_parked();
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(surfaces.history_query.text(), "search");
+            assert_eq!(surfaces.history_highlight, 0);
+            assert!(surfaces.history_matches.len() < 640);
+        });
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.history_query.clear();
+            surfaces.history_query.insert("zzzzzz");
+            surfaces.filter_history();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let empty_dialog = cx.debug_bounds("conversation-history").unwrap();
+        assert_eq!(
+            empty_dialog.size.width, dialog.size.width,
+            "empty results preserve dialog width"
+        );
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.history_resuming = Some("already-opening".to_owned());
+            let entry = surfaces.history[0].clone();
+            surfaces.resume_history(entry, cx);
+            assert_eq!(
+                surfaces.history_resuming.as_deref(),
+                Some("already-opening")
+            );
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "renders deterministic history UI without a live daemon"]
+    fn render_history_preview_screenshot() {
+        let output =
+            PathBuf::from(std::env::var_os("DIRI_VISUAL_OUTPUT").expect("set DIRI_VISUAL_OUTPUT"));
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let narrow = std::env::var_os("DIRI_VISUAL_NARROW").is_some();
+        let window = cx
+            .open_window(
+                size(px(if narrow { 680.0 } else { 1000.0 }), px(720.0)),
+                move |window, cx| {
+                    let surfaces = cx.new(|cx| {
+                        let runtime = Arc::new(StoreRuntime::inert());
+                        let tokio = Arc::new(
+                            tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .unwrap(),
+                        );
+                        let mut surfaces = UtilitySurfaces::new(
+                            runtime,
+                            tokio,
+                            crate::updates::inert(),
+                            window,
+                            cx,
+                        );
+                        seed_history(&mut surfaces);
+                        if std::env::var_os("DIRI_VISUAL_LIGHT").is_some() {
+                            surfaces.prefs.terminal_theme = TermTheme::DIRIJOR_LIGHT.id.to_owned();
+                        }
+                        if let Ok(query) = std::env::var("DIRI_VISUAL_QUERY") {
+                            surfaces.history_query.insert(&query);
+                            surfaces.filter_history();
+                        }
+                        if std::env::var_os("DIRI_VISUAL_OPENING").is_some() {
+                            surfaces.history_resuming = Some(surfaces.history[0].id.clone());
+                        }
+                        surfaces
+                    });
+                    cx.new(|_| CachedOverlayHarness { surfaces })
+                },
+            )
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, _| window.refresh())
+            .unwrap();
+        cx.run_until_parked();
+        cx.capture_screenshot(window.into())
+            .unwrap()
+            .save(output)
+            .unwrap();
     }
 
     /// Regenerates the issue/PR screenshot without Screen Recording access or
