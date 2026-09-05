@@ -79,8 +79,9 @@ daemon, agent discovery, state file, and active socket without opening the UI.
 ## Optional integrations
 
 - Coding-agent executables must be installed separately and visible on the
-  login shell's `PATH`. Diri currently advertises Claude Code, Codex, Cursor,
-  and Gemini when their commands are available.
+  login shell's `PATH`. Diri ships 22 agent definitions and shows the installed
+  CLIs it detects. Claude Code and Codex have the deepest status and resume
+  integration; every supported CLI still runs in a real terminal.
 - Status sounds use the first available command among `pw-play`, `paplay`, and
   `aplay`. Diri remains fully usable when none is installed.
 - SSH password or key-passphrase dialogs use `zenity`, with `kdialog` as a

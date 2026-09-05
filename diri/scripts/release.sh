@@ -353,7 +353,8 @@ if [ ! -f "$NOTES_FILE" ]; then
     cat > "$NOTES_FILE" <<NOTES
 ## diri $VERSION
 
-Native desktop orchestrator for coding agents on macOS and Linux.
+Run coding agents in parallel with live status, persistent local sessions, git
+worktrees, review tools, and direct SSH hosts.
 
 **macOS:** download the DMG below, open it, drag diri to Applications.
 Universal (Apple silicon and Intel), signed and notarized, so it opens without
