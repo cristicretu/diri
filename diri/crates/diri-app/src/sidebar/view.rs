@@ -1218,7 +1218,7 @@ impl Sidebar {
                 bar.child(icon_button(
                     "sidebar-layout",
                     "Group and order sessions",
-                    "line.3.horizontal.decrease",
+                    "gearshape",
                     layout_hover,
                     colors,
                     cx.listener(|this, _, window, cx| {
@@ -3167,6 +3167,11 @@ impl Sidebar {
             .flex_col()
             .role(Role::Menu)
             .aria_label("Sidebar view options")
+            // The sidebar itself remains translucent, while menu labels need
+            // a settled semantic material so the session list cannot compete
+            // with this denser layer in light themes.
+            .bg(colors.floating_surface().alpha(0.995))
+            .rounded(px(Radius::FLOATING_MENU))
             .p(px(4.0))
             .child(section_label("Grouping"))
             .child(choice_menu_row(
@@ -7775,6 +7780,7 @@ mod tests {
             })
             .expect("open headless sidebar window");
         cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(180));
         cx.update_window(window.into(), |_, window, _| window.refresh())
             .expect("refresh sidebar window");
         cx.run_until_parked();
