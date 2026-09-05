@@ -19,6 +19,7 @@ const CURRENT_VERSION: u32 = 1;
 pub const MAX_RECIPES: usize = 64;
 const MAX_RECIPE_NAME_CHARS: usize = 80;
 const MAX_BRANCH_PREFIX_CHARS: usize = 120;
+pub const MAX_RECIPE_PROMPT_CHARS: usize = 32_768;
 const WORKTREE_BRANCH_ATTEMPTS: usize = 16;
 
 static LAUNCH_NONCE: AtomicU64 = AtomicU64::new(0);
@@ -379,7 +380,7 @@ impl LaunchRecipe {
                 host: self.host.clone(),
                 worktree,
                 title: self.title.clone(),
-                initial_prompt: Some(self.initial_prompt.trim().to_owned()),
+                initial_prompt: Some(self.initial_prompt.clone()),
                 ..SpawnOptions::default()
             },
         })
@@ -399,6 +400,16 @@ impl LaunchRecipe {
             .map(|_| ())
     }
 
+    pub fn validate_prompt(&self) -> Result<(), RecipeIssue> {
+        if self.initial_prompt.trim().is_empty() {
+            return Err(RecipeIssue::EmptyPrompt);
+        }
+        if self.initial_prompt.chars().count() > MAX_RECIPE_PROMPT_CHARS {
+            return Err(RecipeIssue::PromptTooLong);
+        }
+        Ok(())
+    }
+
     fn validated_cwd(
         &self,
         projects: &HashMap<ProjectId, Project>,
@@ -406,9 +417,7 @@ impl LaunchRecipe {
         catalog: Option<&diri_proto::AgentReadinessResult>,
         effective_host: &impl Fn(&Project) -> Option<String>,
     ) -> Result<String, RecipeIssue> {
-        if self.initial_prompt.trim().is_empty() {
-            return Err(RecipeIssue::EmptyPrompt);
-        }
+        self.validate_prompt()?;
         if let Some(host) = self.host.as_deref()
             && !hosts.iter().any(|candidate| candidate.id == host)
         {
@@ -463,7 +472,8 @@ impl LaunchRecipe {
             .chars()
             .take(MAX_RECIPE_NAME_CHARS)
             .collect();
-        self.initial_prompt = self.initial_prompt.trim().chars().take(32_768).collect();
+        // Prompts are task data: whitespace and the final instructions matter.
+        // Validate the bound at launch/save instead of silently rewriting them.
         self.title = self
             .title
             .take()
@@ -487,6 +497,7 @@ pub struct ResolvedRecipe {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecipeIssue {
     EmptyPrompt,
+    PromptTooLong,
     MissingHost(String),
     MissingProject(ProjectId),
     MissingPath(String),
@@ -505,6 +516,9 @@ impl RecipeIssue {
     pub fn message(&self) -> String {
         match self {
             Self::EmptyPrompt => "Add an initial prompt to repair this recipe".to_owned(),
+            Self::PromptTooLong => {
+                "Prompt exceeds 32,768 characters — shorten it before saving or running".to_owned()
+            }
             Self::MissingHost(host) => format!("Host ‘{host}’ is missing — choose a new host"),
             Self::MissingProject(_) => "Project is missing — choose a new project".to_owned(),
             Self::MissingPath(path) => {
@@ -692,6 +706,62 @@ mod tests {
             }],
             ..diri_proto::AgentReadinessResult::default()
         }
+    }
+
+    #[test]
+    fn repeated_runs_preserve_the_exact_saved_prompt_and_launch_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let prompt = "\n  Review this code.\n\nKeep this indentation:  \n\tand this tab.\n";
+        let mut book = LaunchRecipeBook::default();
+        let mut recipe = LaunchRecipe::draft(
+            "Review",
+            AgentKind::CODEX,
+            RecipeProject::Path {
+                path: directory.path().to_string_lossy().into_owned(),
+            },
+            None,
+            prompt,
+        );
+        recipe.title = Some("Daily review".into());
+        book.add(recipe).unwrap();
+        let book: LaunchRecipeBook =
+            serde_json::from_slice(&serde_json::to_vec(&book).unwrap()).unwrap();
+        let recipe = &book.items()[0];
+        assert_eq!(recipe.initial_prompt, prompt);
+        let catalog = catalog(&AgentKind::CODEX, true);
+        let first = recipe
+            .resolve(&HashMap::new(), &[], Some(&catalog), |p| p.host.clone())
+            .unwrap();
+        let second = recipe
+            .resolve(&HashMap::new(), &[], Some(&catalog), |p| p.host.clone())
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(second.options.initial_prompt.as_deref(), Some(prompt));
+        assert_eq!(second.options.title.as_deref(), Some("Daily review"));
+        assert!(
+            second.options.parent.is_none(),
+            "each run is independent of prior sessions"
+        );
+    }
+
+    #[test]
+    fn oversized_prompts_are_rejected_without_losing_the_final_instructions() {
+        let prompt = format!("{}\nDo not publish.", "x".repeat(MAX_RECIPE_PROMPT_CHARS));
+        let recipe = LaunchRecipe::draft(
+            "Long task",
+            AgentKind::CODEX,
+            RecipeProject::Path {
+                path: "/tmp".into(),
+            },
+            None,
+            &prompt,
+        );
+        assert_eq!(recipe.initial_prompt, prompt);
+        assert_eq!(recipe.validate_prompt(), Err(RecipeIssue::PromptTooLong));
+        assert_eq!(
+            recipe.resolve(&HashMap::new(), &[], None, |p| p.host.clone()),
+            Err(RecipeIssue::PromptTooLong)
+        );
     }
 
     fn project(id: &str, root: &str, host: Option<&str>) -> Project {
