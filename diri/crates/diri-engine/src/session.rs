@@ -2115,6 +2115,11 @@ fn handle_remote_message(
         }
         RemoteMessage::Terminal(frame) => match frame.frame_type {
             FrameType::ReplayBegin => {
+                shared
+                    .screen
+                    .lock()
+                    .expect("screen")
+                    .reset_notification_sequence();
                 *replaying = true;
                 RemoteConnectionDisposition::Continue
             }
@@ -2976,10 +2981,10 @@ fn pump_held(
             eval_dirty = !evaluate_now;
             let (observation, replies) = {
                 let mut screen = shared.screen.lock().expect("screen");
-                screen.feed(output);
-                if offset <= replay_until {
-                    screen.take_notifications();
-                } else if screen.has_notifications() {
+                let historical_bytes =
+                    replay_until.saturating_sub(start).min(output.len() as u64) as usize;
+                screen.feed_with_history(output, historical_bytes);
+                if screen.has_notifications() {
                     shared.bump_state_version();
                 }
                 let replies = screen.take_replies();

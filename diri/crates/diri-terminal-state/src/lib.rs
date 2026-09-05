@@ -375,6 +375,12 @@ impl HeadlessScreen {
         self
     }
 
+    pub fn reset_notification_sequence(&mut self) {
+        if let Some(parser) = &mut self.notifications {
+            parser.reset_sequence();
+        }
+    }
+
     pub fn has_notifications(&self) -> bool {
         self.notifications
             .as_ref()
@@ -394,9 +400,18 @@ impl HeadlessScreen {
     /// fast path for plain text that byte-at-a-time feeding defeats, and the
     /// difference is multi-x on heavy output like build logs.
     pub fn feed(&mut self, bytes: &[u8]) {
+        self.feed_with_history(bytes, 0);
+    }
+
+    /// Parses all terminal bytes while excluding a replay prefix from product
+    /// notifications. A partial historical OSC cannot leak into live output.
+    pub fn feed_with_history(&mut self, bytes: &[u8], historical_bytes: usize) {
         self.scan_progress(bytes);
         if let Some(parser) = &mut self.notifications {
-            parser.feed(bytes);
+            if historical_bytes != 0 {
+                parser.reset_sequence();
+            }
+            parser.feed(&bytes[historical_bytes.min(bytes.len())..]);
         }
         self.parser.advance(&mut self.term, bytes);
         self.settle();

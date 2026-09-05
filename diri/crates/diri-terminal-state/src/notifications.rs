@@ -17,6 +17,12 @@ pub(crate) struct NotificationParser {
 }
 
 impl NotificationParser {
+    pub fn reset_sequence(&mut self) {
+        self.state = 0;
+        self.payload.clear();
+        self.pending.clear();
+    }
+
     pub fn feed(&mut self, bytes: &[u8]) {
         // No copy or bytewise scan for the common plain-output case.
         if self.state == 0 && !bytes.contains(&0x1b) {
@@ -159,6 +165,18 @@ fn clean(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_replay_boundary_inside_a_read_delivers_only_complete_live_notifications() {
+        let mut screen = crate::HeadlessScreen::new(80, 24).with_notifications();
+        let old = b"\x1b]9;old\x07\x1b]9;partial";
+        let live = b" remainder\x07\x1b]9;new\x07";
+        let bytes: Vec<_> = old.iter().chain(live).copied().collect();
+        screen.feed_with_history(&bytes, old.len());
+        let messages = screen.take_notifications();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].body, "new");
+    }
+
     #[test]
     fn fragmented_osc_bel_st_and_progress() {
         let mut parser = NotificationParser::default();
