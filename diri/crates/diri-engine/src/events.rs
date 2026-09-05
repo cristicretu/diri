@@ -414,6 +414,11 @@ pub fn satisfies_wait_target(status: &diri_proto::SessionStatus, target: &str) -
 /// changes, by diffing registry views on a short cadence. The Swift daemon
 /// publishes at each mutation site inside its status engine; this engine's
 /// state changes on pump threads, so a watcher is the equivalent seam.
+fn next_notification_id() -> u64 {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    SEQUENCE.fetch_add(1, Ordering::Relaxed)
+}
+
 pub fn spawn_registry_watcher(
     registry: Arc<Mutex<crate::registry::Registry>>,
     events: EventBus,
@@ -455,6 +460,29 @@ pub fn spawn_registry_watcher(
                         &record,
                         Some(&id),
                     );
+                    let notifications = registry.lock().expect("registry").take_notifications(&id);
+                    for notification in notifications {
+                        let event = diri_proto::SessionNotificationEvent {
+                            id: format!(
+                                "osc-{}-{}",
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_nanos(),
+                                next_notification_id()
+                            ),
+                            session_id: record.id.clone(),
+                            session_created_at: record.created_at,
+                            occurred_at: diri_proto::DateMillis::from(std::time::SystemTime::now()),
+                            title: notification.title,
+                            body: notification.body,
+                        };
+                        events.publish_encoded(
+                            diri_proto::EventName::SESSION_NOTIFICATION,
+                            &event,
+                            Some(&id),
+                        );
+                    }
                 }
                 std::thread::sleep(Duration::from_millis(150));
             }

@@ -33,6 +33,7 @@ actions!(
         ToggleCommandPalette,
         ToggleQuickOpen,
         ToggleHistory,
+        ToggleNotifications,
         ToggleOverview,
         OpenWorktrees,
         OpenSettings,
@@ -96,6 +97,7 @@ pub enum CommandId {
     ToggleCommandPalette,
     ToggleQuickOpen,
     ToggleHistory,
+    ToggleNotifications,
     ToggleOverview,
     OpenWorktrees,
     OpenSettings,
@@ -419,6 +421,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         Some(APP_CONTEXT)
     ),
     spec!(
+        ToggleNotifications,
+        "toggle-notifications",
+        Some("cmd-shift-i"),
+        Some("⇧⌘I"),
+        Some(APP_CONTEXT),
+        "Notifications",
+        "bell",
+        "inbox unread alerts attention"
+    ),
+    spec!(
         CheckForUpdates,
         "check-for-updates",
         None,
@@ -698,6 +710,7 @@ impl CommandSpec {
             CommandId::ToggleCommandPalette => KeyBinding::new(key, ToggleCommandPalette, context),
             CommandId::ToggleQuickOpen => KeyBinding::new(key, ToggleQuickOpen, context),
             CommandId::ToggleHistory => KeyBinding::new(key, ToggleHistory, context),
+            CommandId::ToggleNotifications => KeyBinding::new(key, ToggleNotifications, context),
             CommandId::ToggleOverview => KeyBinding::new(key, ToggleOverview, context),
             CommandId::OpenWorktrees => KeyBinding::new(key, OpenWorktrees, context),
             CommandId::OpenSettings => KeyBinding::new(key, OpenSettings, context),
@@ -935,6 +948,11 @@ impl CommandId {
                 description: "Hand off work from the selected session",
                 category: Sessions,
             },
+            Self::ToggleNotifications => ShortcutMetadata {
+                title: "Notifications",
+                description: "Open the unread notification inbox",
+                category: Navigation,
+            },
             Self::SelectNextAttentionSession => ShortcutMetadata {
                 title: "Next session needing attention",
                 description: "Jump to the next session waiting for you",
@@ -1134,6 +1152,7 @@ impl CommandId {
             Self::ToggleCommandPalette => Box::new(ToggleCommandPalette),
             Self::ToggleQuickOpen => Box::new(ToggleQuickOpen),
             Self::ToggleHistory => Box::new(ToggleHistory),
+            Self::ToggleNotifications => Box::new(ToggleNotifications),
             Self::ToggleOverview => Box::new(ToggleOverview),
             Self::OpenWorktrees => Box::new(OpenWorktrees),
             Self::OpenSettings => Box::new(OpenSettings),

@@ -1961,13 +1961,14 @@ impl Sidebar {
     ) -> AnyElement {
         let session = &row.session;
         let id = session.id.clone();
-        let (selected, multi, drag_selection, migrating) = {
+        let (selected, multi, drag_selection, migrating, unread) = {
             let mut store = self.store.write().expect("session store lock poisoned");
             (
                 store.selected_session_id() == Some(&id),
                 store.sidebar_selection().contains(&id),
                 (store.sidebar_selection().len() > 1).then(|| store.sidebar_selection_ordered()),
                 store.migrating().contains(&id),
+                store.notifications().session_unread(&id),
             )
         };
         let marked = self.ui.delegation_mark.as_ref() == Some(&id);
@@ -2001,6 +2002,8 @@ impl Sidebar {
             row.pinned,
             !hovered && focused && shortcut.is_some(),
         );
+        let title_available_width =
+            (title_available_width - if unread { 14.0 } else { 0.0 }).max(0.0);
         let title_marquee_id = format!("session-title-marquee:{}", id.0);
         let fill = if selected {
             RowFill::Selected
@@ -2285,6 +2288,15 @@ impl Sidebar {
                 )
                 .font_weight(Typo::ROW.weight),
             )
+            .when(unread, |element| {
+                element.child(
+                    div()
+                        .size(px(6.0))
+                        .flex_none()
+                        .rounded_full()
+                        .bg(Ink::FRESH),
+                )
+            })
             .when(row.pinned, |element| element.child(pin_mark(colors)))
             .when(marked, |element| {
                 element.child(StateChip::new("Delegating", Palette::CLAY, colors))
@@ -5085,6 +5097,13 @@ impl Sidebar {
         self.commit_rename();
         {
             let mut store = self.store.write().expect("session store lock poisoned");
+            if let Some(id) = store.next_unread_notification() {
+                store.select(id);
+                drop(store);
+                cx.emit(SidebarEvent::SessionActivated);
+                cx.notify();
+                return true;
+            }
             let sessions = store.ordered_sessions();
             if sessions.is_empty() {
                 return false;
@@ -5097,7 +5116,12 @@ impl Sidebar {
             let start = current.map_or(0, |index| index + 1);
             let Some(next) = (0..sessions.len())
                 .map(|offset| &sessions[(start + offset) % sessions.len()])
-                .find(|session| session.attention() == ProtoAttentionLevel::NeedsInput)
+                .find(|session| {
+                    matches!(
+                        session.attention(),
+                        ProtoAttentionLevel::NeedsInput | ProtoAttentionLevel::DoneUnseen
+                    )
+                })
             else {
                 return false;
             };
@@ -5463,6 +5487,51 @@ impl Render for Sidebar {
         if let Some(feedback) = self.external_drop_feedback(colors, cx) {
             root = root.child(feedback);
         }
+        let unread = self
+            .store
+            .read()
+            .expect("store")
+            .notifications()
+            .unread_count();
+        root = root.child(
+            div().px(px(Space::INSET)).py(px(4.0)).child(
+                div()
+                    .id("notification-inbox-button")
+                    .h(px(SIDEBAR_NAV_ROW_HEIGHT))
+                    .px(px(8.0))
+                    .rounded(px(SIDEBAR_ROW_RADIUS))
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .text_size(px(Typo::ROW.size))
+                    .text_color(colors.primary)
+                    .hover(|style| style.bg(colors.primary.alpha(0.05)))
+                    .child(sf_symbol(
+                        "bell",
+                        14.0,
+                        if unread > 0 {
+                            Ink::FRESH
+                        } else {
+                            colors.secondary
+                        },
+                    ))
+                    .child(div().flex_1().child("Notifications"))
+                    .when(unread > 0, |row| {
+                        row.child(
+                            div()
+                                .rounded(px(5.0))
+                                .px(px(6.0))
+                                .bg(Ink::FRESH.alpha(0.12))
+                                .text_color(Ink::FRESH)
+                                .child(unread.to_string()),
+                        )
+                    })
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(crate::commands::ToggleNotifications), cx)
+                    }),
+            ),
+        );
         root = root.child(self.account_footer(colors, cx));
         if let Some(popover) = self.popover(colors, window, cx) {
             root = root.child(popover);

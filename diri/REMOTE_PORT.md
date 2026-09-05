@@ -799,6 +799,18 @@ The completed acceptance scenario is:
 5. Continue interacting with the same Agent process.
 ```
 
+## Terminal notification ingestion
+
+The local Engine optionally extracts bounded OSC 9, OSC 777 and textual OSC 99
+notifications from the existing live raw-output stream. It emits a local
+`session.notification` event; the app owns notification history, read state,
+macOS delivery and navigation. Notifications do not change execution status.
+The Holder does not enable notification extraction, store notification objects,
+run hooks, or interpret actions. No Helper protocol or capability changes are
+required. Replayed output must not redeliver notifications. Alerts produced
+while the Engine is disconnected are not recovered from replay; reliable
+offline notification delivery remains an independent enhancement.
+
 ## Deferred enhancements
 
 The following are independent product enhancements, not unfinished remote

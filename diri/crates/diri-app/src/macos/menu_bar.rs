@@ -513,9 +513,23 @@ impl NativeMenuBar {
         let (model, selected, attention, theme_id) = {
             let mut store = self.store.write().expect("session store lock poisoned");
             let projection = store.menu_bar_projection();
-            let model = build_inbox(&projection, &collapsed);
+            let mut model = build_inbox(&projection, &collapsed);
+            for row in &mut model.rows {
+                if let InboxRow::Session(session) = row
+                    && store
+                        .notifications()
+                        .session_unread(&SessionId::new(session.session_id.clone()))
+                    && session.trailing != Some(TrailingStatus::NeedsYou)
+                {
+                    session.trailing = Some(TrailingStatus::Unread);
+                }
+            }
             let selected = store.selected_session_id().cloned();
-            let attention = store.global_attention();
+            let mut attention = store.global_attention();
+            if store.notifications().unread_count() != 0 && attention != AttentionLevel::NeedsInput
+            {
+                attention = AttentionLevel::DoneUnseen;
+            }
             let theme_id = store.preferences().terminal_theme.clone();
             (model, selected, attention, theme_id)
         };
@@ -1050,6 +1064,11 @@ fn trailing_label(session: &InboxSessionRow, theme: &MenuTheme) -> Option<Traili
             width: 36.0,
             color: rgba_ns(Ink::FRESH.r, Ink::FRESH.g, Ink::FRESH.b, 1.0),
         }),
+        TrailingStatus::Unread => Some(TrailingLabel {
+            text: "unread",
+            width: 48.0,
+            color: rgba_ns(Ink::FRESH.r, Ink::FRESH.g, Ink::FRESH.b, 1.0),
+        }),
         TrailingStatus::Zzz => Some(TrailingLabel {
             text: "Zzz",
             width: 28.0,
@@ -1128,7 +1147,9 @@ fn glyph_tint(session: &InboxSessionRow, theme: &MenuTheme) -> Retained<NSColor>
         Some(TrailingStatus::NeedsYou) => {
             rgba_ns(Ink::ATTENTION.r, Ink::ATTENTION.g, Ink::ATTENTION.b, 1.0)
         }
-        Some(TrailingStatus::Done) => rgba_ns(Ink::FRESH.r, Ink::FRESH.g, Ink::FRESH.b, 1.0),
+        Some(TrailingStatus::Done | TrailingStatus::Unread) => {
+            rgba_ns(Ink::FRESH.r, Ink::FRESH.g, Ink::FRESH.b, 1.0)
+        }
         Some(TrailingStatus::Zzz) => theme.primary_alpha(0.36),
         None if session.working => match session.agent_id.as_str() {
             AgentKind::CLAUDE_CODE_ID => {

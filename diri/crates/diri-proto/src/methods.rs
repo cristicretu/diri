@@ -73,6 +73,7 @@ impl Method {
 pub struct EventName;
 
 impl EventName {
+    pub const SESSION_NOTIFICATION: &'static str = "session.notification";
     pub const SESSION_UPDATED: &'static str = "session.updated";
     pub const SESSION_RESOURCES: &'static str = "session.resources";
     pub const SESSION_REMOVED: &'static str = "session.removed";
@@ -1001,4 +1002,16 @@ mod base64_bytes {
             _ => None,
         }
     }
+}
+
+/// A terminal-authored event, separate from session execution/attention state.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionNotificationEvent {
+    pub id: String,
+    pub session_id: crate::SessionId,
+    pub session_created_at: crate::DateMillis,
+    pub occurred_at: crate::DateMillis,
+    pub title: String,
+    pub body: String,
 }

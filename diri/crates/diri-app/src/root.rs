@@ -41,6 +41,9 @@ use crate::terminal_pane::{TerminalPane, TerminalPaneEvent, TerminalViewport};
 use crate::updates::UpdatePhase;
 use crate::workbench::WorkbenchLayout;
 
+#[path = "notification_panel.rs"]
+mod notification_panel;
+
 const WINDOW_BOUNDS_SAVE_DELAY: Duration = Duration::from_millis(150);
 
 pub(crate) fn cached_window_overlay<T: Render>(view: Entity<T>) -> impl IntoElement {
@@ -209,6 +212,14 @@ pub struct RootView {
     status_banner: Option<InAppBanner>,
     status_banner_generation: u64,
     quote_target_picker: Option<QuoteTargetPicker>,
+    notification_panel_open: bool,
+    notification_filter_unread: bool,
+    notification_selected: usize,
+    notification_focus: FocusHandle,
+    notification_health: String,
+    pending_notification_open: Option<(SessionId, Option<String>)>,
+    #[cfg(target_os = "macos")]
+    _notification_events: Task<()>,
     last_quote_surface: QuoteSurface,
     sound_gate: SoundGate,
     /// Set when opening settings had to reveal a hidden sidebar to put its
@@ -489,7 +500,47 @@ impl RootView {
             menu_bar.refresh();
         }
         #[cfg(target_os = "macos")]
-        let notifier = NativeNotifier::new(services.store.notification_action_sender());
+        let (notification_tx, mut notification_rx) = tokio::sync::mpsc::unbounded_channel();
+        #[cfg(target_os = "macos")]
+        let notifier = NativeNotifier::new(notification_tx);
+        #[cfg(target_os = "macos")]
+        let notification_events = cx.spawn_in(window, async move |this, cx| {
+            while let Some(event) = notification_rx.recv().await {
+                if this
+                    .update_in(cx, |this, window, cx| {
+                        use crate::macos::notifier::NativeNotificationEvent;
+                        match event {
+                            NativeNotificationEvent::Open {
+                                session_id,
+                                notification_id,
+                            } => {
+                                this.open_notification(
+                                    SessionId::new(session_id),
+                                    Some(notification_id),
+                                    window,
+                                    cx,
+                                );
+                            }
+                            NativeNotificationEvent::Read(id) => {
+                                this.services
+                                    .store
+                                    .store
+                                    .write()
+                                    .expect("store")
+                                    .set_notification_read(&id, true);
+                            }
+                            NativeNotificationEvent::Health(message) => {
+                                this.notification_health = message
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
 
         let activation_services = Arc::clone(&services);
         let activation = cx.observe_window_activation(window, move |_this, window, _cx| {
@@ -511,7 +562,11 @@ impl RootView {
             loop {
                 tokio::select! {
                     status = status_events.recv() => {
-                        let Ok(status) = status else { break };
+                        let status = match status {
+                            Ok(status) => status,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        };
                         let _ = this.update(cx, |this, cx| {
                             #[cfg(target_os = "macos")]
                             let app_is_active = this
@@ -521,7 +576,10 @@ impl RootView {
                                 .read()
                                 .expect("session store lock poisoned")
                                 .app_is_active();
-                            if let Some(sound) = status.sound {
+                            #[cfg(target_os = "macos")]
+                            this.notifier.dismiss(&status.dismiss);
+                            let deliver = status.notification.as_ref().is_none_or(|request| this.services.store.store.read().expect("store").should_deliver_notification(request));
+                            if let Some(sound) = status.sound && deliver {
                                 let sound = match sound {
                                     NotificationSound::NeedsInput => StatusSound::NeedsInput,
                                     NotificationSound::Done => StatusSound::Done,
@@ -533,7 +591,7 @@ impl RootView {
                             }
                             #[cfg(target_os = "macos")]
                             if let Some(notification) = &status.notification
-                                && (!app_is_active || status.in_app_banner.is_none())
+                                && deliver && (!app_is_active || status.in_app_banner.is_none())
                             {
                                 this.notifier.post(notification);
                             }
@@ -658,6 +716,7 @@ impl RootView {
                                     surfaces.update(cx, |surfaces, cx| surfaces.open_settings(cx));
                                 }
                                 this.sync_auxiliary_terminal(window, cx);
+                                cx.notify();
                             })
                             .is_err()
                         {
@@ -724,6 +783,16 @@ impl RootView {
             status_banner: None,
             status_banner_generation: 0,
             quote_target_picker: None,
+            notification_panel_open: false,
+            notification_filter_unread: true,
+            notification_selected: 0,
+            notification_focus: cx.focus_handle(),
+            pending_notification_open: None,
+            notification_health:
+                "Use Test alert to check macOS delivery. Notifications remain available here."
+                    .into(),
+            #[cfg(target_os = "macos")]
+            _notification_events: notification_events,
             last_quote_surface: QuoteSurface::default(),
             sound_gate: SoundGate::default(),
             sidebar_revealed_for_settings: false,
@@ -1038,6 +1107,9 @@ impl RootView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.notification_panel_open && self.notification_key(event, window, cx) {
+            return;
+        }
         // A sidebar drag rarely has sidebar focus (the press left it in the
         // terminal), so Escape is caught here, on the window's capture path.
         if event.keystroke.key == "escape"
@@ -1231,6 +1303,7 @@ impl RootView {
                     cx.propagate();
                 }
             }
+            CommandId::ToggleNotifications => self.toggle_notifications(window, cx),
             CommandId::SelectNextAttentionSession => {
                 self.sidebar
                     .update(cx, |sidebar, cx| sidebar.select_next_needing_input(cx));
@@ -2684,6 +2757,18 @@ impl RootView {
 
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.pending_notification_open.is_some()
+            && self
+                .services
+                .store
+                .store
+                .read()
+                .expect("store")
+                .has_hydrated_sessions()
+            && let Some((session, event)) = self.pending_notification_open.take()
+        {
+            self.open_notification(session, event, window, cx);
+        }
         let colors = self.colors();
         let recovery_notice = if self.preview {
             None
@@ -2697,7 +2782,29 @@ impl Render for RootView {
             RecoveryNotice::resolve(store.daemon_state(), store.action_failure())
         };
         let recovery_height = if recovery_notice.is_some() { 42.0 } else { 0.0 };
+        #[cfg(target_os = "macos")]
+        self.notifier.set_badge(
+            self.services
+                .store
+                .store
+                .read()
+                .expect("store")
+                .notifications()
+                .unread_count(),
+        );
         let launcher_open = self.launcher.read(cx).is_open();
+        let notification_surface_visible = !launcher_open
+            && !self.notification_panel_open
+            && !self
+                .utility_surfaces
+                .as_ref()
+                .is_some_and(|surfaces| surfaces.read(cx).is_open());
+        self.services
+            .store
+            .store
+            .write()
+            .expect("store")
+            .set_notification_surface_visible(notification_surface_visible);
         let sidebar_visible = self.sidebar.read(cx).is_visible();
         let sidebar_width = self.sidebar.read(cx).width();
         let window_width = f32::from(window.inner_window_bounds().get_bounds().size.width);
@@ -2784,6 +2891,11 @@ impl Render for RootView {
             .on_action(cx.listener(|this, _: &ToggleQuickOpen, window, cx| {
                 this.run_command(CommandId::ToggleQuickOpen, window, cx);
             }))
+            .on_action(cx.listener(
+                |this, _: &crate::commands::ToggleNotifications, window, cx| {
+                    this.toggle_notifications(window, cx);
+                },
+            ))
             .on_action(cx.listener(|this, _: &ToggleHistory, window, cx| {
                 this.run_command(CommandId::ToggleHistory, window, cx);
             }))
@@ -2985,6 +3097,9 @@ impl Render for RootView {
         }
         if let Some(picker) = self.quote_target_picker(colors, sidebar_width, cx) {
             root = root.child(deferred(picker));
+        }
+        if let Some(panel) = self.notification_panel(colors, window, cx) {
+            root = root.child(deferred(panel));
         }
         if let Some(status) = self.status_banner(colors, cx) {
             root = root.child(status);

@@ -11,6 +11,7 @@ use crate::switcher::display_title;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TrailingStatus {
     NeedsYou,
+    Unread,
     Done,
     Zzz,
 }

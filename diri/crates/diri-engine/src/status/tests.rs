@@ -434,7 +434,7 @@ fn a_notification_asking_a_question_needs_input() {
 
     let outcome = reducer.reduce(
         hook(ClaudeHook::Notification {
-            notification_type: Some("idle_prompt".into()),
+            notification_type: Some("agent_needs_input".into()),
             message: Some("Waiting for your answer".into()),
         }),
         now,
@@ -473,7 +473,7 @@ fn codex_turn_complete_then_a_tick_settles_to_idle() {
 }
 
 #[test]
-fn late_codex_output_rearms_working_without_completing_twice() {
+fn late_codex_output_keeps_completion_without_completing_twice() {
     let mut reducer = StatusReducer::new(Authority::ScreenPrimary, t0());
     let now = settled(&mut reducer, t0());
     reducer.reduce(
@@ -503,7 +503,7 @@ fn late_codex_output_rearms_working_without_completing_twice() {
         StatusSignal::PtyOutputActivity,
         completed_at + Duration::from_secs(6),
     );
-    assert_eq!(continuing.status_change, Some(SessionStatus::Working));
+    assert_eq!(continuing.status_change, None);
     assert!(!continuing.turn_completed);
 
     reducer.reduce(
@@ -514,7 +514,7 @@ fn late_codex_output_rearms_working_without_completing_twice() {
         StatusSignal::Tick,
         completed_at + Duration::from_secs(7) + Duration::from_millis(100),
     );
-    assert_eq!(settled_again.status_change, Some(SessionStatus::Idle));
+    assert_eq!(settled_again.status_change, None);
     assert!(
         !settled_again.turn_completed,
         "rearming the same logical turn must not notify twice"
@@ -674,4 +674,123 @@ fn cursor_transcript_idle_commits_even_when_the_osc_still_says_working() {
     now += Duration::from_millis(100);
     reducer.reduce(StatusSignal::CursorTranscriptWorking, now);
     assert_eq!(*reducer.status(), SessionStatus::Working);
+}
+
+#[test]
+fn idle_reminder_does_not_turn_a_finished_agent_into_a_question() {
+    let mut reducer = StatusReducer::new(Authority::HooksPrimary, t0());
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(hook(ClaudeHook::UserPromptSubmit), now);
+    reducer.reduce(hook(ClaudeHook::Stop), now + Duration::from_millis(10));
+    reducer.reduce(StatusSignal::Tick, now + Duration::from_millis(100));
+    reducer.reduce(
+        hook(ClaudeHook::Notification {
+            notification_type: Some("idle_prompt".into()),
+            message: Some("Claude is waiting for your input".into()),
+        }),
+        now + Duration::from_secs(60),
+    );
+    assert_eq!(*reducer.status(), SessionStatus::Idle);
+}
+
+#[test]
+fn stop_resolves_a_stale_permission_and_completes_the_turn() {
+    let mut reducer = StatusReducer::new(Authority::HooksPrimary, t0());
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(hook(ClaudeHook::UserPromptSubmit), now);
+    reducer.reduce(
+        hook(ClaudeHook::PermissionRequest {
+            tool_name: None,
+            input_summary: None,
+        }),
+        now,
+    );
+    let stopped = reducer.reduce(hook(ClaudeHook::Stop), now + Duration::from_secs(1));
+    let tick = reducer.reduce(StatusSignal::Tick, now + Duration::from_secs(2));
+    assert_eq!(*reducer.status(), SessionStatus::Idle);
+    assert!(stopped.turn_completed || tick.turn_completed);
+}
+
+#[test]
+fn redraw_after_codex_completion_does_not_invent_work() {
+    let mut reducer = StatusReducer::new(Authority::ScreenPrimary, t0());
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::Working, 1)),
+        now,
+    );
+    reducer.reduce(StatusSignal::CodexTurnComplete, now);
+    reducer.reduce(StatusSignal::Tick, now + Duration::from_millis(100));
+    reducer.reduce(
+        StatusSignal::PtyOutputActivity,
+        now + Duration::from_secs(6),
+    );
+    assert_eq!(*reducer.status(), SessionStatus::Idle);
+}
+
+#[test]
+fn a_completed_claude_turn_is_not_reopened_by_a_stale_working_title() {
+    let mut reducer = StatusReducer::new(Authority::HooksPrimary, t0());
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(hook(ClaudeHook::UserPromptSubmit), now);
+    reducer.reduce(hook(ClaudeHook::Stop), now);
+    reducer.reduce(StatusSignal::Tick, now + Duration::from_millis(100));
+    reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::Working, 2)),
+        now + Duration::from_secs(1),
+    );
+    assert_eq!(*reducer.status(), SessionStatus::Idle);
+    reducer.reduce(
+        hook(ClaudeHook::UserPromptSubmit),
+        now + Duration::from_secs(2),
+    );
+    assert_eq!(*reducer.status(), SessionStatus::Working);
+}
+
+#[test]
+fn a_quiet_screen_completes_once_without_waiting_for_more_redraws() {
+    let mut reducer = StatusReducer::new(Authority::ScreenPrimary, t0());
+    reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::Working, 1)),
+        t0(),
+    );
+    reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::Idle, 2)),
+        t0() + Duration::from_secs(1),
+    );
+    assert_eq!(reducer.status(), &SessionStatus::Working);
+    let completed = reducer.reduce(StatusSignal::Tick, t0() + Duration::from_secs(2));
+    assert!(completed.turn_completed);
+    assert_eq!(reducer.status(), &SessionStatus::Idle);
+    assert!(
+        !reducer
+            .reduce(
+                StatusSignal::CodexTurnComplete,
+                t0() + Duration::from_secs(3)
+            )
+            .turn_completed
+    );
+}
+
+#[test]
+fn a_recent_work_hook_outranks_an_idle_prompt_during_a_tool_call() {
+    let mut reducer = StatusReducer::new(Authority::HooksPrimary, t0());
+    reducer.reduce(hook(ClaudeHook::UserPromptSubmit), t0());
+    for seq in 1..5 {
+        reducer.reduce(
+            StatusSignal::Screen(observation(ManifestState::Idle, seq)),
+            t0() + Duration::from_millis(seq * 200),
+        );
+    }
+    assert_eq!(reducer.status(), &SessionStatus::Working);
+    assert!(
+        !reducer
+            .reduce(StatusSignal::Tick, t0() + Duration::from_secs(2))
+            .turn_completed
+    );
+    assert!(
+        reducer
+            .reduce(hook(ClaudeHook::Stop), t0() + Duration::from_secs(3))
+            .turn_completed
+    );
 }
