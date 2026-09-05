@@ -6111,8 +6111,6 @@ impl Render for Sidebar {
             .flex_col()
             .text_color(colors.primary)
             .bg(Self::surface_fill(colors))
-            .border_r_1()
-            .border_color(colors.sidebar_stroke())
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_up_out(
@@ -6172,6 +6170,16 @@ impl Render for Sidebar {
             root = root.child(feedback);
         }
         root = root.child(self.account_footer(colors, cx));
+        // Paint the edge without reducing the shared sidebar content width.
+        root = root.child(
+            div()
+                .absolute()
+                .right_0()
+                .top_0()
+                .bottom_0()
+                .w(px(1.0))
+                .bg(colors.sidebar_stroke()),
+        );
         if let Some(popover) = self.popover(colors, window, cx) {
             root = root.child(popover);
         }
