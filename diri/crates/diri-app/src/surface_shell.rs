@@ -6270,6 +6270,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn seed_history(surfaces: &mut UtilitySurfaces) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
