@@ -630,6 +630,11 @@ confirmed Rust Engine whose hash differs from the bundled executable is upgraded
 without abandoning live Holder/Agent state, ensuring subsequent remote actions
 use the current Helper catalog.
 
+An inherited `DIRIJOR_SOCKET` equal to the app's ordinary socket does not bypass
+this startup verification: Agents launched by Diri inherit that path, and an
+app started from their environment must still refresh an outdated Engine.
+Only a different, explicitly supplied socket skips app-owned supervision.
+
 ## Tailscale, iPhone Companion, and `diri-node`
 
 These features are separate from Remote Holder transport:
