@@ -74,16 +74,24 @@ pub(super) struct DeferredDaemonStartup {
 impl DeferredDaemonStartup {
     /// Plans app-owned Engine supervision from the current process layout.
     ///
-    /// A harness that supplied `DIRIJOR_SOCKET` owns its daemon lifecycle, so
-    /// there is no deferred work and the client may connect immediately.
+    /// A harness using a custom `DIRIJOR_SOCKET` owns its daemon lifecycle.
+    /// The ordinary socket may also be inherited from an Agent launched by
+    /// Diri; that must still verify and refresh the bundled Engine.
     pub(super) fn for_process() -> Option<Self> {
-        if std::env::var_os(ENV_SOCKET).is_some() {
-            return None;
-        }
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         let socket_path = DirijorPaths::socket(home);
+        Self::for_socket(
+            socket_path,
+            std::env::var_os(ENV_SOCKET).map(PathBuf::from).as_deref(),
+        )
+    }
+
+    fn for_socket(socket_path: PathBuf, socket_override: Option<&Path>) -> Option<Self> {
+        if socket_override.is_some_and(|path| path != socket_path) {
+            return None;
+        }
         let release_socket = socket_path.clone();
         Some(Self {
             socket_path,
@@ -1369,6 +1377,21 @@ mod tests {
     }
 
     #[test]
+    fn inherited_default_socket_still_supervises_the_engine() {
+        let socket = PathBuf::from("/fixture/Dirijor/daemon.sock");
+        assert!(DeferredDaemonStartup::for_socket(socket.clone(), Some(&socket)).is_some());
+    }
+
+    #[test]
+    fn custom_socket_remains_externally_managed() {
+        let socket = PathBuf::from("/fixture/Dirijor/daemon.sock");
+        assert!(
+            DeferredDaemonStartup::for_socket(socket, Some(Path::new("/fixture/harness.sock")),)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn an_outdated_live_daemon_is_replaced_by_the_resolved_bundle() {
         let tmp = tempfile::tempdir().unwrap();
         let socket = tmp.path().join("daemon.sock");
@@ -1397,7 +1420,9 @@ mod tests {
             ],
         );
 
-        ensure_daemon_running_with(&socket, Some(daemon), None);
+        let startup = DeferredDaemonStartup::for_socket(socket.clone(), Some(&socket))
+            .expect("an inherited ordinary socket must not bypass the upgrade");
+        ensure_daemon_running_with(&startup.socket_path, Some(daemon), None);
         assert_eq!(
             server.join().expect("fixture server"),
             vec![Method::HELLO, Method::DAEMON_SHUTDOWN]

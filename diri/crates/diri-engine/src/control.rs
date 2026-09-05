@@ -3926,6 +3926,14 @@ mod tests {
     }
 
     #[test]
+    fn account_profiles_list_is_available_to_settings() {
+        let temp = tempfile::tempdir().expect("temp");
+        let server = server(temp.path());
+        let result = ok_of(call(&server, "account.profiles.list", None));
+        assert_eq!(result["profiles"], json!([]));
+    }
+
+    #[test]
     fn hello_reports_the_protocol_and_the_engine_build() {
         let temp = tempfile::tempdir().expect("temp");
         let server = server(temp.path());
