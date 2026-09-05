@@ -375,6 +375,22 @@ fn terminal_paste(text: &str, bracketed_paste: bool) -> Vec<u8> {
     paste(text, bracketed_paste)
 }
 
+/// Claude recognizes dropped image paths in its bracketed-paste handler.
+/// A recovered local screen can miss DECSET 2004 when checkpoint recovery
+/// falls back to a bounded log tail (Claude usually enables it only at startup).
+/// Its direct-launch session kind guarantees the recipient supports framing;
+/// shell and unknown sessions must still use only their negotiated mode.
+fn terminal_file_paste(
+    text: &str,
+    bracketed_paste: bool,
+    kind: Option<&ProtoAgentKind>,
+) -> Vec<u8> {
+    terminal_paste(
+        text,
+        bracketed_paste || kind == Some(&ProtoAgentKind::CLAUDE_CODE),
+    )
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PointerOwner {
     LocalSelection,
@@ -1404,13 +1420,20 @@ impl TerminalPane {
         }
     }
 
-    /// Writes `text` to a resident session as one paste, honouring the
-    /// child's bracketed-paste mode exactly like Command-V does.
+    /// Writes dropped file paths to the target session's composer.
     fn paste_into_session(&self, id: &SessionId, text: &str) {
         if let Some(resident) = self.residents.get(id) {
+            let store = self
+                .runtime
+                .store
+                .read()
+                .expect("session store lock poisoned");
+            // Use the declared direct-launch kind, not foreground detection:
+            // a detected Claude inside a shell can return to that shell.
+            let kind = store.sessions().get(id).map(|session| &session.kind);
             resident
                 .attachment
-                .input(terminal_paste(text, resident.bracketed_paste));
+                .input(terminal_file_paste(text, resident.bracketed_paste, kind));
         }
     }
 
@@ -5453,6 +5476,44 @@ mod tests {
             terminal_paste(text, true),
             b"\x1b[200~first command\nsecond command\x1b[201~"
         );
+    }
+
+    #[test]
+    fn claude_image_drop_is_a_paste_even_when_recovered_modes_are_missing() {
+        let directory = tempfile::tempdir().expect("drop fixture");
+        let path = directory
+            .path()
+            .join("CleanShot 2026-09-05 at 9\u{202f}.40.35@2x.png");
+        std::fs::write(&path, b"image fixture").expect("write fixture");
+        let plan = plan_terminal_drop(std::slice::from_ref(&path), false);
+        let Some(TerminalDropAction::Paste(text)) = plan.action else {
+            panic!("a readable local image must reach the terminal");
+        };
+        let expected = paste(&terminal_drop_text([path.to_str().unwrap()]), true);
+        for reported_mode in [false, true] {
+            assert_eq!(
+                terminal_file_paste(&text, reported_mode, Some(&ProtoAgentKind::CLAUDE_CODE)),
+                expected,
+                "Claude attaches images only on its paste path, including after bounded log recovery"
+            );
+        }
+    }
+
+    #[test]
+    fn other_file_drop_targets_keep_their_negotiated_paste_mode() {
+        let text = terminal_drop_text(["/tmp/Screen Shot.png", "/tmp/notes.txt"]);
+        for kind in [
+            None,
+            Some(&ProtoAgentKind::SHELL),
+            Some(&ProtoAgentKind::CODEX),
+        ] {
+            for reported_mode in [false, true] {
+                assert_eq!(
+                    terminal_file_paste(&text, reported_mode, kind),
+                    paste(&text, reported_mode),
+                );
+            }
+        }
     }
 
     #[test]
