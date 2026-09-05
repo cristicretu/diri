@@ -105,13 +105,16 @@ const ANCHOR_SLACK: f32 = 1.0;
 const PARKED_GRID_CAP: usize = 12;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalPaneEvent {
+    ContinueAccount(SessionId),
     OpenFileReference {
         reference: String,
         cwd: String,
         session_id: SessionId,
     },
     /// Files were dropped on the grid and some (or all) could not be used.
-    ExternalDropFeedback { message: String },
+    ExternalDropFeedback {
+        message: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,6 +141,21 @@ pub struct PaneChip {
 impl PaneChip {
     pub fn for_session(session: &SessionRecord) -> Vec<Self> {
         let mut result = Vec::new();
+        if let Some(profile) = &session.account_profile {
+            result.push(Self {
+                id: "account-profile".into(),
+                label: profile.label.clone(),
+                system_image: "account.circle",
+                open_url: None,
+                copy_string: profile.label.clone(),
+                tint: None,
+                help: format!(
+                    "Launch account: {} · {}",
+                    profile.label, profile.config_home
+                ),
+                checks: None,
+            });
+        }
         let artifacts = session.artifacts.as_deref().unwrap_or_default();
         let statuses = session.pull_requests.as_deref().unwrap_or_default();
         let pull_requests = artifacts
@@ -1668,6 +1686,15 @@ impl TerminalPane {
         }
     }
 
+    fn open_account_continuation(&self, cx: &mut Context<Self>) {
+        if let Some(session) = self.selected_session()
+            && session.kind == diri_proto::AgentKind::CLAUDE_CODE
+            && session.agent_session_id.is_some()
+        {
+            cx.emit(TerminalPaneEvent::ContinueAccount(session.id.clone()));
+        }
+    }
+
     fn selected_session(&self) -> Option<Arc<SessionRecord>> {
         let id = self.selected_id()?;
         self.runtime
@@ -2779,6 +2806,8 @@ impl TerminalPane {
                     cx.write_to_clipboard(ClipboardItem::new_string(
                         activation.copy_string.clone(),
                     ));
+                } else if activation.id == "account-profile" {
+                    this.open_account_continuation(cx);
                 } else if activation.checks.is_some() {
                     this.open_checks_for = if this.open_checks_for.as_ref() == Some(&activation.id)
                     {
@@ -3409,7 +3438,9 @@ impl TerminalPane {
                     ))
                     .child(div().min_w(px(0.0)).flex_1().truncate().child(chip.label))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if checks {
+                        if chip_id == "account-profile" {
+                            this.open_account_continuation(cx);
+                        } else if checks {
                             this.open_checks_for = Some(chip_id.clone());
                         } else if let Some(url) = url.as_deref() {
                             cx.open_url(url);

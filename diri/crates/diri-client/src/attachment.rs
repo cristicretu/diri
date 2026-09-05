@@ -519,6 +519,7 @@ mod tests {
             initial_cols: None,
             initial_rows: None,
             host: None,
+            account_profile_id: None,
             same_repo_as: None,
         };
         let session: SessionRecord = control.request(Method::SESSION_SPAWN, &spawn).await?;

@@ -46,6 +46,7 @@ impl IconSize {
 /// catalog and lets the whole app evolve as one visual system.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum IconName {
+    Account,
     Activity,
     Archive,
     ArrowDown,
@@ -99,7 +100,8 @@ pub enum IconName {
 }
 
 impl IconName {
-    pub const ALL: [Self; 50] = [
+    pub const ALL: [Self; 51] = [
+        Self::Account,
         Self::Activity,
         Self::Archive,
         Self::ArrowDown,
@@ -154,6 +156,7 @@ impl IconName {
 
     pub const fn asset_path(self) -> &'static str {
         match self {
+            Self::Account => "icons/account.svg",
             Self::Activity => "icons/activity.svg",
             Self::Archive => "icons/archive.svg",
             Self::ArrowDown => "icons/arrow-down.svg",
@@ -236,6 +239,7 @@ impl IconName {
             "square.grid.2x2" | "terminal.grid" => Self::Grid,
             "keyboard" => Self::Keyboard,
             "person.crop.circle" => Self::LocalAgents,
+            "account.circle" => Self::Account,
             "arrow.triangle.merge" => Self::Merge,
             "desktopcomputer" => Self::Monitor,
             "moon.fill" => Self::Moon,
@@ -320,6 +324,7 @@ impl AssetSource for IconAssets {
 
 fn embedded_svg(path: &str) -> Option<&'static [u8]> {
     Some(match path {
+        "icons/account.svg" => include_bytes!("../assets/icons/account.svg"),
         "icons/activity.svg" => include_bytes!("../assets/icons/activity.svg"),
         "icons/archive.svg" => include_bytes!("../assets/icons/archive.svg"),
         "icons/arrow-down.svg" => include_bytes!("../assets/icons/arrow-down.svg"),

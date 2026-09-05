@@ -403,6 +403,7 @@ mod tests {
             git_branch: Some(id.to_owned()),
             title: id.to_owned(),
             title_source: TitleSource::UserRename,
+            account_profile: None,
             originating_prompt: Some(format!("Implement {id}")),
             agent_session_id: Some(format!("agent-{id}")),
             transcript_path: None,

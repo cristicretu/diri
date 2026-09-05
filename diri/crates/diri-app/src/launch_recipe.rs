@@ -26,6 +26,8 @@ static LAUNCH_NONCE: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LaunchRecipe {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_profile_id: Option<String>,
     pub id: String,
     pub name: String,
     pub agent: AgentKind,
@@ -340,6 +342,7 @@ impl LaunchRecipe {
         initial_prompt: impl Into<String>,
     ) -> Self {
         let mut recipe = Self {
+            account_profile_id: None,
             id: String::new(),
             name: name.into(),
             agent,
@@ -375,6 +378,7 @@ impl LaunchRecipe {
         Ok(ResolvedRecipe {
             kind: self.agent.clone(),
             options: SpawnOptions {
+                account_profile_id: self.account_profile_id.clone(),
                 cwd: Some(cwd),
                 host: self.host.clone(),
                 worktree,
@@ -486,6 +490,7 @@ pub struct ResolvedRecipe {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecipeIssue {
+    AccountUnavailable,
     EmptyPrompt,
     MissingHost(String),
     MissingProject(ProjectId),
@@ -504,6 +509,10 @@ pub enum RecipeIssue {
 impl RecipeIssue {
     pub fn message(&self) -> String {
         match self {
+            Self::AccountUnavailable => {
+                "Account profile is unavailable on this Agent or host — choose an account"
+                    .to_owned()
+            }
             Self::EmptyPrompt => "Add an initial prompt to repair this recipe".to_owned(),
             Self::MissingHost(host) => format!("Host ‘{host}’ is missing — choose a new host"),
             Self::MissingProject(_) => "Project is missing — choose a new project".to_owned(),
@@ -796,6 +805,7 @@ mod tests {
                 initial_cols: None,
                 initial_rows: None,
                 host: None,
+                account_profile_id: None,
                 same_repo_as: None,
             })
         );

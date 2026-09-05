@@ -44,6 +44,7 @@ pub enum SettingsTab {
     #[default]
     General,
     Agents,
+    Accounts,
     Shortcuts,
     Terminal,
     Usage,
@@ -53,9 +54,10 @@ pub enum SettingsTab {
 }
 
 impl SettingsTab {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::General,
         Self::Agents,
+        Self::Accounts,
         Self::Shortcuts,
         Self::Terminal,
         Self::Usage,
@@ -68,6 +70,7 @@ impl SettingsTab {
         match self {
             Self::General => "General",
             Self::Agents => "Agents",
+            Self::Accounts => "Accounts",
             Self::Shortcuts => "Shortcuts",
             Self::Terminal => "Appearance",
             Self::Usage => "Usage",
@@ -81,6 +84,7 @@ impl SettingsTab {
         match self {
             Self::General => "Startup, sessions, and updates",
             Self::Agents => "Installed CLIs and quick create",
+            Self::Accounts => "Profiles for work and personal accounts",
             Self::Shortcuts => "Keyboard commands and bindings",
             Self::Terminal => "Themes and terminal type",
             Self::Usage => "Costs, tokens, and cache savings",
@@ -94,9 +98,12 @@ impl SettingsTab {
     /// describe the machines and resources sessions run on.
     pub const fn section(self) -> SettingsSection {
         match self {
-            Self::General | Self::Agents | Self::Shortcuts | Self::Terminal | Self::Usage => {
-                SettingsSection::Personal
-            }
+            Self::General
+            | Self::Agents
+            | Self::Accounts
+            | Self::Shortcuts
+            | Self::Terminal
+            | Self::Usage => SettingsSection::Personal,
             Self::Resources | Self::Remote | Self::Phone => SettingsSection::System,
         }
     }
@@ -105,6 +112,7 @@ impl SettingsTab {
         match self {
             Self::General => "gearshape",
             Self::Agents => "sparkles",
+            Self::Accounts => "account.circle",
             Self::Shortcuts => "keyboard",
             Self::Terminal => "terminal",
             Self::Usage => "chart.bar.xaxis",

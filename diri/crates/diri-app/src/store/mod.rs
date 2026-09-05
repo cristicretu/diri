@@ -235,6 +235,7 @@ pub struct WorktreeSpawn {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SpawnOptions {
+    pub account_profile_id: Option<String>,
     pub cwd: Option<String>,
     pub worktree: Option<WorktreeSpawn>,
     pub title: Option<String>,
@@ -2011,6 +2012,7 @@ impl SessionStore {
             initial_cols: None,
             initial_rows: None,
             host: session.host.clone(),
+            account_profile_id: None,
             same_repo_as: None,
         }));
         true
@@ -2050,6 +2052,7 @@ impl SessionStore {
             initial_cols: options.initial_cols,
             initial_rows: options.initial_rows,
             host,
+            account_profile_id: options.account_profile_id,
             same_repo_as: options.same_repo_as,
         }));
     }

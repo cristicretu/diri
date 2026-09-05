@@ -1661,7 +1661,11 @@ impl Session {
                 // The holder escalates TERM → KILL itself; wait for the exit
                 // marker to land in the log so the recorded exit is the real
                 // one.
-                let _ = client.kill_tree();
+                if let Err(error) = client.kill_tree()
+                    && !self.shared.exited.load(Ordering::SeqCst)
+                {
+                    return Err(holder_io_error(error));
+                }
                 let deadline = std::time::Instant::now() + grace + Duration::from_secs(1);
                 while std::time::Instant::now() < deadline {
                     if self.shared.exited.load(Ordering::SeqCst) {
@@ -1669,11 +1673,12 @@ impl Session {
                     }
                     std::thread::sleep(Duration::from_millis(20));
                 }
-                self.shared
-                    .exit
-                    .lock()
-                    .expect("exit")
-                    .unwrap_or(Exit::Signal(libc::SIGKILL))
+                self.shared.exit.lock().expect("exit").ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Holder did not confirm Agent exit; the session remains tracked",
+                    )
+                })?
             }
             Transport::Remote(client) => {
                 if !self.shared.exited.load(Ordering::SeqCst) {

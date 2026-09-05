@@ -283,7 +283,14 @@ impl RootView {
             });
         }
         if let Some(terminal) = &terminal {
-            cx.subscribe(terminal, |this, _, event, cx| match event {
+            cx.subscribe_in(terminal, window, |this, _, event, window, cx| match event {
+                TerminalPaneEvent::ContinueAccount(id) => {
+                    if let Some(surfaces) = &this.utility_surfaces {
+                        surfaces.update(cx, |surfaces, cx| {
+                            surfaces.open_account_continuation(id.clone(), window, cx)
+                        });
+                    }
+                }
                 TerminalPaneEvent::OpenFileReference { reference, cwd, .. } => {
                     let inspector = this.inspector.clone();
                     this.reveal_inspector(cx);
@@ -300,6 +307,13 @@ impl RootView {
             .detach();
         }
         cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
+            if let SidebarEvent::ContinueAccount(id) = event
+                && let Some(surfaces) = &this.utility_surfaces
+            {
+                surfaces.update(cx, |surfaces, cx| {
+                    surfaces.open_account_continuation(id.clone(), window, cx)
+                });
+            }
             if let SidebarEvent::HandoffProposed(proposal) = event {
                 this.launcher.update(cx, |launcher, cx| {
                     launcher.open_handoff(proposal.clone(), window, cx);
@@ -412,6 +426,17 @@ impl RootView {
             &launcher,
             window,
             |this, _, event: &LauncherEvent, window, cx| {
+                if matches!(event, LauncherEvent::ManageAccounts)
+                    && let Some(surfaces) = &this.utility_surfaces
+                {
+                    surfaces.update(cx, |surfaces, cx| {
+                        surfaces.open_settings(cx);
+                        surfaces.open_settings_tab(crate::settings::SettingsTab::Accounts, cx);
+                        surfaces.focus_handle(cx).focus(window, cx);
+                    });
+                    cx.notify();
+                    return;
+                }
                 if let LauncherEvent::ManageAgents(host) = event
                     && let Some(surfaces) = &this.utility_surfaces
                 {

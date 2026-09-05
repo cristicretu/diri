@@ -13,10 +13,12 @@ use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::query_label;
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
 use crate::settings::{HostDraft, SettingsNav, SettingsTab, theme};
+mod account_settings;
 use crate::sidebar::DraggedSidebarItem;
 use crate::store::{Prefs, SessionStore, StoreRuntime};
 use crate::updates::{UpdateCommand, UpdateHandle, UpdatePhase};
 use crate::worktrees::WorktreesSheet;
+use account_settings::AccountsState;
 use diri_proto::{AgentKind as ProtoAgentKind, HistoryEntry, HostEntry, HostsConfig};
 use diri_term::theme::{TermTheme, ThemeAppearance};
 use diri_ui::{
@@ -251,6 +253,7 @@ impl HostEditor {
 }
 
 pub struct UtilitySurfaces {
+    accounts: AccountsState,
     phone_access: Option<crate::phone_access::PhoneAccess>,
     phone_loading: bool,
     phone_error: Option<String>,
@@ -329,6 +332,7 @@ impl UtilitySurfaces {
         let settings_tab = match settings_preview.as_deref() {
             Some("terminal" | "appearance") => SettingsTab::Terminal,
             Some("agents") => SettingsTab::Agents,
+            Some("accounts") => SettingsTab::Accounts,
             Some("shortcuts") => SettingsTab::Shortcuts,
             Some("resources") => SettingsTab::Resources,
             Some("remote") => SettingsTab::Remote,
@@ -375,6 +379,7 @@ impl UtilitySurfaces {
         };
         Self {
             focus,
+            accounts: AccountsState::default(),
             phone_access: None,
             phone_loading: false,
             phone_error: None,
@@ -1118,6 +1123,7 @@ impl UtilitySurfaces {
             self.worktrees.cancel_move();
         } else {
             self.surface = Surface::None;
+            self.clear_account_continuation();
             self.settings_menu = None;
             self.host_editor = None;
             self.agent_path_editor = None;
@@ -1218,10 +1224,16 @@ impl UtilitySurfaces {
     }
 
     fn select_settings_tab(&mut self, tab: SettingsTab, cx: &mut Context<Self>) {
+        if tab != SettingsTab::Accounts {
+            self.clear_account_continuation();
+        }
         if self.settings_tab != tab {
             self.settings_scroll.set_offset(point(px(0.0), px(0.0)));
         }
         self.settings_tab = tab;
+        if tab == SettingsTab::Accounts {
+            self.refresh_accounts(cx);
+        }
         self.settings_search_active = false;
         self.settings_menu = None;
         self.host_editor = None;
@@ -1526,7 +1538,10 @@ impl UtilitySurfaces {
             cx.stop_propagation();
             return;
         }
-        if self.handle_agent_path_key(event, cx) || self.handle_host_editor_key(event, cx) {
+        if self.handle_account_key(event, cx)
+            || self.handle_agent_path_key(event, cx)
+            || self.handle_host_editor_key(event, cx)
+        {
             return;
         }
         if self.handle_settings_search_key(event, cx) {
@@ -2189,6 +2204,7 @@ impl UtilitySurfaces {
         let pane = match self.settings_tab {
             SettingsTab::General => self.general_settings(cx).into_any_element(),
             SettingsTab::Agents => self.agents_settings(cx).into_any_element(),
+            SettingsTab::Accounts => self.accounts_settings(cx).into_any_element(),
             SettingsTab::Shortcuts => self.shortcuts_settings(cx).into_any_element(),
             SettingsTab::Terminal => self.terminal_settings(cx).into_any_element(),
             SettingsTab::Resources => self.resource_settings(cx).into_any_element(),
@@ -5392,6 +5408,9 @@ fn settings_tab_matches(tab: SettingsTab, query: &str) -> bool {
         SettingsTab::Agents => {
             "agents codex claude cursor gemini executable installed command line quick create default"
         }
+        SettingsTab::Accounts => {
+            "accounts profiles work personal login authentication codex claude default config home"
+        }
         SettingsTab::Shortcuts => {
             "shortcuts keyboard bindings hotkeys commands keys navigation sessions workspace terminal"
         }
@@ -6444,6 +6463,7 @@ mod tests {
             Ok("shortcuts") => SettingsTab::Shortcuts,
             Ok("general") => SettingsTab::General,
             Ok("agents") => SettingsTab::Agents,
+            Ok("accounts") => SettingsTab::Accounts,
             Ok("terminal") => SettingsTab::Terminal,
             Ok("resources") => SettingsTab::Resources,
             _ => SettingsTab::Remote,
@@ -6776,6 +6796,14 @@ mod tests {
                 );
                 surfaces.open_settings(cx);
                 surfaces.settings_tab = tab;
+                if tab == SettingsTab::Accounts {
+                    surfaces.seed_account_preview(
+                        std::env::var_os("DIRI_VISUAL_ACCOUNT_EDITOR").is_some(),
+                    );
+                    if std::env::var_os("DIRI_VISUAL_ACCOUNT_HANDOFF").is_some() {
+                        surfaces.seed_account_handoff_preview();
+                    }
+                }
                 surfaces
             });
             // RootView re-renders on the sidebar's own events; this harness
