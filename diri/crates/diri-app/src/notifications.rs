@@ -10,6 +10,7 @@ use diri_proto::{
     SessionRecord,
 };
 
+#[cfg(target_os = "macos")]
 pub const OPEN_ACTION_ID: &str = "open-session";
 #[cfg(test)]
 pub const APPROVE_ACTION_ID: &str = "approve";
