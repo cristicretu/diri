@@ -874,6 +874,9 @@ pub struct TerminalPane {
     reflow_holds: HashMap<SessionId, ReflowHold>,
     started_at: Instant,
     session_source: SessionSource,
+    suspended: bool,
+    select_on_focus: bool,
+    workbench_primary: bool,
     /// Last selection observed by the primary pane. Spawn responses select the
     /// daemon-created id asynchronously, so this transition is also the
     /// reliable point at which keyboard focus can leave the picker.
@@ -1000,6 +1003,9 @@ impl TerminalPane {
             started_at: Instant::now(),
             session_source,
             observed_selected_id,
+            suspended: false,
+            select_on_focus: false,
+            workbench_primary: false,
             viewport: None,
             sidebar_visible: true,
             inspector_open: false,
@@ -1020,14 +1026,22 @@ impl TerminalPane {
             .store
             .read()
             .expect("session store lock poisoned");
-        let resident_ids: HashSet<_> = match &self.session_source {
-            SessionSource::FollowSelection => {
-                store.terminal_residency().resident().cloned().collect()
+        let owned_by_split = matches!(self.session_source, SessionSource::FollowSelection)
+            && store
+                .selected_session_id()
+                .is_some_and(|id| store.preferences().split_layouts.containing(id).is_some());
+        let resident_ids: HashSet<_> = if self.suspended || owned_by_split {
+            HashSet::new()
+        } else {
+            match &self.session_source {
+                SessionSource::FollowSelection => {
+                    store.terminal_residency().resident().cloned().collect()
+                }
+                SessionSource::Fixed(id) if store.sessions().contains_key(id) => {
+                    HashSet::from([id.clone()])
+                }
+                SessionSource::Fixed(_) => HashSet::new(),
             }
-            SessionSource::Fixed(id) if store.sessions().contains_key(id) => {
-                HashSet::from([id.clone()])
-            }
-            SessionSource::Fixed(_) => HashSet::new(),
         };
         // A parked grid for a session the store no longer lists is dead
         // weight; one for a session that just became resident is superseded
@@ -1134,7 +1148,17 @@ impl TerminalPane {
         // successful spawns select their daemon-assigned id on the async store
         // path. Following the selection here covers both RPC/event orderings
         // and avoids trying to focus a terminal before its id exists.
-        if selection_changed && selected_id.is_some() {
+        let owned_by_split = selected_id.as_ref().is_some_and(|id| {
+            self.runtime
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .preferences()
+                .split_layouts
+                .containing(id)
+                .is_some()
+        });
+        if selection_changed && selected_id.is_some() && !self.suspended && !owned_by_split {
             window.focus(&self.focus, cx);
         }
         cx.notify();
@@ -1159,6 +1183,29 @@ impl TerminalPane {
 
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus, cx);
+    }
+
+    /// Transfers attachment ownership to/from a fixed-pane workbench. Suspended
+    /// panes never attach in response to selection or store changes.
+    pub fn set_suspended(&mut self, suspended: bool, cx: &mut Context<Self>) {
+        if self.suspended != suspended {
+            self.suspended = suspended;
+            if suspended {
+                self.pending_resizes.clear();
+                self.resize_flush = None;
+                self.resize_flush_armed = false;
+            }
+            self.reconcile_residency();
+            cx.notify();
+        }
+    }
+
+    pub fn set_workbench_primary(&mut self, primary: bool) {
+        self.workbench_primary = primary;
+    }
+
+    pub fn set_select_on_focus(&mut self) {
+        self.select_on_focus = true;
     }
 
     pub fn set_viewport(&mut self, viewport: TerminalViewport, cx: &mut Context<Self>) {
@@ -2603,7 +2650,8 @@ impl TerminalPane {
                 .host_display_name(host)
         });
         let kind = ui_agent_kind(session.effective_kind());
-        let shell_controls = matches!(self.session_source, SessionSource::FollowSelection);
+        let shell_controls =
+            matches!(self.session_source, SessionSource::FollowSelection) || self.workbench_primary;
         let show_sidebar = shell_controls && !self.sidebar_visible;
         let sidebar_reveal = show_sidebar.then(|| self.render_sidebar_reveal_control(colors, cx));
         let inspector_open = self.inspector_open;
@@ -2647,6 +2695,7 @@ impl TerminalPane {
             .h(px(Metrics::TITLE_BAR))
             .flex_none()
             .px(px(Metrics::TOOLBAR_EDGE_INSET))
+            .when(self.select_on_focus, |header| header.pr(px(86.0)))
             .flex()
             .items_center()
             .justify_between()
@@ -2871,12 +2920,13 @@ impl TerminalPane {
                 MouseButton::Left,
                 cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
                     window.focus(&this.focus, cx);
-                    if follows_selection {
+                    if follows_selection || this.select_on_focus {
                         this.runtime
                             .store
                             .write()
                             .expect("session store lock poisoned")
                             .select(id_for_focus.clone());
+                        this.runtime.publish_local_change();
                     }
                     this.handle_pointer_down(event, window, cx);
                 }),
@@ -5131,6 +5181,58 @@ mod tests {
             cx.debug_bounds("show-sidebar").is_some(),
             "collapsing the sidebar must leave a way to reveal it"
         );
+    }
+
+    #[gpui::test]
+    fn split_workbench_exclusively_owns_attachments_until_it_is_unmounted(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let first = fixture_session();
+        let mut second = first.clone();
+        second.id = SessionId::new("second-pane");
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(first.clone());
+            store.upsert_session(second.clone());
+            store.select(first.id.clone());
+            let mut layouts = crate::split_layout::SplitLayouts::default();
+            layouts.split(
+                first.id.clone(),
+                second.id.clone(),
+                crate::split_layout::SplitAxis::Right,
+            );
+            store.remember_split_layouts(layouts);
+        }
+        let shared = runtime.clone();
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(shared, tokio, window, cx));
+        pane.update_in(cx, |pane, window, cx| {
+            assert!(
+                pane.residents.is_empty(),
+                "the hidden following pane must not acquire a second controller on startup"
+            );
+            pane.set_suspended(true, cx);
+            runtime.store.write().unwrap().select(second.id.clone());
+            pane.reconcile_store_change(window, cx);
+            assert!(pane.residents.is_empty());
+            runtime
+                .store
+                .write()
+                .unwrap()
+                .remember_split_layouts(crate::split_layout::SplitLayouts::default());
+            pane.reconcile_store_change(window, cx);
+            assert!(
+                pane.residents.is_empty(),
+                "wait for the old fixed panes to drop before reacquiring their sessions"
+            );
+            pane.set_suspended(false, cx);
+            assert!(pane.residents.contains_key(&second.id));
+        });
     }
 
     #[gpui::test]

@@ -41,6 +41,15 @@ actions!(
         FocusSidebar,
         ToggleInspector,
         ToggleAuxiliaryTerminal,
+        SplitRight,
+        SplitBelow,
+        AddExistingPane,
+        FocusNextPane,
+        FocusPaneLeft,
+        FocusPaneRight,
+        FocusPaneUp,
+        FocusPaneDown,
+        ClosePane,
         QuoteSelection,
         QuoteSelectionToSession,
         ArchiveSelectedSession,
@@ -105,6 +114,15 @@ pub enum CommandId {
     FocusSidebar,
     ToggleInspector,
     ToggleAuxiliaryTerminal,
+    SplitRight,
+    SplitBelow,
+    AddExistingPane,
+    FocusNextPane,
+    FocusPaneLeft,
+    FocusPaneRight,
+    FocusPaneUp,
+    FocusPaneDown,
+    ClosePane,
     QuoteSelection,
     QuoteSelectionToSession,
     ArchiveSelectedSession,
@@ -368,6 +386,96 @@ pub const COMMANDS: &[CommandSpec] = &[
         Some("cmd-j"),
         Some("⌘J"),
         Some(APP_CONTEXT)
+    ),
+    spec!(
+        SplitRight,
+        "split-right",
+        Some("cmd-d"),
+        Some("⌘D"),
+        Some(APP_CONTEXT),
+        "Split Right",
+        "rectangle.split.2x1",
+        "pane split terminal focus workspace"
+    ),
+    spec!(
+        SplitBelow,
+        "split-below",
+        Some("cmd-alt-d"),
+        Some("⌥⌘D"),
+        Some(APP_CONTEXT),
+        "Split Below",
+        "rectangle.split.2x1",
+        "pane split terminal focus workspace"
+    ),
+    spec!(
+        AddExistingPane,
+        "add-existing-pane",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "Add Existing Session to Split",
+        "rectangle.split.2x1",
+        "pane split terminal focus workspace"
+    ),
+    spec!(
+        FocusNextPane,
+        "focus-next-pane",
+        Some("cmd-alt-tab"),
+        Some("⌥⌘⇥"),
+        Some(APP_CONTEXT),
+        "Focus Next Pane",
+        "rectangle.split.2x1",
+        "pane split terminal focus workspace"
+    ),
+    spec!(
+        FocusPaneLeft,
+        "focus-pane-left",
+        Some("cmd-alt-shift-left"),
+        Some("⇧⌥⌘←"),
+        Some(APP_CONTEXT),
+        "Focus Pane Left",
+        "rectangle.split.2x1",
+        "pane split terminal focus workspace"
+    ),
+    spec!(
+        FocusPaneRight,
+        "focus-pane-right",
+        Some("cmd-alt-shift-right"),
+        Some("⇧⌥⌘→"),
+        Some(APP_CONTEXT),
+        "Focus Pane Right",
+        "rectangle.split.2x1",
+        "pane split terminal focus workspace"
+    ),
+    spec!(
+        FocusPaneUp,
+        "focus-pane-up",
+        Some("cmd-alt-shift-up"),
+        Some("⇧⌥⌘↑"),
+        Some(APP_CONTEXT),
+        "Focus Pane Up",
+        "rectangle.split.2x1",
+        "pane split terminal focus workspace"
+    ),
+    spec!(
+        FocusPaneDown,
+        "focus-pane-down",
+        Some("cmd-alt-shift-down"),
+        Some("⇧⌥⌘↓"),
+        Some(APP_CONTEXT),
+        "Focus Pane Down",
+        "rectangle.split.2x1",
+        "pane split terminal focus workspace"
+    ),
+    spec!(
+        ClosePane,
+        "close-pane",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "Close Pane",
+        "rectangle.split.2x1",
+        "pane split terminal focus workspace"
     ),
     spec!(
         QuoteSelection,
@@ -720,6 +828,15 @@ impl CommandSpec {
             CommandId::ToggleAuxiliaryTerminal => {
                 KeyBinding::new(key, ToggleAuxiliaryTerminal, context)
             }
+            CommandId::SplitRight => KeyBinding::new(key, SplitRight, context),
+            CommandId::SplitBelow => KeyBinding::new(key, SplitBelow, context),
+            CommandId::AddExistingPane => KeyBinding::new(key, AddExistingPane, context),
+            CommandId::FocusNextPane => KeyBinding::new(key, FocusNextPane, context),
+            CommandId::FocusPaneLeft => KeyBinding::new(key, FocusPaneLeft, context),
+            CommandId::FocusPaneRight => KeyBinding::new(key, FocusPaneRight, context),
+            CommandId::FocusPaneUp => KeyBinding::new(key, FocusPaneUp, context),
+            CommandId::FocusPaneDown => KeyBinding::new(key, FocusPaneDown, context),
+            CommandId::ClosePane => KeyBinding::new(key, ClosePane, context),
             CommandId::QuoteSelection => KeyBinding::new(key, QuoteSelection, context),
             CommandId::QuoteSelectionToSession => {
                 KeyBinding::new(key, QuoteSelectionToSession, context)
@@ -1055,6 +1172,51 @@ impl CommandId {
                 description: "Show or hide the session inspector",
                 category: Workspace,
             },
+            Self::SplitRight => ShortcutMetadata {
+                title: "Split Right",
+                description: "Create a terminal to the right of the focused pane",
+                category: Workspace,
+            },
+            Self::SplitBelow => ShortcutMetadata {
+                title: "Split Below",
+                description: "Create a terminal below the focused pane",
+                category: Workspace,
+            },
+            Self::AddExistingPane => ShortcutMetadata {
+                title: "Add Existing Session to Split",
+                description: "Choose an existing session for this split workspace",
+                category: Workspace,
+            },
+            Self::FocusNextPane => ShortcutMetadata {
+                title: "Focus Next Pane",
+                description: "Move focus to the next terminal pane",
+                category: Workspace,
+            },
+            Self::FocusPaneLeft => ShortcutMetadata {
+                title: "Focus Pane Left",
+                description: "Move focus to the terminal pane on the left",
+                category: Workspace,
+            },
+            Self::FocusPaneRight => ShortcutMetadata {
+                title: "Focus Pane Right",
+                description: "Move focus to the terminal pane on the right",
+                category: Workspace,
+            },
+            Self::FocusPaneUp => ShortcutMetadata {
+                title: "Focus Pane Up",
+                description: "Move focus to the terminal pane above",
+                category: Workspace,
+            },
+            Self::FocusPaneDown => ShortcutMetadata {
+                title: "Focus Pane Down",
+                description: "Move focus to the terminal pane below",
+                category: Workspace,
+            },
+            Self::ClosePane => ShortcutMetadata {
+                title: "Close Pane",
+                description: "Remove the focused pane and keep its session running",
+                category: Workspace,
+            },
             Self::ToggleAuxiliaryTerminal => ShortcutMetadata {
                 title: "Toggle auxiliary terminal",
                 description: "Show or hide the lower terminal pane",
@@ -1160,6 +1322,16 @@ impl CommandId {
             Self::FocusSidebar => Box::new(FocusSidebar),
             Self::ToggleInspector => Box::new(ToggleInspector),
             Self::ToggleAuxiliaryTerminal => Box::new(ToggleAuxiliaryTerminal),
+            Self::SplitRight => Box::new(SplitRight),
+            Self::SplitBelow => Box::new(SplitBelow),
+            Self::AddExistingPane => Box::new(AddExistingPane),
+            Self::FocusNextPane => Box::new(FocusNextPane),
+            Self::FocusPaneLeft => Box::new(FocusPaneLeft),
+            Self::FocusPaneRight => Box::new(FocusPaneRight),
+            Self::FocusPaneUp => Box::new(FocusPaneUp),
+            Self::FocusPaneDown => Box::new(FocusPaneDown),
+            Self::ClosePane => Box::new(ClosePane),
+
             Self::QuoteSelection => Box::new(QuoteSelection),
             Self::QuoteSelectionToSession => Box::new(QuoteSelectionToSession),
             Self::ArchiveSelectedSession => Box::new(ArchiveSelectedSession),
@@ -1257,6 +1429,27 @@ mod tests {
         let picker = command(CommandId::QuoteSelectionToSession);
         assert_eq!(picker.keystroke, Some("cmd-alt-shift-c"));
         assert!(picker.palette.is_some());
+    }
+
+    #[test]
+    fn pane_shortcuts_do_not_shadow_session_navigation_or_other_defaults() {
+        for id in [
+            CommandId::SplitRight,
+            CommandId::SplitBelow,
+            CommandId::FocusNextPane,
+            CommandId::FocusPaneLeft,
+            CommandId::FocusPaneRight,
+            CommandId::FocusPaneUp,
+            CommandId::FocusPaneDown,
+        ] {
+            let spec = command(id);
+            let key = spec.keystroke.unwrap();
+            assert!(
+                !COMMANDS.iter().any(|other| other.id != id
+                    && (other.keystroke == Some(key) || other.alternate_keystrokes.contains(&key))),
+                "{key} shadows another command"
+            );
+        }
     }
 
     #[test]

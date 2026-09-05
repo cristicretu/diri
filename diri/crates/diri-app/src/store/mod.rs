@@ -942,6 +942,13 @@ impl SessionStore {
         self.repo_targets.insert(key, target);
     }
 
+    pub fn remember_split_layouts(&mut self, layouts: crate::split_layout::SplitLayouts) {
+        self.prefs.split_layouts = layouts;
+        if let Err(error) = self.persist_preferences() {
+            eprintln!("diri: could not remember terminal panes: {error}");
+        }
+    }
+
     pub fn preferences(&self) -> &Prefs {
         &self.prefs
     }

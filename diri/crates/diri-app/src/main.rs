@@ -42,6 +42,8 @@ mod session_surfaces;
 pub mod settings;
 pub mod sidebar;
 pub mod sounds;
+mod split_layout;
+mod split_workbench;
 mod status_debug;
 mod surface_shell;
 pub mod switcher;
