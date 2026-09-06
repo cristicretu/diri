@@ -478,6 +478,21 @@ attach writes. The hot path does not put an `Arc<Mutex<Terminal>>` across tasks.
 Buffers are reused where practical, and idle Holders do not poll, heartbeat, or
 run GC.
 
+The shared terminal core recomputes its 4 MiB history-cell allowance when the
+column count changes, including when the primary screen is inactive. Narrowing
+increases the row allowance before reflow; widening trims after reflow so rows
+that merge are not prematurely discarded. The allowance applies to retained
+history cells, not total process memory, allocator capacity, or visible grids.
+
+VTE 0.15.0 is pinned under `vendor/vte` with a single allocation change: its
+synchronized-update buffer grows on first use instead of reserving 2 MiB for
+every terminal at construction. It retains capacity for subsequent frames.
+The byte limit, timeout, parsing, and synchronization semantics are unchanged;
+the tradeoff is allocation during the first synchronized frame. The vendored
+source and workspace dependency configuration participate in the default
+Helper Build ID. This adds no parser implementation or runtime dependency.
+See `vendor/vte/DIRI-PATCH.md` and the 2026-09-06 measurements in `PERF.md`.
+
 ### Local Holder input compatibility
 
 The durable local Holder is outside the remote Helper wire protocol, but it

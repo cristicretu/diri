@@ -245,8 +245,8 @@ impl ScreenSnapshot {
 const HISTORY_CELL_BUDGET_BYTES: usize = 4 << 20;
 
 fn history_line_limit(cols: usize) -> usize {
-    let bytes_per_line = cols.max(1) * std::mem::size_of::<alacritty_terminal::term::cell::Cell>();
-    (HISTORY_CELL_BUDGET_BYTES / bytes_per_line).max(64)
+    let bytes_per_line = cols.max(1).saturating_mul(std::mem::size_of::<Cell>());
+    HISTORY_CELL_BUDGET_BYTES / bytes_per_line
 }
 
 /// Fixed screen geometry handed to the emulator.
@@ -506,11 +506,34 @@ impl HeadlessScreen {
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
-        self.geometry = Geometry {
+        let geometry = Geometry {
             cols: cols.max(1),
             rows: rows.max(1),
         };
+        if self.geometry.cols == geometry.cols && self.geometry.rows == geometry.rows {
+            return;
+        }
+        let old_limit = history_line_limit(self.geometry.cols);
+        let new_limit = history_line_limit(geometry.cols);
+        // A narrower screen needs the larger row allowance before reflow to
+        // retain wrapped history. When widening, reflow first: rows may merge,
+        // and trimming beforehand would discard history that still fits.
+        if new_limit > old_limit {
+            self.term.set_options(Config {
+                scrolling_history: new_limit,
+                ..Config::default()
+            });
+        }
+        self.geometry = geometry;
         self.term.resize(self.geometry);
+        if new_limit < old_limit {
+            // set_options updates the primary history even while the alternate
+            // screen is active, and preserves the limit across terminal reset.
+            self.term.set_options(Config {
+                scrolling_history: new_limit,
+                ..Config::default()
+            });
+        }
         self.settle();
     }
 
@@ -602,27 +625,27 @@ impl HeadlessScreen {
                 .filter(|dirty| **dirty)
                 .count()
         };
-        let mut changed = Vec::with_capacity(candidate_count);
+        let mut changed = Vec::new();
         for y in 0..rows {
             if !force_full && !self.pending_damage_rows.get(y).copied().unwrap_or(false) {
                 continue;
             }
             let line = Line(y as i32);
             let base = y * cols;
-            let mut row = Vec::with_capacity(cols);
+            let row = &mut self.last_cells[base..base + cols];
             let mut row_changed = force_full;
-            for x in 0..cols {
+            for (x, previous) in row.iter_mut().enumerate() {
                 let cell = wire_cell(&grid[line][Column(x)]);
-                if !row_changed && self.last_cells[base + x] != cell {
-                    row_changed = true;
-                }
-                row.push(cell);
+                row_changed |= *previous != cell;
+                *previous = cell;
             }
             if !row_changed {
                 continue;
             }
-            self.last_cells[base..base + cols].copy_from_slice(&row);
-            changed.push(ChangedRow::new(y as u16, row));
+            if changed.is_empty() {
+                changed.reserve_exact(candidate_count);
+            }
+            changed.push(ChangedRow::new(y as u16, row.to_vec()));
         }
         self.pending_damage_rows.fill(false);
 
@@ -1375,6 +1398,91 @@ mod tests {
         screen.feed(b"hello\r\n");
         screen.resize(40, 10);
         assert_eq!(screen.lines(), vec!["hello"]);
+    }
+
+    #[test]
+    fn resize_keeps_history_within_the_cell_budget() {
+        for alternate in [false, true] {
+            let mut screen = HeadlessScreen::new(80, 24);
+            screen.feed("retained history\r\n".repeat(6000).as_bytes());
+            if alternate {
+                screen.feed(b"\x1b[?1049h");
+            }
+            screen.resize(320, 24);
+            if alternate {
+                screen.feed(b"\x1b[?1049l");
+            }
+            let history = screen.term.grid().history_size();
+            assert!(
+                history <= history_line_limit(320),
+                "{history} rows after widening (alternate={alternate})"
+            );
+            assert!(screen.lines().iter().any(|line| line == "retained history"));
+
+            // Narrowing permits more rows again, including after an app reset.
+            screen.resize(80, 24);
+            screen.feed(b"\x1bc");
+            screen.feed("new history\r\n".repeat(6000).as_bytes());
+            assert_eq!(screen.term.grid().history_size(), history_line_limit(80));
+        }
+    }
+
+    #[test]
+    fn history_budget_does_not_have_a_wide_terminal_exception() {
+        assert!(
+            history_line_limit(4096) * 4096 * std::mem::size_of::<Cell>()
+                <= HISTORY_CELL_BUDGET_BYTES
+        );
+    }
+
+    #[test]
+    fn incremental_grid_matches_fresh_snapshots_through_damage_and_resize() {
+        let mut screen = HeadlessScreen::new(24, 8);
+        let mut mirror = Vec::new();
+        screen.grid_update(true).apply(&mut mirror);
+        let operations: &[&[u8]] = &[
+            b"hello\r\nworld",
+            b"\x1b[1;31mcolored\x1b[0m",
+            b"\x1b[H",
+            b"\x1b[C\x1b[D",
+            b"\x1b[2J",
+            "wide: 界🙂".as_bytes(),
+            b"\x1b[?1049h",
+            b"\x1b[3;5Halternate",
+            b"\x1b[?1049l",
+            b"\x1b[2;6r\x1b[6;1H\n\n\x1b[r",
+            b"\x1b[2;1H\x1b[L",
+            b"\x1b[M",
+            b"\x1b[?2026hheld\x1b[?2026l",
+            b"\x1b[?25l",
+        ];
+        for round in 0..80 {
+            if round % 7 == 0 {
+                screen.resize(16 + round % 13, 4 + round % 8);
+            }
+            // Several feeds accumulate before each publication; byte-sized
+            // chunks also exercise escapes and UTF-8 split across PTY reads.
+            for bytes in operations.iter().cycle().skip(round).take(3) {
+                for byte in bytes.iter() {
+                    screen.feed(std::slice::from_ref(byte));
+                }
+            }
+            let update = screen.grid_update(round % 11 == 0);
+            update.apply(&mut mirror);
+            let snapshot = screen.full_snapshot();
+            let mut expected = Vec::new();
+            snapshot.apply(&mut expected);
+            assert_eq!(mirror, expected, "publication {round}");
+            assert_eq!(
+                (update.cursor_col, update.cursor_row, update.cursor_visible),
+                (
+                    snapshot.cursor_col,
+                    snapshot.cursor_row,
+                    snapshot.cursor_visible
+                )
+            );
+            assert!(screen.grid_update(false).changed_rows.is_empty());
+        }
     }
 
     #[test]

@@ -74,3 +74,9 @@ gpui_macos = { path = "vendor/gpui_macos" }
 # unused profiler does not change the licensing of Diri's distributed binary.
 ztracing = { path = "vendor/ztracing" }
 ztracing_macro = { path = "vendor/ztracing_macro" }
+
+[patch.crates-io]
+# Keep VTE 0.15.0's parser and synchronization semantics; allocate its 2 MiB
+# synchronization buffer only when a child actually sends a synchronized frame.
+# See vendor/vte/DIRI-PATCH.md for provenance and verification.
+vte = { path = "vendor/vte" }

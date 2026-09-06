@@ -12,7 +12,7 @@ use gpui::{
     point, px, relative, size,
 };
 
-use crate::buffer::{ApplySummary, GridBuffer};
+use crate::buffer::{ApplySummary, ChangedRenderRow, GridBuffer};
 use crate::find::{
     FindSnapshot, FindSpan, NavigationTarget, SearchJob, SearchRequest, SearchResult,
     TerminalFindModel,
@@ -281,6 +281,40 @@ struct CachedRow {
     background_quads: Vec<PaintQuad>,
     decoration_quads: Vec<PaintQuad>,
     line: ShapedLine,
+}
+
+impl CachedRow {
+    fn move_vertically(&mut self, dy: Pixels) {
+        for quad in self
+            .background_quads
+            .iter_mut()
+            .chain(self.decoration_quads.iter_mut())
+        {
+            quad.bounds.origin.y += dy;
+        }
+    }
+}
+
+/// Move the existing viewport cache with a full-height scroll. This is only a
+/// reuse hint: the caller compares every cell before accepting a prepared row.
+/// Sparse damage and render-context changes never rotate the cache.
+fn align_scrolled_rows(cache: &mut [Option<CachedRow>], damage: &[ChangedRenderRow]) -> usize {
+    if cache.len() < 2 || damage.len() != cache.len() {
+        return 0;
+    }
+    for changed in [damage.first().unwrap(), damage.last().unwrap()] {
+        if let Some(previous) = cache
+            .iter()
+            .position(|entry| entry.as_ref().is_some_and(|row| row.cells == changed.cells))
+        {
+            let offset = (previous + cache.len() - changed.row) % cache.len();
+            if offset != 0 {
+                cache.rotate_left(offset);
+                return offset;
+            }
+        }
+    }
+    0
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1027,13 +1061,30 @@ impl Element for TerminalElement {
                 buffer.snapshot_damage(&mut generations, visible_rows, visible_cols, force)
             };
             cursor = damage.cursor;
-            cache_misses = damage.changed_rows.len() as u64;
-            cache_hits = visible_rows.saturating_sub(damage.changed_rows.len()) as u64;
+            let mut misses = 0;
 
             let mut cache = mutex_lock(&self.shared.row_cache);
             cache.truncate(visible_rows);
             cache.resize_with(visible_rows, || None);
+            let offset = if force {
+                0
+            } else {
+                align_scrolled_rows(&mut cache, &damage.changed_rows)
+            };
             for changed in damage.changed_rows {
+                if !force
+                    && let Some(prepared) = cache[changed.row].as_mut()
+                    && prepared.cells == changed.cells
+                {
+                    // Shapes are independent of row position. Backgrounds and
+                    // decorations carry absolute bounds and must move with it.
+                    let old_row = (changed.row + offset) % visible_rows;
+                    let dy =
+                        metrics.y_for_row(changed.row as u16) - metrics.y_for_row(old_row as u16);
+                    prepared.move_vertically(dy);
+                    continue;
+                }
+                misses += 1;
                 cache[changed.row] = Some(self.prepare_row(
                     changed.cells,
                     changed.row as u16,
@@ -1042,6 +1093,8 @@ impl Element for TerminalElement {
                     window,
                 ));
             }
+            cache_misses = misses;
+            cache_hits = visible_rows as u64 - misses;
             // No composed copies: paint reads the row cache directly (see
             // `paint_from_cache`), so a frame with zero changed rows clones
             // nothing — previously every prepaint re-cloned all rows' quads
@@ -2035,5 +2088,97 @@ mod selection_repaint_tests {
 
         assert_eq!(element.selected_text(), "");
         assert_eq!(visible_selection_count(&element), 0);
+    }
+}
+
+#[cfg(test)]
+mod live_scroll_cache_tests {
+    use super::*;
+
+    fn cells(ch: u8) -> Vec<GridCell> {
+        let mut cell = GridCell::BLANK;
+        cell.scalar = u32::from(ch);
+        vec![cell; 8]
+    }
+
+    fn cache() -> Vec<Option<CachedRow>> {
+        (b'a'..=b'd')
+            .enumerate()
+            .map(|(row, ch)| {
+                Some(CachedRow {
+                    cells: cells(ch),
+                    background_quads: vec![fill(
+                        Bounds::new(point(px(3.), px(row as f32 * 20.)), size(px(80.), px(20.))),
+                        gpui::black(),
+                    )],
+                    decoration_quads: vec![fill(
+                        Bounds::new(
+                            point(px(3.), px(row as f32 * 20. + 18.)),
+                            size(px(80.), px(1.)),
+                        ),
+                        gpui::white(),
+                    )],
+                    line: ShapedLine::default(),
+                })
+            })
+            .collect()
+    }
+
+    fn damage(text: &[u8]) -> Vec<ChangedRenderRow> {
+        text.iter()
+            .enumerate()
+            .map(|(row, &ch)| ChangedRenderRow {
+                row,
+                generation: 1,
+                cells: cells(ch),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scrolling_reuses_shapes_and_moves_backgrounds_and_decorations_both_ways() {
+        for (text, expected_offset, matched_rows) in [
+            (b"bcde", 1, vec![0, 1, 2]),
+            (b"zabc", 3, vec![1, 2, 3]),
+            (b"cdef", 2, vec![0, 1]),
+        ] {
+            let mut cache = cache();
+            let damage = damage(text);
+            let offset = align_scrolled_rows(&mut cache, &damage);
+            assert_eq!(offset, expected_offset);
+            for row in matched_rows {
+                let prepared = cache[row].as_mut().unwrap();
+                assert_eq!(prepared.cells, damage[row].cells);
+                let previous = (row + offset) % 4;
+                prepared.move_vertically(px((row as f32 - previous as f32) * 20.));
+                assert_eq!(
+                    prepared.background_quads[0].bounds.origin,
+                    point(px(3.), px(row as f32 * 20.))
+                );
+                assert_eq!(
+                    prepared.decoration_quads[0].bounds.origin,
+                    point(px(3.), px(row as f32 * 20. + 18.))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_damage_and_unrelated_redraw_do_not_rotate_the_cache() {
+        let mut cache = cache();
+        assert_eq!(align_scrolled_rows(&mut cache, &damage(b"b")), 0);
+        assert_eq!(align_scrolled_rows(&mut cache, &damage(b"wxyz")), 0);
+        for (row, ch) in (b'a'..=b'd').enumerate() {
+            assert_eq!(cache[row].as_ref().unwrap().cells, cells(ch));
+        }
+    }
+
+    #[test]
+    fn a_scroll_hint_does_not_make_edited_rows_reusable() {
+        let mut cache = cache();
+        let mut damage = damage(b"bcde");
+        damage[1].cells[0].bg = diri_proto::grid::TermColor::Ansi(1);
+        assert_eq!(align_scrolled_rows(&mut cache, &damage), 1);
+        assert_ne!(cache[1].as_ref().unwrap().cells, damage[1].cells);
     }
 }
