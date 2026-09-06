@@ -487,6 +487,15 @@ impl RootView {
                         this.set_inspector_open(false, cx);
                         this.inspector_toggled_at = None;
                     }
+                    InspectorEvent::SessionChanged => {
+                        this.inspector_open = this
+                            .inspector
+                            .as_ref()
+                            .is_some_and(|inspector| inspector.read(cx).is_visible());
+                        this.inspector_toggled_at = None;
+                        this.begin_inspector_slide(cx);
+                        cx.notify();
+                    }
                     InspectorEvent::WorkspaceChanged(surface) => {
                         window.focus(&this.focus, cx);
                         #[cfg(target_os = "macos")]
@@ -496,8 +505,13 @@ impl RootView {
                         {
                             this.browser.borrow_mut().select_tab(id);
                             let state = this.browser.borrow().state();
-                            inspector
-                                .update(cx, |inspector, cx| inspector.set_browser_state(state, cx));
+                            let blank = state.url.is_none();
+                            inspector.update(cx, |inspector, cx| {
+                                inspector.set_browser_state(state, cx);
+                                if blank {
+                                    inspector.focus_browser_address(window, cx);
+                                }
+                            });
                         }
                         if let Some(terminal) = &this.auxiliary_terminal
                             && *surface == crate::inspector::WorkspaceSurface::Terminal
@@ -790,6 +804,11 @@ impl RootView {
                                 if open_settings && let Some(surfaces) = &this.utility_surfaces {
                                     surfaces.update(cx, |surfaces, cx| surfaces.open_settings(cx));
                                 }
+                                if let Some(inspector) = &this.inspector {
+                                    inspector.update(cx, |inspector, cx| {
+                                        inspector.sync_workspace_session(cx)
+                                    });
+                                }
                                 this.sync_auxiliary_terminal(window, cx);
                                 cx.notify();
                             })
@@ -842,9 +861,12 @@ impl RootView {
                 if this
                     .update_in(cx, |this, _window, cx| {
                         if let Some(inspector) = this.inspector.clone() {
-                            let state = this.browser.borrow().state();
-                            inspector
-                                .update(cx, |inspector, cx| inspector.set_browser_state(state, cx));
+                            let states = this.browser.borrow().tab_states();
+                            inspector.update(cx, |inspector, cx| {
+                                for (id, state) in states {
+                                    inspector.set_browser_tab_state(id, state, cx);
+                                }
+                            });
                             cx.notify();
                         }
                     })
@@ -1262,6 +1284,24 @@ impl RootView {
                 }
                 _ => {}
             }
+            cx.stop_propagation();
+            return;
+        }
+        if self.inspector_open
+            && !self.launcher.read(cx).is_open()
+            && !self
+                .navigation
+                .as_ref()
+                .is_some_and(|view| view.read(cx).is_open())
+            && !self
+                .utility_surfaces
+                .as_ref()
+                .is_some_and(|view| view.read(cx).is_open())
+            && let Some(inspector) = &self.inspector
+            && inspector.update(cx, |inspector, cx| {
+                inspector.browser_shortcut(event, window, cx)
+            })
+        {
             cx.stop_propagation();
             return;
         }
