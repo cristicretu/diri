@@ -3868,9 +3868,8 @@ impl Render for LauncherOverlay {
             .store
             .read()
             .expect("session store lock poisoned")
-            .preferences()
-            .terminal_theme
-            .clone();
+            .theme_id()
+            .to_owned();
         let colors = launcher_colors_for_theme(&theme_id);
         let focused = self.focus.is_focused(window);
         root.size_full()

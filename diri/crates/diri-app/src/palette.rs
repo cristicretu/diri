@@ -18,6 +18,7 @@ use crate::fuzzy::{FuzzyMatcher, FuzzyQuery, PreparedText, Score};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaletteCommand {
+    Themes,
     /// A static application command. The palette dispatches the same typed
     /// action used by key bindings, menus, and toolbar controls.
     Action(CommandId),
@@ -29,9 +30,13 @@ pub enum PaletteCommand {
         host: Option<String>,
     },
     /// `session.migrate` the SELECTED session; None = back to local.
-    MigrateSelected { target_host: Option<String> },
+    MigrateSelected {
+        target_host: Option<String>,
+    },
     /// `host.sync_prefs` to one configured host.
-    SyncPrefs { host: String },
+    SyncPrefs {
+        host: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -266,11 +271,13 @@ fn append_management_actions(
             matches!(
                 action.command,
                 PaletteCommand::MigrateSelected { .. }
+                    | PaletteCommand::Themes
                     | PaletteCommand::SyncPrefs { .. }
                     | PaletteCommand::Action(
                         CommandId::OpenWorktrees
                             | CommandId::ToggleSidebar
                             | CommandId::OpenSettings
+                            | CommandId::ToggleHistory
                             | CommandId::CheckForUpdates
                     )
             )
@@ -433,6 +440,17 @@ pub fn actions_for_default_host(
         registered_action(CommandId::OpenWorktrees),
         registered_action(CommandId::ToggleSidebar),
         registered_action(CommandId::OpenSettings),
+        registered_action(CommandId::ToggleHistory),
+        PaletteAction {
+            id: "color-theme".into(),
+            title: "Color theme".into(),
+            system_image: "moon.fill",
+            shortcut: None,
+            detail: None,
+            enabled: true,
+            command: PaletteCommand::Themes,
+            keywords: "settings appearance dark light preferences".into(),
+        },
         registered_action(CommandId::CheckForUpdates),
     ]);
     result
@@ -923,7 +941,7 @@ mod tests {
     }
 
     #[test]
-    fn action_list_matches_swift_order_and_dynamic_default() {
+    fn action_list_preserves_dynamic_default_and_includes_palette_pages() {
         let project = Project {
             id: ProjectId::new("p1"),
             root: "/work/diri".into(),
@@ -947,6 +965,8 @@ mod tests {
                 "worktrees",
                 "toggle-sidebar",
                 "settings",
+                "history",
+                "color-theme",
                 "check-for-updates",
             ]
         );

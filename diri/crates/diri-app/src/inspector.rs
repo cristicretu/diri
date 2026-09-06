@@ -347,7 +347,7 @@ impl WorkbenchInspector {
             let store = runtime.store.read().expect("session store lock poisoned");
             (
                 store.preferences().inspector_tab,
-                crate::app_theme::sidebar_colors(&store.preferences().terminal_theme),
+                crate::app_theme::sidebar_colors(store.theme_id()),
             )
         };
         let code_viewer = cx.new(|cx| CodeViewer::new(tokio.clone(), code_colors, cx));
@@ -693,7 +693,7 @@ impl WorkbenchInspector {
                 .store
                 .read()
                 .expect("session store lock poisoned");
-            crate::app_theme::sidebar_colors(&store.preferences().terminal_theme)
+            crate::app_theme::sidebar_colors(store.theme_id())
         };
         self.code_viewer
             .update(cx, |viewer, cx| viewer.set_colors(colors, cx));
@@ -814,9 +814,8 @@ impl WorkbenchInspector {
                 .store
                 .read()
                 .expect("store")
-                .preferences()
-                .terminal_theme
-                .clone();
+                .theme_id()
+                .to_owned();
             let colors = crate::app_theme::sidebar_colors(&colors);
             let viewer = cx.new(|cx| CodeViewer::new(self.tokio.clone(), colors, cx));
             cx.observe(&viewer, |_, _, cx| cx.notify()).detach();
@@ -4190,7 +4189,7 @@ impl Render for WorkbenchInspector {
                 .store
                 .read()
                 .expect("session store lock poisoned");
-            crate::app_theme::sidebar_colors(&store.preferences().terminal_theme)
+            crate::app_theme::sidebar_colors(store.theme_id())
         };
         let session = self.selected_session();
         let body = match self.workspace_selected {

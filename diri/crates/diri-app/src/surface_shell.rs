@@ -19,31 +19,24 @@ use crate::store::{Prefs, SessionStore, StoreRuntime};
 use crate::updates::{UpdateCommand, UpdateHandle, UpdatePhase};
 use crate::worktrees::WorktreesSheet;
 use account_settings::AccountsState;
-use diri_proto::{AgentKind as ProtoAgentKind, HistoryEntry, HostEntry, HostsConfig};
+use diri_proto::{AgentKind as ProtoAgentKind, HostEntry, HostsConfig};
 use diri_term::theme::{TermTheme, ThemeAppearance};
 use diri_ui::{
-    AgentLogo, Fill, FloatingSurface, HairlineDivider, Icon, IconName, Ink, LoadingIndicator,
-    Metrics, Palette, Radius, SemanticColors, Typo,
+    AgentLogo, Fill, FloatingSurface, HairlineDivider, Ink, LoadingIndicator, Metrics, Palette,
+    Radius, SemanticColors, Typo,
 };
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Bounds, BoxShadow, ClickEvent, Context, CursorStyle,
     FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton, PathPromptOptions,
-    Pixels, Render, Rgba, ScrollHandle, ScrollStrategy, SharedString, Task, TextRun,
-    UniformListScrollHandle, Window, canvas, deferred, div, ease_out_quint, fill, font,
-    linear_color_stop, linear_gradient, point, prelude::*, px, rgba, size, uniform_list,
+    Pixels, Render, Rgba, ScrollHandle, SharedString, Task, TextRun, Window, canvas, deferred, div,
+    ease_out_quint, font, point, prelude::*, px, rgba,
 };
 use tokio::runtime::Runtime;
 
 use crate::commands::{
-    Activate, COMMANDS, CloseSurface, CommandId, MoveDown, MoveUp, OpenSettings, OpenWorktrees,
-    ShortcutCategory, ToggleHistory, UTILITY_CONTEXT,
+    COMMANDS, CloseSurface, CommandId, OpenSettings, OpenWorktrees, ShortcutCategory,
+    UTILITY_CONTEXT,
 };
-const HISTORY_CONTENT_INSET: f32 = 16.0;
-const HISTORY_KEYCAP_WIDTH: f32 = 28.0;
-const HISTORY_KEYCAP_HEIGHT: f32 = 20.0;
-const HISTORY_ROW_HEIGHT: f32 = 36.0;
-const HISTORY_LIST_HEIGHT: f32 = HISTORY_ROW_HEIGHT * 7.0;
-
 const SETTINGS_CONTENT_MAX_WIDTH: f32 = 760.0;
 const SETTINGS_TRANSITION_DURATION: Duration = Duration::from_millis(190);
 const SETTINGS_SECTION_GAP: f32 = 16.0;
@@ -57,7 +50,6 @@ const HOST_REINSTALL_SUCCESS_VISIBILITY: Duration = Duration::from_secs(3);
 enum Surface {
     #[default]
     None,
-    History,
     Worktrees,
     Settings,
     Diagnostics,
@@ -267,16 +259,6 @@ pub struct UtilitySurfaces {
     phone_setup: Option<crate::phone_access::TailscaleSetup>,
     focus: FocusHandle,
     surface: Surface,
-    history: Vec<HistoryEntry>,
-    history_query: QueryEditor,
-    history_highlight: usize,
-    history_loading: bool,
-    history_error: Option<String>,
-    history_scanner: Option<crate::history::HistoryScanner>,
-    history_search: crate::history::HistorySearch,
-    history_matches: Vec<usize>,
-    history_scroll: UniformListScrollHandle,
-    history_resuming: Option<String>,
     worktrees: WorktreesSheet,
     settings_tab: SettingsTab,
     usage: crate::usage::UsageSnapshot,
@@ -376,7 +358,19 @@ impl UtilitySurfaces {
                 loop {
                     match changes.recv().await {
                         Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            if this.update(cx, |_, cx| cx.notify()).is_err() {
+                            if this
+                                .update(cx, |this, cx| {
+                                    this.prefs.terminal_theme = this
+                                        .store
+                                        .read()
+                                        .expect("session store lock poisoned")
+                                        .preferences()
+                                        .terminal_theme
+                                        .clone();
+                                    cx.notify();
+                                })
+                                .is_err()
+                            {
                                 return;
                             }
                         }
@@ -412,16 +406,6 @@ impl UtilitySurfaces {
             } else {
                 Surface::None
             },
-            history: Vec::new(),
-            history_query: QueryEditor::default(),
-            history_highlight: 0,
-            history_loading: false,
-            history_error: None,
-            history_scanner: Some(crate::history::HistoryScanner::default()),
-            history_search: crate::history::HistorySearch::default(),
-            history_matches: Vec::new(),
-            history_scroll: UniformListScrollHandle::new(),
-            history_resuming: None,
             worktrees: WorktreesSheet::default(),
             settings_tab,
             usage: crate::usage::UsageSnapshot::default(),
@@ -456,93 +440,23 @@ impl UtilitySurfaces {
     }
 
     fn colors(&self) -> SemanticColors {
-        crate::app_theme::colors(&self.prefs.terminal_theme)
+        crate::app_theme::colors(
+            self.store
+                .read()
+                .expect("session store lock poisoned")
+                .preview_theme_id()
+                .unwrap_or(&self.prefs.terminal_theme),
+        )
     }
 
     fn settings_colors(&self) -> SemanticColors {
-        crate::app_theme::sidebar_colors(&self.prefs.terminal_theme)
-    }
-
-    pub(crate) fn open_history(&mut self, cx: &mut Context<Self>) {
-        self.surface = Surface::History;
-        self.history_query.clear();
-        self.history_highlight = 0;
-        self.history_scroll = UniformListScrollHandle::new();
-        self.filter_history();
-        self.history_error = None;
-        cx.notify();
-        self.refresh_history(cx);
-    }
-
-    fn refresh_history(&mut self, cx: &mut Context<Self>) {
-        // Reopening uses the last result immediately and shares any in-flight
-        // scan. History is local data: a disconnected Engine must not delay it.
-        let Some(mut scanner) = self.history_scanner.take() else {
-            return;
-        };
-        self.history_loading = true;
-        self.history_error = None;
-        cx.notify();
-
-        let roots = crate::history::HistoryRoots::current_user();
-        let tracked = self
-            .store
-            .read()
-            .expect("session store lock poisoned")
-            .sessions()
-            .values()
-            .filter_map(|session| session.agent_session_id.clone())
-            .collect();
-        let runtime = Arc::clone(&self.runtime);
-        cx.spawn(async move |this, cx| {
-            let task = runtime.spawn(async move {
-                tokio::task::spawn_blocking(move || {
-                    let entries = scanner.scan(&roots, &tracked);
-                    (scanner, entries)
-                })
-                .await
-                .map_err(|error| error.to_string())
-            });
-            let result = task
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|r| r);
-            let _ = this.update(cx, |this, cx| {
-                this.history_loading = false;
-                match result {
-                    Ok((scanner, mut entries)) => {
-                        // A session can become tracked while the disk scan is
-                        // running. Reconcile against the current store as well.
-                        let tracked = this
-                            .store
-                            .read()
-                            .expect("session store lock poisoned")
-                            .sessions()
-                            .values()
-                            .filter_map(|session| session.agent_session_id.clone())
-                            .collect::<HashSet<_>>();
-                        entries.retain(|entry| !tracked.contains(&entry.id));
-                        let selected_id = this.highlighted_history().map(|entry| entry.id.clone());
-                        this.history_scanner = Some(scanner);
-                        this.activity = format!("{} past conversations found", entries.len());
-                        this.history = entries;
-                        this.history_search.rebuild(&this.history);
-                        this.filter_history();
-                        if let Some(index) = this.history_matches.iter().position(|index| {
-                            Some(&this.history[*index].id) == selected_id.as_ref()
-                        }) {
-                            this.history_highlight = index;
-                        }
-                    }
-                    Err(error) => {
-                        this.history_scanner = Some(crate::history::HistoryScanner::default());
-                        this.history_error = Some(error);
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        crate::app_theme::sidebar_colors(
+            self.store
+                .read()
+                .expect("session store lock poisoned")
+                .preview_theme_id()
+                .unwrap_or(&self.prefs.terminal_theme),
+        )
     }
 
     pub(crate) fn open_worktrees(&mut self, cx: &mut Context<Self>) {
@@ -573,73 +487,6 @@ impl UtilitySurfaces {
             };
             let _ = this.update(cx, |this, cx| {
                 this.worktrees.finish_refresh(result);
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn resume_history(&mut self, entry: HistoryEntry, cx: &mut Context<Self>) {
-        if self.history_resuming.is_some() {
-            return;
-        }
-        let existing = self
-            .store
-            .read()
-            .expect("session store lock poisoned")
-            .sessions()
-            .values()
-            .find(|session| {
-                session.agent_session_id.as_deref() == Some(&entry.id) && session.kind == entry.kind
-            })
-            .map(|session| session.id.clone());
-        if let Some(id) = existing {
-            self.store
-                .write()
-                .expect("session store lock poisoned")
-                .select(id);
-            self.surface = Surface::None;
-            cx.notify();
-            return;
-        }
-        if !entry.cwd_exists || !Path::new(&entry.cwd).is_dir() {
-            self.history_error = Some("The conversation folder is no longer available".to_owned());
-            cx.notify();
-            return;
-        }
-        self.history_resuming = Some(entry.id.clone());
-        self.history_error = None;
-        cx.notify();
-        let client = Arc::clone(self.store_runtime.client());
-        let runtime = Arc::clone(&self.runtime);
-        let conversation_id = entry.id.clone();
-        cx.spawn(async move |this, cx| {
-            let task = runtime.spawn(async move {
-                client.wait_until_connected(Duration::from_secs(5)).await?;
-                crate::history::resume(&client, &entry).await
-            });
-            let result = match task.await {
-                Ok(result) => result.map_err(|error| error.to_string()),
-                Err(error) => Err(error.to_string()),
-            };
-            let _ = this.update(cx, |this, cx| {
-                this.history_resuming = None;
-                match result {
-                    Ok(id) => {
-                        this.history.retain(|entry| entry.id != conversation_id);
-                        this.history_search.rebuild(&this.history);
-                        this.filter_history();
-                        this.store
-                            .write()
-                            .expect("session store lock poisoned")
-                            .apply_spawn_result(id.clone());
-                        if this.surface == Surface::History {
-                            this.surface = Surface::None;
-                        }
-                        this.activity = format!("Resumed conversation in session {id}");
-                    }
-                    Err(error) => this.history_error = Some(error),
-                }
                 cx.notify();
             });
         })
@@ -1100,43 +947,6 @@ impl UtilitySurfaces {
         true
     }
 
-    fn filter_history(&mut self) {
-        self.history_matches = self.history_search.rank(self.history_query.text());
-        self.history_highlight = self
-            .history_highlight
-            .min(self.history_matches.len().saturating_sub(1));
-    }
-
-    fn highlighted_history(&self) -> Option<&HistoryEntry> {
-        self.history_matches
-            .get(self.history_highlight)
-            .and_then(|index| self.history.get(*index))
-    }
-
-    fn move_history(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if self.surface != Surface::History {
-            return;
-        }
-        let count = self.history_matches.len();
-        if count == 0 {
-            return;
-        }
-        self.history_highlight =
-            (self.history_highlight as isize + delta).rem_euclid(count as isize) as usize;
-        self.history_scroll
-            .scroll_to_item(self.history_highlight, ScrollStrategy::Nearest);
-        cx.notify();
-    }
-
-    fn activate_history(&mut self, cx: &mut Context<Self>) {
-        if self.surface != Surface::History {
-            return;
-        }
-        if let Some(entry) = self.highlighted_history().cloned() {
-            self.resume_history(entry, cx);
-        }
-    }
-
     fn close_surface(&mut self, cx: &mut Context<Self>) {
         if self.worktrees.pending_cleanup.is_some() {
             self.worktrees.cancel_cleanup();
@@ -1555,14 +1365,6 @@ impl UtilitySurfaces {
         self.begin_adding_host(window, cx);
     }
 
-    pub(crate) fn toggle_history(&mut self, cx: &mut Context<Self>) {
-        if self.surface == Surface::History {
-            self.close_surface(cx);
-        } else {
-            self.open_history(cx);
-        }
-    }
-
     pub(crate) fn key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -1609,320 +1411,7 @@ impl UtilitySurfaces {
             cx.notify();
         } else if key.key == "escape" {
             self.close_surface(cx);
-        } else if key.key == "up" {
-            self.move_history(-1, cx);
-        } else if key.key == "down" {
-            self.move_history(1, cx);
-        } else if key.key == "enter" {
-            self.activate_history(cx);
-        } else if self.surface == Surface::History {
-            let Some(edit) = query_editor::edit_for(key) else {
-                return;
-            };
-            let changed = match edit {
-                Edit::Local(local) => self.history_query.apply(local),
-                Edit::Clipboard(ClipboardEdit::Copy) => {
-                    query_editor::copy_selection(&self.history_query, cx);
-                    false
-                }
-                Edit::Clipboard(ClipboardEdit::Cut) => {
-                    query_editor::cut_selection(&mut self.history_query, cx)
-                }
-                Edit::Clipboard(ClipboardEdit::Paste) => cx
-                    .read_from_clipboard()
-                    .and_then(|item| item.text())
-                    .is_some_and(|text| self.history_query.insert(&text)),
-            };
-            if changed {
-                self.history_highlight = 0;
-                self.filter_history();
-                self.history_scroll.scroll_to_item(0, ScrollStrategy::Top);
-            }
-            cx.notify();
         }
-    }
-
-    fn render_history_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
-        let colors = self.settings_colors();
-        let entry = self.history[self.history_matches[index]].clone();
-        let selected = index == self.history_highlight;
-        let resumable = entry.cwd_exists;
-        let opening = self.history_resuming.as_deref() == Some(&entry.id);
-        let busy = self.history_resuming.is_some();
-        let title = entry
-            .title
-            .clone()
-            .unwrap_or_else(|| "Untitled conversation".to_owned());
-        let detail = format!(
-            "{title}\n{} · {}{}",
-            entry.kind.id(),
-            entry.cwd,
-            if resumable {
-                ""
-            } else {
-                "\nFolder unavailable"
-            }
-        );
-        let age = relative_time(entry.last_active_at.0);
-        let agent = ui_agent(&entry.kind);
-        div()
-            .h(px(HISTORY_ROW_HEIGHT))
-            .px(px(6.0))
-            .py(px(2.0))
-            .child(
-                div()
-                    .id(("history-row", index))
-                    .debug_selector(move || format!("history-row-{index}"))
-                    .group("history-row")
-                    .h_full()
-                    .px(px(10.0))
-                    .rounded(px(Radius::ROW))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .bg(Fill::selected(colors, selected))
-                    .when(resumable && !busy, |row| {
-                        row.cursor_pointer()
-                            .active(move |style| style.bg(colors.primary.alpha(0.14)))
-                    })
-                    .when(!resumable, |row| {
-                        row.cursor(CursorStyle::OperationNotAllowed)
-                    })
-                    .hover(move |style| {
-                        style.bg(if selected {
-                            Fill::selected(colors, true)
-                        } else {
-                            Fill::hover(colors, true)
-                        })
-                    })
-                    .tooltip(move |_, cx| cx.new(|_| HistoryTooltip(detail.clone(), colors)).into())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.history_highlight = index;
-                        this.resume_history(entry.clone(), cx);
-                    }))
-                    .child(AgentLogo::new(agent, 28.0, colors).badged(false))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .text_size(px(Typo::ROW.size))
-                            .text_color(if selected {
-                                colors.primary
-                            } else {
-                                colors.text(diri_ui::TextTone::Unselected)
-                            })
-                            .truncate()
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .relative()
-                            .flex_none()
-                            .w(px(HISTORY_KEYCAP_WIDTH))
-                            .h(px(HISTORY_KEYCAP_HEIGHT))
-                            .flex()
-                            .items_center()
-                            .justify_end()
-                            .child(if opening {
-                                LoadingIndicator::new("history-opening", 12.0, colors.secondary)
-                                    .into_any_element()
-                            } else if !resumable {
-                                sf_symbol("exclamationmark.triangle", 12.0, colors.secondary)
-                            } else {
-                                div()
-                                    .text_size(px(Typo::META.size))
-                                    .text_color(colors.tertiary)
-                                    .when(selected && !busy, |age| age.invisible())
-                                    .when(!busy, |age| {
-                                        age.group_hover("history-row", |style| style.invisible())
-                                    })
-                                    .child(age)
-                                    .into_any_element()
-                            })
-                            .when(resumable && !busy, |slot| {
-                                slot.child(
-                                    history_keycap(colors)
-                                        .debug_selector(move || format!("history-return-{index}"))
-                                        .absolute()
-                                        .right_0()
-                                        .top_0()
-                                        .when(!selected, |cue| cue.invisible())
-                                        .group_hover("history-row", |style| style.visible())
-                                        .child(Icon::new(IconName::Return, 14.0, colors.secondary)),
-                                )
-                            }),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn render_history(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = self.settings_colors();
-        let count = self.history_matches.len();
-        let entity = cx.entity();
-        FloatingSurface::new(
-            colors,
-            div()
-                .id("conversation-history")
-                .debug_selector(|| "conversation-history".into())
-                .w(px(600.0))
-                .max_w_full()
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .h(px(48.0))
-                        .px(px(HISTORY_CONTENT_INSET))
-                        .flex()
-                        .items_center()
-                        .gap(px(6.0))
-                        .child(
-                            div()
-                                .flex_none()
-                                .size(px(28.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(sf_symbol("magnifyingglass", 14.0, colors.secondary)),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .overflow_hidden()
-                                .text_size(px(Typo::ROW.size))
-                                .text_color(if self.history_query.is_empty() {
-                                    colors.secondary
-                                } else {
-                                    colors.primary
-                                })
-                                .child(if self.history_query.is_empty() {
-                                    div().child("Search conversations…").into_any_element()
-                                } else {
-                                    query_label(&self.history_query)
-                                }),
-                        )
-                        .when(!self.history_query.is_empty(), |view| {
-                            view.child(
-                                div()
-                                    .id("clear-history-search")
-                                    .cursor_pointer()
-                                    .size(px(24.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(Radius::CHIP))
-                                    .hover(move |style| style.bg(Fill::hover(colors, true)))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.history_query.clear();
-                                        this.history_highlight = 0;
-                                        this.filter_history();
-                                        this.history_scroll.scroll_to_item(0, ScrollStrategy::Top);
-                                        cx.notify();
-                                    }))
-                                    .child(sf_symbol("xmark.circle.fill", 12.0, colors.secondary)),
-                            )
-                        })
-                        .child(
-                            div()
-                                .id("refresh-history")
-                                .size(px(24.0))
-                                .rounded(px(Radius::CHIP))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .when(!self.history_loading, |button| {
-                                    button
-                                        .cursor_pointer()
-                                        .hover(move |style| style.bg(Fill::hover(colors, true)))
-                                        .active(move |style| style.bg(colors.primary.alpha(0.12)))
-                                })
-                                .tooltip(move |_, cx| {
-                                    cx.new(|_| {
-                                        HistoryTooltip("Refresh conversations".into(), colors)
-                                    })
-                                    .into()
-                                })
-                                .on_click(cx.listener(|this, _, _, cx| this.refresh_history(cx)))
-                                .child(if self.history_loading {
-                                    LoadingIndicator::new(
-                                        "history-refreshing",
-                                        12.0,
-                                        colors.secondary,
-                                    )
-                                    .into_any_element()
-                                } else {
-                                    sf_symbol("arrow.triangle.2.circlepath", 12.0, colors.secondary)
-                                }),
-                        )
-                        .child(
-                            history_keycap(colors)
-                                .id("close-history")
-                                .debug_selector(|| "history-escape".into())
-                                .cursor_pointer()
-                                .hover(move |style| style.bg(Fill::hover(colors, true)))
-                                .on_click(cx.listener(|this, _, _, cx| this.close_surface(cx)))
-                                .child("esc"),
-                        ),
-                )
-                .child(HairlineDivider::horizontal(colors))
-                .when_some(self.history_error.clone(), |view, error| {
-                    view.child(
-                        div()
-                            .px(px(16.0))
-                            .py(px(6.0))
-                            .text_size(px(12.0))
-                            .text_color(Ink::DANGER)
-                            .child(error),
-                    )
-                })
-                .child(
-                    div()
-                        .my(px(6.0))
-                        .relative()
-                        .h(px(HISTORY_LIST_HEIGHT))
-                        .overflow_hidden()
-                        .when(count > 0, |view| {
-                            view.child(
-                                uniform_list("history-results", count, move |range, _, cx| {
-                                    entity.update(cx, |this, cx| {
-                                        range
-                                            .map(|index| this.render_history_row(index, cx))
-                                            .collect()
-                                    })
-                                })
-                                .track_scroll(&self.history_scroll)
-                                .size_full(),
-                            )
-                            .child(history_scroll_fades(self.history_scroll.clone(), colors))
-                        })
-                        .when(count == 0, |view| {
-                            view.child(
-                                div()
-                                    .size_full()
-                                    .flex()
-                                    .flex_col()
-                                    .items_center()
-                                    .justify_center()
-                                    .gap(px(8.0))
-                                    .child(sf_symbol("magnifyingglass", 20.0, colors.tertiary))
-                                    .child(
-                                        div()
-                                            .text_size(px(Typo::ROW.size))
-                                            .text_color(colors.primary)
-                                            .child(if self.history_loading {
-                                                "Finding conversations…"
-                                            } else if self.history_query.is_empty() {
-                                                "No conversations yet"
-                                            } else {
-                                                "No matches"
-                                            }),
-                                    ),
-                            )
-                        }),
-                ),
-        )
-        .radius(Radius::PANEL)
     }
 
     fn render_worktrees(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -4860,7 +4349,6 @@ impl Render for UtilitySurfaces {
         let sidebar_width = self.prefs.sidebar_width;
         let overlay = match self.surface {
             Surface::None => None,
-            Surface::History => Some(self.render_history(cx).into_any_element()),
             Surface::Worktrees => Some(self.render_worktrees(cx).into_any_element()),
             Surface::Settings => Some(self.render_settings(cx).into_any_element()),
             Surface::Diagnostics => Some(self.render_diagnostics(cx).into_any_element()),
@@ -4870,13 +4358,6 @@ impl Render for UtilitySurfaces {
             .track_focus(&self.focus)
             .key_context(UTILITY_CONTEXT)
             .on_key_down(cx.listener(Self::key_down))
-            .on_action(cx.listener(|this, _: &ToggleHistory, _, cx| {
-                if this.surface == Surface::History {
-                    this.close_surface(cx);
-                } else {
-                    this.open_history(cx);
-                }
-            }))
             .on_action(cx.listener(|this, _: &OpenWorktrees, _, cx| {
                 this.open_worktrees(cx);
             }))
@@ -4885,9 +4366,6 @@ impl Render for UtilitySurfaces {
                 cx.stop_propagation();
             }))
             .on_action(cx.listener(|this, _: &CloseSurface, _, cx| this.close_surface(cx)))
-            .on_action(cx.listener(|this, _: &MoveUp, _, cx| this.move_history(-1, cx)))
-            .on_action(cx.listener(|this, _: &MoveDown, _, cx| this.move_history(1, cx)))
-            .on_action(cx.listener(|this, _: &Activate, _, cx| this.activate_history(cx)))
             .absolute()
             // Cached entity roots are laid out independently, so insets alone
             // leave this absolute root without a definite size: its height
@@ -6307,7 +5785,7 @@ fn empty_label(label: &str, colors: SemanticColors) -> impl IntoElement {
         .child(label.to_owned())
 }
 
-fn ui_agent(kind: &ProtoAgentKind) -> diri_ui::AgentKind {
+pub(crate) fn ui_agent(kind: &ProtoAgentKind) -> diri_ui::AgentKind {
     // Brand vocabulary, not a protocol type: a manifest agent the client has
     // no hand-drawn mark for falls back to the generic terminal treatment.
     match kind.id() {
@@ -6325,82 +5803,6 @@ fn folder_name(path: &str) -> &str {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(path)
-}
-
-/// Keyboard hints share a footprint and border, so the header and every row
-/// end on the same vertical axis regardless of their text or icon contents.
-fn history_keycap(colors: SemanticColors) -> gpui::Div {
-    div()
-        .flex_none()
-        .w(px(HISTORY_KEYCAP_WIDTH))
-        .h(px(HISTORY_KEYCAP_HEIGHT))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(Radius::CHIP))
-        .border_1()
-        .border_color(colors.floating_stroke())
-        .text_size(px(Typo::META.size))
-        .text_color(colors.secondary)
-}
-
-struct HistoryTooltip(String, SemanticColors);
-
-impl Render for HistoryTooltip {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .max_w(px(440.0))
-            .px(px(10.0))
-            .py(px(7.0))
-            .rounded(px(Radius::ROW))
-            .bg(self.1.floating_surface())
-            .border_1()
-            .border_color(self.1.floating_stroke())
-            .text_size(px(Typo::META.size))
-            .text_color(self.1.primary)
-            .child(self.0.clone())
-    }
-}
-
-/// Paint after the virtual list has laid out: both wheel scrolling and deferred
-/// keyboard selection then use this frame's offset. A canvas adds no hitbox, so
-/// the fade never intercepts clicks or scrolling at the edges.
-fn history_scroll_fades(
-    scroll: UniformListScrollHandle,
-    colors: SemanticColors,
-) -> impl IntoElement {
-    canvas(
-        |_, _, _| (),
-        move |bounds, _, window, _| {
-            let handle = &scroll.0.borrow().base_handle;
-            let scrolled = f32::from(handle.offset().y).min(0.0).abs();
-            let remaining = (f32::from(handle.max_offset().y) - scrolled).max(0.0);
-            for (distance, angle, top) in [(scrolled, 180.0, true), (remaining, 0.0, false)] {
-                let strength = (distance / 14.0).min(1.0);
-                if strength <= 0.01 {
-                    continue;
-                }
-                let height = px(16.0);
-                let origin = if top {
-                    bounds.origin
-                } else {
-                    point(bounds.left(), bounds.bottom() - height)
-                };
-                let color: gpui::Hsla = colors.floating_surface().alpha(strength).into();
-                window.paint_quad(fill(
-                    Bounds::new(origin, size(bounds.size.width, height)),
-                    linear_gradient(
-                        angle,
-                        linear_color_stop(color, 0.0),
-                        linear_color_stop(color.opacity(0.0), 1.0),
-                    ),
-                ));
-            }
-        },
-    )
-    .absolute()
-    .inset_0()
-    .size_full()
 }
 
 /// Second line under the update summary: why updates are off, or when the last
@@ -6452,19 +5854,6 @@ fn expire_completed_reinstall(
     should_expire
 }
 
-fn relative_time(milliseconds: f64) -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0.0, |duration| duration.as_secs_f64() * 1000.0);
-    let seconds = ((now - milliseconds).max(0.0) / 1000.0) as u64;
-    match seconds {
-        0..=59 => "now".to_owned(),
-        60..=3_599 => format!("{}m", seconds / 60),
-        3_600..=86_399 => format!("{}h", seconds / 3_600),
-        _ => format!("{}d", seconds / 86_400),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6500,192 +5889,6 @@ mod tests {
                     .cached(StyleRefinement::default().absolute().inset_0()),
             )
         }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn seed_history(surfaces: &mut UtilitySurfaces) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs_f64()
-            * 1000.0;
-        let titles = [
-            "Make conversation search fast and useful",
-            "Polish sidebar navigation and rounded popovers",
-            "Keep remote sessions alive after reconnecting",
-            "Fix terminal rendering when switching projects",
-            "Add keyboard shortcuts for quick navigation",
-            "Explore a simpler onboarding flow",
-            "A longer conversation title about investigating search results across multiple projects and keeping useful names visible",
-        ];
-        surfaces.surface = Surface::History;
-        surfaces.history = (0..640)
-            .map(|index| HistoryEntry {
-                id: format!("conversation-{index}"),
-                kind: if index % 2 == 0 {
-                    ProtoAgentKind::CODEX
-                } else {
-                    ProtoAgentKind::CLAUDE_CODE
-                },
-                cwd: if index == 4 {
-                    "/work/old-worktree".to_owned()
-                } else {
-                    "/work/diri".to_owned()
-                },
-                title: Some(titles[index % titles.len()].to_owned()),
-                transcript_path: String::new(),
-                last_active_at: diri_proto::DateMillis(now - index as f64 * 3600000.0),
-                created_at: None,
-                cwd_exists: index != 4,
-            })
-            .collect();
-        surfaces.history_search.rebuild(&surfaces.history);
-        surfaces.filter_history();
-    }
-
-    #[cfg(target_os = "macos")]
-    #[gpui::test]
-    fn history_virtualizes_results_and_keeps_keyboard_selection_visible(cx: &mut TestAppContext) {
-        let (view, cx) = cx.add_window_view(|window, cx| {
-            let runtime = Arc::new(StoreRuntime::inert());
-            let tokio = Arc::new(
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap(),
-            );
-            let surfaces = cx.new(|cx| {
-                let mut surfaces =
-                    UtilitySurfaces::new(runtime, tokio, crate::updates::inert(), window, cx);
-                seed_history(&mut surfaces);
-                surfaces.focus.focus(window, cx);
-                surfaces
-            });
-            CachedOverlayHarness { surfaces }
-        });
-        cx.simulate_resize(size(px(800.0), px(700.0)));
-        cx.run_until_parked();
-        assert!(cx.debug_bounds("history-row-0").is_some());
-        let escape = cx.debug_bounds("history-escape").unwrap();
-        let enter = cx.debug_bounds("history-return-0").unwrap();
-        assert_eq!(enter.size, escape.size, "keyboard hints share a footprint");
-        assert_eq!(enter.left(), escape.left(), "keyboard hints share an axis");
-        assert!(
-            cx.debug_bounds("history-row-639").is_none(),
-            "offscreen rows must not be rendered"
-        );
-        let surfaces = view.read_with(cx, |view, _| view.surfaces.clone());
-        surfaces.update(cx, |surfaces, cx| surfaces.move_history(-1, cx));
-        cx.run_until_parked();
-        let row = cx
-            .debug_bounds("history-row-639")
-            .expect("keyboard selection scrolled into view");
-        let dialog = cx.debug_bounds("conversation-history").unwrap();
-        assert!(row.top() >= dialog.top() && row.bottom() <= dialog.bottom());
-        cx.simulate_keystrokes("s e a r c h");
-        cx.run_until_parked();
-        surfaces.read_with(cx, |surfaces, _| {
-            assert_eq!(surfaces.history_query.text(), "search");
-            assert_eq!(surfaces.history_highlight, 0);
-            assert!(surfaces.history_matches.len() < 640);
-        });
-        surfaces.update(cx, |surfaces, cx| {
-            surfaces.history_query.clear();
-            surfaces.history_query.insert("zzzzzz");
-            surfaces.filter_history();
-            cx.notify();
-        });
-        cx.run_until_parked();
-        let empty_dialog = cx.debug_bounds("conversation-history").unwrap();
-        assert_eq!(
-            empty_dialog.size.width, dialog.size.width,
-            "empty results preserve dialog width"
-        );
-        surfaces.update(cx, |surfaces, cx| {
-            surfaces.history_resuming = Some("already-opening".to_owned());
-            let entry = surfaces.history[0].clone();
-            surfaces.resume_history(entry, cx);
-            assert_eq!(
-                surfaces.history_resuming.as_deref(),
-                Some("already-opening")
-            );
-        });
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore = "renders deterministic history UI without a live daemon"]
-    fn render_history_preview_screenshot() {
-        let output =
-            PathBuf::from(std::env::var_os("DIRI_VISUAL_OUTPUT").expect("set DIRI_VISUAL_OUTPUT"));
-        let platform = gpui_platform::current_platform(true);
-        let mut cx = HeadlessAppContext::with_platform(
-            platform.text_system(),
-            Arc::new(diri_ui::IconAssets),
-            gpui_platform::current_headless_renderer,
-        );
-        cx.update(|cx| {
-            crate::fonts::init(cx);
-            cx.set_reduce_motion(true);
-        });
-        let narrow = std::env::var_os("DIRI_VISUAL_NARROW").is_some();
-        let window = cx
-            .open_window(
-                size(px(if narrow { 680.0 } else { 1000.0 }), px(720.0)),
-                move |window, cx| {
-                    let surfaces = cx.new(|cx| {
-                        let runtime = Arc::new(StoreRuntime::inert());
-                        let tokio = Arc::new(
-                            tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .build()
-                                .unwrap(),
-                        );
-                        let mut surfaces = UtilitySurfaces::new(
-                            runtime,
-                            tokio,
-                            crate::updates::inert(),
-                            window,
-                            cx,
-                        );
-                        seed_history(&mut surfaces);
-                        if let Ok(count) = std::env::var("DIRI_VISUAL_HISTORY_COUNT") {
-                            surfaces
-                                .history
-                                .truncate(count.parse().expect("history count"));
-                            surfaces.history_search.rebuild(&surfaces.history);
-                            surfaces.filter_history();
-                        }
-                        if let Ok(index) = std::env::var("DIRI_VISUAL_HISTORY_SCROLL") {
-                            surfaces.history_scroll.scroll_to_item_strict(
-                                index.parse().expect("history scroll index"),
-                                ScrollStrategy::Top,
-                            );
-                        }
-                        if std::env::var_os("DIRI_VISUAL_LIGHT").is_some() {
-                            surfaces.prefs.terminal_theme = TermTheme::DIRIJOR_LIGHT.id.to_owned();
-                        }
-                        if let Ok(query) = std::env::var("DIRI_VISUAL_QUERY") {
-                            surfaces.history_query.insert(&query);
-                            surfaces.filter_history();
-                        }
-                        if std::env::var_os("DIRI_VISUAL_OPENING").is_some() {
-                            surfaces.history_resuming = Some(surfaces.history[0].id.clone());
-                        }
-                        surfaces
-                    });
-                    cx.new(|_| CachedOverlayHarness { surfaces })
-                },
-            )
-            .unwrap();
-        cx.run_until_parked();
-        cx.update_window(window.into(), |_, window, _| window.refresh())
-            .unwrap();
-        cx.run_until_parked();
-        cx.capture_screenshot(window.into())
-            .unwrap()
-            .save(output)
-            .unwrap();
     }
 
     /// Regenerates the issue/PR screenshot without Screen Recording access or

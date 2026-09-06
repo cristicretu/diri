@@ -294,8 +294,8 @@ pub const COMMANDS: &[CommandSpec] = &[
         Some("cmd-p"),
         Some("⌘P"),
         Some(APP_CONTEXT),
-        "Open Folder…",
-        "magnifyingglass",
+        "Open project…",
+        "folder",
         "folder project directory jump goto find"
     ),
     spec!(
@@ -303,7 +303,10 @@ pub const COMMANDS: &[CommandSpec] = &[
         "history",
         Some("cmd-shift-h"),
         Some("⇧⌘H"),
-        Some(APP_CONTEXT)
+        Some(APP_CONTEXT),
+        "Search chats",
+        "clock",
+        "history conversations past resume"
     ),
     spec!(
         ToggleOverview,
