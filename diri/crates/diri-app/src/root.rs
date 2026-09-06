@@ -807,7 +807,11 @@ impl RootView {
                                     this.open_launcher(&OpenLauncher, window, cx);
                                 }
                                 if open_settings && let Some(surfaces) = &this.utility_surfaces {
-                                    surfaces.update(cx, |surfaces, cx| surfaces.open_settings(cx));
+                                    surfaces.update(cx, |surfaces, cx| {
+                                        if !surfaces.is_settings_open() {
+                                            surfaces.open_settings(cx);
+                                        }
+                                    });
                                 }
                                 if let Some(inspector) = &this.inspector {
                                     inspector.update(cx, |inspector, cx| {
@@ -3261,6 +3265,15 @@ impl Render for RootView {
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 this.run_command(CommandId::OpenSettings, window, cx);
             }))
+            .on_action(cx.listener(|this, _: &commands::ShowSettings, _, cx| {
+                if let Some(surfaces) = &this.utility_surfaces {
+                    surfaces.update(cx, |surfaces, cx| {
+                        if !surfaces.is_settings_open() {
+                            surfaces.open_settings(cx);
+                        }
+                    });
+                }
+            }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| {
                 this.run_command(CommandId::ToggleSidebar, window, cx);
             }))
@@ -3600,6 +3613,65 @@ mod tests {
                     .unwrap(),
             ),
         })
+    }
+
+    #[gpui::test]
+    fn palette_settings_clicks_reach_themes_and_full_settings(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.set_reduce_motion(true);
+            crate::commands::bind_keys(cx, &Default::default());
+        });
+        let services = test_services();
+        let store = services.store.clone();
+        let original_theme = store.store.read().unwrap().theme_id().to_owned();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-k s e t t i n g s");
+        cx.run_until_parked();
+        let position = cx.debug_bounds("palette-row-0").unwrap().center();
+        cx.simulate_click(position, Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("palette-back").is_some(),
+            "Settings opens a palette page"
+        );
+        let position = cx.debug_bounds("palette-row-0").unwrap().center();
+        cx.simulate_click(position, Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("down");
+        assert_ne!(store.store.read().unwrap().theme_id(), original_theme);
+        cx.simulate_keystrokes("escape");
+        assert_eq!(store.store.read().unwrap().theme_id(), original_theme);
+        cx.simulate_keystrokes("cmd-k s e t t i n g s enter");
+        cx.run_until_parked();
+        let position = cx.debug_bounds("palette-row-1").unwrap().center();
+        cx.simulate_click(position, Modifiers::default());
+        cx.run_until_parked();
+        root.read_with(cx, |root, cx| {
+            assert!(
+                root.utility_surfaces
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .is_settings_open()
+            );
+            assert!(!root.navigation.as_ref().unwrap().read(cx).is_open());
+        });
+        cx.simulate_keystrokes("cmd-k s e t t i n g s enter down enter");
+        cx.run_until_parked();
+        root.read_with(cx, |root, cx| {
+            assert!(
+                root.utility_surfaces
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .is_settings_open(),
+                "All settings keeps an already open Settings canvas visible"
+            );
+        });
     }
 
     #[gpui::test]

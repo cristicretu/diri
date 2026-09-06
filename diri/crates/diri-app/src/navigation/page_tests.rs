@@ -368,3 +368,442 @@ fn clicking_back_keeps_the_palette_open(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(!overlay.read_with(cx, |overlay, _| overlay.is_open()));
 }
+
+#[gpui::test]
+fn clicking_settings_opens_its_palette_page(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        let previous_focus = cx.focus_handle();
+        let overlay = cx.new(|cx| {
+            let mut overlay =
+                NavigationOverlay::opened_for_test(Arc::new(StoreRuntime::inert()), cx);
+            overlay.query.insert("settings");
+            overlay.query_changed(cx);
+            overlay.focus_handle.focus(window, cx);
+            overlay
+        });
+        Harness {
+            overlay,
+            previous_focus,
+        }
+    });
+    cx.simulate_resize(size(px(800.0), px(700.0)));
+    cx.run_until_parked();
+    let settings = cx.debug_bounds("palette-row-0").expect("Settings result");
+    cx.simulate_click(settings.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let overlay = view.read_with(cx, |view, _| view.overlay.clone());
+    overlay.read_with(cx, |overlay, _| {
+        assert_eq!(overlay.overlay, Some(Overlay::Settings))
+    });
+}
+
+#[gpui::test]
+fn palette_landing_is_compact_and_notifications_are_searchable(cx: &mut TestAppContext) {
+    let (overlay, cx) = cx.add_window_view(|_, cx| {
+        let mut overlay = NavigationOverlay::opened_for_test(Arc::new(StoreRuntime::inert()), cx);
+        overlay.refresh_command_items();
+        overlay
+    });
+    overlay.update(cx, |overlay, cx| {
+        assert_eq!(
+            overlay.ranked_actions.len(),
+            4,
+            "only everyday actions on the landing page"
+        );
+        overlay.query.insert("notifications");
+        overlay.query_changed(cx);
+        assert!(
+            overlay
+                .ranked_actions
+                .iter()
+                .any(|row| row.item.command
+                    == PaletteCommand::Action(CommandId::ToggleNotifications)),
+            "the inbox must be reachable through command search"
+        );
+    });
+}
+
+struct ActionHarness {
+    overlay: Entity<NavigationOverlay>,
+    previous_focus: FocusHandle,
+    dispatched: Arc<std::sync::Mutex<Vec<CommandId>>>,
+}
+
+impl Render for ActionHarness {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let mut root = div()
+            .key_context(crate::commands::APP_CONTEXT)
+            .size_full()
+            .track_focus(&self.previous_focus)
+            .child(crate::root::cached_window_overlay(self.overlay.clone()));
+        macro_rules! capture {
+            ($($action:ident),+ $(,)?) => {$(
+                let dispatched = self.dispatched.clone();
+                root = root.on_action(move |_: &crate::commands::$action, _, _| {
+                    dispatched.lock().unwrap().push(CommandId::$action);
+                });
+            )+};
+        }
+        capture!(
+            NewDefaultSession,
+            NewTerminal,
+            ToggleOverview,
+            OpenWorktrees,
+            ToggleSidebar,
+            OpenSettings,
+            ToggleNotifications,
+            CheckForUpdates
+        );
+        root
+    }
+}
+
+#[gpui::test]
+fn every_static_palette_action_dispatches_once_by_mouse_and_keyboard(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let dispatched = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let received = dispatched.clone();
+    let (view, cx) = cx.add_window_view(move |window, cx| {
+        let previous_focus = cx.focus_handle();
+        previous_focus.focus(window, cx);
+        let overlay =
+            cx.new(|cx| NavigationOverlay::opened_for_test(Arc::new(StoreRuntime::inert()), cx));
+        ActionHarness {
+            overlay,
+            previous_focus,
+            dispatched,
+        }
+    });
+    cx.simulate_resize(size(px(800.0), px(700.0)));
+    let overlay = view.read_with(cx, |view, _| view.overlay.clone());
+    let actions = {
+        let mut all = palette::actions_for_catalogs(
+            AgentKind::CLAUDE_CODE,
+            &[],
+            &[],
+            None,
+            None,
+            &Default::default(),
+        );
+        all.retain(|row| matches!(row.command, PaletteCommand::Action(id) if !matches!(id, CommandId::ToggleHistory | CommandId::ToggleQuickOpen | CommandId::OpenSettings)));
+        all
+    };
+    assert_eq!(actions.len(), 7, "new static actions need a dispatch probe");
+    for action in actions {
+        let PaletteCommand::Action(expected) = action.command else {
+            unreachable!()
+        };
+        for mouse in [true, false] {
+            overlay.update_in(cx, |overlay, window, cx| {
+                overlay.clear_overlay(cx);
+                overlay.open_overlay(Overlay::CommandPalette, window, cx);
+                overlay.query.insert(&action.title);
+                overlay.query_changed(cx);
+                let index = overlay
+                    .ranked_actions
+                    .iter()
+                    .position(|row| row.item.command == action.command)
+                    .unwrap();
+                overlay.highlight = overlay.ranked_sessions.len() + index;
+                overlay.scroll_to_highlight();
+            });
+            cx.run_until_parked();
+            if mouse {
+                let index = overlay.read_with(cx, |overlay, _| overlay.highlight);
+                assert_eq!(index, 0, "exact action title is the first search result");
+                let position = cx.debug_bounds("palette-row-0").unwrap().center();
+                cx.simulate_click(position, gpui::Modifiers::default());
+            } else {
+                cx.simulate_keystrokes("enter");
+            }
+            cx.run_until_parked();
+            assert_eq!(std::mem::take(&mut *received.lock().unwrap()), [expected]);
+            assert!(!overlay.read_with(cx, |overlay, _| overlay.is_open()));
+        }
+    }
+}
+
+#[test]
+fn landing_membership_does_not_depend_on_shortcut_labels() {
+    let mut actions = palette::actions_for_catalogs(
+        AgentKind::CLAUDE_CODE,
+        &[],
+        &[],
+        None,
+        None,
+        &Default::default(),
+    );
+    for row in &mut actions {
+        row.shortcut = None;
+    }
+    assert_eq!(
+        actions
+            .iter()
+            .filter(|row| landing_action_order(row).is_some())
+            .count(),
+        4
+    );
+    let default = actions.iter_mut().find(|row| row.is_default).unwrap();
+    default.shortcut = Some("custom shortcut".into());
+    assert_eq!(landing_action_order(default), Some(0));
+}
+
+#[gpui::test]
+fn searchable_pages_open_by_mouse_and_keyboard(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        let previous_focus = cx.focus_handle();
+        let overlay = cx.new(|cx| {
+            let mut overlay =
+                NavigationOverlay::opened_for_test(Arc::new(StoreRuntime::inert()), cx);
+            seed_history(&mut overlay);
+            overlay
+                .directory_index
+                .finish_scan(Vec::new(), Instant::now());
+            overlay.focus_handle.focus(window, cx);
+            overlay
+        });
+        Harness {
+            overlay,
+            previous_focus,
+        }
+    });
+    cx.simulate_resize(size(px(800.0), px(700.0)));
+    let overlay = view.read_with(cx, |view, _| view.overlay.clone());
+    for (query, expected) in [
+        ("Open project", Overlay::QuickOpen),
+        ("Search chats", Overlay::History),
+        ("Settings", Overlay::Settings),
+        ("Color theme", Overlay::Themes),
+    ] {
+        for mouse in [true, false] {
+            overlay.update_in(cx, |overlay, window, cx| {
+                overlay.open_overlay(Overlay::CommandPalette, window, cx);
+                overlay.query.insert(query);
+                overlay.query_changed(cx);
+            });
+            cx.run_until_parked();
+            if mouse {
+                let position = cx.debug_bounds("palette-row-0").unwrap().center();
+                cx.simulate_click(position, gpui::Modifiers::default());
+            } else {
+                cx.simulate_keystrokes("enter");
+            }
+            cx.run_until_parked();
+            overlay.read_with(cx, |overlay, _| {
+                assert_eq!(overlay.overlay, Some(expected), "{query}, mouse={mouse}")
+            });
+            let back = cx.debug_bounds("palette-back").unwrap().center();
+            cx.simulate_click(back, gpui::Modifiers::default());
+            cx.run_until_parked();
+            overlay.read_with(cx, |overlay, _| {
+                assert_eq!(overlay.overlay, Some(Overlay::CommandPalette));
+                assert_eq!(overlay.query.text(), query);
+            });
+        }
+    }
+}
+
+#[gpui::test]
+fn dynamic_palette_commands_preserve_their_targets(cx: &mut TestAppContext) {
+    use crate::store::StoreEffect;
+    let runtime = Arc::new(StoreRuntime::inert());
+    let (mut store, mut effects) = SessionStore::headless(Default::default());
+    let mut session =
+        crate::sidebar::SidebarPreviewFixture::make(crate::sidebar::PreviewScenario::Typical)
+            .list
+            .sessions
+            .remove(0);
+    session.kind = AgentKind::CLAUDE_CODE;
+    session.host = None;
+    let selected = session.id.clone();
+    store.upsert_session(session);
+    store.select(selected.clone());
+    store.set_hosts(vec![diri_proto::HostEntry {
+        id: "forge".into(),
+        name: Some("Forge".into()),
+        ssh: "forge".into(),
+        default_cwd: Some("/srv/work".into()),
+        node: None,
+    }]);
+    *runtime.store.write().unwrap() = store;
+    while effects.try_recv().is_ok() {}
+    let (overlay, cx) = cx.add_window_view(|_, cx| NavigationOverlay::opened_for_test(runtime, cx));
+    for (cwd, host) in [
+        (Some(PathBuf::from("/work/project")), None),
+        (None, Some("forge".to_owned())),
+    ] {
+        overlay.update_in(cx, |overlay, window, cx| {
+            overlay.open_overlay(Overlay::CommandPalette, window, cx);
+            overlay.run_palette_command(
+                PaletteCommand::SpawnAgent {
+                    agent: AgentKind::CODEX,
+                    cwd: cwd.clone(),
+                    host: host.clone(),
+                },
+                window,
+                cx,
+            );
+        });
+        let StoreEffect::Spawn(params) = effects.try_recv().unwrap() else {
+            panic!("spawn effect")
+        };
+        assert_eq!(params.kind, AgentKind::CODEX);
+        assert_eq!(params.host, host);
+        assert_eq!(
+            params.cwd,
+            cwd.as_ref()
+                .map_or("/srv/work".into(), |cwd| cwd.to_string_lossy().into_owned())
+        );
+        assert_eq!(params.same_repo_as, host.map(|_| selected.clone()));
+        assert!(!overlay.read_with(cx, |overlay, _| overlay.is_open()));
+    }
+    overlay.update_in(cx, |overlay, window, cx| {
+        overlay.run_palette_command(
+            PaletteCommand::MigrateSelected {
+                target_host: Some("forge".into()),
+            },
+            window,
+            cx,
+        );
+        overlay.run_palette_command(
+            PaletteCommand::SyncPrefs {
+                host: "forge".into(),
+            },
+            window,
+            cx,
+        );
+    });
+    assert_eq!(
+        effects.try_recv().unwrap(),
+        StoreEffect::Migrate {
+            id: selected,
+            target_host: Some("forge".into())
+        }
+    );
+    assert_eq!(
+        effects.try_recv().unwrap(),
+        StoreEffect::SyncPrefs {
+            host: "forge".into(),
+            host_name: "Forge".into()
+        }
+    );
+    assert!(effects.try_recv().is_err());
+}
+
+#[gpui::test]
+fn project_open_keeps_its_context_until_an_agent_can_launch(cx: &mut TestAppContext) {
+    use crate::store::StoreEffect;
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let runtime = Arc::new(StoreRuntime::inert());
+    let (store, mut effects) = SessionStore::headless(Default::default());
+    *runtime.store.write().unwrap() = store;
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        let previous_focus = cx.focus_handle();
+        let overlay = cx.new(|cx| {
+            let mut overlay = NavigationOverlay::opened_for_test(runtime, cx);
+            overlay.overlay = Some(Overlay::QuickOpen);
+            overlay.quick_snapshot.folders.push(QuickOpenItem {
+                name: "project".into(),
+                path: PathBuf::from("/work/project"),
+                is_git_repo: false,
+            });
+            overlay.focus_handle.focus(window, cx);
+            overlay
+        });
+        Harness {
+            overlay,
+            previous_focus,
+        }
+    });
+    cx.simulate_resize(size(px(800.0), px(700.0)));
+    cx.run_until_parked();
+    let position = cx.debug_bounds("palette-row-0").unwrap().center();
+    cx.simulate_click(position, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let overlay = view.read_with(cx, |view, _| view.overlay.clone());
+    assert_eq!(
+        overlay.read_with(cx, |overlay, _| overlay.overlay),
+        Some(Overlay::QuickOpen),
+        "a declined launch must keep the project ready for retry"
+    );
+    assert!(matches!(
+        effects.try_recv().unwrap(),
+        StoreEffect::RefreshAgents { .. }
+    ));
+    assert!(effects.try_recv().is_err());
+    overlay.update_in(cx, |overlay, window, _| {
+        assert!(overlay.focus_handle.is_focused(window));
+        assert!(
+            overlay
+                .page_error
+                .as_deref()
+                .is_some_and(|error| error.contains("Checking"))
+        );
+    });
+    // Cmd+Enter remains an explicit Terminal escape hatch while readiness is pending.
+    cx.simulate_keystrokes("cmd-enter");
+    let StoreEffect::Spawn(terminal) = effects.try_recv().unwrap() else {
+        panic!("terminal spawn")
+    };
+    assert_eq!(terminal.kind, AgentKind::SHELL);
+    assert_eq!(terminal.cwd, "/work/project");
+    overlay.update_in(cx, |overlay, window, cx| {
+        overlay.overlay = Some(Overlay::QuickOpen);
+        overlay.focus_handle.focus(window, cx);
+        cx.notify();
+    });
+    overlay.update(cx, |overlay, _| {
+        overlay
+            .store
+            .write()
+            .unwrap()
+            .set_agent_catalog(diri_proto::AgentReadinessResult::default());
+    });
+    // The refreshed empty catalog resolves to Terminal under the store's
+    // existing policy. The original selected directory must survive retry.
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let spawned = std::iter::from_fn(|| effects.try_recv().ok())
+        .find_map(|effect| match effect {
+            StoreEffect::Spawn(params) => Some(params),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(spawned.cwd, "/work/project");
+    assert_eq!(spawned.kind, AgentKind::SHELL);
+    assert!(!overlay.read_with(cx, |overlay, _| overlay.is_open()));
+}
+
+#[gpui::test]
+fn project_picker_does_not_treat_remote_paths_as_local(cx: &mut TestAppContext) {
+    let runtime = Arc::new(StoreRuntime::inert());
+    let mut fixture =
+        crate::sidebar::SidebarPreviewFixture::make(crate::sidebar::PreviewScenario::Typical).list;
+    fixture.sessions.truncate(2);
+    for (index, session) in fixture.sessions.iter_mut().enumerate() {
+        session.cwd = format!("/work/project-{index}");
+        session.project_id = diri_proto::ProjectId::new(format!("project-{index}"));
+        session.host = (index == 1).then(|| "forge".into());
+    }
+    fixture.projects = fixture
+        .sessions
+        .iter()
+        .map(|session| diri_proto::Project {
+            id: session.project_id.clone(),
+            root: session.cwd.clone(),
+            name: session.cwd.clone(),
+            pinned_order: None,
+            host: session.host.clone(),
+        })
+        .collect();
+    runtime.store.write().unwrap().hydrate(fixture);
+    let (overlay, cx) = cx.add_window_view(|_, cx| NavigationOverlay::opened_for_test(runtime, cx));
+    overlay.update(cx, |overlay, _| {
+        let (projects, directories) = overlay.snapshot_inputs();
+        assert_eq!(directories, [PathBuf::from("/work/project-0")]);
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].0, PathBuf::from("/work/project-0"));
+    });
+}

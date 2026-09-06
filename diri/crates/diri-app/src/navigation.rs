@@ -45,7 +45,7 @@ const LIST_HEIGHT: f32 = ROW_HEIGHT * 9.0;
 const SURFACE_WIDTH: f32 = 600.0;
 const KEYCAP_WIDTH: f32 = 28.0;
 const KEYCAP_HEIGHT: f32 = 20.0;
-const CHAT_PREVIEW_LIMIT: usize = 7;
+const CHAT_PREVIEW_LIMIT: usize = 5;
 const PAGE_DURATION: Duration = Duration::from_millis(140);
 
 /// Where the overlay sits and how tall its list may grow in this window.
@@ -125,7 +125,7 @@ pub struct NavigationOverlay {
     previous_page_rows: usize,
     last_theme_id: String,
     theme_matches: Vec<TermTheme>,
-    theme_error: Option<String>,
+    page_error: Option<String>,
     /// Separate slots: the disk-cache load and the filesystem scan both start
     /// at launch, and neither may cancel the other by sharing a `Task` slot.
     cache_task: Option<Task<()>>,
@@ -194,7 +194,7 @@ impl NavigationOverlay {
             previous_page_rows: 9,
             last_theme_id: String::new(),
             theme_matches: Vec::new(),
-            theme_error: None,
+            page_error: None,
             cache_task: None,
             scan_task: None,
             rank_task: None,
@@ -246,7 +246,7 @@ impl NavigationOverlay {
             previous_page_rows: 9,
             last_theme_id: String::new(),
             theme_matches: Vec::new(),
-            theme_error: None,
+            page_error: None,
             cache_task: None,
             scan_task: None,
             rank_task: None,
@@ -485,7 +485,11 @@ impl NavigationOverlay {
     fn snapshot_inputs(&mut self) -> (Vec<(PathBuf, String)>, Vec<PathBuf>) {
         let projects = self.project_roots();
         let store = self.store.read().expect("session store lock poisoned");
-        let mut sessions: Vec<_> = store.sessions().values().collect();
+        let mut sessions: Vec<_> = store
+            .sessions()
+            .values()
+            .filter(|session| session.host.is_none())
+            .collect();
         sessions.sort_by(|left, right| {
             right
                 .updated_at
@@ -506,6 +510,9 @@ impl NavigationOverlay {
             .sidebar_projection()
             .projects
             .iter()
+            // This picker launches local folders. Remote projects remain
+            // available through commands that carry an explicit host target.
+            .filter(|entry| entry.host.is_none())
             .map(|entry| {
                 (
                     PathBuf::from(&entry.project.root),
@@ -640,18 +647,6 @@ impl NavigationOverlay {
         }
     }
 
-    #[cfg(test)]
-    fn quick_action_count(&self) -> usize {
-        if self.query.text().trim().is_empty() {
-            self.ranked_actions
-                .iter()
-                .take_while(|ranked| is_quick_action(&ranked.item))
-                .count()
-        } else {
-            0
-        }
-    }
-
     fn run_highlighted(&mut self, secondary: bool, window: &mut Window, cx: &mut Context<Self>) {
         match self.overlay {
             Some(Overlay::CommandPalette) => {
@@ -674,24 +669,30 @@ impl NavigationOverlay {
             Some(Overlay::QuickOpen) => {
                 if let Some(item) = self.current_quick_item() {
                     let cwd = item.path.to_string_lossy().into_owned();
-                    if secondary {
-                        self.store
-                            .write()
-                            .expect("session store lock poisoned")
-                            .spawn_shell(SpawnOptions {
-                                cwd: Some(cwd.clone()),
-                                ..SpawnOptions::default()
-                            });
+                    let launched = {
+                        let mut store = self.store.write().expect("session store lock poisoned");
+                        let options = SpawnOptions {
+                            cwd: Some(cwd),
+                            ..SpawnOptions::default()
+                        };
+                        if secondary {
+                            store.spawn_shell(options);
+                            true
+                        } else if store.spawn_default(options) {
+                            true
+                        } else {
+                            self.page_error =
+                                store.action_failure().map(|failure| failure.detail.clone());
+                            false
+                        }
+                    };
+                    if launched {
+                        self.close_overlay(window, cx);
                     } else {
-                        self.store
-                            .write()
-                            .expect("session store lock poisoned")
-                            .spawn_default(SpawnOptions {
-                                cwd: Some(cwd.clone()),
-                                ..SpawnOptions::default()
-                            });
+                        // Keep the selected project and input focus available
+                        // for retry once Agent readiness has arrived.
+                        cx.notify();
                     }
-                    self.close_overlay(window, cx);
                 }
             }
             Some(Overlay::History) => {
@@ -703,7 +704,7 @@ impl NavigationOverlay {
                 Some(0) => self.push_page(Overlay::Themes, window, cx),
                 Some(_) => {
                     self.close_overlay(window, cx);
-                    window.dispatch_action(Box::new(crate::commands::OpenSettings), cx);
+                    window.dispatch_action(Box::new(crate::commands::ShowSettings), cx);
                 }
                 None => {}
             },
@@ -830,14 +831,10 @@ impl NavigationOverlay {
         let searching = !self.query.text().trim().is_empty();
         let mut ranked_actions = palette::rank_actions(actions, &query, &mut self.matcher);
         if !searching {
-            // Empty-query browsing is intentionally curated: two frequent
-            // actions stay visible directly below chats, while fuzzy
-            // search remains score-ordered across every command.
-            let (mut quick, commands): (Vec<_>, Vec<_>) = ranked_actions
-                .into_iter()
-                .partition(|ranked| is_quick_action(&ranked.item));
-            quick.extend(commands);
-            ranked_actions = quick;
+            // Keep the landing page focused. Every advanced action remains
+            // searchable, including target-specific Agent/project shortcuts.
+            ranked_actions.retain(|ranked| landing_action_order(&ranked.item).is_some());
+            ranked_actions.sort_by_key(|ranked| landing_action_order(&ranked.item));
         }
         self.ranked_actions = ranked_actions;
         self.ranked_sessions = palette::rank_sessions(sessions, &query, &mut self.matcher);
@@ -889,7 +886,7 @@ impl NavigationOverlay {
         self.rank_task = None;
         self.cancel_theme_preview();
         self.overlay = Some(page);
-        self.theme_error = None;
+        self.page_error = None;
         self.query.clear();
         self.reset_selection();
         self.ranked_items.clear();
@@ -1010,7 +1007,7 @@ impl NavigationOverlay {
                 self._runtime.publish_local_change();
             }
             Err(error) => {
-                self.theme_error = Some(format!("Could not save theme: {error}"));
+                self.page_error = Some(format!("Could not save theme: {error}"));
                 cx.notify();
             }
         }
@@ -1018,6 +1015,7 @@ impl NavigationOverlay {
 
     fn page_rows(&self) -> usize {
         match self.overlay {
+            Some(Overlay::CommandPalette) => self.visible_count().clamp(1, 9),
             Some(Overlay::Settings) => 2,
             Some(Overlay::History) => 7,
             _ => 9,
@@ -1054,7 +1052,7 @@ impl NavigationOverlay {
         let error = if page == Overlay::History {
             self.history_error.clone()
         } else {
-            self.theme_error.clone()
+            self.page_error.clone()
         };
         let content = div()
             .id("palette-page")
@@ -1595,13 +1593,16 @@ impl Render for NavigationOverlay {
     }
 }
 
-fn is_quick_action(action: &PaletteAction) -> bool {
-    let default_shortcut =
-        crate::commands::command(crate::commands::CommandId::NewDefaultSession).shortcut_label();
-    matches!(
-        action.command,
-        PaletteCommand::Action(crate::commands::CommandId::ToggleQuickOpen)
-    ) || action.shortcut.as_deref() == default_shortcut.as_deref()
+fn landing_action_order(action: &PaletteAction) -> Option<u8> {
+    if action.is_default {
+        return Some(0);
+    }
+    match action.command {
+        PaletteCommand::Action(CommandId::ToggleQuickOpen) => Some(1),
+        PaletteCommand::Action(CommandId::ToggleHistory) => Some(2),
+        PaletteCommand::Action(CommandId::OpenSettings) => Some(3),
+        _ => None,
+    }
 }
 
 fn session_shortcut(index: usize) -> Option<String> {
@@ -1902,16 +1903,14 @@ mod tests {
         overlay.read_with(cx, |overlay, _| {
             assert!(!overlay.ranked_sessions.is_empty());
             assert!(overlay.ranked_sessions.len() <= CHAT_PREVIEW_LIMIT);
-            assert_eq!(overlay.quick_action_count(), 2);
-            assert!(
-                overlay.ranked_actions[..2]
+            assert_eq!(overlay.ranked_actions.len(), 4);
+            assert_eq!(
+                overlay
+                    .ranked_actions
                     .iter()
-                    .all(|ranked| is_quick_action(&ranked.item))
-            );
-            assert!(
-                overlay.ranked_actions[2..]
-                    .iter()
-                    .all(|ranked| !is_quick_action(&ranked.item))
+                    .map(|row| landing_action_order(&row.item))
+                    .collect::<Vec<_>>(),
+                [Some(0), Some(1), Some(2), Some(3)],
             );
             assert!(matches!(
                 overlay.highlighted_command(),
