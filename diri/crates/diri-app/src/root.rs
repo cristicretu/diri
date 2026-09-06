@@ -266,7 +266,7 @@ impl RootView {
         });
         let navigation = (!preview).then(|| {
             let runtime = Arc::clone(&services.store);
-            cx.new(|cx| NavigationOverlay::new(runtime, window, cx))
+            cx.new(|cx| NavigationOverlay::new(runtime, Arc::clone(&services.tokio), window, cx))
         });
         let session_surfaces = (!preview).then(|| {
             let runtime = Arc::clone(&services.store);
@@ -985,7 +985,7 @@ impl RootView {
             .store
             .read()
             .expect("session store lock poisoned");
-        crate::app_theme::colors(&store.preferences().terminal_theme)
+        crate::app_theme::colors(store.theme_id())
     }
 
     fn show_quote_feedback(
@@ -1311,6 +1311,14 @@ impl RootView {
         if self.sidebar.read(cx).is_focused(window) {
             return;
         }
+        if self
+            .navigation
+            .as_ref()
+            .is_some_and(|navigation| navigation.read(cx).is_open())
+        {
+            // The focused palette owns input even over the composer or Settings.
+            return;
+        }
         if self.launcher.read(cx).is_open() {
             let reopen = commands::matches_keystroke(CommandId::OpenLauncher, &event.keystroke);
             let focus_sidebar =
@@ -1389,8 +1397,10 @@ impl RootView {
                 }
             }
             CommandId::ToggleHistory => {
-                if let Some(surfaces) = &self.utility_surfaces {
-                    surfaces.update(cx, |surfaces, cx| surfaces.toggle_history(cx));
+                if let Some(navigation) = &self.navigation {
+                    navigation.update(cx, |navigation, cx| {
+                        navigation.toggle_history(&ToggleHistory, window, cx)
+                    });
                 }
             }
             CommandId::ToggleOverview => {
@@ -1399,11 +1409,17 @@ impl RootView {
                 }
             }
             CommandId::OpenWorktrees => {
+                if let Some(navigation) = &self.navigation {
+                    navigation.update(cx, |navigation, cx| navigation.dismiss(cx));
+                }
                 if let Some(surfaces) = &self.utility_surfaces {
                     surfaces.update(cx, |surfaces, cx| surfaces.open_worktrees(cx));
                 }
             }
             CommandId::OpenSettings => {
+                if let Some(navigation) = &self.navigation {
+                    navigation.update(cx, |navigation, cx| navigation.dismiss(cx));
+                }
                 if let Some(surfaces) = &self.utility_surfaces {
                     surfaces.update(cx, |surfaces, cx| surfaces.toggle_settings(cx));
                 }

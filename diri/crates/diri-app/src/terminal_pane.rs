@@ -1255,7 +1255,7 @@ impl TerminalPane {
             .store
             .read()
             .expect("session store lock poisoned");
-        crate::app_theme::colors(&store.preferences().terminal_theme)
+        crate::app_theme::colors(store.theme_id())
     }
 
     fn handle_pane_event(&mut self, event: PaneEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -3573,7 +3573,7 @@ impl Render for TerminalPane {
                 .store
                 .read()
                 .expect("session store lock poisoned");
-            let theme_id = &store.preferences().terminal_theme;
+            let theme_id = store.theme_id();
             (
                 crate::app_theme::terminal_theme(theme_id),
                 crate::app_theme::colors(theme_id),

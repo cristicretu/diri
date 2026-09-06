@@ -322,6 +322,7 @@ pub struct SessionStore {
     directory_request_seq: u64,
     directory_listing: Option<DirectoryListing>,
     prefs: Prefs,
+    theme_preview: Option<String>,
     terminal_residency: TerminalResidency,
     app_is_active: bool,
     notification_surface_visible: bool,
@@ -415,6 +416,7 @@ impl SessionStore {
                 directory_request_seq: 0,
                 directory_listing: None,
                 prefs,
+                theme_preview: None,
                 terminal_residency: TerminalResidency::default(),
                 app_is_active: true,
                 notification_surface_visible: true,
@@ -1043,6 +1045,25 @@ impl SessionStore {
     /// without waiting for the next daemon event.
     pub fn request_snapshot_publish(&mut self) {
         self.emit(StoreEffect::PublishSnapshot);
+    }
+
+    /// Effective appearance only; persisted preferences never contain a preview.
+    pub fn theme_id(&self) -> &str {
+        self.theme_preview
+            .as_deref()
+            .unwrap_or(&self.prefs.terminal_theme)
+    }
+
+    pub fn preview_theme_id(&self) -> Option<&str> {
+        self.theme_preview.as_deref()
+    }
+
+    pub fn preview_theme(&mut self, theme: Option<String>) -> bool {
+        if self.theme_preview == theme {
+            return false;
+        }
+        self.theme_preview = theme;
+        true
     }
 
     pub fn update_preferences(&mut self, update: impl FnOnce(&mut Prefs)) -> io::Result<()> {
