@@ -1070,6 +1070,7 @@ impl NavigationOverlay {
                     .child(
                         div()
                             .id("palette-back")
+                            .debug_selector(|| "palette-back".into())
                             .size(px(28.0))
                             .flex_none()
                             .flex()
@@ -1260,6 +1261,9 @@ impl NavigationOverlay {
             )
             .child(
                 div()
+                    // Consume hit tests inside the surface before the dismiss
+                    // backdrop sees mouse-down, including header controls.
+                    .occlude()
                     .on_mouse_down_out(
                         cx.listener(|this, _, window, cx| this.close_overlay(window, cx)),
                     )

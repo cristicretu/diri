@@ -312,3 +312,59 @@ fn pending_project_search_cannot_change_a_new_page(cx: &mut TestAppContext) {
         assert!(overlay.rank_task.is_none());
     });
 }
+
+#[gpui::test]
+fn clicking_back_keeps_the_palette_open(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        let previous_focus = cx.focus_handle();
+        let overlay = cx.new(|cx| {
+            let mut overlay =
+                NavigationOverlay::opened_for_test(Arc::new(StoreRuntime::inert()), cx);
+            seed_history(&mut overlay);
+            overlay.focus_handle.focus(window, cx);
+            overlay
+        });
+        Harness {
+            overlay,
+            previous_focus,
+        }
+    });
+    cx.simulate_resize(size(px(800.0), px(700.0)));
+    cx.run_until_parked();
+    let back = cx.debug_bounds("palette-back").expect("back button");
+    cx.simulate_click(back.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let overlay = view.read_with(cx, |view, _| view.overlay.clone());
+    overlay.read_with(cx, |overlay, _| {
+        assert_eq!(
+            overlay.overlay,
+            Some(Overlay::CommandPalette),
+            "clicking Back should return to commands, not dismiss the palette"
+        );
+    });
+    overlay.update_in(cx, |overlay, window, cx| {
+        overlay.query.insert("settings");
+        overlay.query_changed(cx);
+        overlay.push_page(Overlay::Settings, window, cx);
+        overlay.push_page(Overlay::Themes, window, cx);
+        overlay.move_highlight(1, cx);
+    });
+    cx.run_until_parked();
+    for expected in [Overlay::Settings, Overlay::CommandPalette] {
+        let back = cx.debug_bounds("palette-back").unwrap();
+        cx.simulate_click(back.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        overlay.read_with(cx, |overlay, _| {
+            assert_eq!(overlay.overlay, Some(expected));
+            assert!(overlay.store.read().unwrap().preview_theme_id().is_none());
+        });
+    }
+    overlay.update_in(cx, |overlay, window, _| {
+        assert_eq!(overlay.query.text(), "settings");
+        assert!(overlay.focus_handle.is_focused(window));
+    });
+    cx.simulate_click(point(px(5.0), px(600.0)), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(!overlay.read_with(cx, |overlay, _| overlay.is_open()));
+}
