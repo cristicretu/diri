@@ -1,6 +1,6 @@
 use super::*;
 use diri_proto::{DateMillis, HistoryEntry};
-use gpui::{Entity, TestAppContext};
+use gpui::{Entity, TestAppContext, point, size};
 
 struct Harness {
     overlay: Entity<NavigationOverlay>,

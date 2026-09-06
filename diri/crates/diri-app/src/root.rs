@@ -45,6 +45,9 @@ use crate::workbench::WorkbenchLayout;
 
 #[path = "notification_panel.rs"]
 mod notification_panel;
+#[cfg(test)]
+#[path = "notification_panel_tests.rs"]
+mod notification_panel_tests;
 
 const WINDOW_BOUNDS_SAVE_DELAY: Duration = Duration::from_millis(150);
 
@@ -219,6 +222,8 @@ pub struct RootView {
     notification_panel_open: bool,
     notification_filter_unread: bool,
     notification_selected: usize,
+    notification_scroll: gpui::UniformListScrollHandle,
+    notification_options_open: bool,
     notification_focus: FocusHandle,
     notification_health: String,
     pending_notification_open: Option<(SessionId, Option<String>)>,
@@ -913,6 +918,8 @@ impl RootView {
             notification_panel_open: false,
             notification_filter_unread: true,
             notification_selected: 0,
+            notification_scroll: gpui::UniformListScrollHandle::new(),
+            notification_options_open: false,
             notification_focus: cx.focus_handle(),
             pending_notification_open: None,
             notification_health:
@@ -3444,7 +3451,7 @@ impl Render for RootView {
         if let Some(picker) = self.quote_target_picker(colors, sidebar_width, cx) {
             root = root.child(deferred(picker));
         }
-        if let Some(panel) = self.notification_panel(colors, window, cx) {
+        if let Some(panel) = self.notification_panel(window, cx) {
             root = root.child(deferred(panel));
         }
         if let Some(status) = self.status_banner(colors, cx) {
@@ -3578,7 +3585,7 @@ mod tests {
     use crate::sidebar::{PreviewScenario, SidebarPreviewFixture};
     use gpui::{Modifiers, size};
 
-    fn test_services() -> Arc<AppServices> {
+    pub(super) fn test_services() -> Arc<AppServices> {
         Arc::new(AppServices {
             store: Arc::new(crate::store::StoreRuntime::inert()),
             usage_tx: tokio::sync::watch::channel(crate::usage::UsageSnapshot::default()).0,
