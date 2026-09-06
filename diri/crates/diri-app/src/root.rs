@@ -807,11 +807,7 @@ impl RootView {
                                     this.open_launcher(&OpenLauncher, window, cx);
                                 }
                                 if open_settings && let Some(surfaces) = &this.utility_surfaces {
-                                    surfaces.update(cx, |surfaces, cx| {
-                                        if !surfaces.is_settings_open() {
-                                            surfaces.open_settings(cx);
-                                        }
-                                    });
+                                    surfaces.update(cx, |surfaces, cx| surfaces.open_settings(cx));
                                 }
                                 if let Some(inspector) = &this.inspector {
                                     inspector.update(cx, |inspector, cx| {
