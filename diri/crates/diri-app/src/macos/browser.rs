@@ -33,16 +33,24 @@ pub struct BrowserFrame {
     pub height: f32,
 }
 
-/// A lazily-attached, single-tab WebKit view.
+/// Keeps a separate native page and navigation history for each workspace tab.
+/// Only the selected page can be attached visibly; inactive pages retain state.
 pub struct NativeBrowser {
-    web_view: Option<Retained<BrowserWebView>>,
-    /// Non-owning: AppKit owns the GPUI root view for the window lifetime.
-    parent: Option<*const NSView>,
-    pending_url: Option<String>,
-    delegate: Option<Retained<BrowserDelegate>>,
-    events: tokio::sync::mpsc::Sender<()>,
-    visible: bool,
-    pointer_passthrough: bool,
+    active: Option<u64>,
+    page: BrowserPage,
+    pages: std::collections::HashMap<u64, BrowserPage>,
+}
+
+impl std::ops::Deref for NativeBrowser {
+    type Target = BrowserPage;
+    fn deref(&self) -> &Self::Target {
+        &self.page
+    }
+}
+impl std::ops::DerefMut for NativeBrowser {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.page
+    }
 }
 
 impl NativeBrowser {
@@ -50,20 +58,42 @@ impl NativeBrowser {
         let (events, receiver) = tokio::sync::mpsc::channel(1);
         (
             Self {
-                web_view: None,
-                parent: None,
-                pending_url: None,
-                delegate: None,
-                events,
-                visible: false,
-                pointer_passthrough: false,
+                active: None,
+                page: BrowserPage::new(events),
+                pages: std::collections::HashMap::new(),
             },
             receiver,
         )
     }
 
-    pub fn has_page(&self) -> bool {
-        self.pending_url.is_some()
+    pub fn select_tab(&mut self, id: u64) {
+        if self.active == Some(id) {
+            return;
+        }
+        self.page.set_visible(false);
+        let next = self
+            .pages
+            .remove(&id)
+            .unwrap_or_else(|| BrowserPage::new(self.page.events.clone()));
+        if let Some(previous) = self.active.replace(id) {
+            let old = std::mem::replace(&mut self.page, next);
+            self.pages.insert(previous, old);
+        } else {
+            // Initial page can be primed before the first tab is mounted.
+            if !self.page.has_page() {
+                self.page = next;
+            }
+        }
+        let _ = self.page.events.try_send(());
+    }
+
+    pub fn close_tab(&mut self, id: u64) {
+        if self.active == Some(id) {
+            self.page.clear();
+            self.active = None;
+        } else {
+            self.pages.remove(&id);
+        }
     }
 
     /// Native content shares the measured GPUI body, including its borders,
@@ -90,6 +120,36 @@ impl NativeBrowser {
         )
         .absolute()
         .inset_0()
+    }
+}
+
+/// A lazily-attached, single-tab WebKit view.
+pub struct BrowserPage {
+    web_view: Option<Retained<BrowserWebView>>,
+    /// Non-owning: AppKit owns the GPUI root view for the window lifetime.
+    parent: Option<*const NSView>,
+    pending_url: Option<String>,
+    delegate: Option<Retained<BrowserDelegate>>,
+    events: tokio::sync::mpsc::Sender<()>,
+    visible: bool,
+    pointer_passthrough: bool,
+}
+
+impl BrowserPage {
+    fn new(events: tokio::sync::mpsc::Sender<()>) -> Self {
+        Self {
+            web_view: None,
+            parent: None,
+            pending_url: None,
+            delegate: None,
+            events,
+            visible: false,
+            pointer_passthrough: false,
+        }
+    }
+
+    pub fn has_page(&self) -> bool {
+        self.pending_url.is_some()
     }
 
     pub fn set_visible(&mut self, visible: bool) {
@@ -281,7 +341,7 @@ impl NativeBrowser {
     }
 }
 
-impl Drop for NativeBrowser {
+impl Drop for BrowserPage {
     fn drop(&mut self) {
         self.detach();
     }
@@ -536,6 +596,8 @@ pub fn smoke_test() {
     window.makeKeyAndOrderFront(None);
     let host = Host(window.contentView().expect("fixture content view"));
     let (mut browser, mut events) = NativeBrowser::new();
+    browser.select_tab(1);
+    browser.set_visible(true);
     let frame = BrowserFrame {
         x: 0.0,
         y: 0.0,
@@ -577,96 +639,134 @@ pub fn smoke_test() {
     until(|| {
         browser.state().title.as_deref() == Some("Fixture Two") && !browser.state().is_loading
     });
+    // The tab fixture also runs in noninteractive desktop sessions where
+    // WebKit intentionally withholds requestAnimationFrame callbacks.
+    let tabs_only = std::env::var_os("DIRI_NATIVE_BROWSER_TABS_ONLY").is_some();
     let mut resize_time = Duration::ZERO;
-    while events.try_recv().is_ok() {}
-    unsafe {
-        view.evaluateJavaScript_completionHandler(
-            &NSString::from_str("history.pushState({}, '', '/same-document')"),
-            None,
-        );
-    }
-    until(|| {
-        browser
-            .state()
-            .url
-            .as_deref()
-            .is_some_and(|url| url.ends_with("/same-document"))
-    });
-    assert!(
-        events.try_recv().is_ok(),
-        "same-document URLs must notify the toolbar"
-    );
-    let script_done = Rc::new(Cell::new(false));
-    let done = script_done.clone();
-    let completion = block2::RcBlock::new(
-        move |_: *mut objc2::runtime::AnyObject, error: *mut NSError| {
-            assert!(error.is_null(), "resize script failed: {:?}", unsafe {
-                error.as_ref()
-            });
-            done.set(true);
-        },
-    );
-    unsafe {
-        view.evaluateJavaScript_completionHandler(&NSString::from_str(
-            "window.resizeFrames = 0; window.resizeEvents = 0; addEventListener('resize', () => resizeEvents++); function tick() { resizeFrames++; document.title = innerWidth + ':' + resizeFrames + ':' + resizeEvents; requestAnimationFrame(tick); } requestAnimationFrame(tick);"
-        ), Some(&completion));
-    }
-    until(|| script_done.get());
-    until(|| {
-        browser
-            .state()
-            .title
-            .as_deref()
-            .is_some_and(|title| title.contains(':'))
-    });
-    while events.try_recv().is_ok() {}
-    until(|| events.try_recv().is_ok());
-    browser.set_pointer_passthrough(true);
-    assert!(
-        view.hitTest(NSPoint::new(20.0, 20.0)).is_none(),
-        "resize motion must reach GPUI"
-    );
-    for step in 0..240 {
-        let width = 320.0 + (step % 120) as f32 * 2.0;
-        let resized = BrowserFrame { width, ..frame };
-        let start = Instant::now();
-        // Repeated root paints without geometry changes are common while a
-        // terminal streams output next to the page.
-        for _ in 0..8 {
-            browser.sync(&host, true, resized);
-        }
-        resize_time += start.elapsed();
-        assert!(!view.isHidden(), "resize must keep the website painted");
-        assert_eq!(view.frame().size.width, f64::from(width));
-        assert!(std::ptr::eq(&**browser.web_view.as_ref().unwrap(), &*view));
-        pump();
-        if step == 119 || step == 239 {
-            until(|| {
-                browser
-                    .state()
-                    .title
-                    .as_deref()
-                    .is_some_and(|title| title.starts_with("558:"))
-            });
-            let title = browser.state().title.unwrap();
-            let values: Vec<u32> = title
-                .split(':')
-                .map(|value| value.parse().unwrap())
-                .collect();
-            assert!(
-                values[1] > 10 && values[2] > 10,
-                "page must keep painting and reflowing during the drag: {title}"
+    if !tabs_only {
+        while events.try_recv().is_ok() {}
+        unsafe {
+            view.evaluateJavaScript_completionHandler(
+                &NSString::from_str("history.pushState({}, '', '/same-document')"),
+                None,
             );
         }
+        until(|| {
+            browser
+                .state()
+                .url
+                .as_deref()
+                .is_some_and(|url| url.ends_with("/same-document"))
+        });
+        assert!(
+            events.try_recv().is_ok(),
+            "same-document URLs must notify the toolbar"
+        );
+        let script_done = Rc::new(Cell::new(false));
+        let done = script_done.clone();
+        let completion = block2::RcBlock::new(
+            move |_: *mut objc2::runtime::AnyObject, error: *mut NSError| {
+                assert!(error.is_null(), "resize script failed: {:?}", unsafe {
+                    error.as_ref()
+                });
+                done.set(true);
+            },
+        );
+        unsafe {
+            view.evaluateJavaScript_completionHandler(&NSString::from_str(
+            "window.resizeFrames = 0; window.resizeEvents = 0; addEventListener('resize', () => resizeEvents++); function tick() { resizeFrames++; document.title = innerWidth + ':' + resizeFrames + ':' + resizeEvents; requestAnimationFrame(tick); } requestAnimationFrame(tick);"
+        ), Some(&completion));
+        }
+        until(|| script_done.get());
+        until(|| {
+            browser
+                .state()
+                .title
+                .as_deref()
+                .is_some_and(|title| title.contains(':'))
+        });
+        while events.try_recv().is_ok() {}
+        until(|| events.try_recv().is_ok());
+        browser.set_pointer_passthrough(true);
+        assert!(
+            view.hitTest(NSPoint::new(20.0, 20.0)).is_none(),
+            "resize motion must reach GPUI"
+        );
+        for step in 0..240 {
+            let width = 320.0 + (step % 120) as f32 * 2.0;
+            let resized = BrowserFrame { width, ..frame };
+            let start = Instant::now();
+            // Repeated root paints without geometry changes are common while a
+            // terminal streams output next to the page.
+            for _ in 0..8 {
+                browser.sync(&host, true, resized);
+            }
+            resize_time += start.elapsed();
+            assert!(!view.isHidden(), "resize must keep the website painted");
+            assert_eq!(view.frame().size.width, f64::from(width));
+            assert!(std::ptr::eq(&**browser.web_view.as_ref().unwrap(), &*view));
+            pump();
+            if step == 119 || step == 239 {
+                until(|| {
+                    browser
+                        .state()
+                        .title
+                        .as_deref()
+                        .is_some_and(|title| title.starts_with("558:"))
+                });
+                let title = browser.state().title.unwrap();
+                let values: Vec<u32> = title
+                    .split(':')
+                    .map(|value| value.parse().unwrap())
+                    .collect();
+                assert!(
+                    values[1] > 10 && values[2] > 10,
+                    "page must keep painting and reflowing during the drag: {title}"
+                );
+            }
+        }
     }
+    let expected_url = browser.state().url;
+    browser.select_tab(2);
+    browser.set_visible(true);
+    assert!(view.isHidden(), "inactive native tabs must be hidden");
+    browser.load(format!("http://{address}/one"));
+    browser.sync(&host, true, frame);
+    until(|| {
+        browser.state().title.as_deref() == Some("Fixture One") && !browser.state().is_loading
+    });
+    let second_view = browser.web_view.as_ref().unwrap().clone();
+    browser.select_tab(1);
+    browser.set_visible(true);
+    browser.sync(&host, true, frame);
+    assert!(second_view.isHidden());
+    assert!(!view.isHidden());
+    assert!(
+        std::ptr::eq(&**browser.web_view.as_ref().unwrap(), &*view),
+        "tab activation preserves the live web view"
+    );
+    assert_eq!(browser.state().url, expected_url);
+    assert!(browser.state().can_go_back);
+    browser.close_tab(2);
+    assert!(
+        unsafe { second_view.superview() }.is_none(),
+        "closing a background tab detaches only its page"
+    );
+    assert!(!view.isHidden());
     browser.set_pointer_passthrough(false);
     assert!(
         view.hitTest(NSPoint::new(20.0, 20.0)).is_some(),
         "page interaction must resume after release"
     );
-    println!(
-        "Native resize sweep: 240 sizes / 1920 syncs in {resize_time:?} of main-thread sync work"
-    );
+    if tabs_only {
+        println!(
+            "Native browser tabs: independent pages, preserved history, and background close passed"
+        );
+    } else {
+        println!(
+            "Native resize sweep: 240 sizes / 1920 syncs in {resize_time:?} of main-thread sync work"
+        );
+    }
     // Window resizing also changes the AppKit coordinate conversion. Keep the
     // page aligned below a toolbar, with no reload or visibility transition.
     for step in 0..32 {
@@ -711,6 +811,39 @@ pub fn smoke_test() {
     browser.clear();
     window.close();
     println!(
-        "Native browser fixture passed: DOM load, navigation/history, live resize/animation frames, pointer passthrough/release, window resize alignment, cached overlay restoration, close, load failure."
+        "Native browser fixture passed: DOM load, navigation/history, independent tabs, window resize alignment, cached overlay restoration, close, load failure. Live animation sweep: {}.",
+        if tabs_only { "skipped" } else { "passed" }
     );
+}
+
+#[cfg(test)]
+mod tab_tests {
+    use super::*;
+
+    #[test]
+    fn browser_tabs_keep_urls_and_close_only_the_addressed_page() {
+        let (mut browser, _) = NativeBrowser::new();
+        browser.select_tab(10);
+        browser.load("https://example.com/first".into());
+        browser.select_tab(20);
+        assert!(!browser.has_page());
+        browser.load("https://example.com/second".into());
+        browser.select_tab(10);
+        assert_eq!(
+            browser.state().url.as_deref(),
+            Some("https://example.com/first")
+        );
+        browser.close_tab(20);
+        assert_eq!(
+            browser.state().url.as_deref(),
+            Some("https://example.com/first")
+        );
+        browser.select_tab(30);
+        assert!(!browser.has_page());
+        browser.select_tab(10);
+        assert_eq!(
+            browser.state().url.as_deref(),
+            Some("https://example.com/first")
+        );
+    }
 }

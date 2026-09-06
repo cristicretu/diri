@@ -480,8 +480,25 @@ impl RootView {
                 inspector,
                 window,
                 |this, _, event, window, cx| match event {
-                    InspectorEvent::Close => this.set_inspector_open(false, cx),
+                    InspectorEvent::Close => {
+                        // A removed focus path cannot route workbench shortcuts.
+                        window.focus(&this.focus, cx);
+                        this.inspector_toggled_at = None;
+                        this.set_inspector_open(false, cx);
+                        this.inspector_toggled_at = None;
+                    }
                     InspectorEvent::WorkspaceChanged(surface) => {
+                        window.focus(&this.focus, cx);
+                        #[cfg(target_os = "macos")]
+                        if *surface == crate::inspector::WorkspaceSurface::Browser
+                            && let Some(inspector) = &this.inspector
+                            && let Some(id) = inspector.read(cx).active_workspace_id()
+                        {
+                            this.browser.borrow_mut().select_tab(id);
+                            let state = this.browser.borrow().state();
+                            inspector
+                                .update(cx, |inspector, cx| inspector.set_browser_state(state, cx));
+                        }
                         if let Some(terminal) = &this.auxiliary_terminal
                             && *surface == crate::inspector::WorkspaceSurface::Terminal
                         {
@@ -492,14 +509,21 @@ impl RootView {
                     InspectorEvent::RequestTerminal => {
                         this.ensure_auxiliary_terminal(window, cx);
                     }
-                    InspectorEvent::WorkspaceClosed(surface) => {
+                    InspectorEvent::WorkspaceClosed { surface, id } => {
+                        #[cfg(not(target_os = "macos"))]
+                        let _ = id;
                         #[cfg(target_os = "macos")]
                         if *surface == crate::inspector::WorkspaceSurface::Browser {
-                            this.browser.borrow_mut().clear();
+                            this.browser.borrow_mut().close_tab(*id);
                         }
-                        if *surface == crate::inspector::WorkspaceSurface::Terminal {
+                        if *surface == crate::inspector::WorkspaceSurface::Terminal
+                            && !this.inspector.as_ref().is_some_and(|inspector| {
+                                inspector.read(cx).workspace_needs_terminal()
+                            })
+                        {
                             this.hide_auxiliary_terminal(window, cx);
                         }
+                        window.focus(&this.focus, cx);
                         cx.notify();
                     }
                     InspectorEvent::Browser(action) => {
@@ -1364,7 +1388,12 @@ impl RootView {
                 self.sidebar
                     .update(cx, |sidebar, cx| sidebar.focus(window, cx));
             }
-            CommandId::ToggleInspector => self.toggle_inspector(cx),
+            CommandId::ToggleInspector => {
+                self.toggle_inspector(cx);
+                if !self.inspector_open {
+                    window.focus(&self.focus, cx);
+                }
+            }
             CommandId::ToggleAuxiliaryTerminal => {
                 self.open_auxiliary_terminal(window, cx);
             }
@@ -1526,16 +1555,23 @@ impl RootView {
             terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
             return true;
         }
-        if self.auxiliary_spawn_parent.as_ref() == Some(&parent) {
-            return true;
-        }
-        let spawned = self
-            .services
-            .store
-            .store
-            .write()
-            .expect("session store lock poisoned")
-            .spawn_auxiliary_terminal(parent.clone());
+        let slot = self
+            .inspector
+            .as_ref()
+            .map_or(0, |inspector| inspector.read(cx).terminal_slot());
+        let spawned = {
+            let mut store = self
+                .services
+                .store
+                .store
+                .write()
+                .expect("session store lock poisoned");
+            if slot == 0 {
+                store.spawn_auxiliary_terminal(parent.clone())
+            } else {
+                store.spawn_auxiliary_terminal_slot(parent.clone(), slot)
+            }
+        };
         if spawned {
             self.auxiliary_spawn_parent = Some(parent);
             cx.notify();
@@ -1576,18 +1612,25 @@ impl RootView {
         if self.preview {
             return;
         }
-        let (selected, auxiliary, spawn_failed) = {
-            let store = self
+        let slot = self
+            .inspector
+            .as_ref()
+            .map_or(0, |inspector| inspector.read(cx).terminal_slot());
+        let (selected, auxiliary, spawn_pending) = {
+            let mut store = self
                 .services
                 .store
                 .store
-                .read()
+                .write()
                 .expect("session store lock poisoned");
             let selected = store.selected_session_id().cloned();
             let auxiliary = selected
                 .as_ref()
-                .and_then(|parent| store.auxiliary_terminal_for(parent));
-            (selected, auxiliary, store.last_action_error().is_some())
+                .and_then(|parent| store.auxiliary_terminal_for_slot(parent, slot));
+            let pending = selected
+                .as_ref()
+                .is_some_and(|parent| store.auxiliary_spawn_pending(parent, slot));
+            (selected, auxiliary, pending)
         };
 
         if selected
@@ -1647,13 +1690,6 @@ impl RootView {
             return;
         }
 
-        let spawn_still_pending = selected
-            .as_ref()
-            .is_some_and(|selected| self.auxiliary_spawn_parent.as_ref() == Some(selected))
-            && !spawn_failed;
-        if spawn_still_pending {
-            return;
-        }
         let had_auxiliary_state = self.auxiliary_terminal.is_some()
             || self.auxiliary_id.is_some()
             || self.auxiliary_parent.is_some()
@@ -1664,6 +1700,9 @@ impl RootView {
         self.auxiliary_spawn_parent = None;
         if let Some(inspector) = &self.inspector {
             inspector.update(cx, |inspector, cx| inspector.set_terminal_surface(None, cx));
+        }
+        if spawn_pending {
+            self.auxiliary_spawn_parent = selected;
         }
         if had_auxiliary_state {
             cx.notify();
@@ -3498,6 +3537,41 @@ mod tests {
                     .unwrap(),
             ),
         })
+    }
+
+    #[gpui::test]
+    fn inspector_shortcut_reopens_after_close_button(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| crate::commands::bind_keys(cx, &Default::default()));
+        let services = test_services();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, true, PreviewScenario::Artifacts, window, cx)
+        });
+        cx.simulate_resize(size(px(1200.0), px(800.0)));
+        root.update_in(cx, |root, window, cx| {
+            root.preview = false;
+            root.inspector_open = true;
+            root.inspector_seam = 440.0;
+            let inspector = root.inspector.as_ref().unwrap();
+            window.focus(&inspector.read(cx).focus_handle(cx), cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let close = cx.debug_bounds("INSPECTOR_CLOSE").expect("close button");
+        cx.simulate_click(close.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(!root.read_with(cx, |root, _| root.inspector_open));
+        root.update(cx, |root, cx| {
+            root.inspector_slide = None;
+            root.inspector_seam = 0.0;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-shift-d");
+        cx.run_until_parked();
+        assert!(
+            root.read_with(cx, |root, _| root.inspector_open),
+            "shortcut must reopen after X removes the focused panel"
+        );
     }
 
     #[gpui::test]
