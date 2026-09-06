@@ -2241,6 +2241,12 @@ impl UtilitySurfaces {
          * layout immediately.
          * ───────────────────────────────────────────────────────── */
         let colors = self.settings_colors();
+        let unread = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .notifications()
+            .unread_count();
         let generation = self.settings_transition_generation;
         let pane = match self.settings_tab {
             SettingsTab::General => self.general_settings(cx).into_any_element(),
@@ -2292,6 +2298,7 @@ impl UtilitySurfaces {
         div()
             .id("settings-shell")
             .debug_selector(|| "settings-shell".into())
+            .relative()
             .size_full()
             .pt(px(Metrics::TITLE_BAR))
             .overflow_hidden()
@@ -2310,6 +2317,7 @@ impl UtilitySurfaces {
                 }),
             )
             .child(pane)
+            .child(notification_titlebar_button(unread, colors))
     }
 
     fn phone_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -5136,11 +5144,7 @@ fn shortcut_row(
     let binding_label: SharedString = if editing {
         "Press keys…".into()
     } else {
-        assignment
-            .as_deref()
-            .unwrap_or("Unassigned")
-            .to_owned()
-            .into()
+        spaced_shortcut_label(assignment.as_deref().unwrap_or("Unassigned")).into()
     };
     let detail: SharedString = error.unwrap_or(metadata.description).to_owned().into();
 
@@ -5153,9 +5157,9 @@ fn shortcut_row(
             let stable_id = command.stable_id;
             move || format!("SHORTCUT_BINDING_{stable_id}")
         })
-        .h(px(27.0))
-        .min_w(px(if editing { 92.0 } else { 42.0 }))
-        .px(px(9.0))
+        .h(px(31.0))
+        .min_w(px(if editing { 96.0 } else { 48.0 }))
+        .px(px(11.0))
         .rounded(px(Radius::BADGE))
         .border_1()
         .border_color(if error.is_some() {
@@ -5174,7 +5178,7 @@ fn shortcut_row(
         .items_center()
         .justify_center()
         .font_family(crate::fonts::mono_family())
-        .text_size(px(11.0))
+        .text_size(px(Typo::ROW.size))
         .text_color(if assignment.is_none() && !editing {
             colors.tertiary
         } else {
@@ -5472,6 +5476,78 @@ fn settings_tab_matches(tab: SettingsTab, query: &str) -> bool {
     query
         .split_whitespace()
         .all(|word| searchable.contains(word))
+}
+
+fn notification_titlebar_button(unread: usize, colors: SemanticColors) -> AnyElement {
+    div()
+        .id("notification-inbox-button")
+        .debug_selector(|| "notification-inbox-button".into())
+        .absolute()
+        .top(px(7.0))
+        .right(px(14.0))
+        .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(Radius::BADGE))
+        .cursor_pointer()
+        .hover(move |button| button.bg(Fill::subtle(colors)))
+        .child(sf_symbol(
+            if unread > 0 { "bell.fill" } else { "bell" },
+            14.0,
+            if unread > 0 {
+                Ink::FRESH
+            } else {
+                colors.secondary
+            },
+        ))
+        .when(unread > 0, |button| {
+            button.child(
+                div()
+                    .absolute()
+                    .top(px(2.0))
+                    .right(px(2.0))
+                    .size(px(5.0))
+                    .rounded_full()
+                    .bg(Ink::FRESH),
+            )
+        })
+        .on_click(|_, window, cx| {
+            window.dispatch_action(Box::new(crate::commands::ToggleNotifications), cx);
+            cx.stop_propagation();
+        })
+        .into_any_element()
+}
+
+fn spaced_shortcut_label(label: &str) -> String {
+    if label.contains('+') {
+        return label.replace('+', "\u{2009}+\u{2009}");
+    }
+
+    let mut rest = label;
+    let mut parts = Vec::new();
+    if let Some(without_fn) = rest.strip_prefix("fn") {
+        parts.push("fn");
+        rest = without_fn;
+    }
+    while let Some(modifier) = rest
+        .chars()
+        .next()
+        .filter(|character| matches!(character, '⌃' | '⌥' | '⇧' | '⌘'))
+    {
+        parts.push(match modifier {
+            '⌃' => "⌃",
+            '⌥' => "⌥",
+            '⇧' => "⇧",
+            '⌘' => "⌘",
+            _ => unreachable!(),
+        });
+        rest = &rest[modifier.len_utf8()..];
+    }
+    if !rest.is_empty() {
+        parts.push(rest);
+    }
+    parts.join("\u{2009}")
 }
 
 fn settings_page(
@@ -7521,6 +7597,20 @@ mod tests {
         assert!(settings_tab_matches(SettingsTab::Shortcuts, "keyboard"));
         assert!(settings_tab_matches(SettingsTab::Terminal, "appearance"));
         assert!(!settings_tab_matches(SettingsTab::Terminal, "ssh"));
+    }
+
+    #[test]
+    fn shortcut_labels_separate_modifiers_from_each_other_and_the_key() {
+        assert_eq!(
+            spaced_shortcut_label("⌥⇧⌘C"),
+            "⌥\u{2009}⇧\u{2009}⌘\u{2009}C"
+        );
+        assert_eq!(spaced_shortcut_label("⌘Space"), "⌘\u{2009}Space");
+        assert_eq!(
+            spaced_shortcut_label("Ctrl+Shift+C"),
+            "Ctrl\u{2009}+\u{2009}Shift\u{2009}+\u{2009}C"
+        );
+        assert_eq!(spaced_shortcut_label("Unassigned"), "Unassigned");
     }
 
     #[gpui::test]

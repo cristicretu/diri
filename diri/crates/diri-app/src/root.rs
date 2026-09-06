@@ -2290,6 +2290,7 @@ impl RootView {
         if terminal_in_workspace_panel && let Some(auxiliary) = &self.auxiliary_terminal {
             auxiliary.update(cx, |terminal, cx| {
                 terminal.set_shell_chrome(visible_sidebar, true, cx);
+                terminal.set_header_trailing_inset(0.0, cx);
                 terminal.set_viewport(
                     TerminalViewport {
                         x: sidebar_width + card_width,
@@ -2342,6 +2343,7 @@ impl RootView {
                 .overflow_hidden();
             if let Some(terminal) = &self.auxiliary_terminal {
                 terminal.update(cx, |terminal, cx| {
+                    terminal.set_header_trailing_inset(48.0, cx);
                     terminal.set_viewport(
                         TerminalViewport {
                             x: sidebar_width,
@@ -2373,9 +2375,10 @@ impl RootView {
                     div()
                         .id("close-auxiliary-terminal")
                         .absolute()
-                        .top(px(12.0))
+                        .top(px(9.0))
                         .right(px(12.0))
                         .size(px(24.0))
+                        .debug_selector(|| "close-auxiliary-terminal".into())
                         .flex()
                         .items_center()
                         .justify_center()
@@ -3478,11 +3481,10 @@ fn preview_hint(system_image: &str, label: &str, colors: SemanticColors) -> AnyE
 mod tests {
     use super::*;
     use crate::sidebar::{PreviewScenario, SidebarPreviewFixture};
+    use gpui::{Modifiers, size};
 
-    #[cfg(target_os = "macos")]
-    #[gpui::test]
-    fn browser_stays_visible_through_every_resize(cx: &mut gpui::TestAppContext) {
-        let services = Arc::new(AppServices {
+    fn test_services() -> Arc<AppServices> {
+        Arc::new(AppServices {
             store: Arc::new(crate::store::StoreRuntime::inert()),
             usage_tx: tokio::sync::watch::channel(crate::usage::UsageSnapshot::default()).0,
             usage_limits_refresh: tokio::sync::mpsc::channel(1).0,
@@ -3495,7 +3497,134 @@ mod tests {
                     .build()
                     .unwrap(),
             ),
+        })
+    }
+
+    #[gpui::test]
+    fn notification_trigger_closes_an_open_panel_in_one_click(cx: &mut gpui::TestAppContext) {
+        let services = test_services();
+        let session = SidebarPreviewFixture::make(PreviewScenario::Typical)
+            .list
+            .sessions[0]
+            .clone();
+        {
+            let mut store = services.store.store.write().expect("store");
+            store.upsert_session(session.clone());
+            store.select(session.id);
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, true, PreviewScenario::Empty, window, cx)
         });
+        cx.simulate_resize(size(px(1_000.0), px(700.0)));
+        cx.run_until_parked();
+        let trigger = cx
+            .debug_bounds("notification-inbox-button")
+            .expect("notification trigger");
+
+        root.update_in(cx, |root, window, cx| {
+            root.toggle_notifications(window, cx);
+            assert!(root.notification_panel_open);
+        });
+        cx.simulate_click(trigger.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            !root.read_with(cx, |root, _| root.notification_panel_open),
+            "clicking the notification trigger again must close the panel without reopening it"
+        );
+    }
+
+    #[gpui::test]
+    fn auxiliary_close_control_does_not_cover_terminal_identity(cx: &mut gpui::TestAppContext) {
+        let services = test_services();
+        let mut parent = SidebarPreviewFixture::make(PreviewScenario::Typical)
+            .list
+            .sessions[0]
+            .clone();
+        parent.parent = None;
+        let mut auxiliary = parent.clone();
+        auxiliary.id = SessionId::new("auxiliary-terminal");
+        auxiliary.kind = AgentKind::SHELL;
+        auxiliary.parent = Some(parent.id.clone());
+        auxiliary.title = crate::store::AUXILIARY_TERMINAL_TITLE.to_owned();
+        {
+            let mut store = services.store.store.write().expect("store");
+            store.upsert_session(parent.clone());
+            store.upsert_session(auxiliary);
+            store.select(parent.id.clone());
+            assert!(store.auxiliary_terminal_for(&parent.id).is_some());
+            assert_eq!(store.selected_session_id(), Some(&parent.id));
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        assert_eq!(
+            root.read_with(cx, |root, _| root.auxiliary_id.clone()),
+            Some(SessionId::new("auxiliary-terminal")),
+            "fixture must mount the auxiliary terminal before the first async refresh"
+        );
+        cx.simulate_resize(size(px(1_000.0), px(700.0)));
+        cx.run_until_parked();
+
+        assert_eq!(
+            root.read_with(cx, |root, _| root.auxiliary_id.clone()),
+            Some(SessionId::new("auxiliary-terminal")),
+            "fixture must mount the auxiliary terminal"
+        );
+
+        let identity = cx
+            .debug_bounds("terminal-session-identity-auxiliary-terminal")
+            .expect("auxiliary terminal identity");
+        let close = cx
+            .debug_bounds("close-auxiliary-terminal")
+            .expect("auxiliary terminal close control");
+        assert!(
+            identity.right() <= close.left(),
+            "the close control must occupy reserved title-bar space instead of covering {identity:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn notification_panel_uses_the_settings_canvas_top_edge(cx: &mut gpui::TestAppContext) {
+        let services = test_services();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        cx.simulate_resize(size(px(1_000.0), px(700.0)));
+        root.update_in(cx, |root, window, cx| {
+            root.run_command(CommandId::OpenSettings, window, cx);
+            root.toggle_notifications(window, cx);
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+
+        let settings = cx.debug_bounds("settings-shell").expect("settings shell");
+        let trigger = cx
+            .debug_bounds("notification-inbox-button")
+            .expect("settings notification trigger");
+        let panel = cx
+            .debug_bounds("notification-panel")
+            .expect("notification panel");
+        assert_eq!(trigger.top(), settings.top() + px(7.0));
+        assert!(
+            panel.top() <= settings.top() + px(14.0)
+                && panel.top() < settings.top() + px(Metrics::TITLE_BAR),
+            "Settings has no workbench navbar, so the panel must enter from its canvas edge: {panel:?}"
+        );
+
+        cx.simulate_click(trigger.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            !root.read_with(cx, |root, _| root.notification_panel_open),
+            "the Settings notification trigger must close its open panel in one click"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn browser_stays_visible_through_every_resize(cx: &mut gpui::TestAppContext) {
+        let services = test_services();
         let (root, cx) = cx.add_window_view(move |window, cx| {
             RootView::new(services, true, PreviewScenario::Artifacts, window, cx)
         });

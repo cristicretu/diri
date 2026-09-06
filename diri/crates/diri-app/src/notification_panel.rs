@@ -156,6 +156,15 @@ impl RootView {
                 cx.reduce_motion(),
             )
         };
+        let settings_open = self
+            .utility_surfaces
+            .as_ref()
+            .is_some_and(|surfaces| surfaces.read(cx).is_settings_open());
+        let panel_top = if settings_open {
+            14.0
+        } else {
+            Metrics::TITLE_BAR + 6.0
+        };
         let height = (f32::from(window.inner_window_bounds().get_bounds().size.height) - 90.0)
             .clamp(200.0, 620.0);
         let mut list = div()
@@ -305,16 +314,18 @@ impl RootView {
                     ),
             );
         }
-        let panel = div().id("notification-panel").track_focus(&self.notification_focus)
-            .absolute().top(px(48.0)).right(px(14.0)).w(px(440.0)).max_h(px(height))
+        let panel = div().id("notification-panel").debug_selector(|| "notification-panel".into()).track_focus(&self.notification_focus)
+            .absolute().top(px(panel_top)).right(px(14.0)).w(px(440.0)).max_h(px(height))
             .p(px(12.0)).rounded(px(Radius::PANEL)).border_1().border_color(colors.primary.alpha(0.12))
-            .bg(colors.background).shadow_lg().flex().flex_col().gap(px(12.0))
+            .bg(colors.background).shadow_lg().flex().flex_col().gap(px(12.0)).text_color(colors.primary)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(div().flex().items_center().gap(px(8.0))
                 .child(sf_symbol("bell", 17.0, colors.primary))
                 .child(div().flex_1().text_size(px(16.0)).font_weight(FontWeight::SEMIBOLD).child(format!("Notifications · {unread}")))
-                .child(div().id("close-notifications").cursor_pointer().p(px(5.0)).child(sf_symbol("xmark", 12.0, colors.secondary))
-                    .on_click(cx.listener(|this, _, window, cx| this.toggle_notifications(window, cx)))))
+                .when(!settings_open, |header| {
+                    header.child(div().id("close-notifications").cursor_pointer().p(px(5.0)).child(sf_symbol("xmark", 12.0, colors.secondary))
+                        .on_click(cx.listener(|this, _, window, cx| this.toggle_notifications(window, cx))))
+                }))
             .child(div().flex().items_center().gap(px(14.0)).text_size(px(Typo::META.size))
                 .child(div().id("notification-filter").cursor_pointer().text_color(Ink::FRESH).child(if self.notification_filter_unread { "Unread ▾" } else { "All notifications ▾" })
                     .on_click(cx.listener(|this, _, _, cx| { this.notification_filter_unread = !this.notification_filter_unread; this.notification_selected = 0; cx.notify(); })))
@@ -353,7 +364,11 @@ impl RootView {
                 .with_animation(
                     "notification-panel-arrival",
                     Animation::new(Duration::from_millis(160)).with_easing(ease_out_quint()),
-                    |panel, delta| panel.opacity(delta).top(px(48.0 - 6.0 * (1.0 - delta))),
+                    move |panel, delta| {
+                        panel
+                            .opacity(delta)
+                            .top(px(panel_top - 6.0 * (1.0 - delta)))
+                    },
                 )
                 .into_any_element()
         };
@@ -362,11 +377,33 @@ impl RootView {
                 .absolute()
                 .inset_0()
                 .id("notification-dismiss-layer")
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, window, cx| this.toggle_notifications(window, cx)),
-                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.toggle_notifications(window, cx);
+                }))
                 .child(panel)
+                .when(settings_open, |layer| {
+                    layer.child(
+                        div()
+                            .id("notification-inbox-toggle-close")
+                            .absolute()
+                            .top(px(7.0))
+                            .right(px(14.0))
+                            .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(Radius::BADGE))
+                            .bg(colors.background)
+                            .cursor_pointer()
+                            .hover(move |button| button.bg(colors.primary.alpha(0.05)))
+                            .child(sf_symbol("xmark", 12.0, colors.secondary))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.toggle_notifications(window, cx);
+                            })),
+                    )
+                })
                 .into_any_element(),
         )
     }

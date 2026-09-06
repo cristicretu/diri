@@ -6309,51 +6309,6 @@ impl Render for Sidebar {
         if let Some(feedback) = self.external_drop_feedback(colors, cx) {
             root = root.child(feedback);
         }
-        let unread = self
-            .store
-            .read()
-            .expect("store")
-            .notifications()
-            .unread_count();
-        root = root.child(
-            div().px(px(Space::INSET)).py(px(4.0)).child(
-                div()
-                    .id("notification-inbox-button")
-                    .h(px(SIDEBAR_NAV_ROW_HEIGHT))
-                    .px(px(8.0))
-                    .rounded(px(SIDEBAR_ROW_RADIUS))
-                    .cursor_pointer()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .text_size(px(Typo::ROW.size))
-                    .text_color(colors.primary)
-                    .hover(|style| style.bg(colors.primary.alpha(0.05)))
-                    .child(sf_symbol(
-                        "bell",
-                        14.0,
-                        if unread > 0 {
-                            Ink::FRESH
-                        } else {
-                            colors.secondary
-                        },
-                    ))
-                    .child(div().flex_1().child("Notifications"))
-                    .when(unread > 0, |row| {
-                        row.child(
-                            div()
-                                .rounded(px(5.0))
-                                .px(px(6.0))
-                                .bg(Ink::FRESH.alpha(0.12))
-                                .text_color(Ink::FRESH)
-                                .child(unread.to_string()),
-                        )
-                    })
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(crate::commands::ToggleNotifications), cx)
-                    }),
-            ),
-        );
         root = root.child(self.account_footer(colors, cx));
         // Paint the edge without reducing the shared sidebar content width.
         root = root.child(

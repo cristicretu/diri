@@ -881,6 +881,9 @@ pub struct TerminalPane {
     viewport: Option<TerminalViewport>,
     sidebar_visible: bool,
     inspector_open: bool,
+    /// Space in the title bar reserved for workbench-owned controls painted
+    /// above this pane, such as the auxiliary terminal's close button.
+    header_trailing_inset: f32,
     navigation: Option<Entity<NavigationOverlay>>,
     utility_surfaces: Option<Entity<UtilitySurfaces>>,
     local_clipboard_images: Vec<StagedClipboardImage>,
@@ -1003,6 +1006,7 @@ impl TerminalPane {
             viewport: None,
             sidebar_visible: true,
             inspector_open: false,
+            header_trailing_inset: 0.0,
             navigation: None,
             utility_surfaces: None,
             local_clipboard_images: Vec::new(),
@@ -1180,6 +1184,14 @@ impl TerminalPane {
         }
         self.sidebar_visible = sidebar_visible;
         self.inspector_open = inspector_open;
+        cx.notify();
+    }
+
+    pub fn set_header_trailing_inset(&mut self, inset: f32, cx: &mut Context<Self>) {
+        if (self.header_trailing_inset - inset).abs() < f32::EPSILON {
+            return;
+        }
+        self.header_trailing_inset = inset.max(0.0);
         cx.notify();
     }
 
@@ -2603,10 +2615,19 @@ impl TerminalPane {
                 .host_display_name(host)
         });
         let kind = ui_agent_kind(session.effective_kind());
+        let identity_selector = format!("terminal-session-identity-{}", session.id.0);
         let shell_controls = matches!(self.session_source, SessionSource::FollowSelection);
         let show_sidebar = shell_controls && !self.sidebar_visible;
         let sidebar_reveal = show_sidebar.then(|| self.render_sidebar_reveal_control(colors, cx));
         let inspector_open = self.inspector_open;
+        let header_trailing_inset = self.header_trailing_inset;
+        let unread = self
+            .runtime
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .notifications()
+            .unread_count();
         let visible_chip_count = visible_chip_count.min(chips.len());
         let overflow_count = chips.len().saturating_sub(visible_chip_count);
         let mut toolbar_links = div()
@@ -2646,7 +2667,8 @@ impl TerminalPane {
         div()
             .h(px(Metrics::TITLE_BAR))
             .flex_none()
-            .px(px(Metrics::TOOLBAR_EDGE_INSET))
+            .pl(px(Metrics::TOOLBAR_EDGE_INSET))
+            .pr(px(Metrics::TOOLBAR_EDGE_INSET + header_trailing_inset))
             .flex()
             .items_center()
             .justify_between()
@@ -2720,6 +2742,7 @@ impl TerminalPane {
                     .gap(px(Metrics::TOOLBAR_ITEM_GAP))
                     .child(
                         div()
+                            .debug_selector(move || identity_selector.clone())
                             .flex()
                             .items_center()
                             .gap(px(Metrics::TOOLBAR_COMPACT_GAP))
@@ -2757,6 +2780,49 @@ impl TerminalPane {
                                     window.dispatch_action(Box::new(ToggleInspector), cx);
                                     cx.stop_propagation();
                                 })),
+                        )
+                    })
+                    .when(shell_controls, |trailing| {
+                        trailing.child(
+                            div()
+                                .id("notification-inbox-button")
+                                .debug_selector(|| "notification-inbox-button".into())
+                                .relative()
+                                .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(Radius::BADGE))
+                                .cursor_pointer()
+                                .hover(move |button| button.bg(Fill::subtle(colors)))
+                                .child(sf_symbol(
+                                    if unread > 0 { "bell.fill" } else { "bell" },
+                                    14.0,
+                                    if unread > 0 {
+                                        Ink::FRESH
+                                    } else {
+                                        colors.secondary
+                                    },
+                                ))
+                                .when(unread > 0, |button| {
+                                    button.child(
+                                        div()
+                                            .absolute()
+                                            .top(px(2.0))
+                                            .right(px(2.0))
+                                            .size(px(5.0))
+                                            .rounded_full()
+                                            .bg(Ink::FRESH),
+                                    )
+                                })
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(
+                                        Box::new(crate::commands::ToggleNotifications),
+                                        cx,
+                                    );
+                                    cx.stop_propagation();
+                                }),
                         )
                     }),
             )
