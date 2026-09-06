@@ -39,10 +39,12 @@ pub struct SeamSlide {
 impl SeamSlide {
     /// Starts a slide away from `from`, unless there is nowhere to travel.
     pub fn begin(from: f32, to: f32) -> Option<Self> {
-        (from != to).then(|| Self {
-            from,
-            started_at: Instant::now(),
-        })
+        Self::begin_at(from, to, Instant::now())
+    }
+
+    /// Share an origin time when several parts of the same panel move together.
+    pub fn begin_at(from: f32, to: f32, started_at: Instant) -> Option<Self> {
+        (from != to).then_some(Self { from, started_at })
     }
 
     pub fn progress(&self, now: Instant) -> f32 {

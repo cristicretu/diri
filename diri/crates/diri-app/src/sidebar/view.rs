@@ -227,6 +227,8 @@ pub struct Sidebar {
     ui: SidebarUiState,
     peek_open: bool,
     peek_hovered: bool,
+    peek_region_hovered: bool,
+    surface_in_parent: bool,
     peek_close: Option<Task<()>>,
     /// Session list scroll position, read back each frame to size the top and
     /// bottom fades.
@@ -351,6 +353,8 @@ impl Sidebar {
             ui,
             peek_open: false,
             peek_hovered: false,
+            peek_region_hovered: false,
+            surface_in_parent: false,
             peek_close: None,
             list_scroll: ScrollHandle::new(),
             row_bounds: Rc::new(RefCell::new(HashMap::new())),
@@ -403,6 +407,29 @@ impl Sidebar {
         self.peek_open
     }
 
+    /// Root paints the material so its corners can morph without rebuilding
+    /// the sidebar's cached contents on every animation frame.
+    pub(crate) fn set_surface_in_parent(&mut self) {
+        self.surface_in_parent = true;
+    }
+
+    pub(crate) fn hover_peek_region(
+        &mut self,
+        hovered: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.peek_region_hovered == hovered {
+            return;
+        }
+        self.peek_region_hovered = hovered;
+        if hovered {
+            self.peek_close = None;
+        } else {
+            self.schedule_peek_close(window, cx);
+        }
+    }
+
     pub(crate) fn peek(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.ui.visible || self.peek_open {
             return;
@@ -439,6 +466,7 @@ impl Sidebar {
     fn schedule_peek_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.peek_open
             || self.peek_hovered
+            || self.peek_region_hovered
             || self.peek_interaction_active()
             || self.peek_close.is_some()
         {
@@ -450,7 +478,11 @@ impl Sidebar {
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.peek_close = None;
-                if this.peek_open && !this.peek_hovered && !this.peek_interaction_active() {
+                if this.peek_open
+                    && !this.peek_hovered
+                    && !this.peek_region_hovered
+                    && !this.peek_interaction_active()
+                {
                     this.peek_open = false;
                     this.ui.hover_card = None;
                     if this.focus_handle.contains_focused(window, cx) {
@@ -6335,10 +6367,14 @@ impl Render for Sidebar {
             .flex()
             .flex_col()
             .text_color(colors.primary)
-            .bg(Self::surface_fill(colors))
+            .when(!self.surface_in_parent, |root| {
+                root.bg(Self::surface_fill(colors))
+            })
             .track_focus(&self.focus_handle)
             .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
-                this.hover_peek(*hovered, window, cx);
+                if !this.surface_in_parent {
+                    this.hover_peek(*hovered, window, cx);
+                }
             }))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_up_out(
@@ -6399,15 +6435,17 @@ impl Render for Sidebar {
         }
         root = root.child(self.account_footer(colors, cx));
         // Paint the edge without reducing the shared sidebar content width.
-        root = root.child(
-            div()
-                .absolute()
-                .right_0()
-                .top_0()
-                .bottom_0()
-                .w(px(1.0))
-                .bg(colors.sidebar_stroke()),
-        );
+        root = root.when(!self.surface_in_parent, |root| {
+            root.child(
+                div()
+                    .absolute()
+                    .right_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(1.0))
+                    .bg(colors.sidebar_stroke()),
+            )
+        });
         if let Some(popover) = self.popover(colors, window, cx) {
             root = root.child(popover);
         }
