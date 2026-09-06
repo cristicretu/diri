@@ -22,8 +22,8 @@ use account_settings::AccountsState;
 use diri_proto::{AgentKind as ProtoAgentKind, HistoryEntry, HostEntry, HostsConfig};
 use diri_term::theme::{TermTheme, ThemeAppearance};
 use diri_ui::{
-    AgentLogo, Fill, FloatingSurface, HairlineDivider, Ink, LoadingIndicator, Metrics, Palette,
-    Radius, SemanticColors, Typo,
+    AgentLogo, Fill, FloatingSurface, HairlineDivider, Icon, IconName, Ink, LoadingIndicator,
+    Metrics, Palette, Radius, SemanticColors, Typo,
 };
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Bounds, BoxShadow, ClickEvent, Context, CursorStyle,
@@ -38,6 +38,9 @@ use crate::commands::{
     Activate, COMMANDS, CloseSurface, CommandId, MoveDown, MoveUp, OpenSettings, OpenWorktrees,
     ShortcutCategory, ToggleHistory, UTILITY_CONTEXT,
 };
+const HISTORY_CONTENT_INSET: f32 = 16.0;
+const HISTORY_KEYCAP_WIDTH: f32 = 28.0;
+const HISTORY_KEYCAP_HEIGHT: f32 = 20.0;
 const HISTORY_ROW_HEIGHT: f32 = 36.0;
 const HISTORY_LIST_HEIGHT: f32 = HISTORY_ROW_HEIGHT * 7.0;
 
@@ -1673,7 +1676,7 @@ impl UtilitySurfaces {
                     .group("history-row")
                     .h_full()
                     .px(px(10.0))
-                    .rounded(px(Radius::CARD))
+                    .rounded(px(Radius::ROW))
                     .flex()
                     .items_center()
                     .gap(px(6.0))
@@ -1715,8 +1718,8 @@ impl UtilitySurfaces {
                         div()
                             .relative()
                             .flex_none()
-                            .w(px(32.0))
-                            .h(px(24.0))
+                            .w(px(HISTORY_KEYCAP_WIDTH))
+                            .h(px(HISTORY_KEYCAP_HEIGHT))
                             .flex()
                             .items_center()
                             .justify_end()
@@ -1738,21 +1741,14 @@ impl UtilitySurfaces {
                             })
                             .when(resumable && !busy, |slot| {
                                 slot.child(
-                                    div()
+                                    history_keycap(colors)
+                                        .debug_selector(move || format!("history-return-{index}"))
                                         .absolute()
                                         .right_0()
                                         .top_0()
-                                        .size(px(24.0))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded(px(Radius::CHIP))
-                                        .bg(Fill::subtle(colors))
-                                        .text_size(px(14.0))
-                                        .text_color(colors.secondary)
                                         .when(!selected, |cue| cue.invisible())
                                         .group_hover("history-row", |style| style.visible())
-                                        .child("↵"),
+                                        .child(Icon::new(IconName::Return, 14.0, colors.secondary)),
                                 )
                             }),
                     ),
@@ -1776,11 +1772,19 @@ impl UtilitySurfaces {
                 .child(
                     div()
                         .h(px(48.0))
-                        .px(px(16.0))
+                        .px(px(HISTORY_CONTENT_INSET))
                         .flex()
                         .items_center()
-                        .gap(px(10.0))
-                        .child(sf_symbol("magnifyingglass", 14.0, colors.secondary))
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .flex_none()
+                                .size(px(28.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(sf_symbol("magnifyingglass", 14.0, colors.secondary)),
+                        )
                         .child(
                             div()
                                 .flex_1()
@@ -1852,16 +1856,10 @@ impl UtilitySurfaces {
                                 }),
                         )
                         .child(
-                            div()
+                            history_keycap(colors)
                                 .id("close-history")
+                                .debug_selector(|| "history-escape".into())
                                 .cursor_pointer()
-                                .rounded(px(Radius::CHIP))
-                                .px(px(5.0))
-                                .py(px(3.0))
-                                .text_size(px(Typo::META.size))
-                                .text_color(colors.secondary)
-                                .border_1()
-                                .border_color(colors.floating_stroke())
                                 .hover(move |style| style.bg(Fill::hover(colors, true)))
                                 .on_click(cx.listener(|this, _, _, cx| this.close_surface(cx)))
                                 .child("esc"),
@@ -6329,6 +6327,23 @@ fn folder_name(path: &str) -> &str {
         .unwrap_or(path)
 }
 
+/// Keyboard hints share a footprint and border, so the header and every row
+/// end on the same vertical axis regardless of their text or icon contents.
+fn history_keycap(colors: SemanticColors) -> gpui::Div {
+    div()
+        .flex_none()
+        .w(px(HISTORY_KEYCAP_WIDTH))
+        .h(px(HISTORY_KEYCAP_HEIGHT))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(Radius::CHIP))
+        .border_1()
+        .border_color(colors.floating_stroke())
+        .text_size(px(Typo::META.size))
+        .text_color(colors.secondary)
+}
+
 struct HistoryTooltip(String, SemanticColors);
 
 impl Render for HistoryTooltip {
@@ -6551,6 +6566,10 @@ mod tests {
         cx.simulate_resize(size(px(800.0), px(700.0)));
         cx.run_until_parked();
         assert!(cx.debug_bounds("history-row-0").is_some());
+        let escape = cx.debug_bounds("history-escape").unwrap();
+        let enter = cx.debug_bounds("history-return-0").unwrap();
+        assert_eq!(enter.size, escape.size, "keyboard hints share a footprint");
+        assert_eq!(enter.left(), escape.left(), "keyboard hints share an axis");
         assert!(
             cx.debug_bounds("history-row-639").is_none(),
             "offscreen rows must not be rendered"
