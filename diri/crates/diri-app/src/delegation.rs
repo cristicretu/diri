@@ -508,6 +508,7 @@ mod tests {
             merged: false,
             age_days: 1,
             stale_suggestion: false,
+            health: Default::default(),
         };
         let proposal = worktree_move_proposal(&source, Some(&project), &target).unwrap();
         assert_eq!(proposal.worktree_path, "/repo-feature");

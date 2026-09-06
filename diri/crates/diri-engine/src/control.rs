@@ -761,6 +761,7 @@ impl ControlServer {
             Method::ACTIVITY_LIST => self.activity_list(params),
             Method::WORKTREE_CREATE => self.worktree_create(params),
             Method::WORKTREE_LIST => self.worktree_list(params),
+            Method::WORKTREE_CLEANUP => self.worktree_cleanup(params),
             Method::WORKTREE_REMOVE => self.worktree_remove(params),
             Method::WORKTREE_OVERVIEW => self.worktree_overview(),
             Method::TEST_RUN => self.browser_call("run", params),
@@ -1360,122 +1361,29 @@ impl ControlServer {
     /// merged-ness into the default branch, and age — plus the "safe to
     /// clean up" suggestion.
     fn worktree_overview(&self) -> Result<JsonValue, ControlError> {
-        let (records, mut roots) = {
+        let (records, roots) = {
             let registry = self.registry.lock().map_err(poisoned)?;
-            let roots: Vec<String> = registry
-                .projects_raw()
-                .iter()
-                .filter_map(|project| project.get("root").and_then(|value| value.as_str()))
-                .map(str::to_string)
-                .collect();
-            (registry.records(), roots)
+            (registry.records(), registry.projects_raw().to_vec())
         };
-        roots.sort();
-
-        // Join sessions by worktree path (fallback cwd); a live session wins
-        // over an exited one sharing the path.
-        let mut session_by_path: std::collections::HashMap<String, &diri_proto::SessionRecord> =
-            std::collections::HashMap::new();
-        let running = |record: &diri_proto::SessionRecord| {
-            !matches!(
-                record.status,
-                diri_proto::SessionStatus::Exited(_) | diri_proto::SessionStatus::Unknown
-            )
-        };
-        for record in &records {
-            let path = record
-                .worktree_path
-                .clone()
-                .unwrap_or_else(|| record.cwd.clone());
-            match session_by_path.get(&path) {
-                Some(existing) if running(existing) || !running(record) => {}
-                _ => {
-                    session_by_path.insert(path, record);
-                }
-            }
-        }
-
-        let run_git = |args: &[&str], dir: &str| -> Option<String> {
-            let output = std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .env("LC_ALL", "C")
-                .env("LANG", "C")
-                .env("LANGUAGE", "C")
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .output()
-                .ok()?;
-            output
-                .status
-                .success()
-                .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        };
-
-        let mut entries = Vec::new();
-        let mut seen_paths = std::collections::HashSet::new();
-        for root in roots {
-            if !crate::git::is_repository(Path::new(&root)) {
-                continue;
-            }
-            let Ok(worktrees) = crate::git::list_worktrees(Path::new(&root)) else {
-                continue;
-            };
-            // Repo's default branch: origin/HEAD symbolic ref, else "main".
-            let default_branch = run_git(
-                &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-                &root,
-            )
-            .and_then(|full| full.rsplit('/').next().map(str::to_string))
-            .filter(|short| !short.is_empty())
-            .unwrap_or_else(|| "main".into());
-            let merged_branches: std::collections::HashSet<String> = run_git(
-                &[
-                    "branch",
-                    "--merged",
-                    &default_branch,
-                    "--format=%(refname:short)",
-                ],
-                &root,
-            )
-            .map(|output| output.lines().map(str::to_string).collect())
-            .unwrap_or_default();
-
-            for worktree in worktrees {
-                if worktree.is_bare || !seen_paths.insert(worktree.path.clone()) {
-                    continue;
-                }
-                let is_main = worktree.path == root;
-                let dirty = run_git(&["status", "--porcelain"], &worktree.path)
-                    .is_some_and(|output| !output.is_empty());
-                let merged = worktree.branch.as_ref().is_some_and(|branch| {
-                    branch != &default_branch && merged_branches.contains(branch)
-                });
-                let age_days = std::fs::metadata(&worktree.path)
-                    .ok()
-                    .and_then(|meta| meta.created().or_else(|_| meta.modified()).ok())
-                    .and_then(|at| at.elapsed().ok())
-                    .map(|elapsed| (elapsed.as_secs() / 86_400) as i64)
-                    .unwrap_or(0);
-                let record = session_by_path.get(&worktree.path);
-                let session_alive = record.is_some_and(|record| running(record));
-                entries.push(diri_proto::WorktreeOverviewEntry {
-                    path: worktree.path.clone(),
-                    branch: worktree.branch.clone(),
-                    project_root: root.clone(),
-                    session_id: record.map(|record| record.id.clone()),
-                    session_status: record.map(|record| record.status.clone()),
-                    dirty,
-                    merged,
-                    age_days,
-                    stale_suggestion: !is_main
-                        && !session_alive
-                        && merged
-                        && !dirty
-                        && age_days > 7,
-                });
-            }
-        }
+        let entries = crate::worktree_health::overview(&roots, &records);
         encode(&diri_proto::WorktreeOverviewResult { entries })
+    }
+
+    fn worktree_cleanup(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::WorktreeCleanupParams = decode(params)?;
+        // Serialize the final local session check and removal against launches.
+        // Network and disk scans never run while holding the registry lock.
+        let inspection = crate::worktree_health::inspect_cleanup(&p).map_err(io_control_error)?;
+        let registry = self.registry.lock().map_err(poisoned)?;
+        crate::worktree_health::cleanup(&p, &inspection, &registry.records())
+            .map_err(io_control_error)?;
+        drop(registry);
+        self.events.publish(
+            "worktree.removed",
+            json!({"repoPath": p.repo_path, "path": p.worktree_path}),
+            None,
+        );
+        Ok(json!({}))
     }
 
     /// One-click handoff of a live Claude session between hosts: WIP commit
@@ -4817,6 +4725,48 @@ mod tests {
                 .expect("array")
                 .iter()
                 .any(|worktree| worktree["branch"] == "feature/x")
+        );
+    }
+
+    #[test]
+    fn settings_worktree_cleanup_over_wire_checks_head_and_keeps_branch() {
+        let temp = tempfile::tempdir().unwrap();
+        let (repo, target) = repository_with_linked_worktree(temp.path());
+        let server = server(temp.path());
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&target)
+            .output()
+            .unwrap();
+        let head = String::from_utf8(head.stdout).unwrap().trim().to_owned();
+        let response = call(
+            &server,
+            Method::WORKTREE_CLEANUP,
+            Some(json!({
+                "repoPath": repo, "worktreePath": target, "expectedHead": "stale"
+            })),
+        );
+        assert!(matches!(
+            response,
+            ControlMessage::Response { result: Err(_), .. }
+        ));
+        assert!(target.exists());
+        ok_of(call(
+            &server,
+            Method::WORKTREE_CLEANUP,
+            Some(json!({
+                "repoPath": repo, "worktreePath": target, "expectedHead": head
+            })),
+        ));
+        assert!(!target.exists());
+        assert!(
+            std::process::Command::new("git")
+                .args(["show-ref", "--verify", "refs/heads/feature/reparent"])
+                .current_dir(repo)
+                .output()
+                .unwrap()
+                .status
+                .success()
         );
     }
 

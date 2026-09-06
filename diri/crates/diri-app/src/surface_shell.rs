@@ -1,5 +1,6 @@
 #[path = "usage_page.rs"]
 mod usage_page;
+mod worktree_settings;
 
 use std::cell::Cell;
 use std::collections::HashSet;
@@ -324,6 +325,7 @@ impl UtilitySurfaces {
             Some("skills") => SettingsTab::Skills,
             Some("accounts") => SettingsTab::Accounts,
             Some("shortcuts") => SettingsTab::Shortcuts,
+            Some("worktrees") => SettingsTab::Worktrees,
             Some("resources") => SettingsTab::Resources,
             Some("remote") => SettingsTab::Remote,
             Some("phone") => SettingsTab::Phone,
@@ -471,6 +473,9 @@ impl UtilitySurfaces {
     }
 
     fn refresh_worktrees(&mut self, cx: &mut Context<Self>) {
+        if self.worktrees.loading {
+            return;
+        }
         self.worktrees.begin_refresh();
         cx.notify();
         let client = Arc::clone(self.store_runtime.client());
@@ -503,7 +508,7 @@ impl UtilitySurfaces {
         cx.spawn(async move |this, cx| {
             let task = runtime.spawn(async move {
                 client.wait_until_connected(Duration::from_secs(5)).await?;
-                client.worktree_remove(params).await?;
+                client.worktree_cleanup(params).await?;
                 client.worktree_overview().await
             });
             let result = match task.await {
@@ -1065,6 +1070,9 @@ impl UtilitySurfaces {
             self.settings_scroll.set_offset(point(px(0.0), px(0.0)));
         }
         self.settings_tab = tab;
+        if tab == SettingsTab::Worktrees {
+            self.refresh_worktrees(cx);
+        }
         if tab == SettingsTab::Skills {
             self.refresh_skills(cx);
         }
@@ -1840,6 +1848,7 @@ impl UtilitySurfaces {
             SettingsTab::Accounts => self.accounts_settings(cx).into_any_element(),
             SettingsTab::Shortcuts => self.shortcuts_settings(cx).into_any_element(),
             SettingsTab::Terminal => self.terminal_settings(cx).into_any_element(),
+            SettingsTab::Worktrees => self.worktree_settings(cx).into_any_element(),
             SettingsTab::Resources => self.resource_settings(cx).into_any_element(),
             SettingsTab::Remote => self.remote_settings(cx).into_any_element(),
             SettingsTab::Phone => self.phone_settings(cx).into_any_element(),
@@ -1858,11 +1867,16 @@ impl UtilitySurfaces {
             .child(
                 div()
                     .w_full()
-                    .max_w(px(if self.settings_tab == SettingsTab::Usage {
-                        1040.0
-                    } else {
-                        SETTINGS_CONTENT_MAX_WIDTH
-                    }))
+                    .max_w(px(
+                        if matches!(
+                            self.settings_tab,
+                            SettingsTab::Usage | SettingsTab::Worktrees
+                        ) {
+                            1040.0
+                        } else {
+                            SETTINGS_CONTENT_MAX_WIDTH
+                        },
+                    ))
                     .mx_auto()
                     .child(pane),
             );
@@ -5039,6 +5053,9 @@ fn settings_tab_matches(tab: SettingsTab, query: &str) -> bool {
         }
         SettingsTab::Terminal => "terminal appearance color theme font text size zoom",
         SettingsTab::Usage => "usage cost tokens spending cache savings model daily claude codex",
+        SettingsTab::Worktrees => {
+            "worktrees git branches pull requests merged old stale disk space cleanup"
+        }
         SettingsTab::Resources => {
             "resources idle sessions hibernate freeze memory limit performance"
         }
@@ -5964,6 +5981,7 @@ mod tests {
             Ok("skills") => SettingsTab::Skills,
             Ok("accounts") => SettingsTab::Accounts,
             Ok("terminal") => SettingsTab::Terminal,
+            Ok("worktrees") => SettingsTab::Worktrees,
             Ok("resources") => SettingsTab::Resources,
             _ => SettingsTab::Remote,
         };
@@ -6006,6 +6024,41 @@ mod tests {
             std::fs::create_dir_all(parent).expect("create screenshot directory");
         }
         screenshot.save(output).expect("save settings screenshot");
+    }
+
+    #[gpui::test]
+    fn worktree_settings_filters_and_navigation(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.open_settings_tab(SettingsTab::Worktrees, cx);
+            surfaces
+                .worktrees
+                .finish_refresh(Ok(worktree_settings::preview_entries()));
+        });
+        cx.run_until_parked();
+        for (selector, ready, old) in [
+            ("worktrees-filter-Ready to clean", true, false),
+            ("worktrees-filter-Older than 30 days", false, true),
+            ("worktrees-filter-All", false, false),
+        ] {
+            let bounds = cx.debug_bounds(selector).expect("visible worktree filter");
+            cx.simulate_click(bounds.center(), Modifiers::default());
+            cx.run_until_parked();
+            surfaces.read_with(cx, |surfaces, _| {
+                assert_eq!(
+                    surfaces.settings_nav().unwrap().active,
+                    SettingsTab::Worktrees
+                );
+                assert_eq!(surfaces.worktrees.cleanup_only, ready);
+                assert_eq!(surfaces.worktrees.old_only, old);
+            });
+        }
+        assert!(settings_tab_matches(SettingsTab::Worktrees, "disk cleanup"));
+        assert!(settings_tab_matches(
+            SettingsTab::Worktrees,
+            "pull requests"
+        ));
     }
 
     #[gpui::test]
@@ -6303,6 +6356,9 @@ mod tests {
                 );
                 surfaces.open_settings(cx);
                 surfaces.settings_tab = tab;
+                if tab == SettingsTab::Worktrees {
+                    surfaces.worktrees.entries = worktree_settings::preview_entries();
+                }
                 if tab == SettingsTab::Skills {
                     surfaces.skills.update(cx, |skills, _| {
                         skills.seed_preview(std::env::var_os("DIRI_VISUAL_SKILL_DETAIL").is_some())

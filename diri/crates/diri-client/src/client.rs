@@ -749,6 +749,10 @@ impl DaemonClient {
         self.typed(Method::WORKTREE_LIST, &params).await
     }
 
+    pub async fn worktree_cleanup(&self, params: WorktreeCleanupParams) -> Result<(), ClientError> {
+        self.empty(Method::WORKTREE_CLEANUP, &params).await
+    }
+
     pub async fn worktree_remove(&self, params: WorktreeRemoveParams) -> Result<(), ClientError> {
         self.empty(Method::WORKTREE_REMOVE, &params).await
     }

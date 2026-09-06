@@ -48,6 +48,7 @@ impl Method {
     pub const SESSION_RESUME_FROM_HISTORY: &'static str = "session.resume_from_history";
     pub const WORKTREE_CREATE: &'static str = "worktree.create";
     pub const WORKTREE_LIST: &'static str = "worktree.list";
+    pub const WORKTREE_CLEANUP: &'static str = "worktree.cleanup";
     pub const WORKTREE_REMOVE: &'static str = "worktree.remove";
     pub const WORKTREE_OVERVIEW: &'static str = "worktree.overview";
     pub const PROJECT_ADD: &'static str = "project.add";
@@ -783,6 +784,27 @@ pub struct WorktreeRemoveParams {
 
 pub type WorktreeRemoveResult = EmptyResult;
 
+/// Confirmed Settings cleanup. An older engine rejects the unknown method.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeCleanupParams {
+    pub repo_path: String,
+    pub worktree_path: String,
+    pub expected_head: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeHealth {
+    pub head: Option<String>,
+    pub disk_bytes: Option<u64>,
+    pub pr_number: Option<u64>,
+    pub pr_url: Option<String>,
+    /// Open, merged, closed, no recent PR, or unavailable.
+    pub pr_state: String,
+    pub protection: Option<String>,
+}
+
 pub type WorktreeOverviewParams = EmptyParams;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -800,6 +822,8 @@ pub struct WorktreeOverviewEntry {
     pub merged: bool,
     pub age_days: i64,
     pub stale_suggestion: bool,
+    #[serde(default)]
+    pub health: WorktreeHealth,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

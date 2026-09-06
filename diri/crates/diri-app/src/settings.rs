@@ -49,13 +49,14 @@ pub enum SettingsTab {
     Shortcuts,
     Terminal,
     Usage,
+    Worktrees,
     Resources,
     Remote,
     Phone,
 }
 
 impl SettingsTab {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::General,
         Self::Agents,
         Self::Skills,
@@ -63,6 +64,7 @@ impl SettingsTab {
         Self::Shortcuts,
         Self::Terminal,
         Self::Usage,
+        Self::Worktrees,
         Self::Resources,
         Self::Remote,
         Self::Phone,
@@ -77,6 +79,7 @@ impl SettingsTab {
             Self::Shortcuts => "Shortcuts",
             Self::Terminal => "Appearance",
             Self::Usage => "Usage",
+            Self::Worktrees => "Worktrees",
             Self::Resources => "Resources",
             Self::Remote => "Remote",
             Self::Phone => "Phone access",
@@ -92,6 +95,7 @@ impl SettingsTab {
             Self::Shortcuts => "Keyboard commands and bindings",
             Self::Terminal => "Themes and terminal type",
             Self::Usage => "Costs, tokens, and cache savings",
+            Self::Worktrees => "Pull requests and disk cleanup",
             Self::Resources => "Idle sessions and memory",
             Self::Remote => "SSH execution hosts",
             Self::Phone => "Code from your iPhone",
@@ -109,7 +113,9 @@ impl SettingsTab {
             | Self::Shortcuts
             | Self::Terminal
             | Self::Usage => SettingsSection::Personal,
-            Self::Resources | Self::Remote | Self::Phone => SettingsSection::System,
+            Self::Worktrees | Self::Resources | Self::Remote | Self::Phone => {
+                SettingsSection::System
+            }
         }
     }
 
@@ -122,6 +128,7 @@ impl SettingsTab {
             Self::Shortcuts => "keyboard",
             Self::Terminal => "terminal",
             Self::Usage => "chart.bar.xaxis",
+            Self::Worktrees => "arrow.branch",
             Self::Resources => "server.rack",
             Self::Remote => "network",
             Self::Phone => "iphone",

@@ -51,6 +51,7 @@ pub mod screen;
 pub mod session;
 mod state_file;
 pub mod status;
+mod worktree_health;
 
 pub use control::ControlServer;
 pub use detect::{ManifestEngine, ManifestState, ScreenObservation, ScreenSnapshot};

@@ -1,6 +1,6 @@
 //! State and safe cleanup flow for the worktrees sheet.
 
-use diri_proto::{SessionReparentWorktreeParams, WorktreeOverviewEntry, WorktreeRemoveParams};
+use diri_proto::{SessionReparentWorktreeParams, WorktreeCleanupParams, WorktreeOverviewEntry};
 
 use crate::delegation::WorktreeMoveProposal;
 
@@ -8,6 +8,8 @@ use crate::delegation::WorktreeMoveProposal;
 pub struct WorktreesSheet {
     pub entries: Vec<WorktreeOverviewEntry>,
     pub loading: bool,
+    pub cleanup_only: bool,
+    pub old_only: bool,
     pub pending_cleanup: Option<WorktreeOverviewEntry>,
     pub pending_move: Option<WorktreeMoveProposal>,
     pub move_refusal: Option<String>,
@@ -16,6 +18,7 @@ pub struct WorktreesSheet {
 
 impl WorktreesSheet {
     pub fn begin_refresh(&mut self) {
+        self.pending_cleanup = None;
         self.loading = true;
         self.error = None;
     }
@@ -30,6 +33,14 @@ impl WorktreesSheet {
                         .then_with(|| left.branch.cmp(&right.branch))
                         .then_with(|| left.path.cmp(&right.path))
                 });
+                for entry in &mut entries {
+                    if entry.health.head.is_none() {
+                        entry.stale_suggestion = false;
+                        entry.health.protection =
+                            Some("Update the engine to inspect cleanup safety".into());
+                        entry.health.pr_state = "Unavailable".into();
+                    }
+                }
                 self.entries = entries;
                 self.error = None;
             }
@@ -37,13 +48,17 @@ impl WorktreesSheet {
         }
     }
 
-    /// Cleanup is suggest-only, matching the Swift sheet. A dirty, unmerged,
-    /// main, or otherwise non-stale worktree cannot reach confirmation.
+    /// Only an engine-verified candidate can reach confirmation.
     pub fn request_cleanup(&mut self, path: &str) -> bool {
+        if self.loading {
+            return false;
+        }
         let Some(entry) = self
             .entries
             .iter()
-            .find(|entry| entry.path == path && entry.stale_suggestion)
+            .find(|entry| {
+                entry.path == path && entry.stale_suggestion && entry.health.head.is_some()
+            })
             .cloned()
         else {
             return false;
@@ -56,12 +71,12 @@ impl WorktreesSheet {
         self.pending_cleanup = None;
     }
 
-    pub fn confirm_cleanup(&mut self) -> Option<WorktreeRemoveParams> {
+    pub fn confirm_cleanup(&mut self) -> Option<WorktreeCleanupParams> {
         let entry = self.pending_cleanup.take()?;
-        Some(WorktreeRemoveParams {
+        Some(WorktreeCleanupParams {
             repo_path: entry.project_root,
             worktree_path: entry.path,
-            force: false,
+            expected_head: entry.health.head?,
         })
     }
 
@@ -111,6 +126,10 @@ mod tests {
             merged: true,
             age_days: 20,
             stale_suggestion: stale,
+            health: diri_proto::WorktreeHealth {
+                head: Some("abc".into()),
+                ..Default::default()
+            },
         }
     }
 
@@ -125,7 +144,7 @@ mod tests {
         let params = sheet.confirm_cleanup().unwrap();
         assert_eq!(params.repo_path, "/repo");
         assert_eq!(params.worktree_path, "/repo/feature");
-        assert!(!params.force);
+        assert_eq!(params.expected_head, "abc");
     }
 
     #[test]
@@ -137,6 +156,22 @@ mod tests {
         assert!(sheet.request_cleanup("/repo/feature"));
         sheet.cancel_cleanup();
         assert!(sheet.confirm_cleanup().is_none());
+    }
+
+    #[test]
+    fn refresh_invalidates_confirmation_and_old_engines_cannot_cleanup() {
+        let mut sheet = WorktreesSheet {
+            entries: vec![entry("/repo/feature", true)],
+            ..Default::default()
+        };
+        assert!(sheet.request_cleanup("/repo/feature"));
+        sheet.begin_refresh();
+        assert!(sheet.confirm_cleanup().is_none());
+        assert!(!sheet.request_cleanup("/repo/feature"));
+        let mut old = entry("/repo/feature", true);
+        old.health = Default::default();
+        sheet.finish_refresh(Ok(vec![old]));
+        assert!(!sheet.request_cleanup("/repo/feature"));
     }
 
     #[test]
