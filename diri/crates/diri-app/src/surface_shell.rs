@@ -1646,7 +1646,6 @@ impl UtilitySurfaces {
         let resumable = entry.cwd_exists;
         let opening = self.history_resuming.as_deref() == Some(&entry.id);
         let busy = self.history_resuming.is_some();
-        let folder = folder_name(&entry.cwd).to_owned();
         let title = entry
             .title
             .clone()
@@ -1671,6 +1670,7 @@ impl UtilitySurfaces {
                 div()
                     .id(("history-row", index))
                     .debug_selector(move || format!("history-row-{index}"))
+                    .group("history-row")
                     .h_full()
                     .px(px(10.0))
                     .rounded(px(Radius::CARD))
@@ -1678,7 +1678,10 @@ impl UtilitySurfaces {
                     .items_center()
                     .gap(px(6.0))
                     .bg(Fill::selected(colors, selected))
-                    .when(resumable && !busy, |row| row.cursor_pointer())
+                    .when(resumable && !busy, |row| {
+                        row.cursor_pointer()
+                            .active(move |style| style.bg(colors.primary.alpha(0.14)))
+                    })
                     .when(!resumable, |row| {
                         row.cursor(CursorStyle::OperationNotAllowed)
                     })
@@ -1710,25 +1713,47 @@ impl UtilitySurfaces {
                     )
                     .child(
                         div()
-                            .max_w(px(88.0))
-                            .text_size(px(Typo::META.size))
-                            .text_color(colors.tertiary)
-                            .truncate()
-                            .child(folder),
-                    )
-                    .child(
-                        div()
+                            .relative()
                             .flex_none()
                             .w(px(32.0))
-                            .text_right()
-                            .text_size(px(Typo::META.size))
-                            .text_color(colors.secondary)
+                            .h(px(24.0))
+                            .flex()
+                            .items_center()
+                            .justify_end()
                             .child(if opening {
-                                "…".to_owned()
+                                LoadingIndicator::new("history-opening", 12.0, colors.secondary)
+                                    .into_any_element()
                             } else if !resumable {
-                                "!".to_owned()
+                                sf_symbol("exclamationmark.triangle", 12.0, colors.secondary)
                             } else {
-                                age
+                                div()
+                                    .text_size(px(Typo::META.size))
+                                    .text_color(colors.tertiary)
+                                    .when(selected && !busy, |age| age.invisible())
+                                    .when(!busy, |age| {
+                                        age.group_hover("history-row", |style| style.invisible())
+                                    })
+                                    .child(age)
+                                    .into_any_element()
+                            })
+                            .when(resumable && !busy, |slot| {
+                                slot.child(
+                                    div()
+                                        .absolute()
+                                        .right_0()
+                                        .top_0()
+                                        .size(px(24.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(Radius::CHIP))
+                                        .bg(Fill::subtle(colors))
+                                        .text_size(px(14.0))
+                                        .text_color(colors.secondary)
+                                        .when(!selected, |cue| cue.invisible())
+                                        .group_hover("history-row", |style| style.visible())
+                                        .child("↵"),
+                                )
                             }),
                     ),
             )
@@ -1739,17 +1764,6 @@ impl UtilitySurfaces {
         let colors = self.settings_colors();
         let count = self.history_matches.len();
         let entity = cx.entity();
-        let selected = self.highlighted_history();
-        let status = if self.history_resuming.is_some() {
-            "Opening…".to_owned()
-        } else if self.history_loading {
-            "Updating…".to_owned()
-        } else if self.history_query.is_empty() {
-            format!("{count} conversations")
-        } else {
-            format!("{count} matches")
-        };
-
         FloatingSurface::new(
             colors,
             div()
@@ -1779,7 +1793,7 @@ impl UtilitySurfaces {
                                     colors.primary
                                 })
                                 .child(if self.history_query.is_empty() {
-                                    div().child("Search past conversations…").into_any_element()
+                                    div().child("Search conversations…").into_any_element()
                                 } else {
                                     query_label(&self.history_query)
                                 }),
@@ -1807,6 +1821,38 @@ impl UtilitySurfaces {
                         })
                         .child(
                             div()
+                                .id("refresh-history")
+                                .size(px(24.0))
+                                .rounded(px(Radius::CHIP))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .when(!self.history_loading, |button| {
+                                    button
+                                        .cursor_pointer()
+                                        .hover(move |style| style.bg(Fill::hover(colors, true)))
+                                        .active(move |style| style.bg(colors.primary.alpha(0.12)))
+                                })
+                                .tooltip(move |_, cx| {
+                                    cx.new(|_| {
+                                        HistoryTooltip("Refresh conversations".into(), colors)
+                                    })
+                                    .into()
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| this.refresh_history(cx)))
+                                .child(if self.history_loading {
+                                    LoadingIndicator::new(
+                                        "history-refreshing",
+                                        12.0,
+                                        colors.secondary,
+                                    )
+                                    .into_any_element()
+                                } else {
+                                    sf_symbol("arrow.triangle.2.circlepath", 12.0, colors.secondary)
+                                }),
+                        )
+                        .child(
+                            div()
                                 .id("close-history")
                                 .cursor_pointer()
                                 .rounded(px(Radius::CHIP))
@@ -1822,58 +1868,6 @@ impl UtilitySurfaces {
                         ),
                 )
                 .child(HairlineDivider::horizontal(colors))
-                .child(
-                    div()
-                        .px(px(16.0))
-                        .h(px(30.0))
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(
-                            div()
-                                .text_size(px(Typo::SECTION_HEADER.size))
-                                .font_weight(Typo::SECTION_HEADER.weight)
-                                .text_color(colors.secondary)
-                                .child(if self.history_query.is_empty() {
-                                    "Recent"
-                                } else {
-                                    "Results"
-                                }),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_size(px(Typo::META.size))
-                                .text_color(colors.tertiary)
-                                .child(status),
-                        )
-                        .child(
-                            div()
-                                .id("refresh-history")
-                                .size(px(22.0))
-                                .rounded(px(Radius::CHIP))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .when(!self.history_loading, |button| {
-                                    button
-                                        .cursor_pointer()
-                                        .hover(move |style| style.bg(Fill::hover(colors, true)))
-                                })
-                                .tooltip(move |_, cx| {
-                                    cx.new(|_| {
-                                        HistoryTooltip("Refresh conversations".into(), colors)
-                                    })
-                                    .into()
-                                })
-                                .on_click(cx.listener(|this, _, _, cx| this.refresh_history(cx)))
-                                .child(sf_symbol(
-                                    "arrow.triangle.2.circlepath",
-                                    11.0,
-                                    colors.secondary,
-                                )),
-                        ),
-                )
                 .when_some(self.history_error.clone(), |view, error| {
                     view.child(
                         div()
@@ -1886,6 +1880,7 @@ impl UtilitySurfaces {
                 })
                 .child(
                     div()
+                        .my(px(6.0))
                         .relative()
                         .h(px(HISTORY_LIST_HEIGHT))
                         .overflow_hidden()
@@ -1920,58 +1915,13 @@ impl UtilitySurfaces {
                                             .child(if self.history_loading {
                                                 "Finding conversations…"
                                             } else if self.history_query.is_empty() {
-                                                "No past conversations yet"
+                                                "No conversations yet"
                                             } else {
-                                                "No matching conversations"
-                                            }),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(Typo::META.size))
-                                            .text_color(colors.secondary)
-                                            .child(if self.history_query.is_empty() {
-                                                "Claude and Codex chats will appear here."
-                                            } else {
-                                                "Try a title, project, or agent."
+                                                "No matches"
                                             }),
                                     ),
                             )
                         }),
-                )
-                .child(HairlineDivider::horizontal(colors))
-                .child(
-                    div()
-                        .px(px(16.0))
-                        .h(px(30.0))
-                        .flex()
-                        .items_center()
-                        .gap(px(12.0))
-                        .child(
-                            div()
-                                .min_w(px(0.0))
-                                .flex_1()
-                                .text_size(px(Typo::META.size))
-                                .text_color(colors.secondary)
-                                .truncate()
-                                .child(
-                                    selected
-                                        .map(|entry| compact_history_path(&entry.cwd))
-                                        .unwrap_or_default(),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_size(px(Typo::META.size))
-                                .text_color(colors.secondary)
-                                .child(if selected.is_some_and(|entry| !entry.cwd_exists) {
-                                    "Folder unavailable"
-                                } else if selected.is_some() {
-                                    "↵  Resume"
-                                } else {
-                                    "↑ ↓  Navigate"
-                                }),
-                        ),
                 ),
         )
         .radius(Radius::PANEL)
@@ -6377,19 +6327,6 @@ fn folder_name(path: &str) -> &str {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(path)
-}
-
-fn compact_history_path(path: &str) -> String {
-    if let Some(home) = std::env::var_os("HOME")
-        && let Ok(relative) = Path::new(path).strip_prefix(home)
-    {
-        return if relative.as_os_str().is_empty() {
-            "~".to_owned()
-        } else {
-            format!("~/{}", relative.display())
-        };
-    }
-    path.to_owned()
 }
 
 struct HistoryTooltip(String, SemanticColors);

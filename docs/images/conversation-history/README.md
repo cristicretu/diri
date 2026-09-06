@@ -1,8 +1,8 @@
 # Past conversations
 
-The history picker uses a single search header, 36-point single-line rows, and the shared panel and row corner radii. Unboxed agent marks and conversation titles lead each row, with quieter project names and ages aligned on the right. Hover for the full title, agent, and path; the selected project's path and a Resume hint appear in the footer. Search still matches titles, projects, and agents.
+The history picker is a search header and 36-point single-line rows. Agent marks and titles lead the list; ages stay quiet. There is no count strip, repeated project column, or footer. Hover a row for its full title, agent, path, and any folder warning. Search still matches titles, projects, and agents.
 
-The result list fades at edges with more content and remains clear when all results fit. The shared floating surface provides its entrance fade and respects Reduce Motion.
+A return-key cue replaces the age on the selected or hovered row without shifting its title. Pressed rows give immediate feedback. Refreshing and opening use the shared activity indicator, which respects Reduce Motion. The result list fades at edges with more content, and the floating surface retains its short entrance fade.
 
 The screenshots use synthetic history without a live daemon. Regenerate from `diri/`:
 
