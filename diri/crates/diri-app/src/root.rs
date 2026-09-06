@@ -190,6 +190,9 @@ pub struct RootView {
     /// from this rather than from the settled width so it picks up wherever the
     /// previous frame left the panel.
     sidebar_seam: f32,
+    sidebar_peek_slide: Option<SeamSlide>,
+    sidebar_peek_seam: f32,
+    sidebar_peek_dwell: Option<Task<()>>,
     auxiliary_terminal: Option<Entity<TerminalPane>>,
     auxiliary_id: Option<SessionId>,
     auxiliary_parent: Option<SessionId>,
@@ -408,6 +411,14 @@ impl RootView {
                 });
             }
             if matches!(event, SidebarEvent::VisibilityChanged) {
+                // Pinning adopts the overlay's current position. Render the
+                // same sidebar only once as it becomes part of the layout.
+                if this.sidebar.read(cx).is_visible() && this.sidebar_peek_seam > 0.0 {
+                    this.sidebar_seam = this.sidebar_peek_seam;
+                }
+                this.sidebar_peek_slide = None;
+                this.sidebar_peek_seam = 0.0;
+                this.sidebar_peek_dwell = None;
                 this.begin_sidebar_slide(cx);
                 // Settings navigation lives in the sidebar, so hiding the
                 // sidebar is also the way out of settings.
@@ -417,6 +428,19 @@ impl RootView {
                 {
                     this.sidebar_revealed_for_settings = false;
                     surfaces.update(cx, |surfaces, cx| surfaces.dismiss(cx));
+                }
+            }
+            if matches!(event, SidebarEvent::PeekChanged) {
+                let to = if this.sidebar.read(cx).is_peeking() {
+                    this.sidebar.read(cx).width()
+                } else {
+                    0.0
+                };
+                this.sidebar_peek_slide = (!cx.reduce_motion())
+                    .then(|| SeamSlide::begin(this.sidebar_peek_seam, to))
+                    .flatten();
+                if this.sidebar_peek_slide.is_none() {
+                    this.sidebar_peek_seam = to;
                 }
             }
             cx.notify();
@@ -890,6 +914,9 @@ impl RootView {
             focus: cx.focus_handle(),
             resize_origin: None,
             sidebar_slide: None,
+            sidebar_peek_slide: None,
+            sidebar_peek_seam: 0.0,
+            sidebar_peek_dwell: None,
             sidebar_seam,
             auxiliary_terminal: None,
             auxiliary_id: None,
@@ -3143,6 +3170,11 @@ impl Render for RootView {
             .set_notification_surface_visible(notification_surface_visible);
         let sidebar_visible = self.sidebar.read(cx).is_visible();
         let sidebar_width = self.sidebar.read(cx).width();
+        let peek_width = if self.sidebar.read(cx).is_peeking() {
+            sidebar_width
+        } else {
+            0.0
+        };
         let window_width = f32::from(window.inner_window_bounds().get_bounds().size.width);
         let occupied_sidebar_width = if sidebar_visible { sidebar_width } else { 0.0 };
         self.inspector_max_width =
@@ -3156,6 +3188,9 @@ impl Render for RootView {
             0.0
         };
         let now = Instant::now();
+        self.sidebar_peek_seam =
+            advance_seam(&mut self.sidebar_peek_slide, peek_width, now, window);
+        let peeking = self.sidebar_peek_seam > 0.0;
         self.sidebar_seam =
             advance_seam(&mut self.sidebar_slide, occupied_sidebar_width, now, window);
         self.inspector_seam = advance_seam(&mut self.inspector_slide, inspector_width, now, window);
@@ -3178,29 +3213,46 @@ impl Render for RootView {
         // lives against -- the sidebar's right, the inspector's left -- so
         // narrowing a wrapper slides its panel out under the clip instead of
         // squeezing every row's contents down with it.
-        let sidebar_wrapper = div()
-            .relative()
-            .flex_none()
-            .h_full()
-            .overflow_hidden()
-            .w(px(seam))
-            .when(seam > 0.0, |wrapper| {
-                wrapper.child(
-                    div()
+        let painted_sidebar_width = if peeking {
+            self.sidebar_peek_seam
+        } else {
+            seam
+        };
+        let mut sidebar_wrapper = Some(
+            div()
+                .relative()
+                .flex_none()
+                .h_full()
+                .overflow_hidden()
+                .w(px(painted_sidebar_width))
+                .when(peeking, |wrapper| {
+                    wrapper
                         .absolute()
-                        .top(px(0.0))
-                        .right(px(0.0))
-                        .h_full()
-                        .w(px(sidebar_width))
-                        // A reactive boundary: the sidebar re-renders on its
-                        // own notifies, not on the terminal's 60fps repaints.
-                        .child(
-                            self.sidebar
-                                .clone()
-                                .cached(StyleRefinement::default().size_full()),
-                        ),
-                )
-            });
+                        .left_0()
+                        .top(px(recovery_height))
+                        .bottom_0()
+                        .h_auto()
+                        .shadow_md()
+                        .occlude()
+                })
+                .when(painted_sidebar_width > 0.0, |wrapper| {
+                    wrapper.child(
+                        div()
+                            .absolute()
+                            .top(px(0.0))
+                            .right(px(0.0))
+                            .h_full()
+                            .w(px(sidebar_width))
+                            // A reactive boundary: the sidebar re-renders on its
+                            // own notifies, not on the terminal's 60fps repaints.
+                            .child(
+                                self.sidebar
+                                    .clone()
+                                    .cached(StyleRefinement::default().size_full()),
+                            ),
+                    )
+                }),
+        );
 
         let mut root = div()
             .id("root")
@@ -3354,7 +3406,7 @@ impl Render for RootView {
                     this.drag_inspector_resize(f32::from(event.event.position.x), cx);
                 },
             ))
-            .child(sidebar_wrapper)
+            .children((!peeking).then(|| sidebar_wrapper.take().expect("sidebar wrapper")))
             .when(seam > 0.0, |root| root.child(self.resize_handle(cx)));
         if launcher_open {
             // Command-N behaves like an unsaved new tab: preserve the app
@@ -3410,6 +3462,37 @@ impl Render for RootView {
                         ),
                 );
             }
+        }
+        // This overlay never participates in the terminal's flex layout or
+        // viewport sizing. Keep it below dialogs and above workbench content.
+        root = root.children(sidebar_wrapper);
+        if !sidebar_visible && seam == 0.0 && !peeking && peek_width == 0.0 {
+            root = root.child(
+                div()
+                    .id("sidebar-peek-edge")
+                    .debug_selector(|| "sidebar-peek-edge".into())
+                    .absolute()
+                    .left_0()
+                    .top(px(recovery_height + 36.0))
+                    .bottom_0()
+                    .w(px(8.0))
+                    .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
+                        this.sidebar_peek_dwell = None;
+                        if *hovered {
+                            this.sidebar_peek_dwell =
+                                Some(cx.spawn_in(window, async move |this, cx| {
+                                    cx.background_executor()
+                                        .timer(Duration::from_millis(100))
+                                        .await;
+                                    let _ = this.update_in(cx, |this, window, cx| {
+                                        this.sidebar_peek_dwell = None;
+                                        this.sidebar
+                                            .update(cx, |sidebar, cx| sidebar.peek(window, cx));
+                                    });
+                                }));
+                        }
+                    })),
+            );
         }
         if self.resize_origin.is_some()
             || self.terminal_resize_origin.is_some()
@@ -3593,6 +3676,153 @@ mod tests {
                     .unwrap(),
             ),
         })
+    }
+
+    #[gpui::test]
+    fn sidebar_peek_reveals_on_the_edge_and_leaves_the_layout_collapsed(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let services = test_services();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, true, PreviewScenario::Typical, window, cx)
+        });
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        root.update(cx, |root, cx| {
+            root.sidebar.update(cx, |sidebar, cx| sidebar.conceal(cx))
+        });
+        cx.run_until_parked();
+        let edge = cx
+            .debug_bounds("sidebar-peek-edge")
+            .expect("collapsed edge");
+        cx.simulate_mouse_move(edge.center(), None, Modifiers::default());
+        cx.executor().advance_clock(Duration::from_millis(40));
+        cx.simulate_mouse_move(
+            gpui::point(px(600.0), px(300.0)),
+            None,
+            Modifiers::default(),
+        );
+        cx.executor().advance_clock(Duration::from_millis(120));
+        cx.run_until_parked();
+        assert!(!root.read_with(cx, |root, cx| root.sidebar.read(cx).is_peeking()));
+        cx.simulate_mouse_move(edge.center(), None, Modifiers::default());
+        cx.executor().advance_clock(Duration::from_millis(120));
+        cx.run_until_parked();
+        root.read_with(cx, |root, cx| {
+            assert!(root.sidebar.read(cx).is_peeking());
+            assert!(!root.sidebar.read(cx).is_visible());
+            assert_eq!(
+                root.sidebar_seam, 0.0,
+                "peeking must not resize the terminal"
+            );
+            assert_eq!(root.sidebar_peek_seam, root.sidebar.read(cx).width());
+        });
+        let session = cx
+            .debug_bounds("SESSION_preview-claude")
+            .expect("peek session row");
+        cx.simulate_click(session.center(), Modifiers::default());
+        root.read_with(cx, |root, cx| {
+            assert_eq!(
+                root.sidebar.read(cx).selected_session().unwrap().id,
+                SessionId::new("preview-claude")
+            );
+            assert!(
+                root.sidebar.read(cx).is_peeking(),
+                "selecting a session keeps the peek interactive"
+            );
+        });
+        cx.simulate_mouse_move(
+            gpui::point(px(150.0), px(300.0)),
+            None,
+            Modifiers::default(),
+        );
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert!(root.read_with(cx, |root, cx| root.sidebar.read(cx).is_peeking()));
+        cx.simulate_mouse_move(
+            gpui::point(px(600.0), px(300.0)),
+            None,
+            Modifiers::default(),
+        );
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        assert!(root.read_with(cx, |root, cx| root.sidebar.read(cx).is_peeking()));
+        // Returning during the grace period cancels the pending dismissal.
+        cx.simulate_mouse_move(
+            gpui::point(px(150.0), px(300.0)),
+            None,
+            Modifiers::default(),
+        );
+        cx.executor().advance_clock(Duration::from_millis(300));
+        cx.run_until_parked();
+        assert!(root.read_with(cx, |root, cx| root.sidebar.read(cx).is_peeking()));
+        cx.simulate_mouse_move(
+            gpui::point(px(600.0), px(300.0)),
+            None,
+            Modifiers::default(),
+        );
+        cx.executor().advance_clock(Duration::from_millis(300));
+        cx.run_until_parked();
+        assert!(!root.read_with(cx, |root, cx| root.sidebar.read(cx).is_peeking()));
+        assert!(cx.debug_bounds("sidebar-peek-edge").is_some());
+
+        cx.simulate_mouse_move(edge.center(), None, Modifiers::default());
+        cx.executor().advance_clock(Duration::from_millis(120));
+        cx.run_until_parked();
+        let pin = cx.debug_bounds("sidebar-toggle").expect("peek pin control");
+        cx.simulate_click(pin.center(), Modifiers::default());
+        cx.simulate_mouse_move(
+            gpui::point(px(600.0), px(300.0)),
+            None,
+            Modifiers::default(),
+        );
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        root.read_with(cx, |root, cx| {
+            assert!(root.sidebar.read(cx).is_visible());
+            assert!(!root.sidebar.read(cx).is_peeking());
+            assert_eq!(root.sidebar_peek_seam, 0.0);
+            assert_eq!(root.sidebar_seam, root.sidebar.read(cx).width());
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes a visual preview to DIRI_PEEK_SCREENSHOT"]
+    fn render_sidebar_peek_screenshot() {
+        use gpui::{AppContext as _, HeadlessAppContext};
+        let output = std::env::var("DIRI_PEEK_SCREENSHOT").expect("DIRI_PEEK_SCREENSHOT");
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let services = test_services();
+        let window = cx
+            .open_window(size(px(1000.0), px(700.0)), |window, cx| {
+                cx.new(|cx| {
+                    let root = RootView::new(services, true, PreviewScenario::Typical, window, cx);
+                    root.sidebar.update(cx, |sidebar, cx| {
+                        sidebar.conceal(cx);
+                        sidebar.peek(window, cx);
+                    });
+                    root
+                })
+            })
+            .expect("preview window");
+        cx.run_until_parked();
+        cx.capture_screenshot(window.into())
+            .expect("peek screenshot")
+            .save(output)
+            .expect("save peek screenshot");
+        cx.update_window(window.into(), |_, window, _| window.remove_window())
+            .expect("close preview window");
+        cx.run_until_parked();
     }
 
     #[gpui::test]
