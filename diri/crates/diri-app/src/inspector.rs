@@ -1599,6 +1599,7 @@ impl WorkbenchInspector {
                                 .child(count.to_string()),
                         )
                     })
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.select_tab(tab, cx);
                         cx.stop_propagation();
@@ -1812,6 +1813,7 @@ impl WorkbenchInspector {
                     .hover(move |tab| {
                         tab.bg(colors.primary.alpha(if active { 0.12 } else { 0.055 }))
                     })
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child({
                         let state = if active {
                             &self.browser_state
@@ -1906,6 +1908,7 @@ impl WorkbenchInspector {
                     .cursor_pointer()
                     .hover(move |button| button.bg(Fill::subtle(colors)))
                     .child(sf_symbol("plus", 13.0, colors.secondary))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.workspace_chooser_open = !this.workspace_chooser_open;
                         cx.notify();
@@ -1930,6 +1933,7 @@ impl WorkbenchInspector {
                         SymbolWeight::Bold,
                         colors.secondary,
                     ))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(|_, _, _, cx| {
                         cx.emit(InspectorEvent::Close);
                         cx.stop_propagation();

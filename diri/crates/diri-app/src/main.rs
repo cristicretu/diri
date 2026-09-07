@@ -559,6 +559,10 @@ fn open_main_window(
             // surfaces even though only the sidebar used that material.
             window_background: WindowBackgroundAppearance::Opaque,
             app_id: Some(app_id),
+            // Diri paints the whole titlebar. Keep AppKit from turning presses on
+            // its controls into window drags; RootView explicitly moves the
+            // window from unhandled titlebar presses instead.
+            app_owns_titlebar_drag: cfg!(target_os = "macos"),
             titlebar: Some(TitlebarOptions {
                 title,
                 appears_transparent: cfg!(target_os = "macos"),

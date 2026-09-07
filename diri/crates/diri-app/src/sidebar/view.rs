@@ -6517,6 +6517,7 @@ fn icon_button(
         .cursor_pointer()
         .text_size(px(15.0))
         .text_color(colors.secondary)
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(on_click)
         .on_hover(on_hover)
         .child(sf_symbol(system_image, 15.0, colors.secondary))

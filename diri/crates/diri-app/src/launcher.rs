@@ -3910,6 +3910,7 @@ impl Render for LauncherOverlay {
                     .text_size(px(12.0))
                     .text_color(colors.secondary)
                     .hover(move |button| button.bg(Fill::subtle(colors)))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(|this, _, _, cx| this.close(cx)))
                     .child("Back")
                     .child(div().text_color(colors.tertiary).child("esc")),

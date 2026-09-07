@@ -452,6 +452,7 @@ impl TerminalPane {
             })
             .child(Icon::new(IconName::ChevronDown, 14.0, colors.tertiary))
             .tooltip(move |_, cx| cx.new(|_| PaletteTooltip(help.clone(), colors)).into())
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|this, _, window, cx| {
                 if this.session_links.open {
                     this.close_session_links(window, cx);

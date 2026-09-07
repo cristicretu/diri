@@ -2370,6 +2370,7 @@ impl TerminalPane {
                     .cursor_pointer()
                     .hover(move |button| button.bg(Fill::subtle(colors)))
                     .child(sf_symbol("sidebar.left", 15.0, colors.secondary))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(|_, _, window, cx| {
                         window.dispatch_action(Box::new(ToggleSidebar), cx);
                         cx.stop_propagation();
@@ -2473,6 +2474,7 @@ impl TerminalPane {
                                         colors.secondary
                                     },
                                 ))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .on_click(cx.listener(|_, _, window, cx| {
                                     window.dispatch_action(Box::new(ToggleInspector), cx);
                                     cx.stop_propagation();
@@ -2513,6 +2515,7 @@ impl TerminalPane {
                                             .bg(Ink::FRESH),
                                     )
                                 })
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .on_click(|_, window, cx| {
                                     window.dispatch_action(
                                         Box::new(crate::commands::ToggleNotifications),

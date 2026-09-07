@@ -621,6 +621,7 @@ impl RootView {
                             .cursor_pointer()
                             .hover(move |button| button.bg(Fill::hover(colors, true)))
                             .child(Icon::new(IconName::Close, 14.0, colors.secondary))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .on_click(cx.listener(|this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.toggle_notifications(window, cx);

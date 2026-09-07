@@ -5275,6 +5275,7 @@ fn notification_titlebar_button(unread: usize, colors: SemanticColors) -> AnyEle
                     .bg(Ink::FRESH),
             )
         })
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(|_, window, cx| {
             window.dispatch_action(Box::new(crate::commands::ToggleNotifications), cx);
             cx.stop_propagation();

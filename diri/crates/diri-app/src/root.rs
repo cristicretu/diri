@@ -190,6 +190,10 @@ pub struct RootView {
     browser: std::rc::Rc<std::cell::RefCell<NativeBrowser>>,
     services: Arc<AppServices>,
     focus: FocusHandle,
+    /// A press on otherwise-unhandled titlebar chrome. Button presses stop the
+    /// mouse-down before it bubbles here, so even a one-pixel move remains a
+    /// button click rather than becoming a window drag.
+    titlebar_drag_armed: bool,
     resize_origin: Option<(f32, f32)>,
     /// The sidebar open/close currently being painted, if any.
     sidebar_slide: Option<SeamSlide>,
@@ -929,6 +933,7 @@ impl RootView {
             browser,
             services,
             focus: cx.focus_handle(),
+            titlebar_drag_armed: false,
             resize_origin: None,
             sidebar_slide: None,
             sidebar_panel_slide: None,
@@ -3387,6 +3392,32 @@ impl Render for RootView {
             // treatment above this base.
             .bg(colors.background)
             .track_focus(&self.focus)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, _| {
+                    let pointer_y = f32::from(event.position.y);
+                    this.titlebar_drag_armed = cfg!(target_os = "macos")
+                        && pointer_y >= recovery_height
+                        && pointer_y < recovery_height + Metrics::TITLE_BAR;
+                }),
+            )
+            .on_mouse_move(
+                cx.listener(|this, event: &gpui::MouseMoveEvent, window, _| {
+                    if this.titlebar_drag_armed && event.pressed_button == Some(MouseButton::Left) {
+                        this.titlebar_drag_armed = false;
+                        window.start_window_move();
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseUpEvent, window, _| {
+                    if this.titlebar_drag_armed && event.click_count == 2 {
+                        window.titlebar_double_click();
+                    }
+                    this.titlebar_drag_armed = false;
+                }),
+            )
             .capture_key_down(cx.listener(Self::on_key_down))
             .capture_key_up(cx.listener(Self::on_key_up))
             .on_action(cx.listener(Self::close_selected_session))
@@ -3786,7 +3817,7 @@ fn preview_hint(system_image: &str, label: &str, colors: SemanticColors) -> AnyE
 mod tests {
     use super::*;
     use crate::sidebar::{PreviewScenario, SidebarPreviewFixture};
-    use gpui::{Modifiers, size};
+    use gpui::{Modifiers, point, size};
 
     pub(super) fn test_services() -> Arc<AppServices> {
         Arc::new(AppServices {
@@ -3805,6 +3836,7 @@ mod tests {
         })
     }
 
+    #[cfg(target_os = "macos")]
     #[gpui::test]
     fn switching_sidebar_conversations_keeps_terminal_focused(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| cx.set_reduce_motion(true));
@@ -4251,6 +4283,80 @@ mod tests {
         assert!(
             !root.read_with(cx, |root, _| root.notification_panel_open),
             "clicking the notification trigger again must close the panel without reopening it"
+        );
+    }
+
+    #[gpui::test]
+    fn titlebar_controls_do_not_arm_window_drag_but_empty_chrome_does(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let services = test_services();
+        let session = SidebarPreviewFixture::make(PreviewScenario::Typical)
+            .list
+            .sessions[0]
+            .clone();
+        {
+            let mut store = services.store.store.write().expect("store");
+            store.upsert_session(session.clone());
+            store.select(session.id);
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, true, PreviewScenario::Empty, window, cx)
+        });
+        cx.simulate_resize(size(px(1_000.0), px(700.0)));
+        cx.run_until_parked();
+        for selector in [
+            "show-sidebar",
+            "session-links-trigger",
+            "notification-inbox-button",
+        ] {
+            let control = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("missing titlebar control {selector}"));
+            assert!(
+                control.center().y < px(Metrics::TITLE_BAR),
+                "fixture must place {selector} in the titlebar: {control:?}"
+            );
+            cx.simulate_event(gpui::MouseDownEvent {
+                position: control.center(),
+                modifiers: Modifiers::default(),
+                button: MouseButton::Left,
+                click_count: 1,
+                first_mouse: false,
+            });
+            assert!(
+                !root.read_with(cx, |root, _| root.titlebar_drag_armed),
+                "{selector} must remain a click even if the pointer moves by a pixel"
+            );
+            cx.simulate_event(gpui::MouseUpEvent {
+                position: point(px(500.0), px(100.0)),
+                modifiers: Modifiers::default(),
+                button: MouseButton::Left,
+                click_count: 1,
+            });
+        }
+
+        let trigger = cx.debug_bounds("session-links-trigger").unwrap().center();
+        cx.simulate_click(trigger, Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("session-links-panel").is_some(),
+            "the protected dropdown trigger must still activate normally"
+        );
+
+        cx.simulate_click(trigger, Modifiers::default());
+        cx.run_until_parked();
+        let empty_titlebar = point(px(520.0), px(20.0));
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: empty_titlebar,
+            modifiers: Modifiers::default(),
+            button: MouseButton::Left,
+            click_count: 1,
+            first_mouse: false,
+        });
+        assert!(
+            root.read_with(cx, |root, _| root.titlebar_drag_armed),
+            "unhandled titlebar chrome must still move the window"
         );
     }
 
