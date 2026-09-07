@@ -73,6 +73,10 @@ jobs:
     name: iPhone app
     runs-on: macos-15
     timeout-minutes: 20
+    env:
+      # macos-15 still defaults to Xcode 16.4 even though the image includes
+      # Xcode 26 and App Store Connect now requires the iOS 26 SDK.
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
     defaults:
       run:
         working-directory: ios

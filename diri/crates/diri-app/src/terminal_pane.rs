@@ -13,8 +13,8 @@ use diri_proto::terminal::{
     MouseModes, TerminalMouseButton, TerminalMouseEvent, TerminalMouseModifiers, encode_mouse_event,
 };
 use diri_proto::{
-    AgentKind as ProtoAgentKind, ArtifactKind, ExitReason, PrCheck, PullRequestStatus,
-    Resumability, RiskHint, SessionArtifact, SessionId, SessionRecord, SessionStatus,
+    AgentKind as ProtoAgentKind, ExitReason, Resumability, RiskHint, SessionId, SessionRecord,
+    SessionStatus,
 };
 use diri_term::buffer::GridBuffer;
 use diri_term::element::{SharedGridBuffer, TerminalElement, TerminalReference};
@@ -34,10 +34,10 @@ use diri_ui::{
     StatusGlyph, StatusState, Typo,
 };
 use gpui::{
-    AnyElement, ClickEvent, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter,
-    ExternalPaths, FocusHandle, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton,
-    Render, Role, ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Task,
-    Window, div, font, prelude::*, px, rgba,
+    AnyElement, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, ExternalPaths,
+    FocusHandle, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton, Render, Role,
+    ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Task, Window, div,
+    font, prelude::*, px,
 };
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
@@ -63,9 +63,6 @@ const GRID_VERTICAL_PADDING: f32 = 12.0;
 // paint bounds and therefore cannot be offered to the PTY as a text column.
 const GRID_LAYOUT_HORIZONTAL_CHROME: f32 = 3.0;
 const GRID_LAYOUT_VERTICAL_CHROME: f32 = 2.0;
-const TOOLBAR_MAX_VISIBLE_LINKS: usize = 4;
-const TOOLBAR_LINK_MAX_WIDTH: f32 = 176.0;
-const TOOLBAR_OVERFLOW_WIDTH: f32 = 50.0;
 const REATTACH_DELAY: Duration = Duration::from_millis(500);
 const PANE_EVENT_QUEUE_CAPACITY: usize = 256;
 /// How often a live drag is allowed to push a new PTY geometry. Matched to the
@@ -117,258 +114,9 @@ pub enum TerminalPaneEvent {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ChipTint {
-    Red,
-    Orange,
-    Yellow,
-    Green,
-    Purple,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct PaneChip {
-    pub id: String,
-    pub label: String,
-    pub system_image: &'static str,
-    pub open_url: Option<String>,
-    pub copy_string: String,
-    pub tint: Option<ChipTint>,
-    pub help: String,
-    pub checks: Option<PullRequestStatus>,
-}
-
-impl PaneChip {
-    pub fn for_session(session: &SessionRecord) -> Vec<Self> {
-        let mut result = Vec::new();
-        if let Some(profile) = &session.account_profile {
-            result.push(Self {
-                id: "account-profile".into(),
-                label: profile.label.clone(),
-                system_image: "account.circle",
-                open_url: None,
-                copy_string: profile.label.clone(),
-                tint: None,
-                help: format!(
-                    "Launch account: {} · {}",
-                    profile.label, profile.config_home
-                ),
-                checks: None,
-            });
-        }
-        let artifacts = session.artifacts.as_deref().unwrap_or_default();
-        let statuses = session.pull_requests.as_deref().unwrap_or_default();
-        let pull_requests = artifacts
-            .iter()
-            .filter(|artifact| artifact.kind == ArtifactKind::PullRequest)
-            .map(|artifact| {
-                (
-                    artifact,
-                    statuses.iter().find(|status| status.url == artifact.url),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        // Primary PR destinations are the highest-value links, so expose all
-        // of them before their supporting checks/comments or generic URLs.
-        for (artifact, status) in &pull_requests {
-            result.push(Self::from_artifact(artifact, *status));
-        }
-        for (artifact, status) in pull_requests {
-            if let Some(status) = status {
-                if let Some(checks) = Self::checks_chip(artifact, status) {
-                    result.push(checks);
-                }
-                if let Some(comments) = Self::comments_chip(artifact, status) {
-                    result.push(comments);
-                }
-            }
-        }
-        for artifact in artifacts
-            .iter()
-            .filter(|artifact| artifact.kind != ArtifactKind::PullRequest)
-        {
-            result.push(Self::from_artifact(artifact, None));
-        }
-        for port in session.listening_ports.as_deref().unwrap_or_default() {
-            let url = format!("http://localhost:{}", port.port);
-            result.push(Self {
-                id: format!("port-{}", port.port),
-                label: format!(":{}", port.port),
-                system_image: "network",
-                open_url: Some(url.clone()),
-                copy_string: url.clone(),
-                tint: None,
-                help: url,
-                checks: None,
-            });
-        }
-        result
-    }
-
-    fn from_artifact(artifact: &SessionArtifact, pr: Option<&PullRequestStatus>) -> Self {
-        match artifact.kind {
-            ArtifactKind::PullRequest => {
-                let mut label = pr_number(&artifact.url)
-                    .map_or_else(|| "PR".to_owned(), |number| format!("PR #{number}"));
-                if let Some(pr) = pr
-                    && pr.additions + pr.deletions > 0
-                {
-                    label.push_str(&format!(" +{} −{}", pr.additions, pr.deletions));
-                }
-                Self {
-                    id: format!("art-{}", artifact.url),
-                    label,
-                    system_image: pr.map_or("arrow.triangle.pull", |pr| match pr.state.as_str() {
-                        "MERGED" => "arrow.triangle.merge",
-                        "CLOSED" => "xmark.circle",
-                        _ => "arrow.triangle.pull",
-                    }),
-                    open_url: Some(artifact.url.clone()),
-                    copy_string: artifact.url.clone(),
-                    tint: pr.and_then(pr_tint),
-                    help: pr.map_or_else(|| artifact.url.clone(), pr_help),
-                    checks: None,
-                }
-            }
-            ArtifactKind::LinearIssue => Self::quiet_artifact(
-                artifact,
-                linear_key(&artifact.url).unwrap_or_else(|| "Linear".to_owned()),
-                "checklist",
-            ),
-            ArtifactKind::Preview => Self::quiet_artifact(
-                artifact,
-                url_port(&artifact.url)
-                    .map_or_else(|| url_host(&artifact.url), |port| format!(":{port}")),
-                "network",
-            ),
-            ArtifactKind::Link | ArtifactKind::Unknown => {
-                Self::quiet_artifact(artifact, url_host(&artifact.url), "link")
-            }
-        }
-    }
-
-    fn quiet_artifact(
-        artifact: &SessionArtifact,
-        label: String,
-        system_image: &'static str,
-    ) -> Self {
-        Self {
-            id: format!("art-{}", artifact.url),
-            label,
-            system_image,
-            open_url: Some(artifact.url.clone()),
-            copy_string: artifact.url.clone(),
-            tint: None,
-            help: artifact.url.clone(),
-            checks: None,
-        }
-    }
-
-    fn checks_chip(artifact: &SessionArtifact, pr: &PullRequestStatus) -> Option<Self> {
-        let total = pr.checks_passed + pr.checks_failed + pr.checks_pending;
-        if total <= 0 {
-            return None;
-        }
-        let (system_image, tint) = if pr.checks_failed > 0 {
-            ("xmark.circle.fill", ChipTint::Red)
-        } else if pr.checks_pending > 0 {
-            ("clock.fill", ChipTint::Yellow)
-        } else {
-            ("checkmark.circle.fill", ChipTint::Green)
-        };
-        let mut states = vec![format!("{} passed", pr.checks_passed)];
-        if pr.checks_failed > 0 {
-            states.push(format!("{} failed", pr.checks_failed));
-        }
-        if pr.checks_pending > 0 {
-            states.push(format!("{} running", pr.checks_pending));
-        }
-        Some(Self {
-            id: format!("art-{}-checks", artifact.url),
-            label: format!("{}/{total}", pr.checks_passed),
-            system_image,
-            open_url: Some(format!("{}/checks", artifact.url.trim_end_matches('/'))),
-            copy_string: artifact.url.clone(),
-            tint: Some(tint),
-            help: format!("Checks: {}", states.join(" · ")),
-            checks: Some(pr.clone()),
-        })
-    }
-
-    fn comments_chip(artifact: &SessionArtifact, pr: &PullRequestStatus) -> Option<Self> {
-        let count = pr.comment_count + pr.review_count;
-        let (label, tint) = if let Some(total) = pr.total_threads.filter(|total| *total > 0) {
-            let resolved = pr.resolved_threads.unwrap_or(0);
-            (
-                format!("{resolved}/{total}"),
-                Some(if resolved == total {
-                    ChipTint::Green
-                } else {
-                    ChipTint::Orange
-                }),
-            )
-        } else if count > 0 {
-            (count.to_string(), None)
-        } else {
-            return None;
-        };
-        Some(Self {
-            id: format!("art-{}-comments", artifact.url),
-            label,
-            system_image: "bubble.left",
-            open_url: Some(artifact.url.clone()),
-            copy_string: artifact.url.clone(),
-            tint,
-            help: comments_help(pr),
-            checks: None,
-        })
-    }
-}
-
-fn toolbar_chip_width(chip: &PaneChip) -> f32 {
-    let label_width = chip.label.chars().count().min(24) as f32 * 6.2;
-    (label_width + 34.0).clamp(68.0, TOOLBAR_LINK_MAX_WIDTH)
-}
-
-fn toolbar_visible_chip_count(
-    chips: &[PaneChip],
-    viewport_width: f32,
-    sidebar_visible: bool,
-) -> usize {
-    if chips.is_empty() {
-        return 0;
-    }
-
-    // Protect a readable session title, branch/host metadata, agent identity,
-    // and (when needed) the macOS traffic-light lane + sidebar reveal button.
-    let fixed_chrome = if sidebar_visible { 560.0 } else { 673.0 };
-    let budget = (viewport_width - fixed_chrome).clamp(TOOLBAR_OVERFLOW_WIDTH, 720.0);
-    let limit = chips.len().min(TOOLBAR_MAX_VISIBLE_LINKS);
-    let mut used = 0.0;
-    let mut visible = 0;
-
-    for (index, chip) in chips.iter().take(limit).enumerate() {
-        let gap = if index == 0 {
-            0.0
-        } else {
-            Metrics::TOOLBAR_COMPACT_GAP
-        };
-        let candidate = used + gap + toolbar_chip_width(chip);
-        let overflow = if index + 1 < chips.len() {
-            Metrics::TOOLBAR_COMPACT_GAP + TOOLBAR_OVERFLOW_WIDTH
-        } else {
-            0.0
-        };
-        if candidate + overflow > budget {
-            break;
-        }
-        used = candidate;
-        visible += 1;
-    }
-
-    visible
-}
+#[path = "session_links.rs"]
+mod session_links;
+use session_links::SessionLinks;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AttachmentState {
@@ -514,15 +262,24 @@ enum AttachmentCommand {
     Close,
 }
 
+#[cfg(test)]
+type InputObserver = mpsc::UnboundedSender<(SessionId, Vec<u8>)>;
+
 #[derive(Clone)]
 struct AttachmentControl {
     tx: mpsc::UnboundedSender<AttachmentCommand>,
+    #[cfg(test)]
+    input_observer: Option<(SessionId, InputObserver)>,
 }
 
 impl AttachmentControl {
     fn input(&self, bytes: Vec<u8>) {
         if bytes.is_empty() {
             return;
+        }
+        #[cfg(test)]
+        if let Some((id, observer)) = &self.input_observer {
+            let _ = observer.send((id.clone(), bytes.clone()));
         }
         let _ = self.tx.send(AttachmentCommand::Input(bytes));
     }
@@ -856,8 +613,7 @@ pub struct TerminalPane {
     next_attachment_generation: AttachmentGeneration,
     focus: FocusHandle,
     glyphs: HashMap<SessionId, Entity<StatusGlyph>>,
-    open_checks_for: Option<String>,
-    overflow_open: bool,
+    session_links: SessionLinks,
     /// Paced PTY resizes: window and sidebar drags relayout every frame, but
     /// sustained grid frames leave the daemon at up to 120 Hz, so intermediate
     /// sizes coalesce onto that cadence (see [`RESIZE_CADENCE`]).
@@ -878,9 +634,14 @@ pub struct TerminalPane {
     /// daemon-created id asynchronously, so this transition is also the
     /// reliable point at which keyboard focus can leave the picker.
     observed_selected_id: Option<SessionId>,
+    #[cfg(test)]
+    input_observer: Option<InputObserver>,
     viewport: Option<TerminalViewport>,
     sidebar_visible: bool,
     inspector_open: bool,
+    /// Space in the title bar reserved for workbench-owned controls painted
+    /// above this pane, such as the auxiliary terminal's close button.
+    header_trailing_inset: f32,
     navigation: Option<Entity<NavigationOverlay>>,
     utility_surfaces: Option<Entity<UtilitySurfaces>>,
     local_clipboard_images: Vec<StagedClipboardImage>,
@@ -990,8 +751,7 @@ impl TerminalPane {
             next_attachment_generation: 1,
             focus,
             glyphs: HashMap::new(),
-            open_checks_for: None,
-            overflow_open: false,
+            session_links: SessionLinks::new(cx),
             pending_resizes: HashMap::new(),
             resize_flush: None,
             resize_flush_armed: false,
@@ -1000,9 +760,12 @@ impl TerminalPane {
             started_at: Instant::now(),
             session_source,
             observed_selected_id,
+            #[cfg(test)]
+            input_observer: None,
             viewport: None,
             sidebar_visible: true,
             inspector_open: false,
+            header_trailing_inset: 0.0,
             navigation: None,
             utility_surfaces: None,
             local_clipboard_images: Vec::new(),
@@ -1077,6 +840,11 @@ impl TerminalPane {
                 generation,
                 self.pane_tx.clone(),
             );
+            #[cfg(test)]
+            let attachment = AttachmentControl {
+                input_observer: self.input_observer.clone().map(|tx| (id.clone(), tx)),
+                ..attachment
+            };
             let ime_attachment = attachment.clone();
             let element = match parked {
                 // The parked cells paint on the first frame; the attach's
@@ -1123,6 +891,7 @@ impl TerminalPane {
 
         self.reconcile_residency();
         if selection_changed {
+            self.session_links.close();
             for resident in self.residents.values_mut() {
                 resident.pointer_owner = None;
                 resident.mouse_motion.reset();
@@ -1183,8 +952,32 @@ impl TerminalPane {
         cx.notify();
     }
 
+    pub fn set_header_trailing_inset(&mut self, inset: f32, cx: &mut Context<Self>) {
+        if (self.header_trailing_inset - inset).abs() < f32::EPSILON {
+            return;
+        }
+        self.header_trailing_inset = inset.max(0.0);
+        cx.notify();
+    }
+
     pub fn is_focused(&self, window: &Window) -> bool {
         self.focus.is_focused(window)
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn capture_input_for_test(
+        &mut self,
+    ) -> mpsc::UnboundedReceiver<(SessionId, Vec<u8>)> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.input_observer = Some(tx.clone());
+        for (id, resident) in &mut self.residents {
+            resident.attachment.input_observer = Some((id.clone(), tx.clone()));
+            let attachment = resident.attachment.clone();
+            resident.element = resident.element.clone().on_text_input(move |text| {
+                attachment.input(text.as_bytes().to_vec());
+            });
+        }
+        rx
     }
 
     #[must_use]
@@ -1243,7 +1036,7 @@ impl TerminalPane {
             .store
             .read()
             .expect("session store lock poisoned");
-        crate::app_theme::colors(&store.preferences().terminal_theme)
+        crate::app_theme::colors(store.theme_id())
     }
 
     fn handle_pane_event(&mut self, event: PaneEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -2577,6 +2370,7 @@ impl TerminalPane {
                     .cursor_pointer()
                     .hover(move |button| button.bg(Fill::subtle(colors)))
                     .child(sf_symbol("sidebar.left", 15.0, colors.secondary))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(|_, _, window, cx| {
                         window.dispatch_action(Box::new(ToggleSidebar), cx);
                         cx.stop_propagation();
@@ -2588,65 +2382,29 @@ impl TerminalPane {
     fn render_header(
         &self,
         session: &SessionRecord,
-        chips: &[PaneChip],
-        visible_chip_count: usize,
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let glyph = self.glyphs.get(&session.id).cloned();
-        let branch = session.git_branch.clone();
-        let host = session.host.as_ref().map(|host| {
-            self.runtime
-                .store
-                .read()
-                .expect("session store lock poisoned")
-                .host_display_name(host)
-        });
         let kind = ui_agent_kind(session.effective_kind());
+        let identity_selector = format!("terminal-session-identity-{}", session.id.0);
         let shell_controls = matches!(self.session_source, SessionSource::FollowSelection);
         let show_sidebar = shell_controls && !self.sidebar_visible;
         let sidebar_reveal = show_sidebar.then(|| self.render_sidebar_reveal_control(colors, cx));
         let inspector_open = self.inspector_open;
-        let visible_chip_count = visible_chip_count.min(chips.len());
-        let overflow_count = chips.len().saturating_sub(visible_chip_count);
-        let mut toolbar_links = div()
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap(px(Metrics::TOOLBAR_COMPACT_GAP));
-        for chip in chips.iter().take(visible_chip_count).cloned() {
-            toolbar_links = toolbar_links.child(self.render_chip(chip, colors, cx));
-        }
-        if overflow_count > 0 {
-            toolbar_links = toolbar_links.child(
-                div()
-                    .id("terminal-chip-overflow")
-                    .h(px(Metrics::TOOLBAR_CHIP_HEIGHT))
-                    .px(px(6.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap(px(Metrics::TOOLBAR_COMPACT_GAP))
-                    .rounded(px(Radius::CHIP))
-                    .bg(Fill::subtle(colors))
-                    .text_size(px(Typo::META.size))
-                    .text_color(colors.secondary)
-                    .cursor_pointer()
-                    .hover(move |button| button.bg(colors.primary.alpha(0.10)))
-                    .child(sf_symbol("ellipsis", 10.0, colors.secondary))
-                    .child(format!("+{overflow_count}"))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.overflow_open = !this.overflow_open;
-                        this.open_checks_for = None;
-                        cx.notify();
-                        cx.stop_propagation();
-                    })),
-            );
-        }
+        let header_trailing_inset = self.header_trailing_inset;
+        let unread = self
+            .runtime
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .notifications()
+            .unread_count();
         div()
             .h(px(Metrics::TITLE_BAR))
             .flex_none()
-            .px(px(Metrics::TOOLBAR_EDGE_INSET))
+            .pl(px(Metrics::TOOLBAR_EDGE_INSET))
+            .pr(px(Metrics::TOOLBAR_EDGE_INSET + header_trailing_inset))
             .flex()
             .items_center()
             .justify_between()
@@ -2660,7 +2418,6 @@ impl TerminalPane {
                     .gap(px(Metrics::TOOLBAR_ITEM_GAP))
                     .overflow_hidden()
                     .when_some(sidebar_reveal, |title, control| title.child(control))
-                    .child(sf_symbol("terminal", 15.0, colors.secondary))
                     .child(
                         div()
                             .min_w(px(0.0))
@@ -2672,44 +2429,7 @@ impl TerminalPane {
                             .text_color(colors.primary)
                             .child(session.title.clone()),
                     )
-                    .when_some(branch, |title, branch| {
-                        title.child(
-                            div()
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .gap(px(Metrics::TOOLBAR_COMPACT_GAP))
-                                .px(px(5.0))
-                                .py(px(2.0))
-                                .rounded(px(Radius::CHIP))
-                                .bg(Fill::subtle(colors))
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_size(px(Typo::META.size))
-                                .text_color(colors.tertiary)
-                                .child(sf_symbol("arrow.branch", 10.5, colors.tertiary))
-                                .child(branch),
-                        )
-                    })
-                    .when_some(host, |title, host| {
-                        // Remote-host chip: the agent runs on that configured machine.
-                        title.child(
-                            div()
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .gap(px(Metrics::TOOLBAR_COMPACT_GAP))
-                                .rounded(px(Radius::CHIP))
-                                .px(px(5.0))
-                                .py(px(2.0))
-                                .bg(Fill::subtle(colors))
-                                .text_size(px(Typo::META.size))
-                                .text_color(colors.secondary)
-                                .child(sf_symbol("network", 9.0, colors.secondary))
-                                .child(host),
-                        )
-                    })
-                    .when(!chips.is_empty(), |title| title.child(toolbar_links)),
+                    .child(self.render_session_links_trigger(session, colors, cx)),
             )
             .child(
                 div()
@@ -2720,6 +2440,7 @@ impl TerminalPane {
                     .gap(px(Metrics::TOOLBAR_ITEM_GAP))
                     .child(
                         div()
+                            .debug_selector(move || identity_selector.clone())
                             .flex()
                             .items_center()
                             .gap(px(Metrics::TOOLBAR_COMPACT_GAP))
@@ -2753,74 +2474,58 @@ impl TerminalPane {
                                         colors.secondary
                                     },
                                 ))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .on_click(cx.listener(|_, _, window, cx| {
                                     window.dispatch_action(Box::new(ToggleInspector), cx);
                                     cx.stop_propagation();
                                 })),
                         )
+                    })
+                    .when(shell_controls, |trailing| {
+                        trailing.child(
+                            div()
+                                .id("notification-inbox-button")
+                                .debug_selector(|| "notification-inbox-button".into())
+                                .relative()
+                                .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(Radius::BADGE))
+                                .cursor_pointer()
+                                .hover(move |button| button.bg(Fill::subtle(colors)))
+                                .child(sf_symbol(
+                                    if unread > 0 { "bell.fill" } else { "bell" },
+                                    14.0,
+                                    if unread > 0 {
+                                        Ink::FRESH
+                                    } else {
+                                        colors.secondary
+                                    },
+                                ))
+                                .when(unread > 0, |button| {
+                                    button.child(
+                                        div()
+                                            .absolute()
+                                            .top(px(2.0))
+                                            .right(px(2.0))
+                                            .size(px(5.0))
+                                            .rounded_full()
+                                            .bg(Ink::FRESH),
+                                    )
+                                })
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(
+                                        Box::new(crate::commands::ToggleNotifications),
+                                        cx,
+                                    );
+                                    cx.stop_propagation();
+                                }),
+                        )
                     }),
             )
-            .into_any_element()
-    }
-
-    fn render_chip(
-        &self,
-        chip: PaneChip,
-        colors: SemanticColors,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let tint = chip.tint.map(chip_tint_color);
-        let background = tint.map_or_else(|| Fill::subtle(colors), |color| color.alpha(0.13));
-        let hover_background =
-            tint.map_or_else(|| colors.primary.alpha(0.10), |color| color.alpha(0.20));
-        let activation = chip.clone();
-        div()
-            .id(SharedString::from(chip.id.clone()))
-            .h(px(Metrics::TOOLBAR_CHIP_HEIGHT))
-            .max_w(px(TOOLBAR_LINK_MAX_WIDTH))
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap(px(Metrics::TOOLBAR_COMPACT_GAP))
-            .rounded(px(Radius::CHIP))
-            .px(px(6.0))
-            .bg(background)
-            .hover(move |style| style.bg(hover_background))
-            .cursor_pointer()
-            .text_size(px(Typo::META.size))
-            .text_color(colors.secondary)
-            .child(sf_symbol(
-                chip.system_image,
-                10.0,
-                tint.unwrap_or(colors.secondary),
-            ))
-            .child(
-                div()
-                    .min_w(px(0.0))
-                    .max_w(px(138.0))
-                    .truncate()
-                    .child(chip.label),
-            )
-            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                if event.modifiers().alt {
-                    cx.write_to_clipboard(ClipboardItem::new_string(
-                        activation.copy_string.clone(),
-                    ));
-                } else if activation.id == "account-profile" {
-                    this.open_account_continuation(cx);
-                } else if activation.checks.is_some() {
-                    this.open_checks_for = if this.open_checks_for.as_ref() == Some(&activation.id)
-                    {
-                        None
-                    } else {
-                        Some(activation.id.clone())
-                    };
-                    this.overflow_open = false;
-                    cx.notify();
-                } else if let Some(url) = activation.open_url.as_deref() {
-                    cx.open_url(url);
-                }
-            }))
             .into_any_element()
     }
 
@@ -3275,215 +2980,6 @@ impl TerminalPane {
             ))
             .into_any_element()
     }
-
-    fn render_checks_popover(
-        &self,
-        session: &SessionRecord,
-        colors: SemanticColors,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let chip_id = self.open_checks_for.as_ref()?;
-        let chip = PaneChip::for_session(session)
-            .into_iter()
-            .find(|chip| &chip.id == chip_id)?;
-        let pr = chip.checks?;
-        let total = pr.checks_passed + pr.checks_failed + pr.checks_pending;
-        let headline = if pr.checks_failed > 0 {
-            format!("{} of {total} checks failing", pr.checks_failed)
-        } else if pr.checks_pending > 0 {
-            format!("{} of {total} checks running", pr.checks_pending)
-        } else {
-            format!("All {total} checks passed")
-        };
-        let footer = comments_help(&pr);
-        let mut rows = div().flex().flex_col().py(px(4.0)).px(px(6.0));
-        for (index, check) in sorted_checks(&pr).into_iter().enumerate() {
-            let color = match check.result.as_str() {
-                "pass" => Ink::FRESH,
-                "fail" => Ink::DANGER,
-                _ => Ink::ATTENTION,
-            };
-            let word = match check.result.as_str() {
-                "fail" => "failed",
-                "pending" => "running",
-                _ => "",
-            };
-            let url = check.url.clone();
-            rows = rows.child(
-                div()
-                    .id(SharedString::from(format!("pr-check-{index}")))
-                    .h(px(24.0))
-                    .rounded(px(Radius::ROW))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .px(px(8.0))
-                    .hover(move |style| style.bg(colors.primary.alpha(0.06)))
-                    .when(url.is_some(), |row| row.cursor_pointer())
-                    .child(div().size(px(6.0)).rounded(px(3.0)).bg(color))
-                    .child(
-                        div()
-                            .flex_1()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_size(px(Typo::ROW.size))
-                            .text_color(colors.primary)
-                            .child(check.name),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(Typo::META.size))
-                            .text_color(color)
-                            .child(word),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(url) = url.as_deref() {
-                            cx.open_url(url);
-                            this.open_checks_for = None;
-                            cx.notify();
-                        }
-                    })),
-            );
-        }
-        Some(
-            div()
-                .absolute()
-                .inset_0()
-                .child(div().absolute().inset_0().occlude().on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        this.open_checks_for = None;
-                        cx.notify();
-                        cx.stop_propagation();
-                    }),
-                ))
-                .child(
-                    div()
-                        .id("checks-popover")
-                        .absolute()
-                        .top(px(Metrics::TITLE_BAR + 4.0))
-                        .right(px(112.0))
-                        .w(px(300.0))
-                        .occlude()
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                            this.open_checks_for = None;
-                            cx.notify();
-                        }))
-                        .child(FloatingSurface::new(
-                            colors,
-                            div()
-                                .flex()
-                                .flex_col()
-                                .child(
-                                    div()
-                                        .px(px(12.0))
-                                        .py(px(8.0))
-                                        .text_size(px(Typo::ROW_EMPHASIZED.size))
-                                        .font_weight(Typo::ROW_EMPHASIZED.weight)
-                                        .text_color(colors.primary)
-                                        .child(headline),
-                                )
-                                .child(div().h(px(1.0)).bg(colors.primary.alpha(0.08)))
-                                .child(div().max_h(px(246.0)).overflow_hidden().child(rows))
-                                .child(div().h(px(1.0)).bg(colors.primary.alpha(0.08)))
-                                .child(
-                                    div()
-                                        .px(px(12.0))
-                                        .py(px(7.0))
-                                        .text_size(px(Typo::META.size))
-                                        .text_color(colors.secondary)
-                                        .child(footer),
-                                ),
-                        )),
-                )
-                .into_any_element(),
-        )
-    }
-
-    fn render_overflow(
-        &self,
-        session: &SessionRecord,
-        visible_chip_count: usize,
-        colors: SemanticColors,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let chips = PaneChip::for_session(session);
-        if !self.overflow_open || visible_chip_count >= chips.len() {
-            return None;
-        }
-        let mut list = div().flex().flex_col().p(px(6.0));
-        for (index, chip) in chips.into_iter().skip(visible_chip_count).enumerate() {
-            let url = chip.open_url.clone();
-            let checks = chip.checks.is_some();
-            let chip_id = chip.id.clone();
-            let tint = chip.tint.map(chip_tint_color);
-            list = list.child(
-                div()
-                    .id(SharedString::from(format!("overflow-chip-{index}")))
-                    .h(px(26.0))
-                    .rounded(px(Radius::ROW))
-                    .flex()
-                    .items_center()
-                    .gap(px(7.0))
-                    .px(px(8.0))
-                    .text_size(px(Typo::ROW.size))
-                    .text_color(colors.primary)
-                    .hover(move |style| style.bg(colors.primary.alpha(0.06)))
-                    .cursor_pointer()
-                    .child(sf_symbol(
-                        chip.system_image,
-                        11.0,
-                        tint.unwrap_or(colors.secondary),
-                    ))
-                    .child(div().min_w(px(0.0)).flex_1().truncate().child(chip.label))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if chip_id == "account-profile" {
-                            this.open_account_continuation(cx);
-                        } else if checks {
-                            this.open_checks_for = Some(chip_id.clone());
-                        } else if let Some(url) = url.as_deref() {
-                            cx.open_url(url);
-                        }
-                        this.overflow_open = false;
-                        cx.notify();
-                    })),
-            );
-        }
-        Some(
-            div()
-                .absolute()
-                .inset_0()
-                .child(div().absolute().inset_0().occlude().on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        this.overflow_open = false;
-                        cx.notify();
-                        cx.stop_propagation();
-                    }),
-                ))
-                .child(
-                    div()
-                        .absolute()
-                        .top(px(Metrics::TITLE_BAR + 4.0))
-                        .right(px(112.0))
-                        .w(px(280.0))
-                        .occlude()
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                            this.overflow_open = false;
-                            cx.notify();
-                        }))
-                        .child(FloatingSurface::new(
-                            colors,
-                            list.id("toolbar-overflow-list")
-                                .max_h(px(320.0))
-                                .overflow_y_scroll(),
-                        )),
-                )
-                .into_any_element(),
-        )
-    }
 }
 
 fn quote_from_terminal_element(session_id: SessionId, element: &TerminalElement) -> Option<Quote> {
@@ -3507,7 +3003,7 @@ impl Render for TerminalPane {
                 .store
                 .read()
                 .expect("session store lock poisoned");
-            let theme_id = &store.preferences().terminal_theme;
+            let theme_id = store.theme_id();
             (
                 crate::app_theme::terminal_theme(theme_id),
                 crate::app_theme::colors(theme_id),
@@ -3521,15 +3017,6 @@ impl Render for TerminalPane {
         let selected = self.selected_session();
 
         let content = if let Some(session) = selected {
-            let chips = PaneChip::for_session(&session);
-            let visible_chip_count = toolbar_visible_chip_count(
-                &chips,
-                self.viewport.map_or(900.0, |viewport| viewport.width),
-                self.sidebar_visible,
-            );
-            if visible_chip_count >= chips.len() {
-                self.overflow_open = false;
-            }
             let mut pane = div()
                 .relative()
                 .flex()
@@ -3540,13 +3027,7 @@ impl Render for TerminalPane {
                 .border_l_1()
                 .border_color(sidebar_colors.primary.alpha(0.08))
                 .bg(sidebar_colors.sidebar_surface())
-                .child(self.render_header(
-                    &session,
-                    &chips,
-                    visible_chip_count,
-                    sidebar_colors,
-                    cx,
-                ));
+                .child(self.render_header(&session, sidebar_colors, cx));
             let terminal_surface = div()
                 .relative()
                 .min_h(px(0.0))
@@ -3564,11 +3045,8 @@ impl Render for TerminalPane {
             if let Some(find) = self.render_find_bar(&session, colors, cx) {
                 pane = pane.child(find);
             }
-            if let Some(popover) = self.render_checks_popover(&session, colors, cx) {
-                pane = pane.child(popover);
-            }
-            if let Some(overflow) = self.render_overflow(&session, visible_chip_count, colors, cx) {
-                pane = pane.child(overflow);
+            if let Some(summary) = self.render_session_links(&session, sidebar_colors, window, cx) {
+                pane = pane.child(summary);
             }
             pane.into_any_element()
         } else {
@@ -3858,16 +3336,6 @@ fn centered_symbol_message(
         })
 }
 
-fn chip_tint_color(tint: ChipTint) -> gpui::Rgba {
-    match tint {
-        ChipTint::Red => Ink::DANGER,
-        ChipTint::Orange => rgba(0xf59e42ff),
-        ChipTint::Yellow => Ink::ATTENTION,
-        ChipTint::Green => Ink::FRESH,
-        ChipTint::Purple => rgba(0xa879f7ff),
-    }
-}
-
 fn terminal_key_event(event: &KeyDownEvent) -> Option<TermKeyEvent> {
     let named = match event.keystroke.key.as_str() {
         "up" => Some(NamedKey::ArrowUp),
@@ -3921,7 +3389,11 @@ fn spawn_attachment(
     pane_tx: PaneEventSender,
 ) -> AttachmentControl {
     let (command_tx, mut commands) = mpsc::unbounded_channel();
-    let control = AttachmentControl { tx: command_tx };
+    let control = AttachmentControl {
+        tx: command_tx,
+        #[cfg(test)]
+        input_observer: None,
+    };
     runtime.spawn(async move {
         // The first resize must be the measured pane geometry: deferred agent
         // launch waits for it. Do not seed an arbitrary 80×24 size.
@@ -4055,120 +3527,6 @@ fn status_state(session: &SessionRecord) -> StatusState {
     }
 }
 
-fn pr_number(url: &str) -> Option<String> {
-    let parts: Vec<_> = url.split('/').filter(|part| !part.is_empty()).collect();
-    if let Some(index) = parts.iter().position(|part| *part == "pull") {
-        return parts
-            .get(index + 1)
-            .map(|part| part.chars().take_while(char::is_ascii_digit).collect())
-            .filter(|part: &String| !part.is_empty());
-    }
-    parts
-        .last()
-        .filter(|part| part.chars().all(|character| character.is_ascii_digit()))
-        .map(|part| (*part).to_owned())
-}
-
-fn linear_key(url: &str) -> Option<String> {
-    let parts: Vec<_> = url.split('/').collect();
-    let index = parts.iter().position(|part| *part == "issue")?;
-    parts.get(index + 1).map(|part| (*part).to_owned())
-}
-
-fn url_host(url: &str) -> String {
-    url.split_once("://")
-        .map_or(url, |(_, remainder)| remainder)
-        .split('/')
-        .next()
-        .unwrap_or(url)
-        .split(':')
-        .next()
-        .unwrap_or(url)
-        .to_owned()
-}
-
-fn url_port(url: &str) -> Option<u16> {
-    let authority = url
-        .split_once("://")
-        .map_or(url, |(_, remainder)| remainder)
-        .split('/')
-        .next()?;
-    authority.rsplit_once(':')?.1.parse().ok()
-}
-
-fn pr_tint(pr: &PullRequestStatus) -> Option<ChipTint> {
-    if pr.state == "MERGED" {
-        return Some(ChipTint::Purple);
-    }
-    if pr.state == "CLOSED" || pr.mergeable.as_deref() == Some("CONFLICTING") {
-        return Some(ChipTint::Red);
-    }
-    if pr.is_draft {
-        return None;
-    }
-    match pr.review_decision.as_deref() {
-        Some("CHANGES_REQUESTED") => Some(ChipTint::Orange),
-        Some("REVIEW_REQUIRED") => Some(ChipTint::Yellow),
-        Some("APPROVED") => Some(ChipTint::Green),
-        _ => None,
-    }
-}
-
-fn pr_help(pr: &PullRequestStatus) -> String {
-    let overall = if pr.state == "MERGED" {
-        "merged"
-    } else if pr.state == "CLOSED" {
-        "closed"
-    } else if pr.is_draft {
-        "draft"
-    } else {
-        "open"
-    };
-    let title = pr.title.as_deref().map_or_else(
-        || overall.to_owned(),
-        |title| format!("{title} — {overall}"),
-    );
-    format!(
-        "{title} · +{} −{} · {} file{}",
-        pr.additions,
-        pr.deletions,
-        pr.changed_files,
-        if pr.changed_files == 1 { "" } else { "s" }
-    )
-}
-
-fn comments_help(pr: &PullRequestStatus) -> String {
-    let mut parts = Vec::new();
-    if let Some(total) = pr.total_threads.filter(|total| *total > 0) {
-        parts.push(format!(
-            "{} of {total} threads resolved",
-            pr.resolved_threads.unwrap_or(0)
-        ));
-    }
-    parts.push(format!(
-        "{} comment{}",
-        pr.comment_count,
-        if pr.comment_count == 1 { "" } else { "s" }
-    ));
-    parts.push(format!(
-        "{} review{}",
-        pr.review_count,
-        if pr.review_count == 1 { "" } else { "s" }
-    ));
-    parts.join(" · ")
-}
-
-fn sorted_checks(pr: &PullRequestStatus) -> Vec<PrCheck> {
-    let mut checks = pr.checks.clone().unwrap_or_default();
-    checks.sort_by_key(|check| match check.result.as_str() {
-        "fail" => 0,
-        "pending" => 1,
-        "pass" => 2,
-        _ => 3,
-    });
-    checks
-}
-
 fn terminal_damage_should_repaint(
     selected: Option<&SessionId>,
     updated: &SessionId,
@@ -4278,7 +3636,8 @@ mod tests {
     use diri_proto::{
         DateMillis, ExitInfo, NeedsInputDetail, NeedsInputKind, NeedsInputSource, SessionListResult,
     };
-    use gpui::{Image, ImageFormat, KeyDownEvent, Keystroke, Modifiers, TestAppContext, point};
+    use diri_proto::{PrCheck, PullRequestStatus};
+    use gpui::{Image, ImageFormat, KeyDownEvent, Keystroke, Modifiers, TestAppContext};
 
     use super::*;
 
@@ -4960,7 +4319,7 @@ mod tests {
         assert!(!hold.park(grid_frame(120, false)));
     }
 
-    fn fixture_session() -> SessionRecord {
+    pub(super) fn fixture_session() -> SessionRecord {
         let envelope: serde_json::Value = serde_json::from_str(include_str!(
             "../../diri-proto/tests/fixtures/session_list_response.json"
         ))
@@ -4969,7 +4328,7 @@ mod tests {
         list.sessions[0].clone()
     }
 
-    fn pull_request(url: &str) -> PullRequestStatus {
+    pub(super) fn pull_request(url: &str) -> PullRequestStatus {
         PullRequestStatus {
             url: url.to_owned(),
             number: 42,
@@ -5019,81 +4378,8 @@ mod tests {
     }
 
     #[test]
-    fn chips_follow_swift_artifact_pr_family_then_ports_order() {
-        let mut session = fixture_session();
-        let url = "https://github.com/dirijor/dirijor/pull/42";
-        session.artifacts = Some(vec![SessionArtifact {
-            kind: ArtifactKind::PullRequest,
-            url: url.to_owned(),
-            first_seen_at: DateMillis(1.0),
-        }]);
-        session.pull_requests = Some(vec![pull_request(url)]);
-        session.listening_ports = Some(vec![diri_proto::PortInfo {
-            port: 3000,
-            process_name: "vite".to_owned(),
-        }]);
-
-        let chips = PaneChip::for_session(&session);
-        assert_eq!(chips.len(), 4);
-        assert_eq!(chips[0].label, "PR #42 +45 −12");
-        assert_eq!(chips[0].tint, Some(ChipTint::Green));
-        assert_eq!(chips[1].label, "3/5");
-        assert_eq!(chips[1].tint, Some(ChipTint::Red));
-        assert!(chips[1].checks.is_some());
-        assert_eq!(chips[2].label, "3/5");
-        assert_eq!(chips[2].tint, Some(ChipTint::Orange));
-        assert_eq!(chips[3].label, ":3000");
-        assert_eq!(chips[3].open_url.as_deref(), Some("http://localhost:3000"));
-    }
-
-    #[test]
-    fn toolbar_prioritizes_pr_destinations_and_collapses_low_priority_links() {
-        let mut session = fixture_session();
-        let first_pr = "https://github.com/dirijor/dirijor/pull/7";
-        let second_pr = "https://github.com/dirijor/dirijor/pull/8";
-        session.artifacts = Some(vec![
-            SessionArtifact {
-                kind: ArtifactKind::Link,
-                url: "https://docs.example.com/reference".to_owned(),
-                first_seen_at: DateMillis(1.0),
-            },
-            SessionArtifact {
-                kind: ArtifactKind::PullRequest,
-                url: first_pr.to_owned(),
-                first_seen_at: DateMillis(2.0),
-            },
-            SessionArtifact {
-                kind: ArtifactKind::Preview,
-                url: "https://preview.example.com".to_owned(),
-                first_seen_at: DateMillis(3.0),
-            },
-            SessionArtifact {
-                kind: ArtifactKind::PullRequest,
-                url: second_pr.to_owned(),
-                first_seen_at: DateMillis(4.0),
-            },
-        ]);
-        session.pull_requests = Some(vec![pull_request(first_pr), pull_request(second_pr)]);
-
-        let chips = PaneChip::for_session(&session);
-        assert!(chips[0].label.starts_with("PR #7"));
-        assert!(chips[1].label.starts_with("PR #8"));
-        assert!(
-            chips
-                .iter()
-                .position(|chip| chip.label == "docs.example.com")
-                .is_some_and(|index| index > 1)
-        );
-        assert_eq!(
-            toolbar_visible_chip_count(&chips, 5_000.0, true),
-            TOOLBAR_MAX_VISIBLE_LINKS
-        );
-        assert_eq!(toolbar_visible_chip_count(&chips, 700.0, false), 0);
-    }
-
-    #[test]
     fn check_popover_prioritizes_failure_then_running() {
-        let checks = sorted_checks(&pull_request("https://example.com/pull/42"));
+        let checks = session_links::sorted_checks(&pull_request("https://example.com/pull/42"));
         assert_eq!(
             checks
                 .iter()
@@ -5360,55 +4646,6 @@ mod tests {
                 "stale result completed the new resident's active scan"
             );
         });
-    }
-
-    #[gpui::test]
-    fn terminal_popovers_dismiss_on_an_outside_click(cx: &mut TestAppContext) {
-        let runtime = Arc::new(StoreRuntime::inert());
-        let tokio = Arc::new(
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("test runtime"),
-        );
-        let mut session = fixture_session();
-        let url = "https://github.com/dirijor/dirijor/pull/42";
-        session.artifacts = Some(vec![SessionArtifact {
-            kind: ArtifactKind::PullRequest,
-            url: url.to_owned(),
-            first_seen_at: DateMillis(1.0),
-        }]);
-        session.pull_requests = Some(vec![pull_request(url)]);
-        let checks_id = PaneChip::for_session(&session)
-            .into_iter()
-            .find(|chip| chip.checks.is_some())
-            .expect("fixture should expose a checks chip")
-            .id;
-        {
-            let mut store = runtime.store.write().expect("session store lock poisoned");
-            store.upsert_session(session.clone());
-            store.select(session.id.clone());
-        }
-
-        let (pane, cx) = cx.add_window_view(move |window, cx| {
-            let mut pane = TerminalPane::new(runtime, tokio, window, cx);
-            pane.open_checks_for = Some(checks_id);
-            pane
-        });
-        let outside_panel = point(px(500.0), px(320.0));
-
-        cx.simulate_click(outside_panel, Modifiers::default());
-        assert_eq!(
-            pane.read_with(cx, |pane, _| pane.open_checks_for.clone()),
-            None
-        );
-
-        pane.update(cx, |pane, cx| {
-            pane.overflow_open = true;
-            cx.notify();
-        });
-        cx.simulate_click(outside_panel, Modifiers::default());
-        assert!(!pane.read_with(cx, |pane, _| pane.overflow_open));
     }
 
     #[test]

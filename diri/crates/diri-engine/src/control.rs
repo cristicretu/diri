@@ -60,6 +60,7 @@ pub struct ControlServer {
     browser: std::sync::OnceLock<crate::browser::BrowserPool>,
     active_connections: Arc<AtomicUsize>,
     background_requests: Arc<AtomicUsize>,
+    worktree_scan: crate::worktree_scan::ScanStore,
     agent_catalog: Arc<Mutex<crate::agent_catalog::AgentCatalogStore>>,
     accounts: Mutex<crate::accounts::AccountStore>,
     session_operations: Mutex<std::collections::HashSet<String>>,
@@ -154,6 +155,7 @@ impl ControlServer {
             browser: std::sync::OnceLock::new(),
             active_connections: Arc::new(AtomicUsize::new(0)),
             background_requests: Arc::new(AtomicUsize::new(0)),
+            worktree_scan: Default::default(),
             agent_catalog: Arc::new(Mutex::new(agent_catalog)),
             accounts,
             session_operations: Mutex::new(std::collections::HashSet::new()),
@@ -240,12 +242,6 @@ impl ControlServer {
         if let Err(error) = std::thread::Builder::new()
             .name("diri-remote-restore".into())
             .spawn(move || {
-                // Before adoption, not after: adoption prunes bindings for
-                // sessions it finds dead, and a pruned binding is
-                // indistinguishable from a record that never had one. Running
-                // first is what keeps the legacy test — "has a host and no
-                // binding" — from swallowing this launch's own casualties.
-                server.retire_legacy_remote_sessions();
                 let Some(manager) = manager else {
                     return;
                 };
@@ -260,46 +256,6 @@ impl ControlServer {
         {
             eprintln!("diri-engine: could not start remote session restore: {error}");
         }
-    }
-
-    /// One-shot upgrade path for sessions the deleted `ssh -t` + tmux transport
-    /// created. See [`crate::legacy_remote`] for what it does, what it refuses
-    /// to do, and why this is not a tmux fallback.
-    ///
-    /// Deliberately independent of `with_remote`: a build with no Helper
-    /// artifact still has the user's old records and still owes them a working
-    /// Resume button and a cleaned-up host.
-    fn retire_legacy_remote_sessions(&self) {
-        let plan = crate::legacy_remote::Plan {
-            registry: &self.registry,
-            bindings: self.remote_bindings.as_ref(),
-            hosts: &diri_proto::HostsConfig::load(self.hosts_file()),
-            marker_path: self.legacy_remote_marker(),
-        };
-        let outcome =
-            crate::legacy_remote::retire_legacy_remote_sessions(&plan, &crate::hosts::run_shell);
-        if let Some(summary) = outcome.summary() {
-            eprintln!("{summary}");
-        }
-        // These records have no live session, so the registry watcher — which
-        // only diffs live ones — will never announce the rewrite. Without this
-        // the sidebar keeps showing them as running until the next relaunch.
-        if !outcome.migrated.is_empty()
-            && let Ok(registry) = self.registry.lock()
-        {
-            for id in &outcome.migrated {
-                self.publish_updated(&registry, id);
-            }
-        }
-    }
-
-    /// Beside the socket, next to `remote-bindings` — one file, deletable the
-    /// day this migration is retired.
-    fn legacy_remote_marker(&self) -> PathBuf {
-        self.socket_path
-            .parent()
-            .map(|parent| parent.join("legacy-remote-migration.json"))
-            .unwrap_or_else(|| PathBuf::from("legacy-remote-migration.json"))
     }
 
     fn restore_remote_bindings(
@@ -466,14 +422,9 @@ impl ControlServer {
 
         let mut first = true;
         loop {
-            let mut line = Vec::new();
-            let read = reader.read_until(b'\n', &mut line)?;
-            if read == 0 {
+            let Some(line) = read_bounded_control_line(&mut reader)? else {
                 return Ok(());
-            }
-            if line.last() == Some(&b'\n') {
-                line.pop();
-            }
+            };
             if line.is_empty() {
                 continue;
             }
@@ -507,14 +458,6 @@ impl ControlServer {
                     );
                     return Ok(());
                 }
-            }
-            if line.len() > MAX_CONTROL_LINE_BYTES {
-                // A client that sends an oversized frame is out of contract;
-                // answering would mean buffering unbounded input.
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "control line exceeded the protocol maximum",
-                ));
             }
             let Some(response) = self.handle_line(&line, &writer, &mut subscription) else {
                 continue;
@@ -560,6 +503,8 @@ impl ControlServer {
                         | Method::HOST_INITIALIZE
                         | Method::HOST_LIST_DIRECTORIES
                         | Method::SESSION_READ_DIFF
+                        | Method::WORKTREE_OVERVIEW
+                        | Method::WORKTREE_CLEANUP
                 ) || ((method == Method::AGENT_READINESS
                     || method == Method::AGENT_CONFIGURE)
                     && params
@@ -761,7 +706,9 @@ impl ControlServer {
             Method::ACTIVITY_LIST => self.activity_list(params),
             Method::WORKTREE_CREATE => self.worktree_create(params),
             Method::WORKTREE_LIST => self.worktree_list(params),
+            Method::WORKTREE_CLEANUP => self.worktree_cleanup(params),
             Method::WORKTREE_REMOVE => self.worktree_remove(params),
+            Method::WORKTREE_SCAN => encode(&self.worktree_scan_page(decode(params)?)?),
             Method::WORKTREE_OVERVIEW => self.worktree_overview(),
             Method::TEST_RUN => self.browser_call("run", params),
             "browser.act" => self.browser_call("browser", params),
@@ -1359,123 +1306,68 @@ impl ControlServer {
     /// joined with the session (live wins) occupying it, its dirtiness,
     /// merged-ness into the default branch, and age — plus the "safe to
     /// clean up" suggestion.
-    fn worktree_overview(&self) -> Result<JsonValue, ControlError> {
-        let (records, mut roots) = {
-            let registry = self.registry.lock().map_err(poisoned)?;
-            let roots: Vec<String> = registry
-                .projects_raw()
-                .iter()
-                .filter_map(|project| project.get("root").and_then(|value| value.as_str()))
-                .map(str::to_string)
-                .collect();
-            (registry.records(), roots)
-        };
-        roots.sort();
-
-        // Join sessions by worktree path (fallback cwd); a live session wins
-        // over an exited one sharing the path.
-        let mut session_by_path: std::collections::HashMap<String, &diri_proto::SessionRecord> =
-            std::collections::HashMap::new();
-        let running = |record: &diri_proto::SessionRecord| {
-            !matches!(
-                record.status,
-                diri_proto::SessionStatus::Exited(_) | diri_proto::SessionStatus::Unknown
-            )
-        };
-        for record in &records {
-            let path = record
-                .worktree_path
-                .clone()
-                .unwrap_or_else(|| record.cwd.clone());
-            match session_by_path.get(&path) {
-                Some(existing) if running(existing) || !running(record) => {}
-                _ => {
-                    session_by_path.insert(path, record);
-                }
-            }
-        }
-
-        let run_git = |args: &[&str], dir: &str| -> Option<String> {
-            let output = std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .env("LC_ALL", "C")
-                .env("LANG", "C")
-                .env("LANGUAGE", "C")
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .output()
-                .ok()?;
-            output
-                .status
-                .success()
-                .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        };
-
-        let mut entries = Vec::new();
-        let mut seen_paths = std::collections::HashSet::new();
-        for root in roots {
-            if !crate::git::is_repository(Path::new(&root)) {
-                continue;
-            }
-            let Ok(worktrees) = crate::git::list_worktrees(Path::new(&root)) else {
-                continue;
+    fn worktree_scan_page(
+        &self,
+        p: diri_proto::WorktreeScanParams,
+    ) -> Result<diri_proto::WorktreeScanResult, ControlError> {
+        let registry = Arc::clone(&self.registry);
+        self.worktree_scan.request(p, move |measure_disk, emit| {
+            let (records, roots) = {
+                let registry = registry.lock().map_err(|e| e.to_string())?;
+                (registry.records(), registry.projects_raw().to_vec())
             };
-            // Repo's default branch: origin/HEAD symbolic ref, else "main".
-            let default_branch = run_git(
-                &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-                &root,
-            )
-            .and_then(|full| full.rsplit('/').next().map(str::to_string))
-            .filter(|short| !short.is_empty())
-            .unwrap_or_else(|| "main".into());
-            let merged_branches: std::collections::HashSet<String> = run_git(
-                &[
-                    "branch",
-                    "--merged",
-                    &default_branch,
-                    "--format=%(refname:short)",
-                ],
-                &root,
-            )
-            .map(|output| output.lines().map(str::to_string).collect())
-            .unwrap_or_default();
+            crate::worktree_health::scan(&roots, &records, measure_disk, emit)
+        })
+    }
 
-            for worktree in worktrees {
-                if worktree.is_bare || !seen_paths.insert(worktree.path.clone()) {
-                    continue;
+    fn worktree_overview(&self) -> Result<JsonValue, ControlError> {
+        // Older clients still receive a complete result, off the connection
+        // loop, but join the same worker as incremental clients.
+        let mut p = diri_proto::WorktreeScanParams {
+            refresh: true,
+            ..Default::default()
+        };
+        let mut entries = std::collections::BTreeMap::new();
+        loop {
+            let page = self.worktree_scan_page(p.clone())?;
+            if p.generation != Some(page.generation) {
+                entries.clear();
+            }
+            for entry in page.entries {
+                entries.insert(entry.path.clone(), entry);
+            }
+            p.refresh = false;
+            p.generation = Some(page.generation);
+            p.cursor = page.cursor;
+            if !page.running && !page.has_more {
+                if let Some(error) = page.error {
+                    return Err(ControlError::internal(error));
                 }
-                let is_main = worktree.path == root;
-                let dirty = run_git(&["status", "--porcelain"], &worktree.path)
-                    .is_some_and(|output| !output.is_empty());
-                let merged = worktree.branch.as_ref().is_some_and(|branch| {
-                    branch != &default_branch && merged_branches.contains(branch)
-                });
-                let age_days = std::fs::metadata(&worktree.path)
-                    .ok()
-                    .and_then(|meta| meta.created().or_else(|_| meta.modified()).ok())
-                    .and_then(|at| at.elapsed().ok())
-                    .map(|elapsed| (elapsed.as_secs() / 86_400) as i64)
-                    .unwrap_or(0);
-                let record = session_by_path.get(&worktree.path);
-                let session_alive = record.is_some_and(|record| running(record));
-                entries.push(diri_proto::WorktreeOverviewEntry {
-                    path: worktree.path.clone(),
-                    branch: worktree.branch.clone(),
-                    project_root: root.clone(),
-                    session_id: record.map(|record| record.id.clone()),
-                    session_status: record.map(|record| record.status.clone()),
-                    dirty,
-                    merged,
-                    age_days,
-                    stale_suggestion: !is_main
-                        && !session_alive
-                        && merged
-                        && !dirty
-                        && age_days > 7,
+                return encode(&diri_proto::WorktreeOverviewResult {
+                    entries: entries.into_values().collect(),
                 });
             }
+            if !page.has_more {
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
-        encode(&diri_proto::WorktreeOverviewResult { entries })
+    }
+
+    fn worktree_cleanup(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::WorktreeCleanupParams = decode(params)?;
+        // Serialize the final local session check and removal against launches.
+        // Network and disk scans never run while holding the registry lock.
+        let inspection = crate::worktree_health::inspect_cleanup(&p).map_err(io_control_error)?;
+        let registry = self.registry.lock().map_err(poisoned)?;
+        crate::worktree_health::cleanup(&p, &inspection, &registry.records())
+            .map_err(io_control_error)?;
+        drop(registry);
+        self.events.publish(
+            "worktree.removed",
+            json!({"repoPath": p.repo_path, "path": p.worktree_path}),
+            None,
+        );
+        Ok(json!({}))
     }
 
     /// One-click handoff of a live Claude session between hosts: WIP commit
@@ -3241,6 +3133,34 @@ fn idle_shutdown_refusal(live_sessions: usize, connections: usize) -> Option<&'s
     }
 }
 
+fn read_bounded_control_line<R: BufRead>(reader: &mut R) -> std::io::Result<Option<Vec<u8>>> {
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(line))
+            };
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |position| position + 1);
+        let payload = newline.unwrap_or(available.len());
+        if line.len().saturating_add(payload) > MAX_CONTROL_LINE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "control line exceeded the protocol maximum",
+            ));
+        }
+        line.extend_from_slice(&available[..payload]);
+        reader.consume(consumed);
+        if newline.is_some() {
+            return Ok(Some(line));
+        }
+    }
+}
+
 /// Serializes one message onto the shared write half. Responses and event
 /// frames interleave here; the mutex keeps each line whole.
 fn write_message(writer: &Arc<Mutex<UnixStream>>, message: &ControlMessage) -> std::io::Result<()> {
@@ -3764,6 +3684,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn oversized_control_line_is_rejected_before_unbounded_buffering() {
+        let bytes = vec![b'x'; MAX_CONTROL_LINE_BYTES + 1];
+        let mut reader = std::io::BufReader::new(bytes.as_slice());
+        let error = read_bounded_control_line(&mut reader).expect_err("must reject");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
     fn background_request_capacity_is_bounded_and_released() {
         let counter = Arc::new(AtomicUsize::new(0));
         let permits: Vec<_> = (0..32)
@@ -3923,6 +3851,14 @@ mod tests {
             } => error,
             other => panic!("expected an error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn account_profiles_list_is_available_to_settings() {
+        let temp = tempfile::tempdir().expect("temp");
+        let server = server(temp.path());
+        let result = ok_of(call(&server, "account.profiles.list", None));
+        assert_eq!(result["profiles"], json!([]));
     }
 
     #[test]
@@ -4809,6 +4745,107 @@ mod tests {
                 .expect("array")
                 .iter()
                 .any(|worktree| worktree["branch"] == "feature/x")
+        );
+    }
+
+    #[test]
+    fn worktree_inventory_does_not_block_hello_on_the_same_connection() {
+        let temp = tempfile::tempdir().unwrap();
+        let (repo, _) = repository_with_linked_worktree(temp.path());
+        for n in 0..48 {
+            let status = std::process::Command::new("git")
+                .args(["worktree", "add", "--detach", "--quiet"])
+                .arg(temp.path().join(format!("tree-{n}")))
+                .current_dir(&repo)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let server = server(temp.path());
+        server
+            .registry
+            .lock()
+            .unwrap()
+            .insert_record(ended_resumable_record("inventory", &repo));
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        let worker = std::thread::spawn(move || server.serve(stream));
+        let start = Instant::now();
+        peer.write_all(
+            b"{\"id\":1,\"method\":\"worktree.overview\"}\n{\"id\":2,\"method\":\"hello\"}\n",
+        )
+        .unwrap();
+        let mut reader = BufReader::new(peer);
+        let mut first = String::new();
+        let result = reader.read_line(&mut first);
+        let latency = start.elapsed();
+        // Always drain the outstanding scan before removing its fixture.
+        reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let mut remaining = String::new();
+        for _ in 0..if result.is_ok() { 1 } else { 2 } {
+            remaining.clear();
+            reader.read_line(&mut remaining).unwrap();
+        }
+        reader.get_ref().shutdown(std::net::Shutdown::Both).unwrap();
+        worker.join().unwrap().unwrap();
+        eprintln!(
+            "50 worktrees: Hello latency {latency:?}; total {:?}",
+            start.elapsed()
+        );
+        assert!(
+            result.is_ok(),
+            "Hello timed out behind worktree inventory: {result:?}"
+        );
+        let first: Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(
+            first["id"], 2,
+            "Hello must arrive before the slow inventory"
+        );
+    }
+
+    #[test]
+    fn settings_worktree_cleanup_over_wire_checks_head_and_keeps_branch() {
+        let temp = tempfile::tempdir().unwrap();
+        let (repo, target) = repository_with_linked_worktree(temp.path());
+        let server = server(temp.path());
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&target)
+            .output()
+            .unwrap();
+        let head = String::from_utf8(head.stdout).unwrap().trim().to_owned();
+        let response = call(
+            &server,
+            Method::WORKTREE_CLEANUP,
+            Some(json!({
+                "repoPath": repo, "worktreePath": target, "expectedHead": "stale"
+            })),
+        );
+        assert!(matches!(
+            response,
+            ControlMessage::Response { result: Err(_), .. }
+        ));
+        assert!(target.exists());
+        ok_of(call(
+            &server,
+            Method::WORKTREE_CLEANUP,
+            Some(json!({
+                "repoPath": repo, "worktreePath": target, "expectedHead": head
+            })),
+        ));
+        assert!(!target.exists());
+        assert!(
+            std::process::Command::new("git")
+                .args(["show-ref", "--verify", "refs/heads/feature/reparent"])
+                .current_dir(repo)
+                .output()
+                .unwrap()
+                .status
+                .success()
         );
     }
 

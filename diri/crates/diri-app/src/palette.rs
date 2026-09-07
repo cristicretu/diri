@@ -1,7 +1,7 @@
 //! Command-palette actions, ranking, and filtering.
 //!
-//! The ordering and labels mirror `CommandPaletteView.swift`; UI code only
-//! renders these specs and dispatches the associated command.
+//! Target-aware action specs keep command discovery separate from rendering
+//! and preserve the same dispatch as global shortcuts.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -18,6 +18,7 @@ use crate::fuzzy::{FuzzyMatcher, FuzzyQuery, PreparedText, Score};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaletteCommand {
+    Themes,
     /// A static application command. The palette dispatches the same typed
     /// action used by key bindings, menus, and toolbar controls.
     Action(CommandId),
@@ -29,9 +30,13 @@ pub enum PaletteCommand {
         host: Option<String>,
     },
     /// `session.migrate` the SELECTED session; None = back to local.
-    MigrateSelected { target_host: Option<String> },
+    MigrateSelected {
+        target_host: Option<String>,
+    },
     /// `host.sync_prefs` to one configured host.
-    SyncPrefs { host: String },
+    SyncPrefs {
+        host: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,6 +50,8 @@ pub struct PaletteAction {
     /// Disabled rows remain searchable as setup guidance, but cannot be
     /// activated when the manifest provides no safe setup destination.
     pub enabled: bool,
+    /// The default creation action, independent of shortcut customization.
+    pub is_default: bool,
     pub command: PaletteCommand,
     /// Scored alongside the title but never rendered: the folder path behind
     /// "New Claude Code in anara", a host's ssh target, and the synonyms people
@@ -233,6 +240,7 @@ fn new_dynamic_agent_action(
         },
         detail: None,
         enabled: true,
+        is_default: shortcut,
         keywords: format!("{} {label} agent spawn start create", kind.id()),
     }
 }
@@ -266,11 +274,14 @@ fn append_management_actions(
             matches!(
                 action.command,
                 PaletteCommand::MigrateSelected { .. }
+                    | PaletteCommand::Themes
                     | PaletteCommand::SyncPrefs { .. }
                     | PaletteCommand::Action(
                         CommandId::OpenWorktrees
                             | CommandId::ToggleSidebar
                             | CommandId::OpenSettings
+                            | CommandId::ToggleHistory
+                            | CommandId::ToggleNotifications
                             | CommandId::CheckForUpdates
                     )
             )
@@ -346,6 +357,7 @@ pub fn actions_for_default_host(
             shortcut: None,
             detail: None,
             enabled: true,
+            is_default: false,
             command: PaletteCommand::SpawnAgent {
                 agent: default_agent.clone(),
                 cwd: Some(PathBuf::from(&project.root)),
@@ -366,6 +378,7 @@ pub fn actions_for_default_host(
                 shortcut: None,
                 detail: None,
                 enabled: true,
+                is_default: false,
                 command: PaletteCommand::SpawnAgent {
                     agent: option.kind.clone(),
                     cwd: None,
@@ -380,6 +393,7 @@ pub fn actions_for_default_host(
     // Claude-only — other kinds have no reliable resume, so no entries).
     if let Some(session) = selected
         && session.kind == AgentKind::CLAUDE_CODE
+        && session.account_profile.is_none()
         && !session.is_archived()
     {
         if let Some(current) = &session.host {
@@ -391,6 +405,7 @@ pub fn actions_for_default_host(
                     shortcut: None,
                     detail: None,
                     enabled: true,
+                    is_default: false,
                     command: PaletteCommand::MigrateSelected { target_host: None },
                     keywords: "migrate handoff move back local".into(),
                 });
@@ -404,6 +419,7 @@ pub fn actions_for_default_host(
                     shortcut: None,
                     detail: None,
                     enabled: true,
+                    is_default: false,
                     command: PaletteCommand::MigrateSelected {
                         target_host: Some(host.id.clone()),
                     },
@@ -422,6 +438,7 @@ pub fn actions_for_default_host(
             shortcut: None,
             detail: None,
             enabled: true,
+            is_default: false,
             command: PaletteCommand::SyncPrefs {
                 host: host.id.clone(),
             },
@@ -433,6 +450,19 @@ pub fn actions_for_default_host(
         registered_action(CommandId::OpenWorktrees),
         registered_action(CommandId::ToggleSidebar),
         registered_action(CommandId::OpenSettings),
+        registered_action(CommandId::ToggleHistory),
+        registered_action(CommandId::ToggleNotifications),
+        PaletteAction {
+            id: "color-theme".into(),
+            title: "Color theme".into(),
+            system_image: "moon.fill",
+            shortcut: None,
+            detail: None,
+            enabled: true,
+            is_default: false,
+            command: PaletteCommand::Themes,
+            keywords: "settings appearance dark light preferences".into(),
+        },
         registered_action(CommandId::CheckForUpdates),
     ]);
     result
@@ -460,6 +490,7 @@ fn registered_action_with_title(id: CommandId, title: String) -> PaletteAction {
         shortcut: command.shortcut_label(),
         detail: None,
         enabled: true,
+        is_default: false,
         command: PaletteCommand::Action(id),
         keywords: palette.keywords.into(),
     }
@@ -474,6 +505,7 @@ fn default_action(title: String, system_image: &'static str, keywords: &str) -> 
         shortcut: command.shortcut_label(),
         detail: None,
         enabled: true,
+        is_default: true,
         command: PaletteCommand::Action(CommandId::NewDefaultSession),
         keywords: keywords.into(),
     }
@@ -504,6 +536,7 @@ fn new_agent_action(
             .and_then(|id| commands::command(id).shortcut_label()),
         detail: None,
         enabled: true,
+        is_default,
         command: registered.map_or_else(
             || PaletteCommand::SpawnAgent {
                 agent: option.kind.clone(),
@@ -923,7 +956,7 @@ mod tests {
     }
 
     #[test]
-    fn action_list_matches_swift_order_and_dynamic_default() {
+    fn action_list_preserves_dynamic_default_and_includes_palette_pages() {
         let project = Project {
             id: ProjectId::new("p1"),
             root: "/work/diri".into(),
@@ -947,6 +980,9 @@ mod tests {
                 "worktrees",
                 "toggle-sidebar",
                 "settings",
+                "history",
+                "toggle-notifications",
+                "color-theme",
                 "check-for-updates",
             ]
         );
@@ -1089,6 +1125,47 @@ mod tests {
             pull_requests: None,
             listening_ports: None,
             foreground_agent: None,
+        }
+    }
+
+    #[test]
+    fn account_bound_sessions_do_not_offer_unsupported_migration() {
+        let host = HostEntry {
+            id: "forge".into(),
+            name: None,
+            ssh: "forge".into(),
+            default_cwd: None,
+            node: None,
+        };
+        let mut session = claude_session(None);
+        session.account_profile = Some(diri_proto::AgentAccountProfile {
+            id: "work".into(),
+            label: "Work".into(),
+            agent: "claude-code".into(),
+            host: None,
+            config_home: "~/.claude-work".into(),
+            is_default: false,
+        });
+        for session_host in [None, Some("forge".to_owned())] {
+            session.host = session_host;
+            let result = actions_for_catalogs(
+                AgentKind::CLAUDE_CODE,
+                &[],
+                std::slice::from_ref(&host),
+                Some(&session),
+                None,
+                &HashMap::new(),
+            );
+            assert!(
+                !result
+                    .iter()
+                    .any(|row| matches!(row.command, PaletteCommand::MigrateSelected { .. }))
+            );
+            assert!(
+                result
+                    .iter()
+                    .any(|row| matches!(row.command, PaletteCommand::SyncPrefs { .. }))
+            );
         }
     }
 

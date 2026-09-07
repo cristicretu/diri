@@ -31,6 +31,13 @@ Claude Code and Codex have first-class status detection and resume support.
 Other agents may offer partial detection; every agent can still run as a normal
 terminal.
 
+Install each agent's CLI separately. For local agents, Diri checks your login
+shell's PATH and common package-manager locations, including pnpm's global
+executables in both `PNPM_HOME` and `PNPM_HOME/bin` (pnpm 11). After installing
+an agent while Diri is open, use **Settings → Agents → Refresh**. For a custom
+location that still isn't detected, use **Add…** on that agent's row to select
+its executable.
+
 ## Drag and drop in the sidebar
 
 Drag a session between two rows to reorder it among its siblings; an insertion
@@ -43,7 +50,9 @@ drop does nothing.
 ## Working from the keyboard
 
 ⌘N opens the launcher, ⌘T starts a session with the default agent, ⌘K is the
-command palette, and ⌃⇥ switches between running sessions. The
+command palette, and ⌃⇥ switches between running sessions. ⌘P goes straight to
+the palette’s project page; ⇧⌘H searches past chats. In the palette, choose
+Settings → Color theme to preview themes with the arrow keys and save with Enter. The
 [keyboard shortcuts reference](KEYBOARD_SHORTCUTS.md) lists every binding grouped
 by task, and explains which surface wins when two of them want the same key.
 

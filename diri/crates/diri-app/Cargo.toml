@@ -1,6 +1,6 @@
 [package]
 name = "diri-app"
-version = "0.6.0"
+version = "0.6.2"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -40,7 +40,7 @@ diri-updater.workspace = true
 diri-usage.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
-image.workspace = true
+image = { workspace = true, features = ["ico"] }
 libc = "0.2"
 nucleo-matcher.workspace = true
 notify.workspace = true
@@ -107,6 +107,9 @@ objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
     "objc2-core-foundation",
 ] }
 objc2-foundation = { version = "=0.3.2", default-features = false, features = [
+    "NSData",
+    "NSURLSession",
+    "NSURLResponse",
     "NSArray",
     "NSAttributedString",
     "NSBundle",

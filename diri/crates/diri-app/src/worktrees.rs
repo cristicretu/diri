@@ -1,6 +1,6 @@
 //! State and safe cleanup flow for the worktrees sheet.
 
-use diri_proto::{SessionReparentWorktreeParams, WorktreeOverviewEntry, WorktreeRemoveParams};
+use diri_proto::{SessionReparentWorktreeParams, WorktreeCleanupParams, WorktreeOverviewEntry};
 
 use crate::delegation::WorktreeMoveProposal;
 
@@ -8,6 +8,14 @@ use crate::delegation::WorktreeMoveProposal;
 pub struct WorktreesSheet {
     pub entries: Vec<WorktreeOverviewEntry>,
     pub loading: bool,
+    pub page: usize,
+    pub checked: usize,
+    pub total: usize,
+    pub scan_generation: Option<u64>,
+    pub poll_epoch: u64,
+    indices: std::collections::HashMap<String, usize>,
+    pub cleanup_only: bool,
+    pub old_only: bool,
     pub pending_cleanup: Option<WorktreeOverviewEntry>,
     pub pending_move: Option<WorktreeMoveProposal>,
     pub move_refusal: Option<String>,
@@ -16,6 +24,8 @@ pub struct WorktreesSheet {
 
 impl WorktreesSheet {
     pub fn begin_refresh(&mut self) {
+        self.pending_cleanup = None;
+        self.poll_epoch += 1;
         self.loading = true;
         self.error = None;
     }
@@ -30,6 +40,14 @@ impl WorktreesSheet {
                         .then_with(|| left.branch.cmp(&right.branch))
                         .then_with(|| left.path.cmp(&right.path))
                 });
+                for entry in &mut entries {
+                    if entry.health.head.is_none() {
+                        entry.stale_suggestion = false;
+                        entry.health.protection =
+                            Some("Update the engine to inspect cleanup safety".into());
+                        entry.health.pr_state = "Unavailable".into();
+                    }
+                }
                 self.entries = entries;
                 self.error = None;
             }
@@ -37,13 +55,53 @@ impl WorktreesSheet {
         }
     }
 
-    /// Cleanup is suggest-only, matching the Swift sheet. A dirty, unmerged,
-    /// main, or otherwise non-stale worktree cannot reach confirmation.
+    pub fn apply_scan(&mut self, result: diri_proto::WorktreeScanResult) {
+        if self.scan_generation != Some(result.generation) {
+            self.scan_generation = Some(result.generation);
+            self.entries.clear();
+            self.indices.clear();
+            self.page = 0;
+        }
+        for entry in result.entries {
+            if let Some(&index) = self.indices.get(&entry.path) {
+                self.entries[index] = entry;
+            } else {
+                self.indices.insert(entry.path.clone(), self.entries.len());
+                self.entries.push(entry);
+            }
+        }
+        self.total = result.total;
+        self.checked = result.checked;
+        self.loading = result.running || result.has_more;
+        self.error = result.error;
+        // Leave discovery order stable during the scan. Sort only once at the end.
+        if !self.loading {
+            self.entries.sort_by(|a, b| {
+                a.project_root
+                    .cmp(&b.project_root)
+                    .then(a.branch.cmp(&b.branch))
+                    .then(a.path.cmp(&b.path))
+            });
+            self.indices = self
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| (e.path.clone(), i))
+                .collect();
+        }
+    }
+
+    /// Only an engine-verified candidate can reach confirmation.
     pub fn request_cleanup(&mut self, path: &str) -> bool {
+        if self.loading {
+            return false;
+        }
         let Some(entry) = self
             .entries
             .iter()
-            .find(|entry| entry.path == path && entry.stale_suggestion)
+            .find(|entry| {
+                entry.path == path && entry.stale_suggestion && entry.health.head.is_some()
+            })
             .cloned()
         else {
             return false;
@@ -56,12 +114,12 @@ impl WorktreesSheet {
         self.pending_cleanup = None;
     }
 
-    pub fn confirm_cleanup(&mut self) -> Option<WorktreeRemoveParams> {
+    pub fn confirm_cleanup(&mut self) -> Option<WorktreeCleanupParams> {
         let entry = self.pending_cleanup.take()?;
-        Some(WorktreeRemoveParams {
+        Some(WorktreeCleanupParams {
             repo_path: entry.project_root,
             worktree_path: entry.path,
-            force: false,
+            expected_head: entry.health.head?,
         })
     }
 
@@ -111,6 +169,10 @@ mod tests {
             merged: true,
             age_days: 20,
             stale_suggestion: stale,
+            health: diri_proto::WorktreeHealth {
+                head: Some("abc".into()),
+                ..Default::default()
+            },
         }
     }
 
@@ -125,7 +187,7 @@ mod tests {
         let params = sheet.confirm_cleanup().unwrap();
         assert_eq!(params.repo_path, "/repo");
         assert_eq!(params.worktree_path, "/repo/feature");
-        assert!(!params.force);
+        assert_eq!(params.expected_head, "abc");
     }
 
     #[test]
@@ -137,6 +199,44 @@ mod tests {
         assert!(sheet.request_cleanup("/repo/feature"));
         sheet.cancel_cleanup();
         assert!(sheet.confirm_cleanup().is_none());
+    }
+
+    #[test]
+    fn incremental_worktree_updates_replace_rows_and_generations() {
+        let mut sheet = WorktreesSheet::default();
+        let update = |generation, entry| diri_proto::WorktreeScanResult {
+            generation,
+            cursor: 1,
+            entries: vec![entry],
+            total: 1,
+            checked: 1,
+            running: false,
+            has_more: false,
+            error: None,
+        };
+        sheet.apply_scan(update(1, entry("/repo/feature", false)));
+        sheet.apply_scan(update(1, entry("/repo/feature", true)));
+        assert_eq!(sheet.entries.len(), 1);
+        assert!(sheet.entries[0].stale_suggestion);
+        sheet.apply_scan(update(2, entry("/repo/new", false)));
+        assert_eq!(sheet.entries.len(), 1);
+        assert_eq!(sheet.entries[0].path, "/repo/new");
+    }
+
+    #[test]
+    fn refresh_invalidates_confirmation_and_old_engines_cannot_cleanup() {
+        let mut sheet = WorktreesSheet {
+            entries: vec![entry("/repo/feature", true)],
+            ..Default::default()
+        };
+        assert!(sheet.request_cleanup("/repo/feature"));
+        sheet.begin_refresh();
+        assert!(sheet.confirm_cleanup().is_none());
+        assert!(!sheet.request_cleanup("/repo/feature"));
+        let mut old = entry("/repo/feature", true);
+        old.health = Default::default();
+        sheet.finish_refresh(Ok(vec![old]));
+        assert!(!sheet.request_cleanup("/repo/feature"));
     }
 
     #[test]

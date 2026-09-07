@@ -23,6 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::net::MAX_ARCHIVE_BYTES;
 use crate::version::Version;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -57,6 +58,14 @@ impl Release {
         self.minimum_system_version
             .as_deref()
             .and_then(Version::parse)
+    }
+
+    fn has_bounded_integrity_metadata(&self) -> bool {
+        self.size > 0
+            && self.size <= MAX_ARCHIVE_BYTES
+            && self.sha256.as_deref().is_some_and(|digest| {
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
     }
 }
 
@@ -111,7 +120,7 @@ impl Feed {
                 {
                     return false;
                 }
-                !release.url.is_empty()
+                !release.url.is_empty() && release.has_bounded_integrity_metadata()
             })
             .max_by_key(|release| release.parsed_version().unwrap_or_default())
     }
@@ -136,6 +145,8 @@ mod tests {
         Release {
             version: version.to_owned(),
             url: format!("https://example.test/diri-{version}.zip"),
+            size: 1,
+            sha256: Some("0".repeat(64)),
             ..Release::default()
         }
     }
@@ -280,5 +291,20 @@ mod tests {
                 .map(|r| r.version.as_str()),
             Some("0.5.0")
         );
+    }
+
+    #[test]
+    fn skips_releases_without_bounded_size_and_checksum_metadata() {
+        let mut missing_size = release("0.7.0");
+        missing_size.size = 0;
+        let mut huge = release("0.8.0");
+        huge.size = MAX_ARCHIVE_BYTES + 1;
+        let mut bad_digest = release("0.9.0");
+        bad_digest.sha256 = Some("not-a-digest".into());
+        let feed = Feed {
+            feed_version: 1,
+            releases: vec![missing_size, huge, bad_digest],
+        };
+        assert!(feed.newest_eligible(eligibility()).is_none());
     }
 }

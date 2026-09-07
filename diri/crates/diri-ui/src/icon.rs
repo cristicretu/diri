@@ -50,6 +50,7 @@ pub enum IconName {
     Activity,
     Archive,
     ArrowDown,
+    Bell,
     Branch,
     ChartBar,
     Check,
@@ -85,6 +86,7 @@ pub enum IconName {
     PullRequest,
     Refresh,
     ResizeHorizontal,
+    Return,
     Search,
     Server,
     Settings,
@@ -100,11 +102,12 @@ pub enum IconName {
 }
 
 impl IconName {
-    pub const ALL: [Self; 51] = [
+    pub const ALL: [Self; 53] = [
         Self::Account,
         Self::Activity,
         Self::Archive,
         Self::ArrowDown,
+        Self::Bell,
         Self::Branch,
         Self::ChartBar,
         Self::Check,
@@ -140,6 +143,7 @@ impl IconName {
         Self::PullRequest,
         Self::Refresh,
         Self::ResizeHorizontal,
+        Self::Return,
         Self::Search,
         Self::Server,
         Self::Settings,
@@ -160,6 +164,7 @@ impl IconName {
             Self::Activity => "icons/activity.svg",
             Self::Archive => "icons/archive.svg",
             Self::ArrowDown => "icons/arrow-down.svg",
+            Self::Bell => "icons/bell.svg",
             Self::Branch => "icons/branch.svg",
             Self::ChartBar => "icons/chart-bar.svg",
             Self::Check => "icons/check.svg",
@@ -195,6 +200,7 @@ impl IconName {
             Self::PullRequest => "icons/pull-request.svg",
             Self::Refresh => "icons/refresh.svg",
             Self::ResizeHorizontal => "icons/resize-horizontal.svg",
+            Self::Return => "icons/return.svg",
             Self::Search => "icons/search.svg",
             Self::Server => "icons/server.svg",
             Self::Settings => "icons/settings.svg",
@@ -217,6 +223,7 @@ impl IconName {
             "waveform.circle" | "waveform.circle.fill" => Self::Activity,
             "archivebox" | "archivebox.fill" => Self::Archive,
             "arrow.down" => Self::ArrowDown,
+            "bell" | "bell.fill" => Self::Bell,
             "arrow.branch" => Self::Branch,
             "chart.bar" | "chart.bar.xaxis" => Self::ChartBar,
             "checkmark" => Self::Check,
@@ -255,6 +262,7 @@ impl IconName {
                 Self::Refresh
             }
             "arrow.left.and.right" | "arrow.left.arrow.right" => Self::ResizeHorizontal,
+            "return" => Self::Return,
             "magnifyingglass" => Self::Search,
             "server.rack" => Self::Server,
             "gearshape" => Self::Settings,
@@ -328,6 +336,7 @@ fn embedded_svg(path: &str) -> Option<&'static [u8]> {
         "icons/activity.svg" => include_bytes!("../assets/icons/activity.svg"),
         "icons/archive.svg" => include_bytes!("../assets/icons/archive.svg"),
         "icons/arrow-down.svg" => include_bytes!("../assets/icons/arrow-down.svg"),
+        "icons/bell.svg" => include_bytes!("../assets/icons/bell.svg"),
         "icons/branch.svg" => include_bytes!("../assets/icons/branch.svg"),
         "icons/chart-bar.svg" => include_bytes!("../assets/icons/chart-bar.svg"),
         "icons/check.svg" => include_bytes!("../assets/icons/check.svg"),
@@ -362,6 +371,7 @@ fn embedded_svg(path: &str) -> Option<&'static [u8]> {
         "icons/power.svg" => include_bytes!("../assets/icons/power.svg"),
         "icons/pull-request.svg" => include_bytes!("../assets/icons/pull-request.svg"),
         "icons/refresh.svg" => include_bytes!("../assets/icons/refresh.svg"),
+        "icons/return.svg" => include_bytes!("../assets/icons/return.svg"),
         "icons/resize-horizontal.svg" => include_bytes!("../assets/icons/resize-horizontal.svg"),
         "icons/search.svg" => include_bytes!("../assets/icons/search.svg"),
         "icons/server.svg" => include_bytes!("../assets/icons/server.svg"),

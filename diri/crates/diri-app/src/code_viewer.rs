@@ -4,9 +4,12 @@
 //! This module owns only the presentation state: asynchronous opens, source
 //! history, line targeting, virtualization, and lightweight lexical color.
 
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use gpui::{
     AnyElement, App, Context, FocusHandle, Focusable, FontWeight, HighlightStyle, KeyDownEvent,
@@ -15,7 +18,8 @@ use gpui::{
 };
 
 use crate::code_intelligence::{
-    CodeIntelligence, CodeIntelligenceError, SearchHit, SearchHitKind, SourceSnapshot,
+    CodeIntelligence, CodeIntelligenceError, DirectoryEntry, SearchHit, SearchHitKind,
+    SourceSnapshot,
 };
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
@@ -33,6 +37,24 @@ enum ViewerState {
     Loading { reference: String },
     Ready(Arc<SourceSnapshot>),
     Error { reference: String, message: String },
+}
+
+struct ExplorerTooltip(String, SemanticColors);
+
+impl Render for ExplorerTooltip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .max_w(px(420.0))
+            .px(px(9.0))
+            .py(px(6.0))
+            .rounded(px(Radius::BADGE))
+            .bg(self.1.sidebar_surface())
+            .border_1()
+            .border_color(self.1.primary.alpha(0.15))
+            .text_size(px(11.0))
+            .text_color(self.1.primary)
+            .child(self.0.clone())
+    }
 }
 
 pub struct CodeViewer {
@@ -53,6 +75,20 @@ pub struct CodeViewer {
     highlighted_result: usize,
     history: Vec<(PathBuf, String)>,
     history_index: usize,
+    tree_visible: bool,
+    tree_focused: bool,
+    tree_generation: u64,
+    directories: HashMap<PathBuf, Vec<DirectoryEntry>>,
+    expanded: HashSet<PathBuf>,
+    tree_loading: HashSet<PathBuf>,
+    tree_errors: HashMap<PathBuf, String>,
+    tree_selected: Option<PathBuf>,
+    tree_scroll: UniformListScrollHandle,
+    content_search: bool,
+    search_pending: bool,
+    search_error: Option<String>,
+    search_cancel: Arc<AtomicU64>,
+    result_scroll: gpui::ScrollHandle,
 }
 
 impl CodeViewer {
@@ -79,6 +115,20 @@ impl CodeViewer {
             highlighted_result: 0,
             history: Vec::new(),
             history_index: 0,
+            tree_visible: true,
+            tree_focused: false,
+            tree_generation: 0,
+            directories: HashMap::new(),
+            expanded: HashSet::new(),
+            tree_loading: HashSet::new(),
+            tree_errors: HashMap::new(),
+            tree_selected: None,
+            tree_scroll: UniformListScrollHandle::new(),
+            content_search: false,
+            search_pending: false,
+            search_error: None,
+            search_cancel: Arc::new(AtomicU64::new(0)),
+            result_scroll: gpui::ScrollHandle::new(),
         }
     }
 
@@ -87,6 +137,58 @@ impl CodeViewer {
             return;
         }
         self.colors = colors;
+        cx.notify();
+    }
+
+    pub(crate) fn tab_label(&self) -> Option<String> {
+        match &self.state {
+            ViewerState::Ready(snapshot) => snapshot
+                .relative_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned()),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_explorer_preview(&mut self, cx: &mut Context<Self>) {
+        let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let intelligence = Arc::new(CodeIntelligence::for_session(&cwd).unwrap());
+        let snapshot = intelligence
+            .open_reference("diri/crates/diri-app/src/code_intelligence.rs:65")
+            .unwrap();
+        self.workspace_cwd = Some(cwd);
+        for parent in snapshot.relative_path.ancestors().skip(1) {
+            self.expanded.insert(parent.to_path_buf());
+            self.directories.insert(
+                parent.to_path_buf(),
+                intelligence.directory_entries(parent).unwrap(),
+            );
+        }
+        self.tree_selected = Some(snapshot.relative_path.clone());
+        self.state = ViewerState::Ready(Arc::new(snapshot));
+        self.intelligence = Some(intelligence);
+        self.scroll.scroll_to_item(55, ScrollStrategy::Top);
+        if let Some(index) = self
+            .tree_rows()
+            .iter()
+            .position(|(entry, _)| Some(&entry.relative_path) == self.tree_selected.as_ref())
+        {
+            self.tree_scroll
+                .scroll_to_item(index.saturating_sub(5), ScrollStrategy::Top);
+        }
+        if std::env::var_os("DIRI_VISUAL_SEARCH").is_some() {
+            self.picker_open = true;
+            self.query.insert("directory");
+            self.results = self.intelligence.as_ref().unwrap().search("directory", 200);
+        }
         cx.notify();
     }
 
@@ -101,6 +203,8 @@ impl CodeViewer {
             window.focus(&self.focus, cx);
             self.schedule_search(cx);
         } else {
+            self.search_cancel.fetch_add(1, Ordering::Relaxed);
+            self._search_task = None;
             self.query.clear();
             self.results.clear();
             self.highlighted_result = 0;
@@ -109,43 +213,375 @@ impl CodeViewer {
     }
 
     fn schedule_search(&mut self, cx: &mut Context<Self>) {
-        let intelligence = self.intelligence.clone();
-        let workspace_cwd = self.workspace_cwd.clone();
-        if intelligence.is_none() && workspace_cwd.is_none() {
-            self.results.clear();
-            return;
-        }
         self.search_generation = self.search_generation.wrapping_add(1);
         let generation = self.search_generation;
+        self.search_cancel.store(generation, Ordering::Relaxed);
+        let cancel = self.search_cancel.clone();
+        let intelligence = self.intelligence.clone();
+        let Some(cwd) = self.workspace_cwd.clone() else {
+            self.results.clear();
+            self.search_pending = false;
+            return;
+        };
+        self.search_pending = true;
+        self.search_error = None;
+        self.results.clear();
+        self.highlighted_result = 0;
         let query = self.query.text().to_owned();
+        let content_search = self.content_search;
         let tokio = self.tokio.clone();
         self._search_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(120))
+                .await;
             let result = tokio
                 .spawn_blocking(move || {
                     let intelligence = match intelligence {
                         Some(intelligence) => intelligence,
-                        None => Arc::new(CodeIntelligence::for_session(workspace_cwd?).ok()?),
+                        None => Arc::new(CodeIntelligence::for_session(cwd)?),
                     };
-                    let results = intelligence.search(&query, 40);
-                    Some((intelligence, results))
+                    let results = if content_search {
+                        intelligence.search_content(&query, 201, || {
+                            cancel.load(Ordering::Relaxed) != generation
+                        })
+                    } else {
+                        intelligence.search(&query, 201)
+                    };
+                    Ok::<_, CodeIntelligenceError>((intelligence, results))
                 })
                 .await
-                .ok()
-                .flatten();
+                .map_err(|error| error.to_string())
+                .and_then(|result| result.map_err(|error| error.to_string()));
             let _ = this.update(cx, |this, cx| {
                 if this.search_generation != generation || !this.picker_open {
                     return;
                 }
-                if let Some((intelligence, results)) = result {
-                    this.intelligence = Some(intelligence);
-                    this.results = results;
-                } else {
-                    this.results.clear();
+                this.search_pending = false;
+                match result {
+                    Ok((intelligence, results)) => {
+                        this.intelligence = Some(intelligence);
+                        this.results = results;
+                    }
+                    Err(error) => this.search_error = Some(error),
                 }
-                this.highlighted_result = 0;
                 cx.notify();
             });
         }));
+    }
+
+    fn load_directory(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.tree_loading.contains(&path) {
+            return;
+        }
+        let Some(cwd) = self.workspace_cwd.clone() else {
+            return;
+        };
+        self.tree_loading.insert(path.clone());
+        self.tree_errors.remove(&path);
+        let generation = self.tree_generation;
+        let intelligence = self.intelligence.clone();
+        let tokio = self.tokio.clone();
+        cx.spawn(async move |this, cx| {
+            let requested = path.clone();
+            let result = tokio
+                .spawn_blocking(move || {
+                    let intelligence = match intelligence {
+                        Some(intelligence) => intelligence,
+                        None => Arc::new(CodeIntelligence::for_session(cwd)?),
+                    };
+                    let entries = intelligence.directory_entries(&requested)?;
+                    Ok::<_, CodeIntelligenceError>((intelligence, entries))
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result.map_err(|error| error.to_string()));
+            let _ = this.update(cx, |this, cx| {
+                if this.tree_generation != generation {
+                    return;
+                }
+                this.tree_loading.remove(&path);
+                match result {
+                    Ok((intelligence, entries)) => {
+                        this.intelligence = Some(intelligence);
+                        this.directories.insert(path, entries);
+                    }
+                    Err(error) => {
+                        this.tree_errors.insert(path, error);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn tree_rows(&self) -> Vec<(DirectoryEntry, usize)> {
+        fn visit(
+            this: &CodeViewer,
+            path: &std::path::Path,
+            depth: usize,
+            rows: &mut Vec<(DirectoryEntry, usize)>,
+        ) {
+            if let Some(entries) = this.directories.get(path) {
+                for entry in entries {
+                    rows.push((entry.clone(), depth));
+                    if entry.is_dir && this.expanded.contains(&entry.relative_path) {
+                        visit(this, &entry.relative_path, depth + 1, rows);
+                    }
+                }
+            }
+        }
+        let mut rows = Vec::new();
+        visit(self, std::path::Path::new(""), 0, &mut rows);
+        rows
+    }
+
+    fn activate_tree_entry(&mut self, entry: DirectoryEntry, cx: &mut Context<Self>) {
+        self.tree_selected = Some(entry.relative_path.clone());
+        if entry.is_dir {
+            if !self.expanded.remove(&entry.relative_path) {
+                self.expanded.insert(entry.relative_path.clone());
+                if !self.directories.contains_key(&entry.relative_path) {
+                    self.load_directory(entry.relative_path, cx);
+                }
+            }
+        } else if let Some(intelligence) = &self.intelligence {
+            let cwd = intelligence.workspace_root().to_path_buf();
+            if let Ok(uri) = url::Url::from_file_path(cwd.join(entry.relative_path)) {
+                self.open_reference_inner(cwd, uri.to_string(), true, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn handle_tree_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+        let rows = self.tree_rows();
+        if rows.is_empty() {
+            return false;
+        }
+        let index = rows
+            .iter()
+            .position(|(entry, _)| Some(&entry.relative_path) == self.tree_selected.as_ref())
+            .unwrap_or(0);
+        let entry = rows[index].0.clone();
+        let next = match key {
+            "up" => index.saturating_sub(1),
+            "down" => (index + 1).min(rows.len() - 1),
+            "home" => 0,
+            "end" => rows.len() - 1,
+            "enter" | "space" => {
+                self.activate_tree_entry(entry, cx);
+                return true;
+            }
+            "right" => {
+                if !entry.is_dir {
+                    return true;
+                }
+                if entry.is_dir && !self.expanded.contains(&entry.relative_path) {
+                    self.activate_tree_entry(entry, cx);
+                    return true;
+                }
+                (index + 1).min(rows.len() - 1)
+            }
+            "left" => {
+                if self.expanded.remove(&entry.relative_path) {
+                    cx.notify();
+                    return true;
+                }
+                rows.iter()
+                    .position(|(candidate, _)| {
+                        Some(candidate.relative_path.as_path()) == entry.relative_path.parent()
+                    })
+                    .unwrap_or(index)
+            }
+            _ => return false,
+        };
+        self.tree_selected = Some(rows[next].0.relative_path.clone());
+        self.tree_scroll.scroll_to_item(next, ScrollStrategy::Top);
+        cx.notify();
+        true
+    }
+
+    fn render_tree(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+        let rows = self.tree_rows();
+        let label = self
+            .intelligence
+            .as_ref()
+            .map(|index| index.workspace_root())
+            .or(self.workspace_cwd.as_deref())
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "EXPLORER".into());
+        let mut tree = div()
+            .w(px(170.0))
+            .flex_none()
+            .h_full()
+            .flex()
+            .flex_col()
+            .border_r_1()
+            .border_color(colors.primary.alpha(0.08))
+            .child(
+                div()
+                    .h(px(30.0))
+                    .flex_none()
+                    .px(px(8.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_size(px(10.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(colors.secondary)
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .id("refresh-file-tree")
+                            .size(px(24.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(Radius::BADGE))
+                            .cursor_pointer()
+                            .hover(move |button| button.bg(colors.primary.alpha(0.08)))
+                            .child(sf_symbol("arrow.clockwise.circle", 10.0, colors.secondary))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.tree_generation = this.tree_generation.wrapping_add(1);
+                                this.tree_loading.clear();
+                                this.intelligence = None;
+                                this.directories.clear();
+                                this.tree_errors.clear();
+                                this.load_directory(PathBuf::new(), cx);
+                                for path in this.expanded.clone() {
+                                    this.load_directory(path, cx);
+                                }
+                                if this.picker_open {
+                                    this.schedule_search(cx);
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            );
+        if rows.is_empty() {
+            let message = if self.workspace_cwd.is_none() {
+                "Select a local session to browse its files."
+            } else if self.tree_loading.contains(&PathBuf::new()) {
+                "Loading files…"
+            } else if let Some(error) = self.tree_errors.get(&PathBuf::new()) {
+                error.as_str()
+            } else {
+                "This folder is empty."
+            };
+            tree = tree.child(
+                div()
+                    .p(px(12.0))
+                    .text_size(px(11.0))
+                    .text_color(colors.tertiary)
+                    .child(message.to_owned()),
+            );
+        } else {
+            let viewer = cx.entity().downgrade();
+            tree = tree.child(
+                uniform_list("workspace-file-tree", rows.len(), move |range, _, cx| {
+                    viewer
+                        .update(cx, |this, cx| {
+                            range
+                                .map(|index| {
+                                    let (entry, depth) = &rows[index];
+                                    let entry = entry.clone();
+                                    let tooltip = this
+                                        .tree_errors
+                                        .get(&entry.relative_path)
+                                        .cloned()
+                                        .unwrap_or_else(|| {
+                                            entry.relative_path.to_string_lossy().into_owned()
+                                        });
+                                    let selected =
+                                        this.tree_selected.as_ref() == Some(&entry.relative_path);
+                                    let expanded = this.expanded.contains(&entry.relative_path);
+                                    let name = entry
+                                        .relative_path
+                                        .file_name()
+                                        .unwrap_or_default()
+                                        .to_string_lossy()
+                                        .into_owned();
+                                    let status = if this.tree_loading.contains(&entry.relative_path)
+                                    {
+                                        " …"
+                                    } else if this.tree_errors.contains_key(&entry.relative_path) {
+                                        " !"
+                                    } else {
+                                        ""
+                                    };
+                                    div()
+                                        .id(("file-tree-row", index))
+                                        .h(px(24.0))
+                                        .pl(px(6.0 + *depth as f32 * 12.0))
+                                        .pr(px(6.0))
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(5.0))
+                                        .overflow_hidden()
+                                        .bg(colors.primary.alpha(if selected { 0.10 } else { 0.0 }))
+                                        .cursor_pointer()
+                                        .hover(move |row| row.bg(colors.primary.alpha(0.07)))
+                                        .child(div().w(px(8.0)).flex_none().when(
+                                            entry.is_dir,
+                                            |icon| {
+                                                icon.child(sf_symbol(
+                                                    if expanded {
+                                                        "chevron.down"
+                                                    } else {
+                                                        "chevron.right"
+                                                    },
+                                                    8.0,
+                                                    colors.tertiary,
+                                                ))
+                                            },
+                                        ))
+                                        .child(sf_symbol(
+                                            if entry.is_dir {
+                                                if expanded { "folder.fill" } else { "folder" }
+                                            } else {
+                                                "doc.text"
+                                            },
+                                            11.0,
+                                            colors.secondary,
+                                        ))
+                                        .child(
+                                            div()
+                                                .min_w(px(0.0))
+                                                .flex_1()
+                                                .truncate()
+                                                .text_size(px(11.0))
+                                                .text_color(colors.primary)
+                                                .child(format!("{name}{status}")),
+                                        )
+                                        .tooltip(move |_, cx| {
+                                            cx.new(|_| ExplorerTooltip(tooltip.clone(), colors))
+                                                .into()
+                                        })
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.tree_focused = true;
+                                            window.focus(&this.focus, cx);
+                                            this.activate_tree_entry(entry.clone(), cx);
+                                        }))
+                                        .into_any_element()
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .track_scroll(&self.tree_scroll)
+                .flex_1()
+                .min_h(px(0.0)),
+            );
+        }
+        tree.into_any_element()
     }
 
     /// Selects the local workspace represented by the active agent. The file
@@ -156,11 +592,21 @@ impl CodeViewer {
             return;
         }
         self.workspace_cwd = cwd;
+        self.tree_generation = self.tree_generation.wrapping_add(1);
+        self.directories.clear();
+        self.expanded.clear();
+        self.tree_loading.clear();
+        self.tree_errors.clear();
+        self.tree_selected = None;
+        self.tree_scroll = UniformListScrollHandle::new();
         self.intelligence = None;
         self.state = ViewerState::Empty;
         self.scroll = UniformListScrollHandle::new();
         self.generation = self.generation.wrapping_add(1);
         self.search_generation = self.search_generation.wrapping_add(1);
+        self.search_cancel
+            .store(self.search_generation, Ordering::Relaxed);
+        self._search_task = None;
         self.picker_open = false;
         self.query.clear();
         self.results.clear();
@@ -177,12 +623,14 @@ impl CodeViewer {
         let Some(intelligence) = &self.intelligence else {
             return;
         };
-        let mut reference = hit.relative_path.to_string_lossy().into_owned();
-        if let Some(line) = hit.line {
-            reference.push(':');
-            reference.push_str(&line.to_string());
-        }
         let cwd = intelligence.workspace_root().to_path_buf();
+        let Ok(mut reference) = url::Url::from_file_path(cwd.join(&hit.relative_path)) else {
+            return;
+        };
+        if let Some(line) = hit.line {
+            reference.set_fragment(Some(&format!("L{line}")));
+        }
+        let reference = reference.to_string();
         self.picker_open = false;
         self.query.clear();
         self.results.clear();
@@ -192,14 +640,26 @@ impl CodeViewer {
     fn handle_key_down(
         &mut self,
         event: &KeyDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if event.keystroke.modifiers.platform && matches!(event.keystroke.key.as_str(), "f" | "p") {
+            self.content_search = event.keystroke.key == "f";
+            self.picker_open = false;
+            self.toggle_picker(window, cx);
+            cx.stop_propagation();
+            return;
+        }
         if !self.picker_open {
+            if self.tree_focused && self.handle_tree_key(&event.keystroke.key, cx) {
+                cx.stop_propagation();
+            }
             return;
         }
         match event.keystroke.key.as_str() {
             "escape" => {
+                self.search_cancel.fetch_add(1, Ordering::Relaxed);
+                self._search_task = None;
                 self.picker_open = false;
                 self.query.clear();
                 self.results.clear();
@@ -207,11 +667,13 @@ impl CodeViewer {
             }
             "up" => {
                 self.highlighted_result = self.highlighted_result.saturating_sub(1);
+                self.result_scroll.scroll_to_item(self.highlighted_result);
                 cx.notify();
             }
             "down" => {
-                self.highlighted_result =
-                    (self.highlighted_result + 1).min(self.results.len().saturating_sub(1));
+                self.highlighted_result = (self.highlighted_result + 1)
+                    .min(self.results.len().min(200).saturating_sub(1));
+                self.result_scroll.scroll_to_item(self.highlighted_result);
                 cx.notify();
             }
             "enter" => self.open_highlighted(cx),
@@ -235,9 +697,8 @@ impl CodeViewer {
                 };
                 if changed {
                     self.schedule_search(cx);
-                } else {
-                    cx.notify();
                 }
+                cx.notify();
             }
         }
         cx.stop_propagation();
@@ -276,11 +737,15 @@ impl CodeViewer {
 
         let tokio = self.tokio.clone();
         let history_cwd = cwd.clone();
+        let intelligence = self.intelligence.clone();
         self._load_task = Some(cx.spawn(async move |this, cx| {
             let task_reference = reference.clone();
             let result = tokio
                 .spawn_blocking(move || -> Result<_, CodeIntelligenceError> {
-                    let intelligence = CodeIntelligence::for_session(&cwd)?;
+                    let intelligence = match intelligence {
+                        Some(intelligence) => intelligence,
+                        None => Arc::new(CodeIntelligence::for_session(&cwd)?),
+                    };
                     let snapshot = intelligence.open_reference(&task_reference)?;
                     Ok((intelligence, snapshot))
                 })
@@ -293,8 +758,7 @@ impl CodeViewer {
                 }
                 match result {
                     Ok((intelligence, snapshot)) => {
-                        this.workspace_cwd = Some(history_cwd.clone());
-                        this.intelligence = Some(Arc::new(intelligence));
+                        this.intelligence = Some(intelligence);
                         let target_line = snapshot.target.map(|target| target.line);
                         if record_history {
                             if this.history_index + 1 < this.history.len() {
@@ -307,6 +771,13 @@ impl CodeViewer {
                             if should_push {
                                 this.history.push((history_cwd, reference));
                                 this.history_index = this.history.len().saturating_sub(1);
+                            }
+                        }
+                        this.tree_selected = Some(snapshot.relative_path.clone());
+                        for parent in snapshot.relative_path.ancestors().skip(1) {
+                            this.expanded.insert(parent.to_path_buf());
+                            if !this.directories.contains_key(parent) {
+                                this.load_directory(parent.to_path_buf(), cx);
                             }
                         }
                         this.state = ViewerState::Ready(Arc::new(snapshot));
@@ -412,6 +883,23 @@ impl CodeViewer {
             .gap(px(3.0))
             .border_b_1()
             .border_color(colors.primary.alpha(0.06))
+            .child(
+                div()
+                    .id("toggle-file-tree")
+                    .size(px(24.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(Radius::BADGE))
+                    .cursor_pointer()
+                    .hover(move |button| button.bg(colors.primary.alpha(0.07)))
+                    .child(sf_symbol("sidebar.left", 12.0, colors.secondary))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.tree_visible = !this.tree_visible;
+                        cx.notify();
+                    })),
+            )
             .child(nav_button(
                 "code-history-back",
                 "chevron.left",
@@ -542,6 +1030,7 @@ impl CodeViewer {
             .id("code-search-results")
             .max_h(px(330.0))
             .overflow_y_scroll()
+            .track_scroll(&self.result_scroll)
             .py(px(4.0));
         if self.results.is_empty() {
             results = results.child(
@@ -553,20 +1042,28 @@ impl CodeViewer {
                     .justify_center()
                     .text_size(px(Typo::META.size))
                     .text_color(colors.tertiary)
-                    .child(if self.intelligence.is_some() {
-                        if query_empty {
-                            "Indexing workspace…"
+                    .child(
+                        if self.workspace_cwd.is_none() {
+                            "Select a local session to search its files"
+                        } else if self.search_pending {
+                            "Searching…"
+                        } else if let Some(error) = self.search_error.as_deref() {
+                            error
+                        } else if query_empty && self.content_search {
+                            "Search for text across the workspace"
                         } else {
-                            "No matching files or symbols"
+                            "No matches"
                         }
-                    } else {
-                        "Open one file to establish the workspace"
-                    }),
+                        .to_owned(),
+                    ),
             );
         } else {
-            for (index, hit) in self.results.iter().take(40).enumerate() {
+            for (index, hit) in self.results.iter().take(200).enumerate() {
                 let selected = index == self.highlighted_result;
-                let path = hit.relative_path.to_string_lossy().into_owned();
+                let path = match hit.line {
+                    Some(line) => format!("{}:{line}", hit.relative_path.display()),
+                    None => hit.relative_path.to_string_lossy().into_owned(),
+                };
                 let preview = hit.preview.clone();
                 let symbol = hit.kind == SearchHitKind::Symbol;
                 results = results.child(
@@ -636,7 +1133,11 @@ impl CodeViewer {
         let query = if query_empty {
             div()
                 .text_color(colors.tertiary)
-                .child("Search files and symbols…")
+                .child(if self.content_search {
+                    "Search text…"
+                } else {
+                    "Search files and symbols…"
+                })
                 .into_any_element()
         } else {
             crate::navigation::query_label(&self.query)
@@ -648,6 +1149,8 @@ impl CodeViewer {
                 .left(px(8.0))
                 .right(px(8.0))
                 .occlude()
+                .rounded(px(Radius::PANEL))
+                .bg(colors.sidebar_surface().alpha(1.0))
                 .child(FloatingSurface::new(
                     colors,
                     div()
@@ -682,7 +1185,65 @@ impl CodeViewer {
                                         .child(query),
                                 ),
                         )
-                        .child(results),
+                        .child(
+                            div()
+                                .h(px(30.0))
+                                .px(px(8.0))
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .children(
+                                    [(false, "Files & symbols"), (true, "Text")]
+                                        .into_iter()
+                                        .map(|(content, label)| {
+                                            let active = self.content_search == content;
+                                            div()
+                                                .id(("search-mode", usize::from(content)))
+                                                .px(px(7.0))
+                                                .py(px(3.0))
+                                                .rounded(px(Radius::BADGE))
+                                                .text_size(px(10.0))
+                                                .text_color(if active {
+                                                    colors.primary
+                                                } else {
+                                                    colors.tertiary
+                                                })
+                                                .bg(colors.primary.alpha(if active {
+                                                    0.09
+                                                } else {
+                                                    0.0
+                                                }))
+                                                .cursor_pointer()
+                                                .child(label)
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.content_search = content;
+                                                        window.focus(&this.focus, cx);
+                                                        this.schedule_search(cx);
+                                                        cx.notify();
+                                                    },
+                                                ))
+                                        }),
+                                ),
+                        )
+                        .child(results)
+                        .child(
+                            div()
+                                .px(px(10.0))
+                                .py(px(6.0))
+                                .text_size(px(9.0))
+                                .text_color(colors.tertiary)
+                                .child(format!(
+                                    "{}{} results · ↑↓ select · ↵ open · Esc close{}",
+                                    self.results.len().min(200),
+                                    if self.results.len() > 200 { "+" } else { "" },
+                                    if self.content_search {
+                                        " · smart case · 32 MB scan limit"
+                                    } else {
+                                        ""
+                                    }
+                                )),
+                        ),
                 ))
                 .into_any_element(),
         )
@@ -731,6 +1292,14 @@ impl Focusable for CodeViewer {
 
 impl Render for CodeViewer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.tree_visible
+            && self.workspace_cwd.is_some()
+            && self.directories.is_empty()
+            && self.tree_loading.is_empty()
+            && self.tree_errors.is_empty()
+        {
+            self.load_directory(PathBuf::new(), cx);
+        }
         let colors = self.colors;
         let snapshot = match &self.state {
             ViewerState::Ready(snapshot) => Some(Arc::clone(snapshot)),
@@ -740,11 +1309,8 @@ impl Render for CodeViewer {
             ViewerState::Empty => self.render_message(
                 colors,
                 "cursorarrow.click.2",
-                "Open code from the terminal",
-                format!(
-                    "{} a file path, stack frame, or compiler location to inspect it here.",
-                    crate::commands::primary_click_label()
-                ),
+                "Explore your workspace",
+                "Choose a file in the tree, or search for a file, symbol, or text.",
             ),
             ViewerState::Loading { reference } => self.render_message(
                 colors,
@@ -771,7 +1337,24 @@ impl Render for CodeViewer {
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::handle_key_down))
             .child(self.render_toolbar(snapshot.as_deref(), colors, cx))
-            .child(div().min_h(px(0.0)).flex_1().overflow_hidden().child(body))
+            .child(
+                div()
+                    .min_h(px(0.0))
+                    .flex_1()
+                    .flex()
+                    .overflow_hidden()
+                    .when(self.tree_visible, |row| {
+                        row.child(self.render_tree(colors, cx))
+                    })
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .flex_1()
+                            .h_full()
+                            .overflow_hidden()
+                            .child(body),
+                    ),
+            )
             .when_some(picker, |viewer, picker| viewer.child(picker))
     }
 }
@@ -1069,6 +1652,53 @@ mod tests {
         let left = relative_luminance(left);
         let right = relative_luminance(right);
         (left.max(right) + 0.05) / (left.min(right) + 0.05)
+    }
+
+    #[gpui::test]
+    fn explorer_keyboard_navigates_and_collapses_directories(cx: &mut gpui::TestAppContext) {
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (viewer, cx) = cx.add_window_view(|window, cx| {
+            let mut viewer = CodeViewer::new(tokio.handle().clone(), SemanticColors::dark(), cx);
+            viewer.seed_explorer_preview(cx);
+            viewer.tree_focused = true;
+            window.focus(&viewer.focus, cx);
+            viewer
+        });
+        cx.simulate_resize(gpui::size(px(600.0), px(500.0)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("left");
+        viewer.read_with(cx, |viewer, _| {
+            assert_eq!(
+                viewer.tree_selected.as_deref(),
+                Some(std::path::Path::new("diri/crates/diri-app/src"))
+            )
+        });
+        cx.simulate_keystrokes("left");
+        viewer.read_with(cx, |viewer, _| {
+            assert!(
+                !viewer
+                    .expanded
+                    .contains(std::path::Path::new("diri/crates/diri-app/src"))
+            )
+        });
+        cx.simulate_keystrokes("right");
+        viewer.read_with(cx, |viewer, _| {
+            assert!(
+                viewer
+                    .expanded
+                    .contains(std::path::Path::new("diri/crates/diri-app/src"))
+            )
+        });
+        cx.simulate_keystrokes("down");
+        viewer.read_with(cx, |viewer, _| {
+            assert_ne!(
+                viewer.tree_selected.as_deref(),
+                Some(std::path::Path::new("diri/crates/diri-app/src"))
+            )
+        });
     }
 
     #[test]

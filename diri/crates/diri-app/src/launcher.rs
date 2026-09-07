@@ -3868,9 +3868,8 @@ impl Render for LauncherOverlay {
             .store
             .read()
             .expect("session store lock poisoned")
-            .preferences()
-            .terminal_theme
-            .clone();
+            .theme_id()
+            .to_owned();
         let colors = launcher_colors_for_theme(&theme_id);
         let focused = self.focus.is_focused(window);
         root.size_full()
@@ -3911,6 +3910,7 @@ impl Render for LauncherOverlay {
                     .text_size(px(12.0))
                     .text_color(colors.secondary)
                     .hover(move |button| button.bg(Fill::subtle(colors)))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(|this, _, _, cx| this.close(cx)))
                     .child("Back")
                     .child(div().text_color(colors.tertiary).child("esc")),

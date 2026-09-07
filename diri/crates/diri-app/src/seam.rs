@@ -34,19 +34,31 @@ pub fn toggle_has_settled(since_last: Option<Duration>) -> bool {
 pub struct SeamSlide {
     from: f32,
     started_at: Instant,
+    duration: Duration,
 }
 
 impl SeamSlide {
     /// Starts a slide away from `from`, unless there is nowhere to travel.
     pub fn begin(from: f32, to: f32) -> Option<Self> {
-        (from != to).then(|| Self {
+        Self::begin_at(from, to, Instant::now())
+    }
+
+    /// Share an origin time when several parts of the same panel move together.
+    pub fn begin_at(from: f32, to: f32, started_at: Instant) -> Option<Self> {
+        (from != to).then_some(Self {
             from,
-            started_at: Instant::now(),
+            started_at,
+            duration: SEAM_SLIDE,
         })
     }
 
+    pub fn with_duration(mut self, duration: Duration) -> Self {
+        self.duration = duration;
+        self
+    }
+
     pub fn progress(&self, now: Instant) -> f32 {
-        (now.duration_since(self.started_at).as_secs_f32() / SEAM_SLIDE.as_secs_f32())
+        (now.duration_since(self.started_at).as_secs_f32() / self.duration.as_secs_f32())
             .clamp(0.0, 1.0)
     }
 
@@ -71,6 +83,7 @@ mod tests {
         let slide = SeamSlide {
             from: 0.0,
             started_at: Instant::now() - SEAM_SLIDE / 2,
+            duration: SEAM_SLIDE,
         };
         let now = Instant::now();
         let expected = 248.0 * motion::settle(slide.progress(now));
@@ -88,6 +101,7 @@ mod tests {
         let slide = SeamSlide {
             from: 248.0,
             started_at: Instant::now() - SEAM_SLIDE,
+            duration: SEAM_SLIDE,
         };
         let now = Instant::now();
         assert!(slide.is_done(now));
@@ -100,6 +114,7 @@ mod tests {
         let slide = SeamSlide {
             from: 0.0,
             started_at,
+            duration: SEAM_SLIDE,
         };
         assert_eq!(slide.seam_at(248.0, started_at), 0.0);
     }
@@ -110,6 +125,7 @@ mod tests {
         let slide = SeamSlide {
             from: 0.0,
             started_at: Instant::now() - SEAM_SLIDE / 2,
+            duration: SEAM_SLIDE,
         };
         let settled = Instant::now() + SEAM_SLIDE;
         assert_eq!(slide.seam_at(300.0, settled), 300.0);

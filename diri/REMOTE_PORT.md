@@ -358,6 +358,13 @@ each configured SSH host have independent catalog state. The Engine owns the
 catalog and preferences; the Helper only reports filesystem facts from the
 remote account.
 
+Local desktop discovery and launches share a normalized PATH: captured login
+shell entries first, inherited entries next, then user package-manager and
+standard executable directories. Fallbacks include pnpm's old home-directory
+shims and pnpm 11's `bin` layout, `PNPM_HOME`, `XDG_DATA_HOME`, Bun, Cargo,
+mise, and Volta. They also apply when local shell capture fails or times out.
+These local fallbacks are never added to remote launch environments.
+
 Protocol 1.3 adds the required `executable-discovery` capability. One bounded
 `executables` request carries every bundled manifest binary and any configured
 override. The Helper captures the login environment exactly once, resolves all
@@ -477,6 +484,21 @@ One owner/event loop handles PTY drain, terminal parsing, diff construction, and
 attach writes. The hot path does not put an `Arc<Mutex<Terminal>>` across tasks.
 Buffers are reused where practical, and idle Holders do not poll, heartbeat, or
 run GC.
+
+The shared terminal core recomputes its 4 MiB history-cell allowance when the
+column count changes, including when the primary screen is inactive. Narrowing
+increases the row allowance before reflow; widening trims after reflow so rows
+that merge are not prematurely discarded. The allowance applies to retained
+history cells, not total process memory, allocator capacity, or visible grids.
+
+VTE 0.15.0 is pinned under `vendor/vte` with a single allocation change: its
+synchronized-update buffer grows on first use instead of reserving 2 MiB for
+every terminal at construction. It retains capacity for subsequent frames.
+The byte limit, timeout, parsing, and synchronization semantics are unchanged;
+the tradeoff is allocation during the first synchronized frame. The vendored
+source and workspace dependency configuration participate in the default
+Helper Build ID. This adds no parser implementation or runtime dependency.
+See `vendor/vte/DIRI-PATCH.md` and the 2026-09-06 measurements in `PERF.md`.
 
 ### Local Holder input compatibility
 
@@ -629,6 +651,11 @@ hash. The app and client reject missing, old, or unknown daemon identities. A
 confirmed Rust Engine whose hash differs from the bundled executable is upgraded
 without abandoning live Holder/Agent state, ensuring subsequent remote actions
 use the current Helper catalog.
+
+An inherited `DIRIJOR_SOCKET` equal to the app's ordinary socket does not bypass
+this startup verification: Agents launched by Diri inherit that path, and an
+app started from their environment must still refresh an outdated Engine.
+Only a different, explicitly supplied socket skips app-owned supervision.
 
 ## Tailscale, iPhone Companion, and `diri-node`
 

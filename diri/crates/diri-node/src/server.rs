@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use diri_proto::control::{
     ControlError, ControlMessage, MAX_CONTROL_LINE_BYTES, decode_line, encode_line,
@@ -11,6 +12,9 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::error::{NodeError, NodeResult};
 use crate::service::NodeService;
 
+const MAX_CONNECTIONS: usize = 64;
+const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub struct NodeServer {
     service: Arc<NodeService>,
 }
@@ -21,9 +25,9 @@ impl NodeServer {
     }
 
     pub async fn run(&self, address: SocketAddr) -> NodeResult<()> {
-        if !private_bind_address(address) {
+        if !is_safe_plaintext_address(address) {
             return Err(NodeError::BadRequest(format!(
-                "refusing public node listener {address}; bind loopback, a private LAN address, or Tailscale"
+                "refusing unencrypted node listener {address}; bind loopback or Tailscale"
             )));
         }
         let listener = TcpListener::bind(address).await?;
@@ -31,10 +35,15 @@ impl NodeServer {
     }
 
     pub async fn serve(&self, listener: TcpListener) -> NodeResult<()> {
+        let mut connections = tokio::task::JoinSet::new();
         loop {
-            let (stream, _) = listener.accept().await?;
+            let accepted = tokio::select! {
+                result = listener.accept(), if connections.len() < MAX_CONNECTIONS => result,
+                _ = connections.join_next(), if !connections.is_empty() => continue,
+            };
+            let (stream, _) = accepted?;
             let service = Arc::clone(&self.service);
-            tokio::spawn(async move {
+            connections.spawn(async move {
                 if let Err(error) = serve_connection(stream, service).await {
                     eprintln!("diri-node connection closed: {error}");
                 }
@@ -43,7 +52,7 @@ impl NodeServer {
     }
 }
 
-use diri_proto::net::is_private_bind_address as private_bind_address;
+use diri_proto::net::is_safe_plaintext_address;
 
 async fn serve_connection(stream: TcpStream, service: Arc<NodeService>) -> NodeResult<()> {
     stream.set_nodelay(true)?;
@@ -54,11 +63,30 @@ async fn serve_stream<S>(stream: S, service: Arc<NodeService>) -> NodeResult<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    serve_stream_with_auth_timeout(stream, service, AUTH_TIMEOUT).await
+}
+
+async fn serve_stream_with_auth_timeout<S>(
+    stream: S,
+    service: Arc<NodeService>,
+    auth_timeout: Duration,
+) -> NodeResult<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
     let mut authenticated = false;
+    let auth_deadline = tokio::time::Instant::now() + auth_timeout;
     loop {
-        let Some(line) = read_bounded_line(&mut reader).await? else {
+        let line = if authenticated {
+            read_bounded_line(&mut reader).await?
+        } else {
+            tokio::time::timeout_at(auth_deadline, read_bounded_line(&mut reader))
+                .await
+                .map_err(|_| NodeError::Unauthorized)??
+        };
+        let Some(line) = line else {
             return Ok(());
         };
         if line.iter().all(u8::is_ascii_whitespace) {
@@ -146,12 +174,16 @@ mod tests {
     use crate::{NodeConfig, NodePaths};
 
     #[test]
-    fn listeners_are_private_network_only() {
-        assert!(private_bind_address("127.0.0.1:7337".parse().unwrap()));
-        assert!(private_bind_address("100.64.12.2:7337".parse().unwrap()));
-        assert!(private_bind_address("192.168.1.2:7337".parse().unwrap()));
-        assert!(!private_bind_address("0.0.0.0:7337".parse().unwrap()));
-        assert!(!private_bind_address("8.8.8.8:7337".parse().unwrap()));
+    fn listeners_require_loopback_or_tailscale() {
+        assert!(is_safe_plaintext_address("127.0.0.1:7337".parse().unwrap()));
+        assert!(is_safe_plaintext_address(
+            "100.64.12.2:7337".parse().unwrap()
+        ));
+        assert!(!is_safe_plaintext_address(
+            "192.168.1.2:7337".parse().unwrap()
+        ));
+        assert!(!is_safe_plaintext_address("0.0.0.0:7337".parse().unwrap()));
+        assert!(!is_safe_plaintext_address("8.8.8.8:7337".parse().unwrap()));
     }
 
     #[tokio::test]
@@ -232,5 +264,18 @@ mod tests {
         };
         let _: NodeStatusResult = serde_json::from_value(value).expect("typed status");
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn idle_connection_must_authenticate_before_the_deadline() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = NodePaths::for_root(directory.path().join("node"));
+        let config = NodeConfig::load_or_initialize(&paths).expect("config");
+        let service = NodeService::open(paths, config).expect("service");
+        let (_client, server) = tokio::io::duplex(1024);
+        let error = serve_stream_with_auth_timeout(server, service, Duration::from_millis(10))
+            .await
+            .expect_err("idle peer must time out");
+        assert!(matches!(error, NodeError::Unauthorized));
     }
 }

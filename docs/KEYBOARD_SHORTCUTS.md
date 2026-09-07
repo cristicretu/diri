@@ -51,9 +51,9 @@ the overview is open, so those surfaces keep the arrow keys.
 | Shortcut | Keys | Action |
 | --- | --- | --- |
 | ⌘K | Command-K | Command palette |
-| ⌘P | Command-P | Quick Open — start a session in a recent directory |
+| ⌘P | Command-P | Open the palette’s project page |
 | ⇧⌘O | Shift-Command-O | Overview of all sessions |
-| ⇧⌘H | Shift-Command-H | History of past conversations |
+| ⇧⌘H | Shift-Command-H | Open the palette’s chat history page |
 | ⌥⌘W | Option-Command-W | Worktrees overview |
 | ⌘, | Command-comma | Settings |
 | ⌘B | Command-B | Show or hide the sidebar |
@@ -65,7 +65,7 @@ the default, its command also shows ⇧⌘N. The palette lists ⌥⌘T, ⌘P, �
 ⌥⌘W, ⌘B and ⌘, too, so it doubles as a reminder for the shortcuts you use
 least.
 
-### Inside the command palette and Quick Open
+### Inside the palette
 
 | Shortcut | Keys | Action |
 | --- | --- | --- |
@@ -73,7 +73,13 @@ least.
 | ⌃P / ⌃N | Control-P / Control-N | Move the highlight, readline style |
 | ↵ | Return | Run the highlighted entry |
 | ⌘↵ | Command-Return | Quick Open only: open a plain shell in that directory instead of the default agent |
-| Esc | Escape | Close the overlay |
+| ⌘[ | Command-Left bracket | Return to the previous palette page |
+| ⌫ with an empty query | Backspace | Return to the previous palette page |
+| Esc | Escape | Close the palette and cancel any theme preview |
+
+Cmd K, Cmd P, and Cmd Shift H are entry points into the same palette. Switching shortcuts goes directly to that page. The back button restores the previous page’s search and selection.
+
+Choose **Settings → Color theme**, or search for **Color theme** directly. Arrow keys and pointer hover preview the highlighted theme across the app. Enter or a click saves it; Escape, Back, or switching pages restores the saved theme. **All settings** opens the full settings workspace.
 
 Anything else edits the query through the [shared text keymap](#text-fields).
 
@@ -106,19 +112,17 @@ without sending and restores any unfinished Command-N draft.
 | ⌫ / ⌦ | Delete | Delete back through the filter query; with an empty query and a selection, close the selected sessions |
 | Esc | Escape | Step back, then close |
 
-### Inside history, settings and worktrees
+### Inside settings and worktrees
 
 | Shortcut | Keys | Action |
 | --- | --- | --- |
-| ↑ / ↓ | Arrow keys | Move the highlight in history |
-| ↵ | Return | Open the highlighted conversation |
 | Esc | Escape | Close the surface |
 
-In history, other keys filter the list. In settings, Esc first dismisses an open
+In settings, Esc first dismisses an open
 menu or the remote-host editor and only then closes the surface; inside that
 editor ⇥ and ⇧⇥ move between fields and ↵ saves the host.
 
-While one of these surfaces is open, only ⌘H, ⌘K, ⌘P and ⌘, still reach the app.
+While one of these surfaces is open, only ⇧⌘H, ⌘K, ⌘P and ⌘, still reach the app.
 Everything else belongs to the surface.
 
 ### Inside the inspector
@@ -176,7 +180,7 @@ falling back to the terminal:
   than eating it.
 - **The launcher takes everything while it is open**, except ⌘N, which stays
   available.
-- **History, settings and worktrees take everything** except ⌘H, ⌘K, ⌘P and ⌘,.
+- **Settings and worktrees take everything** except ⇧⌘H, ⌘K, ⌘P and ⌘,.
 - **The switcher and the overview own the arrow keys** while they are visible, so
   ⌥⌘↑, ⌘[ and ⌃⌘↑ stand down for as long as either is up.
 - **Esc is shared.** With the overview closed, Esc clears a multi-session sidebar

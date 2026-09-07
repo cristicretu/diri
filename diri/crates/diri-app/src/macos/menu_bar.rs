@@ -195,9 +195,8 @@ impl NativeMenuBar {
             let prefs_theme = store
                 .read()
                 .expect("session store lock poisoned")
-                .preferences()
-                .terminal_theme
-                .clone();
+                .theme_id()
+                .to_owned();
             let colors = app_theme::sidebar_colors(&prefs_theme);
             MenuTheme::new(prefs_theme, colors)
         };
@@ -502,7 +501,7 @@ impl NativeMenuBar {
         if !self.panel.isVisible() {
             let theme_id = {
                 let store = self.store.read().expect("session store lock poisoned");
-                store.preferences().terminal_theme.clone()
+                store.theme_id().to_owned()
             };
             self.sync_theme(&theme_id);
             self.last_fingerprint = None;
@@ -530,7 +529,7 @@ impl NativeMenuBar {
             {
                 attention = AttentionLevel::DoneUnseen;
             }
-            let theme_id = store.preferences().terminal_theme.clone();
+            let theme_id = store.theme_id().to_owned();
             (model, selected, attention, theme_id)
         };
         self.sync_theme(&theme_id);

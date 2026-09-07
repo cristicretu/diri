@@ -12,3 +12,7 @@ diri-proto.workspace = true
 [[bench]]
 name = "terminal_throughput"
 harness = false
+
+[[bench]]
+name = "terminal_fleet"
+harness = false

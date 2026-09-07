@@ -289,12 +289,10 @@ impl SkillsPage {
 
     fn colors(&self) -> SemanticColors {
         crate::app_theme::colors(
-            &self
-                .store
+            self.store
                 .read()
                 .expect("session store lock poisoned")
-                .preferences()
-                .terminal_theme,
+                .theme_id(),
         )
     }
 

@@ -29,6 +29,145 @@ cargo build -p diri-app --release
 The shared target is measurement/build cache only. It must never be packaged or
 shipped.
 
+## Twenty-terminal performance pass (2026-09-06)
+
+Measured on Apple Silicon, macOS 26.5.2, Rust 1.95.0 release builds. These are
+workload-specific results, not proof that Diri is universally faster than
+Ghostty, Kitty, or every other terminal.
+
+### Retained heap and resizing
+
+`cargo bench -p diri-terminal-state --bench terminal_fleet` counts requested
+live Rust heap bytes for twenty real `HeadlessScreen` instances. It fills each
+80×50 terminal with 6,000 hard-newline log lines, widens all to 320 columns,
+then performs 600 mixed width/height resizes. The initial baseline used the
+same harness before the production changes. Values exclude agents, Holders,
+output logs, the desktop, and GPU resources. Reserved heap is **not** physical
+footprint; allocator row slack also means a 4 MiB history-cell allowance does
+not imply a 4 MiB terminal process.
+
+| Twenty terminal cores | Before | After |
+| --- | ---: | ---: |
+| Fresh, 80×50 | 43.88 MiB | 3.88 MiB |
+| Full history, 80×50 | 157.49 MiB | 117.49 MiB |
+| Full history after widening to 320×50 | 381.00 MiB | 101.06 MiB |
+| After repeated resizing | 373.49 MiB | 92.55 MiB |
+| Live allocations after dropping all cores | 0 bytes | 0 bytes |
+| Allocations across 2,000 cursor-only updates | 4,000 | 0 |
+
+The original implementation retained the construction-time history row limit
+through width changes. A regression test first failed with 2,184 history rows
+after widening to 320 columns; the current-width allowance is 546. The fix
+updates primary history even while the alternate screen is active, preserves
+reflow ordering, and removes the minimum-64-row exception that could exceed
+the budget at very wide dimensions. Same-size resizes return immediately.
+Tests reconstruct incremental updates through split UTF-8, ANSI styles,
+alternate screens, insert/delete lines, synchronization, and resizing and
+compare them with independent full snapshots.
+
+Cursor-only publications now compare/update the existing cell baseline in
+place, allocating outgoing rows only when cells differ. VTE's unconditional
+2 MiB synchronization reserve is now lazy; see
+[vendor/vte/DIRI-PATCH.md](vendor/vte/DIRI-PATCH.md). All 54 upstream VTE tests
+pass, including split, nested, and oversized synchronized updates. First-use
+synchronized frames can allocate; subsequent frames reuse their capacity.
+The default Remote Helper Build ID includes the vendored sources.
+
+The fleet benchmark gates fresh heap below 8 MiB, widened and churned heap
+below 140 MiB, zero warmed cursor-update allocations, and zero leaked heap.
+It runs from `scripts/terminal-perf-gate.sh`.
+
+### Scrolling renderer
+
+The production Metal benchmark exposed zero reused shapes on full-height
+scrolling: the cache followed screen row numbers rather than surviving rows.
+The renderer now rotates its existing cache with a detected scroll, verifies
+complete cell equality before reuse, and translates backgrounds and decorations
+with their text. Render-context changes still force rebuilding. No new cache,
+protocol, lock, or dependency was introduced for rendering.
+
+The same 160×50 benchmark improved from a Criterion estimate of 845.48 µs to
+795.43 µs (Criterion's paired estimate: 7.2% faster). Steady scrolling reuses
+49 of 50 row shapes; a new gate requires over 90% reuse once startup amortizes.
+Tests cover both scroll directions, multi-row movement, sparse damage,
+background/decoration positions, and an edited cell that must be reshaped.
+This measures the real headless Metal renderer, not input-to-photon latency.
+The after run had one 120 Hz overrun during calibration; steady-state medians
+are not a guarantee about every frame.
+
+The older `terminal_throughput` typing fixture repeatedly overwrote `x` with
+`x`. It now alternates `x` and `y` so every operation changes a real cell.
+Do not compare its updated typing time directly with the historical table.
+
+### Sessions and remote latency
+
+Twenty simultaneously released local sessions each drained 16 MiB of colored
+build logs: **108.2 MiB/s aggregate**, 2.96 s wall time, fastest/median/slowest
+2.79/2.95/2.96 s. This measures production PTYs, the Holder manager, output
+logging, parsing, and status handling, with no desktop attached. The revised
+`fleetbench` uses a shared start gate, passes payload paths as argv data,
+fails on unfinished sessions, and terminates owned sessions on failure.
+
+The corrected `sessionbench idle 20` measured **59.68 MiB physical footprint
+and 0.97% of one CPU core** over ten seconds across 22 processes: the benchmark
+engine, its private Holder manager, and twenty sleeping children. Real Agent
+runtimes and model workloads are excluded. The old `RUSAGE_CHILDREN` metric
+missed live children; the probe now samples the actual process set through the
+Engine's platform resource collector. These are observations, not portable
+hard gates or before/after daemon comparisons.
+
+The release Remote Holder UDS gate passed:
+
+| Metric | Measured | Architecture ceiling |
+| --- | ---: | ---: |
+| Snapshot p90 | 10 µs | 100 ms |
+| Input-to-PTY p95 | 131 µs | 10 ms |
+| Output-to-diff p90 | 23 µs | 50 ms |
+| Loopback median / p90 | 102 / 148 µs | 75 / 150 ms |
+
+These are same-host UDS timings, not SSH/WAN or display latency. The real SSH
+soak and native Linux architecture jobs remain CI release gates.
+
+### Comparison scope and reproduction
+
+`cargo build --release -p diri-engine --example termcompare` builds a Rust
+probe that writes identical 64 KiB chunks to the terminal in raw mode and waits
+for a cursor report behind the payload. It records five runs after warmup and
+the terminal dimensions, and fails rather than substituting drain-only timing
+for an unanswered query. Run `termcompare <payload> <results.json>` inside each
+terminal at the same geometry; compare medians, versions, and configurations.
+
+Exploratory local runs were made with Diri, Ghostty 1.2.3, and Kitty 0.48.2.
+They are **not an accepted ranking**: Diri's run was headless, competitor GUI
+launch/exit was inconsistent, and initial records lacked verified geometry.
+Use a separate input-to-photon/resize capture and comparable rendered workloads
+before publishing superiority claims. Actual 20-Agent CPU, long-duration
+memory behavior, and sustained loaded input latency require broader workloads
+than twenty synthetic terminal producers.
+
+### Verification of this pass
+
+- `cargo fmt --all -- --check` and workspace Clippy with `-D warnings`: pass.
+- `cargo test --workspace`: 1,336 passed, zero failed, 24 intentionally ignored.
+- `cargo build --workspace --release`: pass.
+- `scripts/terminal-perf-gate.sh`: pass, including the added heap/allocation and
+  shape-reuse gates, VTE tests, persistent input, and attach tests. The final
+  state fixture measured typing 753 ns, scrolling 30,889 ns, and cursor-only
+  721 ns per operation. Local input-to-grid median was 337 µs.
+- Release Remote Holder UDS gate: pass. After including the vendored parser in
+  the Helper source identity, remote package tests passed again: 40 passed,
+  zero failed, five opt-in tests ignored. The native macOS arm64 Helper probe
+  reports protocol 1.4 and all required capabilities.
+- The inert packaged-process gate passed on a disposable, ad-hoc-signed copy
+  containing the new release executable: normal/large footprints 33.8/33.6 MB,
+  sampled idle CPU 0%. Window visibility was not independently verified in
+  this run, so these process-only readings are not accepted visible-window
+  memory comparisons. No production bundle was replaced or published.
+
+PTY/UDS and Metal tests required running outside the execution sandbox. Initial
+sandbox-only attempts could not launch their private Holder sockets or macOS
+graphics services; the authorized runs above completed successfully.
+
 ## Terminal interaction hot path (2026-08-13)
 
 Release-mode measurements below compare untouched `main` at `39af365` with the

@@ -18,6 +18,8 @@ const CURL: &str = "/usr/bin/curl";
 const FEED_TIMEOUT_SECONDS: u32 = 20;
 const DOWNLOAD_TIMEOUT_SECONDS: u32 = 900;
 const PROGRESS_POLL: Duration = Duration::from_millis(150);
+pub(crate) const MAX_FEED_BYTES: u64 = 1024 * 1024;
+pub(crate) const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Downloads over `curl`, with the hardening the installer depends on.
 #[derive(Clone, Debug, Default)]
@@ -36,7 +38,7 @@ impl Http {
             .stderr(Stdio::piped())
             .spawn()
             .and_then(|mut child| {
-                let config = self.config(url, None, FEED_TIMEOUT_SECONDS);
+                let config = self.config(url, None, FEED_TIMEOUT_SECONDS, MAX_FEED_BYTES);
                 child
                     .stdin
                     .take()
@@ -46,6 +48,9 @@ impl Http {
             })?;
         if !output.status.success() {
             return Err(UpdateError::Network(curl_detail(&output.stderr)));
+        }
+        if output.stdout.len() > usize::try_from(MAX_FEED_BYTES).unwrap_or(usize::MAX) {
+            return Err(UpdateError::Feed("feed exceeds the 1 MiB limit".to_owned()));
         }
         String::from_utf8(output.stdout)
             .map_err(|_| UpdateError::Feed("feed is not valid UTF-8".to_owned()))
@@ -61,6 +66,11 @@ impl Http {
         expected_size: u64,
         mut on_progress: impl FnMut(f32),
     ) -> Result<()> {
+        if expected_size == 0 || expected_size > MAX_ARCHIVE_BYTES {
+            return Err(UpdateError::Integrity(format!(
+                "update archive size must be between 1 and {MAX_ARCHIVE_BYTES} bytes"
+            )));
+        }
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -74,7 +84,12 @@ impl Http {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()?;
-        let config = self.config(url, Some(destination), DOWNLOAD_TIMEOUT_SECONDS);
+        let config = self.config(
+            url,
+            Some(destination),
+            DOWNLOAD_TIMEOUT_SECONDS,
+            expected_size,
+        );
         child
             .stdin
             .take()
@@ -97,10 +112,18 @@ impl Http {
                 }
                 break;
             }
+            let written = fs::metadata(destination)
+                .map(|meta| meta.len())
+                .unwrap_or(0);
+            if written > expected_size {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = fs::remove_file(destination);
+                return Err(UpdateError::Integrity(format!(
+                    "download exceeded its declared size of {expected_size} bytes"
+                )));
+            }
             if expected_size > 0 {
-                let written = fs::metadata(destination)
-                    .map(|meta| meta.len())
-                    .unwrap_or(0);
                 let fraction = (written as f32 / expected_size as f32).clamp(0.0, 1.0);
                 if fraction - last_reported >= 0.01 {
                     last_reported = fraction;
@@ -114,7 +137,7 @@ impl Http {
         on_progress(1.0);
 
         let written = fs::metadata(destination)?.len();
-        if expected_size > 0 && written != expected_size {
+        if written != expected_size {
             let _ = fs::remove_file(destination);
             return Err(UpdateError::Integrity(format!(
                 "expected {expected_size} bytes, got {written}"
@@ -131,12 +154,19 @@ impl Http {
         command
     }
 
-    fn config(&self, url: &str, output: Option<&Path>, timeout_seconds: u32) -> String {
+    fn config(
+        &self,
+        url: &str,
+        output: Option<&Path>,
+        timeout_seconds: u32,
+        max_bytes: u64,
+    ) -> String {
         let mut config = String::new();
         config.push_str(&format!("url = \"{url}\"\n"));
         config.push_str("fail\nlocation\nsilent\nshow-error\n");
         config.push_str("proto = \"=https\"\nproto-redir = \"=https\"\n");
         config.push_str(&format!("max-time = {timeout_seconds}\n"));
+        config.push_str(&format!("max-filesize = {max_bytes}\n"));
         config.push_str("connect-timeout = 15\n");
         config.push_str("max-redirs = 5\n");
         config.push_str(&format!("user-agent = \"diri-updater/{}\"\n", crate::AGENT));
@@ -184,6 +214,12 @@ pub fn validated_download_url(url: &str, host: &str) -> Result<()> {
 /// tampered feed would carry a matching hash. `crate::codesign` is what
 /// decides whether the bytes are really a diri build.
 pub fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
+    let expected = expected.trim();
+    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(UpdateError::Feed(
+            "release checksum is not a SHA-256 digest".to_owned(),
+        ));
+    }
     let output = Command::new("/usr/bin/shasum")
         .arg("-a")
         .arg("256")
@@ -197,7 +233,7 @@ pub fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let actual = stdout.split_whitespace().next().unwrap_or_default();
-    if !actual.eq_ignore_ascii_case(expected.trim()) {
+    if !actual.eq_ignore_ascii_case(expected) {
         return Err(UpdateError::Integrity(format!(
             "sha256 {actual} does not match the feed's {expected}"
         )));
@@ -252,9 +288,10 @@ mod tests {
         // Releases are public now: there is no gate to authenticate against,
         // and a `user =` line would only be a credential to leak.
         let http = Http::new();
-        let config = http.config("https://example.test/a.json", None, 20);
+        let config = http.config("https://example.test/a.json", None, 20, MAX_FEED_BYTES);
         assert!(!config.contains("user = "), "no credentials: {config}");
         assert!(config.contains("proto = \"=https\"\n"), "https only");
+        assert!(config.contains("max-filesize = 1048576\n"), "bounded");
 
         // The URL still goes over stdin rather than argv, where any other user
         // on the machine could read it.

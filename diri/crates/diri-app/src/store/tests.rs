@@ -1628,7 +1628,7 @@ fn auxiliary_terminal_inherits_context_without_becoming_sidebar_selection() {
 
     assert!(store.spawn_auxiliary_terminal(id("one")));
     let effects = drain(&mut effects);
-    let Some(StoreEffect::SpawnAuxiliary(params)) = effects.first() else {
+    let Some(StoreEffect::SpawnAuxiliary { params, .. }) = effects.first() else {
         panic!("expected auxiliary spawn, got {effects:?}");
     };
     assert_eq!(params.kind, AgentKind::SHELL);
@@ -2334,4 +2334,112 @@ fn delivery_rechecks_read_focus_and_mute_after_the_event_was_queued() {
     store.toggle_notification_alerts();
     store.mark_notifications_read(&record.id);
     assert!(!store.should_deliver_notification(&request));
+}
+
+#[test]
+fn auxiliary_tab_spawns_bind_exact_ids_and_deduplicate_pending_requests() {
+    let primary = session("parent", "p", 1.0);
+    let (mut store, mut effects) = hydrated(
+        vec![primary],
+        vec![project("p", "Project")],
+        Prefs::default(),
+    );
+    drain(&mut effects);
+    assert!(store.spawn_auxiliary_terminal_slot(id("parent"), 0));
+    assert!(store.spawn_auxiliary_terminal_slot(id("parent"), 1));
+    assert!(store.spawn_auxiliary_terminal_slot(id("parent"), 1));
+    let spawns = drain(&mut effects);
+    assert_eq!(spawns.len(), 2);
+    let mut first = session("first", "p", 10.0);
+    first.kind = AgentKind::SHELL;
+    first.parent = Some(id("parent"));
+    let mut second = first.clone();
+    second.id = id("second");
+    second.created_at = diri_proto::DateMillis(5.0); // Result order and creation order do not identify tabs.
+    store.upsert_session(first);
+    store.upsert_session(second);
+    store.finish_auxiliary_spawn(id("parent"), 1, Some(id("second")));
+    store.finish_auxiliary_spawn(id("parent"), 0, Some(id("first")));
+    assert_eq!(
+        store
+            .auxiliary_terminal_for_slot(&id("parent"), 0)
+            .unwrap()
+            .id,
+        id("first")
+    );
+    assert_eq!(
+        store
+            .auxiliary_terminal_for_slot(&id("parent"), 1)
+            .unwrap()
+            .id,
+        id("second")
+    );
+    store.sessions.remove(&id("first"));
+    assert!(
+        store
+            .auxiliary_terminal_for_slot(&id("parent"), 0)
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .auxiliary_terminal_for_slot(&id("parent"), 1)
+            .unwrap()
+            .id,
+        id("second")
+    );
+    assert!(store.spawn_auxiliary_terminal_slot(id("parent"), 2));
+    store.finish_auxiliary_spawn(id("parent"), 2, None);
+    assert!(!store.auxiliary_spawn_pending(&id("parent"), 2));
+    assert!(
+        store.spawn_auxiliary_terminal_slot(id("parent"), 2),
+        "failed requests can be retried"
+    );
+}
+
+#[test]
+fn auxiliary_tab_binding_waits_for_its_record_and_pins_restored_shells() {
+    let primary = session("parent", "p", 1.0);
+    let mut shell = session("restored", "p", 2.0);
+    shell.kind = AgentKind::SHELL;
+    shell.parent = Some(id("parent"));
+    let (mut store, mut effects) = hydrated(
+        vec![primary, shell.clone()],
+        vec![project("p", "Project")],
+        Prefs::default(),
+    );
+    drain(&mut effects);
+    assert_eq!(
+        store
+            .auxiliary_terminal_for_slot(&id("parent"), 0)
+            .unwrap()
+            .id,
+        id("restored")
+    );
+    assert!(store.spawn_auxiliary_terminal_slot(id("parent"), 1));
+    store.finish_auxiliary_spawn(id("parent"), 1, Some(id("new")));
+    assert!(store.auxiliary_spawn_pending(&id("parent"), 1));
+    assert!(store.spawn_auxiliary_terminal_slot(id("parent"), 1));
+    assert_eq!(
+        drain(&mut effects).len(),
+        1,
+        "RPC acknowledgement before the event cannot spawn twice"
+    );
+    shell.id = id("new");
+    shell.created_at = diri_proto::DateMillis(100.0);
+    store.upsert_session(shell);
+    assert!(!store.auxiliary_spawn_pending(&id("parent"), 1));
+    assert_eq!(
+        store
+            .auxiliary_terminal_for_slot(&id("parent"), 0)
+            .unwrap()
+            .id,
+        id("restored")
+    );
+    assert_eq!(
+        store
+            .auxiliary_terminal_for_slot(&id("parent"), 1)
+            .unwrap()
+            .id,
+        id("new")
+    );
 }

@@ -122,6 +122,8 @@ pub(crate) enum SidebarEvent {
     RefreshUsageLimits,
     ContinueAccount(SessionId),
     VisibilityChanged,
+    /// Transient overlay visibility; never changes the saved sidebar layout.
+    PeekChanged,
     WidthChanged,
     /// The Agents page of Settings, for one target host. Plain Settings goes
     /// through the typed `OpenSettings` action; this event carries the host
@@ -129,6 +131,8 @@ pub(crate) enum SidebarEvent {
     OpenAgentSettings(Option<String>),
     /// One-click path from the footer menu into the Remote host editor.
     AddRemoteHost,
+    /// One-click path from the account menu to the latest release notes.
+    OpenWhatsNew,
     /// A plain click (or shortcut) selected a session: hand keyboard focus
     /// to its terminal surface so the user can type immediately.
     SessionActivated,
@@ -223,6 +227,11 @@ pub struct Sidebar {
     _preview_effects: Option<mpsc::UnboundedReceiver<StoreEffect>>,
     _store_changes: Option<Task<()>>,
     ui: SidebarUiState,
+    peek_open: bool,
+    peek_hovered: bool,
+    peek_region_hovered: bool,
+    surface_in_parent: bool,
+    peek_close: Option<Task<()>>,
     /// Session list scroll position, read back each frame to size the top and
     /// bottom fades.
     list_scroll: ScrollHandle,
@@ -344,6 +353,11 @@ impl Sidebar {
             _preview_effects: preview_effects,
             _store_changes: store_changes,
             ui,
+            peek_open: false,
+            peek_hovered: false,
+            peek_region_hovered: false,
+            surface_in_parent: false,
+            peek_close: None,
             list_scroll: ScrollHandle::new(),
             row_bounds: Rc::new(RefCell::new(HashMap::new())),
             drag_preview: None,
@@ -389,6 +403,98 @@ impl Sidebar {
 
     pub fn is_visible(&self) -> bool {
         self.ui.visible
+    }
+
+    pub(crate) fn is_peeking(&self) -> bool {
+        self.peek_open
+    }
+
+    /// Root paints the material so its corners can morph without rebuilding
+    /// the sidebar's cached contents on every animation frame.
+    pub(crate) fn set_surface_in_parent(&mut self) {
+        self.surface_in_parent = true;
+    }
+
+    pub(crate) fn hover_peek_region(
+        &mut self,
+        hovered: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.peek_region_hovered == hovered {
+            return;
+        }
+        self.peek_region_hovered = hovered;
+        if hovered {
+            self.peek_close = None;
+        } else {
+            self.schedule_peek_close(window, cx);
+        }
+    }
+
+    pub(crate) fn peek(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ui.visible || self.peek_open {
+            return;
+        }
+        self.peek_open = true;
+        self.schedule_peek_close(window, cx);
+        cx.emit(SidebarEvent::PeekChanged);
+        cx.notify();
+    }
+
+    fn peek_interaction_active(&self) -> bool {
+        self.ui.popover.is_some()
+            || self.ui.renaming.is_some()
+            || self.ui.drag.is_some()
+            || self.ui.pending_sibling.is_some()
+            || self.ui.delegation_notice.is_some()
+            || self
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .pending_close()
+                .is_some()
+    }
+
+    fn hover_peek(&mut self, hovered: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.peek_hovered = hovered;
+        if hovered {
+            self.peek_close = None;
+        } else {
+            self.schedule_peek_close(window, cx);
+        }
+    }
+
+    fn schedule_peek_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.peek_open
+            || self.peek_hovered
+            || self.peek_region_hovered
+            || self.peek_interaction_active()
+            || self.peek_close.is_some()
+        {
+            return;
+        }
+        self.peek_close = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(240))
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.peek_close = None;
+                if this.peek_open
+                    && !this.peek_hovered
+                    && !this.peek_region_hovered
+                    && !this.peek_interaction_active()
+                {
+                    this.peek_open = false;
+                    this.ui.hover_card = None;
+                    if this.focus_handle.contains_focused(window, cx) {
+                        cx.emit(SidebarEvent::FocusTerminal);
+                    }
+                    cx.emit(SidebarEvent::PeekChanged);
+                    cx.notify();
+                }
+            });
+        }));
     }
 
     pub fn selected_session(&self) -> Option<SessionRecord> {
@@ -543,6 +649,8 @@ impl Sidebar {
             return;
         }
         self.last_toggle = Some(now);
+        self.peek_open = false;
+        self.peek_close = None;
         self.ui.toggle();
         let visible = self.ui.visible;
         if let Err(error) = self
@@ -569,6 +677,8 @@ impl Sidebar {
             return;
         }
         self.ui.visible = true;
+        self.peek_open = false;
+        self.peek_close = None;
         if let Err(error) = self
             .store
             .write()
@@ -804,7 +914,7 @@ impl Sidebar {
 
     fn colors(&self) -> SemanticColors {
         let store = self.store.read().expect("session store lock poisoned");
-        crate::app_theme::sidebar_colors(&store.preferences().terminal_theme)
+        crate::app_theme::sidebar_colors(store.theme_id())
     }
 
     fn begin_rename(
@@ -839,6 +949,8 @@ impl Sidebar {
     /// subsequent trips to the terminal.
     pub fn focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.ui.visible {
+            self.peek_open = false;
+            self.peek_close = None;
             self.ui.visible = true;
             self.last_toggle = Some(Instant::now());
             if let Err(error) = self
@@ -1318,7 +1430,11 @@ impl Sidebar {
             .child(primary_button)
             .child(icon_button(
                 "sidebar-toggle",
-                "Hide sidebar",
+                if self.peek_open {
+                    "Pin sidebar open"
+                } else {
+                    "Hide sidebar"
+                },
                 "sidebar.left",
                 toggle_hover,
                 colors,
@@ -4518,6 +4634,37 @@ impl Sidebar {
             .child(menu_divider(colors))
             .child(
                 div()
+                    .id("account-whats-new")
+                    .debug_selector(|| "account-whats-new".into())
+                    .mx(px(6.0))
+                    .px(px(8.0))
+                    .h(px(30.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(9.0))
+                    .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
+                    .cursor_pointer()
+                    .hover(move |element| element.bg(colors.primary.alpha(0.06)))
+                    .text_size(px(Typo::ROW.size))
+                    .text_color(colors.primary)
+                    .child(
+                        div()
+                            .w(px(24.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(sf_symbol("sparkles", 11.0, colors.secondary)),
+                    )
+                    .child(div().flex_1().child("What's New"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.ui.popover = None;
+                        cx.emit(SidebarEvent::OpenWhatsNew);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
                     .id("quick-add-remote-host")
                     .debug_selector(|| "quick-add-remote-host".into())
                     .mx(px(6.0))
@@ -6142,6 +6289,9 @@ fn reveal_tracked_row(
 
 impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A menu or editor may finish after the pointer has already left.
+        // Resume dismissal on that notification without polling while idle.
+        self.schedule_peek_close(window, cx);
         let colors = self.colors();
         let (
             projection,
@@ -6250,8 +6400,15 @@ impl Render for Sidebar {
             .flex()
             .flex_col()
             .text_color(colors.primary)
-            .bg(Self::surface_fill(colors))
+            .when(!self.surface_in_parent, |root| {
+                root.bg(Self::surface_fill(colors))
+            })
             .track_focus(&self.focus_handle)
+            .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
+                if !this.surface_in_parent {
+                    this.hover_peek(*hovered, window, cx);
+                }
+            }))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_up_out(
                 MouseButton::Left,
@@ -6309,62 +6466,19 @@ impl Render for Sidebar {
         if let Some(feedback) = self.external_drop_feedback(colors, cx) {
             root = root.child(feedback);
         }
-        let unread = self
-            .store
-            .read()
-            .expect("store")
-            .notifications()
-            .unread_count();
-        root = root.child(
-            div().px(px(Space::INSET)).py(px(4.0)).child(
-                div()
-                    .id("notification-inbox-button")
-                    .h(px(SIDEBAR_NAV_ROW_HEIGHT))
-                    .px(px(8.0))
-                    .rounded(px(SIDEBAR_ROW_RADIUS))
-                    .cursor_pointer()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .text_size(px(Typo::ROW.size))
-                    .text_color(colors.primary)
-                    .hover(|style| style.bg(colors.primary.alpha(0.05)))
-                    .child(sf_symbol(
-                        "bell",
-                        14.0,
-                        if unread > 0 {
-                            Ink::FRESH
-                        } else {
-                            colors.secondary
-                        },
-                    ))
-                    .child(div().flex_1().child("Notifications"))
-                    .when(unread > 0, |row| {
-                        row.child(
-                            div()
-                                .rounded(px(5.0))
-                                .px(px(6.0))
-                                .bg(Ink::FRESH.alpha(0.12))
-                                .text_color(Ink::FRESH)
-                                .child(unread.to_string()),
-                        )
-                    })
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(crate::commands::ToggleNotifications), cx)
-                    }),
-            ),
-        );
         root = root.child(self.account_footer(colors, cx));
         // Paint the edge without reducing the shared sidebar content width.
-        root = root.child(
-            div()
-                .absolute()
-                .right_0()
-                .top_0()
-                .bottom_0()
-                .w(px(1.0))
-                .bg(colors.sidebar_stroke()),
-        );
+        root = root.when(!self.surface_in_parent, |root| {
+            root.child(
+                div()
+                    .absolute()
+                    .right_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(1.0))
+                    .bg(colors.sidebar_stroke()),
+            )
+        });
         if let Some(popover) = self.popover(colors, window, cx) {
             root = root.child(popover);
         }
@@ -6403,6 +6517,7 @@ fn icon_button(
         .cursor_pointer()
         .text_size(px(15.0))
         .text_color(colors.secondary)
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(on_click)
         .on_hover(on_hover)
         .child(sf_symbol(system_image, 15.0, colors.secondary))
@@ -7633,6 +7748,52 @@ mod tests {
     }
 
     #[gpui::test]
+    fn sidebar_peek_waits_for_menu_and_rename_without_saving_visibility(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        cx.simulate_mouse_move(point(px(500.0), px(320.0)), None, Modifiers::default());
+        sidebar.update_in(cx, |sidebar, window, cx| {
+            sidebar.conceal(cx);
+            sidebar.peek(window, cx);
+            sidebar.ui.popover = Some(Popover::SidebarLayout);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        sidebar.update(cx, |sidebar, cx| {
+            assert!(sidebar.is_peeking(), "menu must survive leaving the panel");
+            assert!(!sidebar.store.read().unwrap().preferences().sidebar_visible);
+            sidebar.ui.popover = None;
+            sidebar
+                .ui
+                .begin_rename(SessionId::new("preview-claude"), "Renaming");
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        sidebar.update(cx, |sidebar, cx| {
+            assert!(
+                sidebar.is_peeking(),
+                "rename must survive leaving the panel"
+            );
+            sidebar.ui.cancel_rename();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(300));
+        cx.run_until_parked();
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(!sidebar.is_peeking());
+            assert!(!sidebar.store.read().unwrap().preferences().sidebar_visible);
+        });
+    }
+
+    #[gpui::test]
     fn pointer_selection_does_not_enter_keyboard_navigation(cx: &mut TestAppContext) {
         let (view, cx) = cx.add_window_view(|_, cx| {
             let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
@@ -8062,6 +8223,7 @@ mod tests {
         assert!(cx.debug_bounds("account-usage-session").is_some());
         assert!(cx.debug_bounds("account-usage-today").is_some());
         assert!(cx.debug_bounds("account-usage-month").is_some());
+        assert!(cx.debug_bounds("account-whats-new").is_some());
         assert!(cx.debug_bounds("quick-add-remote-host").is_some());
         assert!(cx.debug_bounds("account-settings").is_some());
     }

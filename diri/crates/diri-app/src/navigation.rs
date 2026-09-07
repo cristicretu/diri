@@ -1,15 +1,22 @@
+mod history_page;
+#[cfg(test)]
+mod page_tests;
+
 use std::cmp::Ordering;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use crate::commands::{NAVIGATION_CONTEXT, ToggleCommandPalette, ToggleQuickOpen};
+use crate::commands::{
+    CommandId, NAVIGATION_CONTEXT, ToggleCommandPalette, ToggleHistory, ToggleQuickOpen,
+};
 use crate::fuzzy::{FuzzyMatcher, FuzzyQuery};
-use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
+use crate::icons::sf_symbol;
 use crate::palette::{self, PaletteAction, PaletteCommand, Ranked};
+use crate::palette_chrome::{PaletteTooltip, keycap, scroll_fades};
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
 use crate::quick_open::{
     self, DirectoryIndex, QuickOpenItem, QuickOpenSnapshot, RANK_DEBOUNCE, RESULT_LIMIT,
@@ -17,34 +24,29 @@ use crate::quick_open::{
 };
 use crate::store::{SessionStore, SpawnOptions, StoreRuntime};
 use diri_proto::{AgentKind, AttentionLevel, SessionId, SessionRecord};
-use diri_ui::{FloatingSurface, HairlineDivider, Palette, Radius, SemanticColors};
+use diri_term::theme::TermTheme;
+use diri_ui::{
+    Fill, FloatingSurface, HairlineDivider, Icon, IconName, Ink, LoadingIndicator, Palette, Radius,
+    SemanticColors,
+};
 use gpui::{
-    AnyElement, App, Context, FocusHandle, Focusable, FontWeight, HighlightStyle, KeyDownEvent,
-    MouseButton, Pixels, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
-    StyledText, Task, Window, div, prelude::*, px, rgba,
+    Animation, AnimationExt, AnyElement, App, Context, FocusHandle, Focusable, FontWeight,
+    HighlightStyle, KeyDownEvent, MouseButton, Pixels, Render, ScrollStrategy, SharedString,
+    StatefulInteractiveElement, StyledText, Task, UniformListScrollHandle, Window, div,
+    ease_out_quint, prelude::*, px, rgba, uniform_list,
 };
 
 /// The search field above the results, and the gap the surface keeps from the
 /// window edges. Everything else is measured against the live viewport so the
 /// list grows into a tall window and never overflows a short one.
-const SEARCH_HEIGHT: f32 = 40.0;
-const ROW_HEIGHT: f32 = 32.0;
-const QUICK_ROW_HEIGHT: f32 = 34.0;
-/// Quick Open rows that show a parent path stack two lines.
-const QUICK_ROW_HEIGHT_WITH_PATH: f32 = 44.0;
-const SECTION_HEADER_HEIGHT: f32 = 26.0;
-const LIST_PADDING_X: f32 = 4.0;
-const LIST_PADDING_Y: f32 = 2.0;
-const ROW_PADDING_X: f32 = 10.0;
-const COMMAND_SURFACE_WIDTH: f32 = 520.0;
-const QUICK_OPEN_SURFACE_WIDTH: f32 = 580.0;
-const MIN_LIST_HEIGHT: f32 = 96.0;
-const COMMAND_MAX_LIST_HEIGHT: f32 = 440.0;
-const QUICK_OPEN_MAX_LIST_HEIGHT: f32 = 640.0;
-const CHAT_PREVIEW_LIMIT: usize = 7;
-const MIN_TOP_INSET: f32 = 12.0;
-const MAX_TOP_INSET: f32 = 96.0;
-const BOTTOM_INSET: f32 = 24.0;
+const SEARCH_HEIGHT: f32 = 48.0;
+const ROW_HEIGHT: f32 = 36.0;
+const LIST_HEIGHT: f32 = ROW_HEIGHT * 9.0;
+const SURFACE_WIDTH: f32 = 600.0;
+const KEYCAP_WIDTH: f32 = 28.0;
+const KEYCAP_HEIGHT: f32 = 20.0;
+const CHAT_PREVIEW_LIMIT: usize = 5;
+const PAGE_DURATION: Duration = Duration::from_millis(140);
 
 /// Where the overlay sits and how tall its list may grow in this window.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -57,32 +59,11 @@ struct OverlayLayout {
 impl OverlayLayout {
     fn command_palette(viewport: gpui::Size<Pixels>) -> Self {
         let height = viewport.height.as_f32();
-        let list = (height - 2.0 * MIN_TOP_INSET - SEARCH_HEIGHT - 1.0)
-            .clamp(MIN_LIST_HEIGHT, COMMAND_MAX_LIST_HEIGHT);
-        let surface_height = SEARCH_HEIGHT + 1.0 + list;
-        Self {
-            top_inset: px(((height - surface_height) / 2.0).max(MIN_TOP_INSET)),
-            width: px(
-                (viewport.width.as_f32() - 2.0 * BOTTOM_INSET).clamp(280.0, COMMAND_SURFACE_WIDTH)
-            ),
-            list_height: px(list),
-        }
-    }
-
-    fn quick_open(viewport: gpui::Size<Pixels>) -> Self {
-        let height = viewport.height.as_f32();
-        let chrome = SEARCH_HEIGHT + 1.0 + BOTTOM_INSET;
-        // Float the surface a twelfth of the way down, but give the inset back
-        // to the list before the list is allowed to fall below its minimum.
-        let top = (height / 12.0)
-            .clamp(MIN_TOP_INSET, MAX_TOP_INSET)
-            .min((height - chrome - MIN_LIST_HEIGHT).max(MIN_TOP_INSET));
-        let list = (height - top - chrome).clamp(MIN_LIST_HEIGHT, QUICK_OPEN_MAX_LIST_HEIGHT);
+        let top = (height / 6.0).clamp(12.0, 96.0);
         Self {
             top_inset: px(top),
-            width: px((viewport.width.as_f32() - 2.0 * BOTTOM_INSET)
-                .clamp(280.0, QUICK_OPEN_SURFACE_WIDTH)),
-            list_height: px(list),
+            width: px((viewport.width.as_f32() - 32.0).clamp(0.0, SURFACE_WIDTH)),
+            list_height: px((height - top - SEARCH_HEIGHT - 25.0).clamp(0.0, LIST_HEIGHT)),
         }
     }
 }
@@ -91,12 +72,22 @@ impl OverlayLayout {
 enum Overlay {
     CommandPalette,
     QuickOpen,
+    History,
+    Settings,
+    Themes,
 }
 
 #[derive(Clone)]
 enum CommandSelection {
     Action(PaletteCommand),
     Session(SessionId),
+}
+
+struct PageState {
+    page: Overlay,
+    query: QueryEditor,
+    highlight: usize,
+    scroll: UniformListScrollHandle,
 }
 
 pub struct NavigationOverlay {
@@ -119,7 +110,22 @@ pub struct NavigationOverlay {
     /// store change that cannot have altered the Agent rows does not rebuild
     /// them. See `agent_actions_fingerprint`.
     agent_actions_fingerprint: u64,
-    scroll_handle: ScrollHandle,
+    list_scroll: UniformListScrollHandle,
+    tokio: Arc<tokio::runtime::Runtime>,
+    history: Vec<diri_proto::HistoryEntry>,
+    history_loading: bool,
+    history_error: Option<String>,
+    history_scanner: Option<crate::history::HistoryScanner>,
+    history_search: crate::history::HistorySearch,
+    history_matches: Vec<usize>,
+    history_resuming: Option<String>,
+    back_stack: Vec<PageState>,
+    page_generation: u64,
+    page_direction: f32,
+    previous_page_rows: usize,
+    last_theme_id: String,
+    theme_matches: Vec<TermTheme>,
+    page_error: Option<String>,
     /// Separate slots: the disk-cache load and the filesystem scan both start
     /// at launch, and neither may cancel the other by sharing a `Task` slot.
     cache_task: Option<Task<()>>,
@@ -132,7 +138,14 @@ pub struct NavigationOverlay {
 }
 
 impl NavigationOverlay {
-    pub fn new(runtime: Arc<StoreRuntime>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        runtime: Arc<StoreRuntime>,
+        tokio: Arc<tokio::runtime::Runtime>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        cx.on_release(|this, _| this.cancel_theme_preview())
+            .detach();
         let focus_handle = cx.focus_handle();
         let _ = window;
         let mut changes = runtime.changes();
@@ -166,7 +179,22 @@ impl NavigationOverlay {
             quick_snapshot: QuickOpenSnapshot::default(),
             ranked_items: Vec::new(),
             agent_actions_fingerprint: 0,
-            scroll_handle: ScrollHandle::new(),
+            list_scroll: UniformListScrollHandle::new(),
+            tokio,
+            history: Vec::new(),
+            history_loading: false,
+            history_error: None,
+            history_scanner: Some(crate::history::HistoryScanner::default()),
+            history_search: crate::history::HistorySearch::default(),
+            history_matches: Vec::new(),
+            history_resuming: None,
+            back_stack: Vec::new(),
+            page_generation: 0,
+            page_direction: 1.0,
+            previous_page_rows: 9,
+            last_theme_id: String::new(),
+            theme_matches: Vec::new(),
+            page_error: None,
             cache_task: None,
             scan_task: None,
             rank_task: None,
@@ -182,6 +210,12 @@ impl NavigationOverlay {
 
     #[cfg(test)]
     fn opened_for_test(runtime: Arc<StoreRuntime>, cx: &mut Context<Self>) -> Self {
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
         Self {
             focus_handle: cx.focus_handle(),
             previous_focus_handle: None,
@@ -197,7 +231,22 @@ impl NavigationOverlay {
             quick_snapshot: QuickOpenSnapshot::default(),
             ranked_items: Vec::new(),
             agent_actions_fingerprint: 0,
-            scroll_handle: ScrollHandle::new(),
+            list_scroll: UniformListScrollHandle::new(),
+            tokio,
+            history: Vec::new(),
+            history_loading: false,
+            history_error: None,
+            history_scanner: Some(crate::history::HistoryScanner::default()),
+            history_search: crate::history::HistorySearch::default(),
+            history_matches: Vec::new(),
+            history_resuming: None,
+            back_stack: Vec::new(),
+            page_generation: 0,
+            page_direction: 1.0,
+            previous_page_rows: 9,
+            last_theme_id: String::new(),
+            theme_matches: Vec::new(),
+            page_error: None,
             cache_task: None,
             scan_task: None,
             rank_task: None,
@@ -216,6 +265,15 @@ impl NavigationOverlay {
     /// highlight index that is not re-anchored. Only readiness can change the
     /// Agent rows this handler exists for, so gate on exactly that.
     fn handle_store_change(&mut self, cx: &mut Context<Self>) {
+        let mut changed = {
+            let store = self.store.read().expect("session store lock poisoned");
+            if self.last_theme_id != store.theme_id() {
+                self.last_theme_id = store.theme_id().to_owned();
+                true
+            } else {
+                false
+            }
+        };
         if self.overlay == Some(Overlay::CommandPalette) {
             let fingerprint = {
                 let store = self.store.read().expect("session store lock poisoned");
@@ -225,9 +283,12 @@ impl NavigationOverlay {
                 let highlighted = self.highlighted_command();
                 self.refresh_command_items();
                 self.restore_highlight(highlighted.as_ref());
+                changed = true;
             }
         }
-        cx.notify();
+        if changed && self.is_open() {
+            cx.notify();
+        }
     }
 
     /// The row the user is on, so a rebuild can put the highlight back on it
@@ -293,18 +354,21 @@ impl NavigationOverlay {
                 .focused(cx)
                 .filter(|handle| handle != &self.focus_handle);
         }
-        self.overlay = Some(overlay);
-        self.query.clear();
-        self.reset_selection();
-        self.ranked_items.clear();
-        if overlay == Overlay::CommandPalette {
-            self.refresh_command_items();
-        }
+        self.back_stack.clear();
+        self.previous_page_rows = self.page_rows();
+        self.page_generation = if self.is_open() {
+            self.page_generation + 1
+        } else {
+            0
+        };
+        self.prepare_page(overlay, cx);
         self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
     fn clear_overlay(&mut self, cx: &mut Context<Self>) {
+        self.cancel_theme_preview();
+        self.back_stack.clear();
         self.overlay = None;
         self.query.clear();
         self.highlight = 0;
@@ -332,7 +396,7 @@ impl NavigationOverlay {
     /// Back to the first row, scrolled back to the top of the list.
     fn reset_selection(&mut self) {
         self.highlight = 0;
-        self.scroll_handle.set_offset(gpui::point(px(0.0), px(0.0)));
+        self.list_scroll = UniformListScrollHandle::new();
     }
 
     /// The roots to index, and where their cached index lives.
@@ -406,7 +470,8 @@ impl NavigationOverlay {
             this.update(cx, |this, cx| {
                 this.directory_index.finish_scan(entries, Instant::now());
                 this.quick_snapshot = snapshot;
-                if !this.query.text().trim().is_empty() {
+                if this.overlay == Some(Overlay::QuickOpen) && !this.query.text().trim().is_empty()
+                {
                     this.schedule_rank(cx);
                 }
                 cx.notify();
@@ -420,7 +485,11 @@ impl NavigationOverlay {
     fn snapshot_inputs(&mut self) -> (Vec<(PathBuf, String)>, Vec<PathBuf>) {
         let projects = self.project_roots();
         let store = self.store.read().expect("session store lock poisoned");
-        let mut sessions: Vec<_> = store.sessions().values().collect();
+        let mut sessions: Vec<_> = store
+            .sessions()
+            .values()
+            .filter(|session| session.host.is_none())
+            .collect();
         sessions.sort_by(|left, right| {
             right
                 .updated_at
@@ -441,6 +510,9 @@ impl NavigationOverlay {
             .sidebar_projection()
             .projects
             .iter()
+            // This picker launches local folders. Remote projects remain
+            // available through commands that carry an explicit host target.
+            .filter(|entry| entry.host.is_none())
             .map(|entry| {
                 (
                     PathBuf::from(&entry.project.root),
@@ -459,12 +531,18 @@ impl NavigationOverlay {
             return;
         }
         let pool = self.quick_snapshot.pool.clone();
+        let expected_query = query.clone();
         self.rank_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(RANK_DEBOUNCE).await;
             let ranked = cx
                 .background_spawn(async move { quick_open::rank(&query, &pool, RESULT_LIMIT) })
                 .await;
             this.update(cx, |this, cx| {
+                if this.overlay != Some(Overlay::QuickOpen)
+                    || this.query.text().trim() != expected_query
+                {
+                    return;
+                }
                 this.ranked_items = ranked;
                 this.reset_selection();
                 cx.notify();
@@ -485,6 +563,8 @@ impl NavigationOverlay {
         let modifiers = event.keystroke.modifiers;
         match event.keystroke.key.as_str() {
             "escape" => self.close_overlay(window, cx),
+            "[" if modifiers.platform => self.back(window, cx),
+            "backspace" if self.query.is_empty() => self.back(window, cx),
             "up" => self.move_highlight(-1, cx),
             "down" => self.move_highlight(1, cx),
             "p" if modifiers.control => self.move_highlight(-1, cx),
@@ -524,12 +604,17 @@ impl NavigationOverlay {
 
     fn query_changed(&mut self, cx: &mut Context<Self>) {
         self.reset_selection();
-        if self.overlay == Some(Overlay::QuickOpen) {
-            self.schedule_rank(cx);
-        } else {
-            self.refresh_command_items();
-            cx.notify();
+        match self.overlay {
+            Some(Overlay::QuickOpen) => self.schedule_rank(cx),
+            Some(Overlay::History) => self.filter_history(),
+            Some(Overlay::Themes) => {
+                self.filter_themes();
+                self.preview_highlighted_theme();
+            }
+            Some(Overlay::CommandPalette) => self.refresh_command_items(),
+            _ => {}
         }
+        cx.notify();
     }
 
     fn move_highlight(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -539,32 +624,13 @@ impl NavigationOverlay {
         }
         self.highlight = (self.highlight as isize + delta).rem_euclid(count as isize) as usize;
         self.scroll_to_highlight();
+        self.preview_highlighted_theme();
         cx.notify();
     }
 
-    /// Keyboard navigation must drag the viewport along with it; the list is
-    /// taller than the window on any real machine.
     fn scroll_to_highlight(&self) {
-        self.scroll_handle.scroll_to_item(self.highlight_child());
-    }
-
-    /// Index of the highlighted row among the scroll container's children,
-    /// which include the section headers.
-    fn highlight_child(&self) -> usize {
-        match self.overlay {
-            Some(Overlay::CommandPalette) => command_row_child_index(
-                self.highlight,
-                self.ranked_sessions.len(),
-                self.quick_action_count(),
-                self.ranked_actions.len(),
-                self.query.text().trim().is_empty(),
-            ),
-            Some(Overlay::QuickOpen) if self.query.text().trim().is_empty() => {
-                row_child_index(self.highlight, Some(self.quick_snapshot.recent.len()))
-            }
-            // A searched Quick Open list is one flat section, no headers.
-            _ => row_child_index(self.highlight, None),
-        }
+        self.list_scroll
+            .scroll_to_item(self.highlight, ScrollStrategy::Nearest);
     }
 
     fn visible_count(&self) -> usize {
@@ -574,18 +640,10 @@ impl NavigationOverlay {
                 self.quick_snapshot.recent.len() + self.quick_snapshot.folders.len()
             }
             Some(Overlay::QuickOpen) => self.ranked_items.len(),
+            Some(Overlay::History) => self.history_matches.len(),
+            Some(Overlay::Settings) => self.settings_items().len(),
+            Some(Overlay::Themes) => self.theme_matches.len(),
             None => 0,
-        }
-    }
-
-    fn quick_action_count(&self) -> usize {
-        if self.query.text().trim().is_empty() {
-            self.ranked_actions
-                .iter()
-                .take_while(|ranked| is_quick_action(&ranked.item))
-                .count()
-        } else {
-            0
         }
     }
 
@@ -611,26 +669,46 @@ impl NavigationOverlay {
             Some(Overlay::QuickOpen) => {
                 if let Some(item) = self.current_quick_item() {
                     let cwd = item.path.to_string_lossy().into_owned();
-                    if secondary {
-                        self.store
-                            .write()
-                            .expect("session store lock poisoned")
-                            .spawn_shell(SpawnOptions {
-                                cwd: Some(cwd.clone()),
-                                ..SpawnOptions::default()
-                            });
+                    let launched = {
+                        let mut store = self.store.write().expect("session store lock poisoned");
+                        let options = SpawnOptions {
+                            cwd: Some(cwd),
+                            ..SpawnOptions::default()
+                        };
+                        if secondary {
+                            store.spawn_shell(options);
+                            true
+                        } else if store.spawn_default(options) {
+                            true
+                        } else {
+                            self.page_error =
+                                store.action_failure().map(|failure| failure.detail.clone());
+                            false
+                        }
+                    };
+                    if launched {
+                        self.close_overlay(window, cx);
                     } else {
-                        self.store
-                            .write()
-                            .expect("session store lock poisoned")
-                            .spawn_default(SpawnOptions {
-                                cwd: Some(cwd.clone()),
-                                ..SpawnOptions::default()
-                            });
+                        // Keep the selected project and input focus available
+                        // for retry once Agent readiness has arrived.
+                        cx.notify();
                     }
-                    self.close_overlay(window, cx);
                 }
             }
+            Some(Overlay::History) => {
+                if let Some(entry) = self.highlighted_history().cloned() {
+                    self.resume_history(entry, window, cx);
+                }
+            }
+            Some(Overlay::Settings) => match self.settings_items().get(self.highlight).copied() {
+                Some(0) => self.push_page(Overlay::Themes, window, cx),
+                Some(_) => {
+                    self.close_overlay(window, cx);
+                    window.dispatch_action(Box::new(crate::commands::ShowSettings), cx);
+                }
+                None => {}
+            },
+            Some(Overlay::Themes) => self.commit_theme(window, cx),
             None => {}
         }
     }
@@ -660,6 +738,16 @@ impl NavigationOverlay {
         cx: &mut Context<Self>,
     ) {
         match command {
+            PaletteCommand::Themes => self.push_page(Overlay::Themes, window, cx),
+            PaletteCommand::Action(CommandId::ToggleQuickOpen) => {
+                self.push_page(Overlay::QuickOpen, window, cx)
+            }
+            PaletteCommand::Action(CommandId::ToggleHistory) => {
+                self.push_page(Overlay::History, window, cx)
+            }
+            PaletteCommand::Action(CommandId::OpenSettings) => {
+                self.push_page(Overlay::Settings, window, cx)
+            }
             PaletteCommand::Action(id) => {
                 self.close_overlay(window, cx);
                 window.dispatch_action(id.action(), cx);
@@ -743,14 +831,10 @@ impl NavigationOverlay {
         let searching = !self.query.text().trim().is_empty();
         let mut ranked_actions = palette::rank_actions(actions, &query, &mut self.matcher);
         if !searching {
-            // Empty-query browsing is intentionally curated: two frequent
-            // actions stay visible directly below chats, while fuzzy
-            // search remains score-ordered across every command.
-            let (mut quick, commands): (Vec<_>, Vec<_>) = ranked_actions
-                .into_iter()
-                .partition(|ranked| is_quick_action(&ranked.item));
-            quick.extend(commands);
-            ranked_actions = quick;
+            // Keep the landing page focused. Every advanced action remains
+            // searchable, including target-specific Agent/project shortcuts.
+            ranked_actions.retain(|ranked| landing_action_order(&ranked.item).is_some());
+            ranked_actions.sort_by_key(|ranked| landing_action_order(&ranked.item));
         }
         self.ranked_actions = ranked_actions;
         self.ranked_sessions = palette::rank_sessions(sessions, &query, &mut self.matcher);
@@ -774,32 +858,389 @@ impl NavigationOverlay {
         }
     }
 
-    fn render_overlay(&mut self, layout: OverlayLayout, cx: &mut Context<Self>) -> AnyElement {
-        let colors = {
-            let store = self.store.read().expect("session store lock poisoned");
-            crate::app_theme::colors(&store.preferences().terminal_theme)
-        };
-        let content = match self.overlay {
-            Some(Overlay::CommandPalette) => self.render_command_palette(layout, colors, cx),
-            Some(Overlay::QuickOpen) => self.render_quick_open(layout, colors, cx),
-            None => return div().into_any_element(),
-        };
-        let surface = if self.overlay == Some(Overlay::CommandPalette) {
-            // Command palettes are keyboard-triggered, so their frame is
-            // immediate; a settled surface is faster to parse than a
-            // decorative entrance animation.
-            FloatingSurface::new(colors, content)
-                .radius(20.0)
-                .animate_entry(false)
+    pub(crate) fn toggle_history(
+        &mut self,
+        _: &ToggleHistory,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.overlay == Some(Overlay::History) {
+            self.close_overlay(window, cx);
         } else {
-            FloatingSurface::new(colors, content)
+            self.open_overlay(Overlay::History, window, cx);
+        }
+    }
+
+    fn cancel_theme_preview(&mut self) {
+        if self
+            .store
+            .write()
+            .expect("session store lock poisoned")
+            .preview_theme(None)
+        {
+            self._runtime.publish_local_change();
+        }
+    }
+
+    fn prepare_page(&mut self, page: Overlay, cx: &mut Context<Self>) {
+        self.rank_task = None;
+        self.cancel_theme_preview();
+        self.overlay = Some(page);
+        self.page_error = None;
+        self.query.clear();
+        self.reset_selection();
+        self.ranked_items.clear();
+        match page {
+            Overlay::CommandPalette => self.refresh_command_items(),
+            Overlay::QuickOpen => self.refresh_directory_index(cx),
+            Overlay::History => {
+                self.filter_history();
+                self.refresh_history(cx);
+            }
+            Overlay::Settings => {}
+            Overlay::Themes => {
+                self.filter_themes();
+                let saved = self
+                    .store
+                    .read()
+                    .expect("session store lock poisoned")
+                    .preferences()
+                    .terminal_theme
+                    .clone();
+                self.highlight = self
+                    .theme_matches
+                    .iter()
+                    .position(|theme| theme.id == saved)
+                    .unwrap_or(0);
+                self.scroll_to_highlight();
+            }
+        }
+        cx.notify();
+    }
+
+    fn push_page(&mut self, page: Overlay, _window: &mut Window, cx: &mut Context<Self>) {
+        self.previous_page_rows = self.page_rows();
+        if let Some(current) = self.overlay {
+            self.back_stack.push(PageState {
+                page: current,
+                query: self.query.clone(),
+                highlight: self.highlight,
+                scroll: self.list_scroll.clone(),
+            });
+        }
+        self.prepare_page(page, cx);
+        self.page_generation += 1;
+        self.page_direction = 1.0;
+    }
+
+    fn back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.previous_page_rows = self.page_rows();
+        if let Some(previous) = self.back_stack.pop() {
+            self.prepare_page(previous.page, cx);
+            self.query = previous.query;
+            self.query_changed(cx);
+            self.highlight = previous
+                .highlight
+                .min(self.visible_count().saturating_sub(1));
+            self.list_scroll = previous.scroll;
+            self.page_generation += 1;
+            self.page_direction = -1.0;
+        } else if self.overlay != Some(Overlay::CommandPalette) {
+            self.prepare_page(Overlay::CommandPalette, cx);
+            self.page_generation += 1;
+            self.page_direction = -1.0;
+        } else {
+            self.close_overlay(window, cx);
+        }
+    }
+
+    fn settings_items(&self) -> Vec<usize> {
+        let query = self.query.text().trim().to_lowercase();
+        [
+            "Color theme appearance dark light",
+            "All settings preferences shortcuts",
+        ]
+        .iter()
+        .enumerate()
+        .filter_map(|(index, label)| label.to_lowercase().contains(&query).then_some(index))
+        .collect()
+    }
+
+    fn filter_themes(&mut self) {
+        let query = self.query.text().trim().to_lowercase();
+        self.theme_matches = TermTheme::CATALOG
+            .into_iter()
+            .filter(|theme| theme.name.to_lowercase().contains(&query))
+            .collect();
+    }
+
+    fn preview_highlighted_theme(&mut self) {
+        if self.overlay != Some(Overlay::Themes) {
+            return;
+        }
+        let theme = self
+            .theme_matches
+            .get(self.highlight)
+            .map(|theme| theme.id.to_owned());
+        if self
+            .store
+            .write()
+            .expect("session store lock poisoned")
+            .preview_theme(theme)
+        {
+            self._runtime.publish_local_change();
+        }
+    }
+
+    fn commit_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(theme) = self.theme_matches.get(self.highlight).copied() else {
+            return;
         };
+        let result = self
+            .store
+            .write()
+            .expect("session store lock poisoned")
+            .update_preferences(|prefs| prefs.terminal_theme = theme.id.to_owned());
+        match result {
+            Ok(()) => {
+                self.close_overlay(window, cx);
+                self._runtime.publish_local_change();
+            }
+            Err(error) => {
+                self.page_error = Some(format!("Could not save theme: {error}"));
+                cx.notify();
+            }
+        }
+    }
+
+    fn page_rows(&self) -> usize {
+        match self.overlay {
+            Some(Overlay::CommandPalette) => self.visible_count().clamp(1, 9),
+            Some(Overlay::Settings) => 2,
+            Some(Overlay::History) => 7,
+            _ => 9,
+        }
+    }
+
+    fn colors(&self) -> SemanticColors {
+        crate::app_theme::sidebar_colors(
+            self.store
+                .read()
+                .expect("session store lock poisoned")
+                .theme_id(),
+        )
+    }
+
+    fn render_overlay(&mut self, layout: OverlayLayout, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.colors();
+        let list_height = layout
+            .list_height
+            .min(px(self.page_rows() as f32 * ROW_HEIGHT));
+        let previous_list_height = layout
+            .list_height
+            .min(px(self.previous_page_rows as f32 * ROW_HEIGHT));
+        let count = self.visible_count();
+        let entity = cx.entity();
+        let page = self.overlay.expect("open palette");
+        let placeholder = match page {
+            Overlay::CommandPalette => "Search chats or run a command…",
+            Overlay::QuickOpen => "Open project…",
+            Overlay::History => "Search chats…",
+            Overlay::Settings => "Settings…",
+            Overlay::Themes => "Color theme…",
+        };
+        let error = if page == Overlay::History {
+            self.history_error.clone()
+        } else {
+            self.page_error.clone()
+        };
+        let content = div()
+            .id("palette-page")
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(px(SEARCH_HEIGHT))
+                    .px(px(16.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .id("palette-back")
+                            .debug_selector(|| "palette-back".into())
+                            .size(px(28.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(Radius::CHIP))
+                            .when(page != Overlay::CommandPalette, |button| {
+                                button
+                                    .cursor_pointer()
+                                    .hover(move |style| style.bg(Fill::hover(colors, true)))
+                                    .tooltip(move |_, cx| {
+                                        cx.new(|_| PaletteTooltip("Back · ⌘[".into(), colors))
+                                            .into()
+                                    })
+                                    .on_click(
+                                        cx.listener(|this, _, window, cx| this.back(window, cx)),
+                                    )
+                            })
+                            .child(sf_symbol(
+                                if page == Overlay::CommandPalette {
+                                    "magnifyingglass"
+                                } else {
+                                    "chevron.left"
+                                },
+                                13.0,
+                                colors.secondary,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_size(px(13.0))
+                            .text_color(if self.query.is_empty() {
+                                colors.secondary
+                            } else {
+                                colors.primary
+                            })
+                            .child(if self.query.is_empty() {
+                                div().child(placeholder).into_any_element()
+                            } else {
+                                query_label(&self.query)
+                            }),
+                    )
+                    .when(page == Overlay::History, |header| {
+                        header.child(
+                            div()
+                                .id("refresh-history")
+                                .size(px(24.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(Radius::CHIP))
+                                .cursor_pointer()
+                                .hover(move |style| style.bg(Fill::hover(colors, true)))
+                                .tooltip(move |_, cx| {
+                                    cx.new(|_| PaletteTooltip("Refresh chats".into(), colors))
+                                        .into()
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| this.refresh_history(cx)))
+                                .child(if self.history_loading {
+                                    LoadingIndicator::new(
+                                        "history-refreshing",
+                                        12.0,
+                                        colors.secondary,
+                                    )
+                                    .into_any_element()
+                                } else {
+                                    sf_symbol("arrow.triangle.2.circlepath", 12.0, colors.secondary)
+                                }),
+                        )
+                    })
+                    .child(
+                        keycap(colors)
+                            .id("close-palette")
+                            .debug_selector(|| "palette-escape".into())
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(Fill::hover(colors, true)))
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.close_overlay(window, cx)),
+                            )
+                            .child("esc"),
+                    ),
+            )
+            .child(HairlineDivider::horizontal(colors))
+            .when_some(error, |view, error| {
+                view.child(
+                    div()
+                        .px(px(16.0))
+                        .py(px(6.0))
+                        .text_size(px(12.0))
+                        .text_color(Ink::DANGER)
+                        .child(error),
+                )
+            })
+            .child(
+                div()
+                    .relative()
+                    .my(px(6.0))
+                    .h(list_height)
+                    .overflow_hidden()
+                    .when(count > 0, |view| {
+                        view.child(
+                            uniform_list("palette-results", count, move |range, _, cx| {
+                                entity.update(cx, |this, cx| {
+                                    range
+                                        .map(|index| this.render_result(index, colors, cx))
+                                        .collect()
+                                })
+                            })
+                            .track_scroll(&self.list_scroll)
+                            .size_full(),
+                        )
+                        .child(scroll_fades(self.list_scroll.clone(), colors))
+                    })
+                    .when(count == 0, |view| {
+                        view.child(
+                            div()
+                                .size_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(13.0))
+                                .text_color(colors.secondary)
+                                .child(if page == Overlay::History && self.history_loading {
+                                    "Finding chats…"
+                                } else if page == Overlay::QuickOpen
+                                    && self.directory_index.is_scanning()
+                                {
+                                    "Finding projects…"
+                                } else {
+                                    "No matches"
+                                }),
+                        )
+                    }),
+            );
+        // Only page changes animate. Typing, selection, and theme previews have
+        // stable IDs and do not restart motion or schedule idle frames.
+        let direction = self.page_direction;
+        let content = if self.page_generation > 0 && !cx.reduce_motion() {
+            content
+                .with_animation(
+                    ("palette-page", self.page_generation),
+                    Animation::new(PAGE_DURATION).with_easing(ease_out_quint()),
+                    move |view, value| {
+                        view.opacity(value)
+                            .h(px(SEARCH_HEIGHT + 13.0)
+                                + previous_list_height
+                                + (list_height - previous_list_height) * value)
+                            .overflow_hidden()
+                            .relative()
+                            .left(px((1.0 - value) * 8.0 * direction))
+                    },
+                )
+                .into_any_element()
+        } else {
+            content.into_any_element()
+        };
+        let surface = FloatingSurface::new(
+            colors,
+            div()
+                .id("command-palette")
+                .debug_selector(|| "command-palette".into())
+                .w(layout.width)
+                .text_color(colors.primary)
+                .child(content),
+        )
+        .radius(Radius::PANEL);
         div()
             .absolute()
             .inset_0()
-            // A modal owns the entire wheel gesture, including the backdrop.
-            // Without this, trackpad deltas hit the terminal underneath and its
-            // precise-scroll accumulator releases them after the modal closes.
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .flex()
             .items_start()
@@ -810,112 +1251,154 @@ impl NavigationOverlay {
                     .absolute()
                     .inset_0()
                     .occlude()
-                    .bg(rgba(0x00000040))
+                    .bg(rgba(0x00000030))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, _, window, cx| {
-                            this.close_overlay(window, cx);
-                        }),
+                        cx.listener(|this, _, window, cx| this.close_overlay(window, cx)),
                     ),
             )
             .child(
                 div()
-                    .on_mouse_down_out(cx.listener(|this, _, window, cx| {
-                        this.close_overlay(window, cx);
-                    }))
+                    // Consume hit tests inside the surface before the dismiss
+                    // backdrop sees mouse-down, including header controls.
+                    .occlude()
+                    .on_mouse_down_out(
+                        cx.listener(|this, _, window, cx| this.close_overlay(window, cx)),
+                    )
                     .child(surface),
             )
             .into_any_element()
     }
 
-    fn render_search(&self, placeholder: &'static str, colors: SemanticColors) -> AnyElement {
-        let field = div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .h(px(SEARCH_HEIGHT))
-            // Line the query up with the rows' icon column below it.
-            .px(px(LIST_PADDING_X + ROW_PADDING_X))
-            .text_size(px(14.0));
-
-        if self.query.is_empty() {
-            return field
-                .text_color(colors.tertiary)
-                .child(placeholder)
-                .into_any_element();
-        }
-
-        field
-            .text_color(colors.primary)
-            .child(query_label(&self.query))
-            .into_any_element()
-    }
-
-    fn render_command_palette(
+    fn render_result(
         &mut self,
-        layout: OverlayLayout,
+        index: usize,
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let actions = self.ranked_actions.clone();
-        let sessions = self.ranked_sessions.clone();
-        let action_count = actions.len();
-        let session_count = sessions.len();
-        let quick_count = self.quick_action_count();
-        let mut results = div()
-            .id("command-palette-results")
-            .track_scroll(&self.scroll_handle)
-            .flex()
-            .flex_col()
-            .max_h(layout.list_height)
-            .overflow_y_scroll()
-            .px(px(LIST_PADDING_X))
-            .py(px(LIST_PADDING_Y));
-
-        if !sessions.is_empty() {
-            results = results.child(section_header("Chats", colors));
-            for (index, session) in sessions.into_iter().enumerate() {
-                results = results.child(self.render_session_row(session, index, colors, cx));
+        if self.overlay == Some(Overlay::History) {
+            return self.render_history_row(index, cx);
+        }
+        let row = match self.overlay {
+            Some(Overlay::CommandPalette) => {
+                if index < self.ranked_sessions.len() {
+                    self.render_session_row(self.ranked_sessions[index].clone(), index, colors, cx)
+                } else {
+                    self.render_action_row(
+                        self.ranked_actions[index - self.ranked_sessions.len()].clone(),
+                        index,
+                        colors,
+                        cx,
+                    )
+                }
             }
-        }
-        if quick_count > 0 {
-            results = results.child(section_header("Quick actions", colors));
-            for (offset, action) in actions.iter().take(quick_count).cloned().enumerate() {
-                results = results.child(self.render_action_row(
-                    action,
-                    session_count + offset,
-                    colors,
-                    cx,
-                ));
+            Some(Overlay::QuickOpen) => {
+                if self.query.text().trim().is_empty() {
+                    let item = self
+                        .quick_snapshot
+                        .recent
+                        .iter()
+                        .chain(&self.quick_snapshot.folders)
+                        .nth(index)
+                        .expect("visible project")
+                        .clone();
+                    self.render_quick_row(item, &[], index, colors, cx)
+                } else {
+                    let ranked = self.ranked_items[index].clone();
+                    self.render_quick_row(ranked.item, &ranked.name_matches, index, colors, cx)
+                }
             }
-        }
-        if action_count > quick_count {
-            results = results.child(section_header("Commands", colors));
-            for (offset, action) in actions.iter().skip(quick_count).cloned().enumerate() {
-                results = results.child(self.render_action_row(
-                    action,
-                    session_count + quick_count + offset,
-                    colors,
-                    cx,
-                ));
-            }
-        }
-        if action_count == 0 && session_count == 0 {
-            results = results.child(empty_label("No matches", colors));
-        }
-
+            Some(Overlay::Settings | Overlay::Themes) => self.render_setting_row(index, colors, cx),
+            _ => div().into_any_element(),
+        };
         div()
-            .id("command-palette")
-            .debug_selector(|| "command-palette".into())
-            .w(layout.width)
-            .p(px(4.0))
-            .flex()
-            .flex_col()
-            .gap(px(4.0))
-            .text_color(colors.primary)
-            .child(self.render_search("Search chats or run a command…", colors))
-            .child(results)
+            .h(px(ROW_HEIGHT))
+            .px(px(6.0))
+            .py(px(2.0))
+            .child(row)
             .into_any_element()
+    }
+
+    fn render_setting_row(
+        &mut self,
+        index: usize,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = (self.overlay == Some(Overlay::Themes)).then(|| self.theme_matches[index]);
+        let title = theme.map_or_else(
+            || {
+                if self.settings_items()[index] == 0 {
+                    "Color theme"
+                } else {
+                    "All settings"
+                }
+            },
+            |theme| theme.name,
+        );
+        let leading = theme.map_or_else(
+            || {
+                sf_symbol(
+                    if self.settings_items()[index] == 0 {
+                        "moon.fill"
+                    } else {
+                        "gearshape"
+                    },
+                    13.0,
+                    colors.secondary,
+                )
+            },
+            |theme| {
+                div()
+                    .size(px(16.0))
+                    .rounded(px(5.0))
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(colors.primary.alpha(0.2))
+                    .bg(theme.background)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(div().size(px(6.0)).rounded_full().bg(theme.ansi[4]))
+                    .into_any_element()
+            },
+        );
+        palette_row(
+            div().child(title).into_any_element(),
+            leading,
+            Vec::new(),
+            index == self.highlight,
+            index,
+            true,
+            colors,
+        )
+        .when(
+            theme.is_some_and(|theme| {
+                theme.id
+                    == self
+                        .store
+                        .read()
+                        .expect("session store lock poisoned")
+                        .preferences()
+                        .terminal_theme
+            }),
+            |row| row.child(sf_symbol("checkmark", 12.0, colors.secondary)),
+        )
+        .when(theme.is_none(), |row| {
+            row.child(sf_symbol("chevron.right", 11.0, colors.tertiary))
+        })
+        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+            if *hovered && this.highlight != index {
+                this.highlight = index;
+                this.preview_highlighted_theme();
+                cx.notify();
+            }
+        }))
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.highlight = index;
+            this.run_highlighted(false, window, cx);
+        }))
+        .into_any_element()
     }
 
     fn render_action_row(
@@ -928,6 +1411,13 @@ impl NavigationOverlay {
         let action = ranked.item;
         let command = action.command.clone();
         let enabled = action.enabled;
+        let opens_page = matches!(
+            command,
+            PaletteCommand::Themes
+                | PaletteCommand::Action(
+                    CommandId::ToggleQuickOpen | CommandId::ToggleHistory | CommandId::OpenSettings
+                )
+        );
         let trailing = action
             .detail
             .clone()
@@ -944,8 +1434,11 @@ impl NavigationOverlay {
             enabled,
             colors,
         )
+        .when(opens_page, |row| {
+            row.child(sf_symbol("chevron.right", 11.0, colors.tertiary))
+        })
         .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-            if *hovered {
+            if *hovered && this.highlight != index {
                 this.highlight = index;
                 cx.notify();
             }
@@ -987,7 +1480,7 @@ impl NavigationOverlay {
             colors,
         )
         .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-            if *hovered {
+            if *hovered && this.highlight != index {
                 this.highlight = index;
                 cx.notify();
             }
@@ -998,199 +1491,74 @@ impl NavigationOverlay {
         .into_any_element()
     }
 
-    fn render_quick_open(
-        &mut self,
-        layout: OverlayLayout,
-        colors: SemanticColors,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let searching = !self.query.text().trim().is_empty();
-        let mut results = div()
-            .id("quick-open-results")
-            .track_scroll(&self.scroll_handle)
-            .flex()
-            .flex_col()
-            .max_h(layout.list_height)
-            .overflow_y_scroll()
-            .px(px(LIST_PADDING_X))
-            .py(px(LIST_PADDING_Y));
-
-        if searching {
-            let ranked = self.ranked_items.clone();
-            for (index, folder) in ranked.iter().enumerate() {
-                results = results.child(self.render_quick_row(
-                    folder.item.clone(),
-                    &folder.name_matches,
-                    index,
-                    colors,
-                    cx,
-                ));
-            }
-            if ranked.is_empty() {
-                results = results.child(empty_label(
-                    if self.directory_index.is_scanning() {
-                        "Scanning…"
-                    } else {
-                        "No matches"
-                    },
-                    colors,
-                ));
-            }
-        } else {
-            let recent = self.quick_snapshot.recent.clone();
-            let folders = self.quick_snapshot.folders.clone();
-            if !recent.is_empty() {
-                results = results.child(section_header("Recent", colors));
-                for (index, item) in recent.iter().cloned().enumerate() {
-                    results = results.child(self.render_quick_row(item, &[], index, colors, cx));
-                }
-            }
-            if !folders.is_empty() {
-                results = results.child(section_header("Folders", colors));
-                for (offset, item) in folders.iter().cloned().enumerate() {
-                    results = results.child(self.render_quick_row(
-                        item,
-                        &[],
-                        recent.len() + offset,
-                        colors,
-                        cx,
-                    ));
-                }
-            }
-            if recent.is_empty() && folders.is_empty() {
-                results = results.child(empty_label(
-                    if self.directory_index.is_scanning() {
-                        "Scanning…"
-                    } else {
-                        "No folders indexed"
-                    },
-                    colors,
-                ));
-            }
-        }
-
-        div()
-            .w(layout.width)
-            .text_color(colors.primary)
-            .child(self.render_search("Jump to a project or folder…", colors))
-            .child(HairlineDivider::horizontal(colors))
-            .child(results)
-            .into_any_element()
-    }
-
     fn render_quick_row(
         &mut self,
         item: QuickOpenItem,
-        name_matches: &[Range<usize>],
+        matches: &[Range<usize>],
         index: usize,
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let path = item.path.clone();
         let parent = relative_parent(&item.path);
-        let icon_color = if item.is_git_repo {
-            Palette::CLAY
-        } else {
-            colors.secondary
-        };
-        let default_name = {
-            let store = self.store.read().expect("session store lock poisoned");
-            store.agent_catalog(None).map_or_else(
-                || crate::agent_catalog::title_case_id(store.preferences().default_agent.id()),
-                |catalog| {
-                    crate::agent_catalog::display_name(&store.preferences().default_agent, catalog)
-                },
-            )
-        };
-        let row = div()
-            .id(format!("quick-row-{index}"))
+        let title = div()
             .flex()
-            .flex_none()
             .items_center()
-            .justify_between()
-            .h(px(if parent.is_empty() {
-                QUICK_ROW_HEIGHT
-            } else {
-                QUICK_ROW_HEIGHT_WITH_PATH
-            }))
-            .px(px(ROW_PADDING_X))
-            .rounded(px(Radius::ROW))
-            .bg(if index == self.highlight {
-                colors.primary.alpha(0.10)
-            } else {
-                colors.primary.alpha(0.0)
-            })
-            .cursor_pointer()
+            .gap(px(8.0))
+            .min_w_0()
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap(px(9.0))
-                    .min_w(px(0.0))
-                    .child(
-                        div()
-                            .w(px(18.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(sf_symbol_weighted(
-                                if item.is_git_repo {
-                                    "folder.fill"
-                                } else {
-                                    "folder"
-                                },
-                                13.0,
-                                SymbolWeight::Regular,
-                                icon_color,
-                            )),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .min_w(px(0.0))
-                            .text_size(px(13.0))
-                            .child(highlighted_label(item.name.clone(), name_matches))
-                            .when(!parent.is_empty(), |column| {
-                                column.child(
-                                    div()
-                                        .text_size(px(11.0))
-                                        .text_color(colors.tertiary)
-                                        .child(parent.clone()),
-                                )
-                            }),
-                    ),
+                    .flex_none()
+                    .child(highlighted_label(item.name, matches)),
             )
-            .when(index == self.highlight, |row| {
-                row.child(
+            .when(index == self.highlight, |title| {
+                title.child(
                     div()
-                        .flex()
-                        .gap(px(5.0))
-                        .child(chip(format!("⏎ {}", default_name.to_lowercase()), colors))
-                        .child(chip(
-                            format!("{} term", crate::commands::primary_shortcut_label("⏎")),
-                            colors,
-                        )),
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(11.0))
+                        .text_color(colors.tertiary)
+                        .child(parent),
                 )
-            })
-            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                if *hovered {
-                    this.highlight = index;
-                    cx.notify();
-                }
-            }))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                let cwd = path.to_string_lossy().into_owned();
-                this.store
-                    .write()
-                    .expect("session store lock poisoned")
-                    .spawn_default(SpawnOptions {
-                        cwd: Some(cwd.clone()),
-                        ..SpawnOptions::default()
-                    });
-                this.close_overlay(window, cx);
-            }));
-        row.into_any_element()
+            });
+        let detail = format!(
+            "{}\nEnter to open · {} for a terminal",
+            item.path.display(),
+            crate::commands::primary_shortcut_label("Enter")
+        );
+        palette_row(
+            title.into_any_element(),
+            sf_symbol(
+                if item.is_git_repo {
+                    "folder.fill"
+                } else {
+                    "folder"
+                },
+                13.0,
+                colors.secondary,
+            ),
+            Vec::new(),
+            index == self.highlight,
+            index,
+            true,
+            colors,
+        )
+        .tooltip(move |_, cx| cx.new(|_| PaletteTooltip(detail.clone(), colors)).into())
+        .when(index == self.highlight, |row| {
+            row.child(keycap(colors).child(Icon::new(IconName::Return, 14.0, colors.secondary)))
+        })
+        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+            if *hovered && this.highlight != index {
+                this.highlight = index;
+                cx.notify();
+            }
+        }))
+        .on_click(
+            cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                this.highlight = index;
+                this.run_highlighted(event.modifiers().platform, window, cx);
+            }),
+        )
+        .into_any_element()
     }
 }
 
@@ -1202,11 +1570,7 @@ impl Focusable for NavigationOverlay {
 
 impl Render for NavigationOverlay {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let layout = if self.overlay == Some(Overlay::CommandPalette) {
-            OverlayLayout::command_palette(window.viewport_size())
-        } else {
-            OverlayLayout::quick_open(window.viewport_size())
-        };
+        let layout = OverlayLayout::command_palette(window.viewport_size());
         let overlay = self.overlay.map(|_| self.render_overlay(layout, cx));
         let root = div()
             .id("navigation-overlay")
@@ -1214,6 +1578,7 @@ impl Render for NavigationOverlay {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::toggle_command_palette))
             .on_action(cx.listener(Self::toggle_quick_open))
+            .on_action(cx.listener(Self::toggle_history))
             .on_key_down(cx.listener(Self::on_key_down))
             .absolute()
             // Cached entity roots are laid out independently, so insets alone
@@ -1228,40 +1593,16 @@ impl Render for NavigationOverlay {
     }
 }
 
-fn section_header(title: &'static str, colors: SemanticColors) -> AnyElement {
-    div()
-        .h(px(SECTION_HEADER_HEIGHT))
-        .flex()
-        .flex_none()
-        .items_end()
-        .px(px(ROW_PADDING_X))
-        .pb(px(3.0))
-        .text_size(px(11.0))
-        .text_color(colors.tertiary)
-        .child(title)
-        .into_any_element()
-}
-
-fn empty_label(text: &'static str, colors: SemanticColors) -> AnyElement {
-    div()
-        .h(px(ROW_HEIGHT))
-        .flex()
-        .flex_none()
-        .items_center()
-        .px(px(ROW_PADDING_X))
-        .text_size(px(13.0))
-        .text_color(colors.tertiary)
-        .child(text)
-        .into_any_element()
-}
-
-fn is_quick_action(action: &PaletteAction) -> bool {
-    let default_shortcut =
-        crate::commands::command(crate::commands::CommandId::NewDefaultSession).shortcut_label();
-    matches!(
-        action.command,
-        PaletteCommand::Action(crate::commands::CommandId::ToggleQuickOpen)
-    ) || action.shortcut.as_deref() == default_shortcut.as_deref()
+fn landing_action_order(action: &PaletteAction) -> Option<u8> {
+    if action.is_default {
+        return Some(0);
+    }
+    match action.command {
+        PaletteCommand::Action(CommandId::ToggleQuickOpen) => Some(1),
+        PaletteCommand::Action(CommandId::ToggleHistory) => Some(2),
+        PaletteCommand::Action(CommandId::OpenSettings) => Some(3),
+        _ => None,
+    }
 }
 
 fn session_shortcut(index: usize) -> Option<String> {
@@ -1279,49 +1620,6 @@ fn session_shortcut(index: usize) -> Option<String> {
         _ => return None,
     };
     crate::commands::command(command).shortcut_label()
-}
-
-/// The command palette has up to three visible sections: recent chats, two
-/// curated quick actions, then the remaining commands. Convert a row index in
-/// that keyboard order into the scroll container's child index.
-const fn command_row_child_index(
-    row: usize,
-    session_count: usize,
-    quick_count: usize,
-    action_count: usize,
-    show_quick_section: bool,
-) -> usize {
-    let mut child = row;
-    if session_count > 0 {
-        child += 1;
-    }
-    if row >= session_count {
-        // Whichever section comes first below the chats contributes a header:
-        // the quick actions when they are shown, the command list otherwise.
-        let leading_count = if show_quick_section {
-            quick_count
-        } else {
-            action_count
-        };
-        if leading_count > 0 {
-            child += 1;
-        }
-        if show_quick_section && row >= session_count + quick_count && action_count > quick_count {
-            child += 1;
-        }
-    }
-    child
-}
-
-/// Rows and section headers are siblings in the scroll container, so scrolling
-/// to row N means scrolling to child N plus every header above it. `sections`
-/// is the size of the first section, or `None` for a headerless flat list.
-const fn row_child_index(row: usize, first_section: Option<usize>) -> usize {
-    let Some(first) = first_section else {
-        return row;
-    };
-    // Each non-empty section above the row contributes one header child.
-    row + (first > 0) as usize + (row >= first) as usize
 }
 
 /// A static caret. Blinking would need an autonomous frame timer, which is
@@ -1384,15 +1682,16 @@ fn palette_row(
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(format!("palette-row-{index}"))
+        .debug_selector(move || format!("palette-row-{index}"))
         .flex()
         // Without this the rows are shrinkable flex children: a list taller
         // than its container squeezes every row toward min-content instead of
         // scrolling, and 40pt rows render as ~21pt of crammed text.
         .flex_none()
         .items_center()
-        .justify_between()
-        .h(px(ROW_HEIGHT))
-        .px(px(ROW_PADDING_X))
+        .gap(px(6.0))
+        .h_full()
+        .px(px(10.0))
         .rounded(px(Radius::ROW))
         .bg(if highlighted {
             colors.primary.alpha(0.10)
@@ -1404,13 +1703,14 @@ fn palette_row(
         .text_size(px(13.0))
         .child(
             div()
+                .flex_1()
                 .flex()
                 .items_center()
-                .gap(px(9.0))
+                .gap(px(6.0))
                 .min_w_0()
                 .child(
                     div()
-                        .w(px(18.0))
+                        .w(px(28.0))
                         .flex()
                         .items_center()
                         .justify_center()
@@ -1523,7 +1823,7 @@ mod tests {
     };
     #[cfg(target_os = "macos")]
     use gpui::HeadlessAppContext;
-    use gpui::{Entity, ScrollDelta, ScrollWheelEvent, TestAppContext, point};
+    use gpui::{Entity, ScrollDelta, ScrollWheelEvent, TestAppContext, point, size};
 
     struct OverlayFocusHarness {
         previous_focus: FocusHandle,
@@ -1551,10 +1851,10 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     impl Render for CommandPalettePreviewHarness {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             div()
                 .size_full()
-                .bg(gpui::rgb(0x191b20))
+                .bg(self.overlay.read(cx).colors().background)
                 .child(crate::root::cached_window_overlay(self.overlay.clone()))
         }
     }
@@ -1573,66 +1873,13 @@ mod tests {
     }
 
     #[test]
-    fn scrolling_to_a_row_counts_the_section_headers_above_it() {
-        // Three chats, two quick actions, then three commands.
-        assert_eq!(command_row_child_index(0, 3, 2, 5, true), 1);
-        assert_eq!(command_row_child_index(2, 3, 2, 5, true), 3);
-        assert_eq!(command_row_child_index(3, 3, 2, 5, true), 5);
-        assert_eq!(command_row_child_index(4, 3, 2, 5, true), 6);
-        assert_eq!(command_row_child_index(5, 3, 2, 5, true), 8);
-        // Search collapses actions into one Commands section.
-        assert_eq!(command_row_child_index(3, 3, 0, 5, false), 5);
-        // A searched Quick Open list has no headers at all.
-        assert_eq!(row_child_index(3, None), 3);
-    }
-
-    fn command_layout(width: f32, height: f32) -> OverlayLayout {
-        OverlayLayout::command_palette(gpui::size(px(width), px(height)))
-    }
-
-    fn quick_open_layout(width: f32, height: f32) -> OverlayLayout {
-        OverlayLayout::quick_open(gpui::size(px(width), px(height)))
-    }
-
-    #[test]
-    fn overlay_never_grows_past_the_window_it_floats_in() {
-        for (width, height) in [
-            (1100.0, 700.0),
-            (1800.0, 1100.0),
-            (900.0, 495.0),
-            (600.0, 360.0),
-        ] {
-            for layout in [
-                command_layout(width, height),
-                quick_open_layout(width, height),
-            ] {
-                let total = layout.top_inset + px(SEARCH_HEIGHT + 1.0) + layout.list_height;
-                assert!(
-                    total <= px(height),
-                    "{width}x{height} overflows by {:?}",
-                    total - px(height)
-                );
-                assert!(layout.width <= px(width));
-            }
+    fn palette_fits_small_windows_and_keeps_one_geometry_for_every_page() {
+        for (width, height) in [(1100.0, 700.0), (600.0, 360.0), (320.0, 180.0)] {
+            let layout = OverlayLayout::command_palette(size(px(width), px(height)));
+            assert!(layout.width <= px(width));
+            assert!(layout.top_inset + px(SEARCH_HEIGHT + 13.0) + layout.list_height <= px(height));
+            assert!(layout.list_height <= px(LIST_HEIGHT));
         }
-    }
-
-    #[test]
-    fn the_list_uses_the_height_the_window_actually_has() {
-        let tall = command_layout(1400.0, 1100.0);
-        assert_eq!(tall.list_height, px(COMMAND_MAX_LIST_HEIGHT));
-        assert_eq!(
-            tall.top_inset,
-            px((1100.0 - SEARCH_HEIGHT - 1.0 - COMMAND_MAX_LIST_HEIGHT) / 2.0)
-        );
-        assert!(command_layout(900.0, 360.0).list_height < px(400.0));
-        assert_eq!(
-            quick_open_layout(1600.0, 3000.0).list_height,
-            px(QUICK_OPEN_MAX_LIST_HEIGHT)
-        );
-        let cramped = command_layout(800.0, 150.0);
-        assert_eq!(cramped.list_height, px(MIN_LIST_HEIGHT));
-        assert_eq!(cramped.top_inset, px(MIN_TOP_INSET));
     }
 
     #[gpui::test]
@@ -1656,16 +1903,14 @@ mod tests {
         overlay.read_with(cx, |overlay, _| {
             assert!(!overlay.ranked_sessions.is_empty());
             assert!(overlay.ranked_sessions.len() <= CHAT_PREVIEW_LIMIT);
-            assert_eq!(overlay.quick_action_count(), 2);
-            assert!(
-                overlay.ranked_actions[..2]
+            assert_eq!(overlay.ranked_actions.len(), 4);
+            assert_eq!(
+                overlay
+                    .ranked_actions
                     .iter()
-                    .all(|ranked| is_quick_action(&ranked.item))
-            );
-            assert!(
-                overlay.ranked_actions[2..]
-                    .iter()
-                    .all(|ranked| !is_quick_action(&ranked.item))
+                    .map(|row| landing_action_order(&row.item))
+                    .collect::<Vec<_>>(),
+                [Some(0), Some(1), Some(2), Some(3)],
             );
             assert!(matches!(
                 overlay.highlighted_command(),
@@ -1732,7 +1977,10 @@ mod tests {
             Arc::new(diri_ui::IconAssets),
             gpui_platform::current_headless_renderer,
         );
-        cx.update(|cx| crate::fonts::init(cx));
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
 
         let runtime = Arc::new(StoreRuntime::inert());
         let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
@@ -1747,15 +1995,75 @@ mod tests {
             .open_window(gpui::size(px(1100.0), px(700.0)), move |_, cx| {
                 let overlay = cx.new(|cx| {
                     let mut overlay = NavigationOverlay::opened_for_test(runtime, cx);
+                    if std::env::var_os("DIRI_VISUAL_LIGHT").is_some() {
+                        overlay
+                            .store
+                            .write()
+                            .unwrap()
+                            .update_preferences(|prefs| {
+                                prefs.terminal_theme = "dirijor-light".into()
+                            })
+                            .unwrap();
+                    }
                     overlay.refresh_command_items();
+                    match std::env::var("DIRI_VISUAL_PAGE").as_deref() {
+                        Ok("history") => super::page_tests::seed_history(&mut overlay),
+                        Ok("projects") => {
+                            overlay.overlay = Some(Overlay::QuickOpen);
+                            overlay.quick_snapshot.recent = [
+                                "diri",
+                                "anara",
+                                "website",
+                                "design-system",
+                                "docs",
+                                "experiments",
+                                "mobile",
+                                "playground",
+                                "research",
+                                "archive",
+                            ]
+                            .into_iter()
+                            .map(|name| QuickOpenItem {
+                                name: name.into(),
+                                path: PathBuf::from(format!("/Users/demo/fun/{name}")),
+                                is_git_repo: true,
+                            })
+                            .collect();
+                        }
+                        Ok("settings") => overlay.overlay = Some(Overlay::Settings),
+                        Ok("themes") => {
+                            overlay.overlay = Some(Overlay::Themes);
+                            overlay.filter_themes();
+                            overlay.highlight = overlay
+                                .theme_matches
+                                .iter()
+                                .position(|theme| {
+                                    theme.id == overlay.store.read().unwrap().theme_id()
+                                })
+                                .unwrap_or(0);
+                            overlay.scroll_to_highlight();
+                        }
+                        _ => {}
+                    }
+                    if let Ok(query) = std::env::var("DIRI_VISUAL_QUERY") {
+                        overlay.query.insert(&query);
+                        overlay.query_changed(cx);
+                    }
                     overlay
                 });
                 cx.new(|_| CommandPalettePreviewHarness { overlay })
             })
             .expect("open headless command-palette window");
         cx.run_until_parked();
-        cx.update_window(window.into(), |_, window, _| window.refresh())
-            .expect("refresh command-palette window");
+        cx.update_window(window.into(), |view, window, cx| {
+            view.downcast::<CommandPalettePreviewHarness>()
+                .unwrap()
+                .update(cx, |view, cx| {
+                    view.overlay.update(cx, |_, cx| cx.notify());
+                });
+            window.refresh();
+        })
+        .expect("refresh command-palette window");
         cx.run_until_parked();
         let screenshot = cx
             .capture_screenshot(window.into())

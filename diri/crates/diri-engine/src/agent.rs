@@ -415,6 +415,9 @@ impl AgentDescriptor {
             }
             spec.env.push((key, value));
         }
+        let path = crate::local_path::search_path(None, spec.env.iter().cloned());
+        spec.env.retain(|(key, _)| key != "PATH");
+        spec.env.push(("PATH".into(), path));
         assert_color_environment(&mut spec.env);
         for (key, value) in &self.env {
             spec.env.retain(|(existing, _)| existing != key);

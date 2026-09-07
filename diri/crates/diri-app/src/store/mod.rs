@@ -116,7 +116,10 @@ pub enum StoreEffect {
     Spawn(SessionSpawnParams),
     /// A shell owned by a workbench pane. Unlike a top-level spawn, its
     /// response must not replace the selected sidebar session.
-    SpawnAuxiliary(SessionSpawnParams),
+    SpawnAuxiliary {
+        params: SessionSpawnParams,
+        slot: usize,
+    },
     /// Wake the client's idempotent reconnect loop out of backoff.
     RetryConnection,
     /// `session.migrate` — move a Claude session between local and a host.
@@ -295,6 +298,8 @@ pub struct SessionStore {
     session_list_hydrated: bool,
     daemon_identity: Option<HelloResult>,
     sessions: HashMap<SessionId, Arc<SessionRecord>>,
+    auxiliary_slots: HashMap<(SessionId, usize), SessionId>,
+    auxiliary_pending: HashSet<(SessionId, usize)>,
     projects: HashMap<ProjectId, Project>,
     selected_session_id: Option<SessionId>,
     sidebar_selection: HashSet<SessionId>,
@@ -317,6 +322,7 @@ pub struct SessionStore {
     directory_request_seq: u64,
     directory_listing: Option<DirectoryListing>,
     prefs: Prefs,
+    theme_preview: Option<String>,
     terminal_residency: TerminalResidency,
     app_is_active: bool,
     notification_surface_visible: bool,
@@ -395,6 +401,8 @@ impl SessionStore {
                 session_list_hydrated: false,
                 daemon_identity: None,
                 sessions: HashMap::new(),
+                auxiliary_slots: HashMap::new(),
+                auxiliary_pending: HashSet::new(),
                 projects: HashMap::new(),
                 selected_session_id: selected_session_id.clone(),
                 sidebar_selection: HashSet::new(),
@@ -408,6 +416,7 @@ impl SessionStore {
                 directory_request_seq: 0,
                 directory_listing: None,
                 prefs,
+                theme_preview: None,
                 terminal_residency: TerminalResidency::default(),
                 app_is_active: true,
                 notification_surface_visible: true,
@@ -796,6 +805,43 @@ impl SessionStore {
             .cloned()
     }
 
+    /// Tab bindings use the Engine's returned ID, never mutable titles or list positions.
+    pub fn auxiliary_terminal_for_slot(
+        &mut self,
+        parent: &SessionId,
+        slot: usize,
+    ) -> Option<Arc<SessionRecord>> {
+        if let Some(id) = self.auxiliary_slots.get(&(parent.clone(), slot)) {
+            return self
+                .sessions
+                .get(id)
+                .filter(|session| !session.is_archived() && !self.closing.contains(id))
+                .cloned();
+        }
+        if slot == 0 {
+            let session = self
+                .auxiliary_terminal_for(parent)
+                .filter(|session| !self.auxiliary_slots.values().any(|id| id == &session.id))?;
+            self.auxiliary_slots
+                .insert((parent.clone(), slot), session.id.clone());
+            return Some(session);
+        }
+        None
+    }
+
+    pub fn auxiliary_spawn_pending(&self, parent: &SessionId, slot: usize) -> bool {
+        self.auxiliary_pending.contains(&(parent.clone(), slot))
+    }
+
+    fn finish_auxiliary_spawn(&mut self, parent: SessionId, slot: usize, id: Option<SessionId>) {
+        if id.as_ref().is_none_or(|id| self.sessions.contains_key(id)) {
+            self.auxiliary_pending.remove(&(parent.clone(), slot));
+        }
+        if let Some(id) = id {
+            self.auxiliary_slots.insert((parent, slot), id);
+        }
+    }
+
     pub fn projects(&self) -> &HashMap<ProjectId, Project> {
         &self.projects
     }
@@ -999,6 +1045,25 @@ impl SessionStore {
     /// without waiting for the next daemon event.
     pub fn request_snapshot_publish(&mut self) {
         self.emit(StoreEffect::PublishSnapshot);
+    }
+
+    /// Effective appearance only; persisted preferences never contain a preview.
+    pub fn theme_id(&self) -> &str {
+        self.theme_preview
+            .as_deref()
+            .unwrap_or(&self.prefs.terminal_theme)
+    }
+
+    pub fn preview_theme_id(&self) -> Option<&str> {
+        self.theme_preview.as_deref()
+    }
+
+    pub fn preview_theme(&mut self, theme: Option<String>) -> bool {
+        if self.theme_preview == theme {
+            return false;
+        }
+        self.theme_preview = theme;
+        true
     }
 
     pub fn update_preferences(&mut self, update: impl FnOnce(&mut Prefs)) -> io::Result<()> {
@@ -1508,6 +1573,8 @@ impl SessionStore {
     }
 
     pub fn upsert_session(&mut self, session: SessionRecord) {
+        self.auxiliary_pending
+            .retain(|key| self.auxiliary_slots.get(key) != Some(&session.id));
         let previous = self.sessions.get(&session.id).cloned();
         let is_new = previous.is_none();
         let id = session.id.clone();
@@ -2274,28 +2341,40 @@ impl SessionStore {
     /// pane focus is local UI state, while sidebar selection remains on the
     /// owning agent.
     pub fn spawn_auxiliary_terminal(&mut self, parent: SessionId) -> bool {
+        self.spawn_auxiliary_terminal_slot(parent, 0)
+    }
+
+    pub fn spawn_auxiliary_terminal_slot(&mut self, parent: SessionId, slot: usize) -> bool {
+        if let Some(existing) = self.auxiliary_terminal_for_slot(&parent, slot) {
+            self.auxiliary_slots
+                .insert((parent, slot), existing.id.clone());
+            return false;
+        }
         let Some(session) = self.sessions.get(&parent) else {
             return false;
         };
-        if self.auxiliary_terminal_for(&parent).is_some() {
-            return false;
+        if !self.auxiliary_pending.insert((parent.clone(), slot)) {
+            return true;
         }
         self.last_action_failure = None;
-        self.emit(StoreEffect::SpawnAuxiliary(SessionSpawnParams {
-            kind: AgentKind::SHELL,
-            cwd: session.cwd.clone(),
-            new_worktree: None,
-            worktree_branch: None,
-            worktree_base: None,
-            title: Some(AUXILIARY_TERMINAL_TITLE.to_owned()),
-            initial_prompt: None,
-            parent: Some(parent),
-            initial_cols: None,
-            initial_rows: None,
-            host: session.host.clone(),
-            account_profile_id: None,
-            same_repo_as: None,
-        }));
+        self.emit(StoreEffect::SpawnAuxiliary {
+            slot,
+            params: SessionSpawnParams {
+                kind: AgentKind::SHELL,
+                cwd: session.cwd.clone(),
+                new_worktree: None,
+                worktree_branch: None,
+                worktree_base: None,
+                title: Some(AUXILIARY_TERMINAL_TITLE.to_owned()),
+                initial_prompt: None,
+                parent: Some(parent),
+                initial_cols: None,
+                initial_rows: None,
+                host: session.host.clone(),
+                account_profile_id: None,
+                same_repo_as: None,
+            },
+        });
         true
     }
 
@@ -3109,7 +3188,16 @@ async fn run_effects(
                 }
                 Err(error) => Err(error),
             },
-            StoreEffect::SpawnAuxiliary(params) => client.spawn(params).await.map(|_| ()),
+            StoreEffect::SpawnAuxiliary { params, slot } => {
+                let parent = params.parent.clone().expect("auxiliary parent");
+                let result = client.spawn(params).await;
+                store.write().expect("store").finish_auxiliary_spawn(
+                    parent,
+                    slot,
+                    result.as_ref().ok().cloned(),
+                );
+                result.map(|_| ())
+            }
             StoreEffect::RetryConnection => {
                 client.retry_now();
                 Ok(())
@@ -3342,7 +3430,7 @@ fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
             }),
         ),
         StoreEffect::Spawn(_) => ("Create session failed", None),
-        StoreEffect::SpawnAuxiliary(_) => ("Open terminal failed", None),
+        StoreEffect::SpawnAuxiliary { .. } => ("Open terminal failed", None),
         StoreEffect::Migrate { .. } => ("Move session failed", None),
         StoreEffect::ReparentWorktree(_) => ("Move session to worktree failed", None),
         StoreEffect::SyncPrefs { host, host_name } => (
