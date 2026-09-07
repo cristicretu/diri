@@ -50,6 +50,7 @@ impl Method {
     pub const WORKTREE_LIST: &'static str = "worktree.list";
     pub const WORKTREE_CLEANUP: &'static str = "worktree.cleanup";
     pub const WORKTREE_REMOVE: &'static str = "worktree.remove";
+    pub const WORKTREE_SCAN: &'static str = "worktree.scan";
     pub const WORKTREE_OVERVIEW: &'static str = "worktree.overview";
     pub const PROJECT_ADD: &'static str = "project.add";
     pub const CLIENT_SET_ACTIVE: &'static str = "client.set_active";
@@ -803,6 +804,32 @@ pub struct WorktreeHealth {
     /// Open, merged, closed, no recent PR, or unavailable.
     pub pr_state: String,
     pub protection: Option<String>,
+}
+
+/// Incremental, shared on-demand scan. Cursors belong to one generation.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeScanParams {
+    #[serde(default)]
+    pub refresh: bool,
+    #[serde(default)]
+    pub measure_disk: bool,
+    pub generation: Option<u64>,
+    #[serde(default)]
+    pub cursor: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeScanResult {
+    pub generation: u64,
+    pub cursor: usize,
+    pub entries: Vec<WorktreeOverviewEntry>,
+    pub total: usize,
+    pub checked: usize,
+    pub running: bool,
+    pub has_more: bool,
+    pub error: Option<String>,
 }
 
 pub type WorktreeOverviewParams = EmptyParams;

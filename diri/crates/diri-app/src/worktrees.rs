@@ -8,6 +8,12 @@ use crate::delegation::WorktreeMoveProposal;
 pub struct WorktreesSheet {
     pub entries: Vec<WorktreeOverviewEntry>,
     pub loading: bool,
+    pub page: usize,
+    pub checked: usize,
+    pub total: usize,
+    pub scan_generation: Option<u64>,
+    pub poll_epoch: u64,
+    indices: std::collections::HashMap<String, usize>,
     pub cleanup_only: bool,
     pub old_only: bool,
     pub pending_cleanup: Option<WorktreeOverviewEntry>,
@@ -19,6 +25,7 @@ pub struct WorktreesSheet {
 impl WorktreesSheet {
     pub fn begin_refresh(&mut self) {
         self.pending_cleanup = None;
+        self.poll_epoch += 1;
         self.loading = true;
         self.error = None;
     }
@@ -45,6 +52,42 @@ impl WorktreesSheet {
                 self.error = None;
             }
             Err(error) => self.error = Some(error),
+        }
+    }
+
+    pub fn apply_scan(&mut self, result: diri_proto::WorktreeScanResult) {
+        if self.scan_generation != Some(result.generation) {
+            self.scan_generation = Some(result.generation);
+            self.entries.clear();
+            self.indices.clear();
+            self.page = 0;
+        }
+        for entry in result.entries {
+            if let Some(&index) = self.indices.get(&entry.path) {
+                self.entries[index] = entry;
+            } else {
+                self.indices.insert(entry.path.clone(), self.entries.len());
+                self.entries.push(entry);
+            }
+        }
+        self.total = result.total;
+        self.checked = result.checked;
+        self.loading = result.running || result.has_more;
+        self.error = result.error;
+        // Leave discovery order stable during the scan. Sort only once at the end.
+        if !self.loading {
+            self.entries.sort_by(|a, b| {
+                a.project_root
+                    .cmp(&b.project_root)
+                    .then(a.branch.cmp(&b.branch))
+                    .then(a.path.cmp(&b.path))
+            });
+            self.indices = self
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| (e.path.clone(), i))
+                .collect();
         }
     }
 
@@ -156,6 +199,28 @@ mod tests {
         assert!(sheet.request_cleanup("/repo/feature"));
         sheet.cancel_cleanup();
         assert!(sheet.confirm_cleanup().is_none());
+    }
+
+    #[test]
+    fn incremental_worktree_updates_replace_rows_and_generations() {
+        let mut sheet = WorktreesSheet::default();
+        let update = |generation, entry| diri_proto::WorktreeScanResult {
+            generation,
+            cursor: 1,
+            entries: vec![entry],
+            total: 1,
+            checked: 1,
+            running: false,
+            has_more: false,
+            error: None,
+        };
+        sheet.apply_scan(update(1, entry("/repo/feature", false)));
+        sheet.apply_scan(update(1, entry("/repo/feature", true)));
+        assert_eq!(sheet.entries.len(), 1);
+        assert!(sheet.entries[0].stale_suggestion);
+        sheet.apply_scan(update(2, entry("/repo/new", false)));
+        assert_eq!(sheet.entries.len(), 1);
+        assert_eq!(sheet.entries[0].path, "/repo/new");
     }
 
     #[test]

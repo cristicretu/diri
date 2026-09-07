@@ -488,27 +488,79 @@ impl UtilitySurfaces {
     }
 
     fn refresh_worktrees(&mut self, cx: &mut Context<Self>) {
+        self.start_worktree_scan(false, cx);
+    }
+
+    fn start_worktree_scan(&mut self, measure_disk: bool, cx: &mut Context<Self>) {
         if self.worktrees.loading {
             return;
         }
         self.worktrees.begin_refresh();
+        let epoch = self.worktrees.poll_epoch;
         cx.notify();
         let client = Arc::clone(self.store_runtime.client());
         let runtime = Arc::clone(&self.runtime);
         cx.spawn(async move |this, cx| {
-            let task = runtime.spawn(async move {
-                client.wait_until_connected(Duration::from_secs(5)).await?;
-                client.worktree_overview().await
-            });
-            let result = match task.await {
-                Ok(Ok(entries)) => Ok(entries),
-                Ok(Err(error)) => Err(error.to_string()),
-                Err(error) => Err(error.to_string()),
+            let mut params = diri_proto::WorktreeScanParams {
+                refresh: true,
+                measure_disk,
+                ..Default::default()
             };
-            let _ = this.update(cx, |this, cx| {
-                this.worktrees.finish_refresh(result);
-                cx.notify();
-            });
+            loop {
+                let visible = this
+                    .update(cx, |this, _| {
+                        let visible = this.surface == Surface::Worktrees
+                            || (this.surface == Surface::Settings
+                                && this.settings_tab == SettingsTab::Worktrees);
+                        if !visible && this.worktrees.poll_epoch == epoch {
+                            this.worktrees.loading = false;
+                        }
+                        visible && this.worktrees.poll_epoch == epoch
+                    })
+                    .unwrap_or(false);
+                if !visible {
+                    break;
+                }
+                let client = Arc::clone(&client);
+                let request = params.clone();
+                let task = runtime.spawn(async move {
+                    client.wait_until_connected(Duration::from_secs(5)).await?;
+                    client.worktree_scan(request).await
+                });
+                let result = match task.await {
+                    Ok(Ok(result)) => Ok(result),
+                    Ok(Err(error)) => Err(error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                };
+                let mut has_more = false;
+                if let Ok(result) = &result {
+                    params.refresh = false;
+                    params.generation = Some(result.generation);
+                    params.cursor = result.cursor;
+                    has_more = result.has_more;
+                }
+                let again = this
+                    .update(cx, |this, cx| {
+                        if this.worktrees.poll_epoch != epoch {
+                            return false;
+                        }
+                        match result {
+                            Ok(result) => this.worktrees.apply_scan(result),
+                            Err(error) => this.worktrees.finish_refresh(Err(error)),
+                        }
+                        cx.notify();
+                        this.worktrees.loading
+                    })
+                    .unwrap_or(false);
+                if !again {
+                    break;
+                }
+                // Drain bounded pages promptly; idle progress checks run only
+                // while this page is visible and the worker is active.
+                cx.background_executor()
+                    .timer(Duration::from_millis(if has_more { 16 } else { 500 }))
+                    .await;
+            }
         })
         .detach();
     }
@@ -556,16 +608,19 @@ impl UtilitySurfaces {
         cx.spawn(async move |this, cx| {
             let task = runtime.spawn(async move {
                 client.wait_until_connected(Duration::from_secs(5)).await?;
-                client.worktree_cleanup(params).await?;
-                client.worktree_overview().await
+                client.worktree_cleanup(params).await
             });
             let result = match task.await {
-                Ok(Ok(entries)) => Ok(entries),
+                Ok(Ok(())) => Ok(()),
                 Ok(Err(error)) => Err(error.to_string()),
                 Err(error) => Err(error.to_string()),
             };
             let _ = this.update(cx, |this, cx| {
-                this.worktrees.finish_refresh(result);
+                this.worktrees.loading = false;
+                match result {
+                    Ok(()) => this.refresh_worktrees(cx),
+                    Err(error) => this.worktrees.error = Some(error),
+                }
                 cx.notify();
             });
         })
@@ -1484,10 +1539,17 @@ impl UtilitySurfaces {
     fn render_worktrees(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.colors();
         let entity = cx.entity();
+        let page_rows = worktree_settings::PAGE_ROWS;
+        let page = self
+            .worktrees
+            .page
+            .min(self.worktrees.entries.len().saturating_sub(1) / page_rows);
         let cards = self
             .worktrees
             .entries
             .iter()
+            .skip(page * page_rows)
+            .take(page_rows)
             .map(|entry| {
                 let path = entry.path.clone();
                 let drop_entry = entry.clone();
@@ -1647,6 +1709,12 @@ impl UtilitySurfaces {
                             div()
                                 .flex()
                                 .gap(px(8.0))
+                                .when(page > 0, |row| row.child(surface_button("Previous", "worktree-sheet-previous", colors, cx, move |this, cx| {
+                                    this.worktrees.page = page - 1; this.worktrees.cancel_cleanup(); cx.notify();
+                                })))
+                                .when((page + 1) * page_rows < self.worktrees.entries.len(), |row| row.child(surface_button("Next", "worktree-sheet-next", colors, cx, move |this, cx| {
+                                    this.worktrees.page = page + 1; this.worktrees.cancel_cleanup(); cx.notify();
+                                })))
                                 .child(surface_button(
                                     "Refresh",
                                     "refresh-worktrees",
@@ -6226,6 +6294,39 @@ mod tests {
     }
 
     #[gpui::test]
+    fn worktree_settings_bounds_rendering_for_10000_entries(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        let start = std::time::Instant::now();
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.settings_tab = SettingsTab::Worktrees;
+            let template = worktree_settings::preview_entries().remove(0);
+            surfaces.worktrees.entries = (0..10_000)
+                .map(|i| {
+                    let mut entry = template.clone();
+                    entry.path = format!("/fixture/tree-{i}");
+                    entry
+                })
+                .collect();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("worktree-row-/fixture/tree-0").is_some());
+        assert!(cx.debug_bounds("worktree-row-/fixture/tree-40").is_none());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.worktrees.page = 249;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("worktree-row-/fixture/tree-0").is_none());
+        assert!(cx.debug_bounds("worktree-row-/fixture/tree-9960").is_some());
+        eprintln!(
+            "10,000 worktrees, two rendered pages: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[gpui::test]
     fn worktree_settings_filters_and_navigation(cx: &mut TestAppContext) {
         let (harness, cx) = open_settings_workbench(cx);
         let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
@@ -6568,6 +6669,20 @@ mod tests {
                 }
                 if tab == SettingsTab::Worktrees {
                     surfaces.worktrees.entries = worktree_settings::preview_entries();
+                    if std::env::var_os("DIRI_VISUAL_WORKTREE_PROGRESS").is_some() {
+                        surfaces.worktrees.loading = true;
+                        surfaces.worktrees.checked = 2;
+                        for entry in surfaces.worktrees.entries.iter_mut().skip(2) {
+                            entry.stale_suggestion = false;
+                            entry.health.pr_state = "Checking…".into();
+                            entry.health.protection = Some("Checking…".into());
+                            entry.health.disk_bytes = None;
+                        }
+                    }
+                    if std::env::var_os("DIRI_VISUAL_WORKTREE_ERROR").is_some() {
+                        surfaces.worktrees.entries.clear();
+                        surfaces.worktrees.error = Some("Couldn't connect to the engine. Refresh to retry.".into());
+                    }
                 }
                 if tab == SettingsTab::Skills {
                     surfaces.skills.update(cx, |skills, _| {

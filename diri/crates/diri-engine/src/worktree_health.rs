@@ -1,6 +1,6 @@
 //! On-demand local worktree inventory and conservative, confirmed cleanup.
 //! Git and gh are read through bounded subprocesses; no fetch or branch deletion.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -90,12 +90,14 @@ fn trees(root: &Path) -> Option<Vec<Tree>> {
         Duration::from_secs(3),
     )?;
     let mut trees = parse_trees(&bytes)?;
-    let paths: Vec<_> = trees.iter().map(|t| t.path.clone()).collect();
+    let mut paths: Vec<_> = trees.iter().map(|t| t.path.clone()).collect();
+    paths.sort();
     for tree in &mut trees {
+        let index = paths.binary_search(&tree.path).expect("listed path");
         if !tree.protected
             && paths
-                .iter()
-                .any(|p| p != &tree.path && p.starts_with(&tree.path))
+                .get(index + 1)
+                .is_some_and(|next| next.starts_with(&tree.path))
         {
             tree.protected = true;
             tree.protection_reason = "Contains another worktree";
@@ -186,6 +188,65 @@ fn local_session<'a>(records: &'a [SessionRecord], path: &Path) -> Option<&'a Se
         })
         .max_by_key(|r| !matches!(r.status, SessionStatus::Exited(_)))
 }
+struct RepoFacts<'a> {
+    base: Option<String>,
+    pulls: Option<Vec<Value>>,
+    merged_heads: HashSet<String>,
+    sessions: &'a HashMap<PathBuf, &'a SessionRecord>,
+}
+fn session_index(records: &[SessionRecord]) -> HashMap<PathBuf, &SessionRecord> {
+    let mut index = HashMap::new();
+    for record in records.iter().filter(|r| r.host.is_none()) {
+        for path in [Some(record.cwd.as_str()), record.worktree_path.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            let path = Path::new(path)
+                .canonicalize()
+                .unwrap_or_else(|_| path.into());
+            for ancestor in path.ancestors() {
+                let entry = index.entry(ancestor.to_path_buf()).or_insert(record);
+                if !matches!(record.status, SessionStatus::Exited(_)) {
+                    *entry = record;
+                }
+            }
+        }
+    }
+    index
+}
+impl<'a> RepoFacts<'a> {
+    fn new(
+        root: &Path,
+        pulls: Option<Vec<Value>>,
+        sessions: &'a HashMap<PathBuf, &'a SessionRecord>,
+    ) -> Self {
+        let base = default_ref(root);
+        // One reachability walk for every local branch, instead of one Git
+        // process and graph walk for each worktree. Detached trees stay protected.
+        let merged_heads = base
+            .as_deref()
+            .and_then(|base| {
+                git(
+                    root,
+                    &[
+                        "for-each-ref",
+                        "--merged",
+                        base,
+                        "--format=%(objectname)",
+                        "refs/heads/",
+                    ],
+                )
+            })
+            .map(|s| s.lines().map(str::to_owned).collect())
+            .unwrap_or_default();
+        Self {
+            base,
+            pulls,
+            merged_heads,
+            sessions,
+        }
+    }
+}
 fn inspect(
     root: &Path,
     tree: &Tree,
@@ -193,11 +254,22 @@ fn inspect(
     records: &[SessionRecord],
     disk: bool,
 ) -> WorktreeOverviewEntry {
+    let index = session_index(records);
+    let facts = RepoFacts::new(root, pulls.map(<[Value]>::to_vec), &index);
+    inspect_cached(root, tree, &facts, disk)
+}
+fn inspect_cached(
+    root: &Path,
+    tree: &Tree,
+    facts: &RepoFacts<'_>,
+    disk: bool,
+) -> WorktreeOverviewEntry {
     let path = &tree.path;
-    let base = default_ref(root);
-    let base_name = base
+    let base_name = facts
+        .base
         .as_deref()
         .map(|b| b.strip_prefix("refs/remotes/origin/").unwrap_or(b));
+    let pulls = facts.pulls.as_deref();
     let pr = pulls.and_then(|prs| {
         prs.iter()
             .filter(|pr| pr["headRefName"].as_str() == tree.branch.as_deref())
@@ -215,9 +287,7 @@ fn inspect(
         _ if pulls.is_some() => "No recent PR",
         _ => "Unavailable",
     };
-    let merged = base.as_ref().is_some_and(|base| {
-        git(root, &["merge-base", "--is-ancestor", &tree.head, base]).is_some()
-    });
+    let merged = facts.merged_heads.contains(&tree.head);
     let pr_merged = pr.is_some_and(|pr| {
         pr_state == "Merged"
             && pr["headRefOid"].as_str() == Some(&tree.head)
@@ -228,7 +298,7 @@ fn inspect(
         &["status", "--porcelain=v1", "--untracked-files=normal"],
     );
     let dirty = status.as_ref().is_none_or(|s| !s.is_empty());
-    let record = local_session(records, path);
+    let record = facts.sessions.get(path).copied();
     let active = record.is_some_and(|r| !matches!(r.status, SessionStatus::Exited(_)));
     let protection = if tree.protected {
         Some(tree.protection_reason)
@@ -256,7 +326,7 @@ fn inspect(
         .and_then(|t| t.elapsed().ok())
         .map(|d| (d.as_secs() / 86400) as i64)
         .unwrap_or(-1);
-    let disk_bytes = disk
+    let disk_bytes = (disk && protection.is_none())
         .then(|| {
             output(
                 "du",
@@ -290,10 +360,15 @@ fn inspect(
     }
 }
 
-pub(crate) fn overview(
+/// Publish cheap discovery before any GitHub request or working-directory walk.
+/// The sink supplies cancellation between every bounded subprocess operation.
+pub(crate) fn scan(
     projects: &[Value],
     records: &[SessionRecord],
-) -> Vec<WorktreeOverviewEntry> {
+    measure_disk: bool,
+    emit: &mut crate::worktree_scan::Emit<'_>,
+) -> Result<(), String> {
+    let index = session_index(records);
     let mut roots: Vec<_> = projects
         .iter()
         .filter(|p| p.get("host").is_none_or(Value::is_null))
@@ -308,24 +383,83 @@ pub(crate) fn overview(
     );
     roots.sort();
     roots.dedup();
-    let mut seen = HashSet::new();
-    let mut entries = Vec::new();
+    let mut known_paths = HashSet::new();
+    let mut repositories = Vec::new();
     for root in roots {
+        if !emit(None, false) {
+            return Err("Scan paused after leaving Worktrees. Refresh to continue.".into());
+        }
+        let root = root.canonicalize().unwrap_or(root);
+        // Session subdirectories reuse discovered checkouts, but an inner
+        // .git boundary may be a separately saved nested repository/submodule.
+        let mut discovered = false;
+        for ancestor in root.ancestors() {
+            if known_paths.contains(ancestor) {
+                discovered = true;
+                break;
+            }
+            if ancestor.join(".git").exists() {
+                break;
+            }
+        }
+        if discovered {
+            continue;
+        }
         let Some(trees) = trees(&root) else {
             continue;
         };
-        if trees.iter().all(|t| seen.contains(&t.path)) {
+        if trees.is_empty() || trees.iter().all(|t| known_paths.contains(&t.path)) {
             continue;
         }
         let root = trees[0].path.clone();
-        let pulls = prs(&root);
+        for tree in &trees {
+            known_paths.insert(tree.path.clone());
+            let record = index.get(&tree.path).copied();
+            let age_days = std::fs::metadata(&tree.path)
+                .ok()
+                .and_then(|m| m.created().ok())
+                .and_then(|t| t.elapsed().ok())
+                .map(|d| (d.as_secs() / 86400) as i64)
+                .unwrap_or(-1);
+            let entry = WorktreeOverviewEntry {
+                path: tree.path.to_string_lossy().into_owned(),
+                branch: tree.branch.clone(),
+                project_root: root.to_string_lossy().into_owned(),
+                session_id: record.map(|r| r.id.clone()),
+                session_status: record.map(|r| r.status.clone()),
+                dirty: true,
+                merged: false,
+                age_days,
+                stale_suggestion: false,
+                health: WorktreeHealth {
+                    head: Some(tree.head.clone()),
+                    pr_state: "Checking…".into(),
+                    protection: Some("Checking…".into()),
+                    ..Default::default()
+                },
+            };
+            if !emit(Some(entry), false) {
+                return Err("Scan paused. Refresh to continue.".into());
+            }
+        }
+        repositories.push((root, trees));
+    }
+    for (root, trees) in repositories {
+        if !emit(None, false) {
+            return Err("Scan paused. Refresh to continue.".into());
+        }
+        let facts = RepoFacts::new(&root, prs(&root), &index);
         for tree in trees {
-            if seen.insert(tree.path.clone()) {
-                entries.push(inspect(&root, &tree, pulls.as_deref(), records, true));
+            if !emit(None, false) {
+                return Err("Scan paused. Refresh to continue.".into());
+            }
+            let entry = inspect_cached(&root, &tree, &facts, measure_disk);
+            if !emit(Some(entry), true) {
+                return Err("Scan paused. Refresh to continue.".into());
             }
         }
     }
-    entries
+    Ok(())
 }
 fn refused(reason: &str) -> io::Error {
     io::Error::other(reason)
@@ -418,6 +552,37 @@ mod tests {
             expected_head: tree.head.clone(),
         }
     }
+    #[test]
+    fn worktree_discovery_publishes_before_pr_or_status_checks_and_can_cancel() {
+        let (_temp, root, tree) = fixture();
+        let start = Instant::now();
+        let mut found = Vec::new();
+        let result = scan(
+            &[json!({"root":root})],
+            &[],
+            false,
+            &mut |entry, checked| {
+                assert!(!checked, "discovery must precede expensive checks");
+                if let Some(entry) = entry {
+                    assert!(!entry.stale_suggestion);
+                    assert_eq!(entry.health.pr_state, "Checking…");
+                    found.push(entry.path);
+                }
+                found.len() < 2
+            },
+        );
+        assert!(
+            result.is_err(),
+            "consumer cancellation stops before enrichment"
+        );
+        assert!(found.contains(&tree.path.to_string_lossy().into_owned()));
+        eprintln!(
+            "First inventory (2 worktrees) before any enrichment: {:?}",
+            start.elapsed()
+        );
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
     #[test]
     fn worktree_cleanup_keeps_branch_and_removes_ignored_build_output() {
         let (_temp, root, tree) = fixture();

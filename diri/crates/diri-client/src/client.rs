@@ -757,6 +757,19 @@ impl DaemonClient {
         self.empty(Method::WORKTREE_REMOVE, &params).await
     }
 
+    pub async fn worktree_scan(
+        &self,
+        params: WorktreeScanParams,
+    ) -> Result<WorktreeScanResult, ClientError> {
+        self.core
+            .request_typed(
+                Method::WORKTREE_SCAN,
+                Some(&params),
+                Some(Duration::from_secs(5)),
+            )
+            .await
+    }
+
     pub async fn worktree_overview(&self) -> Result<Vec<WorktreeOverviewEntry>, ClientError> {
         let result: WorktreeOverviewResult = self.no_params(Method::WORKTREE_OVERVIEW).await?;
         Ok(result.entries)

@@ -1,6 +1,8 @@
 //! Compact worktree inventory inside the shared Settings destination.
 use super::*;
 
+pub(super) const PAGE_ROWS: usize = 40;
+
 fn label(text: impl Into<SharedString>, size: f32, color: Rgba) -> gpui::Div {
     div()
         .text_size(px(size))
@@ -16,7 +18,7 @@ fn disk_label(bytes: Option<u64>) -> String {
         }
         Some(n) if n >= 1024 * 1024 => format!("{:.0} MB", n as f64 / (1024.0 * 1024.0)),
         Some(n) => format!("{} KB", n / 1024),
-        None => "Size unavailable".into(),
+        None => "Size not measured".into(),
     }
 }
 
@@ -30,14 +32,25 @@ impl UtilitySurfaces {
             .filter(|e| e.stale_suggestion)
             .collect();
         let known_bytes: u64 = ready.iter().filter_map(|e| e.health.disk_bytes).sum();
+        let size_summary = if ready.iter().any(|e| e.health.disk_bytes.is_some()) {
+            format!("{} measured", disk_label(Some(known_bytes)))
+        } else {
+            "Size not measured".into()
+        };
         let summary = if state.loading {
-            "Checking worktrees…".into()
+            format!(
+                "{} worktrees found · {} checked · scanning…",
+                state.total.max(state.entries.len()),
+                state.checked
+            )
+        } else if state.error.is_some() && state.entries.is_empty() {
+            "Worktrees could not be loaded".into()
         } else {
             format!(
-                "{} worktrees · {} ready to clean · {} cleanup estimate",
+                "{} worktrees · {} ready to clean · {}",
                 state.entries.len(),
                 ready.len(),
-                disk_label(Some(known_bytes))
+                size_summary
             )
         };
         let mut content = div()
@@ -63,7 +76,16 @@ impl UtilitySurfaces {
                             )),
                     )
                     .when(!state.loading, |row| {
-                        row.child(surface_button(
+                        row.when(!ready.is_empty(), |row| {
+                            row.child(surface_button(
+                                "Measure cleanup size",
+                                "worktrees-measure",
+                                colors,
+                                cx,
+                                |this, cx| this.start_worktree_scan(true, cx),
+                            ))
+                        })
+                        .child(surface_button(
                             "Refresh",
                             "worktrees-refresh",
                             colors,
@@ -97,6 +119,8 @@ impl UtilitySurfaces {
                             .cursor_pointer()
                             .hover(|s| s.bg(colors.primary.alpha(0.12)))
                             .on_click(cx.listener(move |this, _, _, cx| {
+                                this.worktrees.page = 0;
+                                this.worktrees.cancel_cleanup();
                                 this.worktrees.cleanup_only = ready;
                                 this.worktrees.old_only = old;
                                 cx.notify();
@@ -117,9 +141,14 @@ impl UtilitySurfaces {
             .bg(colors.primary.alpha(0.025));
         let mut visible = 0;
         let mut project = String::new();
-        for entry in state.entries.iter().filter(|e| {
-            (!state.cleanup_only || e.stale_suggestion) && (!state.old_only || e.age_days > 30)
-        }) {
+        let matches = || {
+            state.entries.iter().filter(|e| {
+                (!state.cleanup_only || e.stale_suggestion) && (!state.old_only || e.age_days > 30)
+            })
+        };
+        let count = matches().count();
+        let page = state.page.min(count.saturating_sub(1) / PAGE_ROWS);
+        for entry in matches().skip(page * PAGE_ROWS).take(PAGE_ROWS) {
             visible += 1;
             if project != entry.project_root {
                 project.clone_from(&entry.project_root);
@@ -149,8 +178,10 @@ impl UtilitySurfaces {
                 None => health.pr_state.clone(),
             };
             let path = entry.path.clone();
+            let selector_path = path.clone();
             let mut row = div()
                 .id(SharedString::from(format!("worktree-row-{path}")))
+                .debug_selector(move || format!("worktree-row-{selector_path}"))
                 .px(px(9.0))
                 .py(px(6.0))
                 .rounded(px(8.0))
@@ -202,7 +233,13 @@ impl UtilitySurfaces {
                         .child(label(
                             format!(
                                 "{} · {age} · {}",
-                                if entry.dirty { "Changes" } else { "Clean" },
+                                if health.protection.as_deref() == Some("Checking…") {
+                                    "Status pending"
+                                } else if entry.dirty {
+                                    "Changes"
+                                } else {
+                                    "Clean"
+                                },
                                 disk_label(health.disk_bytes)
                             ),
                             11.0,
@@ -258,7 +295,9 @@ impl UtilitySurfaces {
                     .flex_col()
                     .gap(px(7.0))
                     .child(label(
-                        if state.loading {
+                        if state.error.is_some() {
+                            "Couldn't load your worktrees"
+                        } else if state.loading {
                             "Scanning your local projects…"
                         } else if state.entries.is_empty() {
                             "Your worktrees will appear here"
@@ -269,14 +308,24 @@ impl UtilitySurfaces {
                         colors.primary,
                     ))
                     .child(label(
-                        "Add a local project to Diri, then refresh to review its linked worktrees.",
+                        if state.error.is_some() { "Refresh to retry. Your worktrees have not been changed." }
+                        else if state.loading { "Worktrees appear as they are found. PR and status checks follow." }
+                        else { "Add a local project to Diri, then refresh to review its linked worktrees." },
                         11.0,
                         colors.secondary,
                     )),
             );
         }
-        content = content.child(rows)
-            .child(label("Age is time since checkout creation, not last use. PRs use GitHub CLI access and the latest 1,000 repository PRs. Unavailable sizes are excluded from the total.", 11.0, colors.tertiary));
+        content = content.child(rows).when(count > PAGE_ROWS, |content| content.child(
+            div().flex().items_center().justify_between().gap(px(8.0))
+                .child(label(format!("{}–{} of {count} worktrees", page * PAGE_ROWS + 1, ((page + 1) * PAGE_ROWS).min(count)), 11.0, colors.secondary))
+                .when(page > 0, |row| row.child(surface_button("Previous", "worktrees-previous", colors, cx, move |this, cx| {
+                    this.worktrees.page = page - 1; this.worktrees.cancel_cleanup(); this.settings_scroll.set_offset(point(px(0.0), px(0.0))); cx.notify();
+                })))
+                .when((page + 1) * PAGE_ROWS < count, |row| row.child(surface_button("Next", "worktrees-next", colors, cx, move |this, cx| {
+                    this.worktrees.page = page + 1; this.worktrees.cancel_cleanup(); this.settings_scroll.set_offset(point(px(0.0), px(0.0))); cx.notify();
+                })))
+        )).child(label("Age is checkout age, not last use. PRs use GitHub CLI access. Disk sizes are measured only on request, for cleanup candidates.", 11.0, colors.tertiary));
         settings_page("Worktrees", content, colors)
     }
 }

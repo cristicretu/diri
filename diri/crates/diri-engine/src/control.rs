@@ -60,6 +60,7 @@ pub struct ControlServer {
     browser: std::sync::OnceLock<crate::browser::BrowserPool>,
     active_connections: Arc<AtomicUsize>,
     background_requests: Arc<AtomicUsize>,
+    worktree_scan: crate::worktree_scan::ScanStore,
     agent_catalog: Arc<Mutex<crate::agent_catalog::AgentCatalogStore>>,
     accounts: Mutex<crate::accounts::AccountStore>,
     session_operations: Mutex<std::collections::HashSet<String>>,
@@ -154,6 +155,7 @@ impl ControlServer {
             browser: std::sync::OnceLock::new(),
             active_connections: Arc::new(AtomicUsize::new(0)),
             background_requests: Arc::new(AtomicUsize::new(0)),
+            worktree_scan: Default::default(),
             agent_catalog: Arc::new(Mutex::new(agent_catalog)),
             accounts,
             session_operations: Mutex::new(std::collections::HashSet::new()),
@@ -560,6 +562,8 @@ impl ControlServer {
                         | Method::HOST_INITIALIZE
                         | Method::HOST_LIST_DIRECTORIES
                         | Method::SESSION_READ_DIFF
+                        | Method::WORKTREE_OVERVIEW
+                        | Method::WORKTREE_CLEANUP
                 ) || ((method == Method::AGENT_READINESS
                     || method == Method::AGENT_CONFIGURE)
                     && params
@@ -763,6 +767,7 @@ impl ControlServer {
             Method::WORKTREE_LIST => self.worktree_list(params),
             Method::WORKTREE_CLEANUP => self.worktree_cleanup(params),
             Method::WORKTREE_REMOVE => self.worktree_remove(params),
+            Method::WORKTREE_SCAN => encode(&self.worktree_scan_page(decode(params)?)?),
             Method::WORKTREE_OVERVIEW => self.worktree_overview(),
             Method::TEST_RUN => self.browser_call("run", params),
             "browser.act" => self.browser_call("browser", params),
@@ -1360,13 +1365,51 @@ impl ControlServer {
     /// joined with the session (live wins) occupying it, its dirtiness,
     /// merged-ness into the default branch, and age — plus the "safe to
     /// clean up" suggestion.
+    fn worktree_scan_page(
+        &self,
+        p: diri_proto::WorktreeScanParams,
+    ) -> Result<diri_proto::WorktreeScanResult, ControlError> {
+        let registry = Arc::clone(&self.registry);
+        self.worktree_scan.request(p, move |measure_disk, emit| {
+            let (records, roots) = {
+                let registry = registry.lock().map_err(|e| e.to_string())?;
+                (registry.records(), registry.projects_raw().to_vec())
+            };
+            crate::worktree_health::scan(&roots, &records, measure_disk, emit)
+        })
+    }
+
     fn worktree_overview(&self) -> Result<JsonValue, ControlError> {
-        let (records, roots) = {
-            let registry = self.registry.lock().map_err(poisoned)?;
-            (registry.records(), registry.projects_raw().to_vec())
+        // Older clients still receive a complete result, off the connection
+        // loop, but join the same worker as incremental clients.
+        let mut p = diri_proto::WorktreeScanParams {
+            refresh: true,
+            ..Default::default()
         };
-        let entries = crate::worktree_health::overview(&roots, &records);
-        encode(&diri_proto::WorktreeOverviewResult { entries })
+        let mut entries = std::collections::BTreeMap::new();
+        loop {
+            let page = self.worktree_scan_page(p.clone())?;
+            if p.generation != Some(page.generation) {
+                entries.clear();
+            }
+            for entry in page.entries {
+                entries.insert(entry.path.clone(), entry);
+            }
+            p.refresh = false;
+            p.generation = Some(page.generation);
+            p.cursor = page.cursor;
+            if !page.running && !page.has_more {
+                if let Some(error) = page.error {
+                    return Err(ControlError::internal(error));
+                }
+                return encode(&diri_proto::WorktreeOverviewResult {
+                    entries: entries.into_values().collect(),
+                });
+            }
+            if !page.has_more {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
     }
 
     fn worktree_cleanup(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
@@ -4725,6 +4768,65 @@ mod tests {
                 .expect("array")
                 .iter()
                 .any(|worktree| worktree["branch"] == "feature/x")
+        );
+    }
+
+    #[test]
+    fn worktree_inventory_does_not_block_hello_on_the_same_connection() {
+        let temp = tempfile::tempdir().unwrap();
+        let (repo, _) = repository_with_linked_worktree(temp.path());
+        for n in 0..48 {
+            let status = std::process::Command::new("git")
+                .args(["worktree", "add", "--detach", "--quiet"])
+                .arg(temp.path().join(format!("tree-{n}")))
+                .current_dir(&repo)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let server = server(temp.path());
+        server
+            .registry
+            .lock()
+            .unwrap()
+            .insert_record(ended_resumable_record("inventory", &repo));
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        let worker = std::thread::spawn(move || server.serve(stream));
+        let start = Instant::now();
+        peer.write_all(
+            b"{\"id\":1,\"method\":\"worktree.overview\"}\n{\"id\":2,\"method\":\"hello\"}\n",
+        )
+        .unwrap();
+        let mut reader = BufReader::new(peer);
+        let mut first = String::new();
+        let result = reader.read_line(&mut first);
+        let latency = start.elapsed();
+        // Always drain the outstanding scan before removing its fixture.
+        reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let mut remaining = String::new();
+        for _ in 0..if result.is_ok() { 1 } else { 2 } {
+            remaining.clear();
+            reader.read_line(&mut remaining).unwrap();
+        }
+        reader.get_ref().shutdown(std::net::Shutdown::Both).unwrap();
+        worker.join().unwrap().unwrap();
+        eprintln!(
+            "50 worktrees: Hello latency {latency:?}; total {:?}",
+            start.elapsed()
+        );
+        assert!(
+            result.is_ok(),
+            "Hello timed out behind worktree inventory: {result:?}"
+        );
+        let first: Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(
+            first["id"], 2,
+            "Hello must arrive before the slow inventory"
         );
     }
 
