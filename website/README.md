@@ -45,3 +45,9 @@ Claims were checked against the current repository: root README and `docs/GETTIN
 Checked this revision at 1440, 768, 390, and 320px for feature/text overflow, header alignment, GitHub visibility, and a single download action. The mesh height is bounded to the product area so adding feature content does not enlarge the shader drawing buffer or move the gradient away from the app.
 
 The terminal, Changes pane, and command list in the mockup clip overflow without becoming scroll containers. Wheel and touch scrolling over the preview scroll the page; agent switching and command selection remain interactive.
+
+## Mesh experiment
+
+The default mesh adds slowly warped color folds, stationary fine grain, and a diffuse glow aligned with the mockup’s lower edge. Compare the previous shader at `http://localhost:4177/?mesh=original`; the page layout is identical. Window geometry is read only during resize, and all effects share the existing shader pass and drawing buffer.
+
+Verified both shaders compile without WebGL errors; the experimental version drew 20 frames in a one-second local Chrome sample under its 24 fps cap. Pause/resume, reduced motion, offscreen suspension, CSS fallback, and mobile widths were checked. Mockup scrolling passes to the page, mouse focus restoration has no outline, and keyboard restoration uses a 1px inset indicator.

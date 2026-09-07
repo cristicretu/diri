@@ -5,7 +5,7 @@ const motion = matchMedia('(prefers-reduced-motion: reduce)');
 const gl = canvas.getContext('webgl', { alpha: false, antialias: false, depth: false, powerPreference: 'low-power' });
 if (gl) {
   const vertex = `attribute vec2 position; varying vec2 uv; void main(){ uv=position*.5+.5; gl_Position=vec4(position,0.,1.); }`;
-  const fragment = `precision mediump float;
+  const originalFragment = `precision mediump float;
     varying vec2 uv;
     uniform vec2 pointer;
     uniform float time;
@@ -29,6 +29,53 @@ if (gl) {
       color+=grain*.007;
       gl_FragColor=vec4(color,1.);
     }`;
+  // Keep the previous treatment available at ?mesh=original for comparison.
+  const sculptedFragment = `
+    #ifdef GL_FRAGMENT_PRECISION_HIGH
+    precision highp float;
+    #else
+    precision mediump float;
+    #endif
+    varying vec2 uv;
+    uniform vec2 pointer;
+    uniform vec3 windowBase;
+    uniform float time;
+    float field(vec2 p, vec2 center, vec2 radius) {
+      vec2 d=(p-center)/radius;
+      return exp(-dot(d,d)*2.0);
+    }
+    void main(){
+      vec2 screen=vec2(uv.x,1.-uv.y);
+      vec2 p=screen+pointer*.018;
+      float t=time*.065;
+      // Broad, nested waves bend the color fields into soft folds.
+      p += .055*vec2(
+        sin(p.y*6.5+sin(p.x*4.0+t)*.8-t),
+        cos(p.x*5.0+sin(p.y*5.5-t)*.7+t*.8)
+      );
+      vec3 base=vec3(.098,.090,.141);
+      vec3 rose=vec3(.58,.27,.40);
+      vec3 iris=vec3(.31,.22,.48);
+      vec3 pine=vec3(.10,.33,.40);
+      float a=field(p,vec2(.08+sin(t)*.025,.62),vec2(.52,.43));
+      float b=field(p,vec2(.62,.46+cos(t)*.025),vec2(.58,.38));
+      float c=field(p,vec2(.98,.73+sin(t*.8)*.025),vec2(.46,.46));
+      vec3 color=base+rose*a*.70+iris*b*.54+pine*c*.72;
+      float wave=sin(p.x*7.0+p.y*3.0+sin(p.y*6.0-t)*.8+t*.6);
+      float fold=exp(-pow(wave-.25,2.0)*10.0);
+      float envelope=field(p,vec2(.5,.64),vec2(.85,.38));
+      color += mix(rose,pine,smoothstep(.15,.85,p.x))*fold*envelope*.20;
+      color *= 1.0-(1.0-fold)*envelope*.09;
+      // A diffuse reflection follows the actual window's lower edge on resize.
+      vec2 edge=(screen-windowBase.xy)/vec2(max(windowBase.z,.1),.065);
+      float glow=exp(-edge.y*edge.y*2.0-pow(edge.x,4.0)*2.0);
+      color += mix(vec3(.65,.38,.43),vec3(.32,.53,.58),screen.x)*glow*.16;
+      // Stationary grain: texture without flicker or another rendering pass.
+      float grain=fract(52.9829189*fract(dot(gl_FragCoord.xy,vec2(.06711056,.00583715))))-.5;
+      color += grain*.018;
+      gl_FragColor=vec4(color,1.);
+    }`;
+  const fragment = new URLSearchParams(location.search).get('mesh') === 'original' ? originalFragment : sculptedFragment;
   const compile = (type, source) => {
     const shader = gl.createShader(type);
     gl.shaderSource(shader, source); gl.compileShader(shader);
@@ -46,6 +93,8 @@ if (gl) {
       gl.enableVertexAttribArray(position); gl.vertexAttribPointer(position,2,gl.FLOAT,false,0,0);
       const pointer = gl.getUniformLocation(program, 'pointer');
       const time = gl.getUniformLocation(program, 'time');
+      const windowBase = gl.getUniformLocation(program, 'windowBase');
+      const appWindow = document.querySelector('#demo-window');
       const control = document.querySelector('#background-motion');
       const product = document.querySelector('.product');
       let x = 0, y = 0, elapsed = 0, previous = 0;
@@ -74,6 +123,11 @@ if (gl) {
       const schedule = () => { if (!frame && !timer && !document.hidden) frame = requestAnimationFrame(draw); };
       const resize = () => {
         const bounds = canvas.getBoundingClientRect();
+        const windowBounds = appWindow.getBoundingClientRect();
+        gl.uniform3f(windowBase,
+          (windowBounds.left + windowBounds.width / 2 - bounds.left) / Math.max(1, bounds.width),
+          (windowBounds.bottom - bounds.top) / Math.max(1, bounds.height),
+          windowBounds.width / 2 / Math.max(1, bounds.width));
         width = Math.max(1, Math.min(960, Math.round(bounds.width * .65)));
         height = Math.max(1, Math.round(width * bounds.height / Math.max(1, bounds.width)));
         schedule();
