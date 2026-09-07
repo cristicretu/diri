@@ -189,6 +189,7 @@ enum RowDrop {
     Origin,
     /// Reorder among siblings; the zone is never `Onto`.
     Insert(DropZone),
+    Revive,
     Handoff,
     Refused(String),
 }
@@ -1756,6 +1757,10 @@ impl Sidebar {
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let revive_offered = self.ui.drag.as_ref().is_some_and(|item| {
+            self.revivable_drop(&DraggedSidebarItem(item.clone()), None)
+                .is_some()
+        }) && cx.has_active_drag();
         let fan_out_offered = matches!(
             self.ui.drag,
             Some(DragItem::Session {
@@ -1768,7 +1773,7 @@ impl Sidebar {
             .flex_1()
             .min_h(px(52.0))
             .rounded(px(Radius::ROW))
-            .when(fan_out_offered, |element| {
+            .when(fan_out_offered || revive_offered, |element| {
                 element
                     .debug_selector(|| "sidebar-fan-out-zone".to_owned())
                     .mt(px(6.0))
@@ -1780,10 +1785,14 @@ impl Sidebar {
                     .justify_center()
                     .text_size(px(Typo::META.size))
                     .text_color(colors.secondary)
-                    .child("Drop to fan out a sibling")
+                    .child(if revive_offered {
+                        "Drop to revive session"
+                    } else {
+                        "Drop to fan out a sibling"
+                    })
             })
             .drag_over::<DraggedSidebarItem>(move |element, dragged, _, _| {
-                if fan_out_offered && dragged.session_id().is_some() {
+                if (fan_out_offered || revive_offered) && dragged.session_id().is_some() {
                     element
                         .bg(Palette::CLAY.alpha(0.14))
                         .border_color(Palette::CLAY.alpha(0.86))
@@ -1995,14 +2004,28 @@ impl Sidebar {
                                 }
                             });
                             element.bg(colors.primary.alpha(0.08))
+                        } else if entity.read(cx).revivable_drop(dragged, Some(&id)).is_some() {
+                            element.bg(Palette::CLAY.alpha(0.18))
                         } else {
                             element
                         }
                     }
                 })
-                .on_drop(cx.listener(|this, _: &DraggedSidebarItem, _, cx| {
-                    this.finish_drag();
-                    cx.notify();
+                .on_drop(cx.listener({
+                    let id = id.clone();
+                    move |this, dragged: &DraggedSidebarItem, _, cx| {
+                        cx.stop_propagation();
+                        if this.ui.drag.is_some()
+                            && let Some(session) = this.revivable_drop(dragged, Some(&id))
+                        {
+                            this.store
+                                .write()
+                                .expect("session store lock poisoned")
+                                .revive_sessions(vec![session]);
+                        }
+                        this.finish_drag();
+                        cx.notify();
+                    }
                 }))
                 .drag_over::<ExternalPaths>(move |element, paths, _, _| {
                     if Self::can_accept_external_drop(
@@ -2388,6 +2411,15 @@ impl Sidebar {
         if source == &target.id {
             return Some(RowDrop::Origin);
         }
+        if self
+            .revivable_drop(
+                &DraggedSidebarItem(self.ui.drag.as_ref()?.clone()),
+                Some(&target.project_id),
+            )
+            .is_some()
+        {
+            return Some(RowDrop::Revive);
+        }
         // Reordering only ever moves a row inside its own sibling run, and
         // pinned rows sort ahead of the manual order, so a pin boundary is a
         // run boundary too. Anywhere else the bands fall back to the handoff
@@ -2668,7 +2700,7 @@ impl Sidebar {
             // red at every row the pointer crosses; the refusal is explained
             // on release instead.
             .drag_over::<DraggedSidebarItem>({
-                let handoff = drop == Some(RowDrop::Handoff);
+                let handoff = matches!(drop, Some(RowDrop::Handoff | RowDrop::Revive));
                 move |element, _, _, _| {
                     if handoff {
                         element
@@ -3096,6 +3128,24 @@ impl Sidebar {
                 }
                 cx.notify();
             }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener({
+                    let id = id.clone();
+                    move |this, event: &gpui::MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.commit_rename();
+                        this.ui.hover_card = None;
+                        this.ui.focus_cursor = Some(id.clone());
+                        this.focus_handle.focus(window, cx);
+                        this.ui.popover = Some(Popover::SessionActions {
+                            id: id.clone(),
+                            position: event.position,
+                        });
+                        cx.notify();
+                    }
+                }),
+            )
             .on_drag(
                 DraggedSidebarItem(DragItem::Session {
                     id: id.clone(),
@@ -3145,16 +3195,15 @@ impl Sidebar {
                         },
                         colors.secondary,
                     ))
-                    .when(hovered, |button| {
-                        button.on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.store
-                                .write()
-                                .expect("session store lock poisoned")
-                                .revive_sessions(vec![revive_id.clone()]);
-                            cx.notify();
-                        }))
-                    }),
+                    .aria_label("Revive session")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .revive_sessions(vec![revive_id.clone()]);
+                        cx.notify();
+                    })),
             )
             .child(
                 div()
@@ -5517,6 +5566,25 @@ impl Sidebar {
         if let Some(source) = dragged.session_id().cloned()
             && live
         {
+            let target_project = self
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .sessions()
+                .get(target)
+                .map(|session| session.project_id.clone());
+            if target_project
+                .as_ref()
+                .is_some_and(|project| self.revivable_drop(dragged, Some(project)).is_some())
+            {
+                self.store
+                    .write()
+                    .expect("session store lock poisoned")
+                    .revive_sessions(vec![source]);
+                self.finish_drag();
+                cx.notify();
+                return;
+            }
             let drop = drop.unwrap_or(if &source == target {
                 RowDrop::Origin
             } else {
@@ -5551,6 +5619,7 @@ impl Sidebar {
                         Err(refusal) => self.ui.delegation_notice = Some(refusal.0),
                     }
                 }
+                RowDrop::Revive => {} // The source or destination changed since feedback.
                 RowDrop::Refused(reason) => self.ui.delegation_notice = Some(reason),
             }
         }
@@ -5558,8 +5627,32 @@ impl Sidebar {
         cx.notify();
     }
 
+    /// A restore keeps the session's existing project and conversation identity.
+    fn revivable_drop(
+        &self,
+        dragged: &DraggedSidebarItem,
+        project: Option<&ProjectId>,
+    ) -> Option<SessionId> {
+        let id = dragged.session_id()?;
+        let store = self.store.read().expect("session store lock poisoned");
+        let session = store.sessions().get(id)?;
+        (session.is_archived() && project.is_none_or(|project| project == &session.project_id))
+            .then(|| id.clone())
+    }
+
     /// Release of a dragged session on the fan-out zone below the projects.
     fn finish_fan_out_drop(&mut self, dragged: &DraggedSidebarItem, cx: &mut Context<Self>) {
+        if self.ui.drag.is_some()
+            && let Some(id) = self.revivable_drop(dragged, None)
+        {
+            self.store
+                .write()
+                .expect("session store lock poisoned")
+                .revive_sessions(vec![id]);
+            self.finish_drag();
+            cx.notify();
+            return;
+        }
         if let Some(source_id) = dragged.session_id()
             && self.ui.drag.is_some()
         {
@@ -7924,6 +8017,132 @@ mod tests {
                 sidebar.ui.pending_sibling.is_some(),
             )
         })
+    }
+
+    fn archive_drag_source(sidebar: &Entity<Sidebar>, cx: &mut VisualTestContext) {
+        sidebar.update(cx, |sidebar, cx| {
+            let mut store = sidebar.store.write().expect("store");
+            let id = SessionId::new("preview-codex");
+            let project = store.sessions()[&id].project_id.clone();
+            store.archive_sessions(vec![id]);
+            if !store
+                .preferences()
+                .sidebar_expanded_archives
+                .contains(&project)
+            {
+                store
+                    .toggle_archive_expanded(project)
+                    .expect("expand archive");
+            }
+            cx.notify();
+        });
+    }
+
+    fn assert_drag_source_revived(sidebar: &Entity<Sidebar>, cx: &VisualTestContext) {
+        sidebar.read_with(cx, |sidebar, _| {
+            let store = sidebar.store.read().expect("store");
+            let id = SessionId::new("preview-codex");
+            assert!(!store.sessions()[&id].is_archived());
+            assert_eq!(store.selected_session_id(), Some(&id));
+        });
+    }
+
+    #[gpui::test]
+    fn archived_session_right_click_opens_revive_menu(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = drag_harness(cx);
+        archive_drag_source(&sidebar, cx);
+        let archived = row_bounds(&sidebar, cx, "preview-codex");
+        cx.simulate_mouse_down(archived.center(), MouseButton::Right, Modifiers::default());
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(
+                matches!(&sidebar.ui.popover, Some(Popover::SessionActions { id, .. })
+                if id == &SessionId::new("preview-codex"))
+            );
+        });
+        cx.simulate_mouse_up(archived.center(), MouseButton::Right, Modifiers::default());
+        let menu = cx.debug_bounds("sidebar-popover").expect("revive menu");
+        cx.simulate_click(
+            menu.origin + point(px(50.0), px(16.0)),
+            Modifiers::default(),
+        );
+        assert_drag_source_revived(&sidebar, cx);
+    }
+
+    #[gpui::test]
+    fn archived_session_icon_revives(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = drag_harness(cx);
+        archive_drag_source(&sidebar, cx);
+        let archived = row_bounds(&sidebar, cx, "preview-codex");
+        let icon = point(
+            archived.left() + px(Space::ROW_H + Space::INDENT + 8.0),
+            archived.center().y,
+        );
+        cx.simulate_click(icon, Modifiers::default());
+        assert_drag_source_revived(&sidebar, cx);
+    }
+
+    #[gpui::test]
+    fn archived_session_drop_on_active_row_revives(cx: &mut TestAppContext) {
+        let (sidebar, handoffs, cx) = drag_harness(cx);
+        archive_drag_source(&sidebar, cx);
+        let archived = row_bounds(&sidebar, cx, "preview-codex");
+        let target = row_bounds(&sidebar, cx, "preview-claude");
+        drag_and_release(cx, archived.center(), target.center());
+        assert_drag_source_revived(&sidebar, cx);
+        assert!(handoffs.borrow().is_empty());
+        assert_eq!(drag_state(&sidebar, cx), (false, None, false));
+    }
+
+    #[gpui::test]
+    fn archived_session_drop_on_project_header_revives(cx: &mut TestAppContext) {
+        let (sidebar, handoffs, cx) = drag_harness(cx);
+        archive_drag_source(&sidebar, cx);
+        let archived = row_bounds(&sidebar, cx, "preview-codex");
+        let project = cx
+            .debug_bounds("PROJECT_preview-dirijor")
+            .expect("project header");
+        drag_and_release(cx, archived.center(), project.center());
+        assert_drag_source_revived(&sidebar, cx);
+        assert!(handoffs.borrow().is_empty());
+    }
+
+    #[gpui::test]
+    fn archived_session_drop_in_empty_space_revives(cx: &mut TestAppContext) {
+        let (sidebar, handoffs, cx) = drag_harness(cx);
+        archive_drag_source(&sidebar, cx);
+        let archived = row_bounds(&sidebar, cx, "preview-codex");
+        drag_to(
+            cx,
+            archived.center(),
+            archived.center() + point(px(0.0), px(10.0)),
+        );
+        let target = cx
+            .debug_bounds("sidebar-fan-out-zone")
+            .expect("revive drop zone");
+        cx.simulate_mouse_move(target.center(), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(target.center(), MouseButton::Left, Modifiers::default());
+        assert_drag_source_revived(&sidebar, cx);
+        assert!(handoffs.borrow().is_empty());
+        assert_eq!(drag_state(&sidebar, cx), (false, None, false));
+    }
+
+    #[gpui::test]
+    fn cancelled_archived_session_drag_does_not_revive(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = drag_harness(cx);
+        archive_drag_source(&sidebar, cx);
+        let archived = row_bounds(&sidebar, cx, "preview-codex");
+        let target = row_bounds(&sidebar, cx, "preview-claude");
+        drag_to(cx, archived.center(), target.center());
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.cancel_active_drag(cx);
+        });
+        cx.simulate_mouse_up(target.center(), MouseButton::Left, Modifiers::default());
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(
+                sidebar.store.read().expect("store").sessions()[&SessionId::new("preview-codex")]
+                    .is_archived()
+            );
+        });
     }
 
     #[gpui::test]

@@ -1968,7 +1968,7 @@ impl ControlServer {
     fn session_resume(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::SessionIdParams = decode(params)?;
         let record = {
-            let registry = self.registry.lock().map_err(poisoned)?;
+            let mut registry = self.registry.lock().map_err(poisoned)?;
             let record = registry
                 .records()
                 .into_iter()
@@ -1983,8 +1983,7 @@ impl ControlServer {
                 && !matches!(record.status, diri_proto::SessionStatus::Exited(_))
             {
                 // Genuinely live: resuming is a no-op, not an error.
-                return serde_json::to_value(&record)
-                    .map_err(|error| ControlError::internal(error.to_string()));
+                return self.restored_resume_result(&mut registry, &p.session_id.0);
             }
             record
         };
@@ -2021,8 +2020,7 @@ impl ControlServer {
         if registry.get(&p.session_id.0).is_some() {
             if !exited {
                 // Already live: resuming is a no-op, not an error.
-                return serde_json::to_value(&record)
-                    .map_err(|error| ControlError::internal(error.to_string()));
+                return self.restored_resume_result(&mut registry, &p.session_id.0);
             }
             // An agent that died on its own leaves its session behind: only an
             // explicit kill takes one out of the registry, so presence alone
@@ -2039,12 +2037,21 @@ impl ControlServer {
                 record.remote_persistence = Some(persistence);
             });
         }
+        self.restored_resume_result(&mut registry, &p.session_id.0)
+    }
+
+    fn restored_resume_result(
+        &self,
+        registry: &mut Registry,
+        id: &str,
+    ) -> Result<JsonValue, ControlError> {
+        // Resume is also the UI's revive action. Clear the durable archive
+        // only after launch succeeds, including an already-live session.
+        registry.unarchive(id).map_err(io_control_error)?;
         let _ = registry.persist();
-        self.publish_updated(&registry, &p.session_id.0);
+        self.publish_updated(registry, id);
         let record = registry
-            .records()
-            .into_iter()
-            .find(|record| record.id.0 == p.session_id.0)
+            .record(id)
             .ok_or_else(|| ControlError::internal("the resumed session vanished"))?;
         serde_json::to_value(&record).map_err(|error| ControlError::internal(error.to_string()))
     }
@@ -4288,6 +4295,53 @@ mod tests {
     /// with no way at all to restart it.
     #[test]
     fn resume_relaunches_a_session_whose_agent_died_on_its_own() {
+        check_resume_relaunches(false);
+    }
+
+    #[test]
+    fn revive_archived_session_clears_archive_durably() {
+        check_resume_relaunches(true);
+    }
+
+    #[test]
+    fn failed_revive_keeps_the_archived_conversation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let registry = Arc::new(Mutex::new(Registry::new(
+            engine(),
+            temp.path().join("state.json"),
+        )));
+        let mut record = test_record("s_archived");
+        record.kind = diri_proto::AgentKind::new("missing-manifest");
+        record.agent_session_id = Some("saved-conversation".into());
+        registry.lock().expect("registry").insert_record(record);
+        let server = Arc::new(ControlServer::new(
+            Arc::clone(&registry),
+            temp.path().join("daemon.sock"),
+        ));
+        ok_of(call(
+            &server,
+            "session.archive",
+            Some(json!({ "sessionID": "s_archived" })),
+        ));
+        let error = err_of(call(
+            &server,
+            "session.resume",
+            Some(json!({ "sessionID": "s_archived" })),
+        ));
+        assert_eq!(error.code, "not_found");
+        let record = registry
+            .lock()
+            .expect("registry")
+            .record("s_archived")
+            .expect("saved record");
+        assert!(record.is_archived());
+        assert_eq!(
+            record.agent_session_id.as_deref(),
+            Some("saved-conversation")
+        );
+    }
+
+    fn check_resume_relaunches(archived: bool) {
         let temp = tempfile::tempdir().expect("temp");
         // A manifest that resumes by flag, onto a binary that outlives the
         // call: `sh -c 'read line'` blocks on the PTY instead of exiting.
@@ -4362,11 +4416,36 @@ mod tests {
             Arc::clone(&registry),
             temp.path().join("daemon.sock"),
         ));
+        if archived {
+            ok_of(call(
+                &server,
+                "session.archive",
+                Some(json!({ "sessionID": "s_dead" })),
+            ));
+        }
         let result = ok_of(call(
             &server,
             "session.resume",
             Some(json!({ "sessionID": "s_dead" })),
         ));
+        assert!(
+            result.get("archivedAt").is_none(),
+            "revive must leave the archive"
+        );
+        let persisted: JsonValue = serde_json::from_slice(
+            &std::fs::read(temp.path().join("state.json")).expect("persisted state"),
+        )
+        .expect("state JSON");
+        let saved = persisted["sessions"]
+            .as_array()
+            .expect("sessions")
+            .iter()
+            .find(|record| record["id"] == "s_dead")
+            .expect("saved session");
+        assert!(
+            saved.get("archivedAt").is_none(),
+            "revive must survive a resync/restart"
+        );
 
         assert!(
             result["status"].get("exited").is_none(),
@@ -4381,6 +4460,33 @@ mod tests {
                 .is_some_and(|session| !session.view().exited),
             "the resumed session must be a live one"
         );
+        if archived {
+            let pid = {
+                let mut registry = registry.lock().expect("registry");
+                // Older revive attempts could leave a live process archived.
+                registry.update_record("s_dead", |record| {
+                    record.archived_at = Some(diri_proto::DateMillis(42.0));
+                });
+                registry.get("s_dead").expect("live session").child_pid()
+            };
+            let restored = ok_of(call(
+                &server,
+                "session.resume",
+                Some(json!({ "sessionID": "s_dead" })),
+            ));
+            assert!(restored.get("archivedAt").is_none());
+            assert_eq!(restored["agentSessionID"], "conv-1");
+            assert_eq!(
+                registry
+                    .lock()
+                    .expect("registry")
+                    .get("s_dead")
+                    .expect("live session")
+                    .child_pid(),
+                pid,
+                "reviving an already-live archived session must not relaunch it"
+            );
+        }
     }
 
     #[test]
