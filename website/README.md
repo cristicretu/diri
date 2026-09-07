@@ -22,7 +22,17 @@ Open http://localhost:4177. Requires Node.js; no install or build step. Set `POR
 
 The workspace contains curated demonstration data, not a live Diri session. Download and source links go to the real public repository. The demo never launches an agent, runs commands, or sends data.
 
-`index.html`, `style.css`, `app.js`, `agent-previews.js`, `mesh.js`, and `assets/` can be served by any static host. `server.mjs` is a loopback-only development server. There are no external fonts, analytics, runtime dependencies, or third-party scripts.
+`index.html`, `style.css`, `app.js`, `agent-previews.js`, `mesh.js`, `downloads.js`, and `assets/` can be served by any static host. `server.mjs` is a loopback-only development server. There are no external fonts, analytics, runtime dependencies, or third-party scripts.
+
+## Release downloads
+
+On each page load, `downloads.js` checks GitHub's public [latest release API](https://docs.github.com/en/rest/releases/releases#get-the-latest-release). The primary button links directly to that release's universal macOS DMG, with its version and release notes beside it. Other downloads lists the macOS ZIP and Linux x86_64 AppImage/DEB only when those assets exist in the same release. Linux is not included in every release; the full release history and Linux installation guide are always available.
+
+Publishing a new stable GitHub release updates downloads on subsequent page loads without a website rebuild, deploy hook, or token. The browser uses GitHub's normal HTTP caching. Only completed, nonempty desktop assets with matching repository/tag/filename URLs are accepted. Drafts and prereleases are excluded. Asset names follow the current release scripts; update the format list if packaging names change.
+
+If the API is unavailable, rate-limited, returns invalid data, or takes more than five seconds, the original GitHub release link stays usable. It also works without JavaScript. There is no cached version in local storage that can outlive a removed release. The build CSP allows connections to `https://api.github.com`; downloads navigate directly to GitHub. `npm test` covers asset selection, new versions, missing packages, malformed data, errors, and timeout behavior; it runs as part of `npm run verify` and website CI without network access.
+
+Browser checks against the production build and CSP covered 1440, 768, 390, and 320px widths, keyboard access to other downloads, a download click using the live v0.6.2 metadata and a stubbed binary, no JavaScript, API failure/rate limiting, and a future release with Linux packages. The live v0.6.2 DMG URL was also checked through its redirect to an HTTP 200 response.
 
 ## Verification
 
@@ -38,7 +48,7 @@ Agent presentation references: [Claude Code](https://github.com/anthropics/claud
 
 ## Feature coverage
 
-The page has one download action, a GitHub mark in the masthead, and 24 feature descriptions grouped by agents/sessions, parallel work, review, usage/accounts, workspace preferences, and devices. The complete inventory is static HTML, available without JavaScript. It uses shared columns and subtle separators instead of individual cards or hidden accordions.
+The page has one primary download action with other packages in an expandable list, a GitHub mark in the masthead, and 24 feature descriptions grouped by agents/sessions, parallel work, review, usage/accounts, workspace preferences, and devices. The complete inventory is static HTML, available without JavaScript. It uses shared columns and subtle separators instead of individual cards or hidden accordions.
 
 Claims were checked against the current repository: root README and `docs/GETTING_STARTED.md`; the 22 Engine manifests; app history, delegation, commands, code viewer, account settings, usage/limits, skills, and resource controls; and `ios/README.md`. Phone and Linux support remain labeled beta. Cost figures are estimates, history names Claude/Codex, and forks are qualified by provider support. No roadmap-only functionality is advertised.
 

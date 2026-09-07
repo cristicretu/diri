@@ -100,6 +100,7 @@
   <script src="agent-previews.js" defer></script>
   <script src="app.js" defer></script>
   <script src="mesh.js" defer></script>
+  <script type="module" src="downloads.js"></script>
 </head>
 <body>
   <div class="mesh-background" aria-hidden="true"><canvas id="mesh"></canvas></div>
@@ -117,8 +118,20 @@
           <p>Run AI agents side by side, keep sessions alive, and review their work.</p>
         </div>
         <div class="intro-detail">
-          <a class="button primary" href="https://github.com/cristicretu/diri/releases/latest" target="_blank" rel="noopener noreferrer">Download Diri</a>
+          <a id="download-primary" class="button primary" href="https://github.com/cristicretu/diri/releases/latest">Download Diri</a>
           <div class="download-platforms" aria-label="Available platforms"><span class="platform-mark" role="img" aria-label="macOS" title="macOS"><img src="/assets/brand/apple.svg" width="16" height="16" alt=""></span><span class="platform-mark" role="img" aria-label="Linux beta" title="Linux (beta)"><img src="/assets/brand/linux.svg" width="17" height="18" alt=""></span></div>
+          <div class="release-details">
+            <span id="download-version">macOS 15+ · Linux beta</span>
+            <a id="download-notes" href="https://github.com/cristicretu/diri/releases/latest">Release notes</a>
+            <details class="download-options">
+              <summary>Other downloads</summary>
+              <div class="download-options-list">
+                <div id="download-assets"></div>
+                <a href="https://github.com/cristicretu/diri/releases">All releases</a>
+                <a href="https://github.com/cristicretu/diri/blob/main/diri/LINUX.md">Linux beta installation guide</a>
+              </div>
+            </details>
+          </div>
         </div>
       </section>
 
