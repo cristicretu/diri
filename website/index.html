@@ -44,7 +44,7 @@
         </div>
         <div class="app-window" id="demo-window" role="tabpanel" aria-labelledby="tab-workspace">
           <aside class="app-sidebar" aria-label="Demo chats">
-            <div class="sidebar-top"><button class="icon-button" data-open="command" aria-label="Open commands"><span class="icon" data-icon="settings"></span></button><button class="icon-button" data-open="command" aria-label="Search conversations"><span class="icon" data-icon="search"></span></button><button class="icon-button" id="toggle-sidebar" aria-label="Collapse sidebar"><span class="icon" data-icon="sidebar"></span></button></div>
+            <div class="sidebar-top"><span class="traffic-lights" aria-hidden="true"><i></i><i></i><i></i></span><button class="icon-button" data-open="command" aria-label="Open commands"><span class="icon" data-icon="settings"></span></button><button class="icon-button" data-open="command" aria-label="Search conversations"><span class="icon" data-icon="search"></span></button><button class="icon-button" id="toggle-sidebar" aria-label="Collapse sidebar"><span class="icon" data-icon="sidebar"></span></button></div>
             <button class="new-chat" data-open="command"><span class="icon" data-icon="new-agent"></span>New Agent <small>Codex</small></button>
             <div class="sidebar-group"><span class="icon" data-icon="folder"></span>Diri <span class="icon" data-icon="chevron-down"></span></div>
             <button class="chat-row selected" data-chat="website" aria-pressed="true"><span class="agent-logo" data-agent="codex"></span><span>Build the Diri website</span><span class="chat-state completed" aria-label="Completed"><span class="icon" data-icon="check"></span></span></button>
@@ -55,7 +55,7 @@
             <div class="sidebar-bottom"><span class="icon" data-icon="local-agents"></span><span>Local agents</span></div>
           </aside>
           <div class="app-main">
-            <div class="app-titlebar">
+            <div class="app-titlebar"><span class="traffic-lights mobile-traffic-lights" aria-hidden="true"><i></i><i></i><i></i></span>
               <span class="icon session-icon" data-icon="terminal"></span><span class="session-name" id="session-name">Build the Diri website</span>
               <div class="app-tools">
                 <button class="app-tool links-trigger" data-open="links" aria-label="Open demo links">Links <span class="link-count">2</span><span class="icon" data-icon="chevron-down"></span></button>
@@ -119,7 +119,7 @@
         <article><h2>Runs locally</h2><p>Use your own tools without a Diri account</p></article>
       </section>
     </main>
-    <footer class="site-footer"><a class="footer-brand" href="#">diri</a><a href="https://github.com/cristicretu/diri/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">Apache 2.0</a></footer>
+    <footer class="site-footer"><a class="footer-brand" href="#">diri</a><div class="footer-actions"><button class="background-motion" id="background-motion" aria-label="Pause background animation" title="Pause background animation" aria-pressed="false" hidden><span class="motion-symbol" aria-hidden="true"></span></button><a href="https://github.com/cristicretu/diri/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">Apache 2.0</a></div></footer>
   </div>
 </body>
 </html>
