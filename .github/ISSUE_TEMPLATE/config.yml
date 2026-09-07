@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
-  - name: Questions and workflow help
+  - name: Questions and ideas
     url: https://github.com/cristicretu/diri/discussions
-    about: Ask for setup help or talk through an idea before filing an issue.
-  - name: Security vulnerability
+    about: Get setup help, share a workflow, or discuss an early idea.
+  - name: Report a vulnerability
     url: https://github.com/cristicretu/diri/security/advisories/new
-    about: Report vulnerabilities privately; do not post sensitive details publicly.
+    about: Send security reports privately.

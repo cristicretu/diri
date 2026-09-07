@@ -1,21 +1,37 @@
 # Documentation
 
-- [Getting started](GETTING_STARTED.md) — installation, first session, worktrees,
-  remote hosts, diagnostics, and local data.
-- [Keyboard shortcuts](KEYBOARD_SHORTCUTS.md) — every binding, grouped by task,
-  plus how Diri resolves an ambiguous keystroke.
-- [Security model](SECURITY-MODEL.md) — trust boundaries and safe-use guidance.
-- [Agent manifests](AGENT-MANIFESTS.md) — add an agent, author screen rules,
-  capture safe fixtures, and validate both engines.
-- [Remote architecture](../diri/REMOTE_PORT.md) — direct SSH bootstrap, remote
-  PTY Holders, persistence, and protocol guarantees.
-- [Remote nodes](../diri/NODE.md) — optional VPS accounts, fleet usage, and
-  transactional handoff.
-- [Packaging](../diri/PACKAGING.md) — build, signing, and notarization.
-- [Updates and releases](../diri/UPDATING.md) — updater design and release flow.
-- [Engine port history](../diri/PORT.md) — record of the completed Rust migration.
-- [Performance](../diri/PERF.md) — budgets and measurement workflow.
+## Use Diri
 
-Project policies live at the repository root: [contributing](../CONTRIBUTING.md),
-[support](../SUPPORT.md), [security](../SECURITY.md), [privacy](../PRIVACY.md),
-and [governance](../GOVERNANCE.md).
+| Guide | Covers |
+| :--- | :--- |
+| [Getting started](GETTING_STARTED.md) | Install, launch your first agent, use worktrees, and connect an SSH host. |
+| [Keyboard shortcuts](KEYBOARD_SHORTCUTS.md) | Navigation, the command palette, and terminal input. |
+| [Linux beta](../diri/LINUX.md) | Packages, source builds, graphics setup, and platform limits. |
+| [iPhone companion](../ios/README.md) | Beta setup and builds for access through your Tailscale network. |
+| [Support](../SUPPORT.md) | Troubleshooting, diagnostics, and bug reports. |
+| [Security model](SECURITY-MODEL.md) | Process permissions and trust boundaries. |
+
+## Build Diri
+
+Start with [Contributing](../CONTRIBUTING.md) for local setup and review
+expectations. The [Rust workspace guide](../diri/README.md) covers development
+builds and preview fixtures.
+
+| Reference | Covers |
+| :--- | :--- |
+| [Agent manifests](AGENT-MANIFESTS.md) | Launch commands, status rules, safe fixtures, and validation. |
+| [Remote architecture](../diri/REMOTE_PORT.md) | The current SSH transport, PTY Holders, and persistence guarantees. |
+| [Remote nodes](../diri/NODE.md) | Optional enhanced node mode, fleet usage, and handoff. |
+| [Packaging](../diri/PACKAGING.md) | App bundles, signing, and notarization. |
+| [Updates and releases](../diri/UPDATING.md) | Updater behavior and publishing. |
+| [Performance](../diri/PERF.md) | Budgets and measurement. |
+
+## Project
+
+[Roadmap](../ROADMAP.md) · [Governance](../GOVERNANCE.md) ·
+[Code of Conduct](../CODE_OF_CONDUCT.md) · [Privacy](../PRIVACY.md) ·
+[Security reporting](../SECURITY.md)
+
+The [Rust migration record](../diri/PORT.md) is historical context.
+[AGENTS.md](../AGENTS.md) and the remote architecture describe the current
+implementation baseline.

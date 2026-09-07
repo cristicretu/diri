@@ -12,7 +12,7 @@ Please use [GitHub's private vulnerability reporting](https://github.com/cristic
 Do not include an exploit, private terminal output, tokens, or personal paths in
 a public issue.
 
-Include the affected version and macOS version, a minimal reproduction, the
+Include the affected Diri and operating-system versions, a minimal reproduction, the
 impact you believe is possible, and any suggested mitigation. You should receive
 an acknowledgement within seven days. Timing for a fix or disclosure depends on
 severity and complexity; the maintainer will coordinate that with the reporter.

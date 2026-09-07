@@ -1,55 +1,45 @@
-name: Support another agent
-description: Ask for a coding agent diri does not know yet, or report one that detects wrong
+name: Agent support
+description: Request a new agent integration or improve an existing one.
 labels: [agent-manifest]
 body:
   - type: markdown
     attributes:
-      value: >
-        Agent support is a single JSON file in
-        `diri/crates/diri-engine/manifests/` — no Rust required. If you
-        want to write it yourself, copy the closest existing manifest; the
-        fields are documented in CONTRIBUTING.md. Otherwise this issue is
-        enough for someone else to pick up.
-
+      value: >-
+        Agent launch and status rules live in JSON. The
+        [manifest guide](https://github.com/cristicretu/diri/blob/main/docs/AGENT-MANIFESTS.md)
+        covers authoring and validation. Use a disposable prompt for examples;
+        remove credentials, private output, and personal paths before posting.
   - type: input
     id: agent
     attributes:
-      label: Which agent
-      placeholder: "opencode, amp, something new…"
+      label: Agent
+      description: Include the CLI version and a link to its documentation or repository.
     validations:
       required: true
-
   - type: input
     id: command
     attributes:
-      label: How you launch it
-      description: The command you type today.
+      label: Launch command
+      description: The command you use to start the agent, without credentials or private arguments.
       placeholder: "opencode"
     validations:
       required: true
-
   - type: textarea
-    id: working
+    id: behavior
     attributes:
-      label: What it looks like while working
-      description: >
-        Paste the terminal output, or describe the spinner or status line. This
-        is what a rule matches on.
-      render: shell
-
+      label: Missing or incorrect behavior
+      description: For an existing integration, describe what Diri reports and what the agent is actually doing.
   - type: textarea
-    id: waiting
+    id: examples
     attributes:
-      label: What it looks like when it needs you
-      description: >
-        A permission prompt or question, as it appears on screen — including
-        the box drawing and the option list if there is one. This is the most
-        useful part.
-      render: shell
-
+      label: Status examples
+      description: >-
+        Show or describe the agent while working, waiting for approval or input,
+        and finished. A small, redacted terminal excerpt for each state helps
+        us write detection rules.
   - type: input
     id: resume
     attributes:
-      label: How it resumes a past conversation
-      description: The flag, if it has one.
-      placeholder: "--resume <id>, --continue, no support"
+      label: Resume command
+      description: How do you reopen a previous conversation, if supported?
+      placeholder: "--resume <id>, --continue, or unsupported"

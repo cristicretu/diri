@@ -1,17 +1,11 @@
-## Why
+## Change
 
-<!-- What problem does this solve? Link an issue when one exists. -->
-
-## What changed
-
-<!-- Keep this focused enough to review. -->
+<!-- Describe the problem and resulting behavior. Link an issue if relevant. -->
+<!-- For interface changes, include a screenshot or short recording. -->
 
 ## Verification
 
-<!-- Commands run and manual behavior checked. -->
-
-- [ ] `./scripts/check.sh` passes, or I explained why a check is not applicable.
-- [ ] Existing sessions still survive app and daemon restarts, or the migration is documented.
-- [ ] I considered security and privacy impact (processes, IPC, logs, updates, remote hosts).
-- [ ] User-visible behavior or setup changes are documented.
-- [ ] UI changes include a screenshot or short recording.
+<!-- List checks run and what they showed. Explain any checks you could not run. -->
+<!-- Docs-only: check links and rendered output. Rust: see CONTRIBUTING.md. -->
+<!-- If relevant, cover running sessions, restart/reconnect, protocol or stored-format
+     compatibility, and security/privacy impact. Omit what does not apply. -->
