@@ -9,10 +9,10 @@ function paintIcons(root = document) {
   });
 }
 const chats = {
-  website: { title: 'A little more Diri', agent: 'claude', name: 'Claude', status: 'Ready when you are', prompt: 'A quieter home for Diri. Less noise, more room for the work.', body: `<div class="work-line">${icon('check')}<span class="work-verb">Read</span><code>the little details that make Diri, Diri</code></div><div class="work-line">${icon('check')}<span class="work-verb">Updated</span><code>website/index.html</code></div><div class="work-line">${icon('check')}<span class="work-verb">Refined</span><code>spacing, color, and the way things move</code></div><div class="terminal-result"><strong>A little more breathing room.</strong><p>The first draft is ready. Everything you need,<br>with a little less getting in the way.</p><button class="result-link" data-open="links">Take a look ${icon('external-link')}</button></div>` },
-  notes: { title: 'Make sense of the notes', agent: 'codex', name: 'Codex', status: 'A quick question for you', prompt: 'Turn these scattered notes into a plan for the week.', body: `<div class="work-line">${icon('check')}<span class="work-verb">Read</span><code>monday-notes.md · ideas.md · next-up.md</code></div><div class="terminal-result"><strong>Found the thread.</strong><p>Three priorities, a few loose ends, and one good idea.<br>How much detail would you like?</p><div class="question-options"><button data-answer="short">Just the essentials</button><button data-answer="full">A little more detail</button></div></div>` },
-  details: { title: 'Sweat the small stuff', agent: 'cursor', name: 'Cursor', status: 'Working on the details', prompt: 'Make the small interactions feel as good as they look.', body: `<div class="work-line">${icon('check')}<span class="work-verb">Checked</span><code>keyboard navigation and focus</code></div><div class="work-line">${icon('check')}<span class="work-verb">Refined</span><code>the command menu transition</code></div><div class="terminal-result"><strong>The details add up.</strong><p>A softer entrance. A clear way back.<br>Everything right where you expect it.</p><button class="result-link" data-open="command">Try the command menu ${icon('chevron-right')}</button></div>` },
-  weekend: { title: 'The weekend idea', agent: 'gemini', name: 'Gemini', status: 'Saved for a little later', prompt: 'A tiny app for collecting places I want to visit.', body: `<div class="terminal-result"><strong>Start small. Go somewhere.</strong><p>A place, a note, and a pin on a map.<br>No itinerary required.</p><p>Your idea will be right here when you come back.</p></div>` }
+  website: { title: 'Diri website', agent: 'claude', name: 'Claude', status: 'Completed', prompt: 'Build a compact website for Diri. Use the app’s design system.', body: `<div class="work-line">${icon('check')}<span class="work-verb">Read</span><code>design-tokens.css</code></div><div class="work-line">${icon('check')}<span class="work-verb">Updated</span><code>website/index.html</code></div><div class="work-line">${icon('check')}<span class="work-verb">Refined</span><code>website/style.css</code></div><div class="terminal-result"><strong>Website updated.</strong><p>Layout, spacing, and keyboard navigation are ready to review.</p><button class="result-link" data-open="links">Open links ${icon('external-link')}</button></div>` },
+  notes: { title: 'Weekly plan', agent: 'codex', name: 'Codex', status: 'Needs input', prompt: 'Turn these scattered notes into a plan for the week.', body: `<div class="work-line">${icon('check')}<span class="work-verb">Read</span><code>monday-notes.md · ideas.md · next-up.md</code></div><div class="terminal-result"><strong>Notes reviewed.</strong><p>How much detail should the plan include?</p><div class="question-options"><button data-answer="short">Summary</button><button data-answer="full">Detailed plan</button></div></div>` },
+  details: { title: 'Polish interactions', agent: 'cursor', name: 'Cursor', status: 'Working on the details', prompt: 'Make the small interactions feel as good as they look.', body: `<div class="work-line">${icon('check')}<span class="work-verb">Checked</span><code>keyboard navigation and focus</code></div><div class="work-line">${icon('check')}<span class="work-verb">Refined</span><code>the command menu transition</code></div><div class="terminal-result"><strong>Navigation updated.</strong><p>Back navigation and keyboard shortcuts are ready to test.</p><button class="result-link" data-open="command">Try the command menu ${icon('chevron-right')}</button></div>` },
+  weekend: { title: 'Travel map', agent: 'gemini', name: 'Gemini', status: 'Idle', prompt: 'A tiny app for collecting places I want to visit.', body: `<div class="terminal-result"><strong>Map created.</strong><p>Add places, notes, and map pins.</p></div>` }
 };
 let currentChat = 'website';
 let overlay = null;
@@ -20,9 +20,6 @@ let previousFocus;
 let page = 'commands';
 let selected = 0;
 let matches = [];
-let demoTheme = 'dark';
-let originalDemoTheme = null;
-function announce(text) { $('#announcement').textContent = text; }
 function selectChat(id) {
   const chat = chats[id];
   if (!chat) return;
@@ -41,11 +38,7 @@ function setTab(view) {
   $$('.demo-tab').forEach(tab => { const active = tab.dataset.view === view; tab.classList.toggle('active', active); tab.setAttribute('aria-selected', String(active)); tab.tabIndex = active ? 0 : -1; });
   $('#demo-window').setAttribute('aria-labelledby', `tab-${view}`);
 }
-function restoreTheme() {
-  if (originalDemoTheme !== null) { applyDemoTheme(originalDemoTheme); originalDemoTheme = null; }
-}
 function closeOverlay(restoreFocus = true) {
-  restoreTheme();
   $$('.floating-panel').forEach(el => { el.hidden = true; });
   $('#demo-shade').hidden = true;
   overlay = null;
@@ -67,22 +60,17 @@ function openOverlay(kind) {
   if (kind === 'command') { goPage('commands'); $('#palette-input').focus({ preventScroll: true }); }
   else $('button, a', panel)?.focus({ preventScroll: true });
 }
-function applyDemoTheme(value) { demoTheme = value; $('#demo-window').classList.toggle('theme-light', value === 'light'); }
 const chatItem = (id) => ({ label: chats[id].title, agent: chats[id].agent, action: () => { selectChat(id); closeOverlay(); } });
 function itemsForPage() {
   if (page === 'chats') return Object.keys(chats).map(chatItem);
-  if (page === 'projects') return [{ label: 'Sunday studio', icon: 'folder', action: () => { selectChat('website'); closeOverlay(); } }, { label: 'Little experiments', icon: 'folder', action: () => { selectChat('weekend'); closeOverlay(); } }];
-  if (page === 'settings') return [{ label: 'Color theme', icon: 'moon', hint: 'Choose your mood', action: () => goPage('themes') }];
-  if (page === 'themes') return [{ label: 'Diri dark', theme: 'dark', color: '#393540' }, { label: 'Diri light', theme: 'light', color: '#e9e7df' }].map(item => ({ ...item, action: () => { applyDemoTheme(item.theme); originalDemoTheme = null; closeOverlay(); announce(`${item.label} selected for the preview`); } }));
-  return [chatItem('website'), chatItem('notes'), { label: 'Search chats', icon: 'search', hint: '⇧⌘H', action: () => goPage('chats') }, { label: 'Open project', icon: 'folder', hint: '⌘P', action: () => goPage('projects') }, { label: 'Settings', icon: 'settings', hint: 'Appearance', action: () => goPage('settings') }];
+  if (page === 'projects') return [{ label: 'Sunday studio', icon: 'folder', action: () => { selectChat('website'); closeOverlay(); } }, { label: 'Experiments', icon: 'folder', action: () => { selectChat('weekend'); closeOverlay(); } }];
+  return [chatItem('website'), chatItem('notes'), { label: 'Search chats', icon: 'search', hint: '⇧⌘H', action: () => goPage('chats') }, { label: 'Open project', icon: 'folder', hint: '⌘P', action: () => goPage('projects') }, { label: 'Notifications', icon: 'bell', action: () => openOverlay('notifications') }];
 }
 function goPage(next) {
-  restoreTheme();
   page = next;
-  if (page === 'themes') originalDemoTheme = demoTheme;
   selected = 0;
   $('#palette-input').value = '';
-  $('#palette-input').placeholder = { commands: 'Search chats or run a command…', chats: 'Search chats…', projects: 'Open a project…', settings: 'Settings', themes: 'Choose a theme…' }[page];
+  $('#palette-input').placeholder = { commands: 'Search chats or run a command…', chats: 'Search chats…', projects: 'Open a project…' }[page];
   $('#palette-back').hidden = page === 'commands';
   $('#palette-search-icon').hidden = page !== 'commands';
   renderPalette();
@@ -100,13 +88,13 @@ function renderPalette() {
     row.id = `command-${i}`;
     row.setAttribute('role', 'option');
     row.setAttribute('aria-selected', String(i === selected));
-    row.innerHTML = `${item.theme ? `<span class="theme-swatch" style="background:${item.color}"></span>` : item.agent ? `<span class="agent-logo ${item.agent}" data-agent="${item.agent}"></span>` : icon(item.icon)}<span>${item.label}</span>${item.hint ? `<small>${item.hint}</small>` : ''}${item.theme === demoTheme ? icon('check') : ''}`;
+    row.innerHTML = `${item.agent ? `<span class="agent-logo ${item.agent}" data-agent="${item.agent}"></span>` : icon(item.icon)}<span>${item.label}</span>${item.hint ? `<small>${item.hint}</small>` : ''}`;
     row.addEventListener('mousedown', event => event.preventDefault());
     row.addEventListener('click', item.action);
     row.addEventListener('pointermove', () => highlight(i));
     list.append(row);
   });
-  if (!matches.length) { const empty = document.createElement('p'); empty.className = 'palette-empty'; empty.textContent = 'Nothing here yet. Try another search.'; list.append(empty); }
+  if (!matches.length) { const empty = document.createElement('p'); empty.className = 'palette-empty'; empty.textContent = 'No results.'; list.append(empty); }
   paintIcons(list);
   highlight(selected);
 }
@@ -116,7 +104,6 @@ function highlight(index) {
   const item = matches[index];
   if (item) $('#palette-input').setAttribute('aria-activedescendant', `command-${index}`);
   else $('#palette-input').removeAttribute('aria-activedescendant');
-  if (item?.theme) applyDemoTheme(item.theme);
   const row = $(`#command-${index}`);
   const list = $('#palette-list');
   if (row && row.offsetTop < list.scrollTop) list.scrollTop = row.offsetTop;
@@ -126,9 +113,9 @@ $('#palette-input').addEventListener('input', () => { selected = 0; renderPalett
 $('#palette-input').addEventListener('keydown', event => {
   if (['ArrowDown', 'ArrowUp'].includes(event.key)) { event.preventDefault(); if (matches.length) highlight((selected + (event.key === 'ArrowDown' ? 1 : -1) + matches.length) % matches.length); }
   if (event.key === 'Enter') { event.preventDefault(); matches[selected]?.action(); }
-  if (event.key === 'Backspace' && !event.target.value && page !== 'commands') { event.preventDefault(); goPage(page === 'themes' ? 'settings' : 'commands'); }
+  if (event.key === 'Backspace' && !event.target.value && page !== 'commands') { event.preventDefault(); goPage('commands'); }
 });
-$('#palette-back').addEventListener('click', () => goPage(page === 'themes' ? 'settings' : 'commands'));
+$('#palette-back').addEventListener('click', () => goPage('commands'));
 $('#demo-shade').addEventListener('click', () => closeOverlay());
 $('#preview-website').addEventListener('click', () => { closeOverlay(); $('#main').scrollIntoView({ behavior: 'smooth' }); });
 document.addEventListener('click', event => {
@@ -138,10 +125,9 @@ document.addEventListener('click', event => {
   if (target.hasAttribute('data-close')) closeOverlay();
   if (target.dataset.chat) { selectChat(target.dataset.chat); if (overlay) closeOverlay(); }
   if (target.dataset.view) target.dataset.view === 'workspace' ? closeOverlay(false) : openOverlay(target.dataset.view);
-  if (target.dataset.themeChoice) setSiteTheme(target.dataset.themeChoice, true);
   if (target.dataset.answer) {
-    chats.notes.status = 'Ready when you are';
-    chats.notes.body = `<div class="work-line">${icon('check')}<span class="work-verb">Saved</span><code>this-week.md</code></div><div class="terminal-result"><strong>A little clarity for the week.</strong><p>1. Finish the first draft.<br>2. Share it with someone you trust.<br>3. Leave a little room for the unexpected.</p>${target.dataset.answer === 'full' ? '<p>Start with the page on Monday. Gather feedback midweek.<br>Keep Friday open for the small improvements.</p>' : ''}</div>`;
+    chats.notes.status = 'Completed';
+    chats.notes.body = `<div class="work-line">${icon('check')}<span class="work-verb">Saved</span><code>this-week.md</code></div><div class="terminal-result"><strong>Plan saved.</strong><p>1. Finish the first draft.<br>2. Share it with someone you trust.<br>3. Refine the design based on feedback.</p>${target.dataset.answer === 'full' ? '<p>Start with the page on Monday. Gather feedback midweek.<br>Keep Friday open for the small improvements.</p>' : ''}</div>`;
     $('.chat-row[data-chat="notes"] .status-dot').className = 'status-dot green';
     $('.chat-row[data-chat="notes"] .status-dot').setAttribute('aria-label', 'Done');
     selectChat('notes');
@@ -166,11 +152,4 @@ document.addEventListener('keydown', event => {
   }
   if (event.key === 'Escape' && overlay) { event.preventDefault(); closeOverlay(); }
 });
-function setSiteTheme(value, persist = false) {
-  document.documentElement.dataset.theme = value;
-  $$('[data-theme-choice]').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.themeChoice === value)));
-  $('meta[name="theme-color"]').content = value === 'dark' ? '#18191b' : '#f7f6f2';
-  if (persist) { try { localStorage.setItem('diri-site-theme', value); } catch {} }
-}
-try { const saved = localStorage.getItem('diri-site-theme'); if (['light', 'dark'].includes(saved)) setSiteTheme(saved); } catch {}
 selectChat(currentChat);

@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="en" data-theme="light">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#f7f6f2">
+  <meta name="theme-color" content="#191724">
   <meta name="description" content="A native workspace for your AI agents. Bring Claude Code, Codex, your chats, and your projects together in Diri.">
   <title>Diri — a home for your agents</title>
   <link rel="icon" href="assets/brand/diri.svg" type="image/svg+xml">
@@ -23,11 +23,10 @@
     <main id="main">
       <section class="intro" aria-labelledby="page-title">
         <div class="intro-heading">
-          <p class="eyebrow"><span class="status-dot green"></span>A little space to do your thing.</p>
           <h1 id="page-title">A home for<br>your agents<span class="title-dot">.</span></h1>
         </div>
         <div class="intro-detail">
-          <p>Claude Code, Codex, and the tools you love.<br class="desktop-break"> Your chats, projects, and progress.<br class="desktop-break"> All together, in a native app.</p>
+          <p>Run your agents side by side.<br class="desktop-break"> Chats, projects, and progress in one native app.</p>
           <a class="button primary" href="https://github.com/cristicretu/diri/releases/latest" target="_blank" rel="noopener noreferrer"><span class="icon" data-icon="download"></span>Download for Mac</a>
           <p class="download-note">Free & open source <span>·</span> <a href="https://github.com/cristicretu/diri/blob/main/diri/LINUX.md" target="_blank" rel="noopener noreferrer">Linux beta <span aria-hidden="true">↗</span></a></p>
         </div>
@@ -36,27 +35,27 @@
       <section class="product" aria-label="Interactive Diri preview">
         <div class="preview-toolbar">
           <div class="demo-tabs" role="tablist" aria-label="Explore Diri">
-            <button class="demo-tab active" id="tab-workspace" role="tab" aria-selected="true" aria-controls="demo-window" data-view="workspace">Your workspace</button>
-            <button class="demo-tab" id="tab-command" role="tab" aria-selected="false" aria-controls="demo-window" tabindex="-1" data-view="command">One shortcut away <kbd>⌘K</kbd></button>
-            <button class="demo-tab" id="tab-links" role="tab" aria-selected="false" aria-controls="demo-window" tabindex="-1" data-view="links">Links & progress</button>
+            <button class="demo-tab active" id="tab-workspace" role="tab" aria-selected="true" aria-controls="demo-window" data-view="workspace">Workspace</button>
+            <button class="demo-tab" id="tab-command" role="tab" aria-selected="false" aria-controls="demo-window" tabindex="-1" data-view="command">Commands <kbd>⌘K</kbd></button>
+            <button class="demo-tab" id="tab-links" role="tab" aria-selected="false" aria-controls="demo-window" tabindex="-1" data-view="links">Links</button>
           </div>
-          <span class="preview-label"><span class="live-dot"></span>Take a look around</span>
+          <span class="preview-label">Interactive preview</span>
         </div>
         <div class="app-window" id="demo-window" role="tabpanel" aria-labelledby="tab-workspace">
           <aside class="app-sidebar" aria-label="Demo chats">
             <div class="sidebar-top"><div class="traffic-lights" aria-hidden="true"><i></i><i></i><i></i></div><span class="icon muted" data-icon="sidebar"></span></div>
             <button class="new-chat" data-open="command"><span class="icon" data-icon="plus"></span>New chat</button>
             <div class="sidebar-group"><span class="icon" data-icon="folder"></span>Sunday studio <span class="icon" data-icon="chevron-down"></span></div>
-            <button class="chat-row selected" data-chat="website" aria-pressed="true"><span class="agent-logo claude" data-agent="claude"></span><span>A little more Diri</span><span class="status-dot green" aria-label="Done"></span></button>
-            <button class="chat-row" data-chat="notes" aria-pressed="false"><span class="agent-logo" data-agent="codex"></span><span>Make sense of the notes</span><span class="status-dot orange" aria-label="Needs input"></span></button>
-            <button class="chat-row" data-chat="details" aria-pressed="false"><span class="agent-logo" data-agent="cursor"></span><span>Sweat the small stuff</span><span class="working-dot" aria-label="Working"></span></button>
-            <div class="sidebar-group second"><span class="icon" data-icon="folder"></span>Little experiments <span class="icon" data-icon="chevron-down"></span></div>
-            <button class="chat-row" data-chat="weekend" aria-pressed="false"><span class="agent-logo gemini" data-agent="gemini"></span><span>The weekend idea</span><span class="status-dot dim" aria-label="Idle"></span></button>
+            <button class="chat-row selected" data-chat="website" aria-pressed="true"><span class="agent-logo claude" data-agent="claude"></span><span>Diri website</span><span class="status-dot green" aria-label="Done"></span></button>
+            <button class="chat-row" data-chat="notes" aria-pressed="false"><span class="agent-logo" data-agent="codex"></span><span>Weekly plan</span><span class="status-dot orange" aria-label="Needs input"></span></button>
+            <button class="chat-row" data-chat="details" aria-pressed="false"><span class="agent-logo" data-agent="cursor"></span><span>Polish interactions</span><span class="working-dot" aria-label="Working"></span></button>
+            <div class="sidebar-group second"><span class="icon" data-icon="folder"></span>Experiments <span class="icon" data-icon="chevron-down"></span></div>
+            <button class="chat-row" data-chat="weekend" aria-pressed="false"><span class="agent-logo gemini" data-agent="gemini"></span><span>Travel map</span><span class="status-dot dim" aria-label="Idle"></span></button>
             <div class="sidebar-bottom"><span class="icon" data-icon="monitor"></span><span>On this Mac</span><span class="local-dot"></span></div>
           </aside>
           <div class="app-main">
             <div class="app-titlebar">
-              <span class="session-name" id="session-name">A little more Diri</span>
+              <span class="session-name" id="session-name">Diri website</span>
               <div class="app-tools">
                 <button class="app-tool links-trigger" data-open="links" aria-label="Open demo links"><span class="status-dot green"></span>Links <span class="link-count">2</span><span class="icon" data-icon="chevron-down"></span></button>
                 <span class="current-agent"><span class="agent-logo claude" data-agent="claude"></span><span id="agent-name">Claude</span></span>
@@ -65,7 +64,7 @@
               </div>
             </div>
             <div class="terminal" id="terminal-content" aria-live="polite"></div>
-            <div class="terminal-footer"><span class="status-dot green"></span><span id="terminal-status">Ready when you are</span><button data-open="command" aria-label="Explore the command menu"><span class="icon" data-icon="search"></span><kbd>⌘K</kbd></button></div>
+            <div class="terminal-footer"><span class="status-dot green"></span><span id="terminal-status">Completed</span><button data-open="command" aria-label="Explore the command menu"><span class="icon" data-icon="search"></span><kbd>⌘K</kbd></button></div>
           </div>
           <div class="demo-shade" id="demo-shade" hidden></div>
           <section class="palette floating-panel" id="palette" aria-label="Demo command menu" hidden>
@@ -74,30 +73,27 @@
           </section>
           <section class="links-panel floating-panel" id="links-panel" aria-label="Demo links" hidden>
             <div class="floating-head"><span class="icon" data-icon="external-link"></span><span>Links</span><button class="escape-key" data-close aria-label="Close links">esc</button></div>
-            <a class="link-row" href="https://github.com/cristicretu/diri/pulls" target="_blank" rel="noopener noreferrer"><span class="icon pr-icon" data-icon="pull-request"></span><span><strong>Everything in its place</strong><small>Pull request · Preview</small></span><span class="checks-label">Checks passed</span><span class="icon" data-icon="external-link"></span></a>
-            <button class="link-row" id="preview-website"><span class="icon" data-icon="monitor"></span><span><strong>The website</strong><small>You're looking at it</small></span><span class="icon" data-icon="external-link"></span></button>
-            <div class="link-context"><span class="icon" data-icon="branch"></span>Branch <span>design/a-little-more-diri</span></div>
+            <a class="link-row" href="https://github.com/cristicretu/diri/pulls" target="_blank" rel="noopener noreferrer"><span class="icon pr-icon" data-icon="pull-request"></span><span><strong>Update website</strong><small>Pull request · Preview</small></span><span class="checks-label">Checks passed</span><span class="icon" data-icon="external-link"></span></a>
+            <button class="link-row" id="preview-website"><span class="icon" data-icon="monitor"></span><span><strong>Website</strong><small>Local preview</small></span><span class="icon" data-icon="external-link"></span></button>
+            <div class="link-context"><span class="icon" data-icon="branch"></span>Branch <span>design/website</span></div>
           </section>
           <section class="notifications-panel floating-panel" id="notifications-panel" aria-label="Demo notifications" hidden>
             <div class="floating-head"><span class="icon" data-icon="bell"></span><span>Notifications</span><button class="escape-key" data-close aria-label="Close notifications">esc</button></div>
-            <button class="notification-row" data-chat="website"><span class="icon green-icon" data-icon="check-circle"></span><span><strong>A little more Diri</strong><small>Claude finished · Just now</small></span></button>
-            <button class="notification-row" data-chat="notes"><span class="icon orange-icon" data-icon="bell"></span><span><strong>Make sense of the notes</strong><small>Codex has a question</small></span></button>
+            <button class="notification-row" data-chat="website"><span class="icon green-icon" data-icon="check-circle"></span><span><strong>Diri website</strong><small>Claude finished · Just now</small></span></button>
+            <button class="notification-row" data-chat="notes"><span class="icon orange-icon" data-icon="bell"></span><span><strong>Weekly plan</strong><small>Codex has a question</small></span></button>
           </section>
         </div>
-        <div class="preview-caption"><p><span class="caption-dash"></span>Less keeping track. More getting somewhere.</p><span>Interactive preview <span aria-hidden="true">↗</span></span></div>
       </section>
 
-      <section class="compatible" aria-label="Compatible agents"><p>Good company for the tools you already use.</p><div><span><i class="agent-logo" data-agent="claude"></i>Claude Code</span><span><i class="agent-logo" data-agent="codex"></i>Codex</span><span><i class="agent-logo" data-agent="cursor"></i>Cursor</span><span><i class="agent-logo" data-agent="gemini"></i>Gemini</span><span class="and-more">& more</span></div></section>
+      <section class="compatible" aria-label="Compatible agents"><div><span><i class="agent-logo" data-agent="claude"></i>Claude Code</span><span><i class="agent-logo" data-agent="codex"></i>Codex</span><span><i class="agent-logo" data-agent="cursor"></i>Cursor</span><span><i class="agent-logo" data-agent="gemini"></i>Gemini</span></div></section>
 
-      <section class="details" aria-label="Why Diri">
-        <article><span class="detail-number">01</span><h2>Know when you're needed.</h2><p>Working, waiting, or ready to review.<br> A little signal. A lot less checking.</p></article>
-        <article><span class="detail-number">02</span><h2>Leave. Come right back.</h2><p>Close the window and get on with your day. Your local sessions keep going.</p></article>
-        <article><span class="detail-number">03</span><h2>Make yourself at home.</h2><p>Your tools. Your machine. Your themes.<br> No Diri account standing in the way.</p></article>
+      <section class="details" aria-label="Features">
+        <article><h2>Live status</h2><p>See which agents are working or need your input.</p></article>
+        <article><h2>Persistent sessions</h2><p>Close the window. Your local agents keep running.</p></article>
+        <article><h2>Local first</h2><p>Your machine, your tools. No Diri account required.</p></article>
       </section>
-      <section class="closing"><p>A small app.<br><span>A little less in your way.</span></p><a class="button primary" href="https://github.com/cristicretu/diri/releases/latest" target="_blank" rel="noopener noreferrer">Make room for Diri<span class="icon" data-icon="download"></span></a></section>
     </main>
-    <footer class="site-footer"><a class="footer-brand" href="#">diri.</a><span>Made with care. Open by nature.</span><a href="https://github.com/cristicretu/diri/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">Apache 2.0</a><div class="appearance" role="group" aria-label="Website appearance"><button data-theme-choice="light" aria-pressed="true" aria-label="Light appearance"><span class="icon" data-icon="monitor"></span></button><button data-theme-choice="dark" aria-pressed="false" aria-label="Dark appearance"><span class="icon" data-icon="moon"></span></button></div></footer>
+    <footer class="site-footer"><a class="footer-brand" href="#">diri.</a><a href="https://github.com/cristicretu/diri/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">Apache 2.0</a></footer>
   </div>
-  <div class="sr-only" id="announcement" aria-live="polite"></div>
 </body>
 </html>
