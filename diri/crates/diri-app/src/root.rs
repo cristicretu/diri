@@ -1190,6 +1190,19 @@ impl RootView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // The close dialog overlays the focused surface without taking its
+        // focus. Handle its keys first so they cannot reach the terminal or
+        // sidebar beneath it, and focus is preserved when closing is canceled.
+        if self.sidebar.read(cx).pending_close_copy().is_some() {
+            self.sidebar
+                .update(cx, |sidebar, cx| match event.keystroke.key.as_str() {
+                    "enter" => sidebar.confirm_close(cx),
+                    "escape" => sidebar.cancel_close(cx),
+                    _ => {}
+                });
+            cx.stop_propagation();
+            return;
+        }
         if self.notification_panel_open && self.notification_key(event, window, cx) {
             return;
         }
@@ -3478,6 +3491,73 @@ fn preview_hint(system_image: &str, label: &str, colors: SemanticColors) -> AnyE
 mod tests {
     use super::*;
     use crate::sidebar::{PreviewScenario, SidebarPreviewFixture};
+
+    #[gpui::test]
+    fn close_confirmation_keyboard_from_terminal(cx: &mut gpui::TestAppContext) {
+        check_close_confirmation_keyboard(cx, false);
+    }
+
+    #[gpui::test]
+    fn close_confirmation_keyboard_from_sidebar(cx: &mut gpui::TestAppContext) {
+        check_close_confirmation_keyboard(cx, true);
+    }
+
+    fn check_close_confirmation_keyboard(cx: &mut gpui::TestAppContext, sidebar_focused: bool) {
+        cx.update(|cx| commands::bind_keys(cx, &Default::default()));
+        let runtime = Arc::new(crate::store::StoreRuntime::inert());
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let selected = fixture.selected_session_id.expect("selected session");
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.select(selected.clone());
+        }
+        let services = Arc::new(AppServices {
+            store: runtime.clone(),
+            usage_tx: tokio::sync::watch::channel(crate::usage::UsageSnapshot::default()).0,
+            usage_limits_refresh: tokio::sync::mpsc::channel(1).0,
+            updates: crate::updates::inert(),
+            dev_build: None,
+            daemon_startup: None,
+            tokio: Arc::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap(),
+            ),
+        });
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Typical, window, cx)
+        });
+        if sidebar_focused {
+            root.update_in(cx, |root, window, cx| {
+                root.sidebar
+                    .update(cx, |sidebar, cx| sidebar.focus(window, cx));
+            });
+        }
+
+        cx.simulate_keystrokes("cmd-w");
+        assert!(runtime.store.read().unwrap().pending_close().is_some());
+        cx.simulate_keystrokes("escape");
+        {
+            let store = runtime.store.read().unwrap();
+            assert!(
+                store.pending_close().is_none(),
+                "Escape must cancel closing"
+            );
+            assert_eq!(store.selected_session_id(), Some(&selected));
+        }
+
+        cx.simulate_keystrokes("cmd-w");
+        assert!(runtime.store.read().unwrap().pending_close().is_some());
+        cx.simulate_keystrokes("enter");
+        let store = runtime.store.read().unwrap();
+        assert!(
+            store.pending_close().is_none(),
+            "Enter must confirm closing"
+        );
+        assert_ne!(store.selected_session_id(), Some(&selected));
+    }
 
     #[cfg(target_os = "macos")]
     #[gpui::test]
