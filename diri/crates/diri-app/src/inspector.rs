@@ -77,7 +77,12 @@ pub enum InspectorEvent {
     Close,
     SessionChanged,
     WorkspaceChanged(WorkspaceSurface),
-    WorkspaceClosed { surface: WorkspaceSurface, id: u64 },
+    /// Restore a conversation's inspector without moving keyboard focus into it.
+    WorkspaceRestored(WorkspaceSurface),
+    WorkspaceClosed {
+        surface: WorkspaceSurface,
+        id: u64,
+    },
     RequestTerminal,
     Browser(BrowserAction),
 }
@@ -883,8 +888,10 @@ impl WorkbenchInspector {
         self.state = LoadState::NoSession;
         self.review_state = ReviewLoadState::NoSession;
         self.transcript_state = TranscriptLoadState::Unavailable;
-        if let Some(id) = next.active {
-            self.activate_workspace(id, cx);
+        if let Some(id) = next.active
+            && let Some(surface) = self.load_workspace(id, cx)
+        {
+            cx.emit(InspectorEvent::WorkspaceRestored(surface));
         }
         self.reconcile_diff_polling(cx);
         cx.emit(InspectorEvent::SessionChanged);
@@ -1002,14 +1009,18 @@ impl WorkbenchInspector {
     }
 
     fn activate_workspace(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(surface) = self.load_workspace(id, cx) {
+            cx.emit(InspectorEvent::WorkspaceChanged(surface));
+        }
+    }
+
+    fn load_workspace(&mut self, id: u64, cx: &mut Context<Self>) -> Option<WorkspaceSurface> {
         self.workspace_chooser_open = false;
         if self.workspace_active == Some(id) {
             cx.notify();
-            return;
+            return None;
         }
-        let Some(index) = self.workspace_tabs.iter().position(|tab| tab.id == id) else {
-            return;
-        };
+        let index = self.workspace_tabs.iter().position(|tab| tab.id == id)?;
         let previous_index = self
             .workspace_tabs
             .iter()
@@ -1071,8 +1082,8 @@ impl WorkbenchInspector {
             self.refresh_transcript(&context, false, cx);
         }
         self.reconcile_diff_polling(cx);
-        cx.emit(InspectorEvent::WorkspaceChanged(surface));
         cx.notify();
+        Some(surface)
     }
 
     fn close_workspace(&mut self, id: u64, cx: &mut Context<Self>) {

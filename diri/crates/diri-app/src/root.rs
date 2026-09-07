@@ -527,8 +527,12 @@ impl RootView {
                         this.begin_inspector_slide(cx);
                         cx.notify();
                     }
-                    InspectorEvent::WorkspaceChanged(surface) => {
-                        window.focus(&this.focus, cx);
+                    InspectorEvent::WorkspaceChanged(surface)
+                    | InspectorEvent::WorkspaceRestored(surface) => {
+                        let focus_workspace = matches!(event, InspectorEvent::WorkspaceChanged(_));
+                        if focus_workspace {
+                            window.focus(&this.focus, cx);
+                        }
                         #[cfg(target_os = "macos")]
                         if *surface == crate::inspector::WorkspaceSurface::Browser
                             && let Some(inspector) = &this.inspector
@@ -539,13 +543,14 @@ impl RootView {
                             let blank = state.url.is_none();
                             inspector.update(cx, |inspector, cx| {
                                 inspector.set_browser_state(state, cx);
-                                if blank {
+                                if blank && focus_workspace {
                                     inspector.focus_browser_address(window, cx);
                                 }
                             });
                         }
                         if let Some(terminal) = &this.auxiliary_terminal
                             && *surface == crate::inspector::WorkspaceSurface::Terminal
+                            && focus_workspace
                         {
                             terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
                         }
@@ -3793,6 +3798,114 @@ mod tests {
                     .unwrap(),
             ),
         })
+    }
+
+    #[gpui::test]
+    fn switching_sidebar_conversations_keeps_terminal_focused(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let services = test_services();
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let runtime = services.store.clone();
+        {
+            let mut store = services.store.store.write().unwrap();
+            store
+                .update_preferences(|prefs| *prefs = fixture.prefs)
+                .unwrap();
+            store.hydrate(fixture.list);
+            store.select(SessionId::new("preview-claude"));
+            store.select(SessionId::new("preview-codex"));
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        let mut input = root.update(cx, |root, cx| {
+            root.terminal
+                .as_ref()
+                .unwrap()
+                .update(cx, |terminal, _| terminal.capture_input_for_test())
+        });
+        // Explicit inspector navigation may take focus; restoring this same
+        // blank browser tab after a conversation switch must not.
+        root.update(cx, |root, cx| {
+            root.inspector
+                .as_ref()
+                .unwrap()
+                .update(cx, |inspector, cx| {
+                    inspector.select_workspace(crate::inspector::WorkspaceSurface::Browser, cx);
+                });
+        });
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        cx.run_until_parked();
+        root.update_in(cx, |root, window, cx| {
+            assert!(
+                !root.terminal.as_ref().unwrap().read(cx).is_focused(window),
+                "explicit browser tab activation still takes focus"
+            );
+        });
+        for peeking in [false, true] {
+            if peeking {
+                root.update(cx, |root, cx| {
+                    root.sidebar.update(cx, |sidebar, cx| sidebar.conceal(cx));
+                });
+                cx.run_until_parked();
+                let edge = cx.debug_bounds("sidebar-peek-edge").unwrap();
+                cx.simulate_mouse_move(edge.center(), None, Modifiers::default());
+                cx.executor().advance_clock(Duration::from_millis(25));
+                cx.run_until_parked();
+            }
+            for id in ["preview-claude", "preview-codex", "preview-claude"] {
+                // Debug selectors are paint-local; refresh the cached sidebar
+                // before locating a row, never after the click under test.
+                root.update(cx, |root, cx| root.sidebar.update(cx, |_, cx| cx.notify()));
+                cx.run_until_parked();
+                let session = cx
+                    .debug_bounds(if id == "preview-claude" {
+                        "SESSION_preview-claude"
+                    } else {
+                        "SESSION_preview-codex"
+                    })
+                    .unwrap_or_else(|| panic!("visible row {id} (peek={peeking})"));
+                cx.simulate_click(session.center(), Modifiers::default());
+                // The inert runtime has no effect worker. Deliver the real local
+                // change broadcast so inspector restoration runs after the click.
+                runtime.publish_local_change();
+                cx.run_until_parked();
+                root.update_in(cx, |root, window, cx| {
+                    assert!(
+                        root.terminal.as_ref().unwrap().read(cx).is_focused(window),
+                        "terminal must accept typing after sidebar selection (peek={peeking})"
+                    );
+                });
+                cx.simulate_input("a");
+                cx.simulate_keystrokes("enter");
+                let mut bytes = Vec::new();
+                while let Ok((target, chunk)) = input.try_recv() {
+                    assert_eq!(
+                        target,
+                        SessionId::new(id),
+                        "typing must reach the selected conversation"
+                    );
+                    bytes.extend(chunk);
+                }
+                assert_eq!(
+                    bytes, b"a\r",
+                    "typing must work without clicking the terminal"
+                );
+            }
+            if peeking {
+                cx.simulate_mouse_move(
+                    gpui::point(px(600.0), px(300.0)),
+                    None,
+                    Modifiers::default(),
+                );
+                cx.executor().advance_clock(Duration::from_millis(300));
+                cx.run_until_parked();
+                root.update_in(cx, |root, window, cx| {
+                    assert!(!root.sidebar.read(cx).is_peeking());
+                    assert!(root.terminal.as_ref().unwrap().read(cx).is_focused(window));
+                });
+            }
+        }
     }
 
     #[gpui::test]

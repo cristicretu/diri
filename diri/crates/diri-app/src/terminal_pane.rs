@@ -262,15 +262,24 @@ enum AttachmentCommand {
     Close,
 }
 
+#[cfg(test)]
+type InputObserver = mpsc::UnboundedSender<(SessionId, Vec<u8>)>;
+
 #[derive(Clone)]
 struct AttachmentControl {
     tx: mpsc::UnboundedSender<AttachmentCommand>,
+    #[cfg(test)]
+    input_observer: Option<(SessionId, InputObserver)>,
 }
 
 impl AttachmentControl {
     fn input(&self, bytes: Vec<u8>) {
         if bytes.is_empty() {
             return;
+        }
+        #[cfg(test)]
+        if let Some((id, observer)) = &self.input_observer {
+            let _ = observer.send((id.clone(), bytes.clone()));
         }
         let _ = self.tx.send(AttachmentCommand::Input(bytes));
     }
@@ -625,6 +634,8 @@ pub struct TerminalPane {
     /// daemon-created id asynchronously, so this transition is also the
     /// reliable point at which keyboard focus can leave the picker.
     observed_selected_id: Option<SessionId>,
+    #[cfg(test)]
+    input_observer: Option<InputObserver>,
     viewport: Option<TerminalViewport>,
     sidebar_visible: bool,
     inspector_open: bool,
@@ -749,6 +760,8 @@ impl TerminalPane {
             started_at: Instant::now(),
             session_source,
             observed_selected_id,
+            #[cfg(test)]
+            input_observer: None,
             viewport: None,
             sidebar_visible: true,
             inspector_open: false,
@@ -827,6 +840,11 @@ impl TerminalPane {
                 generation,
                 self.pane_tx.clone(),
             );
+            #[cfg(test)]
+            let attachment = AttachmentControl {
+                input_observer: self.input_observer.clone().map(|tx| (id.clone(), tx)),
+                ..attachment
+            };
             let ime_attachment = attachment.clone();
             let element = match parked {
                 // The parked cells paint on the first frame; the attach's
@@ -944,6 +962,22 @@ impl TerminalPane {
 
     pub fn is_focused(&self, window: &Window) -> bool {
         self.focus.is_focused(window)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capture_input_for_test(
+        &mut self,
+    ) -> mpsc::UnboundedReceiver<(SessionId, Vec<u8>)> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.input_observer = Some(tx.clone());
+        for (id, resident) in &mut self.residents {
+            resident.attachment.input_observer = Some((id.clone(), tx.clone()));
+            let attachment = resident.attachment.clone();
+            resident.element = resident.element.clone().on_text_input(move |text| {
+                attachment.input(text.as_bytes().to_vec());
+            });
+        }
+        rx
     }
 
     #[must_use]
@@ -3352,7 +3386,11 @@ fn spawn_attachment(
     pane_tx: PaneEventSender,
 ) -> AttachmentControl {
     let (command_tx, mut commands) = mpsc::unbounded_channel();
-    let control = AttachmentControl { tx: command_tx };
+    let control = AttachmentControl {
+        tx: command_tx,
+        #[cfg(test)]
+        input_observer: None,
+    };
     runtime.spawn(async move {
         // The first resize must be the measured pane geometry: deferred agent
         // launch waits for it. Do not seed an arbitrary 80×24 size.
