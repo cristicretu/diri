@@ -79,13 +79,22 @@ if (gl) {
   const compile = (type, source) => {
     const shader = gl.createShader(type);
     gl.shaderSource(shader, source); gl.compileShader(shader);
-    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) { gl.deleteShader(shader); return null; }
     return shader;
   };
   const vs = compile(gl.VERTEX_SHADER, vertex), fs = compile(gl.FRAGMENT_SHADER, fragment);
   if (vs && fs) {
     const program = gl.createProgram(); gl.attachShader(program, vs); gl.attachShader(program, fs); gl.linkProgram(program);
-    if (gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    const parallel = gl.getExtension('KHR_parallel_shader_compile');
+    const initialize = () => {
+      if (gl.isContextLost()) return;
+      if (parallel && !gl.getProgramParameter(program, parallel.COMPLETION_STATUS_KHR)) {
+        requestAnimationFrame(initialize);
+        return;
+      }
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        gl.deleteProgram(program); gl.deleteShader(vs); gl.deleteShader(fs);
+        return;
+      }
       gl.useProgram(program);
       const buffer = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
       gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,1,-1,-1,1,-1,1,1,-1,1,1]), gl.STATIC_DRAW);
@@ -157,6 +166,7 @@ if (gl) {
         stop(); canvas.classList.remove('ready'); control.hidden = true;
       });
       resize(); update();
-    }
+    };
+    requestAnimationFrame(initialize);
   }
 }

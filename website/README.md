@@ -1,4 +1,4 @@
-# Diri website — first draft
+# Diri website
 
 A compact, static product page using Diri's own icons, agent marks, system type, and 5/7/12px control radii. The page and interactive workspace use the official Rosé Pine dark palette throughout. There is no appearance toggle or stored theme preference.
 
@@ -10,7 +10,7 @@ From this directory:
 npm run dev
 ```
 
-Open http://localhost:4177. Requires Node.js; no install or build step. Set `PORT` to use another local port. `npm run check` checks JavaScript syntax.
+Open http://localhost:4177. Requires Node.js; no install or build step. Set `PORT` to use another local port. `npm run check` checks JavaScript syntax. `npm run verify` builds the Cloudflare output and validates the SEO and public file set.
 
 ## What's interactive
 
@@ -53,3 +53,11 @@ The default mesh adds slowly warped color folds, stationary fine grain, and a di
 Verified both shaders compile without WebGL errors; the experimental version drew 20 frames in a one-second local Chrome sample under its 24 fps cap. Pause/resume, reduced motion, offscreen suspension, CSS fallback, and mobile widths were checked. Mockup scrolling passes to the page, mouse focus restoration has no outline, and keyboard restoration uses a 1px inset indicator.
 
 Preview controls share translucent hover, selected, selected-hover, and pressed fills with short color transitions. Hover styling is limited to fine pointers. Tabs, provider buttons, and rows retain distinct selection; Links and Notifications expose their open state and clear it on dismissal. Keyboard focus uses an inset indicator, while pointer restoration does not draw a ring. Verified mouse press/hover, selected hover, touch dismissal, keyboard palette navigation, and toolbar state cleanup.
+
+## Production and SEO
+
+The canonical site is `https://diri.sh/`. Cloudflare Pages configuration, domain redirects, and the remaining DNS/Search Console steps are in [CLOUDFLARE.md](CLOUDFLARE.md). `npm run build` produces only deployable files in `dist/`, fingerprints CSS/JavaScript for immutable browser caching, and generates CSP and preview-host noindex headers. Runtime code has no added dependencies.
+
+The page includes a descriptive title, description, canonical URL, Open Graph and Twitter large-image metadata, WebSite/WebPage/SoftwareApplication JSON-LD, a single-URL sitemap, robots.txt, branded icons, and an 80 KB social card. The interactive demonstration is excluded from Google snippets with `data-nosnippet`; real feature copy remains static and crawlable. The custom 404 prevents Pages from treating arbitrary URLs as copies of the home page.
+
+The Apple and Linux marks are from [Simple Icons](https://github.com/simple-icons/simple-icons), distributed under CC0; brand rights remain with their owners. The button is text-only, with platform icons alongside it. Shader linking uses `KHR_parallel_shader_compile` when available to avoid blocking the page while the program compiles; the CSS background remains available throughout startup.

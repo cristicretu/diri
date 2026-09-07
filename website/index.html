@@ -4,9 +4,97 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#191724">
-  <meta name="description" content="A native workspace for your AI agents. Bring Claude Code, Codex, your chats, and your projects together in Diri.">
-  <title>Diri — a workspace for your agents</title>
-  <link rel="icon" href="assets/brand/diri.svg" type="image/svg+xml">
+  <title>Diri — Workspace for Claude Code, Codex &amp; AI Agents</title>
+  <meta name="description" content="Run Claude Code, Codex, Cursor, and Gemini side by side. Keep sessions alive, review changes, and track usage. Free, open-source app for macOS and Linux beta.">
+  <meta name="robots" content="index, follow, max-image-preview:large">
+  <link rel="canonical" href="https://diri.sh/">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Diri">
+  <meta property="og:locale" content="en_US">
+  <meta property="og:url" content="https://diri.sh/">
+  <meta property="og:title" content="Diri — Workspace for Claude Code, Codex &amp; AI Agents">
+  <meta property="og:description" content="Run Claude Code, Codex, Cursor, and Gemini side by side. Keep sessions alive, review changes, and track usage. Free, open-source app for macOS and Linux beta.">
+  <meta property="og:image" content="https://diri.sh/assets/social-card.jpg">
+  <meta property="og:image:type" content="image/jpeg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="Diri’s native workspace with Claude Code, Codex, Cursor, and Gemini sessions, alongside code changes.">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Diri — Workspace for Claude Code, Codex &amp; AI Agents">
+  <meta name="twitter:description" content="Run Claude Code, Codex, Cursor, and Gemini side by side. Keep sessions alive, review changes, and track usage. Free, open-source app for macOS and Linux beta.">
+  <meta name="twitter:image" content="https://diri.sh/assets/social-card.jpg">
+  <meta name="twitter:image:alt" content="Diri’s native workspace for parallel AI agents.">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" sizes="any">
+  <link rel="icon" href="/favicon-96.png" type="image/png" sizes="96x96">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180">
+  <script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "WebSite",
+      "@id": "https://diri.sh/#website",
+      "url": "https://diri.sh/",
+      "name": "Diri",
+      "alternateName": "diri.sh",
+      "inLanguage": "en"
+    },
+    {
+      "@type": "WebPage",
+      "@id": "https://diri.sh/#webpage",
+      "url": "https://diri.sh/",
+      "name": "Diri — Workspace for Claude Code, Codex & AI Agents",
+      "description": "Run Claude Code, Codex, Cursor, and Gemini side by side. Keep sessions alive, review changes, and track usage. Free, open-source app for macOS and Linux beta.",
+      "isPartOf": {
+        "@id": "https://diri.sh/#website"
+      },
+      "mainEntity": {
+        "@id": "https://diri.sh/#app"
+      },
+      "primaryImageOfPage": {
+        "@type": "ImageObject",
+        "url": "https://diri.sh/assets/social-card.jpg",
+        "width": 1200,
+        "height": 630
+      },
+      "inLanguage": "en"
+    },
+    {
+      "@type": "SoftwareApplication",
+      "@id": "https://diri.sh/#app",
+      "name": "Diri",
+      "url": "https://diri.sh/",
+      "description": "Run Claude Code, Codex, Cursor, and Gemini side by side. Keep sessions alive, review changes, and track usage. Free, open-source app for macOS and Linux beta.",
+      "applicationCategory": "DeveloperApplication",
+      "operatingSystem": [
+        "macOS",
+        "Linux"
+      ],
+      "isAccessibleForFree": true,
+      "license": "https://github.com/cristicretu/diri/blob/main/LICENSE",
+      "downloadUrl": "https://github.com/cristicretu/diri/releases/latest",
+      "sameAs": [
+        "https://github.com/cristicretu/diri"
+      ],
+      "image": "https://diri.sh/assets/social-card.jpg",
+      "offers": {
+        "@type": "Offer",
+        "price": "0",
+        "priceCurrency": "USD",
+        "url": "https://github.com/cristicretu/diri/releases/latest"
+      },
+      "featureList": [
+        "Parallel AI agent sessions",
+        "Persistent local sessions",
+        "Isolated Git worktrees",
+        "Code review and pull request status",
+        "Usage and account profiles",
+        "Remote sessions over SSH"
+      ]
+    }
+  ]
+}
+  </script>
   <link rel="stylesheet" href="style.css">
   <script src="agent-previews.js" defer></script>
   <script src="app.js" defer></script>
@@ -24,15 +112,15 @@
       <section class="intro" aria-labelledby="page-title">
         <div class="intro-heading">
           <h1 id="page-title">Your agents in one workspace</h1>
-          <p>Run agents side by side, keep sessions alive, and review their work.</p>
+          <p>Run AI agents side by side, keep sessions alive, and review their work.</p>
         </div>
         <div class="intro-detail">
-          <a class="button primary" href="https://github.com/cristicretu/diri/releases/latest" target="_blank" rel="noopener noreferrer"><span class="icon" data-icon="download"></span>Download Diri</a>
-          <p class="download-note">macOS and Linux beta</p>
+          <a class="button primary" href="https://github.com/cristicretu/diri/releases/latest" target="_blank" rel="noopener noreferrer">Download Diri</a>
+          <div class="download-platforms" aria-label="Available platforms"><span class="platform-mark" role="img" aria-label="macOS" title="macOS"><img src="/assets/brand/apple.svg" width="16" height="16" alt=""></span><span class="platform-mark" role="img" aria-label="Linux beta" title="Linux (beta)"><img src="/assets/brand/linux.svg" width="17" height="18" alt=""></span></div>
         </div>
       </section>
 
-      <section class="product" aria-label="Interactive Diri preview">
+      <section class="product" aria-label="Interactive Diri preview" data-nosnippet>
         <div class="preview-toolbar">
           <div class="demo-tabs" role="tablist" aria-label="Explore Diri">
             <button class="demo-tab active" id="tab-workspace" role="tab" aria-selected="true" aria-controls="demo-window" data-view="workspace">Workspace</button>
@@ -56,7 +144,7 @@
             <div class="app-titlebar"><span class="traffic-lights mobile-traffic-lights" aria-hidden="true"><i></i><i></i><i></i></span>
               <span class="icon session-icon" data-icon="terminal"></span><span class="session-name" id="session-name">Build the Diri website</span>
               <div class="app-tools">
-                <button class="app-tool links-trigger" data-open="links" aria-expanded="false" aria-controls="links-panel" aria-label="Open demo links">Links <span class="link-count">2</span><span class="icon" data-icon="chevron-down"></span></button>
+                <button class="app-tool links-trigger" data-open="links" aria-expanded="false" aria-controls="links-panel">Links <span class="link-count">2</span><span class="icon" data-icon="chevron-down"></span></button>
                 <span class="current-agent"><span class="agent-logo" data-agent="codex"></span><span id="agent-name">Codex</span></span>
                 <button class="icon-button" id="toggle-changes" aria-label="Toggle changes" aria-expanded="true"><span class="icon" data-icon="sidebar-right"></span></button>
                 <button class="icon-button notification-trigger" data-open="notifications" aria-expanded="false" aria-controls="notifications-panel" aria-label="Open demo notifications"><span class="icon" data-icon="bell"></span></button>

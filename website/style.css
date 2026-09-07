@@ -530,3 +530,18 @@ body { isolation: isolate; position: relative; min-height: 100svh; }
 .product[data-input-method="pointer"] :is(button, a):focus-visible,
 .compatible[data-input-method="pointer"] .agent-switch:focus-visible { outline: none; }
 .product[data-input-method="keyboard"] .palette-option { transition: none; }
+
+.not-found { min-height: 100svh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 24px; padding: 32px; text-align: center; }
+.not-found > p { color: var(--rp-subtle); font-size: 13px; }
+.not-found h1 { font-size: clamp(28px, 6vw, 42px); }
+
+/* One compact download action, with platform marks as quiet supporting detail. */
+.intro-detail { gap: 18px; }
+.intro-detail .button.primary { min-width: 132px; height: 38px; padding: 0 18px; border-radius: 7px; color: #f0c5c3; background: #ebbcba16; border: 1px solid #ebbcba38; box-shadow: inset 0 1px 0 #ebbcba08; font-size: 13px; font-weight: 500; transition: background-color 140ms ease, border-color 140ms ease; }
+.download-platforms { display: flex; align-items: center; gap: 13px; color: #b6afc9; }
+.platform-mark { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 24px; }
+.platform-mark img { display: block; filter: invert(81%) sepia(8%) saturate(580%) hue-rotate(214deg); }
+@media (hover: hover) and (pointer: fine) {
+  .intro-detail .button.primary:hover { background: #ebbcba24; border-color: #ebbcba52; }
+}
+.intro-detail .button.primary:active { background: #ebbcba30; transform: none; }
