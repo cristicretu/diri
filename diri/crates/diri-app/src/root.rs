@@ -51,6 +51,9 @@ mod notification_panel_tests;
 
 const WINDOW_BOUNDS_SAVE_DELAY: Duration = Duration::from_millis(150);
 const SIDEBAR_PEEK_INSET: f32 = 10.0;
+const SIDEBAR_PEEK_DWELL: Duration = Duration::from_millis(20);
+const SIDEBAR_PEEK_REVEAL: Duration = Duration::from_millis(140);
+const SIDEBAR_PEEK_TRIGGER_WIDTH: f32 = 24.0;
 
 pub(crate) fn cached_window_overlay<T: Render>(view: Entity<T>) -> impl IntoElement {
     view.cached(StyleRefinement::default().absolute().inset_0())
@@ -1944,7 +1947,14 @@ impl RootView {
         let float_to = if self.sidebar_floating { 1.0 } else { 0.0 };
         self.sidebar_panel_slide = (!cx.reduce_motion())
             .then(|| SeamSlide::begin_at(self.sidebar_panel_width, to, now))
-            .flatten();
+            .flatten()
+            .map(|slide| {
+                if sidebar.is_peeking() {
+                    slide.with_duration(SIDEBAR_PEEK_REVEAL)
+                } else {
+                    slide
+                }
+            });
         self.sidebar_float_slide = (!cx.reduce_motion())
             .then(|| SeamSlide::begin_at(self.sidebar_float, float_to, now))
             .flatten();
@@ -3250,6 +3260,10 @@ impl Render for RootView {
         let inset = SIDEBAR_PEEK_INSET * self.sidebar_float;
         let radius = Radius::PANEL * self.sidebar_float;
         let exposed = self.sidebar_panel_width;
+        // Keep workbench text from bleeding through the floating panel, then
+        // ease its material back to the docked theme alongside the geometry.
+        let mut sidebar_surface = colors.sidebar_surface();
+        sidebar_surface.a += (1.0 - sidebar_surface.a) * self.sidebar_float;
         let peek_pointer_tracking = self.sidebar.read(cx).is_peeking().then(|| {
             let region = gpui::Bounds::new(
                 gpui::point(px(0.0), px(recovery_height)),
@@ -3312,7 +3326,7 @@ impl Render for RootView {
                         .right(px(0.0))
                         .w(px(sidebar_width))
                         .rounded(px(radius))
-                        .bg(colors.sidebar_surface())
+                        .bg(sidebar_surface)
                         .occlude()
                         .shadow(vec![BoxShadow {
                             color: gpui::black().opacity(0.32 * self.sidebar_float),
@@ -3578,15 +3592,13 @@ impl Render for RootView {
                     .left_0()
                     .top(px(recovery_height + 36.0))
                     .bottom_0()
-                    .w(px(8.0))
+                    .w(px(SIDEBAR_PEEK_TRIGGER_WIDTH))
                     .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
                         this.sidebar_peek_dwell = None;
                         if *hovered {
                             this.sidebar_peek_dwell =
                                 Some(cx.spawn_in(window, async move |this, cx| {
-                                    cx.background_executor()
-                                        .timer(Duration::from_millis(100))
-                                        .await;
+                                    cx.background_executor().timer(SIDEBAR_PEEK_DWELL).await;
                                     let _ = this.update_in(cx, |this, window, cx| {
                                         this.sidebar_peek_dwell = None;
                                         this.sidebar.update(cx, |sidebar, cx| {
@@ -3860,7 +3872,7 @@ mod tests {
             .debug_bounds("sidebar-peek-edge")
             .expect("collapsed edge");
         cx.simulate_mouse_move(edge.center(), None, Modifiers::default());
-        cx.executor().advance_clock(Duration::from_millis(40));
+        cx.executor().advance_clock(Duration::from_millis(5));
         cx.simulate_mouse_move(
             gpui::point(px(600.0), px(300.0)),
             None,
@@ -3870,7 +3882,7 @@ mod tests {
         cx.run_until_parked();
         assert!(!root.read_with(cx, |root, cx| root.sidebar.read(cx).is_peeking()));
         cx.simulate_mouse_move(edge.center(), None, Modifiers::default());
-        cx.executor().advance_clock(Duration::from_millis(120));
+        cx.executor().advance_clock(Duration::from_millis(25));
         cx.run_until_parked();
         root.read_with(cx, |root, cx| {
             assert!(root.sidebar.read(cx).is_peeking());
@@ -3882,6 +3894,11 @@ mod tests {
             assert_eq!(root.sidebar_panel_width, root.sidebar.read(cx).width());
         });
         // Resting in the new inset must not start a close/reopen loop.
+        cx.simulate_mouse_move(
+            gpui::point(px(SIDEBAR_PEEK_INSET / 2.0), edge.center().y),
+            None,
+            Modifiers::default(),
+        );
         cx.executor().advance_clock(Duration::from_secs(1));
         cx.run_until_parked();
         assert!(root.read_with(cx, |root, cx| root.sidebar.read(cx).is_peeking()));
