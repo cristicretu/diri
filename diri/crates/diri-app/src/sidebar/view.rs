@@ -131,6 +131,8 @@ pub(crate) enum SidebarEvent {
     OpenAgentSettings(Option<String>),
     /// One-click path from the footer menu into the Remote host editor.
     AddRemoteHost,
+    /// One-click path from the account menu to the latest release notes.
+    OpenWhatsNew,
     /// A plain click (or shortcut) selected a session: hand keyboard focus
     /// to its terminal surface so the user can type immediately.
     SessionActivated,
@@ -4632,6 +4634,37 @@ impl Sidebar {
             .child(menu_divider(colors))
             .child(
                 div()
+                    .id("account-whats-new")
+                    .debug_selector(|| "account-whats-new".into())
+                    .mx(px(6.0))
+                    .px(px(8.0))
+                    .h(px(30.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(9.0))
+                    .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
+                    .cursor_pointer()
+                    .hover(move |element| element.bg(colors.primary.alpha(0.06)))
+                    .text_size(px(Typo::ROW.size))
+                    .text_color(colors.primary)
+                    .child(
+                        div()
+                            .w(px(24.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(sf_symbol("sparkles", 11.0, colors.secondary)),
+                    )
+                    .child(div().flex_1().child("What's New"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.ui.popover = None;
+                        cx.emit(SidebarEvent::OpenWhatsNew);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
                     .id("quick-add-remote-host")
                     .debug_selector(|| "quick-add-remote-host".into())
                     .mx(px(6.0))
@@ -8189,6 +8222,7 @@ mod tests {
         assert!(cx.debug_bounds("account-usage-session").is_some());
         assert!(cx.debug_bounds("account-usage-today").is_some());
         assert!(cx.debug_bounds("account-usage-month").is_some());
+        assert!(cx.debug_bounds("account-whats-new").is_some());
         assert!(cx.debug_bounds("quick-add-remote-host").is_some());
         assert!(cx.debug_bounds("account-settings").is_some());
     }

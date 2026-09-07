@@ -43,6 +43,7 @@ pub struct SettingsNav {
 pub enum SettingsTab {
     #[default]
     General,
+    WhatsNew,
     Agents,
     Skills,
     Accounts,
@@ -56,8 +57,9 @@ pub enum SettingsTab {
 }
 
 impl SettingsTab {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::General,
+        Self::WhatsNew,
         Self::Agents,
         Self::Skills,
         Self::Accounts,
@@ -73,6 +75,7 @@ impl SettingsTab {
     pub const fn label(self) -> &'static str {
         match self {
             Self::General => "General",
+            Self::WhatsNew => "What's New",
             Self::Agents => "Agents",
             Self::Skills => "Skills",
             Self::Accounts => "Accounts",
@@ -89,6 +92,7 @@ impl SettingsTab {
     pub const fn subtitle(self) -> &'static str {
         match self {
             Self::General => "Startup, sessions, and updates",
+            Self::WhatsNew => "Latest release notes",
             Self::Agents => "Installed CLIs and quick create",
             Self::Skills => "Browse local and project skills",
             Self::Accounts => "Profiles for work and personal accounts",
@@ -107,6 +111,7 @@ impl SettingsTab {
     pub const fn section(self) -> SettingsSection {
         match self {
             Self::General
+            | Self::WhatsNew
             | Self::Agents
             | Self::Skills
             | Self::Accounts
@@ -122,6 +127,7 @@ impl SettingsTab {
     pub const fn icon(self) -> &'static str {
         match self {
             Self::General => "gearshape",
+            Self::WhatsNew => "sparkles",
             Self::Agents => "sparkles",
             Self::Skills => "doc.text",
             Self::Accounts => "account.circle",

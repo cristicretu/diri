@@ -65,6 +65,18 @@ enum SettingsMenu {
     MemoryLimit,
 }
 
+#[derive(Default)]
+enum ReleaseNotesState {
+    #[default]
+    Idle,
+    Loading,
+    Loaded {
+        release: diri_updater::ReleaseNotes,
+        document: Arc<crate::markdown::MarkdownDocument>,
+    },
+    Failed(String),
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum HostFormField {
     #[default]
@@ -266,6 +278,7 @@ pub struct UtilitySurfaces {
     usage_days: usize,
     usage_tokens: bool,
     usage_by_day: bool,
+    release_notes: ReleaseNotesState,
     settings_scroll: ScrollHandle,
     settings_search: QueryEditor,
     settings_search_active: bool,
@@ -321,6 +334,7 @@ impl UtilitySurfaces {
             .map(|value| value.to_ascii_lowercase());
         let settings_tab = match settings_preview.as_deref() {
             Some("terminal" | "appearance") => SettingsTab::Terminal,
+            Some("whats-new" | "what's-new") => SettingsTab::WhatsNew,
             Some("agents") => SettingsTab::Agents,
             Some("skills") => SettingsTab::Skills,
             Some("accounts") => SettingsTab::Accounts,
@@ -414,6 +428,7 @@ impl UtilitySurfaces {
             usage_days: 30,
             usage_tokens: false,
             usage_by_day: false,
+            release_notes: ReleaseNotesState::default(),
             settings_scroll: ScrollHandle::new(),
             settings_search: QueryEditor::default(),
             settings_search_active: false,
@@ -492,6 +507,39 @@ impl UtilitySurfaces {
             };
             let _ = this.update(cx, |this, cx| {
                 this.worktrees.finish_refresh(result);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn refresh_release_notes(&mut self, cx: &mut Context<Self>) {
+        if matches!(
+            self.release_notes,
+            ReleaseNotesState::Loading | ReleaseNotesState::Loaded { .. }
+        ) {
+            return;
+        }
+        self.release_notes = ReleaseNotesState::Loading;
+        cx.notify();
+
+        let runtime = Arc::clone(&self.runtime);
+        cx.spawn(async move |this, cx| {
+            let task = runtime.spawn_blocking(diri_updater::fetch_latest_release_notes);
+            let result = match task.await {
+                Ok(Ok(release)) => Ok(release),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.release_notes = match result {
+                    Ok(release) => {
+                        let document =
+                            Arc::new(crate::markdown::MarkdownDocument::parse(&release.body));
+                        ReleaseNotesState::Loaded { release, document }
+                    }
+                    Err(error) => ReleaseNotesState::Failed(error),
+                };
                 cx.notify();
             });
         })
@@ -998,6 +1046,9 @@ impl UtilitySurfaces {
         if self.settings_tab == SettingsTab::Skills {
             self.refresh_skills(cx);
         }
+        if self.settings_tab == SettingsTab::WhatsNew {
+            self.refresh_release_notes(cx);
+        }
         cx.notify();
     }
 
@@ -1070,6 +1121,9 @@ impl UtilitySurfaces {
             self.settings_scroll.set_offset(point(px(0.0), px(0.0)));
         }
         self.settings_tab = tab;
+        if tab == SettingsTab::WhatsNew {
+            self.refresh_release_notes(cx);
+        }
         if tab == SettingsTab::Worktrees {
             self.refresh_worktrees(cx);
         }
@@ -1354,6 +1408,11 @@ impl UtilitySurfaces {
             .expect("session store lock poisoned")
             .request_agent_catalog(host, false);
         cx.notify();
+    }
+
+    pub(crate) fn open_whats_new(&mut self, cx: &mut Context<Self>) {
+        self.open_settings(cx);
+        self.select_settings_tab(SettingsTab::WhatsNew, cx);
     }
 
     fn open_diagnostics(&mut self, cx: &mut Context<Self>) {
@@ -1843,6 +1902,7 @@ impl UtilitySurfaces {
         let generation = self.settings_transition_generation;
         let pane = match self.settings_tab {
             SettingsTab::General => self.general_settings(cx).into_any_element(),
+            SettingsTab::WhatsNew => self.whats_new_settings(cx).into_any_element(),
             SettingsTab::Agents => self.agents_settings(cx).into_any_element(),
             SettingsTab::Skills => self.skills.clone().into_any_element(),
             SettingsTab::Accounts => self.accounts_settings(cx).into_any_element(),
@@ -2003,6 +2063,115 @@ impl UtilitySurfaces {
                     }))
             });
         settings_page("Phone access", content, colors)
+    }
+
+    fn whats_new_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        let content = match &self.release_notes {
+            ReleaseNotesState::Idle | ReleaseNotesState::Loading => div()
+                .id("release-notes-loading")
+                .p(px(16.0))
+                .flex()
+                .items_center()
+                .gap(px(9.0))
+                .text_size(px(Typo::ROW.size))
+                .text_color(colors.secondary)
+                .child(LoadingIndicator::new(
+                    "release-notes-loading-indicator",
+                    14.0,
+                    colors.tertiary,
+                ))
+                .child("Loading the latest release notes…")
+                .into_any_element(),
+            ReleaseNotesState::Failed(error) => div()
+                .id("release-notes-error")
+                .p(px(16.0))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(16.0))
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap(px(3.0))
+                        .child(
+                            div()
+                                .text_size(px(Typo::ROW_EMPHASIZED.size))
+                                .font_weight(Typo::ROW_EMPHASIZED.weight)
+                                .text_color(colors.primary)
+                                .child("Release notes couldn't be loaded"),
+                        )
+                        .child(
+                            div()
+                                .whitespace_normal()
+                                .text_size(px(Typo::META.size))
+                                .line_height(px(14.0))
+                                .text_color(colors.tertiary)
+                                .child(wrappable_setting_copy(error.clone().into())),
+                        ),
+                )
+                .child(surface_button(
+                    "Try Again",
+                    "retry-release-notes",
+                    colors,
+                    cx,
+                    |this, cx| this.refresh_release_notes(cx),
+                ))
+                .into_any_element(),
+            ReleaseNotesState::Loaded { release, document } => {
+                let version = release.tag_name.trim_start_matches('v');
+                let published = release
+                    .published_at
+                    .as_deref()
+                    .and_then(|date| date.split('T').next())
+                    .unwrap_or("Publication date unavailable");
+                div()
+                    .id("release-notes-content")
+                    .debug_selector(|| "release-notes-content".into())
+                    .p(px(16.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(14.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(12.0))
+                            .child(
+                                div()
+                                    .text_size(px(Typo::TITLE.size))
+                                    .font_weight(Typo::TITLE.weight)
+                                    .text_color(colors.primary)
+                                    .child(
+                                        release
+                                            .name
+                                            .clone()
+                                            .unwrap_or_else(|| format!("diri {version}")),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(Typo::META.size))
+                                    .text_color(colors.tertiary)
+                                    .child(format!("Released {published}")),
+                            ),
+                    )
+                    .child(HairlineDivider::horizontal(colors))
+                    .child(crate::markdown_view::render_markdown(document, colors))
+                    .into_any_element()
+            }
+        };
+
+        settings_page(
+            "What's New",
+            setting_section("LATEST RELEASE", content, colors),
+            colors,
+        )
     }
 
     fn general_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -5039,6 +5208,9 @@ fn settings_tab_matches(tab: SettingsTab, query: &str) -> bool {
         SettingsTab::General => {
             "general default startup login sessions close confirmation sounds chimes support diagnostics quick open search roots updates"
         }
+        SettingsTab::WhatsNew => {
+            "what's new whats new release notes latest version changes features improvements"
+        }
         SettingsTab::Agents => {
             "agents codex claude cursor gemini executable installed command line quick create default"
         }
@@ -5977,6 +6149,7 @@ mod tests {
         let tab = match std::env::var("DIRI_VISUAL_SETTINGS_TAB").as_deref() {
             Ok("shortcuts") => SettingsTab::Shortcuts,
             Ok("general") => SettingsTab::General,
+            Ok("whats-new") => SettingsTab::WhatsNew,
             Ok("agents") => SettingsTab::Agents,
             Ok("skills") => SettingsTab::Skills,
             Ok("accounts") => SettingsTab::Accounts,
@@ -6024,6 +6197,32 @@ mod tests {
             std::fs::create_dir_all(parent).expect("create screenshot directory");
         }
         screenshot.save(output).expect("save settings screenshot");
+    }
+
+    #[gpui::test]
+    fn whats_new_is_searchable_and_renders_release_markdown(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            let release = diri_updater::ReleaseNotes {
+                tag_name: "v0.6.0".into(),
+                name: Some("diri 0.6.0".into()),
+                body: "## Highlights\n\n- Faster sessions".into(),
+                published_at: Some("2026-09-05T12:17:55Z".into()),
+            };
+            let document = Arc::new(crate::markdown::MarkdownDocument::parse(&release.body));
+            surfaces.release_notes = ReleaseNotesState::Loaded { release, document };
+            surfaces.settings_tab = SettingsTab::WhatsNew;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("release-notes-content").is_some());
+        assert!(settings_tab_matches(SettingsTab::WhatsNew, "release notes"));
+        assert!(settings_tab_matches(
+            SettingsTab::WhatsNew,
+            "latest changes"
+        ));
     }
 
     #[gpui::test]
@@ -6356,6 +6555,17 @@ mod tests {
                 );
                 surfaces.open_settings(cx);
                 surfaces.settings_tab = tab;
+                if tab == SettingsTab::WhatsNew {
+                    let release = diri_updater::ReleaseNotes {
+                        tag_name: "v0.6.0".into(),
+                        name: Some("diri 0.6.0 — Your agent workspace".into()),
+                        body: "## Everything in one place\n\n- Open browser and shell tabs beside a session.\n- Search conversation history and resume previous work.\n\n### Polish and reliability\n\nSettings, navigation, and session recovery now feel more at home on macOS."
+                            .into(),
+                        published_at: Some("2026-09-05T12:17:55Z".into()),
+                    };
+                    let document = Arc::new(crate::markdown::MarkdownDocument::parse(&release.body));
+                    surfaces.release_notes = ReleaseNotesState::Loaded { release, document };
+                }
                 if tab == SettingsTab::Worktrees {
                     surfaces.worktrees.entries = worktree_settings::preview_entries();
                 }

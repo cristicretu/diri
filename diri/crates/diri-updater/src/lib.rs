@@ -44,6 +44,12 @@ pub const RELEASES_HOST: &str = "github.com";
 /// URL that always resolves to the newest one.
 pub const DEFAULT_FEED_URL: &str =
     "https://github.com/cristicretu/diri/releases/latest/download/appcast.json";
+/// Canonical release metadata. The update feed deliberately stays small and
+/// archive-focused; GitHub owns the human-written release body shown by the
+/// app's What's New page.
+pub const LATEST_RELEASE_URL: &str =
+    "https://api.github.com/repos/cristicretu/diri/releases/latest";
+const MAX_RELEASE_METADATA_BYTES: usize = 512 * 1024;
 
 /// Set to `1` to let an unsigned local build run the whole flow. Only useful
 /// for exercising the updater against a test feed; the signature check still
@@ -51,6 +57,40 @@ pub const DEFAULT_FEED_URL: &str =
 pub const ALLOW_UNSIGNED_ENV: &str = "DIRI_UPDATER_ALLOW_UNSIGNED";
 /// Overrides the feed URL, for staging a release before it goes live.
 pub const FEED_URL_ENV: &str = "DIRI_UPDATE_FEED";
+
+#[derive(Clone, Debug, Default, serde::Deserialize, PartialEq, Eq)]
+pub struct ReleaseNotes {
+    pub tag_name: String,
+    pub name: Option<String>,
+    #[serde(default)]
+    pub body: String,
+    pub published_at: Option<String>,
+}
+
+/// Fetches the latest public GitHub release and its Markdown notes.
+///
+/// This is separate from update eligibility: an up-to-date install should
+/// still be able to read the notes for the version it is already running.
+pub fn fetch_latest_release_notes() -> Result<ReleaseNotes> {
+    let body = Http::new().fetch_text(LATEST_RELEASE_URL)?;
+    parse_release_notes(&body)
+}
+
+fn parse_release_notes(body: &str) -> Result<ReleaseNotes> {
+    if body.len() > MAX_RELEASE_METADATA_BYTES {
+        return Err(UpdateError::Feed(
+            "latest release metadata is unexpectedly large".to_owned(),
+        ));
+    }
+    let release: ReleaseNotes =
+        serde_json::from_str(body).map_err(|error| UpdateError::Feed(error.to_string()))?;
+    if release.tag_name.trim().is_empty() || release.body.trim().is_empty() {
+        return Err(UpdateError::Feed(
+            "latest release has no version or release notes".to_owned(),
+        ));
+    }
+    Ok(release)
+}
 
 #[derive(Clone, Debug)]
 pub struct UpdaterConfig {
@@ -256,6 +296,41 @@ mod tests {
             cache_dir: PathBuf::from("/tmp/diri-updates"),
             installed_signature: SignatureInfo::default(),
         }
+    }
+
+    #[test]
+    fn latest_release_metadata_keeps_the_canonical_markdown_body() {
+        let release = parse_release_notes(
+            r###"{
+                "tag_name": "v0.6.0",
+                "name": "diri 0.6.0",
+                "body": "## Highlights\n\n- Faster sessions",
+                "published_at": "2026-09-05T12:17:55Z"
+            }"###,
+        )
+        .expect("release metadata");
+
+        assert_eq!(release.tag_name, "v0.6.0");
+        assert_eq!(release.body, "## Highlights\n\n- Faster sessions");
+        assert_eq!(
+            release.published_at.as_deref(),
+            Some("2026-09-05T12:17:55Z")
+        );
+    }
+
+    #[test]
+    fn latest_release_metadata_requires_notes() {
+        let error = parse_release_notes(r#"{"tag_name":"v0.6.0","body":""}"#)
+            .expect_err("empty notes must not render as a successful release");
+        assert!(matches!(error, UpdateError::Feed(_)));
+    }
+
+    #[test]
+    #[ignore = "requires network access to GitHub's releases API"]
+    fn the_latest_release_notes_are_reachable() {
+        let release = fetch_latest_release_notes().expect("latest release notes");
+        assert!(release.tag_name.starts_with('v'));
+        assert!(!release.body.trim().is_empty());
     }
 
     #[test]

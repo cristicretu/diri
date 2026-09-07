@@ -428,6 +428,11 @@ impl RootView {
                     surfaces.open_add_remote_host(window, cx);
                 });
             }
+            if matches!(event, SidebarEvent::OpenWhatsNew)
+                && let Some(surfaces) = &this.utility_surfaces
+            {
+                surfaces.update(cx, |surfaces, cx| surfaces.open_whats_new(cx));
+            }
             if matches!(event, SidebarEvent::VisibilityChanged) {
                 this.sidebar_peek_dwell = None;
                 this.sidebar_floating = false;
