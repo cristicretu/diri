@@ -1,6 +1,14 @@
 # Deploy Diri to Cloudflare Pages
 
-The production domain is **https://diri.sh/**. This repository prepares the site; it does not provision a Cloudflare project, modify DNS, or publish automatically.
+The production domain is **https://diri.sh/**. Connect this repository to Cloudflare Pages once to enable automatic deployments. The GitHub website workflow validates changes; Cloudflare's Git integration publishes them.
+
+## Connect GitHub once
+
+In Cloudflare, open **Workers & Pages → Create application → Pages → Connect to Git**, authorize `cristicretu/diri`, and use the settings below. Merge the website PR into `main` before the first production build.
+
+After connecting, pushes to `main` that change the website trigger production deployments. Enable preview deployments for other branches to get review URLs on website PRs. In **Settings → Builds → Build watch paths**, set the include path to `website/**` so app-only changes do not rebuild the landing page.
+
+See Cloudflare's [GitHub integration](https://developers.cloudflare.com/pages/configuration/git-integration/github-integration/) and [build watch paths](https://developers.cloudflare.com/pages/configuration/build-watch-paths/).
 
 ## Build settings
 
@@ -8,9 +16,9 @@ The production domain is **https://diri.sh/**. This repository prepares the site
 | --- | --- |
 | Framework preset | None |
 | Root directory | `website` |
-| Build command | `npm run build` |
+| Build command | `npm run verify` |
 | Build output directory | `dist` |
-| Node.js | 22 or newer |
+| Environment variable | `NODE_VERSION` = `22` |
 | Production branch | `main`, after the website branch is merged |
 | Build watch path | `website/**` |
 
