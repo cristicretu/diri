@@ -1,5 +1,10 @@
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
+// Programmatic focus restoration should follow how the preview is being used.
+const product = $('.product');
+product.dataset.inputMethod = 'pointer';
+document.addEventListener('pointerdown', () => { product.dataset.inputMethod = 'pointer'; }, true);
+document.addEventListener('keydown', () => { product.dataset.inputMethod = 'keyboard'; }, true);
 const icon = name => `<span class="icon" data-icon="${name}" aria-hidden="true"></span>`;
 function paintIcons(root = document) {
   $$('[data-icon], [data-agent]', root).forEach(el => {
@@ -38,7 +43,6 @@ function selectChat(id) {
   $('.terminal-footer').innerHTML = preview.footer;
   $('.changes-content').innerHTML = preview.changes;
   $('.diff-count').textContent = `+${$$('.changes-content .added').length}`;
-  $('#terminal-content').scrollTop = 0;
   $$('.agent-switch').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.chat === id)));
   $('.new-chat small').textContent = chat.name;
   paintIcons();
@@ -115,10 +119,6 @@ function highlight(index) {
   const item = matches[index];
   if (item) $('#palette-input').setAttribute('aria-activedescendant', `command-${index}`);
   else $('#palette-input').removeAttribute('aria-activedescendant');
-  const row = $(`#command-${index}`);
-  const list = $('#palette-list');
-  if (row && row.offsetTop < list.scrollTop) list.scrollTop = row.offsetTop;
-  else if (row && row.offsetTop + row.offsetHeight > list.scrollTop + list.clientHeight) list.scrollTop = row.offsetTop + row.offsetHeight - list.clientHeight;
 }
 $('#palette-input').addEventListener('input', () => { selected = 0; renderPalette(); });
 $('#palette-input').addEventListener('keydown', event => {
