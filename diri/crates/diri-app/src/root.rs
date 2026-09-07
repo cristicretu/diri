@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use diri_proto::{AgentKind, SessionId, SessionRecord, SessionStatus};
 use diri_ui::{FloatingSurface, Ink, Metrics, Radius, SemanticColors, Typo};
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, Context, CursorStyle, DragMoveEvent, Entity,
-    FocusHandle, Focusable, FontWeight, KeyContext, KeyDownEvent, KeyUpEvent,
+    Animation, AnimationExt, AnyElement, App, BoxShadow, Context, CursorStyle, DragMoveEvent,
+    Entity, FocusHandle, Focusable, FontWeight, KeyContext, KeyDownEvent, KeyUpEvent,
     ModifiersChangedEvent, MouseButton, Render, StyleRefinement, Subscription, Task, Window,
     deferred, div, ease_out_quint, prelude::*, px, rgba,
 };
@@ -50,6 +50,7 @@ mod notification_panel;
 mod notification_panel_tests;
 
 const WINDOW_BOUNDS_SAVE_DELAY: Duration = Duration::from_millis(150);
+const SIDEBAR_PEEK_INSET: f32 = 10.0;
 
 pub(crate) fn cached_window_overlay<T: Render>(view: Entity<T>) -> impl IntoElement {
     view.cached(StyleRefinement::default().absolute().inset_0())
@@ -193,6 +194,14 @@ pub struct RootView {
     /// from this rather than from the settled width so it picks up wherever the
     /// previous frame left the panel.
     sidebar_seam: f32,
+    /// The panel is always mounted in one absolute slot. Only this exposure
+    /// and its floating treatment change; the layout seam independently makes room.
+    sidebar_panel_slide: Option<SeamSlide>,
+    sidebar_panel_width: f32,
+    sidebar_float_slide: Option<SeamSlide>,
+    sidebar_float: f32,
+    sidebar_floating: bool,
+    sidebar_peek_dwell: Option<Task<()>>,
     auxiliary_terminal: Option<Entity<TerminalPane>>,
     auxiliary_id: Option<SessionId>,
     auxiliary_parent: Option<SessionId>,
@@ -263,7 +272,11 @@ impl RootView {
         cx: &mut Context<Self>,
     ) -> Self {
         let sidebar_runtime = (!preview).then(|| Arc::clone(&services.store));
-        let sidebar = cx.new(|cx| Sidebar::new(sidebar_runtime, preview, preview_scenario, cx));
+        let sidebar = cx.new(|cx| {
+            let mut sidebar = Sidebar::new(sidebar_runtime, preview, preview_scenario, cx);
+            sidebar.set_surface_in_parent();
+            sidebar
+        });
         let terminal = (!preview || preview_scenario == PreviewScenario::Empty).then(|| {
             let runtime = Arc::clone(&services.store);
             let tokio = Arc::clone(&services.tokio);
@@ -413,6 +426,8 @@ impl RootView {
                 });
             }
             if matches!(event, SidebarEvent::VisibilityChanged) {
+                this.sidebar_peek_dwell = None;
+                this.sidebar_floating = false;
                 this.begin_sidebar_slide(cx);
                 // Settings navigation lives in the sidebar, so hiding the
                 // sidebar is also the way out of settings.
@@ -423,6 +438,14 @@ impl RootView {
                     this.sidebar_revealed_for_settings = false;
                     surfaces.update(cx, |surfaces, cx| surfaces.dismiss(cx));
                 }
+            }
+            if matches!(event, SidebarEvent::PeekChanged) {
+                this.sidebar_floating = true;
+                // Establish the floating shape offscreen; exits retain it.
+                if this.sidebar_panel_width == 0.0 {
+                    this.sidebar_float = 1.0;
+                }
+                this.begin_sidebar_panel_slide(Instant::now(), cx);
             }
             cx.notify();
         })
@@ -895,6 +918,12 @@ impl RootView {
             focus: cx.focus_handle(),
             resize_origin: None,
             sidebar_slide: None,
+            sidebar_panel_slide: None,
+            sidebar_panel_width: sidebar_seam,
+            sidebar_float_slide: None,
+            sidebar_float: 0.0,
+            sidebar_floating: false,
+            sidebar_peek_dwell: None,
             sidebar_seam,
             auxiliary_terminal: None,
             auxiliary_id: None,
@@ -1895,11 +1924,35 @@ impl RootView {
     /// Reduced-motion users get the settled width immediately.
     fn begin_sidebar_slide(&mut self, cx: &mut Context<Self>) {
         let to = self.settled_sidebar_seam(cx);
+        let now = Instant::now();
         self.sidebar_slide = (!cx.reduce_motion())
-            .then(|| SeamSlide::begin(self.sidebar_seam, to))
+            .then(|| SeamSlide::begin_at(self.sidebar_seam, to, now))
             .flatten();
         if self.sidebar_slide.is_none() {
             self.sidebar_seam = to;
+        }
+        self.begin_sidebar_panel_slide(now, cx);
+    }
+
+    fn begin_sidebar_panel_slide(&mut self, now: Instant, cx: &mut Context<Self>) {
+        let sidebar = self.sidebar.read(cx);
+        let to = if sidebar.is_visible() || sidebar.is_peeking() {
+            sidebar.width()
+        } else {
+            0.0
+        };
+        let float_to = if self.sidebar_floating { 1.0 } else { 0.0 };
+        self.sidebar_panel_slide = (!cx.reduce_motion())
+            .then(|| SeamSlide::begin_at(self.sidebar_panel_width, to, now))
+            .flatten();
+        self.sidebar_float_slide = (!cx.reduce_motion())
+            .then(|| SeamSlide::begin_at(self.sidebar_float, float_to, now))
+            .flatten();
+        if self.sidebar_panel_slide.is_none() {
+            self.sidebar_panel_width = to;
+        }
+        if self.sidebar_float_slide.is_none() {
+            self.sidebar_float = float_to;
         }
     }
 
@@ -3150,6 +3203,11 @@ impl Render for RootView {
             .set_notification_surface_visible(notification_surface_visible);
         let sidebar_visible = self.sidebar.read(cx).is_visible();
         let sidebar_width = self.sidebar.read(cx).width();
+        let panel_width = if sidebar_visible || self.sidebar.read(cx).is_peeking() {
+            sidebar_width
+        } else {
+            0.0
+        };
         let window_width = f32::from(window.inner_window_bounds().get_bounds().size.width);
         let occupied_sidebar_width = if sidebar_visible { sidebar_width } else { 0.0 };
         self.inspector_max_width =
@@ -3163,6 +3221,14 @@ impl Render for RootView {
             0.0
         };
         let now = Instant::now();
+        self.sidebar_panel_width =
+            advance_seam(&mut self.sidebar_panel_slide, panel_width, now, window);
+        self.sidebar_float = advance_seam(
+            &mut self.sidebar_float_slide,
+            if self.sidebar_floating { 1.0 } else { 0.0 },
+            now,
+            window,
+        );
         self.sidebar_seam =
             advance_seam(&mut self.sidebar_slide, occupied_sidebar_width, now, window);
         self.inspector_seam = advance_seam(&mut self.inspector_slide, inspector_width, now, window);
@@ -3181,30 +3247,103 @@ impl Render for RootView {
         let mut key_context = KeyContext::new_with_defaults();
         key_context.add(APP_CONTEXT);
         key_context.add(SESSION_NAVIGATION_CONTEXT);
-        // Each panel keeps its full width and is pinned to the wrapper edge it
-        // lives against -- the sidebar's right, the inspector's left -- so
-        // narrowing a wrapper slides its panel out under the clip instead of
-        // squeezing every row's contents down with it.
+        let inset = SIDEBAR_PEEK_INSET * self.sidebar_float;
+        let radius = Radius::PANEL * self.sidebar_float;
+        let exposed = self.sidebar_panel_width;
+        let peek_pointer_tracking = self.sidebar.read(cx).is_peeking().then(|| {
+            let region = gpui::Bounds::new(
+                gpui::point(px(0.0), px(recovery_height)),
+                gpui::size(
+                    px(sidebar_width + inset),
+                    window.viewport_size().height - px(recovery_height),
+                ),
+            );
+            // Capture moves even when a terminal or menu handles the bubble
+            // phase. The gap and panel are one hover target, including the
+            // first stationary frame after the edge dwell opens it.
+            let sidebar = self.sidebar.downgrade();
+            gpui::canvas(
+                |_, _, _| (),
+                move |_, _, window, _| {
+                    let moving_sidebar = sidebar.clone();
+                    window.on_mouse_event(
+                        move |event: &gpui::MouseMoveEvent, phase, window, cx| {
+                            if phase == gpui::DispatchPhase::Capture {
+                                let _ = moving_sidebar.update(cx, |sidebar, cx| {
+                                    sidebar.hover_peek_region(
+                                        region.contains(&event.position),
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            }
+                        },
+                    );
+                    let sidebar = sidebar.clone();
+                    window.on_mouse_event(move |_: &gpui::MouseExitEvent, phase, window, cx| {
+                        if phase == gpui::DispatchPhase::Capture {
+                            let _ = sidebar.update(cx, |sidebar, cx| {
+                                sidebar.hover_peek_region(false, window, cx)
+                            });
+                        }
+                    });
+                },
+            )
+            .absolute()
+            .size_full()
+        });
         let sidebar_wrapper = div()
-            .relative()
-            .flex_none()
-            .h_full()
-            .overflow_hidden()
-            .w(px(seam))
-            .when(seam > 0.0, |wrapper| {
-                wrapper.child(
+            .id("sidebar-frame")
+            .absolute()
+            .left_0()
+            .top(px(recovery_height))
+            .bottom_0()
+            // Include the inset in the hover region so the edge and card
+            // are one continuous target, including during docking.
+            .w(px(exposed + inset * exposed / sidebar_width))
+            .when(exposed > 0.0, |wrapper| {
+                wrapper.occlude().child(
                     div()
+                        .id("sidebar-surface")
+                        .debug_selector(|| "sidebar-surface".into())
                         .absolute()
-                        .top(px(0.0))
+                        .top(px(inset))
+                        .bottom(px(inset))
                         .right(px(0.0))
-                        .h_full()
                         .w(px(sidebar_width))
+                        .rounded(px(radius))
+                        .bg(colors.sidebar_surface())
+                        .occlude()
+                        .shadow(vec![BoxShadow {
+                            color: gpui::black().opacity(0.32 * self.sidebar_float),
+                            offset: gpui::point(px(0.0), px(8.0 * self.sidebar_float)),
+                            blur_radius: px(24.0 * self.sidebar_float),
+                            spread_radius: px(0.0),
+                            inset: false,
+                        }])
                         // A reactive boundary: the sidebar re-renders on its
                         // own notifies, not on the terminal's 60fps repaints.
                         .child(
                             self.sidebar
                                 .clone()
                                 .cached(StyleRefinement::default().size_full()),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .rounded(px(radius))
+                                .border_1()
+                                .border_color(colors.floating_stroke().opacity(self.sidebar_float)),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .right_0()
+                                .top_0()
+                                .bottom_0()
+                                .w(px(1.0))
+                                .bg(colors.sidebar_stroke().opacity(1.0 - self.sidebar_float)),
                         ),
                 )
             });
@@ -3370,7 +3509,7 @@ impl Render for RootView {
                     this.drag_inspector_resize(f32::from(event.event.position.x), cx);
                 },
             ))
-            .child(sidebar_wrapper)
+            .child(div().flex_none().h_full().w(px(seam)))
             .when(seam > 0.0, |root| root.child(self.resize_handle(cx)));
         if launcher_open {
             // Command-N behaves like an unsaved new tab: preserve the app
@@ -3426,6 +3565,39 @@ impl Render for RootView {
                         ),
                 );
             }
+        }
+        // This overlay never participates in the terminal's flex layout or
+        // viewport sizing. Keep it below dialogs and above workbench content.
+        root = root.child(sidebar_wrapper).children(peek_pointer_tracking);
+        if !sidebar_visible && seam == 0.0 && exposed == 0.0 && panel_width == 0.0 {
+            root = root.child(
+                div()
+                    .id("sidebar-peek-edge")
+                    .debug_selector(|| "sidebar-peek-edge".into())
+                    .absolute()
+                    .left_0()
+                    .top(px(recovery_height + 36.0))
+                    .bottom_0()
+                    .w(px(8.0))
+                    .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
+                        this.sidebar_peek_dwell = None;
+                        if *hovered {
+                            this.sidebar_peek_dwell =
+                                Some(cx.spawn_in(window, async move |this, cx| {
+                                    cx.background_executor()
+                                        .timer(Duration::from_millis(100))
+                                        .await;
+                                    let _ = this.update_in(cx, |this, window, cx| {
+                                        this.sidebar_peek_dwell = None;
+                                        this.sidebar.update(cx, |sidebar, cx| {
+                                            sidebar.hover_peek_region(true, window, cx);
+                                            sidebar.peek(window, cx);
+                                        });
+                                    });
+                                }));
+                        }
+                    })),
+            );
         }
         if self.resize_origin.is_some()
             || self.terminal_resize_origin.is_some()
@@ -3666,6 +3838,214 @@ mod tests {
                     .read(cx)
                     .is_settings_open(),
                 "All settings keeps an already open Settings canvas visible"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn sidebar_peek_reveals_on_the_edge_and_leaves_the_layout_collapsed(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let services = test_services();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, true, PreviewScenario::Typical, window, cx)
+        });
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        root.update(cx, |root, cx| {
+            root.sidebar.update(cx, |sidebar, cx| sidebar.conceal(cx))
+        });
+        cx.run_until_parked();
+        let edge = cx
+            .debug_bounds("sidebar-peek-edge")
+            .expect("collapsed edge");
+        cx.simulate_mouse_move(edge.center(), None, Modifiers::default());
+        cx.executor().advance_clock(Duration::from_millis(40));
+        cx.simulate_mouse_move(
+            gpui::point(px(600.0), px(300.0)),
+            None,
+            Modifiers::default(),
+        );
+        cx.executor().advance_clock(Duration::from_millis(120));
+        cx.run_until_parked();
+        assert!(!root.read_with(cx, |root, cx| root.sidebar.read(cx).is_peeking()));
+        cx.simulate_mouse_move(edge.center(), None, Modifiers::default());
+        cx.executor().advance_clock(Duration::from_millis(120));
+        cx.run_until_parked();
+        root.read_with(cx, |root, cx| {
+            assert!(root.sidebar.read(cx).is_peeking());
+            assert!(!root.sidebar.read(cx).is_visible());
+            assert_eq!(
+                root.sidebar_seam, 0.0,
+                "peeking must not resize the terminal"
+            );
+            assert_eq!(root.sidebar_panel_width, root.sidebar.read(cx).width());
+        });
+        // Resting in the new inset must not start a close/reopen loop.
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert!(root.read_with(cx, |root, cx| root.sidebar.read(cx).is_peeking()));
+        let floating = cx
+            .debug_bounds("sidebar-surface")
+            .expect("floating sidebar");
+        assert_eq!(
+            floating.origin,
+            gpui::point(px(SIDEBAR_PEEK_INSET), px(SIDEBAR_PEEK_INSET))
+        );
+        assert_eq!(floating.size.height, px(700.0 - 2.0 * SIDEBAR_PEEK_INSET));
+        let session = cx
+            .debug_bounds("SESSION_preview-claude")
+            .expect("peek session row");
+        cx.simulate_click(session.center(), Modifiers::default());
+        root.read_with(cx, |root, cx| {
+            assert_eq!(
+                root.sidebar.read(cx).selected_session().unwrap().id,
+                SessionId::new("preview-claude")
+            );
+            assert!(
+                root.sidebar.read(cx).is_peeking(),
+                "selecting a session keeps the peek interactive"
+            );
+        });
+        cx.simulate_mouse_move(
+            gpui::point(px(150.0), px(300.0)),
+            None,
+            Modifiers::default(),
+        );
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert!(root.read_with(cx, |root, cx| root.sidebar.read(cx).is_peeking()));
+        cx.simulate_mouse_move(
+            gpui::point(px(600.0), px(300.0)),
+            None,
+            Modifiers::default(),
+        );
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        assert!(root.read_with(cx, |root, cx| root.sidebar.read(cx).is_peeking()));
+        // Returning during the grace period cancels the pending dismissal.
+        cx.simulate_mouse_move(
+            gpui::point(px(150.0), px(300.0)),
+            None,
+            Modifiers::default(),
+        );
+        cx.executor().advance_clock(Duration::from_millis(300));
+        cx.run_until_parked();
+        assert!(root.read_with(cx, |root, cx| root.sidebar.read(cx).is_peeking()));
+        cx.simulate_mouse_move(
+            gpui::point(px(600.0), px(300.0)),
+            None,
+            Modifiers::default(),
+        );
+        cx.executor().advance_clock(Duration::from_millis(300));
+        cx.run_until_parked();
+        assert!(!root.read_with(cx, |root, cx| root.sidebar.read(cx).is_peeking()));
+        assert!(cx.debug_bounds("sidebar-peek-edge").is_some());
+
+        cx.simulate_mouse_move(edge.center(), None, Modifiers::default());
+        cx.executor().advance_clock(Duration::from_millis(120));
+        cx.run_until_parked();
+        let pin = cx.debug_bounds("sidebar-toggle").expect("peek pin control");
+        cx.simulate_click(pin.center(), Modifiers::default());
+        cx.simulate_mouse_move(
+            gpui::point(px(600.0), px(300.0)),
+            None,
+            Modifiers::default(),
+        );
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        root.read_with(cx, |root, cx| {
+            assert!(root.sidebar.read(cx).is_visible());
+            assert!(!root.sidebar.read(cx).is_peeking());
+            assert_eq!(root.sidebar_float, 0.0);
+            assert_eq!(root.sidebar_seam, root.sidebar.read(cx).width());
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes a visual preview to DIRI_PEEK_SCREENSHOT"]
+    fn render_sidebar_peek_screenshot() {
+        use gpui::{AppContext as _, HeadlessAppContext};
+        let output = std::env::var("DIRI_PEEK_SCREENSHOT").expect("DIRI_PEEK_SCREENSHOT");
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let services = test_services();
+        let window = cx
+            .open_window(size(px(1000.0), px(700.0)), |window, cx| {
+                cx.new(|cx| {
+                    let root = RootView::new(services, true, PreviewScenario::Typical, window, cx);
+                    root.sidebar.update(cx, |sidebar, cx| {
+                        sidebar.conceal(cx);
+                        sidebar.peek(window, cx);
+                        if std::env::var_os("DIRI_PEEK_PINNED").is_some() {
+                            sidebar.toggle(cx);
+                        }
+                    });
+                    root
+                })
+            })
+            .expect("preview window");
+        cx.run_until_parked();
+        cx.capture_screenshot(window.into())
+            .expect("peek screenshot")
+            .save(output)
+            .expect("save peek screenshot");
+        cx.update_window(window.into(), |_, window, _| window.remove_window())
+            .expect("close preview window");
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn sidebar_peek_docks_the_same_panel_on_one_motion_curve(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let services = test_services();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, true, PreviewScenario::Typical, window, cx)
+        });
+        root.update_in(cx, |root, window, cx| {
+            root.sidebar.update(cx, |sidebar, cx| {
+                sidebar.conceal(cx);
+                sidebar.peek(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        let sidebar = root.read_with(cx, |root, _| root.sidebar.clone());
+        root.update(cx, |root, cx| {
+            cx.set_reduce_motion(false);
+            root.sidebar.update(cx, |sidebar, cx| sidebar.toggle(cx));
+        });
+        root.read_with(cx, |root, cx| {
+            assert_eq!(root.sidebar, sidebar);
+            let width = sidebar.read(cx).width();
+            assert_eq!(
+                root.sidebar_panel_width, width,
+                "the peek stays fully exposed when pinned"
+            );
+            assert!(
+                root.sidebar_panel_slide.is_none(),
+                "the panel must not replay its reveal"
+            );
+            let seam = root.sidebar_slide.expect("content makes room gradually");
+            let float = root
+                .sidebar_float_slide
+                .expect("inset and corners ease into the dock");
+            let halfway = Instant::now() + crate::seam::SEAM_SLIDE / 2;
+            let occupied = seam.seam_at(width, halfway);
+            let floating = float.seam_at(0.0, halfway);
+            assert!(occupied > 0.0 && occupied < width);
+            assert!(floating > 0.0 && floating < 1.0);
+            assert!(
+                (occupied / width + floating - 1.0).abs() < 0.001,
+                "layout, inset, radius and shadow must share the same curve and clock"
             );
         });
     }
