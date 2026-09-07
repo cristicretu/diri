@@ -396,9 +396,9 @@ impl Registry {
     /// Resume because the conversation still looks live. Retract the claim
     /// here, once, on the only pass that knows which holders answered.
     ///
-    /// Remote (`host`-bound) sessions are none of this pass's business: they
-    /// live in tmux on another machine and outlive both this daemon and this
-    /// Mac, so their records stay untouched.
+    /// Remote (`host`-bound) sessions are none of this pass's business: their
+    /// authenticated Holders live on another machine and outlive both this
+    /// daemon and this Mac, so their records stay untouched.
     fn reap_orphans(&mut self) {
         let orphaned: Vec<String> = self
             .records
@@ -2079,10 +2079,10 @@ mod tests {
         assert_eq!(reaped.resumability, Resumability::Resumable);
     }
 
-    /// Remote sessions live in tmux on another machine: they outlive this
-    /// daemon and this Mac, so the reap pass must not touch them. Marking one
-    /// exited would strand still-running work behind a Resume button that
-    /// starts a second agent on top of the first.
+    /// Remote sessions live in authenticated Holders on another machine: they
+    /// outlive this daemon and this Mac, so the reap pass must not touch them.
+    /// Marking one exited would strand still-running work behind a Resume
+    /// button that starts a second agent on top of the first.
     #[test]
     fn a_remote_session_survives_the_reap() {
         let temp = tempfile::tempdir().expect("temp");

@@ -191,9 +191,10 @@ impl Updater {
         let archive = directory.join("diri.zip");
         self.http
             .download(&release.url, &archive, release.size, on_progress)?;
-        if let Some(expected) = &release.sha256 {
-            net::verify_sha256(&archive, expected)?;
-        }
+        let expected = release.sha256.as_deref().ok_or_else(|| {
+            UpdateError::Feed("release is missing its SHA-256 checksum".to_owned())
+        })?;
+        net::verify_sha256(&archive, expected)?;
         Ok(archive)
     }
 

@@ -242,12 +242,6 @@ impl ControlServer {
         if let Err(error) = std::thread::Builder::new()
             .name("diri-remote-restore".into())
             .spawn(move || {
-                // Before adoption, not after: adoption prunes bindings for
-                // sessions it finds dead, and a pruned binding is
-                // indistinguishable from a record that never had one. Running
-                // first is what keeps the legacy test — "has a host and no
-                // binding" — from swallowing this launch's own casualties.
-                server.retire_legacy_remote_sessions();
                 let Some(manager) = manager else {
                     return;
                 };
@@ -262,46 +256,6 @@ impl ControlServer {
         {
             eprintln!("diri-engine: could not start remote session restore: {error}");
         }
-    }
-
-    /// One-shot upgrade path for sessions the deleted `ssh -t` + tmux transport
-    /// created. See [`crate::legacy_remote`] for what it does, what it refuses
-    /// to do, and why this is not a tmux fallback.
-    ///
-    /// Deliberately independent of `with_remote`: a build with no Helper
-    /// artifact still has the user's old records and still owes them a working
-    /// Resume button and a cleaned-up host.
-    fn retire_legacy_remote_sessions(&self) {
-        let plan = crate::legacy_remote::Plan {
-            registry: &self.registry,
-            bindings: self.remote_bindings.as_ref(),
-            hosts: &diri_proto::HostsConfig::load(self.hosts_file()),
-            marker_path: self.legacy_remote_marker(),
-        };
-        let outcome =
-            crate::legacy_remote::retire_legacy_remote_sessions(&plan, &crate::hosts::run_shell);
-        if let Some(summary) = outcome.summary() {
-            eprintln!("{summary}");
-        }
-        // These records have no live session, so the registry watcher — which
-        // only diffs live ones — will never announce the rewrite. Without this
-        // the sidebar keeps showing them as running until the next relaunch.
-        if !outcome.migrated.is_empty()
-            && let Ok(registry) = self.registry.lock()
-        {
-            for id in &outcome.migrated {
-                self.publish_updated(&registry, id);
-            }
-        }
-    }
-
-    /// Beside the socket, next to `remote-bindings` — one file, deletable the
-    /// day this migration is retired.
-    fn legacy_remote_marker(&self) -> PathBuf {
-        self.socket_path
-            .parent()
-            .map(|parent| parent.join("legacy-remote-migration.json"))
-            .unwrap_or_else(|| PathBuf::from("legacy-remote-migration.json"))
     }
 
     fn restore_remote_bindings(
@@ -468,14 +422,9 @@ impl ControlServer {
 
         let mut first = true;
         loop {
-            let mut line = Vec::new();
-            let read = reader.read_until(b'\n', &mut line)?;
-            if read == 0 {
+            let Some(line) = read_bounded_control_line(&mut reader)? else {
                 return Ok(());
-            }
-            if line.last() == Some(&b'\n') {
-                line.pop();
-            }
+            };
             if line.is_empty() {
                 continue;
             }
@@ -509,14 +458,6 @@ impl ControlServer {
                     );
                     return Ok(());
                 }
-            }
-            if line.len() > MAX_CONTROL_LINE_BYTES {
-                // A client that sends an oversized frame is out of contract;
-                // answering would mean buffering unbounded input.
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "control line exceeded the protocol maximum",
-                ));
             }
             let Some(response) = self.handle_line(&line, &writer, &mut subscription) else {
                 continue;
@@ -3192,6 +3133,34 @@ fn idle_shutdown_refusal(live_sessions: usize, connections: usize) -> Option<&'s
     }
 }
 
+fn read_bounded_control_line<R: BufRead>(reader: &mut R) -> std::io::Result<Option<Vec<u8>>> {
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(line))
+            };
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |position| position + 1);
+        let payload = newline.unwrap_or(available.len());
+        if line.len().saturating_add(payload) > MAX_CONTROL_LINE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "control line exceeded the protocol maximum",
+            ));
+        }
+        line.extend_from_slice(&available[..payload]);
+        reader.consume(consumed);
+        if newline.is_some() {
+            return Ok(Some(line));
+        }
+    }
+}
+
 /// Serializes one message onto the shared write half. Responses and event
 /// frames interleave here; the mutex keeps each line whole.
 fn write_message(writer: &Arc<Mutex<UnixStream>>, message: &ControlMessage) -> std::io::Result<()> {
@@ -3713,6 +3682,14 @@ const MAX_PROBE_CHARS: usize = 20;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_control_line_is_rejected_before_unbounded_buffering() {
+        let bytes = vec![b'x'; MAX_CONTROL_LINE_BYTES + 1];
+        let mut reader = std::io::BufReader::new(bytes.as_slice());
+        let error = read_bounded_control_line(&mut reader).expect_err("must reject");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
 
     #[test]
     fn background_request_capacity_is_bounded_and_released() {

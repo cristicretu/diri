@@ -76,6 +76,11 @@ ztracing = { path = "vendor/ztracing" }
 ztracing_macro = { path = "vendor/ztracing_macro" }
 
 [patch.crates-io]
+# xcb is an inactive optional GPUI edge in Diri's current Linux graph, but its
+# published manifest keeps a vulnerable quick-xml release in Cargo.lock. Pin
+# the upstream compatibility fix until xcb publishes it.
+xcb = { git = "https://github.com/rust-x-bindings/rust-xcb.git", rev = "ae3b2cd080e78173223038ccbebdc644eaf4a9ad" }
+
 # Keep VTE 0.15.0's parser and synchronization semantics; allocate its 2 MiB
 # synchronization buffer only when a child actually sends a synchronized frame.
 # See vendor/vte/DIRI-PATCH.md for provenance and verification.
