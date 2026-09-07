@@ -2,9 +2,14 @@ const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 // Programmatic focus restoration should follow how the preview is being used.
 const product = $('.product');
-product.dataset.inputMethod = 'pointer';
-document.addEventListener('pointerdown', () => { product.dataset.inputMethod = 'pointer'; }, true);
-document.addEventListener('keydown', () => { product.dataset.inputMethod = 'keyboard'; }, true);
+const agentSwitcher = $('.compatible');
+function setInputMethod(method) {
+  product.dataset.inputMethod = method;
+  agentSwitcher.dataset.inputMethod = method;
+}
+setInputMethod('pointer');
+document.addEventListener('pointerdown', () => setInputMethod('pointer'), true);
+document.addEventListener('keydown', () => setInputMethod('keyboard'), true);
 const icon = name => `<span class="icon" data-icon="${name}" aria-hidden="true"></span>`;
 function paintIcons(root = document) {
   $$('[data-icon], [data-agent]', root).forEach(el => {
@@ -55,6 +60,7 @@ function closeOverlay(restoreFocus = true) {
   $$('.floating-panel').forEach(el => { el.hidden = true; });
   $('#demo-shade').hidden = true;
   overlay = null;
+  $$('.links-trigger, .notification-trigger').forEach(button => button.setAttribute('aria-expanded', 'false'));
   $('.app-sidebar').inert = false;
   $('.app-main').inert = false;
   $('.changes-panel').inert = false;
@@ -65,6 +71,7 @@ function openOverlay(kind) {
   if (!overlay) previousFocus = document.activeElement;
   closeOverlay(false);
   overlay = kind;
+  $$('.links-trigger, .notification-trigger').forEach(button => button.setAttribute('aria-expanded', String(button.dataset.open === kind)));
   $('.app-sidebar').inert = true;
   $('.app-main').inert = true;
   $('.changes-panel').inert = true;
