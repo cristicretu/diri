@@ -24,6 +24,9 @@ assert.match(await read('sitemap.xml'), /<loc>https:\/\/diri\.sh\/<\/loc>/);
 assert.match(await read('404.html'), /content="noindex, follow"/);
 assert.match(await read('_redirects'), /\/index\.html \/ 301/);
 const headers = await read('_headers');
+assert.match(headers, /connect-src 'self' https:\/\/api\.github\.com;/);
+assert.match(html, /<script type="module" src="downloads\.[a-f0-9]{12}\.js"><\/script>/);
+assert.match(html, /id="download-primary"[^>]+href="https:\/\/github\.com\/cristicretu\/diri\/releases\/latest"/);
 assert.match(headers, /https:\/\/:project\.pages\.dev\/\*\n  X-Robots-Tag: noindex/);
 assert.match(headers, /https:\/\/:version\.:project\.pages\.dev\/\*\n  X-Robots-Tag: noindex/);
 for (const match of html.matchAll(/(?:src|href)="([^"#]+)"/g)) {

@@ -8,7 +8,7 @@ await rm(output, { recursive: true, force: true });
 await mkdir(output, { recursive: true });
 const pages = new Map(await Promise.all(['index.html', '404.html'].map(async file => [file, await readFile(resolve(root, file), 'utf8')])));
 const hashed = [];
-for (const file of ['style.css', 'app.js', 'agent-previews.js', 'mesh.js']) {
+for (const file of ['style.css', 'app.js', 'agent-previews.js', 'mesh.js', 'downloads.js']) {
   const content = await readFile(resolve(root, file));
   const hash = createHash('sha256').update(content).digest('hex').slice(0, 12);
   const ext = extname(file);
@@ -26,7 +26,7 @@ const jsonHash = createHash('sha256').update(structuredData).digest('base64');
 const headers = `/*
   X-Content-Type-Options: nosniff
   Referrer-Policy: strict-origin-when-cross-origin
-  Content-Security-Policy: default-src 'self'; script-src 'self' 'sha256-${jsonHash}'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'none'
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'sha256-${jsonHash}'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' https://api.github.com; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'none'
 
 https://:project.pages.dev/*
   X-Robots-Tag: noindex

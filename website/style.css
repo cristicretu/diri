@@ -541,6 +541,18 @@ body { isolation: isolate; position: relative; min-height: 100svh; }
 .download-platforms { display: flex; align-items: center; gap: 13px; color: #b6afc9; }
 .platform-mark { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 24px; }
 .platform-mark img { display: block; filter: invert(81%) sepia(8%) saturate(580%) hue-rotate(214deg); }
+.release-details { flex-basis: 100%; display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px; margin-top: -6px; color: #b6afc9; font-size: 11px; }
+.release-details a, .download-options summary { transition: color 140ms ease; }
+.release-details a:hover, .download-options summary:hover { color: var(--rp-text); }
+.download-options { flex-basis: 100%; }
+.download-options summary { width: fit-content; cursor: pointer; }
+.download-options summary:focus-visible { outline: 1px solid var(--rp-rose); outline-offset: 4px; border-radius: 2px; }
+.download-options-list, #download-assets { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; }
+.download-options-list { padding-top: 12px; }
+#download-assets:empty { display: none; }
+.download-options[open] .download-options-list { animation: download-reveal 180ms ease-out; }
+@keyframes download-reveal { from { opacity: 0; transform: translateY(-3px); } to { opacity: 1; transform: translateY(0); } }
+@media (prefers-reduced-motion: reduce) { .download-options[open] .download-options-list { animation: none; } }
 @media (hover: hover) and (pointer: fine) {
   .intro-detail .button.primary:hover { background: #ebbcba24; border-color: #ebbcba52; }
 }
