@@ -31,6 +31,9 @@ stored. Metadata-free reminders retain the fact for the same conversation;
 child callbacks cannot replace the parent's recovery signal. Old seeds without
 the additive field continue to load.
 
+See the [live Claude validation](claude-notification-validation.md) for observed
+foreground, background-agent, permission and idle-reminder behavior.
+
 A notification for the selected, visible session in the active app is recorded
 as read and makes no sound or desktop banner. A selected session behind
 Settings, the launcher or an overlay can still notify. Delivery is checked
@@ -96,8 +99,8 @@ terminal notification ingress and delivery diagnostics. References:
 [session opening](https://github.com/manaflow-ai/cmux/blob/7d5d308450eac2991e748c6387d8718704be891a/Sources/AppDelegate%2BNotificationOpen.swift).
 
 Remaining notification differences include transcript-derived completion
-summaries, agent background-work metadata, notification webhooks/mobile
-forwarding, full Kitty notification protocol support, and reliable offline
+summaries, notification webhooks/mobile forwarding, full Kitty notification
+protocol support, and reliable offline
 remote events. Terminal-scraped statuses still depend on each agent manifest.
 
 Other product gaps, in priority order:
