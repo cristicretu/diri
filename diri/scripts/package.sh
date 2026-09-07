@@ -102,7 +102,7 @@ mkdir -p "${license_dir}"
 cp "${workspace_dir}/../LICENSE" "${license_dir}/Apache-2.0.txt"
 cp "${workspace_dir}/../NOTICE" "${license_dir}/NOTICE.txt"
 cp "${workspace_dir}/../scripts/license-policy.json" "${license_dir}/license-policy.json"
-cp "${workspace_dir}/../LICENSES/"*.txt "${license_dir}/"
+cp "${workspace_dir}/../docs/licenses/"*.txt "${license_dir}/"
 cp "${third_party_inventory}" "${license_dir}/THIRD-PARTY-LICENSES.json"
 
 app_bin_dir="${app_path}/Contents/Resources/bin"

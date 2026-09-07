@@ -30,7 +30,7 @@ builds and preview fixtures.
 
 [Roadmap](../ROADMAP.md) · [Governance](../GOVERNANCE.md) ·
 [Code of Conduct](../CODE_OF_CONDUCT.md) · [Privacy](../PRIVACY.md) ·
-[Security reporting](../SECURITY.md)
+[Security reporting](../SECURITY.md) · [Third-party licenses](licenses/README.md)
 
 The [Rust migration record](../diri/PORT.md) is historical context.
 [AGENTS.md](../AGENTS.md) and the remote architecture describe the current
