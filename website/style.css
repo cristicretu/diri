@@ -545,3 +545,28 @@ body { isolation: isolate; position: relative; min-height: 100svh; }
   .intro-detail .button.primary:hover { background: #ebbcba24; border-color: #ebbcba52; }
 }
 .intro-detail .button.primary:active { background: #ebbcba30; transform: none; }
+
+/* A compact closing signature with resources above the quieter utility row. */
+.site-footer { position: relative; display: flex; flex-direction: column; align-items: stretch; gap: 16px; min-height: 0; padding: 28px 0 24px; border-top: 0; }
+.site-footer::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 1px; background: linear-gradient(90deg, #ebbcba30, #e0def414 55%, #e0def408); }
+.footer-main, .footer-meta { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+.footer-brand { display: inline-flex; align-items: center; gap: 8px; font-size: 24px; font-weight: 600; letter-spacing: -.8px; line-height: 1; }
+.footer-brand .brand-mark { width: 23px; height: 18px; color: var(--rp-rose); }
+.footer-nav { display: flex; align-items: center; gap: 24px; }
+.footer-nav a { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: #b6afc9; transition: color 140ms ease; }
+.footer-nav .icon { width: 14px; height: 14px; }
+.footer-meta { min-height: 28px; color: var(--rp-subtle); font-size: 11px; }
+.footer-meta > a { transition: color 140ms ease; }
+.footer-meta .background-motion { width: auto; height: 28px; padding: 0 8px; margin-right: -8px; gap: 8px; border-radius: 5px; color: var(--rp-subtle); font-size: 11px; transition: color 140ms ease, background-color 140ms ease; }
+.footer-meta .motion-symbol { width: 7px; height: 9px; border-inline-width: 2px; }
+.footer-meta .background-motion[aria-pressed="true"] .motion-symbol { width: 7px; height: 9px; }
+.site-footer :is(a, button):focus-visible { outline: 1px solid var(--rp-rose); outline-offset: 4px; }
+@media (hover: hover) and (pointer: fine) {
+  .footer-meta .background-motion:hover { color: var(--rp-text); background: #e0def40c; }
+}
+@media (max-width: 600px) {
+  .site-footer { gap: 18px; padding-top: 24px; }
+  .footer-nav { gap: 18px; }
+  .footer-nav a { font-size: 11px; }
+  .footer-brand { font-size: 22px; }
+}

@@ -1,6 +1,6 @@
 # Production readiness check
 
-Audited with Lighthouse 13.4.1 against the local Cloudflare Pages emulator, using its default mobile profile. Recorded at 2026-09-07T08:05:43.967Z.
+Audited with Lighthouse 13.4.1 against the local Cloudflare Pages emulator, using its default mobile profile. Recorded at 2026-09-07T08:11:39.528Z.
 
 | Category | Score |
 | --- | --- |
@@ -20,3 +20,5 @@ These are local lab measurements, not live-domain field data or a search-ranking
 Shader tests cover compilation, animation cap, pause/resume, reduced motion, offscreen suspension, and the no-WebGL fallback. The synchronous shader startup delay observed in the first audit was removed using asynchronous link-completion checks where supported.
 
 Live-domain checks remain in [CLOUDFLARE.md](CLOUDFLARE.md): domain association and TLS, www/Pages-host redirects, crawler response headers, Search Console verification, sitemap submission, and a post-launch PageSpeed run.
+
+The final footer revision was re-audited with the same 100/100 scores in all four categories. Its resource links, motion control, and narrow layouts passed browser checks.
