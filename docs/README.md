@@ -5,6 +5,7 @@
 | Guide | Covers |
 | :--- | :--- |
 | [Getting started](GETTING_STARTED.md) | Install, launch your first agent, use worktrees, and connect an SSH host. |
+| [Workflow guides](https://diri.sh/guides/) | Parallel agents in worktrees and persistent sessions over SSH. |
 | [Keyboard shortcuts](KEYBOARD_SHORTCUTS.md) | Navigation, the command palette, and terminal input. |
 | [Linux beta](../diri/LINUX.md) | Packages, source builds, graphics setup, and platform limits. |
 | [iPhone companion](../ios/README.md) | Beta setup and builds for access through your Tailscale network. |

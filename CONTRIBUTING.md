@@ -5,6 +5,9 @@ contribution solves a specific problem and keeps those properties intact.
 
 ## Choose a change
 
+New here? Browse the [good first issues](https://github.com/cristicretu/diri/issues?q=is%3Aissue%20is%3Aopen%20label%3A%22good%20first%20issue%22).
+Each one includes a starting point, a bounded scope, and verification steps.
+
 - **Bugs:** include reproduction steps, expected behavior, and your environment
   in a [bug report](https://github.com/cristicretu/diri/issues/new?template=bug_report.yml).
 - **Fixes and docs:** open a focused PR. An issue is useful context, not a

@@ -8,6 +8,7 @@ place. Built with Rust and GPUI for macOS, with Linux in beta.
 
 [Download](https://github.com/cristicretu/diri/releases/latest) ·
 [Getting started](docs/GETTING_STARTED.md) ·
+[Guides](https://diri.sh/guides/) ·
 [Documentation](docs/README.md) ·
 [Contributing](CONTRIBUTING.md)
 

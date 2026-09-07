@@ -6,9 +6,9 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const output = resolve(root, 'dist');
 await rm(output, { recursive: true, force: true });
 await mkdir(output, { recursive: true });
-const pages = new Map(await Promise.all(['index.html', '404.html'].map(async file => [file, await readFile(resolve(root, file), 'utf8')])));
+const pages = new Map(await Promise.all(['index.html', '404.html', 'guides/index.html', 'guides/parallel-agents/index.html', 'guides/remote-sessions/index.html'].map(async file => [file, await readFile(resolve(root, file), 'utf8')])));
 const hashed = [];
-for (const file of ['style.css', 'app.js', 'agent-previews.js', 'mesh.js']) {
+for (const file of ['style.css', 'guides.css', 'app.js', 'agent-previews.js', 'mesh.js']) {
   const content = await readFile(resolve(root, file));
   const hash = createHash('sha256').update(content).digest('hex').slice(0, 12);
   const ext = extname(file);
@@ -17,16 +17,21 @@ for (const file of ['style.css', 'app.js', 'agent-previews.js', 'mesh.js']) {
   await writeFile(resolve(output, name), content);
   for (const [page, html] of pages) pages.set(page, html.replaceAll(file, name));
 }
-for (const [file, content] of pages) await writeFile(resolve(output, file), content);
+for (const [file, content] of pages) {
+  await mkdir(dirname(resolve(output, file)), { recursive: true });
+  await writeFile(resolve(output, file), content);
+}
 for (const file of ['robots.txt', 'sitemap.xml', '_redirects', 'favicon.svg', 'favicon-96.png', 'apple-touch-icon.png', 'assets']) {
   await cp(resolve(root, file), resolve(output, file), { recursive: true });
 }
-const structuredData = pages.get('index.html').match(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/)[1];
-const jsonHash = createHash('sha256').update(structuredData).digest('base64');
+const jsonHashes = [...new Set([...pages.values()].flatMap(html =>
+  [...html.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g)]
+    .map(match => `'sha256-${createHash('sha256').update(match[1]).digest('base64')}'`)
+))].join(' ');
 const headers = `/*
   X-Content-Type-Options: nosniff
   Referrer-Policy: strict-origin-when-cross-origin
-  Content-Security-Policy: default-src 'self'; script-src 'self' 'sha256-${jsonHash}'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'none'
+  Content-Security-Policy: default-src 'self'; script-src 'self' ${jsonHashes}; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'none'
 
 https://:project.pages.dev/*
   X-Robots-Tag: noindex

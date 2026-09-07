@@ -63,3 +63,18 @@ The page includes a descriptive title, description, canonical URL, Open Graph an
 The Apple and Linux marks are from [Simple Icons](https://github.com/simple-icons/simple-icons), distributed under CC0; brand rights remain with their owners. The button is text-only, with platform icons alongside it. Shader linking uses `KHR_parallel_shader_compile` when available to avoid blocking the page while the program compiles; the CSS background remains available throughout startup.
 
 The footer uses a two-row layout: Diri branding and Documentation/GitHub links, followed by the license and a labeled animation control. It introduces no extra download action. Desktop and 390/320px layouts, motion toggling, and reduced-motion visibility were verified.
+
+## Workflow guides
+
+`guides/` contains the guide index and two static articles. They share the site
+palette and header, with reading styles in `guides.css`. Article pages work
+without JavaScript and link back to the product and reference documentation.
+
+When adding a guide, include its `index.html` in `scripts/build.mjs` and
+`scripts/check-site.mjs`, add its canonical URL to `sitemap.xml`, and link it
+from the guide index. The build fingerprints shared assets and allows each
+page’s JSON-LD through the generated Content Security Policy. Verification
+checks metadata, local files and anchors, sitemap entries, and those hashes.
+
+The local server serves directory indexes and redirects directory URLs to
+their trailing-slash form, matching the guide URLs used on Cloudflare Pages.

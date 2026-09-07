@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#191724">
+  <title>Run Claude Code and Codex in parallel · Diri</title>
+  <meta name="description" content="Run Claude Code and Codex side by side in Diri. Give each agent its own Git worktree, split the task, and review the changes before merging.">
+  <meta name="robots" content="index, follow, max-image-preview:large">
+  <link rel="canonical" href="https://diri.sh/guides/parallel-agents/">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="Diri">
+  <meta property="og:title" content="Run Claude Code and Codex in parallel">
+  <meta property="og:description" content="Run Claude Code and Codex side by side in Diri. Give each agent its own Git worktree, split the task, and review the changes before merging.">
+  <meta property="og:url" content="https://diri.sh/guides/parallel-agents/">
+  <meta property="og:image" content="https://diri.sh/assets/social-card.jpg">
+  <meta property="og:image:alt" content="Diri, a workspace for coding agents.">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/guides.css">
+  <script type="application/ld+json">{"@context": "https://schema.org", "@type": "TechArticle", "headline": "Run Claude Code and Codex in parallel", "description": "Run Claude Code and Codex side by side in Diri. Give each agent its own Git worktree, split the task, and review the changes before merging.", "url": "https://diri.sh/guides/parallel-agents/", "inLanguage": "en", "publisher": {"@type": "Organization", "name": "Diri", "url": "https://diri.sh/"}}</script>
+</head>
+<body class="guide-page">
+  <a class="skip-link" href="#main">Skip to content</a>
+  <div class="site-wrap">
+    <header class="site-header">
+      <a class="wordmark" href="/" aria-label="Diri home"><span class="brand-mark" aria-hidden="true"></span>diri</a>
+      <nav class="guide-nav" aria-label="Main"><a href="/guides/" aria-current="location">Guides</a><a href="https://github.com/cristicretu/diri">GitHub ↗</a></nav>
+    </header>
+    <main id="main">
+      <div class="guide-heading"><a class="eyebrow" href="/guides/">Guides / Workflow</a><h1>Run Claude Code and Codex in parallel</h1><p>Two agents. Two branches. One place to follow the work.</p></div>
+      <div class="guide-layout"><nav class="guide-toc" aria-label="On this page"><span>On this page</span><a href="#before-you-start">Before you start</a><a href="#split-the-work">1. Split the work</a><a href="#start-the-agents">2. Start each agent in a worktree</a><a href="#follow-progress">3. Follow progress</a><a href="#review-and-combine">4. Review and combine</a></nav>
+        <article class="guide-content"><section id="before-you-start"><h2>Before you start</h2><p>Install <a href="https://github.com/cristicretu/diri/releases/latest">Diri</a> and the Claude Code and Codex CLIs. Sign in to each agent using its own setup flow, then open a local Git repository with at least one commit.</p><p>Diri uses your existing tools and accounts. If an installed agent is missing, open <strong>Settings → Agents</strong> and refresh discovery.</p></section><section id="split-the-work"><h2>1. Split the work</h2><p>Choose tasks that can be reviewed independently. In a small task-list project, one agent can implement filtering while the other adds a summary function.</p><div class="task-pair"><div><span class="eyebrow">Claude Code</span><p>Add <code>filterTasks(tasks, status)</code> in a new module, with tests for all, open, and done.</p></div><div><span class="eyebrow">Codex</span><p>Add <code>summarizeTasks(tasks)</code> in a new module, with tests for total, open, and done counts.</p></div></div><p>Specify the files each task owns. Agree on shared data shapes first. Two agents changing the same interface will still need coordination.</p></section><section id="start-the-agents"><h2>2. Start each agent in a worktree</h2><ol><li>Open <strong>New Agent</strong> and select your project.</li><li>Choose <strong>Claude Code</strong>. Switch <strong>Current folder</strong> to <strong>New worktree</strong>.</li><li>Give the session a clear title, enter the first task, and launch.</li><li>Repeat for <strong>Codex</strong>, selecting the same project and another <strong>New worktree</strong>.</li></ol><p>Each agent gets a separate checkout and branch. Their edits stay apart while they run. Worktrees share the Git repository; they do not isolate ports, databases, or external services.</p><p class="guide-note">This workflow uses a local repository. For remote work, start with an existing project directory on the host.</p></section><section id="follow-progress"><h2>3. Follow progress</h2><p>Use the sidebar to switch between sessions and see which one is working or needs input. Read each agent’s request before approving a command. If one task discovers a change to the shared interface, pass that decision to the other agent.</p><p>You can close and reopen Diri while local sessions keep running. This does not keep the computer awake or preserve processes across a reboot.</p></section><section id="review-and-combine"><h2>4. Review and combine</h2><p>Open each session’s <strong>Changes</strong> pane. Check the diff, ask the agent to run the relevant tests, and review the result. Keep each task in its own commit or pull request.</p><p>Merge one branch, bring the other up to date, and run the tests again with both changes present. Separate worktrees prevent agents from overwriting each other’s files during the task; the combined result still needs review.</p><p>For setup and shortcuts, see the <a href="https://github.com/cristicretu/diri/blob/main/docs/GETTING_STARTED.md">getting-started guide</a>.</p></section><aside class="guide-next"><span class="eyebrow">Next guide</span><a href="/guides/remote-sessions/">Keep coding-agent sessions running over SSH <span aria-hidden="true">→</span></a></aside></article>
+      </div>
+    </main>
+    <footer class="site-footer guide-footer"><a href="/">diri</a><nav aria-label="Resources"><a href="https://github.com/cristicretu/diri/releases/latest">Download</a><a href="https://github.com/cristicretu/diri/tree/main/docs">Documentation</a><a href="https://github.com/cristicretu/diri/blob/main/LICENSE">Apache 2.0</a></nav></footer>
+  </div>
+</body>
+</html>

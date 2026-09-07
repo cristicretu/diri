@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { readFile, readdir, stat } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -26,10 +27,40 @@ assert.match(await read('_redirects'), /\/index\.html \/ 301/);
 const headers = await read('_headers');
 assert.match(headers, /https:\/\/:project\.pages\.dev\/\*\n  X-Robots-Tag: noindex/);
 assert.match(headers, /https:\/\/:version\.:project\.pages\.dev\/\*\n  X-Robots-Tag: noindex/);
-for (const match of html.matchAll(/(?:src|href)="([^"#]+)"/g)) {
-  const target = match[1];
-  if (/^[a-z]+:/.test(target)) continue;
-  await stat(resolve(root, target.replace(/^\//, '')));
+const pagePaths = ['index.html', '404.html', 'guides/index.html', 'guides/parallel-agents/index.html', 'guides/remote-sessions/index.html'];
+const sitemap = await read('sitemap.xml');
+const titles = new Set();
+for (const page of pagePaths) {
+  const content = await read(page);
+  assert.equal((content.match(/<h1\b/g) || []).length, 1, `${page}: one heading`);
+  if (page.startsWith('guides/')) {
+    const url = 'https://diri.sh/' + page.replace(/index\.html$/, '');
+    assert.ok(content.includes(`rel="canonical" href="${url}"`), `${page}: canonical`);
+    assert.ok(sitemap.includes(`<loc>${url}</loc>`), `${page}: sitemap`);
+    assert.match(content, /name="description" content="[^"]{80,180}"/);
+    assert.match(content, /name="twitter:card" content="summary_large_image"/);
+    assert.doesNotMatch(content, /content="noindex/);
+    const title = content.match(/<title>(.*?)<\/title>/)[1];
+    assert.ok(!titles.has(title), `${page}: unique title`);
+    titles.add(title);
+  }
+  for (const match of content.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g)) {
+    assert.equal(JSON.parse(match[1])['@context'], 'https://schema.org');
+    const hash = createHash('sha256').update(match[1]).digest('base64');
+    assert.ok(headers.includes(`'sha256-${hash}'`), `${page}: structured data allowed by CSP`);
+  }
+  for (const match of content.matchAll(/(?:src|href)="([^"]+)"/g)) {
+    const target = match[1];
+    if (/^[a-z]+:/.test(target)) continue;
+    const [path, fragment] = target.split('#');
+    let file = path ? resolve(path.startsWith('/') ? root : dirname(resolve(root, page)), path.replace(/^\//, '')) : resolve(root, page);
+    if ((await stat(file)).isDirectory()) file = resolve(file, 'index.html');
+    await stat(file);
+    if (fragment && file.endsWith('.html')) {
+      const linked = await readFile(file, 'utf8');
+      assert.ok(linked.includes(`id="${fragment}"`), `${page}: missing anchor ${target}`);
+    }
+  }
 }
 for (const entry of await readdir(root)) assert.ok(!['README.md','CLOUDFLARE.md','package.json','server.mjs','scripts','.wrangler','node_modules'].includes(entry), `Source file leaked into build: ${entry}`);
 assert.ok((await stat(resolve(root, 'assets/social-card.jpg'))).size < 300_000);
