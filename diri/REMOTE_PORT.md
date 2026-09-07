@@ -358,6 +358,13 @@ each configured SSH host have independent catalog state. The Engine owns the
 catalog and preferences; the Helper only reports filesystem facts from the
 remote account.
 
+Local desktop discovery and launches share a normalized PATH: captured login
+shell entries first, inherited entries next, then user package-manager and
+standard executable directories. Fallbacks include pnpm's old home-directory
+shims and pnpm 11's `bin` layout, `PNPM_HOME`, `XDG_DATA_HOME`, Bun, Cargo,
+mise, and Volta. They also apply when local shell capture fails or times out.
+These local fallbacks are never added to remote launch environments.
+
 Protocol 1.3 adds the required `executable-discovery` capability. One bounded
 `executables` request carries every bundled manifest binary and any configured
 override. The Helper captures the login environment exactly once, resolves all

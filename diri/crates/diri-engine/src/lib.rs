@@ -40,6 +40,7 @@ pub mod hosts;
 pub mod inject;
 mod lifecycle;
 pub mod limits;
+pub mod local_path;
 pub mod log;
 pub mod migrate;
 pub mod pr_monitor;

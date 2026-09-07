@@ -31,6 +31,13 @@ Claude Code and Codex have first-class status detection and resume support.
 Other agents may offer partial detection; every agent can still run as a normal
 terminal.
 
+Install each agent's CLI separately. For local agents, Diri checks your login
+shell's PATH and common package-manager locations, including pnpm's global
+executables in both `PNPM_HOME` and `PNPM_HOME/bin` (pnpm 11). After installing
+an agent while Diri is open, use **Settings → Agents → Refresh**. For a custom
+location that still isn't detected, use **Add…** on that agent's row to select
+its executable.
+
 ## Drag and drop in the sidebar
 
 Drag a session between two rows to reorder it among its siblings; an insertion
