@@ -964,7 +964,7 @@ impl TerminalPane {
         self.focus.is_focused(window)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn capture_input_for_test(
         &mut self,
     ) -> mpsc::UnboundedReceiver<(SessionId, Vec<u8>)> {
