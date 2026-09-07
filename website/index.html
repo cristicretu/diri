@@ -8,6 +8,7 @@
   <title>Diri — a workspace for your agents</title>
   <link rel="icon" href="assets/brand/diri.svg" type="image/svg+xml">
   <link rel="stylesheet" href="style.css">
+  <script src="agent-previews.js" defer></script>
   <script src="app.js" defer></script>
   <script src="mesh.js" defer></script>
 </head>
@@ -48,11 +49,11 @@
             <button class="new-chat" data-open="command"><span class="icon" data-icon="new-agent"></span>New Agent <small>Codex</small></button>
             <div class="sidebar-group"><span class="icon" data-icon="folder"></span>Diri <span class="icon" data-icon="chevron-down"></span></div>
             <button class="chat-row selected" data-chat="website" aria-pressed="true"><span class="agent-logo" data-agent="codex"></span><span>Build the Diri website</span><span class="chat-state completed" aria-label="Completed"><span class="icon" data-icon="check"></span></span></button>
-            <button class="chat-row" data-chat="notes" aria-pressed="false"><span class="agent-logo" data-agent="codex"></span><span>Weekly plan</span><span class="chat-state needs-input" aria-label="Needs input"><span class="icon" data-icon="bell"></span></span></button>
+            <button class="chat-row" data-chat="notes" aria-pressed="false"><span class="agent-logo claude" data-agent="claude"></span><span>Weekly plan</span><span class="chat-state needs-input" aria-label="Needs input"><span class="icon" data-icon="bell"></span></span></button>
             <button class="chat-row" data-chat="details" aria-pressed="false"><span class="agent-logo" data-agent="cursor"></span><span>Keyboard navigation</span><span class="chat-state working" aria-label="Working"><span class="icon" data-icon="clock"></span></span></button>
             <div class="sidebar-divider"></div><div class="sidebar-group second"><span class="icon" data-icon="folder"></span>Experiments <span class="icon" data-icon="chevron-down"></span></div>
             <button class="chat-row" data-chat="weekend" aria-pressed="false"><span class="agent-logo gemini" data-agent="gemini"></span><span>Travel map</span></button>
-            <div class="sidebar-bottom"><span class="icon" data-icon="local-agents"></span><span>Local agents</span></div>
+            <div class="sidebar-bottom account-summary"><span class="account-avatar" aria-hidden="true">G</span><span class="account-name">giga</span><span class="account-cost" title="Estimated usage cost today" aria-label="Estimated usage cost today: 19 dollars and 41 cents">$19.41</span></div>
           </aside>
           <div class="app-main">
             <div class="app-titlebar"><span class="traffic-lights mobile-traffic-lights" aria-hidden="true"><i></i><i></i><i></i></span>
@@ -71,26 +72,8 @@
             </div>
           </div>
           <aside class="changes-panel" aria-label="Changes preview">
-            <div class="changes-header"><span class="icon" data-icon="code"></span><strong>Changes</strong><span class="diff-count">+18 −6</span><button class="icon-button" id="close-changes" aria-label="Close changes"><span class="icon" data-icon="close"></span></button></div>
-            <div class="diff-file"><span class="icon" data-icon="code"></span>website/style.css</div>
-            <div class="diff-lines" aria-label="Example CSS changes">
-              <div><span>1</span><code>:root {</code></div>
-              <div><span>2</span><code>  color-scheme: dark;</code></div>
-              <div class="removed"><span>−</span><code>  --background: #18191b;</code></div>
-              <div class="added"><span>+</span><code>  --background: #191724;</code></div>
-              <div class="added"><span>+</span><code>  --text: #e0def4;</code></div>
-              <div class="added"><span>+</span><code>  --accent: #ebbcba;</code></div>
-              <div><span>7</span><code>}</code></div>
-              <div><span>8</span><code></code></div>
-              <div><span>9</span><code>.app-window {</code></div>
-              <div class="added"><span>+</span><code>  background: #19172480;</code></div>
-              <div class="added"><span>+</span><code>  backdrop-filter:</code></div>
-              <div class="added"><span>+</span><code>    blur(16px);</code></div>
-              <div><span>13</span><code>  border-radius: 12px;</code></div>
-              <div><span>14</span><code>}</code></div>
-            </div>
-            <div class="diff-file"><span class="icon" data-icon="code"></span>website/mesh.js</div>
-            <div class="diff-lines"><div class="added"><span>+</span><code>const gl = canvas</code></div><div class="added"><span>+</span><code>  .getContext('webgl');</code></div><div class="added"><span>+</span><code></code></div><div class="added"><span>+</span><code>drawMesh(gl);</code></div></div>
+            <div class="changes-header"><span class="icon" data-icon="code"></span><strong>Changes</strong><span class="diff-count"></span><button class="icon-button" id="close-changes" aria-label="Close changes"><span class="icon" data-icon="close"></span></button></div>
+            <div class="changes-content"></div>
           </aside>
           <div class="demo-shade" id="demo-shade" hidden></div>
           <section class="palette floating-panel" id="palette" aria-label="Demo command menu" hidden>
@@ -105,13 +88,18 @@
           </section>
           <section class="notifications-panel floating-panel" id="notifications-panel" aria-label="Demo notifications" hidden>
             <div class="floating-head"><span class="icon" data-icon="bell"></span><span>Notifications</span><button class="escape-key" data-close aria-label="Close notifications">esc</button></div>
-            <button class="notification-row" data-chat="website"><span class="icon green-icon" data-icon="check-circle"></span><span><strong>Diri website</strong><small>Claude finished</small></span></button>
-            <button class="notification-row" data-chat="notes"><span class="icon orange-icon" data-icon="bell"></span><span><strong>Weekly plan</strong><small>Codex has a question</small></span></button>
+            <button class="notification-row" data-chat="website"><span class="icon green-icon" data-icon="check-circle"></span><span><strong>Diri website</strong><small>Codex finished</small></span></button>
+            <button class="notification-row" data-chat="notes"><span class="icon orange-icon" data-icon="bell"></span><span><strong>Weekly plan</strong><small>Claude has a question</small></span></button>
           </section>
         </div>
       </section>
 
-      <section class="compatible" aria-label="Compatible agents"><div><span><i class="agent-logo" data-agent="claude"></i>Claude Code</span><span><i class="agent-logo" data-agent="codex"></i>Codex</span><span><i class="agent-logo" data-agent="cursor"></i>Cursor</span><span><i class="agent-logo" data-agent="gemini"></i>Gemini</span></div></section>
+      <section class="compatible" aria-label="Preview each agent"><div>
+        <button class="agent-switch" data-chat="notes" aria-pressed="false"><i class="agent-logo claude" data-agent="claude"></i>Claude Code</button>
+        <button class="agent-switch" data-chat="website" aria-pressed="true"><i class="agent-logo" data-agent="codex"></i>Codex</button>
+        <button class="agent-switch" data-chat="details" aria-pressed="false"><i class="agent-logo" data-agent="cursor"></i>Cursor</button>
+        <button class="agent-switch" data-chat="weekend" aria-pressed="false"><i class="agent-logo gemini" data-agent="gemini"></i>Gemini</button>
+      </div></section>
 
       <section class="details" aria-label="Features">
         <article><h2>Agent status</h2><p>See when an agent needs your input</p></article>

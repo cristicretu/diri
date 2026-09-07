@@ -9,11 +9,12 @@ function paintIcons(root = document) {
   });
 }
 const chats = {
-  website: { title: 'Build the Diri website', agent: 'codex', name: 'Codex', status: 'gpt-6', prompt: 'Make a website for Diri using the app’s design system.', body: `<p class="cli-response">I’ll use the app’s layout, icons, and Rosé Pine theme.</p><div class="cli-tool">${icon('check')}<strong>Read</strong><code>website/index.html</code></div><div class="cli-tool">${icon('check')}<strong>Updated</strong><code>website/style.css</code></div><div class="cli-tool">${icon('check')}<strong>Added</strong><code>website/mesh.js</code></div><div class="cli-summary"><p>The preview now has:</p><p>— A Rosé Pine mesh background<br>— Translucent sidebars and toolbar<br>— A separate changes panel</p><button class="result-link" data-open="links">Open preview ${icon('external-link')}</button></div><div class="cli-divider">Changes ready to review</div>` },
-  notes: { title: 'Weekly plan', agent: 'codex', name: 'Codex', status: 'Needs input', prompt: 'Create a weekly plan from these notes.', body: `<div class="work-line">${icon('check')}<span class="work-verb">Read</span><code>monday-notes.md · ideas.md · next-up.md</code></div><div class="terminal-result"><strong>Notes reviewed.</strong><p>How much detail should the plan include?</p><div class="question-options"><button data-answer="short">Summary</button><button data-answer="full">Detailed plan</button></div></div>` },
-  details: { title: 'Keyboard navigation', agent: 'cursor', name: 'Cursor', status: 'Working', prompt: 'Fix keyboard navigation in the command menu.', body: `<div class="work-line">${icon('check')}<span class="work-verb">Checked</span><code>keyboard navigation and focus</code></div><div class="work-line">${icon('check')}<span class="work-verb">Refined</span><code>the command menu transition</code></div><div class="terminal-result"><strong>Navigation updated.</strong><p>Back navigation and keyboard shortcuts are ready to test.</p><button class="result-link" data-open="command">Open commands ${icon('chevron-right')}</button></div>` },
-  weekend: { title: 'Travel map', agent: 'gemini', name: 'Gemini', status: 'Idle', prompt: 'Build a map of places to visit.', body: `<div class="terminal-result"><strong>Map created.</strong><p>Add places, notes, and map pins.</p></div>` }
+  website: { title: 'Build the Diri website', agent: 'codex', name: 'Codex', prompt: 'Make a website for Diri using the app’s design system.' },
+  notes: { title: 'Weekly plan', agent: 'claude', name: 'Claude Code', prompt: 'Create a weekly plan from these notes.' },
+  details: { title: 'Keyboard navigation', agent: 'cursor', name: 'Cursor', prompt: 'Fix keyboard navigation in the command menu.' },
+  weekend: { title: 'Travel map', agent: 'gemini', name: 'Gemini', prompt: 'Build a map of places to visit.' }
 };
+let notesAnswer = null;
 let currentChat = 'website';
 let overlay = null;
 let previousFocus;
@@ -30,8 +31,16 @@ function selectChat(id) {
   const logo = $('.current-agent .agent-logo');
   logo.dataset.agent = chat.agent;
   logo.className = `agent-logo ${chat.agent}`;
-  $('#terminal-status').textContent = chat.status;
-  $('#terminal-content').innerHTML = `<div class="terminal-scene"><div class="prompt-line"><span>›</span><span>${chat.prompt}</span></div>${chat.body}</div>`;
+  const preview = agentPreviews[chat.agent].render(chat, notesAnswer);
+  $('.terminal-body').dataset.cli = chat.agent;
+  $('#terminal-content').innerHTML = `<div class="terminal-scene">${preview.html}</div>`;
+  $('.terminal-composer').innerHTML = preview.composer;
+  $('.terminal-footer').innerHTML = preview.footer;
+  $('.changes-content').innerHTML = preview.changes;
+  $('.diff-count').textContent = `+${$$('.changes-content .added').length}`;
+  $('#terminal-content').scrollTop = 0;
+  $$('.agent-switch').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.chat === id)));
+  $('.new-chat small').textContent = chat.name;
   paintIcons();
 }
 function setTab(view) {
@@ -128,8 +137,7 @@ document.addEventListener('click', event => {
   if (target.dataset.chat) { selectChat(target.dataset.chat); if (overlay) closeOverlay(); }
   if (target.dataset.view) target.dataset.view === 'workspace' ? closeOverlay(false) : openOverlay(target.dataset.view);
   if (target.dataset.answer) {
-    chats.notes.status = 'Completed';
-    chats.notes.body = `<div class="work-line">${icon('check')}<span class="work-verb">Saved</span><code>this-week.md</code></div><div class="terminal-result"><strong>Plan saved.</strong><p>1. Finish the first draft.<br>2. Collect feedback.<br>3. Refine the design based on feedback.</p>${target.dataset.answer === 'full' ? '<p>Start with the page on Monday. Gather feedback midweek.<br>Revise the page on Friday.</p>' : ''}</div>`;
+    notesAnswer = target.dataset.answer;
     const state = $('.chat-row[data-chat="notes"] .chat-state');
     state.className = 'chat-state completed';
     state.setAttribute('aria-label', 'Completed');

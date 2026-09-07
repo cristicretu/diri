@@ -3,5 +3,5 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "scripts": { "dev": "node server.mjs", "check": "node --check app.js && node --check mesh.js && node --check server.mjs" }
+  "scripts": { "dev": "node server.mjs", "check": "node --check app.js && node --check agent-previews.js && node --check mesh.js && node --check server.mjs" }
 }
