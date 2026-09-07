@@ -9,7 +9,7 @@ function paintIcons(root = document) {
   });
 }
 const chats = {
-  website: { title: 'Diri website', agent: 'claude', name: 'Claude', status: 'Completed', prompt: 'Build a compact website for Diri. Use the app’s design system.', body: `<div class="work-line">${icon('check')}<span class="work-verb">Read</span><code>design-tokens.css</code></div><div class="work-line">${icon('check')}<span class="work-verb">Updated</span><code>website/index.html</code></div><div class="work-line">${icon('check')}<span class="work-verb">Refined</span><code>website/style.css</code></div><div class="terminal-result"><strong>Website updated.</strong><p>Layout, spacing, and keyboard navigation are ready to review.</p><button class="result-link" data-open="links">Open links ${icon('external-link')}</button></div>` },
+  website: { title: 'Build the Diri website', agent: 'codex', name: 'Codex', status: 'gpt-6', prompt: 'Make a website for Diri using the app’s design system.', body: `<p class="cli-response">I’ll use the app’s layout, icons, and Rosé Pine theme.</p><div class="cli-tool">${icon('check')}<strong>Read</strong><code>website/index.html</code></div><div class="cli-tool">${icon('check')}<strong>Updated</strong><code>website/style.css</code></div><div class="cli-tool">${icon('check')}<strong>Added</strong><code>website/mesh.js</code></div><div class="cli-summary"><p>The preview now has:</p><p>— A Rosé Pine mesh background<br>— Translucent sidebar and terminal<br>— A separate changes panel</p><button class="result-link" data-open="links">Open preview ${icon('external-link')}</button></div><div class="cli-divider">Changes ready to review</div>` },
   notes: { title: 'Weekly plan', agent: 'codex', name: 'Codex', status: 'Needs input', prompt: 'Create a weekly plan from these notes.', body: `<div class="work-line">${icon('check')}<span class="work-verb">Read</span><code>monday-notes.md · ideas.md · next-up.md</code></div><div class="terminal-result"><strong>Notes reviewed.</strong><p>How much detail should the plan include?</p><div class="question-options"><button data-answer="short">Summary</button><button data-answer="full">Detailed plan</button></div></div>` },
   details: { title: 'Keyboard navigation', agent: 'cursor', name: 'Cursor', status: 'Working', prompt: 'Fix keyboard navigation in the command menu.', body: `<div class="work-line">${icon('check')}<span class="work-verb">Checked</span><code>keyboard navigation and focus</code></div><div class="work-line">${icon('check')}<span class="work-verb">Refined</span><code>the command menu transition</code></div><div class="terminal-result"><strong>Navigation updated.</strong><p>Back navigation and keyboard shortcuts are ready to test.</p><button class="result-link" data-open="command">Open commands ${icon('chevron-right')}</button></div>` },
   weekend: { title: 'Travel map', agent: 'gemini', name: 'Gemini', status: 'Idle', prompt: 'Build a map of places to visit.', body: `<div class="terminal-result"><strong>Map created.</strong><p>Add places, notes, and map pins.</p></div>` }
@@ -31,7 +31,7 @@ function selectChat(id) {
   logo.dataset.agent = chat.agent;
   logo.className = `agent-logo ${chat.agent}`;
   $('#terminal-status').textContent = chat.status;
-  $('#terminal-content').innerHTML = `<div class="terminal-scene"><div class="terminal-meta"><span class="agent-logo ${chat.agent}" data-agent="${chat.agent}"></span><strong>${chat.name}</strong><span>~/diri</span></div><div class="prompt-line"><span>›</span><span>${chat.prompt}</span></div>${chat.body}</div>`;
+  $('#terminal-content').innerHTML = `<div class="terminal-scene"><div class="prompt-line"><span>›</span><span>${chat.prompt}</span></div>${chat.body}</div>`;
   paintIcons();
 }
 function setTab(view) {
@@ -44,6 +44,7 @@ function closeOverlay(restoreFocus = true) {
   overlay = null;
   $('.app-sidebar').inert = false;
   $('.app-main').inert = false;
+  $('.changes-panel').inert = false;
   setTab('workspace');
   if (restoreFocus && previousFocus?.isConnected) previousFocus.focus({ preventScroll: true });
 }
@@ -53,6 +54,7 @@ function openOverlay(kind) {
   overlay = kind;
   $('.app-sidebar').inert = true;
   $('.app-main').inert = true;
+  $('.changes-panel').inert = true;
   $('#demo-shade').hidden = false;
   const panel = $(kind === 'command' ? '#palette' : `#${kind}-panel`);
   panel.hidden = false;
@@ -155,3 +157,14 @@ document.addEventListener('keydown', event => {
   if (event.key === 'Escape' && overlay) { event.preventDefault(); closeOverlay(); }
 });
 selectChat(currentChat);
+
+function toggleChanges() {
+  const hidden = $('#demo-window').classList.toggle('changes-hidden');
+  $('#toggle-changes').setAttribute('aria-expanded', String(!hidden));
+}
+$('#toggle-changes').addEventListener('click', toggleChanges);
+$('#close-changes').addEventListener('click', () => { toggleChanges(); $('#toggle-changes').focus({preventScroll:true}); });
+$('#toggle-sidebar').addEventListener('click', () => {
+  $('#demo-window').classList.toggle('sidebar-collapsed');
+  $('#toggle-sidebar').setAttribute('aria-label', $('#demo-window').classList.contains('sidebar-collapsed') ? 'Expand sidebar' : 'Collapse sidebar');
+});

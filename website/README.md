@@ -17,11 +17,18 @@ Open http://localhost:4177. Requires Node.js; no install or build step. Set `POR
 - Switch among four illustrative chats, or answer the sample Codex question.
 - Open the command menu, search chats, or choose a project.
 - Open compact links and notifications panels.
+- Collapse the sidebar or toggle the Changes pane at desktop widths.
 
 The workspace contains curated demonstration data, not a live Diri session. Download and source links go to the real public repository. The demo never launches an agent, runs commands, or sends data.
 
-`index.html`, `style.css`, `app.js`, and `assets/` can be served by any static host. `server.mjs` is a loopback-only development server. There are no external fonts, analytics, runtime dependencies, or third-party scripts.
+`index.html`, `style.css`, `app.js`, `mesh.js`, and `assets/` can be served by any static host. `server.mjs` is a loopback-only development server. There are no external fonts, analytics, runtime dependencies, or third-party scripts.
 
 ## Verification
 
 Checked in Chrome at 1440, 768, 390, and 320px: no document overflow; command search and back navigation; chat replies; link and notification panels; and dark appearance with a previously saved light preference. Reduced-motion preferences disable animations. App controls behind an open preview panel are inert.
+
+## Visual reference and background
+
+The window layout follows the repository screenshot at `docs/images/diri.png`, the Rust sidebar fixture screenshots, and the sidebar implementation: agent launcher, project hierarchy, terminal output and composer, and a separate Changes pane. It is still a browser reconstruction with demonstration content, not a capture of the current live session. Screen capture was unavailable in the editing environment.
+
+The background uses a small WebGL mesh, capped at 960 pixels wide. It draws on layout or pointer changes only; there is no continuous animation loop. Reduced motion disables pointer response. A CSS mesh remains underneath for unavailable or lost WebGL contexts. The app window uses one backdrop blur layer; reduced transparency uses opaque surfaces.

@@ -9,8 +9,10 @@
   <link rel="icon" href="assets/brand/diri.svg" type="image/svg+xml">
   <link rel="stylesheet" href="style.css">
   <script src="app.js" defer></script>
+  <script src="mesh.js" defer></script>
 </head>
 <body>
+  <div class="mesh-background" aria-hidden="true"><canvas id="mesh"></canvas></div>
   <a class="skip-link" href="#main">Skip to content</a>
   <div class="site-wrap">
     <header class="site-header">
@@ -42,29 +44,52 @@
         </div>
         <div class="app-window" id="demo-window" role="tabpanel" aria-labelledby="tab-workspace">
           <aside class="app-sidebar" aria-label="Demo chats">
-            <div class="sidebar-top"><span>Projects</span></div>
-            <button class="new-chat" data-open="command"><span class="icon" data-icon="plus"></span>New chat</button>
+            <div class="sidebar-top"><button class="icon-button" data-open="command" aria-label="Open commands"><span class="icon" data-icon="settings"></span></button><button class="icon-button" data-open="command" aria-label="Search conversations"><span class="icon" data-icon="search"></span></button><button class="icon-button" id="toggle-sidebar" aria-label="Collapse sidebar"><span class="icon" data-icon="sidebar"></span></button></div>
+            <button class="new-chat" data-open="command"><span class="icon" data-icon="new-agent"></span>New Agent <small>Codex</small></button>
             <div class="sidebar-group"><span class="icon" data-icon="folder"></span>Diri <span class="icon" data-icon="chevron-down"></span></div>
-            <button class="chat-row selected" data-chat="website" aria-pressed="true"><span class="agent-logo claude" data-agent="claude"></span><span>Diri website</span><span class="chat-state completed" aria-label="Completed"><span class="icon" data-icon="check"></span></span></button>
+            <button class="chat-row selected" data-chat="website" aria-pressed="true"><span class="agent-logo" data-agent="codex"></span><span>Build the Diri website</span><span class="chat-state completed" aria-label="Completed"><span class="icon" data-icon="check"></span></span></button>
             <button class="chat-row" data-chat="notes" aria-pressed="false"><span class="agent-logo" data-agent="codex"></span><span>Weekly plan</span><span class="chat-state needs-input" aria-label="Needs input"><span class="icon" data-icon="bell"></span></span></button>
             <button class="chat-row" data-chat="details" aria-pressed="false"><span class="agent-logo" data-agent="cursor"></span><span>Keyboard navigation</span><span class="chat-state working" aria-label="Working"><span class="icon" data-icon="clock"></span></span></button>
-            <div class="sidebar-group second"><span class="icon" data-icon="folder"></span>Experiments <span class="icon" data-icon="chevron-down"></span></div>
+            <div class="sidebar-divider"></div><div class="sidebar-group second"><span class="icon" data-icon="folder"></span>Experiments <span class="icon" data-icon="chevron-down"></span></div>
             <button class="chat-row" data-chat="weekend" aria-pressed="false"><span class="agent-logo gemini" data-agent="gemini"></span><span>Travel map</span></button>
-            <div class="sidebar-bottom"><span class="icon" data-icon="monitor"></span><span>On this Mac</span></div>
+            <div class="sidebar-bottom"><span class="icon" data-icon="local-agents"></span><span>Local agents</span></div>
           </aside>
           <div class="app-main">
             <div class="app-titlebar">
-              <span class="session-name" id="session-name">Diri website</span>
+              <span class="icon session-icon" data-icon="terminal"></span><span class="session-name" id="session-name">Build the Diri website</span>
               <div class="app-tools">
                 <button class="app-tool links-trigger" data-open="links" aria-label="Open demo links">Links <span class="link-count">2</span><span class="icon" data-icon="chevron-down"></span></button>
-                <span class="current-agent"><span class="agent-logo claude" data-agent="claude"></span><span id="agent-name">Claude</span></span>
-                <button class="icon-button" data-open="command" aria-label="Open demo command menu"><span class="icon" data-icon="search"></span></button>
+                <span class="current-agent"><span class="agent-logo" data-agent="codex"></span><span id="agent-name">Codex</span></span>
+                <button class="icon-button" id="toggle-changes" aria-label="Toggle changes" aria-expanded="true"><span class="icon" data-icon="sidebar-right"></span></button>
                 <button class="icon-button notification-trigger" data-open="notifications" aria-label="Open demo notifications"><span class="icon" data-icon="bell"></span></button>
               </div>
             </div>
             <div class="terminal" id="terminal-content" aria-live="polite"></div>
+            <div class="terminal-composer" aria-label="Example terminal prompt"><span>›</span><span>Ask a question or describe a task</span><span class="terminal-cursor" aria-hidden="true"></span></div>
             <div class="terminal-footer"><span id="terminal-status">Completed</span><button data-open="command" aria-label="Explore the command menu"><span class="icon" data-icon="search"></span><kbd>⌘K</kbd></button></div>
           </div>
+          <aside class="changes-panel" aria-label="Changes preview">
+            <div class="changes-header"><span class="icon" data-icon="code"></span><strong>Changes</strong><span class="diff-count">+18 −6</span><button class="icon-button" id="close-changes" aria-label="Close changes"><span class="icon" data-icon="close"></span></button></div>
+            <div class="diff-file"><span class="icon" data-icon="code"></span>website/style.css</div>
+            <div class="diff-lines" aria-label="Example CSS changes">
+              <div><span>1</span><code>:root {</code></div>
+              <div><span>2</span><code>  color-scheme: dark;</code></div>
+              <div class="removed"><span>−</span><code>  --background: #18191b;</code></div>
+              <div class="added"><span>+</span><code>  --background: #191724;</code></div>
+              <div class="added"><span>+</span><code>  --text: #e0def4;</code></div>
+              <div class="added"><span>+</span><code>  --accent: #ebbcba;</code></div>
+              <div><span>7</span><code>}</code></div>
+              <div><span>8</span><code></code></div>
+              <div><span>9</span><code>.app-window {</code></div>
+              <div class="added"><span>+</span><code>  background: #19172480;</code></div>
+              <div class="added"><span>+</span><code>  backdrop-filter:</code></div>
+              <div class="added"><span>+</span><code>    blur(16px);</code></div>
+              <div><span>13</span><code>  border-radius: 12px;</code></div>
+              <div><span>14</span><code>}</code></div>
+            </div>
+            <div class="diff-file"><span class="icon" data-icon="code"></span>website/mesh.js</div>
+            <div class="diff-lines"><div class="added"><span>+</span><code>const gl = canvas</code></div><div class="added"><span>+</span><code>  .getContext('webgl');</code></div><div class="added"><span>+</span><code></code></div><div class="added"><span>+</span><code>drawMesh(gl);</code></div></div>
+          </aside>
           <div class="demo-shade" id="demo-shade" hidden></div>
           <section class="palette floating-panel" id="palette" aria-label="Demo command menu" hidden>
             <div class="palette-head"><button id="palette-back" class="icon-button" aria-label="Back to commands" hidden><span class="icon" data-icon="chevron-left"></span></button><span id="palette-search-icon" class="icon" data-icon="search"></span><input id="palette-input" aria-label="Search demo commands" placeholder="Search chats or run a command…" autocomplete="off" spellcheck="false" role="combobox" aria-expanded="true" aria-controls="palette-list" aria-autocomplete="list"><button class="escape-key" data-close aria-label="Close command menu">esc</button></div>
