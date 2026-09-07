@@ -220,7 +220,7 @@ body { isolation: isolate; position: relative; min-height: 100svh; }
 .intro { padding-block: 48px; }
 .intro-detail > p:first-child { color: #b6afc9; }
 .quiet-link, .download-note, .details p, .compatible > div, .site-footer { color: #b6afc9; }
-.app-window { grid-template-columns: 208px minmax(0, 1fr) 272px; height: 520px; background: #19172480; border: 1px solid #e0def42b; backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); box-shadow: 0 24px 80px -20px #08071099, 0 1px 0 #e0def40c inset; }
+.app-window { width: 100%; min-width: 0; --sidebar-width: 248px; --changes-width: 320px; grid-template-columns: var(--sidebar-width) minmax(0, 1fr) var(--changes-width); aspect-ratio: 16 / 10; height: auto; min-height: 520px; background: #19172480; border: 1px solid #e0def42b; backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); box-shadow: 0 24px 80px -20px #08071099, 0 1px 0 #e0def40c inset; }
 .app-sidebar { background: #26233a80; border-right-color: #e0def416; padding-inline: 8px; }
 .sidebar-top { height: 40px; justify-content: flex-end; gap: 4px; padding-inline: 4px; }
 .new-chat { font-size: 12px; padding: 0 8px; margin: 0 0 16px; height: 36px; }
@@ -274,22 +274,22 @@ body { isolation: isolate; position: relative; min-height: 100svh; }
 .diff-lines .added code { color: #b1d2d7; }
 .diff-lines .removed { background: #eb6f9212; }
 .diff-lines .removed code { color: #ce8da5; }
-.app-window.changes-hidden { grid-template-columns: 208px minmax(0, 1fr); }
+.app-window.changes-hidden { grid-template-columns: var(--sidebar-width) minmax(0, 1fr); }
 .changes-hidden .changes-panel { display: none; }
-.app-window.sidebar-collapsed { grid-template-columns: 40px minmax(0, 1fr) 272px; }
+.app-window.sidebar-collapsed { grid-template-columns: 40px minmax(0, 1fr) var(--changes-width); }
 .sidebar-collapsed.changes-hidden { grid-template-columns: 40px minmax(0, 1fr); }
 .sidebar-collapsed .app-sidebar { padding: 0; }
 .sidebar-collapsed .app-sidebar > :not(.sidebar-top), .sidebar-collapsed .sidebar-top > :not(#toggle-sidebar) { display: none; }
 .sidebar-collapsed .sidebar-top { justify-content: center; padding: 0; }
-.floating-panel { background: #26233af2; }
+.floating-panel { background: var(--rp-overlay); }
 @media(max-width: 1050px) {
-  .app-window { grid-template-columns: 208px minmax(0, 1fr); }
+  .app-window { --sidebar-width: 208px; grid-template-columns: var(--sidebar-width) minmax(0, 1fr); }
   .changes-panel { display: none; }
   #toggle-changes { display: none; }
   .app-window.sidebar-collapsed { grid-template-columns: 40px minmax(0, 1fr); }
 }
 @media(max-width: 600px) {
-  .app-window, .app-window.changes-hidden, .app-window.sidebar-collapsed { grid-template-columns: minmax(0, 1fr); height: 468px; }
+  .app-window, .app-window.changes-hidden, .app-window.sidebar-collapsed { grid-template-columns: minmax(0, 1fr); aspect-ratio: auto; height: 480px; min-height: 0; }
   .app-titlebar { padding-inline: 10px; }
   .terminal { padding: 16px 12px; font-size: 10px; }
   .cli-tool { font-size: 9px; gap: 6px; }
@@ -301,4 +301,22 @@ body { isolation: isolate; position: relative; min-height: 100svh; }
 @media(prefers-reduced-transparency: reduce) {
   .app-window { background: var(--rp-base); backdrop-filter: none; -webkit-backdrop-filter: none; }
   .app-sidebar, .app-titlebar, .changes-panel { background: var(--rp-surface); }
+}
+
+/* Only the sidebars and titlebars reveal the desktop behind the window. */
+.terminal-body { display: flex; flex-direction: column; flex: 1; min-height: 0; background: var(--rp-base); overflow: hidden; }
+.app-titlebar, .changes-header { height: 40px; flex-shrink: 0; }
+.new-chat { font-size: 13px; }
+.sidebar-group { font-size: 13px; }
+.chat-row { height: 32px; min-height: 32px; font-size: 12px; }
+.terminal { font-size: 12px; line-height: 1.65; }
+.session-name, .changes-header { font-size: 11px; }
+.diff-file, .diff-lines { font-size: 10px; }
+@media(max-width: 850px) {
+  .chat-row { font-size: 11px; }
+  .terminal { font-size: 11px; }
+}
+@media(max-width: 600px) {
+  .terminal { font-size: 10px; }
+  .session-name { font-size: 10px; }
 }
