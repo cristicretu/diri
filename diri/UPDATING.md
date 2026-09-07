@@ -126,6 +126,17 @@ Release notes come from `dist/notes-<version>.md`. The script writes a default
 one if it is missing, so writing that file first — and re-running — is how you
 customize them.
 
+Keep the public title to `diri <version>`. Lead the notes with one sentence
+about the most useful change, then a short list of user-visible improvements
+and fixes. Include required upgrade steps and known limitations when relevant.
+Link PRs for implementation detail; avoid repeating the title, feature pitches,
+or the full install guide in every release.
+
+When using GitHub's **Generate release notes**, the
+[release configuration](../.github/release.yml) groups PRs by the existing
+labels. Review and edit that output before publishing; it does not replace
+the release script's authored notes file.
+
 ### The bundled Engine updates safely with the app
 
 `diri.app` carries `dirijord-rs` + `diri-holder` in `Contents/Resources/bin`,

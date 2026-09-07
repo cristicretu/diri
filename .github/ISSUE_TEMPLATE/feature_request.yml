@@ -1,5 +1,6 @@
 name: Feature request
 description: Propose a focused improvement to Diri.
+labels: [enhancement]
 body:
   - type: markdown
     attributes:

@@ -9,6 +9,6 @@ their own terms.
   license metadata.
 - Apache-2.0 dependencies are covered by the repository's Apache-2.0 text.
 
-`license-policy.json` records the reviewed exceptions and
-`scripts/check-licenses.py` fails CI when the dependency graph changes in a way
-that needs a new review.
+[`scripts/license-policy.json`](../scripts/license-policy.json) records the
+reviewed exceptions. The [license check](../scripts/check-licenses.py) fails CI
+when the dependency graph changes in a way that needs a new review.

@@ -1,0 +1,14 @@
+changelog:
+  categories:
+    - title: Fixes
+      labels: [bug]
+    - title: Agent support
+      labels: [agent-manifest]
+    - title: Improvements
+      labels: [enhancement]
+    - title: Documentation
+      labels: [documentation]
+    - title: Dependencies
+      labels: [dependencies]
+    - title: Other changes
+      labels: ['*']
