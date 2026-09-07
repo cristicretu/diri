@@ -268,6 +268,71 @@ mod tests {
         engine
     }
 
+    #[test]
+    fn claude_live_work_outranks_its_visible_input_box() {
+        let engine = engine();
+        for (title, activity) in [
+            ("◐ Working", ""),
+            ("◑ Working", ""),
+            ("◒ Working", ""),
+            ("◓ Working", ""),
+            ("✳ Project", "⏵ processing · esc to interrupt"),
+            ("✳ Project", "✻ Thinking… (12s · ↓ 100 tokens)"),
+            ("✳ Project", "✻ Waiting for 2 background agents to finish"),
+            ("✳ Project", "✻ Working… · 2 MCP tasks still running"),
+        ] {
+            let snapshot = ScreenSnapshot {
+                lines: vec![
+                    activity.into(),
+                    "──────────".into(),
+                    "❯".into(),
+                    "──────────".into(),
+                ],
+                osc_title: Some(title.into()),
+                ..Default::default()
+            };
+            let observation = engine
+                .evaluate(&snapshot, "claude-code")
+                .expect("Claude rule");
+            assert_eq!(
+                observation.state,
+                ManifestState::Working,
+                "title={title}, activity={activity}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_work_indicators_do_not_hide_blockers_or_match_user_prompt_text() {
+        let engine = engine();
+        let mut blocked = ScreenSnapshot::from_lines([
+            "✻ Working… · 2 MCP tasks still running",
+            "Do you want to proceed?",
+            "❯ 1. Yes",
+            "2. No",
+            "esc to cancel",
+        ]);
+        blocked.osc_title = Some("◐ Working".into());
+        assert_eq!(
+            engine.evaluate(&blocked, "claude-code").unwrap().state,
+            ManifestState::BlockedPermission
+        );
+        for text in [
+            "❯ ✻ Waiting for 2 background agents to finish",
+            "❯ ✻ Working… · 2 MCP tasks still running",
+            "❯ ⏵ processing · esc to interrupt",
+            "1 background shell · ↓ to view",
+        ] {
+            let mut idle = ScreenSnapshot::from_lines([text]);
+            idle.osc_title = Some("✳ Project".into());
+            assert_eq!(
+                engine.evaluate(&idle, "claude-code").unwrap().state,
+                ManifestState::Idle,
+                "{text}"
+            );
+        }
+    }
+
     /// Every manifest decoding is also the proof that every pattern in them
     /// compiles under the `regex` crate — the one real risk in moving off ICU,
     /// since `regex` has no backreferences or lookaround. A pattern that needed
@@ -332,7 +397,7 @@ mod tests {
             .into_iter()
             .map(|id| engine.manifest(id).expect("manifest").rules.len())
             .sum();
-        assert_eq!(rules, 99, "the shipped ruleset lost rules");
+        assert_eq!(rules, 102, "the shipped ruleset lost rules");
 
         for id in engine.ids() {
             let expected_empty = matches!(id, "shell" | "generic" | "pi");

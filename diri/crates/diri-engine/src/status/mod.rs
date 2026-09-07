@@ -89,6 +89,8 @@ pub enum StatusSignal {
     ClaudeHook {
         hook: ClaudeHook,
         is_subagent: bool,
+        /// Optional aggregate from the payload or the durable recovery seed.
+        pending_work: Option<bool>,
     },
     CodexTurnComplete,
     /// Cursor jsonl tail: last object is a user prompt or `tool_use`.
@@ -145,6 +147,8 @@ struct InternalState {
     /// Tool calls and thinking have no time limit; an idle-looking input box
     /// must not expire hook authority and announce completion mid-turn.
     hook_turn_in_flight: bool,
+    /// Retained across idle reminders, which omit background task metadata.
+    claude_pending_work: bool,
 
     // On-screen blocker tracking.
     screen_blocker_active: bool,
@@ -179,6 +183,7 @@ impl InternalState {
             idle_strong: false,
             pending_turn_completed: false,
             hook_turn_in_flight: false,
+            claude_pending_work: false,
             screen_blocker_active: false,
             blocker_miss_scans: 0,
             screen_belief: None,
@@ -342,9 +347,11 @@ impl StatusReducer {
                     self.state.responding_since = Some(now);
                 }
             }
-            StatusSignal::ClaudeHook { hook, is_subagent } => {
-                self.handle_claude_hook(hook, is_subagent, now, &mut outcome)
-            }
+            StatusSignal::ClaudeHook {
+                hook,
+                is_subagent,
+                pending_work,
+            } => self.handle_claude_hook(hook, is_subagent, pending_work, now, &mut outcome),
             StatusSignal::CodexTurnComplete => {
                 self.state.last_signal_at = now;
                 self.handle_strong_idle(now, &mut outcome);
@@ -601,6 +608,7 @@ impl StatusReducer {
         &mut self,
         hook: ClaudeHook,
         is_subagent: bool,
+        pending_work: Option<bool>,
         now: SystemTime,
         outcome: &mut ReducerOutcome,
     ) {
@@ -622,6 +630,9 @@ impl StatusReducer {
         // state must not move because a child of it did something.
         if is_subagent {
             return;
+        }
+        if let Some(pending) = pending_work {
+            self.state.claude_pending_work = pending;
         }
 
         match hook {
@@ -652,11 +663,30 @@ impl StatusReducer {
             ClaudeHook::Notification {
                 notification_type,
                 message,
-            } => self.handle_notification(notification_type, message, now, outcome),
-            ClaudeHook::Stop => self.handle_strong_idle(now, outcome),
+            } => self.handle_notification(notification_type, message, pending_work, now, outcome),
+            ClaudeHook::Stop => {
+                self.handle_claude_completion(pending_work.unwrap_or(false), now, outcome)
+            }
             // A hint only.
             ClaudeHook::SessionEnd => {}
             ClaudeHook::SubagentStart(_) | ClaudeHook::SubagentStop(_) => {}
+        }
+    }
+
+    fn handle_claude_completion(
+        &mut self,
+        pending_work: bool,
+        now: SystemTime,
+        outcome: &mut ReducerOutcome,
+    ) {
+        self.state.claude_pending_work = pending_work;
+        if pending_work {
+            // The foreground response ended, but Claude still has live work.
+            // Keep screen idle and subsequent metadata-free reminders from
+            // announcing completion until a fresh completion says it drained.
+            self.go_working(now, true, outcome);
+        } else {
+            self.handle_strong_idle(now, outcome);
         }
     }
 
@@ -664,6 +694,7 @@ impl StatusReducer {
         &mut self,
         notification_type: Option<String>,
         message: Option<String>,
+        pending_work: Option<bool>,
         now: SystemTime,
         outcome: &mut ReducerOutcome,
     ) {
@@ -690,7 +721,16 @@ impl StatusReducer {
             }
             // An idle reminder is not a question or an approval request.
             // It must not overwrite a completed turn or an actual blocker.
-            Some("idle_prompt") => {}
+            Some("idle_prompt") => {
+                if pending_work == Some(true)
+                    && !matches!(self.status, SessionStatus::NeedsInput(_))
+                {
+                    // A recovered reminder can be the first signal after a
+                    // daemon restart. Its retained work fact still outranks
+                    // the word "idle", without dismissing a live blocker.
+                    self.handle_claude_completion(true, now, outcome);
+                }
+            }
             Some("agent_needs_input") | Some("elicitation_dialog") => {
                 let text = message.unwrap_or_else(|| "Waiting for input".into());
                 let detail = NeedsInputDetail {
@@ -708,7 +748,11 @@ impl StatusReducer {
                 self.cancel_idle_candidacy();
                 self.set_status(SessionStatus::NeedsInput(NeedsInputKind::Question), outcome);
             }
-            Some("agent_completed") => self.handle_strong_idle(now, outcome),
+            Some("agent_completed") => self.handle_claude_completion(
+                pending_work.unwrap_or(self.state.claude_pending_work),
+                now,
+                outcome,
+            ),
             _ => {}
         }
     }

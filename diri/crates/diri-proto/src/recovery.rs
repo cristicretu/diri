@@ -69,10 +69,35 @@ pub struct HookActivitySeed {
     pub notification_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
+    /// Aggregate lifecycle fact only; never persist task payloads or cron prompts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_pending_work: Option<bool>,
 }
 
 impl HookActivitySeed {
     pub const VERSION: u32 = 1;
+}
+
+/// Extract the same bounded fact for live hooks and the CLI's durable seed.
+/// Older Claude payloads omit both fields. Notifications can also omit them,
+/// in which case callers retain the last known fact instead of clearing it.
+/// A present field with an invalid shape is conservatively treated as pending.
+pub fn claude_pending_work(payload: &serde_json::Value) -> Option<bool> {
+    let tasks = payload.get("background_tasks");
+    let crons = payload.get("session_crons");
+    if tasks.is_none() && crons.is_none() {
+        return None;
+    }
+    let tasks_pending = tasks.is_some_and(|value| {
+        value.as_array().is_none_or(|tasks| {
+            tasks.iter().any(|task| {
+                task.get("status").and_then(serde_json::Value::as_str) == Some("running")
+            })
+        })
+    });
+    let crons_pending =
+        crons.is_some_and(|value| value.as_array().is_none_or(|crons| !crons.is_empty()));
+    Some(tasks_pending || crons_pending)
 }
 
 /// Filesystem adapter for one session's recovery directory.
@@ -207,6 +232,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let store = SessionRecoveryStore::new(directory.path().join("s_one"));
         let seed = HookActivitySeed {
+            claude_pending_work: None,
             version: HookActivitySeed::VERSION,
             kind: "claude-hook".into(),
             event: Some("Stop".into()),
@@ -225,6 +251,15 @@ mod tests {
 
         assert_eq!(store.read_capsule().expect("read"), Some(updated));
         assert_eq!(store.read_activity().expect("read"), Some(seed));
+    }
+
+    #[test]
+    fn old_activity_seeds_load_without_a_background_work_fact() {
+        let seed: HookActivitySeed = serde_json::from_value(serde_json::json!({
+            "version": 1, "kind": "claude-hook", "event": "Stop", "occurredAtMs": 99,
+        }))
+        .expect("version-one seed");
+        assert_eq!(seed.claude_pending_work, None);
     }
 
     #[test]

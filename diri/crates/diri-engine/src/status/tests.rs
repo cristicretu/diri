@@ -139,6 +139,7 @@ fn hook(hook: ClaudeHook) -> StatusSignal {
     StatusSignal::ClaudeHook {
         hook,
         is_subagent: false,
+        pending_work: None,
     }
 }
 
@@ -382,6 +383,7 @@ fn subagent_events_never_move_the_parent() {
         StatusSignal::ClaudeHook {
             hook: ClaudeHook::Stop,
             is_subagent: true,
+            pending_work: None,
         },
         now + Duration::from_millis(100),
     );

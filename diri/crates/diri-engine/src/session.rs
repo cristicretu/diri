@@ -1645,7 +1645,11 @@ impl Session {
     }
 
     pub fn claude_hook(&self, hook: ClaudeHook, is_subagent: bool) -> ReducerOutcome {
-        self.feed_signal(StatusSignal::ClaudeHook { hook, is_subagent })
+        self.feed_signal(StatusSignal::ClaudeHook {
+            hook,
+            is_subagent,
+            pending_work: None,
+        })
     }
 
     /// Ends the session, killing the child's whole tree.

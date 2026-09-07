@@ -29,6 +29,16 @@ pub fn parse_claude_hook(
     payload: &Value,
     now: std::time::SystemTime,
 ) -> Option<(StatusSignal, HookMetadata)> {
+    // A stale hook configuration must not route a child lifecycle callback
+    // through the parent's Stop command. Payloads without the discriminator
+    // retain compatibility with older agents.
+    if payload
+        .get("hook_event_name")
+        .and_then(Value::as_str)
+        .is_some_and(|reported| reported != event)
+    {
+        return None;
+    }
     let mut meta = HookMetadata::default();
     let is_subagent = string(payload, "agent_id").is_some();
 
@@ -105,7 +115,14 @@ pub fn parse_claude_hook(
         _ => return None,
     };
 
-    Some((StatusSignal::ClaudeHook { hook, is_subagent }, meta))
+    Some((
+        StatusSignal::ClaudeHook {
+            hook,
+            is_subagent,
+            pending_work: diri_proto::recovery::claude_pending_work(payload),
+        },
+        meta,
+    ))
 }
 
 /// Parses a Codex notify payload. Only turn-completion is meaningful.
@@ -164,7 +181,13 @@ pub fn parse_activity_seed(
     }
     let payload = Value::Object(payload);
     match seed.kind.as_str() {
-        "claude-hook" => parse_claude_hook(seed.event.as_deref()?, &payload, now),
+        "claude-hook" => {
+            let (mut signal, metadata) = parse_claude_hook(seed.event.as_deref()?, &payload, now)?;
+            if let StatusSignal::ClaudeHook { pending_work, .. } = &mut signal {
+                *pending_work = seed.claude_pending_work;
+            }
+            Some((signal, metadata))
+        }
         "codex-notify" => {
             let mut payload = payload.as_object().cloned().unwrap_or_default();
             payload.insert("type".into(), Value::String("agent-turn-complete".into()));
@@ -259,6 +282,116 @@ mod tests {
 
     fn now() -> std::time::SystemTime {
         std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000)
+    }
+
+    #[test]
+    fn claude_background_work_suppresses_completion_until_a_drained_stop() {
+        use crate::status::{Authority, StatusReducer};
+        use diri_proto::SessionStatus;
+        use std::time::Duration;
+
+        for pending in [
+            json!({"background_tasks": [{"status": "running"}]}),
+            json!({"session_crons": [{"id": "wake-later"}]}),
+        ] {
+            let mut reducer = StatusReducer::new(Authority::HooksPrimary, now());
+            let (start, _) = parse_claude_hook("UserPromptSubmit", &json!({}), now()).unwrap();
+            reducer.reduce(start, now());
+            for (seconds, event, payload) in [
+                (1, "Stop", pending.clone()),
+                (2, "Stop", pending),
+                (
+                    3,
+                    "Notification",
+                    json!({"notification_type": "agent_completed"}),
+                ),
+                (
+                    30,
+                    "Notification",
+                    json!({"notification_type": "idle_prompt"}),
+                ),
+            ] {
+                let at = now() + Duration::from_secs(seconds);
+                let (signal, _) = parse_claude_hook(event, &payload, at).unwrap();
+                assert!(!reducer.reduce(signal, at).turn_completed);
+                assert!(!reducer.reduce(StatusSignal::Tick, at).turn_completed);
+                assert_eq!(reducer.status(), &SessionStatus::Working);
+            }
+            let at = now() + Duration::from_secs(31);
+            let (stop, _) = parse_claude_hook(
+                "Stop",
+                &json!({"background_tasks": [], "session_crons": []}),
+                at,
+            )
+            .unwrap();
+            let first = reducer.reduce(stop.clone(), at);
+            let settled = reducer.reduce(StatusSignal::Tick, at);
+            assert_eq!(
+                usize::from(first.turn_completed) + usize::from(settled.turn_completed),
+                1
+            );
+            assert!(!reducer.reduce(stop, at).turn_completed);
+        }
+    }
+
+    #[test]
+    fn claude_pending_work_keeps_permission_alerts_and_ignores_child_stops() {
+        use crate::status::{Authority, StatusReducer};
+        use diri_proto::SessionStatus;
+        let mut reducer = StatusReducer::new(Authority::HooksPrimary, now());
+        for (event, payload) in [
+            ("UserPromptSubmit", json!({})),
+            ("Stop", json!({"background_tasks": [{"status": "running"}]})),
+            (
+                "Notification",
+                json!({"notification_type": "permission_prompt", "message": "Approve this command"}),
+            ),
+        ] {
+            let (signal, _) = parse_claude_hook(event, &payload, now()).unwrap();
+            assert!(!reducer.reduce(signal, now()).turn_completed);
+        }
+        assert_eq!(
+            reducer.status(),
+            &SessionStatus::NeedsInput(NeedsInputKind::Permission)
+        );
+        for payload in [
+            json!({"agent_id": "child", "background_tasks": []}),
+            json!({"hook_event_name": "SubagentStop"}),
+        ] {
+            if let Some((signal, _)) = parse_claude_hook("Stop", &payload, now()) {
+                assert!(!reducer.reduce(signal, now()).turn_completed);
+            }
+            assert_eq!(
+                reducer.status(),
+                &SessionStatus::NeedsInput(NeedsInputKind::Permission)
+            );
+        }
+        let (reminder, _) = parse_claude_hook("Notification", &json!({"notification_type": "idle_prompt", "background_tasks": [{"status": "running"}]}), now()).unwrap();
+        reducer.reduce(reminder, now());
+        assert_eq!(
+            reducer.status(),
+            &SessionStatus::NeedsInput(NeedsInputKind::Permission)
+        );
+    }
+
+    #[test]
+    fn claude_old_and_drained_payloads_still_complete_once() {
+        use crate::status::{Authority, StatusReducer};
+        use diri_proto::SessionStatus;
+        for payload in [
+            json!({}),
+            json!({"background_tasks": [], "session_crons": []}),
+            json!({"background_tasks": [{"status": "completed"}, {"status": "failed"}, {"status": "cancelled"}]}),
+        ] {
+            let mut reducer = StatusReducer::new(Authority::HooksPrimary, now());
+            let (start, _) = parse_claude_hook("UserPromptSubmit", &json!({}), now()).unwrap();
+            reducer.reduce(start, now());
+            let (stop, _) = parse_claude_hook("Stop", &payload, now()).unwrap();
+            reducer.reduce(stop.clone(), now());
+            assert!(reducer.reduce(StatusSignal::Tick, now()).turn_completed);
+            assert!(!reducer.reduce(stop, now()).turn_completed);
+            assert_eq!(reducer.status(), &SessionStatus::Idle);
+        }
     }
 
     #[test]
@@ -417,6 +550,7 @@ mod tests {
     #[test]
     fn a_durable_seed_rehydrates_lifecycle_and_safe_identity() {
         let seed = diri_proto::recovery::HookActivitySeed {
+            claude_pending_work: None,
             version: diri_proto::recovery::HookActivitySeed::VERSION,
             kind: "claude-hook".into(),
             event: Some("PermissionRequest".into()),

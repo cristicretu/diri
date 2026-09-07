@@ -206,6 +206,17 @@ fn notify(arguments: &[String]) -> Result<(), CliError> {
 /// Records only lifecycle and identity fields before attempting delivery.
 /// Raw prompts, tool inputs, and notification messages never enter this file.
 fn persist_hook_activity(kind: &str, event: Option<&str>, payload: &Value) {
+    if kind == "claude-hook"
+        && (payload.get("agent_id").and_then(Value::as_str).is_some()
+            || matches!(event, Some("SubagentStart" | "SubagentStop"))
+            || payload
+                .get("hook_event_name")
+                .and_then(Value::as_str)
+                .is_some_and(|reported| Some(reported) != event))
+    {
+        // A child's activity must not replace the parent's recovery signal.
+        return;
+    }
     let Some(directory) = std::env::var_os(diri_proto::paths::ENV_SESSION_RECOVERY_DIR)
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
@@ -225,6 +236,24 @@ fn persist_hook_activity(kind: &str, event: Option<&str>, payload: &Value) {
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
     };
+    let store = diri_proto::recovery::SessionRecoveryStore::new(directory);
+    let claude_pending_work = if kind == "claude-hook" {
+        diri_proto::recovery::claude_pending_work(payload).or_else(|| {
+            if event == Some("Stop") {
+                return Some(false);
+            }
+            store
+                .read_activity()
+                .ok()
+                .flatten()
+                .filter(|previous| {
+                    previous.kind == kind && previous.agent_session_id == string("session_id")
+                })
+                .and_then(|previous| previous.claude_pending_work)
+        })
+    } else {
+        None
+    };
     let seed = diri_proto::recovery::HookActivitySeed {
         version: diri_proto::recovery::HookActivitySeed::VERSION,
         kind: kind.to_owned(),
@@ -238,10 +267,11 @@ fn persist_hook_activity(kind: &str, event: Option<&str>, payload: &Value) {
         transcript_path: string("transcript_path"),
         notification_type: string("notification_type"),
         tool_name: string("tool_name"),
+        claude_pending_work,
     };
     // Hook contracts are fail-open. A read-only disk or interrupted rename
     // must not prevent the provider from completing its own callback.
-    let _ = diri_proto::recovery::SessionRecoveryStore::new(directory).write_activity(&seed);
+    let _ = store.write_activity(&seed);
 }
 
 fn mcp_stdio() -> Result<(), CliError> {

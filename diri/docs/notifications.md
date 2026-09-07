@@ -13,10 +13,23 @@ history remains available. Failed exits notify; clean exits and sessions
 closed through the app do not.
 
 For Claude, a parent work hook keeps the turn active until a completion hook
-arrives. Long tool calls, idle-looking input boxes and subagent completions do
-not produce “finished” alerts. If signals disappear, status can become unknown;
-elapsed time alone never completes a hook-owned turn. Sessions without work
-hooks retain terminal-based status detection.
+arrives with no reported running background tasks or scheduled session work.
+Repeated stops while that work remains pending, idle reminders and child-agent
+callbacks do not produce “finished” alerts. Permission and question alerts
+remain enabled. A drained parent stop completes once; older Claude versions
+that omit background-work metadata retain their normal stop behavior.
+
+Long tool calls and idle-looking input boxes cannot expire hook authority. If
+signals disappear, status can become unknown; elapsed time alone never finishes
+the turn. Sessions without work hooks use terminal detection, including Claude's
+braille/half-circle title spinners, live-turn footer and background-agent/MCP
+activity. Visible permission and question prompts outrank those working rules.
+
+The hook CLI retains only an optional aggregate `claudePendingWork` boolean in
+the version-1 activity seed. Task contents and scheduled prompts are never
+stored. Metadata-free reminders retain the fact for the same conversation;
+child callbacks cannot replace the parent's recovery signal. Old seeds without
+the additive field continue to load.
 
 A notification for the selected, visible session in the active app is recorded
 as read and makes no sound or desktop banner. A selected session behind
