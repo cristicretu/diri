@@ -484,14 +484,23 @@ impl UtilitySurfaces {
             .preferences()
             .clone();
         self.surface = Surface::Worktrees;
-        self.refresh_worktrees(cx);
+        self.load_worktrees(cx);
+    }
+
+    fn load_worktrees(&mut self, cx: &mut Context<Self>) {
+        // Tab navigation preserves checked results. A new window joins the
+        // engine's existing job/cache rather than requesting another scan.
+        if self.worktrees.scan_generation.is_none() || self.worktrees.error.is_some() {
+            self.start_worktree_scan(false, false, cx);
+        }
+        cx.notify();
     }
 
     fn refresh_worktrees(&mut self, cx: &mut Context<Self>) {
-        self.start_worktree_scan(false, cx);
+        self.start_worktree_scan(true, false, cx);
     }
 
-    fn start_worktree_scan(&mut self, measure_disk: bool, cx: &mut Context<Self>) {
+    fn start_worktree_scan(&mut self, refresh: bool, measure_disk: bool, cx: &mut Context<Self>) {
         if self.worktrees.loading {
             return;
         }
@@ -502,23 +511,15 @@ impl UtilitySurfaces {
         let runtime = Arc::clone(&self.runtime);
         cx.spawn(async move |this, cx| {
             let mut params = diri_proto::WorktreeScanParams {
-                refresh: true,
+                refresh,
                 measure_disk,
                 ..Default::default()
             };
             loop {
-                let visible = this
-                    .update(cx, |this, _| {
-                        let visible = this.surface == Surface::Worktrees
-                            || (this.surface == Surface::Settings
-                                && this.settings_tab == SettingsTab::Worktrees);
-                        if !visible && this.worktrees.poll_epoch == epoch {
-                            this.worktrees.loading = false;
-                        }
-                        visible && this.worktrees.poll_epoch == epoch
-                    })
+                let active = this
+                    .update(cx, |this, _| this.worktrees.poll_epoch == epoch)
                     .unwrap_or(false);
-                if !visible {
+                if !active {
                     break;
                 }
                 let client = Arc::clone(&client);
@@ -555,8 +556,8 @@ impl UtilitySurfaces {
                 if !again {
                     break;
                 }
-                // Drain bounded pages promptly; idle progress checks run only
-                // while this page is visible and the worker is active.
+                // Drain bounded pages promptly, including while the sidebar is
+                // closed. Stop polling once the engine job and pages finish.
                 cx.background_executor()
                     .timer(Duration::from_millis(if has_more { 16 } else { 500 }))
                     .await;
@@ -1180,7 +1181,7 @@ impl UtilitySurfaces {
             self.refresh_release_notes(cx);
         }
         if tab == SettingsTab::Worktrees {
-            self.refresh_worktrees(cx);
+            self.load_worktrees(cx);
         }
         if tab == SettingsTab::Skills {
             self.refresh_skills(cx);
@@ -6292,6 +6293,69 @@ mod tests {
             SettingsTab::WhatsNew,
             "latest changes"
         ));
+    }
+
+    #[gpui::test]
+    fn worktree_checks_keep_running_after_closing_the_sidebar(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.open_settings_tab(SettingsTab::Worktrees, cx);
+            assert!(surfaces.worktrees.loading);
+            surfaces.close_surface(cx);
+        });
+        cx.run_until_parked();
+        surfaces.read_with(cx, |surfaces, _| {
+            assert!(
+                surfaces.worktrees.loading,
+                "hiding the sidebar must not stop progress updates"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn worktree_checks_survive_reopening_both_entry_points(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            let entries = worktree_settings::preview_entries();
+            surfaces
+                .worktrees
+                .apply_scan(diri_proto::WorktreeScanResult {
+                    generation: 7,
+                    cursor: entries.len(),
+                    total: entries.len(),
+                    checked: entries.len(),
+                    entries: entries.clone(),
+                    running: false,
+                    has_more: false,
+                    error: None,
+                });
+            let entries = surfaces.worktrees.entries.clone();
+            let epoch = surfaces.worktrees.poll_epoch;
+            surfaces.open_settings_tab(SettingsTab::General, cx);
+            surfaces.open_settings_tab(SettingsTab::Worktrees, cx);
+            assert!(
+                !surfaces.worktrees.loading,
+                "reopening settings must keep checked results"
+            );
+            assert_eq!(surfaces.worktrees.poll_epoch, epoch);
+            assert_eq!(surfaces.worktrees.entries, entries);
+            surfaces.close_surface(cx);
+            surfaces.open_worktrees(cx);
+            assert!(
+                !surfaces.worktrees.loading,
+                "reopening the sheet must keep checked results"
+            );
+            assert_eq!(surfaces.worktrees.poll_epoch, epoch);
+            assert_eq!(surfaces.worktrees.entries, entries);
+            surfaces.refresh_worktrees(cx);
+            assert!(
+                surfaces.worktrees.loading,
+                "explicit refresh still starts a scan"
+            );
+            assert_eq!(surfaces.worktrees.poll_epoch, epoch + 1);
+        });
     }
 
     #[gpui::test]

@@ -82,7 +82,7 @@ impl UtilitySurfaces {
                                 "worktrees-measure",
                                 colors,
                                 cx,
-                                |this, cx| this.start_worktree_scan(true, cx),
+                                |this, cx| this.start_worktree_scan(true, true, cx),
                             ))
                         })
                         .child(surface_button(

@@ -1,12 +1,11 @@
 //! One on-demand worker shared by all windows. Polling transfers bounded deltas,
-//! not the inventory again. No worker or timer exists when the scan is idle.
+//! not the inventory again. Jobs finish even when no view is polling; results
+//! remain available until an explicit refresh. No idle worker or timer remains.
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use diri_proto::{ControlError, WorktreeOverviewEntry, WorktreeScanParams, WorktreeScanResult};
 
 const PAGE_SIZE: usize = 32;
-const VIEW_LEASE: Duration = Duration::from_secs(10);
 
 pub(crate) type Emit<'a> = dyn FnMut(Option<WorktreeOverviewEntry>, bool) -> bool + 'a;
 
@@ -16,7 +15,6 @@ pub(crate) struct ScanStore(Arc<Mutex<State>>);
 struct State {
     generation: u64,
     running: bool,
-    last_poll: Option<Instant>,
     // At most two updates per discovered checkout. Replaced on a new scan.
     updates: Vec<WorktreeOverviewEntry>,
     total: usize,
@@ -38,7 +36,6 @@ impl ScanStore {
             *state = State {
                 generation: state.generation + 1,
                 running: true,
-                last_poll: Some(Instant::now()),
                 ..Default::default()
             };
             let shared = Arc::clone(&self.0);
@@ -47,12 +44,6 @@ impl ScanStore {
                 .spawn(move || {
                     let result = scan(p.measure_disk, &mut |entry, checked| {
                         let mut state = shared.lock().expect("worktree scan state");
-                        if state
-                            .last_poll
-                            .is_none_or(|last| last.elapsed() > VIEW_LEASE)
-                        {
-                            return false;
-                        }
                         if let Some(entry) = entry {
                             state.updates.push(entry);
                             if checked {
@@ -72,7 +63,6 @@ impl ScanStore {
                 state.error = Some(format!("Could not start worktree scan: {error}"));
             }
         }
-        state.last_poll = Some(Instant::now());
         let cursor = if p.generation == Some(state.generation) {
             p.cursor.min(state.updates.len())
         } else {
@@ -96,6 +86,7 @@ impl ScanStore {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
     fn entry(n: usize) -> WorktreeOverviewEntry {
         WorktreeOverviewEntry {
@@ -180,20 +171,46 @@ mod tests {
     }
 
     #[test]
-    fn worktree_scan_stops_when_the_last_view_stops_polling() {
+    fn worktree_scan_continues_when_the_last_view_stops_polling() {
         let store = ScanStore::default();
-        let (release, waiting) = mpsc::channel();
-        let (finished, result) = mpsc::channel();
-        store
+        let first = store
             .request(Default::default(), move |_, emit| {
-                waiting.recv().unwrap();
-                finished.send(emit(None, false)).unwrap();
+                assert!(emit(Some(entry(0)), false));
+                // Outlive the former ten-second view lease without any polls.
+                std::thread::sleep(Duration::from_secs(11));
+                if !emit(Some(entry(0)), true) {
+                    return Err("closing Worktrees cancelled the engine job".into());
+                }
                 Ok(())
             })
             .unwrap();
-        store.0.lock().unwrap().last_poll =
-            Some(Instant::now() - VIEW_LEASE - Duration::from_secs(1));
-        release.send(()).unwrap();
-        assert!(!result.recv_timeout(Duration::from_secs(1)).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(15);
+        // Observe completion directly so the test cannot keep a view lease alive.
+        while store.0.lock().unwrap().running {
+            assert!(Instant::now() < deadline, "background scan did not finish");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let reopened = store
+            .request(Default::default(), |_, _| {
+                panic!("reopening must reuse the scan")
+            })
+            .unwrap();
+        assert_eq!(reopened.generation, first.generation);
+        assert_eq!(reopened.total, 1);
+        assert_eq!(reopened.checked, 1);
+        assert_eq!(reopened.entries.len(), 2);
+        assert!(!reopened.running);
+        assert_eq!(reopened.error, None);
+
+        let refreshed = store
+            .request(
+                WorktreeScanParams {
+                    refresh: true,
+                    ..Default::default()
+                },
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(refreshed.generation, first.generation + 1);
     }
 }
