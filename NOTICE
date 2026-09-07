@@ -1,7 +1,7 @@
 Dirijor — third-party attributions
 ==================================
 
-Full dependency license texts are in docs/licenses/. The reviewed dependency
+Full dependency license texts are in docs/third-party/. The reviewed dependency
 policy is scripts/license-policy.json.
 
 GPUI (https://github.com/zed-industries/zed)

@@ -69,7 +69,7 @@ def main() -> int:
                 "src": str(repository / "scripts" / "license-policy.json"),
                 "target": "licenses/license-policy.json",
             },
-            {"src": str(repository / "docs" / "licenses"), "target": "licenses"},
+            {"src": str(repository / "docs" / "third-party"), "target": "licenses"},
         ],
         "linux": {"generateDesktopEntry": True},
         "deb": {
