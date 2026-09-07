@@ -44,7 +44,6 @@ pub struct ReducerTiming {
     pub recheck_interval: Duration,
     pub idle_confirm_cap: Duration,
     pub startup_grace: Duration,
-    pub hook_authority_window: Duration,
     pub blocker_clear_scans: u32,
     pub staleness_timeout: Duration,
 }
@@ -56,7 +55,6 @@ impl Default for ReducerTiming {
             recheck_interval: Duration::from_millis(100),
             idle_confirm_cap: Duration::from_millis(700),
             startup_grace: Duration::from_secs(3),
-            hook_authority_window: Duration::from_secs(7),
             blocker_clear_scans: 2,
             staleness_timeout: Duration::from_secs(60),
         }
@@ -143,7 +141,10 @@ struct InternalState {
     idle_strong: bool,
     /// Fire `turn_completed` exactly once on the next committed working→idle.
     pending_turn_completed: bool,
-    last_work_hook_at: Option<SystemTime>,
+    /// A parent work hook owns its turn until a strong completion signal.
+    /// Tool calls and thinking have no time limit; an idle-looking input box
+    /// must not expire hook authority and announce completion mid-turn.
+    hook_turn_in_flight: bool,
 
     // On-screen blocker tracking.
     screen_blocker_active: bool,
@@ -177,7 +178,7 @@ impl InternalState {
             idle_confirms: 0,
             idle_strong: false,
             pending_turn_completed: false,
-            last_work_hook_at: None,
+            hook_turn_in_flight: false,
             screen_blocker_active: false,
             blocker_miss_scans: 0,
             screen_belief: None,
@@ -513,7 +514,7 @@ impl StatusReducer {
         }
         self.state.turn_in_flight = true;
         if clear_screen_blocker {
-            self.state.last_work_hook_at = Some(now);
+            self.state.hook_turn_in_flight = true;
         }
         self.state.last_signal_at = now;
         self.set_status(SessionStatus::Working, outcome);
@@ -552,7 +553,11 @@ impl StatusReducer {
 
     /// Register one idle-confirming observation.
     fn confirm_idle(&mut self, now: SystemTime, outcome: &mut ReducerOutcome) {
-        if self.status != SessionStatus::Working {
+        if self.status != SessionStatus::Working
+            || (self.authority == Authority::HooksPrimary
+                && self.state.hook_turn_in_flight
+                && !self.state.idle_strong)
+        {
             return;
         }
         if self.state.idle_candidate_since.is_none() {
@@ -582,6 +587,7 @@ impl StatusReducer {
         let fire = self.state.pending_turn_completed;
         self.set_status(SessionStatus::Idle, outcome);
         self.state.turn_in_flight = false;
+        self.state.hook_turn_in_flight = false;
         if fire {
             outcome.turn_completed = true;
         }
@@ -793,22 +799,18 @@ impl StatusReducer {
             }
             ManifestState::Idle => {
                 if self.status == SessionStatus::Working {
-                    if self.authority == Authority::HooksPrimary
-                        && !self.state.idle_strong
-                        && self.state.last_work_hook_at.is_some_and(|last| {
-                            now.duration_since(last).unwrap_or_default()
-                                < self.timing.hook_authority_window
-                        })
-                    {
-                        return;
-                    }
                     self.confirm_idle(now, outcome);
                 } else if self.status == SessionStatus::Starting {
                     self.set_status(SessionStatus::Idle, outcome);
                 } else if cleared_blocker && matches!(self.status, SessionStatus::NeedsInput(_)) {
-                    // The blocker was released and the screen now reads idle.
-                    self.cancel_idle_candidacy();
-                    self.set_status(SessionStatus::Idle, outcome);
+                    if self.authority == Authority::HooksPrimary && self.state.hook_turn_in_flight {
+                        // Dismissing a permission/question does not finish the
+                        // turn whose tool call was waiting for that answer.
+                        self.go_working(now, false, outcome);
+                    } else {
+                        self.cancel_idle_candidacy();
+                        self.set_status(SessionStatus::Idle, outcome);
+                    }
                 }
             }
             // Handled elsewhere.
@@ -855,16 +857,6 @@ impl StatusReducer {
                 self.set_status(SessionStatus::Unknown, outcome);
                 return;
             }
-        }
-        if self.status == SessionStatus::Working
-            && self.authority == Authority::HooksPrimary
-            && self.state.screen_belief == Some(ManifestState::Idle)
-            && self.state.idle_candidate_since.is_none()
-            && self.state.last_work_hook_at.is_some_and(|last| {
-                now.duration_since(last).unwrap_or_default() >= self.timing.hook_authority_window
-            })
-        {
-            self.confirm_idle(now, outcome);
         }
         // A settled screen often stops emitting new content sequences. One
         // idle observation held for the debounce cap is enough; requiring

@@ -12,6 +12,12 @@ withdrawn. Closing or archiving a session resolves its notifications; the
 history remains available. Failed exits notify; clean exits and sessions
 closed through the app do not.
 
+For Claude, a parent work hook keeps the turn active until a completion hook
+arrives. Long tool calls, idle-looking input boxes and subagent completions do
+not produce “finished” alerts. If signals disappear, status can become unknown;
+elapsed time alone never completes a hook-owned turn. Sessions without work
+hooks retain terminal-based status detection.
+
 A notification for the selected, visible session in the active app is recorded
 as read and makes no sound or desktop banner. A selected session behind
 Settings, the launcher or an overlay can still notify. Delivery is checked
