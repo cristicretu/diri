@@ -1,9 +1,8 @@
 # Interface cleanup screenshots
 
 Native GPUI renders with deterministic fixture data. The before images were
-captured from sidebar PR #222; the after images show this change. The composer
-fixture intentionally disables launching Agents. Its project label reflects the
-worktree used to render it.
+captured from sidebar PR #222; the after images show this change. Composer
+fixtures show the project as `diri` and intentionally disable launching Agents.
 
 Render from `diri/` on macOS:
 
@@ -13,5 +12,11 @@ DIRI_VISUAL_OUTPUT=docs/screenshots/interface-cleanup/composer-after.png DIRI_RE
 DIRI_VISUAL_OUTPUT=docs/screenshots/interface-cleanup/appearance-after.png cargo test -p diri-app render_appearance_settings_preview_screenshot -- --ignored --nocapture
 ```
 
-The account picker was also inspected with `DIRI_VISUAL_ACCOUNTS=1`. Its project
-label truncates to leave room for the account and checkout controls.
+For the empty light composer, set `DIRI_RECIPE_VISUAL_SCENARIO=shortcuts` and
+`DIRI_RECIPE_VISUAL_THEME=dirijor-light`. For light Appearance, set
+`DIRI_APPEARANCE_THEME=dirijor-light`. These are included as `composer-light.png`
+and `appearance-light.png`.
+
+The account picker was also inspected with `DIRI_VISUAL_ACCOUNTS=1`, and the
+recipe library with `DIRI_RECIPE_VISUAL_SCENARIO` unset. Both remain available
+through the compact toolbar.

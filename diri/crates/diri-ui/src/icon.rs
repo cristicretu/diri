@@ -50,6 +50,7 @@ pub enum IconName {
     Activity,
     Archive,
     ArrowDown,
+    ArrowUp,
     Bell,
     Branch,
     ChartBar,
@@ -102,11 +103,12 @@ pub enum IconName {
 }
 
 impl IconName {
-    pub const ALL: [Self; 53] = [
+    pub const ALL: [Self; 54] = [
         Self::Account,
         Self::Activity,
         Self::Archive,
         Self::ArrowDown,
+        Self::ArrowUp,
         Self::Bell,
         Self::Branch,
         Self::ChartBar,
@@ -164,6 +166,7 @@ impl IconName {
             Self::Activity => "icons/activity.svg",
             Self::Archive => "icons/archive.svg",
             Self::ArrowDown => "icons/arrow-down.svg",
+            Self::ArrowUp => "icons/arrow-up.svg",
             Self::Bell => "icons/bell.svg",
             Self::Branch => "icons/branch.svg",
             Self::ChartBar => "icons/chart-bar.svg",
@@ -223,6 +226,7 @@ impl IconName {
             "waveform.circle" | "waveform.circle.fill" => Self::Activity,
             "archivebox" | "archivebox.fill" => Self::Archive,
             "arrow.down" => Self::ArrowDown,
+            "arrow.up" => Self::ArrowUp,
             "bell" | "bell.fill" => Self::Bell,
             "arrow.branch" => Self::Branch,
             "chart.bar" | "chart.bar.xaxis" => Self::ChartBar,
@@ -345,6 +349,7 @@ fn embedded_svg(path: &str) -> Option<&'static [u8]> {
         "icons/activity.svg" => include_bytes!("../assets/icons/activity.svg"),
         "icons/archive.svg" => include_bytes!("../assets/icons/archive.svg"),
         "icons/arrow-down.svg" => include_bytes!("../assets/icons/arrow-down.svg"),
+        "icons/arrow-up.svg" => include_bytes!("../assets/icons/arrow-up.svg"),
         "icons/bell.svg" => include_bytes!("../assets/icons/bell.svg"),
         "icons/branch.svg" => include_bytes!("../assets/icons/branch.svg"),
         "icons/chart-bar.svg" => include_bytes!("../assets/icons/chart-bar.svg"),

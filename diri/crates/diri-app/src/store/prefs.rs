@@ -128,6 +128,8 @@ pub struct Prefs {
     #[serde(default)]
     pub hibernation_defaults_revision: u32,
     pub terminal_theme: String,
+    /// Follow native appearance changes; terminal_theme stores the resolved palette.
+    pub follow_system_theme: bool,
     pub terminal_font_size: f32,
     /// Last size, position, and presentation mode of the main window.
     pub window_placement: Option<WindowPlacement>,
@@ -187,6 +189,7 @@ impl Default for Prefs {
             memory_hard_limit_gb: 16,
             hibernation_defaults_revision: Self::HIBERNATION_DEFAULTS_REVISION,
             terminal_theme: DEFAULT_THEME.to_owned(),
+            follow_system_theme: false,
             terminal_font_size: 13.0,
             window_placement: None,
             sidebar_visible: false,
@@ -285,6 +288,22 @@ impl Prefs {
         self.hibernation_defaults_revision = Self::HIBERNATION_DEFAULTS_REVISION;
     }
 
+    pub fn apply_system_theme(&mut self, dark: bool) -> bool {
+        if !self.follow_system_theme {
+            return false;
+        }
+        let id = if dark {
+            "dirijor-dark"
+        } else {
+            "dirijor-light"
+        };
+        if self.terminal_theme == id {
+            return false;
+        }
+        self.terminal_theme = id.to_owned();
+        true
+    }
+
     pub fn normalize(&mut self) {
         if !self.terminal_font_size.is_finite() {
             self.terminal_font_size = 13.0;
@@ -334,6 +353,28 @@ impl Prefs {
 mod tests {
     use super::*;
     use crate::launch_recipe::{LaunchRecipe, RecipeProject};
+
+    #[test]
+    fn system_appearance_is_opt_in_persisted_and_only_changes_with_the_os() {
+        let mut prefs: Prefs = serde_json::from_str(r#"{"terminalTheme":"vesper"}"#).unwrap();
+        assert!(!prefs.follow_system_theme);
+        assert!(!prefs.apply_system_theme(false));
+        assert_eq!(prefs.terminal_theme, "vesper");
+
+        prefs.follow_system_theme = true;
+        assert!(prefs.apply_system_theme(false));
+        assert_eq!(prefs.terminal_theme, "dirijor-light");
+        assert!(!prefs.apply_system_theme(false));
+        let mut restored: Prefs =
+            serde_json::from_slice(&serde_json::to_vec(&prefs).unwrap()).unwrap();
+        assert!(restored.follow_system_theme);
+        assert!(restored.apply_system_theme(true));
+        assert_eq!(restored.terminal_theme, "dirijor-dark");
+        assert!(!restored.apply_system_theme(true));
+        restored.follow_system_theme = false;
+        assert!(!restored.apply_system_theme(false));
+        assert_eq!(restored.terminal_theme, "dirijor-dark");
+    }
 
     fn prefs_with_hibernation(minutes: u32, gb: u64, revision: Option<u32>) -> Prefs {
         let mut value = serde_json::to_value(Prefs::default()).expect("serialize prefs");

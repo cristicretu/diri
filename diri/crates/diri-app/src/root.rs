@@ -55,6 +55,23 @@ const SIDEBAR_PEEK_DWELL: Duration = Duration::from_millis(20);
 const SIDEBAR_PEEK_REVEAL: Duration = Duration::from_millis(140);
 const SIDEBAR_PEEK_TRIGGER_WIDTH: f32 = 24.0;
 
+fn sync_system_theme(runtime: &crate::store::StoreRuntime, appearance: gpui::WindowAppearance) {
+    let dark = matches!(
+        appearance,
+        gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+    );
+    let mut store = runtime.store.write().expect("store lock");
+    let mut candidate = store.preferences().clone();
+    if !candidate.apply_system_theme(dark) {
+        return;
+    }
+    let changed = store.update_preferences(|prefs| *prefs = candidate).is_ok();
+    drop(store);
+    if changed {
+        runtime.publish_local_change();
+    }
+}
+
 pub(crate) fn cached_window_overlay<T: Render>(view: Entity<T>) -> impl IntoElement {
     view.cached(StyleRefinement::default().absolute().inset_0())
 }
@@ -278,6 +295,15 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        if !preview {
+            sync_system_theme(&services.store, window.appearance());
+        }
+        let appearance_observer = (!preview).then(|| {
+            let runtime = Arc::clone(&services.store);
+            window.observe_window_appearance(move |window, _| {
+                sync_system_theme(&runtime, window.appearance())
+            })
+        });
         let sidebar_runtime = (!preview).then(|| Arc::clone(&services.store));
         let sidebar = cx.new(|cx| {
             let mut sidebar = Sidebar::new(sidebar_runtime, preview, preview_scenario, cx);
@@ -983,7 +1009,10 @@ impl RootView {
             menu_bar,
             #[cfg(target_os = "macos")]
             notifier,
-            _subscriptions: std::iter::once(activation).chain(bounds_observer).collect(),
+            _subscriptions: std::iter::once(activation)
+                .chain(bounds_observer)
+                .chain(appearance_observer)
+                .collect(),
             _service_events: service_events,
             _surface_sync: surface_sync,
             _workbench_sync: workbench_sync,

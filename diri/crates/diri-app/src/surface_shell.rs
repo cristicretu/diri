@@ -27,7 +27,7 @@ use diri_ui::{
     Radius, SemanticColors, Typo,
 };
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, Bounds, BoxShadow, ClickEvent, Context, CursorStyle,
+    Animation, AnimationExt, AnyElement, App, Bounds, ClickEvent, Context, CursorStyle,
     FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton, PathPromptOptions,
     Pixels, Render, Rgba, ScrollHandle, SharedString, Task, TextRun, Window, canvas, deferred, div,
     ease_out_quint, font, point, prelude::*, px, rgba,
@@ -376,13 +376,12 @@ impl UtilitySurfaces {
                         Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                             if this
                                 .update(cx, |this, cx| {
-                                    this.prefs.terminal_theme = this
-                                        .store
-                                        .read()
-                                        .expect("session store lock poisoned")
-                                        .preferences()
-                                        .terminal_theme
-                                        .clone();
+                                    let store = this.store.read().expect("store lock");
+                                    this.prefs.terminal_theme =
+                                        store.preferences().terminal_theme.clone();
+                                    this.prefs.follow_system_theme =
+                                        store.preferences().follow_system_theme;
+                                    drop(store);
                                     cx.notify();
                                 })
                                 .is_err()
@@ -3263,24 +3262,53 @@ impl UtilitySurfaces {
                     .child("+"),
             );
 
-        let mut featured_themes = div().w_full().flex().flex_wrap().gap(px(9.0));
-        for (index, candidate) in [
-            TermTheme::DIRIJOR_DARK,
-            TermTheme::VESPER,
-            TermTheme::DIRIJOR_LIGHT,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            featured_themes = featured_themes.child(featured_theme_card(
-                index,
-                candidate,
-                candidate.id == selected.id,
-                colors,
-                cx,
-            ));
-        }
-
+        let choices = div().w_full().flex().gap(px(12.0)).children(
+            [(0, "System"), (1, "Light"), (2, "Dark")]
+                .into_iter()
+                .map(|(index, label)| {
+                    let active = if index == 0 {
+                        self.prefs.follow_system_theme
+                    } else {
+                        !self.prefs.follow_system_theme
+                            && (selected.appearance == ThemeAppearance::Light) == (index == 1)
+                    };
+                    appearance_mode_card(index, label, active, colors, cx).into_any_element()
+                }),
+        );
+        let hex = |color: gpui::Rgba| {
+            format!(
+                "#{:02X}{:02X}{:02X}",
+                (color.r * 255.0).round() as u8,
+                (color.g * 255.0).round() as u8,
+                (color.b * 255.0).round() as u8
+            )
+        };
+        let swatch = |color: gpui::Rgba| {
+            let ink = if color.r * 0.2126 + color.g * 0.7152 + color.b * 0.0722 > 0.5 {
+                rgba(0x202020ff)
+            } else {
+                rgba(0xf5f5f5ff)
+            };
+            div()
+                .h(px(30.0))
+                .w(px(148.0))
+                .px(px(10.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .rounded(px(9.0))
+                .bg(color)
+                .border_1()
+                .border_color(colors.primary.alpha(0.12))
+                .child(
+                    div()
+                        .size(px(12.0))
+                        .rounded_full()
+                        .border_1()
+                        .border_color(ink.alpha(0.3)),
+                )
+                .child(div().text_size(px(12.0)).text_color(ink).child(hex(color)))
+        };
         appearance_settings_page(
             div()
                 .flex()
@@ -3288,35 +3316,56 @@ impl UtilitySurfaces {
                 .gap(px(18.0))
                 .child(
                     div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap(px(12.0))
-                        .child(setting_text_stack(
-                            "Color theme".into(),
-                            "Used throughout Diri and your terminals.".into(),
-                            colors,
-                        ))
-                        .child(self.terminal_theme_dropdown(cx)),
+                        .text_size(px(13.0))
+                        .text_color(colors.primary)
+                        .child("Theme"),
                 )
-                .child(featured_themes)
-                .child(workspace_theme_preview(
+                .child(choices)
+                .child(appearance_diff_preview(
                     selected,
                     self.prefs.terminal_font_size,
-                    colors,
                 ))
                 .child(
                     div()
+                        .rounded(px(16.0))
+                        .border_1()
+                        .border_color(colors.primary.alpha(0.08))
+                        .bg(colors.primary.alpha(0.035))
+                        .px(px(16.0))
                         .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap(px(12.0))
-                        .child(setting_text_stack(
-                            "Terminal text".into(),
-                            "Adjust the font size in every terminal.".into(),
+                        .flex_col()
+                        .child(appearance_setting_row(
+                            "Color theme",
+                            self.terminal_theme_dropdown(cx),
                             colors,
                         ))
-                        .child(font_control),
+                        .child(appearance_divider(colors))
+                        .child(appearance_setting_row(
+                            "Background",
+                            swatch(selected.background),
+                            colors,
+                        ))
+                        .child(appearance_divider(colors))
+                        .child(appearance_setting_row(
+                            "Foreground",
+                            swatch(selected.foreground),
+                            colors,
+                        ))
+                        .child(appearance_divider(colors))
+                        .child(appearance_setting_row(
+                            "Code font",
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(colors.secondary)
+                                .child(crate::fonts::mono_family()),
+                            colors,
+                        ))
+                        .child(appearance_divider(colors))
+                        .child(appearance_setting_row(
+                            "Code font size",
+                            font_control,
+                            colors,
+                        )),
                 ),
             colors,
         )
@@ -4172,6 +4221,7 @@ impl UtilitySurfaces {
                                 .cursor_pointer()
                                 .hover(move |style| style.bg(colors.primary.alpha(0.08)))
                                 .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.prefs.follow_system_theme = false;
                                     this.prefs.terminal_theme = candidate.id.to_owned();
                                     this.settings_menu = None;
                                     this.persist_prefs();
@@ -5294,7 +5344,47 @@ fn settings_page(
 }
 
 fn appearance_settings_page(content: impl IntoElement, colors: SemanticColors) -> impl IntoElement {
-    settings_page("Appearance", content, colors)
+    div()
+        .w_full()
+        .px(px(24.0))
+        .pt(px(28.0))
+        .pb(px(36.0))
+        .flex()
+        .flex_col()
+        .gap(px(36.0))
+        .child(
+            div()
+                .text_size(px(24.0))
+                .font_weight(FontWeight::NORMAL)
+                .text_color(colors.primary)
+                .child("Appearance"),
+        )
+        .child(content)
+}
+
+fn appearance_setting_row(
+    label: &'static str,
+    control: impl IntoElement,
+    colors: SemanticColors,
+) -> impl IntoElement {
+    div()
+        .min_h(px(52.0))
+        .py(px(9.0))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(16.0))
+        .child(
+            div()
+                .text_size(px(13.0))
+                .text_color(colors.primary)
+                .child(label),
+        )
+        .child(control)
+}
+
+fn appearance_divider(colors: SemanticColors) -> impl IntoElement {
+    div().h(px(1.0)).bg(colors.primary.alpha(0.055))
 }
 
 fn setting_divider(colors: SemanticColors) -> impl IntoElement {
@@ -5399,322 +5489,268 @@ fn settings_choice_row(
         })
 }
 
-fn featured_theme_card(
+fn appearance_mode_card(
     index: usize,
-    theme: TermTheme,
+    label: &'static str,
     selected: bool,
     colors: SemanticColors,
     cx: &mut Context<UtilitySurfaces>,
 ) -> impl IntoElement {
+    let light = index == 1;
+    let ink = if light {
+        rgba(0x737373ff)
+    } else {
+        rgba(0xa0a0a0ff)
+    };
     div()
-        .id(SharedString::from(format!("featured-theme-{index}")))
+        .id(SharedString::from(format!("appearance-mode-{index}")))
         .debug_selector(move || format!("FEATURED_THEME_{index}"))
-        .role(gpui::Role::Button)
-        .aria_label(format!("Use {} theme", theme.name))
-        .h(px(36.0))
-        .px(px(10.0))
+        .flex_1()
+        .min_w(px(0.0))
         .flex()
-        .items_center()
+        .flex_col()
         .gap(px(8.0))
-        .rounded(px(Radius::ROW))
-        .bg(if selected {
-            colors.primary.alpha(0.08)
-        } else {
-            colors.primary.alpha(0.0)
-        })
+        .role(gpui::Role::Button)
+        .aria_label(format!("Use {label} appearance"))
         .cursor_pointer()
-        .hover(move |chip| chip.bg(colors.primary.alpha(0.10)))
-        .active(|chip| chip.opacity(0.84))
-        .on_click(cx.listener(move |this, _, _, cx| {
-            this.prefs.terminal_theme = theme.id.to_owned();
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.prefs.follow_system_theme = index == 0;
+            if index == 0 {
+                this.prefs.apply_system_theme(matches!(
+                    window.appearance(),
+                    gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+                ));
+            } else if (theme(&this.prefs.terminal_theme).appearance == ThemeAppearance::Light)
+                != light
+            {
+                this.prefs.terminal_theme = if light {
+                    "dirijor-light"
+                } else {
+                    "dirijor-dark"
+                }
+                .into();
+            }
             this.settings_menu = None;
             this.persist_prefs();
             cx.notify();
         }))
         .child(
             div()
-                .size(px(18.0))
-                .rounded_full()
-                .bg(theme.background)
-                .border_1()
-                .border_color(colors.primary.alpha(0.18))
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(div().size(px(7.0)).rounded_full().bg(theme.cursor)),
-        )
-        .child(
-            div()
-                .text_size(px(12.0))
-                .text_color(colors.secondary)
-                .child(theme.name),
-        )
-        .child(div().w(px(12.0)).when(selected, |mark| {
-            mark.child(sf_symbol("checkmark", 10.0, colors.secondary))
-        }))
-}
-
-fn preview_sidebar_row(
-    label: &'static str,
-    tint: Rgba,
-    active: bool,
-    theme: TermTheme,
-) -> impl IntoElement {
-    div()
-        .h(px(25.0))
-        .px(px(8.0))
-        .rounded(px(5.0))
-        .bg(if active {
-            theme.foreground.alpha(0.085)
-        } else {
-            theme.foreground.alpha(0.0)
-        })
-        .flex()
-        .items_center()
-        .gap(px(7.0))
-        .child(div().size(px(5.0)).rounded_full().bg(tint))
-        .child(
-            div()
-                .min_w(px(0.0))
-                .text_ellipsis()
-                .text_size(px(9.0))
-                .font_weight(if active {
-                    FontWeight::MEDIUM
+                .relative()
+                .h(px(148.0))
+                .w_full()
+                .rounded(px(11.0))
+                .overflow_hidden()
+                .border_2()
+                .border_color(if selected {
+                    colors.primary
                 } else {
-                    FontWeight::NORMAL
+                    colors.primary.alpha(0.07)
                 })
-                .text_color(if active {
-                    theme.foreground
+                .bg(if light {
+                    rgba(0xedededff)
                 } else {
-                    theme.foreground.alpha(0.58)
+                    rgba(0x555555ff)
+                })
+                .hover(move |card| {
+                    card.border_color(colors.primary.alpha(if selected { 1.0 } else { 0.4 }))
+                })
+                .when(index == 0, |card| {
+                    card.child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .top_0()
+                            .bottom_0()
+                            .w(gpui::relative(0.5))
+                            .rounded_tl(px(9.0))
+                            .rounded_bl(px(9.0))
+                            .bg(rgba(0xb3b3b3ff)),
+                    )
+                })
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(30.0))
+                        .left(gpui::relative(0.28))
+                        .w(gpui::relative(0.44))
+                        .h(px(7.0))
+                        .rounded_full()
+                        .bg(ink.alpha(0.6)),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(42.0))
+                        .left(gpui::relative(0.2))
+                        .w(gpui::relative(0.6))
+                        .h(px(4.0))
+                        .rounded_full()
+                        .bg(ink.alpha(0.3)),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(62.0))
+                        .left(px(11.0))
+                        .right(px(11.0))
+                        .h(px(120.0))
+                        .rounded_tl(px(11.0))
+                        .rounded_tr(px(11.0))
+                        .overflow_hidden()
+                        .bg(if index == 2 {
+                            rgba(0x262626ff)
+                        } else {
+                            rgba(0xfafafaff)
+                        })
+                        .when(index == 0, |card| {
+                            card.child(
+                                div()
+                                    .absolute()
+                                    .right_0()
+                                    .top_0()
+                                    .bottom_0()
+                                    .w(gpui::relative(0.5))
+                                    .rounded_tr(px(11.0))
+                                    .bg(rgba(0x262626ff)),
+                            )
+                        })
+                        .child(
+                            div()
+                                .relative()
+                                .p(px(11.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(12.0))
+                                .children([0.44, 0.7, 0.54].into_iter().map(|width| {
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(5.0))
+                                        .child(
+                                            div()
+                                                .w(gpui::relative(width))
+                                                .h(px(7.0))
+                                                .rounded_full()
+                                                .bg(ink.alpha(0.4)),
+                                        )
+                                        .child(div().w_full().h(px(2.0)).bg(ink.alpha(0.12)))
+                                })),
+                        ),
+                ),
+        )
+        .child(
+            div()
+                .w_full()
+                .text_center()
+                .text_size(px(12.0))
+                .text_color(if selected {
+                    colors.primary
+                } else {
+                    colors.secondary
                 })
                 .child(label),
         )
 }
 
-fn preview_code_line(
-    number: &'static str,
-    content: impl IntoElement,
-    highlighted: bool,
-    theme: TermTheme,
-    line_height: f32,
-) -> impl IntoElement {
-    div()
-        .h(px(line_height))
-        .px(px(9.0))
-        .flex()
-        .items_center()
-        .when(highlighted, |line| {
-            line.bg(theme.ansi[4].alpha(0.11))
-                .border_l_2()
-                .border_color(theme.ansi[4].alpha(0.80))
-        })
-        .child(
-            div()
-                .flex_none()
-                .w(px(24.0))
-                .text_color(theme.ansi[8].alpha(0.76))
-                .child(number),
-        )
-        .child(content)
-}
-
-fn workspace_theme_preview(
-    theme: TermTheme,
-    font_size: f32,
-    colors: SemanticColors,
-) -> impl IntoElement {
+fn appearance_diff_preview(theme: TermTheme, font_size: f32) -> impl IntoElement {
     let line_height = (font_size * 1.5).ceil();
+    let column = |added: bool| {
+        let tint = if added { theme.ansi[2] } else { theme.ansi[1] };
+        div()
+            .flex_1()
+            .min_w(px(0.0))
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .children(
+                [
+                    "const themePreview = {".to_owned(),
+                    format!(
+                        "  surface: \"{}\",",
+                        if added { "sidebar-elevated" } else { "sidebar" }
+                    ),
+                    format!(
+                        "  accent: \"{}\",",
+                        if added { "#0ea5e9" } else { "#2563eb" }
+                    ),
+                    format!("  contrast: {},", if added { 68 } else { 42 }),
+                    "};".to_owned(),
+                ]
+                .into_iter()
+                .enumerate()
+                .map(move |(index, text)| {
+                    let changed = (1..=3).contains(&index);
+                    let color = |color: gpui::Rgba| gpui::HighlightStyle {
+                        color: Some(color.into()),
+                        ..Default::default()
+                    };
+                    let highlights = match index {
+                        0 => vec![(0..5, color(theme.ansi[5].alpha(0.85)))],
+                        1..=3 => {
+                            let colon = text.find(':').expect("preview property");
+                            vec![
+                                (2..colon, color(theme.ansi[3].alpha(0.7))),
+                                (
+                                    colon + 2..text.len() - 1,
+                                    color(
+                                        if index == 3 {
+                                            theme.ansi[6]
+                                        } else {
+                                            theme.ansi[2]
+                                        }
+                                        .alpha(0.85),
+                                    ),
+                                ),
+                            ]
+                        }
+                        _ => Vec::new(),
+                    };
+                    div()
+                        .h(px(line_height))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .border_l_2()
+                        .border_color(if changed { tint } else { theme.background })
+                        .when(changed, |line| line.bg(tint.alpha(0.16)))
+                        .child(
+                            div()
+                                .w(px(33.0))
+                                .flex_none()
+                                .text_right()
+                                .pr(px(10.0))
+                                .text_color(if changed {
+                                    tint.alpha(0.8)
+                                } else {
+                                    theme.foreground.alpha(0.35)
+                                })
+                                .child((index + 1).to_string()),
+                        )
+                        .child(
+                            div()
+                                .whitespace_nowrap()
+                                .text_color(theme.foreground.alpha(0.7))
+                                .child(gpui::StyledText::new(text).with_highlights(highlights)),
+                        )
+                }),
+            )
+    };
     div()
         .debug_selector(|| "APPEARANCE_WORKSPACE_PREVIEW".into())
         .w_full()
-        .h(px((71.0 + 5.0 * line_height).max(176.0)))
-        .rounded(px(Radius::CARD))
+        .rounded(px(12.0))
         .overflow_hidden()
         .border_1()
-        .border_color(colors.primary.alpha(0.13))
+        .border_color(theme.foreground.alpha(0.09))
         .bg(theme.background)
-        .shadow(vec![BoxShadow {
-            color: rgba(0x00000042).into(),
-            offset: point(px(0.0), px(8.0)),
-            blur_radius: px(22.0),
-            spread_radius: px(-7.0),
-            inset: false,
-        }])
+        .font_family(crate::fonts::mono_family())
+        .font_weight(FontWeight::NORMAL)
+        .text_size(px(font_size))
         .flex()
-        .child(
-            div()
-                .flex_none()
-                .w(px(128.0))
-                .h_full()
-                .p(px(9.0))
-                .bg(theme.foreground.alpha(0.045))
-                .flex()
-                .flex_col()
-                .gap(px(5.0))
-                .child(
-                    div()
-                        .h(px(20.0))
-                        .flex()
-                        .items_center()
-                        .gap(px(4.0))
-                        .children(
-                            [theme.ansi[1], theme.ansi[3], theme.ansi[2]].map(|color| {
-                                div().size(px(5.0)).rounded_full().bg(color.alpha(0.88))
-                            }),
-                        ),
-                )
-                .child(
-                    div()
-                        .mt(px(3.0))
-                        .mb(px(2.0))
-                        .text_size(px(8.0))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme.foreground.alpha(0.38))
-                        .child("WORKSPACE"),
-                )
-                .child(preview_sidebar_row(
-                    "Appearance",
-                    theme.ansi[4],
-                    true,
-                    theme,
-                ))
-                .child(preview_sidebar_row(
-                    "Refactor UI",
-                    theme.ansi[5],
-                    false,
-                    theme,
-                ))
-                .child(preview_sidebar_row(
-                    "Run tests",
-                    theme.ansi[2],
-                    false,
-                    theme,
-                ))
-                .child(
-                    div()
-                        .mt_auto()
-                        .h(px(23.0))
-                        .px(px(7.0))
-                        .rounded(px(5.0))
-                        .bg(theme.foreground.alpha(0.045))
-                        .flex()
-                        .items_center()
-                        .gap(px(6.0))
-                        .child(div().size(px(5.0)).rounded_full().bg(Ink::FRESH))
-                        .child(
-                            div()
-                                .text_size(px(8.5))
-                                .text_color(theme.foreground.alpha(0.66))
-                                .child("3 agents ready"),
-                        ),
-                ),
-        )
-        .child(div().w(px(1.0)).h_full().bg(theme.foreground.alpha(0.09)))
-        .child(
-            div()
-                .min_w(px(0.0))
-                .flex_1()
-                .h_full()
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .flex_none()
-                        .h(px(31.0))
-                        .px(px(10.0))
-                        .bg(theme.foreground.alpha(0.025))
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .child(
-                            div()
-                                .font_family(crate::fonts::mono_family())
-                                .text_size(px(9.0))
-                                .text_color(theme.foreground.alpha(0.68))
-                                .child("appearance.rs"),
-                        ),
-                )
-                .child(div().h(px(1.0)).bg(theme.foreground.alpha(0.08)))
-                .child(
-                    div()
-                        .flex_1()
-                        .py(px(7.0))
-                        .font_family(crate::fonts::mono_family())
-                        .text_size(px(font_size))
-                        .text_color(theme.foreground)
-                        .child(preview_code_line(
-                            "1",
-                            div()
-                                .flex()
-                                .child(div().text_color(theme.ansi[5]).child("const "))
-                                .child(div().text_color(theme.ansi[3]).child("appearance"))
-                                .child(div().text_color(theme.foreground).child(" = {")),
-                            false,
-                            theme,
-                            line_height,
-                        ))
-                        .child(preview_code_line(
-                            "2",
-                            div()
-                                .flex()
-                                .child(div().text_color(theme.foreground).child("  theme: "))
-                                .child(div().text_color(theme.ansi[2]).child(theme.name))
-                                .child(div().text_color(theme.foreground).child(",")),
-                            true,
-                            theme,
-                            line_height,
-                        ))
-                        .child(preview_code_line(
-                            "3",
-                            div()
-                                .flex()
-                                .child(div().text_color(theme.foreground).child("  type: "))
-                                .child(
-                                    div()
-                                        .text_color(theme.ansi[6])
-                                        .child(format!("{font_size:.0}pt")),
-                                )
-                                .child(div().text_color(theme.foreground).child(",")),
-                            false,
-                            theme,
-                            line_height,
-                        ))
-                        .child(preview_code_line(
-                            "4",
-                            div()
-                                .flex()
-                                .child(div().text_color(theme.foreground).child("  status: "))
-                                .child(div().text_color(theme.ansi[2]).child("focused"))
-                                .child(div().text_color(theme.foreground).child(",")),
-                            false,
-                            theme,
-                            line_height,
-                        ))
-                        .child(preview_code_line(
-                            "5",
-                            div().text_color(theme.foreground).child("};"),
-                            false,
-                            theme,
-                            line_height,
-                        )),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .h(px(24.0))
-                        .px(px(10.0))
-                        .bg(theme.foreground.alpha(0.04))
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .font_family(crate::fonts::mono_family())
-                        .text_size(px(8.0))
-                        .text_color(theme.foreground.alpha(0.52))
-                        .child("main  +1 −1")
-                        .child("diri · ready"),
-                ),
-        )
+        .child(column(false))
+        .child(div().w(px(1.0)).bg(theme.foreground.alpha(0.1)))
+        .child(column(true))
 }
 
 fn chip(label: String, colors: SemanticColors) -> impl IntoElement {
@@ -7204,7 +7240,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn appearance_quick_themes_update_the_live_preview(cx: &mut TestAppContext) {
+    fn appearance_modes_switch_the_palette_and_persist_system_following(cx: &mut TestAppContext) {
         let (harness, cx) = cx.add_window_view(|window, cx| {
             SettingsWorkbenchHarness::open_at(SettingsTab::Terminal, window, cx)
         });
@@ -7212,23 +7248,34 @@ mod tests {
         cx.run_until_parked();
         let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
 
-        let vesper = cx
-            .debug_bounds("FEATURED_THEME_1")
-            .expect("Vesper quick theme should render");
-        cx.simulate_click(vesper.center(), Modifiers::default());
-        cx.run_until_parked();
-
-        surfaces.read_with(cx, |surfaces, _| {
-            assert_eq!(surfaces.prefs.terminal_theme, TermTheme::VESPER.id);
-        });
-        assert!(
-            cx.debug_bounds("APPEARANCE_WORKSPACE_PREVIEW").is_some(),
-            "the live preview must remain mounted after changing theme"
-        );
+        for (index, palette, selector) in [
+            (1, "dirijor-light", "FEATURED_THEME_1"),
+            (2, "dirijor-dark", "FEATURED_THEME_2"),
+            (0, "", "FEATURED_THEME_0"),
+        ] {
+            let card = cx
+                .debug_bounds(selector)
+                .expect("appearance mode should render");
+            cx.simulate_click(card.center(), Modifiers::default());
+            cx.run_until_parked();
+            surfaces.read_with(cx, |surfaces, _| {
+                assert_eq!(surfaces.prefs.follow_system_theme, index == 0);
+                if index != 0 {
+                    assert_eq!(surfaces.prefs.terminal_theme, palette);
+                }
+                let store = surfaces.store.read().unwrap();
+                assert_eq!(store.preferences().follow_system_theme, index == 0);
+                assert_eq!(
+                    store.preferences().terminal_theme,
+                    surfaces.prefs.terminal_theme
+                );
+            });
+            assert!(cx.debug_bounds("APPEARANCE_WORKSPACE_PREVIEW").is_some());
+        }
     }
 
     #[gpui::test]
-    fn appearance_theme_cards_wrap_inside_a_narrow_settings_pane(cx: &mut TestAppContext) {
+    fn appearance_theme_cards_fit_inside_a_narrow_settings_pane(cx: &mut TestAppContext) {
         let (_harness, cx) = cx.add_window_view(|window, cx| {
             SettingsWorkbenchHarness::open_at(SettingsTab::Terminal, window, cx)
         });

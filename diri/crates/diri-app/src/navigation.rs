@@ -1006,7 +1006,10 @@ impl NavigationOverlay {
             .store
             .write()
             .expect("session store lock poisoned")
-            .update_preferences(|prefs| prefs.terminal_theme = theme.id.to_owned());
+            .update_preferences(|prefs| {
+                prefs.follow_system_theme = false;
+                prefs.terminal_theme = theme.id.to_owned();
+            });
         match result {
             Ok(()) => {
                 self.close_overlay(window, cx);
