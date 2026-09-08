@@ -2499,7 +2499,12 @@ impl Sidebar {
             hibernated,
             row.pinned,
             hovered || (focused && shortcut.is_some()),
-        ) - if loading { 60.0 } else { 0.0 })
+        ) - if loading { 60.0 } else { 0.0 }
+            - if row.has_children {
+                Space::INDENT + 8.0
+            } else {
+                0.0
+            })
         .max(36.0);
         let title_available_width =
             (title_available_width - if unread { 14.0 } else { 0.0 }).max(0.0);
@@ -2561,9 +2566,6 @@ impl Sidebar {
                     }
                 }))
                 .children(indent_rails(row, colors))
-                // The fold control is inert mid-rename, but its column stays so
-                // the text does not slide sideways the moment editing starts.
-                .child(div().w(px(Space::INDENT)).flex_none())
                 .child(activity_mark(
                     status_state(session, migrating),
                     self.activity_frame,
@@ -2579,6 +2581,11 @@ impl Sidebar {
                         .text_color(colors.primary)
                         .child(query_label(&self.ui.rename_draft)),
                 )
+                // Keep the trailing fold slot inert while editing, preserving
+                // the same title width as the non-editing row.
+                .when(row.has_children, |element| {
+                    element.child(div().w(px(Space::INDENT)).flex_none())
+                })
                 .child(self.status_glyph(session, migrating, colors, window, cx))
                 .into_any_element();
         }
@@ -2609,7 +2616,8 @@ impl Sidebar {
                 let id = id.clone();
                 move || format!("SESSION_{}", id.0)
             })
-            .pl(px(Space::ROW_H))
+            // Account for the selection border when aligning with project icons.
+            .pl(px(Space::ROW_H - 1.0))
             .pr(px(Space::ROW_H))
             .h(px(SIDEBAR_NAV_ROW_HEIGHT))
             .flex()
@@ -2759,8 +2767,8 @@ impl Sidebar {
                 }
             }))
             .children(indent_rails(row, colors))
-            .child(self.disclosure(row, colors, cx))
-            // Activity, title, and agent identity have independent columns.
+            // Activity shares the project's icon column. Leaf rows reserve
+            // no empty disclosure column; only parents get a trailing fold.
             // Hover never hides the activity mark or provider identity.
             .child(activity_mark(
                 status_state(session, migrating),
@@ -2817,6 +2825,9 @@ impl Sidebar {
             .when_some(host_label, |element, host| {
                 // Remote-host chip: this session's agent runs on another machine.
                 element.child(StateChip::new(host, colors.tertiary, colors))
+            })
+            .when(row.has_children, |element| {
+                element.child(self.disclosure(row, colors, cx))
             })
             .when(hovered, |element| {
                 let close_id = id.clone();
@@ -2898,9 +2909,8 @@ impl Sidebar {
         .into_any_element()
     }
 
-    /// The fold control for a row that spawned children, drawn in the same
-    /// column a deeper row's rail occupies so titles stay on one axis whether
-    /// or not a row has children.
+    /// Trailing fold control, mounted only for rows that spawned children.
+    /// Leaf rows never pay for an empty disclosure column.
     fn disclosure(
         &self,
         row: &crate::store::SidebarRow,
@@ -2908,9 +2918,6 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let slot = div().w(px(Space::INDENT)).flex_none().flex().items_center();
-        if !row.has_children {
-            return slot.into_any_element();
-        }
         let id = row.id().clone();
         slot.id(format!("fold:{}", id.0))
             .justify_center()
@@ -7403,8 +7410,8 @@ fn clamp_path(path: &str) -> String {
 
 /// Overflow threshold for a session title. Individual badges reserve their
 /// content estimate, padding, and following gap; HoverMarquee shapes the title
-/// itself exactly. Rows carry a fixed disclosure column and one indent column
-/// per ancestor, so nesting costs title width and has to be counted here or a
+/// itself exactly. Rows carry one indent column per ancestor, so nesting
+/// costs title width and has to be counted here or a
 /// deep row marquees a title that was never actually clipped.
 #[allow(clippy::too_many_arguments)]
 fn session_title_available_width(
@@ -7418,8 +7425,9 @@ fn session_title_available_width(
     pinned: bool,
     shortcut_visible: bool,
 ) -> f32 {
-    // Row insets + disclosure + activity + trailing identity + their gaps.
-    let mut available = sidebar_width - 92.0 - f32::from(depth) * (Space::INDENT + 8.0);
+    // Row insets + project-aligned activity + trailing identity + their gaps.
+    // A parent's trailing fold is accounted for by the caller.
+    let mut available = sidebar_width - 74.0 - f32::from(depth) * (Space::INDENT + 8.0);
     if migrating {
         available -= 66.0;
     }

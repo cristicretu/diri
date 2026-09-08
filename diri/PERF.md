@@ -373,6 +373,11 @@ repaints the mark stays still. Reduce Motion fixes the phase at zero.
 Sleeping and ended rows have no animated mark. This deliberately preserves
 the no-periodic-wake contract instead of promising a continuous spinner.
 
+The following measurements are from the initial layout at `1ca2efb`, before
+aligning the leading activity column with the project icon and moving parent
+fold controls to the trailing edge. That refinement removes the empty leading
+fold slot; the animation policy is unchanged.
+
 On this Apple Silicon workstation running macOS 26.5.2, an optimized native
 headless benchmark with **30 visible working rows**, a 360×1120 pt window,
 32 warmup repaints, and 500 measured forced repaints produced:

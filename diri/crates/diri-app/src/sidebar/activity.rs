@@ -28,8 +28,9 @@ pub(super) fn activity_mark(
     frame: usize,
     colors: SemanticColors,
 ) -> AnyElement {
+    // Match the project badge column; the mark itself stays optically smaller.
     let slot = div()
-        .size(px(16.0))
+        .size(px(18.0))
         .flex_none()
         .flex()
         .items_center()
