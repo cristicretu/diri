@@ -2620,6 +2620,7 @@ impl RootView {
             PreviewScenario::Stress => "Stress",
             PreviewScenario::Empty => "Empty",
             PreviewScenario::Artifacts => "Artifacts",
+            PreviewScenario::Fleet => "30 working sessions",
         };
         div()
             .size_full()

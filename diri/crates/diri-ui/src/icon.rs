@@ -332,6 +332,15 @@ impl AssetSource for IconAssets {
 
 fn embedded_svg(path: &str) -> Option<&'static [u8]> {
     Some(match path {
+        "icons/working-0.svg" => include_bytes!("../assets/icons/working-0.svg"),
+        "icons/working-1.svg" => include_bytes!("../assets/icons/working-1.svg"),
+        "icons/working-2.svg" => include_bytes!("../assets/icons/working-2.svg"),
+        "icons/working-3.svg" => include_bytes!("../assets/icons/working-3.svg"),
+        "icons/working-4.svg" => include_bytes!("../assets/icons/working-4.svg"),
+        "icons/working-5.svg" => include_bytes!("../assets/icons/working-5.svg"),
+        "icons/working-6.svg" => include_bytes!("../assets/icons/working-6.svg"),
+        "icons/working-7.svg" => include_bytes!("../assets/icons/working-7.svg"),
+
         "icons/account.svg" => include_bytes!("../assets/icons/account.svg"),
         "icons/activity.svg" => include_bytes!("../assets/icons/activity.svg"),
         "icons/archive.svg" => include_bytes!("../assets/icons/archive.svg"),

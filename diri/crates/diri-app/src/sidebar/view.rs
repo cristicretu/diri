@@ -39,6 +39,8 @@ use crate::switcher::display_title;
 use crate::updates::{UpdateCommand, UpdatePhase, UpdateState};
 use crate::usage::{UsageFormat, UsageSnapshot};
 
+use super::activity::{activity_mark, frame_at};
+
 use super::{
     CursorMove, DragItem, DropZone, Popover, PreviewScenario, SidebarPreviewFixture,
     SidebarUiState, drop_zone, move_before, move_past, move_to_end,
@@ -244,6 +246,7 @@ pub struct Sidebar {
     drag_preview: Option<Entity<DragPreview>>,
     directory_scroll: ScrollHandle,
     glyphs: HashMap<SessionId, Entity<StatusGlyph>>,
+    activity_frame: usize,
     /// Rebuilt once per projection render. Looking up ⌘1…⌘9 inside every row
     /// previously re-locked the store and scanned the full session list N times.
     shortcut_ranks: HashMap<SessionId, usize>,
@@ -364,6 +367,7 @@ impl Sidebar {
             drag_preview: None,
             directory_scroll: ScrollHandle::new(),
             glyphs: HashMap::new(),
+            activity_frame: 0,
             shortcut_ranks: HashMap::new(),
             focus_handle: cx.focus_handle(),
             hover_generation: 0,
@@ -2469,6 +2473,9 @@ impl Sidebar {
             && self.ui.focus_cursor.as_ref() == Some(&id);
         let archived = session.is_archived();
         let hibernated = session.hibernation.is_some();
+        let loading = !migrating
+            && !hibernated
+            && matches!(session.status, diri_proto::SessionStatus::Starting);
         let session_is_remote = session.host.is_some();
         let ended = matches!(session.status, diri_proto::SessionStatus::Exited(_)) && !archived;
         let host_label = session.host.as_ref().map(|host| {
@@ -2482,7 +2489,7 @@ impl Sidebar {
             session.remote_persistence == Some(PersistenceCapability::NonPersistent);
         // Read before the title moves into the marquee below.
         let ended_chip = ended && title != ENDED_TITLE;
-        let title_available_width = session_title_available_width(
+        let title_available_width = (session_title_available_width(
             self.ui.width,
             row.depth,
             migrating,
@@ -2491,8 +2498,9 @@ impl Sidebar {
             host_label.as_deref(),
             hibernated,
             row.pinned,
-            !hovered && focused && shortcut.is_some(),
-        );
+            hovered || (focused && shortcut.is_some()),
+        ) - if loading { 60.0 } else { 0.0 })
+        .max(36.0);
         let title_available_width =
             (title_available_width - if unread { 14.0 } else { 0.0 }).max(0.0);
         let title_marquee_id = format!("session-title-marquee:{}", id.0);
@@ -2556,15 +2564,11 @@ impl Sidebar {
                 // The fold control is inert mid-rename, but its column stays so
                 // the text does not slide sideways the moment editing starts.
                 .child(div().w(px(Space::INDENT)).flex_none())
-                .child(
-                    div()
-                        .size(px(16.0))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(self.status_glyph(session, migrating, colors, window, cx)),
-                )
+                .child(activity_mark(
+                    status_state(session, migrating),
+                    self.activity_frame,
+                    colors,
+                ))
                 .child(
                     div()
                         .min_w(px(0.0))
@@ -2575,6 +2579,7 @@ impl Sidebar {
                         .text_color(colors.primary)
                         .child(query_label(&self.ui.rename_draft)),
                 )
+                .child(self.status_glyph(session, migrating, colors, window, cx))
                 .into_any_element();
         }
 
@@ -2755,19 +2760,13 @@ impl Sidebar {
             }))
             .children(indent_rails(row, colors))
             .child(self.disclosure(row, colors, cx))
-            // The status glyph is the row's whole reason for existing at a
-            // glance, so it no longer yields its slot to the close button on
-            // hover -- pointing at a working agent used to hide the fact that
-            // it was working. The ✕ lives at the trailing edge instead.
-            .child(
-                div()
-                    .size(px(16.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(self.status_glyph(session, migrating, colors, window, cx)),
-            )
+            // Activity, title, and agent identity have independent columns.
+            // Hover never hides the activity mark or provider identity.
+            .child(activity_mark(
+                status_state(session, migrating),
+                self.activity_frame,
+                colors,
+            ))
             .child(
                 HoverMarquee::new(
                     title_marquee_id,
@@ -2809,10 +2808,11 @@ impl Sidebar {
                 // the glyph goes quiet and nothing else says why.
                 element.child(StateChip::new("Ended", colors.tertiary, colors))
             })
+            .when(loading, |element| {
+                element.child(StateChip::new("Loading", colors.secondary, colors))
+            })
             .when(hibernated, |element| {
-                // Hibernation chip. An 8px moon glyph was a smudge at this
-                // size; the chip reads at a glance and matches the host badge.
-                element.child(StateChip::new("Zzz", colors.tertiary, colors))
+                element.child(StateChip::new("Sleeping", colors.secondary, colors))
             })
             .when_some(host_label, |element, host| {
                 // Remote-host chip: this session's agent runs on another machine.
@@ -2867,6 +2867,8 @@ impl Sidebar {
                     )
                 },
             );
+
+        let row = row.child(self.status_glyph(session, migrating, colors, window, cx));
 
         // A selection fill arrives on ROW_SELECT instead of switching between
         // two frames. Hover deliberately does not animate: hover should feel
@@ -6382,6 +6384,9 @@ fn reveal_tracked_row(
 
 impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Sample once for all visible rows, only on an already requested paint.
+        // No ticker: a quiet, hidden, or background sidebar adds no wakeups.
+        self.activity_frame = frame_at(wall_clock_millis(), cx.reduce_motion());
         // A menu or editor may finish after the pointer has already left.
         // Resume dismissal on that notification without polling while idle.
         self.schedule_peek_close(window, cx);
@@ -7413,8 +7418,8 @@ fn session_title_available_width(
     pinned: bool,
     shortcut_visible: bool,
 ) -> f32 {
-    // Row insets + fold column + identity glyph + the gaps between them.
-    let mut available = sidebar_width - 68.0 - f32::from(depth) * (Space::INDENT + 8.0);
+    // Row insets + disclosure + activity + trailing identity + their gaps.
+    let mut available = sidebar_width - 92.0 - f32::from(depth) * (Space::INDENT + 8.0);
     if migrating {
         available -= 66.0;
     }
@@ -7428,7 +7433,7 @@ fn session_title_available_width(
         available -= host.chars().count() as f32 * 6.2 + 18.0;
     }
     if hibernated {
-        available -= 42.0;
+        available -= 68.0;
     }
     if pinned {
         available -= 18.0;
@@ -7507,9 +7512,12 @@ mod tests {
 
     impl Render for SidebarPopoverHarness {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div()
-                .size_full()
-                .child(div().h_full().w(px(248.0)).child(self.sidebar.clone()))
+            div().size_full().child(
+                div()
+                    .h_full()
+                    .w(px(self.sidebar.read(_cx).width()))
+                    .child(self.sidebar.clone()),
+            )
         }
     }
 
@@ -7783,7 +7791,7 @@ mod tests {
     /// guards the other half: a glyph that needs repainting to look right.
     #[test]
     fn the_sidebar_owns_no_repeating_clock() {
-        let source = include_str!("view.rs");
+        let source = [include_str!("view.rs"), include_str!("activity.rs")].join("\n");
         let periodic_timer = ["background_executor()", ".timer("].concat();
         let frame_request = ["request_animation", "_frame("].concat();
 
@@ -8505,6 +8513,17 @@ mod tests {
         let light = std::env::var_os("DIRI_VISUAL_LIGHT").is_some();
         let show_popover = std::env::var_os("DIRI_VISUAL_POPOVER")
             .is_none_or(|value| !value.to_string_lossy().eq_ignore_ascii_case("none"));
+        let scenario =
+            PreviewScenario::from_env(std::env::var("DIRI_VISUAL_SCENARIO").ok().as_deref());
+        let width: f32 = std::env::var("DIRI_VISUAL_WIDTH")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(248.0);
+        let height = if scenario == PreviewScenario::Fleet {
+            1120.0
+        } else {
+            720.0
+        };
         let platform = gpui_platform::current_platform(true);
         let mut cx = HeadlessAppContext::with_platform(
             platform.text_system(),
@@ -8514,9 +8533,10 @@ mod tests {
         cx.update(|cx| crate::fonts::init(cx));
 
         let window = cx
-            .open_window(size(px(300.0), px(720.0)), |_, cx| {
+            .open_window(size(px(width), px(height)), |_, cx| {
                 let sidebar = cx.new(|cx| {
-                    let mut sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                    let mut sidebar = Sidebar::new(None, true, scenario, cx);
+                    sidebar.ui.width = width;
                     let now = wall_clock_millis();
                     let mut store = sidebar.store.write().expect("preview session store");
                     let sessions: Vec<_> = store
@@ -8567,6 +8587,28 @@ mod tests {
         cx.update_window(window.into(), |_, window, _| window.refresh())
             .expect("refresh sidebar window");
         cx.run_until_parked();
+        if std::env::var_os("DIRI_VISUAL_BENCH").is_some() {
+            // Force exactly the same work in before/after runs; warm all eight
+            // frames before measuring. Includes layout, paint, and GPU submission.
+            let mut samples = Vec::with_capacity(500);
+            for index in 0..532 {
+                if index < 8 {
+                    std::thread::sleep(Duration::from_millis(125));
+                }
+                let started = Instant::now();
+                cx.update_window(window.into(), |_, window, _| window.refresh())
+                    .unwrap();
+                cx.run_until_parked();
+                if index >= 32 {
+                    samples.push(started.elapsed().as_secs_f64() * 1000.0);
+                }
+            }
+            samples.sort_by(f64::total_cmp);
+            eprintln!(
+                "sidebar repaint: median={:.3}ms p90={:.3}ms (500 frames)",
+                samples[250], samples[450]
+            );
+        }
         let screenshot = cx
             .capture_screenshot(window.into())
             .expect("capture sidebar screenshot");

@@ -361,3 +361,45 @@ diri/scripts/perf-gate.sh --app diri/dist/diri.app --scenario all
 
 The packaged probe is the release acceptance authority; the historical command
 results above apply only to the dated T16 sample.
+
+## Sidebar activity marks (2026-09-08)
+
+Session rows separate activity (left) from agent identity (right). Working
+marks use eight embedded SVG frames, shared through GPUI's existing SVG atlas.
+The sidebar samples one phase per existing render, quantized to 125 ms; it
+never requests another render for the activity mark. There is no timer per
+row or per sidebar, and no animated-image decoder. Between existing sidebar
+repaints the mark stays still. Reduce Motion fixes the phase at zero.
+Sleeping and ended rows have no animated mark. This deliberately preserves
+the no-periodic-wake contract instead of promising a continuous spinner.
+
+On this Apple Silicon workstation running macOS 26.5.2, an optimized native
+headless benchmark with **30 visible working rows**, a 360×1120 pt window,
+32 warmup repaints, and 500 measured forced repaints produced:
+
+| Three alternating runs | Median repaint (ms) | p90 repaint (ms) |
+| --- | --- | --- |
+| `main` at `5b6b46e` | 1.011 / 1.018 / 1.014 | 1.059 / 1.091 / 1.050 |
+| Separate activity/identity | 1.043 / 1.041 / 1.045 | 1.153 / 1.109 / 1.105 |
+
+The additional mark costs approximately **0.03 ms per forced full sidebar
+repaint** in this fixture. Whole-process CPU time (including startup, warmup,
+and PNG capture) was 0.710–0.739 s before and 0.726–0.759 s after. These are
+rendering measurements, not a packaged idle-CPU gate or a guarantee about
+live terminal workloads. No added timer means the activity marks introduce
+no autonomous wakeups, including with 30 working sessions.
+
+Reproduce from `diri/` using an isolated Cargo target directory:
+
+```sh
+DIRI_VISUAL_SCENARIO=fleet DIRI_VISUAL_WIDTH=360 \
+DIRI_VISUAL_POPOVER=none DIRI_VISUAL_BENCH=1 \
+DIRI_VISUAL_OUTPUT=/tmp/sidebar-fleet.png \
+cargo test --release -p diri-app render_sidebar_preview_screenshot -- --ignored --nocapture
+```
+
+For a before/after comparison, use the same fixture and screenshot benchmark
+harness on both revisions. `DIRIJOR_SIDEBAR_PREVIEW=fleet` also opens the
+30-session fixture interactively without an Engine connection. Use
+`DIRI_VISUAL_SCENARIO=stress` and `DIRI_VISUAL_LIGHT=1` for layout checks of
+loading, sleeping, nested, and long-title rows.

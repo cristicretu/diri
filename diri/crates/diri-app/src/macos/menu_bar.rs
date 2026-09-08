@@ -1,6 +1,6 @@
 //! Native menu-bar session list.
 //!
-//! Mirrors the sidebar: project collapse, spawn indent, agent marks, and Zzz
+//! Mirrors the sidebar: project collapse, spawn indent, agent marks, and Sleeping
 //! chip. Project collapse is local to the menu bar and never writes sidebar prefs.
 
 use std::cell::RefCell;
@@ -973,7 +973,7 @@ impl NativeMenuBar {
             row.addSubview(chip);
         }
 
-        let title_alpha = if session.trailing == Some(TrailingStatus::Zzz) {
+        let title_alpha = if session.trailing == Some(TrailingStatus::Sleeping) {
             0.55
         } else {
             0.90
@@ -1068,9 +1068,9 @@ fn trailing_label(session: &InboxSessionRow, theme: &MenuTheme) -> Option<Traili
             width: 48.0,
             color: rgba_ns(Ink::FRESH.r, Ink::FRESH.g, Ink::FRESH.b, 1.0),
         }),
-        TrailingStatus::Zzz => Some(TrailingLabel {
-            text: "Zzz",
-            width: 28.0,
+        TrailingStatus::Sleeping => Some(TrailingLabel {
+            text: "Sleeping",
+            width: 58.0,
             color: Retained::clone(&theme.tertiary),
         }),
     }
@@ -1149,7 +1149,7 @@ fn glyph_tint(session: &InboxSessionRow, theme: &MenuTheme) -> Retained<NSColor>
         Some(TrailingStatus::Done | TrailingStatus::Unread) => {
             rgba_ns(Ink::FRESH.r, Ink::FRESH.g, Ink::FRESH.b, 1.0)
         }
-        Some(TrailingStatus::Zzz) => theme.primary_alpha(0.36),
+        Some(TrailingStatus::Sleeping) => theme.primary_alpha(0.36),
         None if session.working => match session.agent_id.as_str() {
             AgentKind::CLAUDE_CODE_ID => {
                 NSColor::colorWithSRGBRed_green_blue_alpha(0.851, 0.467, 0.341, 0.96)
