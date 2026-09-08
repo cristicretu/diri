@@ -3285,6 +3285,7 @@ enum InitialPromptFailure {
     SessionEnded,
     TimedOut,
     SubmissionUnconfirmed,
+    InputFailed,
 }
 
 impl std::fmt::Display for InitialPromptFailure {
@@ -3292,6 +3293,7 @@ impl std::fmt::Display for InitialPromptFailure {
         match self {
             Self::SessionEnded => formatter.write_str("the session ended before accepting it"),
             Self::TimedOut => formatter.write_str("the agent did not accept it before the timeout"),
+            Self::InputFailed => formatter.write_str("the session could not accept input"),
             Self::SubmissionUnconfirmed => {
                 formatter.write_str("the agent never confirmed that it submitted")
             }
@@ -3303,7 +3305,7 @@ fn initial_prompt_control_error(session_id: &str, failure: InitialPromptFailure)
     ControlError::new(
         "initial_prompt_delivery_failed",
         format!(
-            "session {session_id} was created, but its initial prompt was not delivered: {failure}"
+            "session {session_id} was created, but initial prompt delivery was not confirmed: {failure}"
         ),
     )
 }
@@ -3398,9 +3400,9 @@ fn inject_initial_prompt(
         // tips panel) proves nothing, so the probe is chosen against the
         // pre-typing screen.
         let probe = verification_probe(prompt, &before);
-        if with_session(registry, session_id, |session| session.paste_text(prompt)).is_none() {
-            return Err(InitialPromptFailure::SessionEnded);
-        }
+        with_session(registry, session_id, |session| session.paste_text(prompt))
+            .ok_or(InitialPromptFailure::SessionEnded)?
+            .map_err(|_| InitialPromptFailure::InputFailed)?;
         match wait_for_echo(registry, session_id, probe.as_deref(), &before, ECHO_WINDOW) {
             EchoOutcome::Gone => return Err(InitialPromptFailure::SessionEnded),
             // The composer is holding our text: the Enter is safe.
@@ -3423,9 +3425,9 @@ fn inject_initial_prompt(
         // here. The old code sent this same blind Enter on every attempt, so
         // the exposure is unchanged; narrowing it would need the holder to
         // report termios.
-        if with_session(registry, session_id, |session| session.submit_input()).is_none() {
-            return Err(InitialPromptFailure::SessionEnded);
-        }
+        with_session(registry, session_id, |session| session.submit_input())
+            .ok_or(InitialPromptFailure::SessionEnded)?
+            .map_err(|_| InitialPromptFailure::InputFailed)?;
         match wait_for_echo(
             registry,
             session_id,
@@ -3527,22 +3529,35 @@ fn submit_typed_prompt(
     session_id: &str,
     probe: Option<&str>,
 ) -> Result<(), InitialPromptFailure> {
+    let submitted_at = diri_proto::DateMillis::from(std::time::SystemTime::now());
     for _ in 0..2 {
-        if with_session(registry, session_id, |session| session.submit_input()).is_none() {
-            return Err(InitialPromptFailure::SessionEnded);
-        }
-        let Some(probe) = probe else {
-            return Ok(());
-        };
-        // Submitting moves the prompt out of the composer and into the
-        // transcript above it; either way the agent now owns it. Only a
-        // screen that never moved at all means the Enter was swallowed.
+        let (before, process_only) = with_session(registry, session_id, |session| {
+            let view = session.view();
+            (
+                session.screen_lines().join("\n"),
+                view.status_evidence.is_some_and(|evidence| {
+                    evidence.fallback_reason == Some(diri_proto::StatusFallbackReason::ProcessOnly)
+                }),
+            )
+        })
+        .ok_or(InitialPromptFailure::SessionEnded)?;
+        with_session(registry, session_id, |session| session.submit_input())
+            .ok_or(InitialPromptFailure::SessionEnded)?
+            .map_err(|_| InitialPromptFailure::InputFailed)?;
+        // The prompt may remain in the transcript after submission. In that
+        // case require a fresh, authoritative Agent signal; startup output or
+        // a status that predates Enter cannot acknowledge these bytes.
         for _ in 0..20 {
             std::thread::sleep(Duration::from_millis(100));
             match screen_text(registry, session_id) {
                 None => return Err(InitialPromptFailure::SessionEnded),
                 Some(now)
-                    if !now.contains(probe) || agent_started_working(registry, session_id) =>
+                    if probe.is_some_and(|probe| !now.contains(probe))
+                        // Plain CLI tools have no Agent status signals. A new
+                        // response after Enter is their available confirmation;
+                        // the pasted echo alone must never count as one.
+                        || ((process_only || probe.is_none()) && now != before)
+                        || agent_started_working(registry, session_id, submitted_at) =>
                 {
                     return Ok(());
                 }
@@ -3553,15 +3568,29 @@ fn submit_typed_prompt(
     Err(InitialPromptFailure::SubmissionUnconfirmed)
 }
 
-/// True once the session's own status reducer says the agent is doing
-/// something — the prompt was received even if its text is still echoed in
-/// the transcript above the composer.
-fn agent_started_working(registry: &Arc<Mutex<Registry>>, session_id: &str) -> bool {
+/// Only fresh Agent evidence can acknowledge submission. A running process
+/// or a pre-existing startup/permission status says nothing about this Enter.
+fn agent_started_working(
+    registry: &Arc<Mutex<Registry>>,
+    session_id: &str,
+    submitted_at: diri_proto::DateMillis,
+) -> bool {
     with_session(registry, session_id, |session| {
-        matches!(
-            session.view().status,
-            diri_proto::SessionStatus::Working | diri_proto::SessionStatus::NeedsInput(_)
-        )
+        let view = session.view();
+        view.status_evidence.is_some_and(|evidence| {
+            evidence.status == view.status
+                && evidence.signal_at.0 >= submitted_at.0
+                && matches!(
+                    evidence.source,
+                    diri_proto::StatusEvidenceSource::Hook
+                        | diri_proto::StatusEvidenceSource::Notify
+                        | diri_proto::StatusEvidenceSource::ScreenRule
+                )
+                && matches!(
+                    view.status,
+                    diri_proto::SessionStatus::Working | diri_proto::SessionStatus::NeedsInput(_)
+                )
+        })
     })
     .unwrap_or(false)
 }

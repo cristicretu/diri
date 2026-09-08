@@ -1012,6 +1012,17 @@ impl SessionStore {
         self.last_action_failure.as_ref()
     }
 
+    pub(crate) fn report_prompt_delivery_failure(&mut self, detail: String) {
+        // Never offer a blind retry: the Agent may have accepted input before
+        // the connection failed. The composer retains the reviewable draft.
+        self.last_action_failure = Some(ActionFailure {
+            title: "Prompt delivery not confirmed".into(),
+            detail,
+            retrying: false,
+            retry: None,
+        });
+    }
+
     pub fn dismiss_action_failure(&mut self) {
         self.last_action_failure = None;
         self.emit(StoreEffect::UiChanged);
@@ -2379,6 +2390,15 @@ impl SessionStore {
     }
 
     pub fn spawn_kind(&mut self, kind: AgentKind, options: SpawnOptions) {
+        self.emit(StoreEffect::Spawn(self.spawn_params(kind, options)));
+    }
+
+    /// Shared launch resolution for queued actions and acknowledged composers.
+    pub(crate) fn spawn_params(
+        &self,
+        kind: AgentKind,
+        options: SpawnOptions,
+    ) -> SessionSpawnParams {
         let host = options.host;
         let cwd = if let Some(host_id) = &host {
             // Remote spawn: local directories are meaningless — use the
@@ -2400,7 +2420,7 @@ impl SessionStore {
         let (new_worktree, worktree_branch) = worktree.map_or((None, None), |worktree| {
             (Some(worktree.create), worktree.branch)
         });
-        self.emit(StoreEffect::Spawn(SessionSpawnParams {
+        SessionSpawnParams {
             kind,
             cwd,
             new_worktree,
@@ -2414,7 +2434,7 @@ impl SessionStore {
             host,
             account_profile_id: options.account_profile_id,
             same_repo_as: options.same_repo_as,
-        }));
+        }
     }
 
     pub fn reparent_worktree(&self, params: diri_proto::SessionReparentWorktreeParams) {

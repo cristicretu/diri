@@ -160,7 +160,8 @@ fn spawn_reports_when_the_child_exits_before_accepting_its_prompt() {
 
     assert_eq!(error.code, "initial_prompt_delivery_failed");
     assert!(
-        error.message.contains("session s_") && error.message.contains("was not delivered"),
+        error.message.contains("session s_")
+            && error.message.contains("delivery was not confirmed"),
         "the error must identify the created session and the delivery failure: {error}"
     );
 }
@@ -352,4 +353,33 @@ while :; do sleep 1; done"#
     );
 
     control.request("session.kill", json!({ "sessionID": id }));
+}
+
+/// An echoed paste is not a submitted prompt. Some startup composers swallow
+/// the first Enter while finishing initialization.
+#[test]
+fn an_echoed_prompt_waits_for_an_accepted_enter() {
+    for prompt in ["verify swallowed enter", "hi"] {
+        let temp = tempfile::tempdir().expect("temp");
+        let server = start_server(temp.path());
+        let mut control = Control::connect(&server);
+        let framed_len = prompt.len() + 12;
+        let script = format!(
+            r#"stty -echo -icanon min 1 time 0
+printf '\033[?2004hREADY'
+dd if=/dev/stdin of=/dev/null bs=1 count={framed_len} 2>/dev/null
+printf '\r\033[2K{prompt}'
+dd if=/dev/stdin of=/dev/null bs=1 count=1 2>/dev/null
+dd if=/dev/stdin of=/dev/null bs=1 count=1 2>/dev/null
+printf '\r\033[2KSUBMITTED'
+exec cat"#
+        );
+        let id = spawn(&mut control, &script, "/bin/sh", prompt);
+        let text = screen(&mut control, &id);
+        control.request("session.kill", json!({ "sessionID": id }));
+        assert!(
+            text.contains("SUBMITTED"),
+            "spawn acknowledged an unsubmitted paste: {text:?}"
+        );
+    }
 }

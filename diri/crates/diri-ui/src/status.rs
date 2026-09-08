@@ -130,7 +130,8 @@ impl StatusGlyph {
         }
     }
 
-    fn rendered_mark(&self) -> gpui::AnyElement {
+    /// Render the same static identity mark in transient lists without an entity.
+    pub fn rendered_mark(&self) -> gpui::AnyElement {
         static_mark(
             self.kind,
             self.size,

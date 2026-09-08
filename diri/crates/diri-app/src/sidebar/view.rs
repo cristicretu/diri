@@ -10,9 +10,9 @@ use diri_proto::{
     SessionRecord,
 };
 use diri_ui::{
-    AgentKind, AgentLogo, AlertChip, AttentionDot, AttentionLevel, Fill, FloatingSurface,
-    HairlineDivider, HoverMarquee, Ink, LoadingIndicator, Metrics, Motion, Palette, Radius,
-    RowFill, SemanticColors, Space, StateChip, StatusGlyph, StatusState, Typo,
+    AgentLogo, AlertChip, AttentionDot, AttentionLevel, Fill, FloatingSurface, HairlineDivider,
+    HoverMarquee, Ink, LoadingIndicator, Metrics, Motion, Palette, Radius, RowFill, SemanticColors,
+    Space, StateChip, StatusGlyph, StatusState, Typo,
 };
 use gpui::{
     Anchor, Animation, AnimationExt, AnyElement, App, AppContext as _, Bounds, Context,
@@ -39,7 +39,7 @@ use crate::switcher::display_title;
 use crate::updates::{UpdateCommand, UpdatePhase, UpdateState};
 use crate::usage::{UsageFormat, UsageSnapshot};
 
-use super::activity::{activity_mark, frame_at};
+use crate::session_presentation::{activity_mark, frame_at, status_state, ui_agent_kind};
 
 use super::{
     CursorMove, DragItem, DropZone, Popover, PreviewScenario, SidebarPreviewFixture,
@@ -7260,27 +7260,6 @@ fn hover_detail(icon: &str, text: &str, mono: bool, colors: SemanticColors) -> A
         .into_any_element()
 }
 
-fn status_state(session: &SessionRecord, migrating: bool) -> StatusState {
-    if migrating {
-        return StatusState::Working;
-    }
-    if session.hibernation.is_some() {
-        return StatusState::Hibernated;
-    }
-    match session.attention() {
-        ProtoAttentionLevel::NeedsInput => StatusState::NeedsInput {
-            destructive: session
-                .needs_input
-                .as_ref()
-                .is_some_and(|detail| detail.risk_hint == diri_proto::RiskHint::Destructive),
-        },
-        ProtoAttentionLevel::DoneUnseen => StatusState::DoneUnseen,
-        ProtoAttentionLevel::Working => StatusState::Working,
-        ProtoAttentionLevel::IdleSeen => StatusState::IdleSeen,
-        ProtoAttentionLevel::None | ProtoAttentionLevel::Unknown => StatusState::None,
-    }
-}
-
 /// Rows for the new-agent picker come from the selected target's runtime
 /// catalog. Unavailable and user-hidden Agents stay out of this high-frequency
 /// surface; Settings remains the complete supported-Agent inventory.
@@ -7343,19 +7322,6 @@ fn agent_picker_shortcut(
             .unwrap_or_default()
     } else {
         fallback.to_owned()
-    }
-}
-
-fn ui_agent_kind(kind: &ProtoAgentKind) -> AgentKind {
-    // Brand vocabulary, not a protocol type: a manifest agent the client has
-    // no hand-drawn mark for falls back to the generic terminal treatment.
-    match kind.id() {
-        ProtoAgentKind::CLAUDE_CODE_ID => AgentKind::ClaudeCode,
-        ProtoAgentKind::CODEX_ID => AgentKind::Codex,
-        ProtoAgentKind::CURSOR_ID => AgentKind::Cursor,
-        ProtoAgentKind::GEMINI_ID => AgentKind::Gemini,
-        ProtoAgentKind::SHELL_ID => AgentKind::Shell,
-        _ => AgentKind::Generic,
     }
 }
 
@@ -7799,7 +7765,11 @@ mod tests {
     /// guards the other half: a glyph that needs repainting to look right.
     #[test]
     fn the_sidebar_owns_no_repeating_clock() {
-        let source = [include_str!("view.rs"), include_str!("activity.rs")].join("\n");
+        let source = [
+            include_str!("view.rs"),
+            include_str!("../session_presentation.rs"),
+        ]
+        .join("\n");
         let periodic_timer = ["background_executor()", ".timer("].concat();
         let frame_request = ["request_animation", "_frame("].concat();
 

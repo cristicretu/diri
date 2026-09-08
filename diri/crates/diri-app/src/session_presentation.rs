@@ -1,7 +1,10 @@
 //! Opportunistic motion: callers supply one shared phase on an existing paint.
 //! No task, clock, entity invalidation, or frame request belongs to this mark.
 
-use diri_ui::{Icon, IconName, Ink, SemanticColors, StatusState};
+use diri_proto::{
+    AgentKind as ProtoAgentKind, AttentionLevel as ProtoAttentionLevel, SessionRecord,
+};
+use diri_ui::{AgentKind, Icon, IconName, Ink, SemanticColors, StatusState};
 use gpui::{AnyElement, IntoElement, div, prelude::*, px, svg};
 
 const FRAMES: [&str; 8] = [
@@ -15,7 +18,7 @@ const FRAMES: [&str; 8] = [
     "icons/working-7.svg",
 ];
 
-pub(super) fn frame_at(millis: f64, reduce_motion: bool) -> usize {
+pub(crate) fn frame_at(millis: f64, reduce_motion: bool) -> usize {
     if reduce_motion {
         0
     } else {
@@ -23,7 +26,7 @@ pub(super) fn frame_at(millis: f64, reduce_motion: bool) -> usize {
     }
 }
 
-pub(super) fn activity_mark(
+pub(crate) fn activity_mark(
     state: StatusState,
     frame: usize,
     colors: SemanticColors,
@@ -61,6 +64,40 @@ pub(super) fn activity_mark(
         StatusState::IdleSeen | StatusState::None | StatusState::Hibernated => {
             slot.into_any_element()
         }
+    }
+}
+
+pub(crate) fn status_state(session: &SessionRecord, migrating: bool) -> StatusState {
+    if migrating {
+        return StatusState::Working;
+    }
+    if session.hibernation.is_some() {
+        return StatusState::Hibernated;
+    }
+    match session.attention() {
+        ProtoAttentionLevel::NeedsInput => StatusState::NeedsInput {
+            destructive: session
+                .needs_input
+                .as_ref()
+                .is_some_and(|detail| detail.risk_hint == diri_proto::RiskHint::Destructive),
+        },
+        ProtoAttentionLevel::DoneUnseen => StatusState::DoneUnseen,
+        ProtoAttentionLevel::Working => StatusState::Working,
+        ProtoAttentionLevel::IdleSeen => StatusState::IdleSeen,
+        ProtoAttentionLevel::None | ProtoAttentionLevel::Unknown => StatusState::None,
+    }
+}
+
+pub(crate) fn ui_agent_kind(kind: &ProtoAgentKind) -> AgentKind {
+    // Brand vocabulary, not a protocol type: a manifest agent the client has
+    // no hand-drawn mark for falls back to the generic terminal treatment.
+    match kind.id() {
+        ProtoAgentKind::CLAUDE_CODE_ID => AgentKind::ClaudeCode,
+        ProtoAgentKind::CODEX_ID => AgentKind::Codex,
+        ProtoAgentKind::CURSOR_ID => AgentKind::Cursor,
+        ProtoAgentKind::GEMINI_ID => AgentKind::Gemini,
+        ProtoAgentKind::SHELL_ID => AgentKind::Shell,
+        _ => AgentKind::Generic,
     }
 }
 

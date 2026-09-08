@@ -22,12 +22,15 @@ use crate::quick_open::{
     self, DirectoryIndex, QuickOpenItem, QuickOpenSnapshot, RANK_DEBOUNCE, RESULT_LIMIT,
     RankedFolder,
 };
+use crate::session_presentation::{activity_mark, frame_at, status_state, ui_agent_kind};
 use crate::store::{SessionStore, SpawnOptions, StoreRuntime};
-use diri_proto::{AgentKind, AttentionLevel, SessionId, SessionRecord};
+#[cfg(test)]
+use diri_proto::AgentKind;
+use diri_proto::{SessionId, SessionRecord};
 use diri_term::theme::TermTheme;
 use diri_ui::{
     Fill, FloatingSurface, HairlineDivider, Icon, IconName, Ink, LoadingIndicator, Palette, Radius,
-    SemanticColors,
+    SemanticColors, StatusGlyph,
 };
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Context, FocusHandle, Focusable, FontWeight,
@@ -126,6 +129,7 @@ pub struct NavigationOverlay {
     last_theme_id: String,
     theme_matches: Vec<TermTheme>,
     page_error: Option<String>,
+    activity_frame: usize,
     /// Separate slots: the disk-cache load and the filesystem scan both start
     /// at launch, and neither may cancel the other by sharing a `Task` slot.
     cache_task: Option<Task<()>>,
@@ -195,6 +199,7 @@ impl NavigationOverlay {
             last_theme_id: String::new(),
             theme_matches: Vec::new(),
             page_error: None,
+            activity_frame: 0,
             cache_task: None,
             scan_task: None,
             rank_task: None,
@@ -247,6 +252,7 @@ impl NavigationOverlay {
             last_theme_id: String::new(),
             theme_matches: Vec::new(),
             page_error: None,
+            activity_frame: 0,
             cache_task: None,
             scan_task: None,
             rank_task: None,
@@ -1315,6 +1321,14 @@ impl NavigationOverlay {
             .h(px(ROW_HEIGHT))
             .px(px(6.0))
             .py(px(2.0))
+            // Separate the two result groups without introducing a selectable
+            // header or changing uniform-list indices and shortcut numbering.
+            .when(
+                self.overlay == Some(Overlay::CommandPalette)
+                    && !self.ranked_sessions.is_empty()
+                    && index == self.ranked_sessions.len(),
+                |row| row.border_t_1().border_color(colors.primary.alpha(0.08)),
+            )
             .child(row)
             .into_any_element()
     }
@@ -1460,25 +1474,31 @@ impl NavigationOverlay {
     ) -> AnyElement {
         let session = ranked.item;
         let id = session.id.clone();
-        let dot_color = attention_color(session.attention(), colors);
-        let mut trailing = vec![SharedString::from(kind_label(session.effective_kind()))];
-        if let Some(shortcut) = session_shortcut(index) {
-            trailing.push(shortcut.into());
-        }
+        let migrating = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .migrating()
+            .contains(&id);
+        let state = status_state(&session, migrating);
+        let identity =
+            StatusGlyph::new(ui_agent_kind(session.effective_kind()), state, 16.0, colors)
+                .rendered_mark();
+        let frame = self.activity_frame;
+        let trailing = session_shortcut(index)
+            .map(SharedString::from)
+            .into_iter()
+            .collect();
         palette_row(
             highlighted_label(session.title, &ranked.title_matches),
-            div()
-                .flex_none()
-                .size(px(7.0))
-                .rounded_full()
-                .bg(dot_color)
-                .into_any_element(),
+            activity_mark(state, frame, colors),
             trailing,
             index == self.highlight,
             index,
             true,
             colors,
         )
+        .child(identity)
         .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
             if *hovered && this.highlight != index {
                 this.highlight = index;
@@ -1570,6 +1590,7 @@ impl Focusable for NavigationOverlay {
 
 impl Render for NavigationOverlay {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.activity_frame = frame_at(diri_ui::wall_clock_seconds() * 1000.0, cx.reduce_motion());
         let layout = OverlayLayout::command_palette(window.viewport_size());
         let overlay = self.overlay.map(|_| self.render_overlay(layout, cx));
         let root = div()
@@ -1673,7 +1694,7 @@ fn highlighted_label_styled(
 fn palette_row(
     title: AnyElement,
     leading: AnyElement,
-    // Owned: agent chips and shortcut hints are not compile-time literals.
+    // Owned: detail labels and shortcut hints are not compile-time literals.
     trailing: Vec<SharedString>,
     highlighted: bool,
     index: usize,
@@ -1731,47 +1752,25 @@ fn palette_row(
                     .flex()
                     .items_center()
                     .gap(px(4.0))
-                    .children(trailing.into_iter().map(|trailing| chip(trailing, colors))),
+                    .children(
+                        trailing
+                            .into_iter()
+                            .map(|trailing| shortcut_hint(trailing, colors)),
+                    ),
             )
         })
 }
 
-fn chip(text: impl Into<gpui::SharedString>, colors: SemanticColors) -> AnyElement {
+fn shortcut_hint(text: impl Into<gpui::SharedString>, colors: SemanticColors) -> AnyElement {
     div()
         .px(px(5.0))
         .py(px(2.0))
-        .rounded(px(Radius::CHIP))
-        .bg(colors.primary.alpha(0.06))
         .text_size(px(11.0))
         .text_color(colors.tertiary)
         .child(text.into())
         .into_any_element()
 }
 
-fn attention_color(attention: AttentionLevel, colors: SemanticColors) -> gpui::Rgba {
-    match attention {
-        AttentionLevel::NeedsInput => gpui::rgb(0xf59e0b),
-        AttentionLevel::DoneUnseen => gpui::rgb(0x3b82f6),
-        AttentionLevel::Working => colors.secondary,
-        _ => colors.tertiary,
-    }
-}
-
-/// Compact label for the navigator's kind column. The manifest id is already a
-/// short lowercase word for every agent, so only the two non-agent kinds and
-/// Claude's hyphenated id need shortening.
-fn kind_label(kind: &AgentKind) -> String {
-    match kind.id() {
-        AgentKind::CLAUDE_CODE_ID => "claude".to_owned(),
-        AgentKind::GENERIC_ID => "term".to_owned(),
-        other => other.to_owned(),
-    }
-}
-
-/// Identity of everything the palette's Agent rows are derived from: the saved
-/// default, the target it spawns on, and each target's readiness facts. Session
-/// and project churn is deliberately excluded — it moves on every UI tick and
-/// cannot change which Agents a target can launch.
 fn agent_actions_fingerprint(store: &SessionStore) -> u64 {
     let mut hasher = DefaultHasher::new();
     store.preferences().default_agent.id().hash(&mut hasher);

@@ -3288,152 +3288,35 @@ impl UtilitySurfaces {
                 .gap(px(18.0))
                 .child(
                     div()
-                        .relative()
-                        .rounded(px(Radius::PANEL))
-                        .border_1()
-                        .border_color(colors.primary.alpha(0.085))
-                        .bg(colors.primary.alpha(0.022))
                         .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .min_h(px(62.0))
-                                .p(px(13.0))
-                                .flex()
-                                .flex_wrap()
-                                .items_center()
-                                .justify_between()
-                                .gap(px(12.0))
-                                .child(
-                                    div()
-                                        .min_w(px(230.0))
-                                        .flex_1()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(10.0))
-                                        .child(
-                                            div()
-                                                .flex_none()
-                                                .size(px(32.0))
-                                                .rounded(px(Radius::ROW))
-                                                .bg(selected.cursor.alpha(0.13))
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .child(sf_symbol(
-                                                    "sparkles",
-                                                    13.0,
-                                                    selected.cursor,
-                                                )),
-                                        )
-                                        .child(setting_text_stack(
-                                            "Color theme".into(),
-                                            "One palette for Diri, every terminal, and all app chrome."
-                                                .into(),
-                                            colors,
-                                        )),
-                                )
-                                .child(self.terminal_theme_dropdown(cx)),
-                        )
-                        .child(setting_divider(colors))
-                        .child(
-                            div()
-                                .p(px(12.0))
-                                .flex()
-                                .flex_col()
-                                .gap(px(9.0))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .child(
-                                            div()
-                                                .text_size(px(Typo::META.size))
-                                                .font_weight(Typo::META.weight)
-                                                .text_color(colors.secondary)
-                                                .child("Quick themes"),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_size(px(Typo::META.size - 1.0))
-                                                .text_color(colors.tertiary)
-                                                .child("Select to preview instantly"),
-                                        ),
-                                )
-                                .child(featured_themes),
-                        )
-                        .child(setting_divider(colors))
-                        .child(
-                            div()
-                                .p(px(12.0))
-                                .flex()
-                                .flex_col()
-                                .gap(px(9.0))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .gap(px(12.0))
-                                        .child(
-                                            div()
-                                                .text_size(px(Typo::META.size))
-                                                .font_weight(Typo::META.weight)
-                                                .text_color(colors.secondary)
-                                                .child("Live workspace preview"),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap(px(5.0))
-                                                .child(
-                                                    div()
-                                                        .size(px(5.0))
-                                                        .rounded_full()
-                                                        .bg(Ink::FRESH),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .font_family(crate::fonts::mono_family())
-                                                        .text_size(px(10.0))
-                                                        .text_color(colors.tertiary)
-                                                        .child(format!(
-                                                            "{} · {:.0} pt",
-                                                            selected.name,
-                                                            self.prefs.terminal_font_size
-                                                        )),
-                                                ),
-                                        ),
-                                )
-                                .child(workspace_theme_preview(
-                                    selected,
-                                    self.prefs.terminal_font_size,
-                                    colors,
-                                )),
-                        ),
-                )
-                .child(
-                    div()
-                        .rounded(px(Radius::PANEL))
-                        .border_1()
-                        .border_color(colors.primary.alpha(0.085))
-                        .bg(colors.primary.alpha(0.022))
-                        .overflow_hidden()
-                        .flex()
-                        .flex_col()
-                        .child(setting_row(
-                            "Terminal text",
-                            "Keep code comfortable without scaling the rest of the interface.",
-                            font_control,
+                        .items_center()
+                        .justify_between()
+                        .gap(px(12.0))
+                        .child(setting_text_stack(
+                            "Color theme".into(),
+                            "Used throughout Diri and your terminals.".into(),
                             colors,
                         ))
-                        .child(setting_divider(colors))
-                        .child(terminal_type_specimen(
-                            selected,
-                            self.prefs.terminal_font_size,
-                        )),
+                        .child(self.terminal_theme_dropdown(cx)),
+                )
+                .child(featured_themes)
+                .child(workspace_theme_preview(
+                    selected,
+                    self.prefs.terminal_font_size,
+                    colors,
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(12.0))
+                        .child(setting_text_stack(
+                            "Terminal text".into(),
+                            "Adjust the font size in every terminal.".into(),
+                            colors,
+                        ))
+                        .child(font_control),
                 ),
             colors,
         )
@@ -5411,69 +5294,7 @@ fn settings_page(
 }
 
 fn appearance_settings_page(content: impl IntoElement, colors: SemanticColors) -> impl IntoElement {
-    div()
-        .w_full()
-        .px(px(24.0))
-        .pt(px(22.0))
-        .pb(px(32.0))
-        .flex()
-        .flex_col()
-        .gap(px(22.0))
-        .child(
-            div()
-                .pr(px(34.0))
-                .min_h(px(44.0))
-                .flex()
-                .flex_wrap()
-                .items_end()
-                .justify_between()
-                .gap(px(12.0))
-                .child(
-                    div()
-                        .min_w(px(260.0))
-                        .flex_1()
-                        .flex()
-                        .flex_col()
-                        .gap(px(5.0))
-                        .child(
-                            div()
-                                .text_size(px(21.0))
-                                .line_height(px(24.0))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(colors.primary)
-                                .child("Appearance"),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(12.0))
-                                .line_height(px(17.0))
-                                .text_color(colors.secondary)
-                                .child("Shape a workspace that feels focused, legible, and yours."),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .h(px(26.0))
-                        .px(px(9.0))
-                        .rounded(px(Radius::CHIP))
-                        .border_1()
-                        .border_color(Ink::FRESH.alpha(0.22))
-                        .bg(Ink::FRESH.alpha(0.08))
-                        .flex()
-                        .items_center()
-                        .gap(px(6.0))
-                        .child(div().size(px(5.0)).rounded_full().bg(Ink::FRESH))
-                        .child(
-                            div()
-                                .text_size(px(10.0))
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(colors.secondary)
-                                .child("Changes apply instantly"),
-                        ),
-                ),
-        )
-        .child(content)
+    settings_page("Appearance", content, colors)
 }
 
 fn setting_divider(colors: SemanticColors) -> impl IntoElement {
@@ -5585,104 +5406,52 @@ fn featured_theme_card(
     colors: SemanticColors,
     cx: &mut Context<UtilitySurfaces>,
 ) -> impl IntoElement {
-    let selection_tint = if theme.cursor.a > 0.0 {
-        theme.cursor
-    } else {
-        theme.foreground
-    };
-
     div()
         .id(SharedString::from(format!("featured-theme-{index}")))
         .debug_selector(move || format!("FEATURED_THEME_{index}"))
-        .relative()
-        .min_w(px(176.0))
-        .h(px(108.0))
-        .flex_1()
-        .rounded(px(Radius::CARD))
-        .overflow_hidden()
-        .border_1()
-        .border_color(if selected {
-            selection_tint.alpha(0.76)
+        .role(gpui::Role::Button)
+        .aria_label(format!("Use {} theme", theme.name))
+        .h(px(36.0))
+        .px(px(10.0))
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .rounded(px(Radius::ROW))
+        .bg(if selected {
+            colors.primary.alpha(0.08)
         } else {
-            colors.primary.alpha(0.11)
-        })
-        .bg(theme.background)
-        .shadow(if selected {
-            vec![BoxShadow {
-                color: selection_tint.alpha(0.14).into(),
-                offset: point(px(0.0), px(5.0)),
-                blur_radius: px(16.0),
-                spread_radius: px(-3.0),
-                inset: false,
-            }]
-        } else {
-            Vec::new()
+            colors.primary.alpha(0.0)
         })
         .cursor_pointer()
-        .hover(move |card| card.border_color(colors.primary.alpha(0.34)))
-        .active(|card| card.opacity(0.84))
+        .hover(move |chip| chip.bg(colors.primary.alpha(0.10)))
+        .active(|chip| chip.opacity(0.84))
         .on_click(cx.listener(move |this, _, _, cx| {
             this.prefs.terminal_theme = theme.id.to_owned();
             this.settings_menu = None;
             this.persist_prefs();
             cx.notify();
         }))
-        .flex()
-        .flex_col()
         .child(
             div()
-                .h(px(30.0))
-                .px(px(9.0))
+                .size(px(18.0))
+                .rounded_full()
+                .bg(theme.background)
+                .border_1()
+                .border_color(colors.primary.alpha(0.18))
                 .flex()
                 .items_center()
-                .justify_between()
-                .bg(theme.foreground.alpha(0.045))
-                .child(
-                    div()
-                        .min_w(px(0.0))
-                        .text_ellipsis()
-                        .text_size(px(10.0))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme.foreground)
-                        .child(theme.name),
-                )
-                .when(selected, |bar| {
-                    bar.child(sf_symbol("checkmark.circle.fill", 11.0, selection_tint))
-                }),
+                .justify_center()
+                .child(div().size(px(7.0)).rounded_full().bg(theme.cursor)),
         )
         .child(
             div()
-                .flex_1()
-                .px(px(10.0))
-                .py(px(8.0))
-                .flex()
-                .flex_col()
-                .gap(px(5.0))
-                .font_family(crate::fonts::mono_family())
-                .text_size(px(9.5))
-                .child(
-                    div()
-                        .flex()
-                        .child(div().text_color(theme.ansi[2]).child("❯ "))
-                        .child(div().text_color(theme.foreground).child("diri --continue"))
-                        .child(div().ml(px(2.0)).text_color(theme.cursor).child("█")),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(5.0))
-                        .text_color(theme.ansi[8])
-                        .child(div().size(px(4.0)).rounded_full().bg(Ink::FRESH))
-                        .child("workspace ready"),
-                )
-                .child(
-                    div().mt_auto().flex().gap(px(3.0)).children(
-                        [theme.ansi[1], theme.ansi[2], theme.ansi[3], theme.ansi[4]]
-                            .map(|color| div().flex_1().h(px(4.0)).rounded(px(2.0)).bg(color)),
-                    ),
-                ),
+                .text_size(px(12.0))
+                .text_color(colors.secondary)
+                .child(theme.name),
         )
+        .child(div().w(px(12.0)).when(selected, |mark| {
+            mark.child(sf_symbol("checkmark", 10.0, colors.secondary))
+        }))
 }
 
 fn preview_sidebar_row(
@@ -5728,9 +5497,10 @@ fn preview_code_line(
     content: impl IntoElement,
     highlighted: bool,
     theme: TermTheme,
+    line_height: f32,
 ) -> impl IntoElement {
     div()
-        .h(px(21.0))
+        .h(px(line_height))
         .px(px(9.0))
         .flex()
         .items_center()
@@ -5754,11 +5524,11 @@ fn workspace_theme_preview(
     font_size: f32,
     colors: SemanticColors,
 ) -> impl IntoElement {
-    let preview_font_size = (font_size - 2.0).clamp(9.0, 13.0);
+    let line_height = (font_size * 1.5).ceil();
     div()
         .debug_selector(|| "APPEARANCE_WORKSPACE_PREVIEW".into())
         .w_full()
-        .h(px(176.0))
+        .h(px((71.0 + 5.0 * line_height).max(176.0)))
         .rounded(px(Radius::CARD))
         .overflow_hidden()
         .border_1()
@@ -5863,17 +5633,6 @@ fn workspace_theme_preview(
                                 .text_size(px(9.0))
                                 .text_color(theme.foreground.alpha(0.68))
                                 .child("appearance.rs"),
-                        )
-                        .child(
-                            div()
-                                .px(px(5.0))
-                                .py(px(2.0))
-                                .rounded(px(4.0))
-                                .bg(theme.ansi[2].alpha(0.12))
-                                .text_size(px(8.0))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme.ansi[2])
-                                .child("LIVE"),
                         ),
                 )
                 .child(div().h(px(1.0)).bg(theme.foreground.alpha(0.08)))
@@ -5882,7 +5641,7 @@ fn workspace_theme_preview(
                         .flex_1()
                         .py(px(7.0))
                         .font_family(crate::fonts::mono_family())
-                        .text_size(px(preview_font_size))
+                        .text_size(px(font_size))
                         .text_color(theme.foreground)
                         .child(preview_code_line(
                             "1",
@@ -5893,6 +5652,7 @@ fn workspace_theme_preview(
                                 .child(div().text_color(theme.foreground).child(" = {")),
                             false,
                             theme,
+                            line_height,
                         ))
                         .child(preview_code_line(
                             "2",
@@ -5903,6 +5663,7 @@ fn workspace_theme_preview(
                                 .child(div().text_color(theme.foreground).child(",")),
                             true,
                             theme,
+                            line_height,
                         ))
                         .child(preview_code_line(
                             "3",
@@ -5917,6 +5678,7 @@ fn workspace_theme_preview(
                                 .child(div().text_color(theme.foreground).child(",")),
                             false,
                             theme,
+                            line_height,
                         ))
                         .child(preview_code_line(
                             "4",
@@ -5927,12 +5689,14 @@ fn workspace_theme_preview(
                                 .child(div().text_color(theme.foreground).child(",")),
                             false,
                             theme,
+                            line_height,
                         ))
                         .child(preview_code_line(
                             "5",
                             div().text_color(theme.foreground).child("};"),
                             false,
                             theme,
+                            line_height,
                         )),
                 )
                 .child(
@@ -5951,60 +5715,6 @@ fn workspace_theme_preview(
                         .child("diri · ready"),
                 ),
         )
-}
-
-fn terminal_type_specimen(theme: TermTheme, font_size: f32) -> impl IntoElement {
-    div().p(px(12.0)).child(
-        div()
-            .w_full()
-            .min_h(px(58.0))
-            .px(px(12.0))
-            .py(px(9.0))
-            .rounded(px(Radius::ROW))
-            .border_1()
-            .border_color(theme.foreground.alpha(0.10))
-            .bg(theme.background)
-            .flex()
-            .items_center()
-            .gap(px(11.0))
-            .child(
-                div()
-                    .flex_none()
-                    .size(px(36.0))
-                    .rounded(px(Radius::BADGE))
-                    .bg(theme.ansi[4].alpha(0.15))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .font_family(crate::fonts::mono_family())
-                    .text_size(px(13.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.ansi[4])
-                    .child("Aa"),
-            )
-            .child(
-                div()
-                    .min_w(px(0.0))
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .gap(px(3.0))
-                    .font_family(crate::fonts::mono_family())
-                    .child(
-                        div()
-                            .text_size(px(font_size.clamp(10.0, 17.0)))
-                            .line_height(px((font_size + 4.0).clamp(14.0, 21.0)))
-                            .text_color(theme.foreground)
-                            .child("cargo test --workspace"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(9.0))
-                            .text_color(theme.ansi[8])
-                            .child("A live specimen at your selected terminal size"),
-                    ),
-            ),
-    )
 }
 
 fn chip(label: String, colors: SemanticColors) -> impl IntoElement {
