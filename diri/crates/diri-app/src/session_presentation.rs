@@ -1,4 +1,4 @@
-//! Opportunistic motion: callers supply one shared phase on an existing paint.
+//! Callers supply a shared animation frame and own its repaint cadence.
 //! No task, clock, entity invalidation, or frame request belongs to this mark.
 
 use diri_proto::{

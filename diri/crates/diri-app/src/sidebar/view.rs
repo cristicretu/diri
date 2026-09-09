@@ -39,7 +39,7 @@ use crate::switcher::display_title;
 use crate::updates::{UpdateCommand, UpdatePhase, UpdateState};
 use crate::usage::{UsageFormat, UsageSnapshot};
 
-use crate::session_presentation::{activity_mark, frame_at, status_state, ui_agent_kind};
+use crate::session_presentation::{activity_mark, status_state, ui_agent_kind};
 
 use super::{
     CursorMove, DragItem, DropZone, Popover, PreviewScenario, SidebarPreviewFixture,
@@ -247,6 +247,9 @@ pub struct Sidebar {
     directory_scroll: ScrollHandle,
     glyphs: HashMap<SessionId, Entity<StatusGlyph>>,
     activity_frame: usize,
+    activity_tick: Option<Task<()>>,
+    activity_activation: Option<gpui::Subscription>,
+    working_row_rendered: bool,
     /// Rebuilt once per projection render. Looking up ⌘1…⌘9 inside every row
     /// previously re-locked the store and scanned the full session list N times.
     shortcut_ranks: HashMap<SessionId, usize>,
@@ -368,6 +371,9 @@ impl Sidebar {
             directory_scroll: ScrollHandle::new(),
             glyphs: HashMap::new(),
             activity_frame: 0,
+            activity_tick: None,
+            activity_activation: None,
+            working_row_rendered: false,
             shortcut_ranks: HashMap::new(),
             focus_handle: cx.focus_handle(),
             hover_generation: 0,
@@ -2466,6 +2472,8 @@ impl Sidebar {
                 store.notifications().session_unread(&id),
             )
         };
+        let activity_state = sidebar_activity_state(status_state(session, migrating), unread);
+        self.working_row_rendered |= activity_state == StatusState::Working;
         let marked = self.ui.delegation_mark.as_ref() == Some(&id);
         let hovered = self.ui.hovered_session.as_ref() == Some(&id);
         let focused = self.focus_handle.is_focused(window)
@@ -2498,7 +2506,7 @@ impl Sidebar {
             host_label.as_deref(),
             hibernated,
             row.pinned,
-            hovered || (focused && shortcut.is_some()),
+            !hovered && focused && shortcut.is_some(),
         ) - if loading { 60.0 } else { 0.0 }
             - if row.has_children {
                 Space::INDENT + 8.0
@@ -2506,8 +2514,6 @@ impl Sidebar {
                 0.0
             })
         .max(36.0);
-        let title_available_width =
-            (title_available_width - if unread { 14.0 } else { 0.0 }).max(0.0);
         let title_marquee_id = format!("session-title-marquee:{}", id.0);
         let fill = if selected {
             RowFill::Selected
@@ -2566,11 +2572,7 @@ impl Sidebar {
                     }
                 }))
                 .children(indent_rails(row, colors))
-                .child(activity_mark(
-                    status_state(session, migrating),
-                    self.activity_frame,
-                    colors,
-                ))
+                .child(activity_mark(activity_state, self.activity_frame, colors))
                 .child(
                     div()
                         .min_w(px(0.0))
@@ -2769,12 +2771,8 @@ impl Sidebar {
             .children(indent_rails(row, colors))
             // Activity shares the project's icon column. Leaf rows reserve
             // no empty disclosure column; only parents get a trailing fold.
-            // Hover never hides the activity mark or provider identity.
-            .child(activity_mark(
-                status_state(session, migrating),
-                self.activity_frame,
-                colors,
-            ))
+            // Hover keeps activity visible and swaps identity for the close action.
+            .child(activity_mark(activity_state, self.activity_frame, colors))
             .child(
                 HoverMarquee::new(
                     title_marquee_id,
@@ -2786,15 +2784,6 @@ impl Sidebar {
                 )
                 .font_weight(Typo::ROW.weight),
             )
-            .when(unread, |element| {
-                element.child(
-                    div()
-                        .size(px(6.0))
-                        .flex_none()
-                        .rounded_full()
-                        .bg(Ink::FRESH),
-                )
-            })
             .when(row.pinned, |element| element.child(pin_mark(colors)))
             .when(marked, |element| {
                 element.child(StateChip::new("Delegating", Palette::CLAY, colors))
@@ -2834,6 +2823,12 @@ impl Sidebar {
                 element.child(
                     div()
                         .id(format!("close:{}", id.0))
+                        .debug_selector({
+                            let id = id.clone();
+                            move || format!("session-close:{}", id.0)
+                        })
+                        .role(Role::Button)
+                        .aria_label("Close session")
                         .size(px(16.0))
                         .flex_none()
                         .flex()
@@ -2879,7 +2874,18 @@ impl Sidebar {
                 },
             );
 
-        let row = row.child(self.status_glyph(session, migrating, colors, window, cx));
+        let row = row.when(!hovered, |row| {
+            row.child(
+                div()
+                    .debug_selector({
+                        let id = id.clone();
+                        move || format!("session-agent-logo:{}", id.0)
+                    })
+                    .size(px(16.0))
+                    .flex_none()
+                    .child(self.status_glyph(session, migrating, colors, window, cx)),
+            )
+        });
 
         // A selection fill arrives on ROW_SELECT instead of switching between
         // two frames. Hover deliberately does not animate: hover should feel
@@ -5266,6 +5272,37 @@ impl Sidebar {
         )
     }
 
+    /// One bounded 8 Hz wake for the whole sidebar, only while working marks
+    /// are shown. A one-shot is rearmed by painting, so an unmounted sidebar
+    /// cannot keep a background loop alive.
+    fn schedule_activity_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let animate = self.working_row_rendered
+            && (self.ui.visible || self.peek_open)
+            && self.settings_nav.is_none()
+            && window.is_window_active()
+            && !cx.reduce_motion();
+        if !animate {
+            self.activity_tick = None;
+        } else if self.activity_tick.is_none() {
+            self.activity_tick = Some(cx.spawn_in(window, async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(125))
+                    .await;
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.activity_tick = None;
+                    if (this.ui.visible || this.peek_open)
+                        && this.settings_nav.is_none()
+                        && window.is_window_active()
+                        && !cx.reduce_motion()
+                    {
+                        this.activity_frame = (this.activity_frame + 1) % 8;
+                        cx.notify();
+                    }
+                });
+            }));
+        }
+    }
+
     fn status_glyph(
         &mut self,
         session: &SessionRecord,
@@ -5275,7 +5312,13 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> Entity<StatusGlyph> {
         let kind = ui_agent_kind(session.effective_kind());
-        let state = status_state(session, migrating);
+        // Activity and unread attention have one home: the leading mark.
+        // Keep provider identity neutral instead of repeating the same signal.
+        let state = match status_state(session, migrating) {
+            StatusState::Hibernated => StatusState::Hibernated,
+            StatusState::None => StatusState::None,
+            _ => StatusState::IdleSeen,
+        };
         let entity = self
             .glyphs
             .entry(session.id.clone())
@@ -6391,9 +6434,15 @@ fn reveal_tracked_row(
 
 impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Sample once for all visible rows, only on an already requested paint.
-        // No ticker: a quiet, hidden, or background sidebar adds no wakeups.
-        self.activity_frame = frame_at(wall_clock_millis(), cx.reduce_motion());
+        self.working_row_rendered = false;
+        if cx.reduce_motion() {
+            self.activity_frame = 0;
+        }
+        if self.activity_activation.is_none() {
+            self.activity_activation = Some(cx.observe_window_activation(window, |_, _, cx| {
+                cx.notify();
+            }));
+        }
         // A menu or editor may finish after the pointer has already left.
         // Resume dismissal on that notification without polling while idle.
         self.schedule_peek_close(window, cx);
@@ -6496,6 +6545,8 @@ impl Render for Sidebar {
             list = list.child(self.empty_space_drop_target(colors, cx));
             list
         });
+
+        self.schedule_activity_tick(window, cx);
 
         let mut root = div()
             .id("sidebar")
@@ -7357,6 +7408,16 @@ const fn attention_rank(level: AttentionLevel) -> u8 {
     }
 }
 
+/// Unread inbox entries share the completion mark, while active work and
+/// requests for input retain priority. There is never a second unread dot.
+fn sidebar_activity_state(state: StatusState, unread: bool) -> StatusState {
+    match state {
+        StatusState::Working | StatusState::NeedsInput { .. } => state,
+        _ if unread => StatusState::DoneUnseen,
+        _ => state,
+    }
+}
+
 fn retain_live_glyphs<T>(glyphs: &mut HashMap<SessionId, T>, live: &[SessionId]) {
     let live: std::collections::HashSet<_> = live.iter().collect();
     glyphs.retain(|id, _| live.contains(id));
@@ -7412,8 +7473,8 @@ fn session_title_available_width(
     if pinned {
         available -= 18.0;
     }
-    // The close button and the shortcut hint share the trailing slot and are
-    // near enough the same width that one reservation covers both.
+    // The close button replaces the logo without consuming title space.
+    // Only the keyboard shortcut needs an additional reservation.
     if shortcut_visible {
         available -= 28.0;
     }
@@ -7757,30 +7818,127 @@ mod tests {
         assert_eq!(status_state(session, true), StatusState::Working);
     }
 
-    /// A sidebar full of working Agents is diri's normal resting state, so a
-    /// repeating timer here is a permanent wake, not an occasional one. The
-    /// 10 Hz status ticker this replaces measured ~3% idle CPU and held
-    /// ~240 MB of GPU memory that an idle window returns within seconds of its
-    /// last frame. `diri-ui`'s `status_marks_never_sample_a_clock_while_rendering`
-    /// guards the other half: a glyph that needs repainting to look right.
-    #[test]
-    fn the_sidebar_owns_no_repeating_clock() {
-        let source = [
-            include_str!("view.rs"),
-            include_str!("../session_presentation.rs"),
-        ]
-        .join("\n");
-        let periodic_timer = ["background_executor()", ".timer("].concat();
-        let frame_request = ["request_animation", "_frame("].concat();
-
+    #[gpui::test]
+    fn working_sidebar_repaints_without_pointer_input(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = drag_harness(cx);
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let paints = Rc::new(std::cell::Cell::new(0));
+        let observed = Rc::clone(&paints);
+        let _subscription =
+            cx.update(|_, cx| cx.observe(&sidebar, move |_, _| observed.set(observed.get() + 1)));
+        // No mouse movement or store events: the working mark must advance itself.
+        for _ in 0..3 {
+            let frame = sidebar.read_with(cx, |sidebar, _| sidebar.activity_frame);
+            cx.executor().advance_clock(Duration::from_millis(125));
+            cx.run_until_parked();
+            assert_eq!(
+                sidebar.read_with(cx, |sidebar, _| sidebar.activity_frame),
+                (frame + 1) % 8,
+            );
+        }
         assert!(
-            !source.contains(&periodic_timer),
-            "the sidebar must stay event-driven; a status clock here never stops, because \
-             sessions are usually working"
+            paints.get() > 0,
+            "working animation froze without pointer input"
         );
+    }
+
+    #[gpui::test]
+    fn sidebar_hover_replaces_logo_in_the_same_slot(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = drag_harness(cx);
+        let logo = cx.debug_bounds("session-agent-logo:preview-codex").unwrap();
+        assert!(cx.debug_bounds("session-close:preview-codex").is_none());
+        let row = row_bounds(&sidebar, cx, "preview-codex");
+        cx.simulate_mouse_move(row.center(), None, Modifiers::default());
         assert!(
-            !source.contains(&frame_request),
-            "the sidebar must not drive the compositor from a render pass"
+            cx.debug_bounds("session-agent-logo:preview-codex")
+                .is_none()
+        );
+        assert_eq!(cx.debug_bounds("session-close:preview-codex"), Some(logo));
+        cx.simulate_mouse_move(point(px(500.0), px(320.0)), None, Modifiers::default());
+        assert_eq!(
+            cx.debug_bounds("session-agent-logo:preview-codex"),
+            Some(logo)
+        );
+        assert!(cx.debug_bounds("session-close:preview-codex").is_none());
+    }
+
+    #[gpui::test]
+    fn sidebar_activity_stops_when_hidden_or_motion_is_reduced(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = drag_harness(cx);
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        assert!(sidebar.read_with(cx, |sidebar, _| sidebar.activity_tick.is_some()));
+        sidebar.update(cx, |sidebar, cx| sidebar.conceal(cx));
+        cx.run_until_parked();
+        let frame = sidebar.read_with(cx, |sidebar, _| sidebar.activity_frame);
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(sidebar.activity_tick.is_none());
+            assert_eq!(sidebar.activity_frame, frame);
+        });
+        sidebar.update(cx, |sidebar, cx| sidebar.reveal(cx));
+        cx.run_until_parked();
+        assert!(sidebar.read_with(cx, |sidebar, _| sidebar.activity_tick.is_some()));
+        cx.update(|_, cx| cx.set_reduce_motion(true));
+        cx.run_until_parked();
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(sidebar.activity_tick.is_none());
+            assert_eq!(sidebar.activity_frame, 0);
+        });
+    }
+
+    #[gpui::test]
+    fn idle_sidebar_does_not_schedule_activity_frames(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = drag_harness(cx);
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        sidebar.update(cx, |sidebar, cx| {
+            let mut store = sidebar.store.write().unwrap();
+            let sessions: Vec<_> = store.sessions().values().cloned().collect();
+            for session in sessions {
+                let mut session = (*session).clone();
+                session.status = diri_proto::SessionStatus::Idle;
+                store.upsert_session(session);
+            }
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let frame = sidebar.read_with(cx, |sidebar, _| {
+            assert!(!sidebar.working_row_rendered);
+            assert!(sidebar.activity_tick.is_none());
+            sidebar.activity_frame
+        });
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.activity_frame),
+            frame
+        );
+    }
+
+    #[test]
+    fn unread_attention_uses_one_mark_without_hiding_work_or_input_requests() {
+        assert_eq!(
+            sidebar_activity_state(StatusState::IdleSeen, true),
+            StatusState::DoneUnseen,
+        );
+        assert_eq!(
+            sidebar_activity_state(StatusState::DoneUnseen, true),
+            StatusState::DoneUnseen,
+        );
+        assert_eq!(
+            sidebar_activity_state(StatusState::IdleSeen, false),
+            StatusState::IdleSeen,
+        );
+        assert_eq!(
+            sidebar_activity_state(StatusState::Working, true),
+            StatusState::Working,
+        );
+        assert_eq!(
+            sidebar_activity_state(StatusState::NeedsInput { destructive: true }, true),
+            StatusState::NeedsInput { destructive: true },
         );
     }
 
@@ -8515,6 +8673,9 @@ mod tests {
                 let sidebar = cx.new(|cx| {
                     let mut sidebar = Sidebar::new(None, true, scenario, cx);
                     sidebar.ui.width = width;
+                    if std::env::var_os("DIRI_VISUAL_HOVER").is_some() {
+                        sidebar.ui.hovered_session = Some(SessionId::new("preview-codex"));
+                    }
                     let now = wall_clock_millis();
                     let mut store = sidebar.store.write().expect("preview session store");
                     let sessions: Vec<_> = store
