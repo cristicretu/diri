@@ -254,7 +254,8 @@ pub struct Sidebar {
     /// previously re-locked the store and scanned the full session list N times.
     shortcut_ranks: HashMap<SessionId, usize>,
     focus_handle: FocusHandle,
-    hover_generation: u64,
+    hover_task: Option<Task<()>>,
+    hover_keystrokes: Option<gpui::Subscription>,
     usage: Option<UsageSnapshot>,
     account_context: Option<crate::transcript::ContextUsage>,
     account_context_session: Option<SessionId>,
@@ -376,7 +377,8 @@ impl Sidebar {
             working_row_rendered: false,
             shortcut_ranks: HashMap::new(),
             focus_handle: cx.focus_handle(),
-            hover_generation: 0,
+            hover_task: None,
+            hover_keystrokes: None,
             usage: None,
             account_context: None,
             account_context_session: None,
@@ -497,7 +499,7 @@ impl Sidebar {
                     && !this.peek_interaction_active()
                 {
                     this.peek_open = false;
-                    this.ui.hover_card = None;
+                    this.dismiss_hover_card(cx);
                     if this.focus_handle.contains_focused(window, cx) {
                         cx.emit(SidebarEvent::FocusTerminal);
                     }
@@ -655,6 +657,7 @@ impl Sidebar {
     /// sidebar's own collapse button -- routes through here, so the gate is the
     /// single place the debounce has to hold.
     pub fn toggle(&mut self, cx: &mut Context<Self>) {
+        self.dismiss_hover_card(cx);
         let now = Instant::now();
         if !toggle_has_settled(self.last_toggle.map(|at| now.duration_since(at))) {
             return;
@@ -705,6 +708,7 @@ impl Sidebar {
     /// Hides the sidebar without the toggle's debounce, for the callers that
     /// revealed it themselves and are now putting it back.
     pub fn conceal(&mut self, cx: &mut Context<Self>) {
+        self.dismiss_hover_card(cx);
         if !self.ui.visible {
             return;
         }
@@ -733,7 +737,7 @@ impl Sidebar {
             // A popover anchored to a session row has nothing to point at once
             // the rows are gone.
             self.ui.popover = None;
-            self.ui.hover_card = None;
+            self.dismiss_hover_card(cx);
         }
         self.settings_nav = nav;
         cx.notify();
@@ -1248,6 +1252,30 @@ impl Sidebar {
         }
     }
 
+    /// Cancel both the visible card and the delayed show. Keep row hover intact:
+    /// after an interaction the pointer must leave and re-enter to show it again.
+    fn dismiss_hover_card(&mut self, cx: &mut Context<Self>) {
+        let pending = self.hover_task.take().is_some();
+        let visible = self.ui.hover_card.take().is_some();
+        self.hover_keystrokes = None;
+        if pending || visible {
+            cx.notify();
+        }
+    }
+
+    fn can_show_hover_card(&self, window: &Window) -> bool {
+        (self.ui.visible || self.peek_open)
+            && window.is_window_active()
+            && self.settings_nav.is_none()
+            && !self.peek_interaction_active()
+            && self.ui.hovered_session.as_ref().is_some_and(|id| {
+                self.row_bounds
+                    .borrow()
+                    .get(id)
+                    .is_some_and(|bounds| bounds.contains(&window.mouse_position()))
+            })
+    }
+
     fn schedule_hover_card(
         &mut self,
         id: SessionId,
@@ -1255,35 +1283,82 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.hover_generation = self.hover_generation.wrapping_add(1);
-        let generation = self.hover_generation;
         if !hovering {
-            if self
-                .ui
-                .hover_card
-                .as_ref()
-                .is_some_and(|(card_id, _)| card_id == &id)
-            {
-                self.ui.hover_card = None;
+            // GPUI can deliver the previous row's leave after the next row's enter.
+            if self.ui.hovered_session.as_ref() == Some(&id) {
+                self.ui.hovered_session = None;
+                self.dismiss_hover_card(cx);
             }
-            cx.notify();
             return;
         }
-        cx.spawn_in(window, async move |this, cx| {
+        self.dismiss_hover_card(cx);
+        self.ui.hovered_session = Some(id.clone());
+        if !self.can_show_hover_card(window) {
+            return;
+        }
+        let sidebar = cx.weak_entity();
+        let window_id = window.window_handle();
+        self.hover_keystrokes = Some(cx.intercept_keystrokes(move |_, window, cx| {
+            if window.window_handle() == window_id {
+                let _ = sidebar.update(cx, |this, cx| this.dismiss_hover_card(cx));
+            }
+        }));
+        self.hover_task = Some(cx.spawn_in(window, async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(700))
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
-                if this.hover_generation == generation
-                    && this.ui.hovered_session.as_ref() == Some(&id)
+                this.hover_task = None;
+                if this.ui.hovered_session.as_ref() == Some(&id) && this.can_show_hover_card(window)
                 {
-                    let pointer_y = f32::from(window.mouse_position().y);
-                    this.ui.hover_card = Some((id, pointer_y));
+                    this.ui.hover_card = Some(id);
                     cx.notify();
+                } else {
+                    this.dismiss_hover_card(cx);
                 }
             });
-        })
-        .detach();
+        }));
+    }
+
+    /// Capture dismissal without consuming input, even when the terminal or a
+    /// menu handles the bubble phase. This element has no hitbox of its own.
+    fn hover_card_input(&self, cx: &Context<Self>) -> impl IntoElement {
+        let sidebar = cx.weak_entity();
+        gpui::canvas(
+            |_, _, _| (),
+            move |_, _, window, _| {
+                let moving = sidebar.clone();
+                window.on_mouse_event(move |_: &gpui::MouseMoveEvent, phase, window, cx| {
+                    if phase == gpui::DispatchPhase::Capture {
+                        let _ = moving.update(cx, |this, cx| {
+                            if !this.can_show_hover_card(window) {
+                                this.dismiss_hover_card(cx);
+                            }
+                        });
+                    }
+                });
+                let clicking = sidebar.clone();
+                window.on_mouse_event(move |_: &gpui::MouseDownEvent, phase, _, cx| {
+                    if phase == gpui::DispatchPhase::Capture {
+                        let _ = clicking.update(cx, |this, cx| this.dismiss_hover_card(cx));
+                    }
+                });
+                let scrolling = sidebar.clone();
+                window.on_mouse_event(move |_: &gpui::ScrollWheelEvent, phase, _, cx| {
+                    if phase == gpui::DispatchPhase::Capture {
+                        let _ = scrolling.update(cx, |this, cx| this.dismiss_hover_card(cx));
+                    }
+                });
+                let exiting = sidebar.clone();
+                window.on_mouse_event(move |_: &gpui::MouseExitEvent, phase, _, cx| {
+                    if phase == gpui::DispatchPhase::Capture {
+                        let _ = exiting.update(cx, |this, cx| this.dismiss_hover_card(cx));
+                    }
+                });
+            },
+        )
+        .absolute()
+        .size_full()
     }
 
     fn new_agent_row(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
@@ -1973,7 +2048,7 @@ impl Sidebar {
                         move |this, event: &gpui::MouseDownEvent, window, cx| {
                             cx.stop_propagation();
                             this.commit_rename();
-                            this.ui.hover_card = None;
+                            this.dismiss_hover_card(cx);
                             this.focus_handle.focus(window, cx);
                             this.ui.popover = Some(Popover::ProjectActions {
                                 id: id.clone(),
@@ -2645,7 +2720,6 @@ impl Sidebar {
             // click still selects the session and hands focus to its terminal.
             .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
             .on_hover(cx.listener(move |this, is_hovered: &bool, window, cx| {
-                this.ui.hovered_session = is_hovered.then(|| hover_id.clone());
                 this.schedule_hover_card(hover_id.clone(), *is_hovered, window, cx);
                 cx.notify();
             }))
@@ -2686,7 +2760,7 @@ impl Sidebar {
                 cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
                     cx.stop_propagation();
                     this.commit_rename();
-                    this.ui.hover_card = None;
+                    this.dismiss_hover_card(cx);
                     this.ui.focus_cursor = Some(rename_session.id.clone());
                     this.focus_handle.focus(window, cx);
                     this.ui.popover = Some(Popover::SessionActions {
@@ -3146,7 +3220,7 @@ impl Sidebar {
                     move |this, event: &gpui::MouseDownEvent, window, cx| {
                         cx.stop_propagation();
                         this.commit_rename();
-                        this.ui.hover_card = None;
+                        this.dismiss_hover_card(cx);
                         this.ui.focus_cursor = Some(id.clone());
                         this.focus_handle.focus(window, cx);
                         this.ui.popover = Some(Popover::SessionActions {
@@ -5188,19 +5262,15 @@ impl Sidebar {
     }
 
     fn hover_card(&self, colors: SemanticColors) -> Option<AnyElement> {
-        let (id, pointer_y) = self.ui.hover_card.as_ref()?;
+        let id = self.ui.hover_card.as_ref()?;
+        let row = *self.row_bounds.borrow().get(id)?;
         let (session, project) = {
             let store = self.store.read().expect("session store lock poisoned");
             let session = store.sessions().get(id)?.clone();
             let project = store.projects().get(&session.project_id).cloned();
             (session, project)
         };
-        let mut details = div()
-            .flex()
-            .flex_col()
-            .gap(px(7.0))
-            .px(px(12.0))
-            .py(px(9.0));
+        let mut details = div().flex().flex_col().gap(px(5.0));
         if session.hibernation.is_some() {
             details = details.child(hover_detail("moon.fill", "Sleeping", false, colors));
         }
@@ -5235,35 +5305,35 @@ impl Sidebar {
             ));
         }
         let card = div()
-            .w(px(260.0))
-            .rounded(px(Radius::CARD))
-            .bg(colors.background.alpha(0.98))
+            .debug_selector(|| "session-hover-card".into())
+            .w(px(280.0))
+            .p(px(10.0))
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .rounded(px(Radius::ROW))
+            .bg(colors.floating_surface())
             .border_1()
             .border_color(colors.primary.alpha(0.08))
-            .shadow_lg()
+            .shadow_sm()
             .overflow_hidden()
             .child(
                 div()
-                    .px(px(12.0))
-                    .pt(px(10.0))
-                    .pb(px(8.0))
-                    .text_size(px(Typo::ROW_EMPHASIZED.size))
+                    .line_clamp(3)
+                    .line_height(px(18.0))
+                    .text_size(px(Typo::META.size))
                     .font_weight(Typo::ROW_EMPHASIZED.weight)
                     .text_color(colors.primary)
                     .child(display_title(&session)),
             )
-            .child(HairlineDivider::horizontal(colors))
             .child(details);
         // Deferred + anchored so the card floats over the terminal instead of
-        // being clipped at the sidebar edge. No mouse listeners: like the
-        // Swift click-through panel, it never eats the first click on a row.
+        // being clipped at the sidebar edge. Anchor to the row, not the pointer,
+        // and leave a gap so the card never covers the row's hover target.
         Some(
             deferred(
                 anchored()
-                    .position(point(
-                        px((self.ui.width - 4.0).max(0.0)),
-                        px(pointer_y - 14.0),
-                    ))
+                    .position(point(row.right() + px(8.0), row.top()))
                     .snap_to_window_with_margin(px(8.0))
                     .child(card),
             )
@@ -6438,13 +6508,17 @@ impl Render for Sidebar {
             self.activity_frame = 0;
         }
         if self.activity_activation.is_none() {
-            self.activity_activation = Some(cx.observe_window_activation(window, |_, _, cx| {
+            self.activity_activation = Some(cx.observe_window_activation(window, |this, _, cx| {
+                this.dismiss_hover_card(cx);
                 cx.notify();
             }));
         }
         // A menu or editor may finish after the pointer has already left.
         // Resume dismissal on that notification without polling while idle.
         self.schedule_peek_close(window, cx);
+        if !self.can_show_hover_card(window) {
+            self.dismiss_hover_card(cx);
+        }
         let colors = self.colors();
         let (
             projection,
@@ -6494,6 +6568,15 @@ impl Render for Sidebar {
         self.row_bounds
             .borrow_mut()
             .retain(|id, _| visible_set.contains(id));
+        if self
+            .ui
+            .hovered_session
+            .as_ref()
+            .is_some_and(|id| !visible_set.contains(id))
+        {
+            self.dismiss_hover_card(cx);
+            self.ui.hovered_session = None;
+        }
         self.shortcut_ranks.clear();
         let session_count = visible.len();
         for (index, id) in visible.iter().enumerate() {
@@ -6639,6 +6722,9 @@ impl Render for Sidebar {
         }
         if let Some(card) = self.hover_card(colors) {
             root = root.child(card);
+        }
+        if self.hover_task.is_some() || self.ui.hover_card.is_some() {
+            root = root.child(self.hover_card_input(cx));
         }
         if let Some(proposal) = self.ui.pending_sibling.clone() {
             root = root.child(self.sibling_confirmation(proposal, colors, cx));
@@ -7542,12 +7628,15 @@ mod tests {
 
     impl Render for SidebarPopoverHarness {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div().size_full().child(
-                div()
-                    .h_full()
-                    .w(px(self.sidebar.read(_cx).width()))
-                    .child(self.sidebar.clone()),
-            )
+            div()
+                .size_full()
+                .bg(self.sidebar.read(_cx).colors().background)
+                .child(
+                    div()
+                        .h_full()
+                        .w(px(self.sidebar.read(_cx).width()))
+                        .child(self.sidebar.clone()),
+                )
         }
     }
 
@@ -8021,6 +8110,148 @@ mod tests {
             assert!(!sidebar.is_peeking());
             assert!(!sidebar.store.read().unwrap().preferences().sidebar_visible);
         });
+    }
+
+    #[gpui::test]
+    fn session_preview_dismisses_on_click_and_stays_dismissed(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let row = row_bounds(&sidebar, cx, "preview-claude");
+        cx.simulate_mouse_move(row.center(), None, Modifiers::default());
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert!(sidebar.read_with(cx, |sidebar, _| sidebar.ui.hover_card.is_some()));
+
+        cx.simulate_click(row.center(), Modifiers::default());
+        assert!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.ui.hover_card.is_none()),
+            "the session preview must disappear when its row is clicked"
+        );
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert!(sidebar.read_with(cx, |sidebar, _| sidebar.ui.hover_card.is_none()));
+    }
+
+    #[gpui::test]
+    fn session_preview_cancels_pending_and_visible_cards(cx: &mut TestAppContext) {
+        for visible in [false, true] {
+            for action in [
+                "click", "outside", "scroll", "escape", "blur", "hide", "menu", "leave", "remove",
+            ] {
+                let (view, cx) = cx.add_window_view(|_, cx| {
+                    let sidebar =
+                        cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+                    SidebarPopoverHarness { sidebar }
+                });
+                let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+                cx.update(|window, _| window.activate_window());
+                cx.run_until_parked();
+                let row = row_bounds(&sidebar, cx, "preview-claude");
+                cx.simulate_mouse_move(row.center(), None, Modifiers::default());
+                cx.run_until_parked();
+                assert!(sidebar.read_with(cx, |sidebar, _| sidebar.hover_task.is_some()));
+                if visible {
+                    cx.executor().advance_clock(Duration::from_secs(1));
+                    cx.run_until_parked();
+                    assert!(cx.debug_bounds("session-hover-card").is_some(), "{action}");
+                }
+                match action {
+                    "click" => cx.simulate_click(row.center(), Modifiers::default()),
+                    "outside" => {
+                        cx.simulate_click(point(px(500.0), px(320.0)), Modifiers::default())
+                    }
+                    "scroll" => cx.simulate_event(gpui::ScrollWheelEvent {
+                        position: point(px(500.0), px(320.0)),
+                        delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(-30.0))),
+                        modifiers: Modifiers::default(),
+                        touch_phase: gpui::TouchPhase::Moved,
+                    }),
+                    // No sidebar focus: Escape must work while a terminal owns focus too.
+                    "escape" => cx.simulate_keystrokes("escape"),
+                    "blur" => cx.deactivate_window(),
+                    "hide" => sidebar.update(cx, |sidebar, cx| sidebar.conceal(cx)),
+                    "menu" => sidebar.update(cx, |sidebar, cx| {
+                        sidebar.ui.popover = Some(Popover::SidebarLayout);
+                        cx.notify();
+                    }),
+                    "leave" => cx.simulate_mouse_move(
+                        point(px(500.0), px(320.0)),
+                        None,
+                        Modifiers::default(),
+                    ),
+                    "remove" => sidebar.update(cx, |sidebar, cx| {
+                        sidebar
+                            .store
+                            .write()
+                            .unwrap()
+                            .remove_session_record(&SessionId::new("preview-claude"));
+                        cx.notify();
+                    }),
+                    _ => unreachable!(),
+                }
+                cx.run_until_parked();
+                assert!(
+                    cx.debug_bounds("session-hover-card").is_none(),
+                    "{action}, visible={visible}"
+                );
+                cx.executor().advance_clock(Duration::from_secs(1));
+                cx.run_until_parked();
+                sidebar.read_with(cx, |sidebar, _| {
+                    assert!(
+                        sidebar.ui.hover_card.is_none(),
+                        "{action}, visible={visible}"
+                    );
+                    assert!(sidebar.hover_task.is_none(), "{action}, visible={visible}");
+                });
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn session_preview_tracks_the_latest_row_and_ignores_stale_leave(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let first = row_bounds(&sidebar, cx, "preview-claude");
+        let second = row_bounds(&sidebar, cx, "preview-codex");
+        cx.simulate_mouse_move(first.center(), None, Modifiers::default());
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(500));
+        cx.simulate_mouse_move(second.center(), None, Modifiers::default());
+        sidebar.update_in(cx, |sidebar, window, cx| {
+            sidebar.schedule_hover_card(SessionId::new("preview-claude"), false, window, cx);
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(250));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("session-hover-card").is_none());
+        cx.executor().advance_clock(Duration::from_millis(450));
+        cx.run_until_parked();
+        sidebar.read_with(cx, |sidebar, _| {
+            assert_eq!(sidebar.ui.hover_card, Some(SessionId::new("preview-codex")));
+        });
+        let card = cx.debug_bounds("session-hover-card").unwrap();
+        assert!(
+            card.left() > second.right(),
+            "preview must not overlap its row"
+        );
+        assert_eq!(card.top(), second.top());
+        cx.simulate_mouse_move(
+            point(second.center().x + px(3.0), second.center().y),
+            None,
+            Modifiers::default(),
+        );
+        assert_eq!(cx.debug_bounds("session-hover-card"), Some(card));
     }
 
     #[gpui::test]
@@ -8624,6 +8855,64 @@ mod tests {
         screenshot
             .save(output)
             .expect("save account-menu screenshot");
+    }
+
+    /// Capture the real hover path with long content in either appearance.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes a deterministic session-preview screenshot artifact"]
+    fn render_session_hover_card_screenshot() {
+        let output =
+            PathBuf::from(std::env::var_os("DIRI_VISUAL_OUTPUT").expect("set DIRI_VISUAL_OUTPUT"));
+        let light = std::env::var_os("DIRI_VISUAL_LIGHT").is_some();
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| crate::fonts::init(cx));
+        let window = cx.open_window(size(px(760.0), px(500.0)), |_, cx| {
+            let sidebar = cx.new(|cx| {
+                let sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                let mut store = sidebar.store.write().unwrap();
+                store.update_preferences(|prefs| {
+                    prefs.terminal_theme = if light { "dirijor-light" } else { "dirijor-dark" }.into();
+                }).unwrap();
+                let mut session = (**store.sessions().get(&SessionId::new("preview-claude")).unwrap()).clone();
+                session.title = "Make the session preview behave like a normal tooltip, even while switching between conversations with very long titles".into();
+                session.git_branch = Some("fix/sidebar-preview-dismissal-and-long-branch-name".into());
+                store.upsert_session(session);
+                drop(store);
+                sidebar
+            });
+            cx.new(|_| SidebarPopoverHarness { sidebar })
+        }).unwrap();
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, _| window.activate_window())
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window.into(), |view, window, cx| {
+            let view = view.downcast::<SidebarPopoverHarness>().unwrap();
+            let sidebar = view.read(cx).sidebar.clone();
+            let row = sidebar.read(cx).row_bounds.borrow()[&SessionId::new("preview-claude")];
+            window.simulate_mouse_move(row.center(), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        cx.update_window(window.into(), |view, window, cx| {
+            let view = view.downcast::<SidebarPopoverHarness>().unwrap();
+            assert!(view.read(cx).sidebar.read(cx).ui.hover_card.is_some());
+            window.refresh();
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.capture_screenshot(window.into())
+            .unwrap()
+            .save(output)
+            .unwrap();
     }
 
     /// Produces the sidebar layout variants used for material and hierarchy
