@@ -2504,7 +2504,6 @@ impl Sidebar {
             non_persistent,
             ended_chip,
             host_label.as_deref(),
-            hibernated,
             row.pinned,
             !hovered && focused && shortcut.is_some(),
         ) - if loading { 60.0 } else { 0.0 }
@@ -2807,9 +2806,6 @@ impl Sidebar {
             })
             .when(loading, |element| {
                 element.child(StateChip::new("Loading", colors.secondary, colors))
-            })
-            .when(hibernated, |element| {
-                element.child(StateChip::new("Sleeping", colors.secondary, colors))
             })
             .when_some(host_label, |element, host| {
                 // Remote-host chip: this session's agent runs on another machine.
@@ -5205,6 +5201,9 @@ impl Sidebar {
             .gap(px(7.0))
             .px(px(12.0))
             .py(px(9.0));
+        if session.hibernation.is_some() {
+            details = details.child(hover_detail("moon.fill", "Sleeping", false, colors));
+        }
         if let Some(project) = &project {
             details = details.child(hover_detail("folder.fill", &project.name, false, colors));
         }
@@ -7448,7 +7447,6 @@ fn session_title_available_width(
     non_persistent: bool,
     ended: bool,
     host_label: Option<&str>,
-    hibernated: bool,
     pinned: bool,
     shortcut_visible: bool,
 ) -> f32 {
@@ -7466,9 +7464,6 @@ fn session_title_available_width(
     }
     if let Some(host) = host_label {
         available -= host.chars().count() as f32 * 6.2 + 18.0;
-    }
-    if hibernated {
-        available -= 68.0;
     }
     if pinned {
         available -= 18.0;
@@ -7614,7 +7609,7 @@ mod tests {
     #[test]
     fn title_overflow_threshold_accounts_for_sidebar_badges() {
         let plain =
-            session_title_available_width(248.0, 0, false, false, false, None, false, false, false);
+            session_title_available_width(248.0, 0, false, false, false, None, false, false);
         let remote = session_title_available_width(
             248.0,
             0,
@@ -7623,13 +7618,12 @@ mod tests {
             false,
             Some("mini-b"),
             false,
-            false,
             true,
         );
         assert!(plain > remote);
         // A nested row pays for every indent column it sits behind.
         let nested =
-            session_title_available_width(248.0, 2, false, false, false, None, false, false, false);
+            session_title_available_width(248.0, 2, false, false, false, None, false, false);
         assert!(plain > nested);
         assert_eq!(
             session_title_available_width(
@@ -7639,7 +7633,6 @@ mod tests {
                 true,
                 true,
                 Some("very-long-host"),
-                true,
                 true,
                 true,
             ),

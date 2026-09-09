@@ -5,7 +5,7 @@ use diri_proto::{
     AgentKind as ProtoAgentKind, AttentionLevel as ProtoAttentionLevel, SessionRecord,
 };
 use diri_ui::{AgentKind, Icon, IconName, Ink, SemanticColors, StatusState};
-use gpui::{AnyElement, IntoElement, div, prelude::*, px, svg};
+use gpui::{AnyElement, IntoElement, Role, div, prelude::*, px, svg};
 
 const FRAMES: [&str; 8] = [
     "icons/working-0.svg",
@@ -61,9 +61,13 @@ pub(crate) fn activity_mark(
         StatusState::DoneUnseen => slot
             .child(Icon::new(IconName::Check, 14.0, Ink::FRESH))
             .into_any_element(),
-        StatusState::IdleSeen | StatusState::None | StatusState::Hibernated => {
-            slot.into_any_element()
-        }
+        StatusState::Hibernated => slot
+            .id("sleeping-status")
+            .role(Role::Image)
+            .aria_label("Sleeping")
+            .child(Icon::new(IconName::Moon, 13.0, colors.tertiary))
+            .into_any_element(),
+        StatusState::IdleSeen | StatusState::None => slot.into_any_element(),
     }
 }
 
