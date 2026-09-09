@@ -71,7 +71,11 @@ impl Control {
 }
 
 fn start_server(temp: &Path) -> Arc<ControlServer> {
-    let registry = Arc::new(Mutex::new(Registry::new(engine(), temp.join("state.json"))));
+    start_server_with_engine(temp, engine())
+}
+
+fn start_server_with_engine(temp: &Path, engine: Arc<ManifestEngine>) -> Arc<ControlServer> {
+    let registry = Arc::new(Mutex::new(Registry::new(engine, temp.join("state.json"))));
     let server = Arc::new(
         ControlServer::new(Arc::clone(&registry), temp.join("daemon.sock"))
             .with_logs_dir(temp.join("logs")),
@@ -89,6 +93,84 @@ fn start_server(temp: &Path) -> Arc<ControlServer> {
         });
     }
     server
+}
+
+/// Keep Codex's real screen rules, with a deterministic child instead of an
+/// installed Agent or account. The submitted prompt remains in the transcript.
+#[test]
+fn codex_prompt_retained_in_transcript_is_acknowledged_once() {
+    assert_codex_delivery(false);
+}
+
+#[test]
+fn codex_banner_repaint_does_not_acknowledge_a_swallowed_enter() {
+    assert_codex_delivery(true);
+}
+
+fn assert_codex_delivery(swallow_first_enter: bool) {
+    let temp = tempfile::tempdir().expect("temp");
+    let manifests = temp.path().join("manifests");
+    std::fs::create_dir(&manifests).unwrap();
+    let mut manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(diri_engine::detect::bundled_manifest_dir().join("codex.json")).unwrap(),
+    )
+    .unwrap();
+    manifest["agent"].as_object_mut().unwrap().remove("binary");
+    std::fs::write(
+        manifests.join("codex.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let (engine, _) = ManifestEngine::load_dir(&manifests).unwrap();
+    let server = start_server_with_engine(temp.path(), Arc::new(engine));
+    let mut control = Control::connect(&server);
+    let prompt = "testing";
+    let framed_len = prompt.len() + 12;
+    let accepted = temp.path().join("accepted");
+    let extra_enter = temp.path().join("extra-enter");
+    let swallow = if swallow_first_enter {
+        // Unrelated banner output while the actual composer keeps the paste.
+        // A changed screen alone must not acknowledge this first Enter.
+        "printf '\\033[s\\033[1;40HUpdated banner\\033[u'; dd of=/dev/null bs=1 count=1 2>/dev/null"
+    } else {
+        ""
+    };
+    let script = format!(
+        r#"stty -echo -icanon min 1 time 0
+printf '\033[?2004h› '
+dd of=/dev/null bs=1 count={framed_len} 2>/dev/null
+printf '{prompt}'
+dd of=/dev/null bs=1 count=1 2>/dev/null
+{swallow}
+printf accepted > '{}'
+printf '\r\033[2K› {prompt}\r\nAnswer received.\r\n› '
+dd of=/dev/null bs=1 count=1 2>/dev/null
+printf duplicate > '{}'
+exec cat"#,
+        accepted.display(),
+        extra_enter.display()
+    );
+    let result = control.try_request(
+        "session.spawn",
+        json!({
+            "kind": { "codex": {} }, "cwd": "/tmp",
+            "argv": ["/bin/sh", "-c", script], "initialPrompt": prompt,
+        }),
+    );
+    let id = match &result {
+        Ok(value) => value["id"].as_str().unwrap().to_owned(),
+        Err(error) => error.message.split_whitespace().nth(1).unwrap().to_owned(),
+    };
+    control.request("session.kill", json!({ "sessionID": id }));
+    assert!(
+        accepted.exists(),
+        "fixture must receive the submitted prompt"
+    );
+    assert!(result.is_ok(), "sent prompt reported as failed: {result:?}");
+    assert!(
+        !extra_enter.exists(),
+        "accepted prompt received another Enter"
+    );
 }
 
 fn spawn(control: &mut Control, script: &str, shell: &str, prompt: &str) -> String {

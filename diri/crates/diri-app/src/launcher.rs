@@ -1590,16 +1590,18 @@ impl LauncherOverlay {
                 self.close(cx);
             }
             Err(error) => {
-                let message = format!(
-                    "Prompt delivery was not confirmed: {error}. Your draft is saved in the composer. Check the session before trying again."
-                );
-                self.fallback_notice = Some(message.clone());
+                let message = if error.contains("initial_prompt_delivery_failed") {
+                    "Session opened. Check its terminal before sending again. Your draft is saved."
+                } else {
+                    "Couldn’t confirm delivery. Check the session before sending again. Your draft is saved."
+                };
+                self.fallback_notice = Some(message.into());
                 self.services
                     .store
                     .store
                     .write()
                     .expect("store lock")
-                    .report_prompt_delivery_failure(message);
+                    .report_prompt_delivery_failure(error);
                 self.services.store.publish_local_change();
                 cx.notify();
             }
@@ -4214,7 +4216,7 @@ mod tests {
                     .fallback_notice
                     .as_deref()
                     .unwrap()
-                    .contains("test delivery failed")
+                    .contains("Your draft is saved")
             );
             assert!(launcher.submit(cx));
             let retry = launcher.delivery.pending.unwrap();

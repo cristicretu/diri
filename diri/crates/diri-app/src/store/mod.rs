@@ -178,6 +178,8 @@ impl RetryAction {
     }
 }
 
+pub(crate) const PROMPT_DELIVERY_FAILURE_TITLE: &str = "Check prompt delivery";
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActionFailure {
     pub title: String,
@@ -1016,7 +1018,7 @@ impl SessionStore {
         // Never offer a blind retry: the Agent may have accepted input before
         // the connection failed. The composer retains the reviewable draft.
         self.last_action_failure = Some(ActionFailure {
-            title: "Prompt delivery not confirmed".into(),
+            title: PROMPT_DELIVERY_FAILURE_TITLE.into(),
             detail,
             retrying: false,
             retry: None,

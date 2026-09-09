@@ -3124,47 +3124,63 @@ impl RootView {
             .id("recovery-notice")
             .debug_selector(|| "RECOVERY_NOTICE".to_owned())
             .absolute()
-            .top_0()
-            .left_0()
-            .right_0()
-            .h(px(42.0))
-            .px(px(14.0))
+            .bottom(px(16.0))
+            .right(px(16.0))
+            .w(px(380.0))
+            .max_w(gpui::relative(0.9))
+            .p(px(14.0))
             .flex()
-            .items_center()
-            .gap(px(9.0))
-            .bg(colors.sidebar_surface())
-            .border_b_1()
-            .border_color(colors.primary.alpha(0.08))
+            .flex_col()
+            .gap(px(8.0))
+            .rounded(px(Radius::PANEL))
+            .bg(colors.floating_surface())
+            .border_1()
+            .border_color(colors.floating_stroke())
+            .shadow_lg()
+            .occlude()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .text_color(colors.primary)
-            .child(div().size(px(7.0)).flex_none().rounded_full().bg(accent))
             .child(
                 div()
-                    .min_w(px(0.0))
-                    .flex_1()
+                    .pr(px(24.0))
                     .flex()
-                    .items_baseline()
-                    .gap(px(7.0))
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(sf_symbol(
+                        if matches!(
+                            notice.kind,
+                            RecoveryKind::ActionFailed | RecoveryKind::ManualAttention
+                        ) {
+                            "exclamationmark.triangle"
+                        } else {
+                            "arrow.triangle.2.circlepath"
+                        },
+                        13.0,
+                        accent,
+                    ))
                     .child(
                         div()
-                            .flex_none()
+                            .flex_1()
+                            .min_w(px(0.0))
                             .text_size(px(Typo::ROW_EMPHASIZED.size))
                             .font_weight(Typo::ROW_EMPHASIZED.weight)
                             .child(notice.title),
-                    )
-                    .child(
-                        div()
-                            .min_w(px(0.0))
-                            .text_ellipsis()
-                            .text_size(px(Typo::META.size))
-                            .text_color(colors.secondary)
-                            .child(bounded_notice_body(&notice.body)),
                     ),
+            )
+            .child(
+                div()
+                    .text_size(px(Typo::META.size))
+                    .line_height(px(18.0))
+                    .text_color(colors.secondary)
+                    .child(bounded_notice_body(&notice.body)),
             );
+        let mut actions = div().flex().items_center().gap(px(8.0));
         if let Some((action, label)) = notice.primary_action {
             let store = Arc::clone(&self.services.store.store);
-            bar = bar.child(
+            actions = actions.child(
                 div()
                     .id("recovery-primary-action")
+                    .self_start()
                     .h(px(27.0))
                     .px(px(9.0))
                     .flex_none()
@@ -3187,18 +3203,52 @@ impl RootView {
                     }),
             );
         }
+        let detail = notice.detail;
+        let has_actions = notice.primary_action.is_some() || detail.is_some();
+        if let Some(detail) = detail {
+            actions = actions.child(
+                div()
+                    .id("copy-recovery-details")
+                    .debug_selector(|| "copy-recovery-details".into())
+                    .h(px(28.0))
+                    .px(px(7.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(Radius::ROW))
+                    .cursor_pointer()
+                    .text_size(px(Typo::META.size))
+                    .text_color(colors.secondary)
+                    .hover(move |button| button.bg(colors.primary.alpha(0.06)))
+                    .child("Copy details")
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(detail.clone()));
+                        cx.stop_propagation();
+                    }),
+            );
+        }
+        if has_actions {
+            bar = bar.child(actions);
+        }
         if notice.dismissible {
             let store = Arc::clone(&self.services.store.store);
             bar = bar.child(
                 div()
                     .id("dismiss-recovery-notice")
-                    .size(px(24.0))
+                    .debug_selector(|| "dismiss-recovery-notice".into())
+                    .absolute()
+                    .top(px(9.0))
+                    .right(px(9.0))
+                    .size(px(28.0))
                     .flex_none()
                     .flex()
                     .items_center()
                     .justify_center()
                     .rounded(px(Radius::CHIP))
                     .cursor_pointer()
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| crate::palette_chrome::PaletteTooltip("Dismiss".into(), colors))
+                            .into()
+                    })
                     .hover(move |button| button.bg(colors.primary.alpha(0.06)))
                     .child(sf_symbol_weighted(
                         "xmark",
@@ -3234,6 +3284,7 @@ impl Render for RootView {
             self.open_notification(session, event, window, cx);
         }
         let colors = self.colors();
+        let launcher_open = self.launcher.read(cx).is_open();
         let recovery_notice = if self.preview {
             None
         } else {
@@ -3243,9 +3294,15 @@ impl Render for RootView {
                 .store
                 .read()
                 .expect("session store lock poisoned");
-            RecoveryNotice::resolve(store.daemon_state(), store.action_failure())
+            // The composer owns its inline failure while open. Once closed,
+            // the same failure remains available here without duplicate copy.
+            RecoveryNotice::resolve(
+                store.daemon_state(),
+                store.action_failure().filter(|failure| {
+                    !launcher_open || failure.title != crate::store::PROMPT_DELIVERY_FAILURE_TITLE
+                }),
+            )
         };
-        let recovery_height = if recovery_notice.is_some() { 42.0 } else { 0.0 };
         #[cfg(target_os = "macos")]
         self.notifier.set_badge(
             self.services
@@ -3256,7 +3313,6 @@ impl Render for RootView {
                 .notifications()
                 .unread_count(),
         );
-        let launcher_open = self.launcher.read(cx).is_open();
         let notification_surface_visible = !launcher_open
             && !self.notification_panel_open
             && !self
@@ -3324,11 +3380,8 @@ impl Render for RootView {
         sidebar_surface.a += (1.0 - sidebar_surface.a) * self.sidebar_float;
         let peek_pointer_tracking = self.sidebar.read(cx).is_peeking().then(|| {
             let region = gpui::Bounds::new(
-                gpui::point(px(0.0), px(recovery_height)),
-                gpui::size(
-                    px(sidebar_width + inset),
-                    window.viewport_size().height - px(recovery_height),
-                ),
+                gpui::point(px(0.0), px(0.0)),
+                gpui::size(px(sidebar_width + inset), window.viewport_size().height),
             );
             // Capture moves even when a terminal or menu handles the bubble
             // phase. The gap and panel are one hover target, including the
@@ -3368,7 +3421,7 @@ impl Render for RootView {
             .id("sidebar-frame")
             .absolute()
             .left_0()
-            .top(px(recovery_height))
+            .top_0()
             .bottom_0()
             // Include the inset in the hover region so the edge and card
             // are one continuous target, including during docking.
@@ -3425,7 +3478,6 @@ impl Render for RootView {
             .key_context(key_context)
             .relative()
             .size_full()
-            .pt(px(recovery_height))
             // Real SF Pro (registered from SFNS.ttf at startup) for every UI
             // surface; the terminal grid sets its own mono font.
             .font_family(crate::fonts::ui_family())
@@ -3439,9 +3491,8 @@ impl Render for RootView {
                 MouseButton::Left,
                 cx.listener(move |this, event: &gpui::MouseDownEvent, _, _| {
                     let pointer_y = f32::from(event.position.y);
-                    this.titlebar_drag_armed = cfg!(target_os = "macos")
-                        && pointer_y >= recovery_height
-                        && pointer_y < recovery_height + Metrics::TITLE_BAR;
+                    this.titlebar_drag_armed =
+                        cfg!(target_os = "macos") && (0.0..Metrics::TITLE_BAR).contains(&pointer_y);
                 }),
             )
             .on_mouse_move(
@@ -3674,7 +3725,7 @@ impl Render for RootView {
                     .debug_selector(|| "sidebar-peek-edge".into())
                     .absolute()
                     .left_0()
-                    .top(px(recovery_height + 36.0))
+                    .top(px(36.0))
                     .bottom_0()
                     .w(px(SIDEBAR_PEEK_TRIGGER_WIDTH))
                     .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
@@ -3738,11 +3789,7 @@ impl Render for RootView {
             root = root.child(self.recovery_notice(notice, colors));
         }
         if let Some(build) = &self.services.dev_build {
-            root = root.child(dev_build_marker(
-                build.marker_label(),
-                colors,
-                recovery_height + 10.0,
-            ));
+            root = root.child(dev_build_marker(build.marker_label(), colors, 10.0));
         }
         root
     }
@@ -4224,6 +4271,97 @@ mod tests {
             assert_eq!(root.sidebar_float, 0.0);
             assert_eq!(root.sidebar_seam, root.sidebar.read(cx).width());
         });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn recovery_notice_keeps_titlebar_clear_and_supports_copy_and_dismiss(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let services = test_services();
+        let store = services.store.clone();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            let mut root = RootView::new(services, true, PreviewScenario::Typical, window, cx);
+            root.preview = false;
+            root.services
+                .store
+                .store
+                .write()
+                .unwrap()
+                .report_prompt_delivery_failure("diagnostic detail".into());
+            root
+        });
+        for width in [640.0, 1000.0] {
+            cx.simulate_resize(size(px(width), px(700.0)));
+            cx.run_until_parked();
+            let card = cx.debug_bounds("RECOVERY_NOTICE").unwrap();
+            assert!(card.top() > px(Metrics::TITLE_BAR));
+            assert!(card.right() <= px(width - 16.0));
+            assert!(card.bottom() <= px(684.0));
+            let button = cx.debug_bounds("copy-recovery-details").unwrap();
+            assert!(card.contains(&button.center()));
+            cx.simulate_click(button.center(), Modifiers::default());
+            assert_eq!(
+                cx.read_from_clipboard().unwrap().text().as_deref(),
+                Some("diagnostic detail")
+            );
+        }
+        let dismiss = cx.debug_bounds("dismiss-recovery-notice").unwrap().center();
+        cx.simulate_click(dismiss, Modifiers::default());
+        assert!(store.store.read().unwrap().action_failure().is_none());
+        root.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("copy-recovery-details").is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes a visual preview to DIRI_RECOVERY_SCREENSHOT"]
+    fn render_recovery_notice_screenshot() {
+        use gpui::{AppContext as _, HeadlessAppContext};
+        let output = std::env::var("DIRI_RECOVERY_SCREENSHOT").expect("output path");
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let services = test_services();
+        let width = if std::env::var_os("DIRI_RECOVERY_NARROW").is_some() {
+            640.0
+        } else {
+            1000.0
+        };
+        let window = cx.open_window(size(px(width), px(700.0)), |window, cx| {
+            cx.new(|cx| {
+                let mut root = RootView::new(services.clone(), true, PreviewScenario::Typical, window, cx);
+                root.preview = false;
+                let mut store = services.store.store.write().unwrap();
+                store.update_preferences(|prefs| {
+                    prefs.terminal_theme = if std::env::var_os("DIRI_RECOVERY_LIGHT").is_some() {
+                        "dirijor-light".into()
+                    } else {
+                        "dirijor-dark".into()
+                    };
+                }).unwrap();
+                store.report_prompt_delivery_failure("initial_prompt_delivery_failed: session s_123 was created, but initial prompt delivery was not confirmed: the agent never confirmed that it submitted".into());
+                drop(store);
+                services.store.publish_local_change();
+                root
+            })
+        }).expect("preview window");
+        cx.run_until_parked();
+        cx.capture_screenshot(window.into())
+            .expect("screenshot")
+            .save(output)
+            .expect("save");
+        cx.update_window(window.into(), |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
     }
 
     #[cfg(target_os = "macos")]

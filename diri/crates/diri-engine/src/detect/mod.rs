@@ -18,6 +18,7 @@ mod regions;
 
 pub use manifest::{Manifest, ManifestState, RegionKind, StatusModel};
 pub use redact::redact;
+pub(crate) use regions::prompt_box_body;
 
 use std::collections::HashMap;
 use std::path::Path;

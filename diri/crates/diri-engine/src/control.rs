@@ -3541,6 +3541,9 @@ fn submit_typed_prompt(
             )
         })
         .ok_or(InitialPromptFailure::SessionEnded)?;
+        let composer_had_prompt = probe.is_some_and(|probe| {
+            composer_text(&before).is_some_and(|composer| composer.contains(probe))
+        });
         with_session(registry, session_id, |session| session.submit_input())
             .ok_or(InitialPromptFailure::SessionEnded)?
             .map_err(|_| InitialPromptFailure::InputFailed)?;
@@ -3553,6 +3556,13 @@ fn submit_typed_prompt(
                 None => return Err(InitialPromptFailure::SessionEnded),
                 Some(now)
                     if probe.is_some_and(|probe| !now.contains(probe))
+                        // Codex keeps the submitted text in the transcript.
+                        // Require a composer that held our probe before Enter
+                        // and is still identifiable but no longer holds it.
+                        // An absent composer during a repaint proves nothing.
+                        || (composer_had_prompt && probe.is_some_and(|probe| {
+                            composer_text(&now).is_some_and(|composer| !composer.contains(probe))
+                        }))
                         // Plain CLI tools have no Agent status signals. A new
                         // response after Enter is their available confirmation;
                         // the pasted echo alone must never count as one.
@@ -3566,6 +3576,12 @@ fn submit_typed_prompt(
         }
     }
     Err(InitialPromptFailure::SubmissionUnconfirmed)
+}
+
+fn composer_text(screen: &str) -> Option<String> {
+    let lines: Vec<String> = screen.lines().map(str::to_owned).collect();
+    let body = crate::detect::prompt_box_body(&lines);
+    (!body.is_empty()).then(|| body.join("\n"))
 }
 
 /// Only fresh Agent evidence can acknowledge submission. A running process
