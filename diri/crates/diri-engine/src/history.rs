@@ -809,24 +809,61 @@ pub(crate) fn profile_codex_title(
     home: &Path,
     thread_id: &str,
 ) -> Option<String> {
-    if !safe_agent_id(thread_id) {
-        return None;
-    }
-    let codex_home = profile.map_or_else(|| home.join(".codex"), |p| PathBuf::from(&p.config_home));
-    let database = codex_database_titles(&codex_home, thread_id).unwrap_or_default();
-    database
-        .explicit
-        .or_else(|| codex_indexed_title(&codex_home, thread_id))
-        .or(database.fallback)
+    profile_codex_titles(profile, home, &[thread_id]).remove(thread_id)
 }
 
-fn codex_database_titles(codex_home: &Path, thread_id: &str) -> Option<CodexTitleCandidates> {
-    for path in newest_codex_state_files(codex_home) {
-        if let Some(titles) = codex_database_title(&path, thread_id) {
-            return Some(titles);
+/// One refresh pass over one profile. Connections, schema discovery and the
+/// bounded index read are shared by the requested sessions, then dropped. No
+/// persistent database connection or title cache can hide a provider rename.
+pub(crate) fn profile_codex_titles(
+    profile: Option<&diri_proto::AgentAccountProfile>,
+    home: &Path,
+    thread_ids: &[&str],
+) -> HashMap<String, String> {
+    let thread_ids: HashSet<_> = thread_ids
+        .iter()
+        .copied()
+        .filter(|id| safe_agent_id(id))
+        .collect();
+    if thread_ids.is_empty() {
+        return HashMap::new();
+    }
+    let codex_home = profile.map_or_else(|| home.join(".codex"), |p| PathBuf::from(&p.config_home));
+    let mut database = HashMap::new();
+    for path in newest_codex_state_files(&codex_home) {
+        let missing: Vec<_> = thread_ids
+            .iter()
+            .copied()
+            .filter(|id| !database.contains_key(*id))
+            .collect();
+        if missing.is_empty() {
+            break;
+        }
+        if let Some(titles) = codex_database_titles(&path, &missing) {
+            database.extend(titles);
         }
     }
-    None
+    let indexed_ids = thread_ids
+        .iter()
+        .copied()
+        .filter(|id| {
+            database
+                .get(*id)
+                .is_none_or(|title| title.explicit.is_none())
+        })
+        .collect();
+    let mut indexed = codex_indexed_titles(&codex_home, &indexed_ids);
+    thread_ids
+        .into_iter()
+        .filter_map(|id| {
+            let candidate = database.remove(id).unwrap_or_default();
+            candidate
+                .explicit
+                .or_else(|| indexed.remove(id))
+                .or(candidate.fallback)
+                .map(|title| (id.to_owned(), title))
+        })
+        .collect()
 }
 
 fn newest_codex_state_files(codex_home: &Path) -> Vec<PathBuf> {
@@ -855,7 +892,10 @@ fn newest_codex_state_files(codex_home: &Path) -> Vec<PathBuf> {
     paths
 }
 
-fn codex_database_title(path: &Path, thread_id: &str) -> Option<CodexTitleCandidates> {
+fn codex_database_titles(
+    path: &Path,
+    thread_ids: &[&str],
+) -> Option<HashMap<String, CodexTitleCandidates>> {
     let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -886,23 +926,40 @@ fn codex_database_title(path: &Path, thread_id: &str) -> Option<CodexTitleCandid
         field("title"),
         field("first_user_message"),
     );
-    connection
-        .query_row(&query, params![thread_id], |row| {
-            let explicit = row.get::<_, Option<String>>(0)?;
-            let generated = row.get::<_, Option<String>>(1)?;
-            let first_prompt = row.get::<_, Option<String>>(2)?;
-            Ok(CodexTitleCandidates {
-                explicit: explicit.and_then(clean_provider_title),
-                fallback: generated
-                    .and_then(clean_provider_title)
-                    .or_else(|| first_prompt.and_then(clean_provider_title)),
+    let mut statement = connection.prepare(&query).ok()?;
+    let mut titles = HashMap::new();
+    for thread_id in thread_ids {
+        if let Ok(Some(candidate)) = statement
+            .query_row(params![thread_id], |row| {
+                let explicit = row.get::<_, Option<String>>(0)?;
+                let generated = row.get::<_, Option<String>>(1)?;
+                let first_prompt = row.get::<_, Option<String>>(2)?;
+                Ok(CodexTitleCandidates {
+                    explicit: explicit.and_then(clean_provider_title),
+                    fallback: generated
+                        .and_then(clean_provider_title)
+                        .or_else(|| first_prompt.and_then(clean_provider_title)),
+                })
             })
-        })
-        .optional()
-        .ok()?
+            .optional()
+        {
+            titles.insert((*thread_id).to_owned(), candidate);
+        }
+    }
+    Some(titles)
 }
 
-fn codex_indexed_title(codex_home: &Path, thread_id: &str) -> Option<String> {
+fn codex_indexed_titles(codex_home: &Path, thread_ids: &HashSet<&str>) -> HashMap<String, String> {
+    if thread_ids.is_empty() {
+        return HashMap::new();
+    }
+    read_codex_indexed_titles(codex_home, thread_ids).unwrap_or_default()
+}
+
+fn read_codex_indexed_titles(
+    codex_home: &Path,
+    thread_ids: &HashSet<&str>,
+) -> Option<HashMap<String, String>> {
     let mut handle = open_regular_readonly(&codex_home.join("session_index.jsonl"))?;
     let end = handle.seek(SeekFrom::End(0)).ok()?;
     let start = end.saturating_sub(CODEX_INDEX_BYTES as u64);
@@ -917,25 +974,26 @@ fn codex_indexed_title(codex_home: &Path, thread_id: &str) -> Option<String> {
     if start > 0 {
         lines.next();
     }
-    let mut newest = None;
+    let mut newest = HashMap::new();
     for line in lines {
-        if !line.contains(thread_id) {
+        if !thread_ids.iter().any(|id| line.contains(id)) {
             continue;
         }
         let Ok(object) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if object.get("id").and_then(Value::as_str) == Some(thread_id)
+        if let Some(id) = object.get("id").and_then(Value::as_str)
+            && thread_ids.contains(id)
             && let Some(title) = object
                 .get("thread_name")
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .and_then(clean_provider_title)
         {
-            newest = Some(title);
+            newest.insert(id.to_owned(), title);
         }
     }
-    newest
+    Some(newest)
 }
 
 fn clean_provider_title(title: String) -> Option<String> {
@@ -1307,6 +1365,76 @@ mod tests {
         assert_eq!(
             codex_title(home.path(), "thread-9").as_deref(),
             Some("Generated database title")
+        );
+    }
+
+    #[test]
+    fn codex_title_batch_preserves_priority_and_observes_renames() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join(".codex");
+        std::fs::create_dir_all(&config).unwrap();
+        let db = Connection::open(config.join("state_1.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT, title TEXT, first_user_message TEXT);
+            INSERT INTO threads VALUES ('explicit', 'My rename', 'Generated', NULL),
+            ('indexed', NULL, 'Generated', NULL), ('fallback', NULL, NULL, 'First prompt');").unwrap();
+        write(
+            &config.join("session_index.jsonl"),
+            "{\"id\":\"explicit\",\"thread_name\":\"Index loses\"}\n{\"id\":\"indexed\",\"thread_name\":\"Old index\"}\n{\"id\":\"indexed\",\"thread_name\":\"Latest index\"}\n",
+        );
+        let ids = ["explicit", "indexed", "fallback", "absent", "../invalid"];
+        let result = profile_codex_titles(None, home.path(), &ids);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result["explicit"], "My rename");
+        assert_eq!(result["indexed"], "Latest index");
+        assert_eq!(result["fallback"], "First prompt");
+        db.execute(
+            "UPDATE threads SET name = 'New rename' WHERE id = 'explicit'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            profile_codex_titles(None, home.path(), &ids)["explicit"],
+            "New rename"
+        );
+    }
+
+    #[test]
+    #[ignore = "timing comparison; run with --release --ignored --nocapture"]
+    fn codex_title_batch_timing() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join(".codex");
+        std::fs::create_dir_all(&config).unwrap();
+        let db = Connection::open(config.join("state_1.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT, title TEXT, first_user_message TEXT);").unwrap();
+        let ids: Vec<_> = (0..20).map(|n| format!("thread-{n}")).collect();
+        for id in &ids {
+            db.execute(
+                "INSERT INTO threads VALUES (?1, 'Fixture title', NULL, NULL)",
+                params![id],
+            )
+            .unwrap();
+        }
+        let borrowed: Vec<_> = ids.iter().map(String::as_str).collect();
+        let mut single = Vec::new();
+        let mut batch = Vec::new();
+        for _ in 0..21 {
+            let start = std::time::Instant::now();
+            for id in &ids {
+                assert!(profile_codex_title(None, home.path(), id).is_some());
+            }
+            single.push(start.elapsed());
+            let start = std::time::Instant::now();
+            assert_eq!(
+                profile_codex_titles(None, home.path(), &borrowed).len(),
+                ids.len()
+            );
+            batch.push(start.elapsed());
+        }
+        single.sort_unstable();
+        batch.sort_unstable();
+        eprintln!(
+            "20 Codex titles: individual median {:?}, batch median {:?}",
+            single[10], batch[10]
         );
     }
 

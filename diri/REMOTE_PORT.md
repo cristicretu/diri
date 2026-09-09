@@ -517,6 +517,19 @@ faster socket acknowledgement for slower end-to-grid delivery. The local
 daemon's held-output follower is raised only while the session is recently
 attached or receiving input, then returns to default QoS.
 
+Local output-stream negotiation also respects surviving Holder versions. A
+completed rejection is remembered for the attached session lifetime, and the
+Engine keeps following its durable log without probing on every wakeup.
+Transport failures and interrupted supported streams remain retryable. This
+changes no local or remote wire format and never replaces a live Holder.
+
+The local Holder's `OutputLog` writer retains no raw-output ring: no Holder
+operation reads it. Durable file output, offsets, rotation and exit markers
+remain unchanged; the separate bounded live-output queue still serves attached
+Engines. The Engine and remote Helper retain their existing history/output
+budgets. Existing Holder processes keep their original allocations until their
+sessions end naturally.
+
 ## Controller lease
 
 The completed baseline permits exactly one live attach/controller. A new attach

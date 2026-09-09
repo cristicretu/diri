@@ -2739,6 +2739,11 @@ fn pump_held(
     // and the loop just goes back to reading the file from the offset it had
     // reached.
     let mut live: Option<crate::holder::HolderOutputStream> = None;
+    // An adopted Holder keeps the same executable for this session's life.
+    // Remember a completed negative negotiation; otherwise every log wakeup
+    // reconnects just to receive the same unsupported-operation response.
+    // Transport errors remain retryable, as do interrupted supported streams.
+    let mut output_stream_supported = true;
     // Reused across passes: a fresh allocation per pass would charge every
     // byte of output an allocation it does not need.
     let mut live_run: Vec<u8> = Vec::new();
@@ -2758,20 +2763,24 @@ fn pump_held(
         // holder begins filling a queue this loop is not yet reading, and once
         // that queue is full the pump waits on it for every chunk. Waiting for
         // a drained log keeps the handover to a few frames.
-        if live.is_none() && drained {
-            if let Ok(Some(stream)) = client.open_output_stream() {
-                // A drained log does not mean the holder is where the log
-                // ends: writes are queued, so it can be megabytes further on.
-                // Subscribing across that distance is the worst case — the
-                // holder fills a queue this loop cannot read until the file
-                // catches up, then drops it for being full, and both ends
-                // repeat. Take the subscription only when the gap is small
-                // enough to close immediately, and otherwise keep tailing and
-                // try again the next time the log runs dry.
-                live_from = stream.start_offset();
-                if live_from.saturating_sub(offset) <= LIVE_HANDOVER_GAP {
-                    live = Some(stream);
+        if output_stream_supported && live.is_none() && drained {
+            match client.open_output_stream() {
+                Ok(Some(stream)) => {
+                    // A drained log does not mean the holder is where the log
+                    // ends: writes are queued, so it can be megabytes further on.
+                    // Subscribing across that distance is the worst case — the
+                    // holder fills a queue this loop cannot read until the file
+                    // catches up, then drops it for being full, and both ends
+                    // repeat. Take the subscription only when the gap is small
+                    // enough to close immediately, and otherwise keep tailing and
+                    // try again the next time the log runs dry.
+                    live_from = stream.start_offset();
+                    if live_from.saturating_sub(offset) <= LIVE_HANDOVER_GAP {
+                        live = Some(stream);
+                    }
                 }
+                Ok(None) => output_stream_supported = false,
+                Err(_) => {}
             }
             drained = false;
         }

@@ -1,5 +1,88 @@
 # diri performance record
 
+## Live-session CPU and local Holder memory (2026-09-09)
+
+The reported Activity Monitor usage was reproduced on the installed 0.6.5
+app: app CPU commonly 8–15% (one 28% interval), Engine 3–6%, local Holder
+1–2.5%; physical footprints approximately 419–424, 186–191 and 126 MB.
+The workload included 20 local and 56 remote sessions and mouse interaction;
+these are not idle acceptance measurements. App stack samples primarily showed
+rendering, and about 266 MB of its memory map was graphics-related. This pass
+does not claim to resolve or reduce that graphics allocation.
+
+Three Engine/local Holder changes address directly observed waste:
+
+- A local Holder that predates output streaming is negotiated once per adopted
+  session. Previously each quiet tick/log wake reconnected and elicited the
+  same rejection. The socket/Session regression first failed with 12
+  negotiations across ten real log updates, then passed with one. A second
+  test drops the first connection and verifies transport failures still retry.
+  No protocol, input-delivery, or session-survival behavior changes.
+- The local Holder opens its append-only log with no in-memory raw-output ring.
+  No Holder operation reads that ring; the Engine reads the durable file and
+  the independent bounded live queue serves output subscribers. A regression
+  verifies zero retained ring bytes and exact tail replay after file rotation.
+  Terminal scrollback and Engine/Remote Helper output budgets are unchanged.
+- Codex title refreshes batch sessions by their exact account-profile directory.
+  Each pass opens each candidate database, inspects its schema, and reads the
+  bounded title index once for the group. Statements are reused within the pass
+  and all resources then drop. There is no persistent title cache or change to
+  the one-second cadence. Tests preserve explicit/index/generated title priority,
+  immediate observation of renames, missing fields, and account isolation.
+
+Measurements use Apple Silicon/macOS 26.5.2 and the repository's current pinned
+Rust 1.97.1 release toolchain. The new `holderbench` launches a private manager
+with 20 real PTYs, drains 5 MiB per session, waits two seconds, then measures the
+manager's physical footprint and five seconds of idle CPU. It excludes the
+Engine, desktop and synthetic producer processes. The same benchmark executable
+was run against the saved pre-change Holder and the changed Holder.
+
+| Measurement | Before / individual reads | After / batched reads |
+| --- | ---: | ---: |
+| Holder physical footprint, median of three runs | 150.1 MiB | 7.3 MiB |
+| Holder footprint range | 146.0–155.1 MiB | 7.1–8.1 MiB |
+| Twenty Codex titles, median of 21 passes | 1.77 ms | 0.19 ms |
+
+The Holder memory reduction is approximately 95%. Idle Holder CPU was noisy
+(0.30–0.37% before and 0.17–0.38% after), so no idle-CPU percentage improvement
+is claimed. The title comparison measures twenty individual calls versus one
+shared pass in the same release build, not total Engine CPU. Launch-plus-drain
+timings also varied; they are not a terminal-throughput comparison.
+
+A separate `fleetbench` comparison releases 20 sessions together to drain
+16 MiB of generated colored log lines each, using the same Engine executable
+and changing only `DIRI_HOLDER_BIN`. All 120 sessions across three paired runs
+finished. Median aggregate throughput was 116.5 MiB/s before and 118.8 MiB/s
+after (ranges 111.5–118.7 and 114.7–124.3 MiB/s). This supports comparable
+throughput while removing the retained ring, not a broad throughput-speedup
+claim. There was no desktop attached during either fixture.
+
+Reproduce from `diri/`:
+
+```sh
+cargo build --release -p diri-engine --bin diri-holder --example holderbench
+DIRI_HOLDER_BIN="$PWD/target/release/diri-holder" target/release/examples/holderbench 20
+cargo test --release -p diri-engine --lib codex_title_batch_timing -- --ignored --nocapture
+cargo test -p diri-engine --test holder_output_compat -- --nocapture
+```
+
+All fixtures use temporary state and terminate only their own sessions. Existing
+production processes were not replaced or stopped. The Engine improvements need
+an Engine update; the memory saving requires an updated Holder process. The
+long-lived local manager cannot pick up new code until its sessions end and it
+restarts, including sessions subsequently launched through that old manager.
+
+Validation in the original development workspace: formatting, Clippy with
+`-D warnings`, all workspace tests
+(1,349 passed, 26 intentionally ignored), release build, and terminal performance
+gate passed. The release gate measured local input-to-grid median 113 µs and
+persistent input p95 16 µs. No UI/rendering behavior or production dependency
+was changed by this pass. That workspace also contained separate terminal/parser
+optimizations; those edits are not included in this CPU/memory PR. The numbers
+above describe that measured workspace, not a newly measured desktop release.
+
+## Historical baseline
+
 Historical measurements in this file are from the T16 release build on Apple
 Silicon, macOS 26.5.2, on 2026-07-23. They predate subsequent UI/font changes
 and are context, not proof that the current release passes. Release acceptance

@@ -1415,6 +1415,34 @@ pub(crate) fn scan_native_title_refreshes(
     let Some(home) = user_home() else {
         return Vec::new();
     };
+    // Group by the exact bound provider directory for this pass. Opening the
+    // same SQLite database and scanning its index once per session made the
+    // one-second title refresh scale with repeated filesystem/schema work.
+    let mut codex_groups: HashMap<Option<&str>, Vec<&NativeTitleRefreshRequest>> = HashMap::new();
+    for request in &requests {
+        if request.kind.id() == AgentKind::CODEX_ID {
+            codex_groups
+                .entry(
+                    request
+                        .account_profile
+                        .as_ref()
+                        .map(|p| p.config_home.as_str()),
+                )
+                .or_default()
+                .push(request);
+        }
+    }
+    let mut codex_titles = HashMap::new();
+    for group in codex_groups.values() {
+        let ids: Vec<_> = group.iter().map(|r| r.agent_session_id.as_str()).collect();
+        let titles =
+            crate::history::profile_codex_titles(group[0].account_profile.as_ref(), &home, &ids);
+        for request in group {
+            if let Some(title) = titles.get(&request.agent_session_id) {
+                codex_titles.insert(request.id.clone(), title.clone());
+            }
+        }
+    }
     requests
         .into_iter()
         .map(|request| {
@@ -1433,11 +1461,7 @@ pub(crate) fn scan_native_title_refreshes(
                         )
                     })
                     .and_then(|mut transcript| transcript.latest_claude_title()),
-                AgentKind::CODEX_ID => crate::history::profile_codex_title(
-                    request.account_profile.as_ref(),
-                    &home,
-                    &request.agent_session_id,
-                ),
+                AgentKind::CODEX_ID => codex_titles.remove(&request.id),
                 _ => None,
             };
             NativeTitleRefreshResult { request, title }
@@ -1754,6 +1778,54 @@ pub(crate) fn session_project_id(root: &str, host: Option<&str>) -> diri_proto::
 mod tests {
     use super::*;
     use diri_proto::{AgentKind, DateMillis, ProjectId, Resumability, SessionId, TitleSource};
+
+    #[test]
+    fn title_refresh_batch_keeps_profiles_with_the_same_thread_id_separate() {
+        let root = tempfile::tempdir().unwrap();
+        let mut requests = Vec::new();
+        for label in ["Personal", "Work"] {
+            let config = root.path().join(label);
+            std::fs::create_dir_all(&config).unwrap();
+            let db = rusqlite::Connection::open(config.join("state_1.sqlite")).unwrap();
+            db.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT);")
+                .unwrap();
+            db.execute("INSERT INTO threads VALUES ('same-thread', ?1)", [label])
+                .unwrap();
+            for index in 0..2 {
+                requests.push(NativeTitleRefreshRequest {
+                    account_profile: Some(diri_proto::AgentAccountProfile {
+                        id: label.into(),
+                        label: label.into(),
+                        agent: "codex".into(),
+                        host: None,
+                        config_home: config.to_string_lossy().into_owned(),
+                        is_default: false,
+                    }),
+                    id: format!("{label}-{index}"),
+                    kind: AgentKind::CODEX,
+                    cwd: "/tmp".into(),
+                    agent_session_id: "same-thread".into(),
+                    transcript_path: None,
+                });
+            }
+        }
+        let refreshed = scan_native_title_refreshes(requests);
+        assert_eq!(refreshed.len(), 4);
+        for result in refreshed {
+            assert_eq!(
+                result.title.as_deref(),
+                Some(
+                    result
+                        .request
+                        .account_profile
+                        .as_ref()
+                        .unwrap()
+                        .label
+                        .as_str()
+                )
+            );
+        }
+    }
 
     fn record(id: &str) -> SessionRecord {
         SessionRecord {

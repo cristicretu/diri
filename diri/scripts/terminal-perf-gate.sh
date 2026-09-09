@@ -15,3 +15,4 @@ cargo bench --locked -p diri-term --bench terminal_renderer -- \
 cargo test --locked --release -p diri-engine --test holder \
     holder_input_latency_is_reported -- --ignored --exact --nocapture
 cargo test --locked --release -p diri-engine --test attach -- --nocapture
+cargo test --locked --release -p diri-engine --test holder_output_compat -- --nocapture
