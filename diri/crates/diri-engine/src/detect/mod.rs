@@ -398,7 +398,7 @@ mod tests {
             .into_iter()
             .map(|id| engine.manifest(id).expect("manifest").rules.len())
             .sum();
-        assert_eq!(rules, 102, "the shipped ruleset lost rules");
+        assert_eq!(rules, 103, "the shipped ruleset lost rules");
 
         for id in engine.ids() {
             let expected_empty = matches!(id, "shell" | "generic" | "pi");
@@ -618,6 +618,82 @@ mod tests {
     }
 
     #[test]
+    fn codex_queued_follow_up_question_keeps_session_working() {
+        use crate::status::{Authority, StatusReducer, StatusSignal};
+        use diri_proto::SessionStatus;
+        use std::time::{Duration, SystemTime};
+
+        let engine = engine();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let mut reducer = StatusReducer::new(Authority::ScreenPrimary, now);
+        for (index, activity) in [
+            "• Working (27m 01s • esc to interrupt)",
+            "─ Worked for 3m 48s ─────────────────",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let snapshot = ScreenSnapshot {
+                lines: vec![
+                    activity.into(),
+                    "• Queued follow-up inputs".into(),
+                    "  ? 1 question".into(),
+                    "    ⌥ + ↑ to answer".into(),
+                    "› Ask Codex to do anything".into(),
+                    "gpt-6-astra high · ~/project".into(),
+                ],
+                osc_title: Some("Action Required | project".into()),
+                content_seq: index as u64 + 1,
+                ..ScreenSnapshot::default()
+            };
+            let observation = engine.evaluate(&snapshot, "codex").expect("queue rule");
+            assert_eq!(observation.state, ManifestState::Working, "{observation:?}");
+            let outcome = reducer.reduce(
+                StatusSignal::Screen(observation),
+                now + Duration::from_secs(index as u64),
+            );
+            assert_eq!(reducer.status(), &SessionStatus::Working);
+            assert!(outcome.needs_input.is_none(), "queued input is nonblocking");
+            assert!(!outcome.turn_completed);
+        }
+    }
+
+    #[test]
+    fn codex_queue_override_requires_a_complete_recent_footer() {
+        let engine = engine();
+        let footer = [
+            "• Queued follow-up inputs",
+            "  ? 1 question",
+            "    ⌥ + ↑ to answer",
+        ];
+        for missing in 0..footer.len() {
+            let snapshot = ScreenSnapshot {
+                lines: footer
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| *index != missing)
+                    .map(|(_, line)| (*line).into())
+                    .collect(),
+                osc_title: Some("Action Required | project".into()),
+                ..ScreenSnapshot::default()
+            };
+            let observation = engine.evaluate(&snapshot, "codex").unwrap();
+            assert_eq!(observation.state, ManifestState::BlockedPermission);
+        }
+
+        let mut snapshot = ScreenSnapshot {
+            lines: footer.iter().map(|line| (*line).into()).collect(),
+            osc_title: Some("Action Required | project".into()),
+            ..ScreenSnapshot::default()
+        };
+        snapshot
+            .lines
+            .extend((0..12).map(|i| format!("Output {i}")));
+        let observation = engine.evaluate(&snapshot, "codex").unwrap();
+        assert_eq!(observation.state, ManifestState::BlockedPermission);
+    }
+
+    #[test]
     fn codex_action_required_redraws_keep_the_same_notification_identity() {
         use crate::status::{Authority, StatusReducer, StatusSignal};
         use std::time::{Duration, SystemTime};
@@ -627,15 +703,12 @@ mod tests {
         let mut reducer = StatusReducer::new(Authority::ScreenPrimary, now);
         let mut first = None;
         for seconds in 0..20 {
-            // A queued async question keeps the title at Action Required even
-            // while Codex runs tools and repaints its elapsed-time footer.
+            // Generic action-required attention must retain its identity
+            // across redraws when no nonblocking queue footer is visible.
             let snapshot = ScreenSnapshot {
                 lines: vec![
                     format!("• Ran tool {seconds}"),
                     format!("• Working (27m {seconds:02}s • esc to interrupt)"),
-                    "• Queued follow-up inputs".into(),
-                    "  ? 1 question".into(),
-                    "    ⌥ + ↑ to answer".into(),
                     "› Ask Codex to do anything".into(),
                 ],
                 osc_title: Some("Action Required | project".into()),
@@ -649,9 +722,9 @@ mod tests {
             );
             assert!(
                 !outcome.turn_completed,
-                "a queued question is not completion"
+                "an action-required title is not completion"
             );
-            let mut detail = outcome.needs_input.expect("pending question attention");
+            let mut detail = outcome.needs_input.expect("action-required attention");
             // Notification identity includes the summary and kind, excluding
             // repaint timestamps. The rest of the detail must stay stable too.
             detail.occurred_at = now.into();
@@ -680,6 +753,9 @@ mod tests {
         ] {
             let snapshot = cursor_snapshot(
                 &[
+                    "• Queued follow-up inputs",
+                    "  ? 2 questions",
+                    "    ⌥ + ↑ to answer",
                     "╭────────────────────╮",
                     "│ Which option?      │",
                     "╰────────────────────╯",

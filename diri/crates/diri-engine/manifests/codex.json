@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "id": "codex",
-  "version": "2026.09.10.1",
+  "version": "2026.09.10.2",
   "statusModel": "full",
   "agent": {
     "id": "codex",
@@ -63,6 +63,27 @@
     }
   },
   "rules": [
+    {
+      "id": "queued-follow-up-question",
+      "state": "working",
+      "priority": 940,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 12,
+      "_notice": "Queued async questions do not block Codex, even when its OSC title says Action Required. Explicit answer and approval dialogs still outrank this footer.",
+      "when": {
+        "all": [
+          {
+            "lineRegex": "^\\s*•\\s+Queued follow-up inputs\\s*$"
+          },
+          {
+            "lineRegex": "^\\s*\\?\\s+[1-9][0-9]* questions?\\s*$"
+          },
+          {
+            "lineRegex": "^\\s*[^\\w\\n]+to answer\\s*$"
+          }
+        ]
+      }
+    },
     {
       "id": "action-required-title",
       "state": "blockedPermission",
