@@ -20,7 +20,10 @@ struct OldHolder {
 impl Drop for OldHolder {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        self.worker.take().unwrap().join().unwrap();
+        let result = self.worker.take().unwrap().join();
+        if !std::thread::panicking() {
+            result.unwrap();
+        }
     }
 }
 
@@ -77,12 +80,7 @@ fn exercise_old_holder(fail_first: bool) {
                     }
                     Err(e) => panic!("accept: {e}"),
                 };
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(1)))
-                    .unwrap();
-                let mut line = String::new();
-                BufReader::new(&mut stream).read_line(&mut line).unwrap();
-                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let request = read_request(&mut stream);
                 let response = match request["op"].as_str().unwrap() {
                     "stat" => serde_json::json!({"ok":true,"stat":stat}),
                     "output-stream" => {
@@ -146,4 +144,32 @@ fn exercise_old_holder(fail_first: bool) {
         if fail_first { 2 } else { 1 },
         "unsupported output streaming must stay on log transport"
     );
+}
+
+fn read_request(stream: &mut std::os::unix::net::UnixStream) -> serde_json::Value {
+    // Keep accept nonblocking for shutdown, but wait for the client's request
+    // on the accepted socket. macOS inherits the listener's nonblocking flag.
+    stream.set_nonblocking(false).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
+#[test]
+fn fake_holder_waits_for_request_after_nonblocking_accept() {
+    use std::os::unix::net::UnixStream;
+    let (mut server, mut client) = UnixStream::pair().unwrap();
+    // macOS can inherit this flag from the nonblocking listener. The client
+    // need not have written its request when accept returns.
+    server.set_nonblocking(true).unwrap();
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(30));
+        let _ = client.write_all(b"{\"op\":\"stat\"}\n");
+    });
+    let request = read_request(&mut server);
+    writer.join().unwrap();
+    assert_eq!(request["op"], "stat");
 }
