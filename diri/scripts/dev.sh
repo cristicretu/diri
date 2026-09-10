@@ -199,5 +199,6 @@ exec env \
     -u DIRIJOR_SESSION_ID \
     -u DIRIJOR_CLI \
     -u NO_COLOR \
+    -u FORCE_COLOR \
     "${launch_environment[@]}" \
     "${contents}/MacOS/diri"

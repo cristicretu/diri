@@ -5,6 +5,7 @@ use tempfile::TempDir;
 
 use super::{
     Clock, ClockReading, ScanPaths, UsageProvider, UsageStore,
+    cursor::{CursorBatch, CursorUsageEvent},
     parser::fnv1a,
     pricing::{match_claude, match_openai},
     timestamp::parse_timestamp,
@@ -116,6 +117,7 @@ fn aggregates_costs_dedupes_claude_and_preserves_provider_totals() {
     assert_eq!(snapshot.codex.month, snapshot.codex.today);
     assert_eq!(snapshot.codex.session.total_tokens(), 0);
 
+    assert_eq!(snapshot.cursor.today.total_tokens(), 0);
     assert_eq!(snapshot.today().total_tokens(), 3_000);
     assert_close(snapshot.today().cost, 0.011_027_5);
     assert_close(snapshot.session_cost.unwrap(), 0.007_927_5);
@@ -442,6 +444,67 @@ fn ordered_pricing_table_and_fnv_hash_match_the_swift_constants() {
 }
 
 #[test]
+fn ingest_cursor_events_dedupes_and_survives_refresh() {
+    let fixture = Fixture::new();
+    let mut store = fixture.store(
+        "2026-07-22T12:00:00Z",
+        "2026-07-22T00:00:00Z",
+        "2026-07-01T00:00:00Z",
+    );
+    let event = CursorUsageEvent {
+        id: "evt-1".into(),
+        timestamp_ms: timestamp("2026-07-22T10:12:00.000Z") * 1_000,
+        model: "composer-1".into(),
+        input_tokens: 100,
+        output_tokens: 20,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        cost: 1.5,
+    };
+    let mut window = store.cursor_fetch_window();
+    window.newest_event_ms = event.timestamp_ms;
+    let usage = store.ingest_cursor_batch(CursorBatch {
+        events: vec![event.clone(), event.clone()],
+        window,
+        complete: true,
+    });
+    assert_eq!(usage.today.input_tokens, 100);
+    assert_eq!(usage.today.output_tokens, 20);
+    assert_close(usage.today.cost, 1.5);
+    assert_eq!(usage.month, usage.today);
+
+    let snapshot = store.refresh();
+    assert_eq!(snapshot.cursor.today.input_tokens, 100);
+    assert_close(snapshot.cursor.today.cost, 1.5);
+    assert_eq!(snapshot.today().total_tokens(), 120);
+    assert_close(snapshot.today().cost, 1.5);
+    assert_eq!(
+        store.cursor_fetch_window().start_ms,
+        event.timestamp_ms - 5 * 60 * 1_000
+    );
+    let report = snapshot.history.report(snapshot.updated_at, 30);
+    assert_eq!(report.models.len(), 1);
+    assert_eq!(report.models[0].model, "composer-1");
+    assert_eq!(report.models[0].provider, 2);
+    assert_close(report.providers[2].tokens.c, 1.5);
+
+    let cache: Value = serde_json::from_slice(&fs::read(&fixture.cache).unwrap()).unwrap();
+    assert_eq!(cache["cursor"]["last_event_ms"], event.timestamp_ms);
+    assert_eq!(
+        cache["cursor"]["seen"]
+            .as_object()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn timestamps_accept_fractional_plain_and_offset_forms() {
     assert_eq!(
         parse_timestamp("2026-07-22T12:34:56.123456Z"),
@@ -702,4 +765,59 @@ fn codex_repeated_usage_is_not_billed_again_after_cache_reload() {
         220,
         "equal-sized real requests must both count when cumulative usage advances"
     );
+}
+
+#[test]
+fn cursor_regression_checkpoint_survives_restart_and_replay() {
+    let fixture = Fixture::new();
+    let make_store = || {
+        fixture.store(
+            "2026-07-22T12:00:00Z",
+            "2026-07-22T00:00:00Z",
+            "2026-07-01T00:00:00Z",
+        )
+    };
+    let mut store = make_store();
+    let original = store.cursor_fetch_window();
+    let newest = CursorUsageEvent {
+        id: "newest".into(),
+        timestamp_ms: timestamp("2026-07-22T11:00:00Z") * 1000,
+        model: "composer".into(),
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        cost: 1.0,
+    };
+    let mut pending = original;
+    pending.next_page = 11;
+    pending.newest_event_ms = newest.timestamp_ms;
+    store.ingest_cursor_batch(CursorBatch {
+        events: vec![newest.clone()],
+        window: pending,
+        complete: false,
+    });
+    // Transcript refresh and process restart must retain the unfinished window,
+    // even though newer events have already been included in the totals.
+    let _ = store.refresh();
+    let mut store = make_store();
+    assert_eq!(store.cursor_fetch_window(), pending);
+    let cache: Value = serde_json::from_slice(&fs::read(&fixture.cache).unwrap()).unwrap();
+    assert_eq!(cache["cursor"]["last_event_ms"], 0);
+    let mut oldest = newest.clone();
+    oldest.id = "oldest".into();
+    oldest.timestamp_ms -= 86_400_000;
+    for _ in 0..2 {
+        store.ingest_cursor_batch(CursorBatch {
+            events: vec![newest.clone(), oldest.clone()],
+            window: pending,
+            complete: true,
+        });
+    }
+    let snapshot = make_store().refresh();
+    assert_close(snapshot.cursor.month.cost, 2.0);
+    assert_eq!(snapshot.cursor.month.input_tokens, 20);
+    let next = store.cursor_fetch_window();
+    assert_eq!(next.next_page, 1);
+    assert_eq!(next.start_ms, newest.timestamp_ms - 300_000);
 }

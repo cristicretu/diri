@@ -54,6 +54,7 @@ pub struct ProviderUsage {
 pub struct UsageSnapshot {
     pub claude: ProviderUsage,
     pub codex: ProviderUsage,
+    pub cursor: ProviderUsage,
     pub session_cost: Option<f64>,
     pub session_started_at: Option<i64>,
     pub session_ends_at: Option<i64>,
@@ -70,6 +71,7 @@ impl UsageSnapshot {
     pub fn today(&self) -> UsageTotals {
         let mut totals = self.claude.today;
         totals += self.codex.today;
+        totals += self.cursor.today;
         totals
     }
 
@@ -77,6 +79,7 @@ impl UsageSnapshot {
     pub fn month(&self) -> UsageTotals {
         let mut totals = self.claude.month;
         totals += self.codex.month;
+        totals += self.cursor.month;
         totals
     }
 }

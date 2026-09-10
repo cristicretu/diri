@@ -2789,7 +2789,17 @@ fn pump_held(
         let from_log;
         let (start, chunk): (u64, &[u8]) = match live.as_mut().filter(|_| streaming) {
             Some(stream) => {
-                match stream.next_run_into(shared.quiet_tick(), LOG_READ_BUDGET, &mut live_run) {
+                // Once a redraw is pending, the next empty read is what
+                // publishes it. Waiting the ordinary idle tick here held an
+                // otherwise complete mouse-driven TUI frame for 100 ms. Keep
+                // draining within the batch deadline, then publish even if
+                // the child produces no more output. Truly idle sessions
+                // retain their existing blocking wait.
+                let timeout = publish_pending.map_or_else(
+                    || shared.quiet_tick(),
+                    |started| OUTPUT_BATCH_CEILING.saturating_sub(started.elapsed()),
+                );
+                match stream.next_run_into(timeout, LOG_READ_BUDGET, &mut live_run) {
                     // Contiguous by construction, and checked anyway: a run
                     // that does not start where the last one ended means
                     // something raced, and the log is the authority to fall

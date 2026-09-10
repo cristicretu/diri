@@ -8,6 +8,10 @@ a plain-language name wherever the glyph alone is ambiguous. Unless a row says
 otherwise, a shortcut works whenever the main window is focused, including while
 you are typing in a terminal.
 
+On Linux, **Ctrl+Shift+D** toggles the inspector and **Ctrl+Alt+D** delegates
+the selected session. These are separate bindings; user-assigned shortcuts
+continue to take precedence.
+
 ## Sessions
 
 | Shortcut | Keys | Action |

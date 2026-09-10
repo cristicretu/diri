@@ -262,22 +262,22 @@ fn registered_shortcuts_route_to_the_focused_palette(cx: &mut TestAppContext) {
         }
     });
     let overlay = view.read_with(cx, |view, _| view.overlay.clone());
-    cx.simulate_keystrokes("cmd-p");
+    cx.simulate_keystrokes(&crate::commands::test_chords("cmd-p"));
     assert_eq!(
         overlay.read_with(cx, |overlay, _| overlay.overlay),
         Some(Overlay::QuickOpen)
     );
-    cx.simulate_keystrokes("cmd-k");
+    cx.simulate_keystrokes(&crate::commands::test_chords("cmd-k"));
     assert_eq!(
         overlay.read_with(cx, |overlay, _| overlay.overlay),
         Some(Overlay::CommandPalette)
     );
-    cx.simulate_keystrokes("cmd-shift-h");
+    cx.simulate_keystrokes(&crate::commands::test_chords("cmd-shift-h"));
     assert_eq!(
         overlay.read_with(cx, |overlay, _| overlay.overlay),
         Some(Overlay::History)
     );
-    cx.simulate_keystrokes("cmd-shift-h");
+    cx.simulate_keystrokes(&crate::commands::test_chords("cmd-shift-h"));
     assert!(!overlay.read_with(cx, |overlay, _| overlay.is_open()));
 }
 

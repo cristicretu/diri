@@ -677,6 +677,12 @@ impl CommandSpec {
             Some(Some(binding)) if Keystroke::parse(binding).is_ok() => Keystroke::parse(binding)
                 .ok()
                 .map(|key| shortcut_label_for_keystroke(&key)),
+            #[cfg(not(target_os = "macos"))]
+            _ if self.id == CommandId::DelegateSelectedSession => {
+                linux_keystroke(self.id, self.keystroke?)
+                    .and_then(|key| Keystroke::parse(&key).ok())
+                    .map(|key| shortcut_label_for_keystroke(&key))
+            }
             _ => self
                 .keystroke
                 .and_then(|binding| platform_keystroke(self.id, binding))
@@ -781,13 +787,42 @@ fn platform_keystroke(_id: CommandId, key: &str) -> Option<String> {
 
 #[cfg(not(target_os = "macos"))]
 fn platform_keystroke(id: CommandId, key: &str) -> Option<String> {
+    linux_keystroke(id, key)
+}
+
+#[cfg(any(test, not(target_os = "macos")))]
+fn linux_keystroke(id: CommandId, key: &str) -> Option<String> {
     if id == CommandId::HideApp {
         return None;
     }
-    let key = key
-        .replace("cmd-ctrl-", "ctrl-shift-")
-        .replace("cmd-", "ctrl-");
-    Some(key)
+    // Cmd-Ctrl-D would otherwise collide with the inspector's Cmd-Shift-D
+    // after translating macOS modifiers to Linux.
+    if id == CommandId::DelegateSelectedSession {
+        return Some("ctrl-alt-d".to_owned());
+    }
+    Some(linux_chord(key))
+}
+
+/// Maps a macOS `cmd-` chord onto the string `simulate_keystrokes` must send
+/// on this OS. GPUI treats `cmd` as Super on Linux; shipped bindings use Ctrl.
+#[cfg(test)]
+pub(crate) fn test_chords(spec: &str) -> String {
+    spec.split_whitespace()
+        .map(|token| {
+            if cfg!(target_os = "macos") {
+                token.to_owned()
+            } else {
+                linux_chord(token)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(any(test, not(target_os = "macos")))]
+fn linux_chord(key: &str) -> String {
+    key.replace("cmd-ctrl-", "ctrl-shift-")
+        .replace("cmd-", "ctrl-")
 }
 
 #[cfg(target_os = "macos")]
@@ -1236,12 +1271,41 @@ mod tests {
     }
 
     #[test]
+    fn linux_default_bindings_do_not_collide() {
+        let mut bindings = HashSet::new();
+        for command in COMMANDS {
+            for key in command
+                .keystroke
+                .into_iter()
+                .chain(command.alternate_keystrokes.iter().copied())
+            {
+                let Some(key) = linux_keystroke(command.id, key) else {
+                    continue;
+                };
+                assert!(
+                    bindings.insert((command.context, key.clone())),
+                    "duplicate Linux binding for {:?}: {key}",
+                    command.id
+                );
+            }
+        }
+    }
+
+    #[test]
     fn shortcut_labels_come_from_the_bound_command() {
         let terminal = command(CommandId::NewTerminal);
         #[cfg(target_os = "macos")]
         assert_eq!(terminal.shortcut_label().as_deref(), Some("⌥⌘T"));
         #[cfg(not(target_os = "macos"))]
         assert_eq!(terminal.shortcut_label().as_deref(), Some("Ctrl+Alt+T"));
+
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(
+            command(CommandId::DelegateSelectedSession)
+                .shortcut_label_for(&ShortcutOverrides::new())
+                .as_deref(),
+            Some("Ctrl+Alt+D")
+        );
 
         let settings = command(CommandId::OpenSettings);
         #[cfg(target_os = "macos")]
@@ -1330,8 +1394,9 @@ mod tests {
     #[test]
     fn conflicts_include_alternate_bindings() {
         let overrides = ShortcutOverrides::new();
-        let conflict = shortcut_conflict(CommandId::OpenLauncher, "cmd-[", &overrides)
-            .expect("navigation alternate should be reserved");
+        let conflict =
+            shortcut_conflict(CommandId::OpenLauncher, &test_chords("cmd-["), &overrides)
+                .expect("navigation alternate should be reserved");
         assert_eq!(conflict.id, CommandId::SelectPreviousSession);
     }
 

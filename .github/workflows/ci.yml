@@ -88,6 +88,11 @@ jobs:
         run: brew install xcodegen
       - name: Check release inputs and generate project
         run: bash scripts/testflight.sh check
+      # macos-15 images usually ship iPhone 17 Pro. Some VMs come up with the
+      # iOS runtime installed but no devices registered, and xcodebuild then
+      # fails with an empty destination list.
+      - name: Prepare iPhone simulator
+        run: python3 scripts/prepare-simulator.py
       # This runner has no signing identity. Device archive below is a build
       # gate only, not proof of signing or TestFlight acceptance.
       - name: Test
@@ -145,6 +150,7 @@ jobs:
           bash scripts/verify-remote-refactor.sh
           bash scripts/test-publish-github-release.sh
           bash scripts/test-publish-homebrew-cask.sh
+          python3 ../ios/scripts/test-prepare-simulator.py
       - name: Check dependency license policy
         run: python3 ../scripts/check-licenses.py
 

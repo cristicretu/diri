@@ -1004,14 +1004,21 @@ mod tests {
             &startup,
             StartupPhase::Complete(StartupOutcome::EngineExpected),
         );
-        assert!(
-            !matches!(
-                &*client.connection_state().borrow(),
-                diri_client::ConnectionState::Disconnected(message)
-                    if message == "not connected to daemon"
-            ),
-            "normal completion must release the reconnect loop"
-        );
+        // Completion means connect() scheduled the reconnect task, not that
+        // the runtime has already polled it. Observe its first state change.
+        let mut connection = client.connection_state();
+        runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                connection.wait_for(|state| {
+                    !matches!(state, diri_client::ConnectionState::Disconnected(message)
+                    if message == "not connected to daemon")
+                }),
+            )
+            .await
+            .expect("normal completion must release the reconnect loop")
+            .expect("connection state stays available");
+        });
     }
 
     #[test]

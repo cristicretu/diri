@@ -1,5 +1,22 @@
 # diri performance record
 
+## Local mouse-driven redraw publication (2026-09-10)
+
+The local Holder output follower waited for its ordinary 100 ms quiet tick
+after parsing a short redraw before notifying attached clients. Claude's
+mouse-driven transcript scrolling exposed this because every wheel response
+can end in silence. The wait now uses the remaining 8 ms output-batch budget
+while publication is pending; an idle follower keeps its existing blocking
+wait. No Holder/protocol changes or additional idle polling are introduced.
+
+`cargo test -p diri-engine --test held_scroll -- --nocapture` exercises an
+SGR wheel frame through the actual local Holder, PTY, Engine and binary
+attachment. A fullscreen fixture redraws once per wheel report, then waits.
+On macOS, the debug-build median of ten measured turns fell from 103.51 ms
+to 9.39 ms. The regression requires a median below 50 ms, leaving scheduler
+headroom while catching the former 100 ms wait. This measures arrival at the
+client socket, not display presentation or Claude's own scrolling speed.
+
 ## Live-session CPU and local Holder memory (2026-09-09)
 
 The reported Activity Monitor usage was reproduced on the installed 0.6.5

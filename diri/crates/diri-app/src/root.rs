@@ -3940,7 +3940,7 @@ mod tests {
             });
         }
 
-        cx.simulate_keystrokes("cmd-w");
+        cx.simulate_keystrokes(&commands::test_chords("cmd-w"));
         assert!(runtime.store.read().unwrap().pending_close().is_some());
         cx.simulate_keystrokes("escape");
         {
@@ -3952,7 +3952,7 @@ mod tests {
             assert_eq!(store.selected_session_id(), Some(&selected));
         }
 
-        cx.simulate_keystrokes("cmd-w");
+        cx.simulate_keystrokes(&commands::test_chords("cmd-w"));
         assert!(runtime.store.read().unwrap().pending_close().is_some());
         cx.simulate_keystrokes("enter");
         let store = runtime.store.read().unwrap();
@@ -4103,7 +4103,7 @@ mod tests {
         });
         cx.simulate_resize(size(px(1000.0), px(700.0)));
         cx.run_until_parked();
-        cx.simulate_keystrokes("cmd-k s e t t i n g s");
+        cx.simulate_keystrokes(&commands::test_chords("cmd-k s e t t i n g s"));
         cx.run_until_parked();
         let position = cx.debug_bounds("palette-row-0").unwrap().center();
         cx.simulate_click(position, Modifiers::default());
@@ -4119,7 +4119,7 @@ mod tests {
         assert_ne!(store.store.read().unwrap().theme_id(), original_theme);
         cx.simulate_keystrokes("escape");
         assert_eq!(store.store.read().unwrap().theme_id(), original_theme);
-        cx.simulate_keystrokes("cmd-k s e t t i n g s enter");
+        cx.simulate_keystrokes(&commands::test_chords("cmd-k s e t t i n g s enter"));
         cx.run_until_parked();
         let position = cx.debug_bounds("palette-row-1").unwrap().center();
         cx.simulate_click(position, Modifiers::default());
@@ -4134,7 +4134,9 @@ mod tests {
             );
             assert!(!root.navigation.as_ref().unwrap().read(cx).is_open());
         });
-        cx.simulate_keystrokes("cmd-k s e t t i n g s enter down enter");
+        cx.simulate_keystrokes(&commands::test_chords(
+            "cmd-k s e t t i n g s enter down enter",
+        ));
         cx.run_until_parked();
         root.read_with(cx, |root, cx| {
             assert!(
@@ -4453,6 +4455,58 @@ mod tests {
     }
 
     #[gpui::test]
+    fn inspector_close_preserves_new_focus(cx: &mut gpui::TestAppContext) {
+        for command in [
+            None,
+            Some(CommandId::FocusSidebar),
+            Some(CommandId::ToggleCommandPalette),
+        ] {
+            let services = test_services();
+            let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+            services.store.store.write().unwrap().hydrate(fixture.list);
+            let (root, cx) = cx.add_window_view(move |window, cx| {
+                RootView::new(services, false, PreviewScenario::Empty, window, cx)
+            });
+            cx.simulate_resize(size(px(1200.0), px(800.0)));
+            root.update(cx, |root, cx| {
+                root.preview = false;
+                root.inspector_open = true;
+                root.inspector_seam = 440.0;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            // Move to another keyboard surface while the inspector closes.
+            let focused = root.update_in(cx, |root, window, cx| {
+                root.run_command(CommandId::ToggleInspector, window, cx);
+                if let Some(command) = command {
+                    root.run_command(command, window, cx);
+                } else {
+                    root.terminal
+                        .as_ref()
+                        .expect("terminal")
+                        .update(cx, |terminal, cx| {
+                            terminal.focus(window, cx);
+                        });
+                }
+                window.focused(cx).expect("new surface has focus")
+            });
+            root.update(cx, |root, cx| {
+                root.inspector_slide = None;
+                root.inspector_seam = 0.0;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            root.update_in(cx, |_, window, cx| {
+                assert_eq!(
+                    window.focused(cx),
+                    Some(focused),
+                    "inspector unmount must preserve the newly focused {command:?}"
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
     fn inspector_shortcut_reopens_after_close_button(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| crate::commands::bind_keys(cx, &Default::default()));
         let services = test_services();
@@ -4479,7 +4533,7 @@ mod tests {
             cx.notify();
         });
         cx.run_until_parked();
-        cx.simulate_keystrokes("cmd-shift-d");
+        cx.simulate_keystrokes(&commands::test_chords("cmd-shift-d"));
         cx.run_until_parked();
         assert!(
             root.read_with(cx, |root, _| root.inspector_open),
@@ -4589,9 +4643,10 @@ mod tests {
             click_count: 1,
             first_mouse: false,
         });
-        assert!(
+        assert_eq!(
             root.read_with(cx, |root, _| root.titlebar_drag_armed),
-            "unhandled titlebar chrome must still move the window"
+            cfg!(target_os = "macos"),
+            "macOS arms window move on empty chrome; Linux leaves it to the compositor"
         );
     }
 

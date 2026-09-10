@@ -32,6 +32,27 @@ impl UsageDetail {
     }
 }
 
+pub(crate) fn record_billed(hours: &mut ModelHours, model: &str, hour: i64, tokens: UsageHourAgg) {
+    hours
+        .entry(
+            if model.is_empty() {
+                "Unknown model"
+            } else {
+                model
+            }
+            .to_owned(),
+        )
+        .or_default()
+        .entry(hour)
+        .or_default()
+        .merge(UsageDetail {
+            tokens,
+            reasoning: 0,
+            priced_tokens: tokens.i + tokens.o + tokens.cr + tokens.cw,
+            read_savings: 0.0,
+        });
+}
+
 pub(crate) fn record(
     hours: &mut ModelHours,
     model: &str,
@@ -67,6 +88,7 @@ pub(crate) fn record(
 pub struct UsageHistory {
     pub(crate) claude: ModelHours,
     pub(crate) codex: ModelHours,
+    pub(crate) cursor: ModelHours,
 }
 
 #[derive(Clone, Debug)]
@@ -79,13 +101,14 @@ pub struct ModelRow {
 #[derive(Clone, Debug, Default)]
 pub struct DayRow {
     pub day: i64,
-    pub providers: [UsageDetail; 2],
+    pub providers: [UsageDetail; 3],
 }
 
 impl DayRow {
     pub fn total(&self) -> UsageDetail {
         let mut detail = self.providers[0];
         detail.merge(self.providers[1]);
+        detail.merge(self.providers[2]);
         detail
     }
 }
@@ -93,7 +116,7 @@ impl DayRow {
 #[derive(Clone, Debug, Default)]
 pub struct UsageReport {
     pub total: UsageDetail,
-    pub providers: [UsageDetail; 2],
+    pub providers: [UsageDetail; 3],
     pub days: Vec<DayRow>,
     pub models: Vec<ModelRow>,
     pub active_days: usize,
@@ -130,7 +153,10 @@ impl UsageHistory {
                 .collect(),
             ..UsageReport::default()
         };
-        for (provider, models) in [&self.claude, &self.codex].into_iter().enumerate() {
+        for (provider, models) in [&self.claude, &self.codex, &self.cursor]
+            .into_iter()
+            .enumerate()
+        {
             for (model, hours) in models {
                 let mut detail = UsageDetail::default();
                 for (&hour, &value) in hours.range(start * 24..=now.div_euclid(3_600)) {

@@ -7201,7 +7201,8 @@ mod tests {
             .debug_bounds("SHORTCUT_BINDING_open-launcher")
             .expect("filtered shortcut binding should render");
         cx.simulate_click(binding.center(), Modifiers::default());
-        cx.simulate_keystrokes("cmd-shift-y");
+        let assigned = crate::commands::test_chords("cmd-shift-y");
+        cx.simulate_keystrokes(&assigned);
         surfaces.read_with(cx, |surfaces, _| {
             assert_eq!(
                 surfaces
@@ -7209,7 +7210,7 @@ mod tests {
                     .shortcut_overrides
                     .get("open-launcher")
                     .and_then(|binding| binding.as_deref()),
-                Some("cmd-shift-y")
+                Some(assigned.as_str())
             );
             assert!(surfaces.shortcut_editor.is_none());
         });
