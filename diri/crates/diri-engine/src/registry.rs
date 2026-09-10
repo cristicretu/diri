@@ -2777,6 +2777,7 @@ mod tests {
     #[test]
     fn completed_turn_time_folds_into_attention_state() {
         let mut session = record("completed");
+        session.kind = AgentKind::CLAUDE_CODE;
         session.status = SessionStatus::Working;
         let view = SessionView {
             id: "completed".to_owned(),

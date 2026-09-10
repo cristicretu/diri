@@ -401,6 +401,28 @@ fn session_record_host_field_is_wire_compatible() {
     typed_round_trip(&record);
 }
 
+#[test]
+fn plain_terminal_liveness_does_not_report_agent_activity() {
+    let sessions: SessionListResult = fixture_ok(FIXTURES[1]);
+    let mut record = sessions.sessions[0].clone();
+    record.kind = diri_proto::AgentKind::SHELL;
+    record.foreground_agent = None;
+    for host in [None, Some("forge".to_owned())] {
+        record.host = host;
+        for status in [
+            SessionStatus::Starting,
+            SessionStatus::Working,
+            SessionStatus::Idle,
+        ] {
+            record.status = status;
+            assert_eq!(record.attention(), diri_proto::AttentionLevel::None);
+        }
+    }
+    record.foreground_agent = Some(diri_proto::AgentKind::CLAUDE_CODE);
+    record.status = SessionStatus::Working;
+    assert_eq!(record.attention(), diri_proto::AttentionLevel::Working);
+}
+
 /// The subscribe filter is a wire contract with a Swift daemon, and the exact
 /// key names are what makes it take effect. A daemon that predates the filter
 /// ignores unknown keys and streams everything, so a mis-spelled key fails

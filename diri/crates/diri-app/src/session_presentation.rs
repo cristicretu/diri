@@ -92,6 +92,13 @@ pub(crate) fn status_state(session: &SessionRecord, migrating: bool) -> StatusSt
     }
 }
 
+pub(crate) fn is_loading(session: &SessionRecord, migrating: bool) -> bool {
+    !migrating
+        && session.hibernation.is_none()
+        && session.effective_kind() != &ProtoAgentKind::SHELL
+        && matches!(session.status, diri_proto::SessionStatus::Starting)
+}
+
 pub(crate) fn ui_agent_kind(kind: &ProtoAgentKind) -> AgentKind {
     // Brand vocabulary, not a protocol type: a manifest agent the client has
     // no hand-drawn mark for falls back to the generic terminal treatment.
@@ -108,6 +115,34 @@ pub(crate) fn ui_agent_kind(kind: &ProtoAgentKind) -> AgentKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_terminal_has_no_loading_or_working_indicator() {
+        use crate::sidebar::{PreviewScenario, SidebarPreviewFixture};
+        use diri_proto::SessionStatus;
+
+        let mut session = SidebarPreviewFixture::make(PreviewScenario::Typical)
+            .list
+            .sessions
+            .into_iter()
+            .find(|session| session.kind == ProtoAgentKind::SHELL)
+            .expect("shell fixture");
+        for status in [
+            SessionStatus::Starting,
+            SessionStatus::Working,
+            SessionStatus::Idle,
+        ] {
+            session.status = status;
+            assert!(!is_loading(&session, false));
+            assert_eq!(status_state(&session, false), StatusState::None);
+        }
+
+        session.foreground_agent = Some(ProtoAgentKind::CLAUDE_CODE);
+        session.status = SessionStatus::Starting;
+        assert!(is_loading(&session, false));
+        assert_eq!(status_state(&session, false), StatusState::Working);
+        assert!(!is_loading(&session, true));
+    }
 
     #[test]
     fn every_activity_frame_is_embedded_in_the_app() {

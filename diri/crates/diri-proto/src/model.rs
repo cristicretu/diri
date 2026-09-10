@@ -825,6 +825,17 @@ impl SessionRecord {
     }
 
     pub fn attention(&self) -> AttentionLevel {
+        // A shell's Starting/Working status describes process liveness, not
+        // an Agent turn. It has no completion event to clear an activity mark.
+        // A detected foreground Agent still uses the normal attention rules.
+        if self.effective_kind() == &AgentKind::SHELL
+            && matches!(
+                self.status,
+                SessionStatus::Starting | SessionStatus::Working | SessionStatus::Idle
+            )
+        {
+            return AttentionLevel::None;
+        }
         match self.status {
             SessionStatus::NeedsInput(_) => AttentionLevel::NeedsInput,
             SessionStatus::Working | SessionStatus::Starting => AttentionLevel::Working,

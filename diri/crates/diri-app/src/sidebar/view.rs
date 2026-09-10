@@ -39,7 +39,7 @@ use crate::switcher::display_title;
 use crate::updates::{UpdateCommand, UpdatePhase, UpdateState};
 use crate::usage::{UsageFormat, UsageSnapshot};
 
-use crate::session_presentation::{activity_mark, status_state, ui_agent_kind};
+use crate::session_presentation::{activity_mark, is_loading, status_state, ui_agent_kind};
 
 use super::{
     CursorMove, DragItem, DropZone, Popover, PreviewScenario, SidebarPreviewFixture,
@@ -2556,9 +2556,7 @@ impl Sidebar {
             && self.ui.focus_cursor.as_ref() == Some(&id);
         let archived = session.is_archived();
         let hibernated = session.hibernation.is_some();
-        let loading = !migrating
-            && !hibernated
-            && matches!(session.status, diri_proto::SessionStatus::Starting);
+        let loading = is_loading(session, migrating);
         let session_is_remote = session.host.is_some();
         let ended = matches!(session.status, diri_proto::SessionStatus::Exited(_)) && !archived;
         let host_label = session.host.as_ref().map(|host| {
@@ -8022,6 +8020,35 @@ mod tests {
             sidebar_activity_state(StatusState::NeedsInput { destructive: true }, true),
             StatusState::NeedsInput { destructive: true },
         );
+    }
+
+    #[gpui::test]
+    fn plain_terminal_sidebar_does_not_schedule_activity_frames(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = drag_harness(cx);
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        for status in [
+            diri_proto::SessionStatus::Starting,
+            diri_proto::SessionStatus::Working,
+        ] {
+            sidebar.update(cx, |sidebar, cx| {
+                let mut store = sidebar.store.write().unwrap();
+                let sessions: Vec<_> = store.sessions().values().cloned().collect();
+                for session in sessions {
+                    let mut session = (*session).clone();
+                    session.kind = ProtoAgentKind::SHELL;
+                    session.foreground_agent = None;
+                    session.status = status.clone();
+                    store.upsert_session(session);
+                }
+                cx.notify();
+            });
+            cx.run_until_parked();
+            sidebar.read_with(cx, |sidebar, _| {
+                assert!(!sidebar.working_row_rendered);
+                assert!(sidebar.activity_tick.is_none());
+            });
+        }
     }
 
     #[test]
