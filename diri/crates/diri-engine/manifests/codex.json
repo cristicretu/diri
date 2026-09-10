@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "id": "codex",
-  "version": "2026.08.15.1",
+  "version": "2026.09.10.1",
   "statusModel": "full",
   "agent": {
     "id": "codex",
@@ -66,7 +66,7 @@
     {
       "id": "action-required-title",
       "state": "blockedPermission",
-      "priority": 1100,
+      "priority": 925,
       "region": "osc_title",
       "when": {
         "contains": "action required"
@@ -75,8 +75,7 @@
         "visible_blocker"
       ],
       "capture": {
-        "region": "bottom_non_empty_lines",
-        "regionLines": 12,
+        "region": "osc_title",
         "maxChars": 400
       }
     },

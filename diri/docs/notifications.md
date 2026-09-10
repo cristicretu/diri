@@ -70,6 +70,11 @@ Kitty queries, icons, encoded payloads and callback actions are ignored.
 Inputs, multipart state and event queues are bounded; repeated identical
 terminal messages within five seconds are coalesced.
 
+Codex's generic `Action Required` title can remain visible while it continues
+working with a queued question. That title produces one stable attention alert;
+changing tool output and elapsed time are not new prompts. A visible question
+or permission prompt takes precedence and supplies its own prompt details.
+
 The same terminal sequences work over Diri's Remote PTY Holder transport while
 the local Engine is connected. The local Engine derives events from live raw
 output; the Holder does not run hooks or store product notifications. Replay

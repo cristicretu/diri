@@ -618,6 +618,86 @@ mod tests {
     }
 
     #[test]
+    fn codex_action_required_redraws_keep_the_same_notification_identity() {
+        use crate::status::{Authority, StatusReducer, StatusSignal};
+        use std::time::{Duration, SystemTime};
+
+        let engine = engine();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let mut reducer = StatusReducer::new(Authority::ScreenPrimary, now);
+        let mut first = None;
+        for seconds in 0..20 {
+            // A queued async question keeps the title at Action Required even
+            // while Codex runs tools and repaints its elapsed-time footer.
+            let snapshot = ScreenSnapshot {
+                lines: vec![
+                    format!("• Ran tool {seconds}"),
+                    format!("• Working (27m {seconds:02}s • esc to interrupt)"),
+                    "• Queued follow-up inputs".into(),
+                    "  ? 1 question".into(),
+                    "    ⌥ + ↑ to answer".into(),
+                    "› Ask Codex to do anything".into(),
+                ],
+                osc_title: Some("Action Required | project".into()),
+                content_seq: seconds + 1,
+                ..ScreenSnapshot::default()
+            };
+            let observation = engine.evaluate(&snapshot, "codex").expect("title rule");
+            let outcome = reducer.reduce(
+                StatusSignal::Screen(observation),
+                now + Duration::from_secs(seconds),
+            );
+            assert!(
+                !outcome.turn_completed,
+                "a queued question is not completion"
+            );
+            let mut detail = outcome.needs_input.expect("pending question attention");
+            // Notification identity includes the summary and kind, excluding
+            // repaint timestamps. The rest of the detail must stay stable too.
+            detail.occurred_at = now.into();
+            if let Some(first) = &first {
+                assert_eq!(&detail, first, "redraw must not create a new alert");
+            } else {
+                first = Some(detail);
+            }
+        }
+    }
+
+    #[test]
+    fn codex_visible_prompts_outrank_the_generic_action_required_title() {
+        let engine = engine();
+        for (footer, expected, rule) in [
+            (
+                "Enter to submit answer",
+                ManifestState::BlockedQuestion,
+                "submit-answer",
+            ),
+            (
+                "Press enter to confirm or esc to cancel",
+                ManifestState::BlockedPermission,
+                "confirm-prompt",
+            ),
+        ] {
+            let snapshot = cursor_snapshot(
+                &[
+                    "╭────────────────────╮",
+                    "│ Which option?      │",
+                    "╰────────────────────╯",
+                    footer,
+                ],
+                Some("Action Required | project"),
+            );
+            let observation = engine.evaluate(&snapshot, "codex").expect("prompt rule");
+            assert_eq!(observation.state, expected);
+            assert_eq!(observation.matched_rule_id, rule);
+            assert_eq!(
+                observation.prompt_excerpt.as_deref().map(str::trim),
+                Some("Which option?")
+            );
+        }
+    }
+
+    #[test]
     fn cursor_osc_title_keeps_tool_turns_working_until_ready() {
         let engine = engine();
         let grep = cursor_snapshot(
