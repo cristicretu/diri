@@ -12,6 +12,7 @@ use gpui::{
     point, px, relative, size,
 };
 
+use crate::blocks::BlockGlyph;
 use crate::buffer::{ApplySummary, ChangedRenderRow, GridBuffer};
 use crate::find::{
     FindSnapshot, FindSpan, NavigationTarget, SearchJob, SearchRequest, SearchResult,
@@ -350,6 +351,7 @@ struct CursorPaint {
     col: u16,
     quad: PaintQuad,
     glyph: Option<ShapedLine>,
+    block: Option<BlockGlyph>,
 }
 
 impl TerminalElement {
@@ -1176,6 +1178,12 @@ impl Element for TerminalElement {
                     self.theme.cursor,
                 ),
                 glyph: self.shape_cursor_glyph(cell, metrics, window),
+                block: self
+                    .theme
+                    .resolve_cell(cell)
+                    .visible
+                    .then(|| BlockGlyph::from_scalar(cell.scalar))
+                    .flatten(),
             })
         } else {
             None
@@ -1330,6 +1338,16 @@ impl Element for TerminalElement {
 
             if let Some(cursor) = prepaint.cursor.take() {
                 window.paint_quad(cursor.quad);
+                if let Some(block) = cursor.block {
+                    for rect in block.rectangles(
+                        bounds.origin,
+                        metrics,
+                        usize::from(cursor.col),
+                        cursor.row,
+                    ) {
+                        window.paint_quad(fill(rect, self.theme.cursor_text));
+                    }
+                }
                 if let Some(glyph) = cursor.glyph {
                     let origin = point(
                         bounds.left() + metrics.x_for_col(cursor.col),
@@ -1425,11 +1443,26 @@ fn append_row_quads(
             && !cell
                 .style
                 .contains(diri_proto::grid::TermStyle::CROSSED_OUT)
+            && BlockGlyph::from_scalar(cell.scalar).is_none()
     });
     if is_plain {
         return;
     }
     append_background_quads(row, row_index, origin, metrics, theme, background_quads);
+    // Keep blocks in the foreground layer, above selection/search backgrounds
+    // and below the cursor. The same path serves cached live rows and history.
+    for (col, cell) in row.iter().enumerate() {
+        if let Some(block) = BlockGlyph::from_scalar(cell.scalar) {
+            let style = theme.resolve_cell(*cell);
+            if style.visible {
+                decoration_quads.extend(
+                    block
+                        .rectangles(origin, metrics, col, row_index)
+                        .map(|bounds| fill(bounds, style.foreground)),
+                );
+            }
+        }
+    }
     append_decoration_quads(row, row_index, origin, metrics, theme, decoration_quads);
 }
 
@@ -1571,7 +1604,7 @@ fn styled_font(base: &Font, style: ResolvedCellStyle) -> Font {
 }
 
 fn render_char(cell: GridCell, visible: bool) -> char {
-    if !visible || cell.scalar == 0 {
+    if !visible || cell.scalar == 0 || BlockGlyph::from_scalar(cell.scalar).is_some() {
         return ' ';
     }
     char::from_u32(cell.scalar)
@@ -1703,6 +1736,101 @@ fn read_lock<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
 fn write_lock<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
     lock.write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod block_tests {
+    use super::*;
+    use diri_proto::grid::{TermColor, TermStyle};
+
+    #[test]
+    fn anara_blocks_fill_their_cell_and_keep_adjacent_text_in_place() {
+        let metrics =
+            CellMetrics::from_measurements(px(8.5), px(12.0), px(5.0), px(0.0), FontId(0));
+        for (ch, top, height) in [('█', 0.0, 17.0), ('▀', 0.0, 8.5), ('▄', 8.5, 8.5)] {
+            let cell = GridCell::new(
+                ch as u32,
+                TermColor::Default,
+                TermColor::DefaultInverted,
+                TermStyle::empty(),
+            );
+            let mut backgrounds = Vec::new();
+            let mut foregrounds = Vec::new();
+            append_row_quads(
+                &[cell],
+                1,
+                point(px(2.0), px(3.0)),
+                metrics,
+                TermTheme::default(),
+                &mut backgrounds,
+                &mut foregrounds,
+            );
+            assert_eq!(
+                foregrounds.len(),
+                1,
+                "{ch} must use cell geometry, not font ink bounds"
+            );
+            assert_eq!(
+                foregrounds[0].bounds,
+                Bounds::new(point(px(2.0), px(20.0 + top)), size(px(8.5), px(height)))
+            );
+            let terminal = TerminalElement::with_buffer(GridBuffer::default());
+            let (text, _) = terminal.row_text_and_runs(&[
+                cell,
+                GridCell::new('A' as u32, cell.fg, cell.bg, cell.style),
+            ]);
+            assert_eq!(
+                text, " A",
+                "the block must reserve one text column without painting a second glyph"
+            );
+        }
+    }
+
+    #[test]
+    fn blocks_preserve_terminal_colors_styles_and_source_text() {
+        let metrics =
+            CellMetrics::from_measurements(px(8.0), px(12.0), px(4.0), px(0.0), FontId(0));
+        for theme in [TermTheme::DIRIJOR_DARK, TermTheme::DIRIJOR_LIGHT] {
+            for style in [
+                TermStyle::empty(),
+                TermStyle::DIM,
+                TermStyle::INVERSE,
+                TermStyle::BOLD | TermStyle::ITALIC,
+                TermStyle::INVISIBLE,
+            ] {
+                let cell = GridCell::new(
+                    '█' as u32,
+                    TermColor::Rgb(120, 150, 180),
+                    TermColor::Rgb(20, 30, 40),
+                    style,
+                );
+                let mut backgrounds = Vec::new();
+                let mut foregrounds = Vec::new();
+                append_row_quads(
+                    &[cell],
+                    0,
+                    Point::default(),
+                    metrics,
+                    theme,
+                    &mut backgrounds,
+                    &mut foregrounds,
+                );
+                assert_eq!(backgrounds.len(), 1);
+                if style.contains(TermStyle::INVISIBLE) {
+                    assert!(foregrounds.is_empty());
+                } else {
+                    assert_eq!(foregrounds.len(), 1);
+                    assert_eq!(
+                        foregrounds[0].background,
+                        fill(foregrounds[0].bounds, theme.resolve_cell(cell).foreground).background
+                    );
+                }
+                let mut buffer = GridBuffer::new(1, 1);
+                buffer.cells[0] = cell;
+                assert_eq!(buffer.row_text_with_columns(0).unwrap().0, "█");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
