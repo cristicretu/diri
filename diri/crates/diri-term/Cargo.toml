@@ -17,3 +17,7 @@ gpui_platform = { workspace = true, features = ["test-support"] }
 [[bench]]
 name = "terminal_renderer"
 harness = false
+
+[[bench]]
+name = "reading_view"
+harness = false

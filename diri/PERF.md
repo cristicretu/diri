@@ -1,5 +1,21 @@
 # diri performance record
 
+## Stable reading during streaming redraws (2026-09-10)
+
+An absolute scroll anchor did not protect text still backed by the live grid.
+The desktop now captures one grid when scrolling away from live, and retains
+already fetched history rows within the existing 512-row cache until returning
+to live. Live damage still updates the authoritative mirror. No new lock,
+worker, parser, or Holder allocation is involved; the extra screen copy exists
+only for a scrolled terminal.
+
+Run `cargo bench -p diri-term --bench reading_view -- --sample-size 10
+--measurement-time 1 --warm-up-time 1` from this workspace. On macOS arm64 in
+release mode, the 160×50 case measured capture/release at 1.41–1.42 µs,
+live full-screen damage at 5.97–6.09 µs, and damage while reading at
+6.01–6.14 µs. Damage timings include cloning each input frame. These are local
+mirror/capture microbenchmarks, not display-presentation or PTY latency gates.
+
 ## Local mouse-driven redraw publication (2026-09-10)
 
 The local Holder output follower waited for its ordinary 100 ms quiet tick

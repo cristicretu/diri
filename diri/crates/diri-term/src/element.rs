@@ -476,8 +476,12 @@ impl TerminalElement {
         // Absolute rows keep a selection attached while the viewport moves,
         // but not when the daemon replaces cells at those rows. Damage is
         // row-granular, so unrelated live output and history remain selected.
-        let live_start_row = mutex_lock(&self.shared.viewport).live_start_row();
+        let mut viewport = mutex_lock(&self.shared.viewport);
+        let live_start_row = viewport.live_start_row();
         let mut buffer = write_lock(&self.buffer);
+        viewport.hold_reading_view(&buffer);
+        let reading_held = viewport.view_offset() > 0;
+        drop(viewport);
         let replaces_grid =
             update.is_full_snapshot || buffer.cols != update.cols || buffer.rows != update.rows;
         let damaged_cols = usize::from(if replaces_grid {
@@ -486,7 +490,7 @@ impl TerminalElement {
             update.cols
         });
         let mut selection = mutex_lock(&self.shared.selection);
-        let selection_overlaps_damage = if selection.range().is_none() {
+        let selection_overlaps_damage = if reading_held || selection.range().is_none() {
             false
         } else if replaces_grid {
             (0..buffer.rows.max(update.rows)).any(|row| {
@@ -534,15 +538,27 @@ impl TerminalElement {
     }
 
     pub fn set_view_offset(&self, offset: i64, visible_rows: usize) -> bool {
-        mutex_lock(&self.shared.viewport).set_view_offset(offset, visible_rows)
+        let mut viewport = mutex_lock(&self.shared.viewport);
+        let changed = viewport.set_view_offset(offset, visible_rows);
+        viewport.hold_reading_view(&read_lock(&self.buffer));
+        if changed && viewport.view_offset() == 0 {
+            mutex_lock(&self.shared.selection).clear();
+        }
+        changed
     }
 
     pub fn scroll_to_live(&self, visible_rows: usize) -> bool {
-        mutex_lock(&self.shared.viewport).scroll_to_live(visible_rows)
+        self.set_view_offset(0, visible_rows)
     }
 
     pub fn scroll_to_absolute(&self, absolute_row: i64, anchor: f32, visible_rows: usize) -> bool {
-        mutex_lock(&self.shared.viewport).scroll_to_absolute(absolute_row, anchor, visible_rows)
+        let mut viewport = mutex_lock(&self.shared.viewport);
+        let changed = viewport.scroll_to_absolute(absolute_row, anchor, visible_rows);
+        viewport.hold_reading_view(&read_lock(&self.buffer));
+        if changed && viewport.view_offset() == 0 {
+            mutex_lock(&self.shared.selection).clear();
+        }
+        changed
     }
 
     /// Updates daemon-owned terminal modes and reports whether entering the
@@ -573,7 +589,12 @@ impl TerminalElement {
         let route = mutex_lock(&self.shared.scroll_router).route(modes, event)?;
         match route {
             WheelRoute::Local { lines } => {
-                mutex_lock(&self.shared.viewport).scroll_by(lines, usize::from(event.visible_rows));
+                let mut viewport = mutex_lock(&self.shared.viewport);
+                let changed = viewport.scroll_by(lines, usize::from(event.visible_rows));
+                viewport.hold_reading_view(&read_lock(&self.buffer));
+                if changed && viewport.view_offset() == 0 {
+                    mutex_lock(&self.shared.selection).clear();
+                }
             }
             // This route leaves the viewport still while the foreground
             // program may repaint beneath the selection's coordinates.
@@ -1960,6 +1981,41 @@ mod selection_repaint_tests {
         element
     }
 
+    #[test]
+    fn streaming_redraw_preserves_scrolled_reading_window() {
+        let element = populated_element();
+        mutex_lock(&element.shared.viewport).apply_rows(
+            vec![row("history")],
+            7,
+            8,
+            11,
+            1,
+            usize::from(ROWS),
+        );
+        element.set_view_offset(1, usize::from(ROWS));
+        let reading = element
+            .viewport()
+            .compose(&super::read_lock(&element.buffer), usize::from(ROWS));
+
+        // An agent redraws its live screen while the reader is one row up.
+        element.apply_damage(update(true, &[(0, "new"), (1, "output"), (2, "below")]));
+
+        assert_eq!(
+            element
+                .viewport()
+                .compose(&super::read_lock(&element.buffer), usize::from(ROWS)),
+            reading,
+            "streaming must not replace text already visible to a scrolled reader",
+        );
+        element.scroll_to_live(usize::from(ROWS));
+        assert_eq!(
+            element
+                .viewport()
+                .window_row(&super::read_lock(&element.buffer), 0),
+            row("new")
+        );
+    }
+
     fn wheel(delta: f32) -> WheelEvent {
         WheelEvent {
             delta: WheelDelta::Lines(delta),
@@ -1968,6 +2024,100 @@ mod selection_repaint_tests {
             visible_rows: ROWS,
             line_height: 16.0,
         }
+    }
+
+    fn history_reply(
+        first: i64,
+        live: i64,
+        seq: u64,
+        texts: &[&str],
+    ) -> diri_proto::methods::ReadScrollbackCellsResult {
+        diri_proto::methods::ReadScrollbackCellsResult {
+            payload: diri_proto::grid::GridRowCodec::encode_rows(
+                &texts.iter().map(|text| row(text)).collect::<Vec<_>>(),
+            )
+            .unwrap(),
+            first_row: first,
+            row_count: texts.len() as i64,
+            live_start_row: live,
+            total_rows: live + i64::from(ROWS),
+            cols: i64::from(COLS),
+            content_seq: seq,
+        }
+    }
+
+    #[test]
+    fn scrolling_before_first_fetch_holds_live_text_and_selection() {
+        let element = populated_element();
+        element.route_wheel(wheel(1.0));
+        element.apply_damage(update(false, &[(0, "new")]));
+        element
+            .complete_scrollback_fetch(history_reply(7, 8, 2, &["history"]), usize::from(ROWS))
+            .unwrap();
+        assert_eq!(
+            element
+                .viewport()
+                .compose(&super::read_lock(&element.buffer), 3),
+            vec![row("history"), row("zero"), row("one")]
+        );
+        element.begin_selection(0, 1);
+        element.drag_selection(4, 1);
+        element.apply_damage(update(false, &[(0, "again")]));
+        assert_eq!(element.selected_text(), "zero");
+        element.scroll_to_live(3);
+        assert_eq!(element.selected_text(), "");
+        element.route_wheel(wheel(1.0));
+        element
+            .complete_scrollback_fetch(history_reply(17, 18, 3, &["fresh"]), 3)
+            .unwrap();
+        assert_eq!(
+            element.view_offset(),
+            1,
+            "a new scroll starts at the current live edge"
+        );
+        assert_eq!(
+            element
+                .viewport()
+                .compose(&super::read_lock(&element.buffer), 3),
+            vec![row("fresh"), row("again"), row("one")]
+        );
+    }
+
+    #[test]
+    fn overlapping_history_replies_and_live_growth_preserve_reading_text() {
+        let element = populated_element();
+        element
+            .complete_scrollback_fetch(history_reply(6, 8, 1, &["hist six", "hist sev"]), 3)
+            .unwrap();
+        element.set_view_offset(2, 3);
+        let reading = element
+            .viewport()
+            .compose(&super::read_lock(&element.buffer), 3);
+        for seq in 2..10 {
+            element.apply_damage(update(true, &[(0, "new"), (1, "output"), (2, "below")]));
+            element
+                .complete_scrollback_fetch(
+                    history_reply(7, 8 + seq as i64, seq, &["changed", "changed"]),
+                    3,
+                )
+                .unwrap();
+            assert_eq!(
+                element
+                    .viewport()
+                    .compose(&super::read_lock(&element.buffer), 3),
+                reading
+            );
+            assert_eq!(element.viewport().absolute_row(0), 6);
+        }
+        element.set_modes(true, MouseModes::OFF);
+        assert_eq!(element.view_offset(), 0);
+        assert!(element.viewport().cached_row(6).is_none());
+        assert_eq!(
+            element
+                .viewport()
+                .window_row(&super::read_lock(&element.buffer), 0),
+            row("new")
+        );
     }
 
     fn visible_selection_count(element: &TerminalElement) -> usize {

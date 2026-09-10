@@ -150,6 +150,10 @@ pub struct ScrollbackViewport {
     geometry_known: bool,
     cache_seq: Option<u64>,
     cache: BTreeMap<i64, Vec<GridCell>>,
+    /// One screen captured when leaving live. Agents can rewrite these rows
+    /// in place; an absolute scroll anchor alone cannot preserve their text.
+    held_live: Option<GridBuffer>,
+    held_live_start: Option<i64>,
     in_flight: Option<Range<i64>>,
     queued: Option<Range<i64>>,
 }
@@ -215,6 +219,9 @@ impl ScrollbackViewport {
             return false;
         }
         self.view_offset = clamped;
+        if clamped == 0 {
+            self.release_reading_view();
+        }
         self.sync_anchor();
         self.queue_missing_window(visible_rows);
         true
@@ -274,6 +281,15 @@ impl ScrollbackViewport {
     #[must_use]
     pub fn row_at_absolute(&self, buffer: &GridBuffer, absolute_row: i64) -> Vec<GridCell> {
         let cols = usize::from(buffer.cols);
+        if self.view_offset > 0
+            && let Some(held) = &self.held_live
+            && let Ok(row) = usize::try_from(
+                absolute_row.saturating_sub(self.held_live_start.unwrap_or(self.live_start_row)),
+            )
+            && let Some(cells) = held.row(row)
+        {
+            return normalized_row(cells, cols);
+        }
         let source = if absolute_row >= self.live_start_row {
             usize::try_from(absolute_row - self.live_start_row)
                 .ok()
@@ -302,6 +318,28 @@ impl ScrollbackViewport {
             .collect()
     }
 
+    /// Called at local navigation and before applying live damage. The live
+    /// mirror keeps receiving every update; only the reading view is held.
+    pub(crate) fn hold_reading_view(&mut self, buffer: &GridBuffer) {
+        if self.view_offset > 0 && self.held_live.is_none() {
+            self.held_live = Some(buffer.clone());
+            self.held_live_start = self.geometry_known.then_some(self.live_start_row);
+        }
+    }
+
+    fn release_reading_view(&mut self) {
+        self.held_live = None;
+        self.held_live_start = None;
+        // A later scroll starts a fresh reading view, including history that
+        // may have been rewritten or evicted while this view was held.
+        self.cache.clear();
+        self.cache_seq = None;
+        self.queued = None;
+        // Live grid updates carry no history geometry. After following live,
+        // the next reply must establish a fresh origin for the captured screen.
+        self.geometry_known = false;
+    }
+
     /// Returns the next coalesced request and marks it in flight. Until it is
     /// completed, further viewport movement is merged into one queued range.
     pub fn begin_fetch(&mut self, visible_rows: usize) -> Option<ScrollbackRequest> {
@@ -320,8 +358,8 @@ impl ScrollbackViewport {
         })
     }
 
-    /// Completes the active request and ingests decoded rows. A content-sequence
-    /// change invalidates all old cached absolute rows before inserting data.
+    /// Completes the active request and ingests decoded rows. While reading,
+    /// already fetched rows survive sequence changes and overlapping replies.
     pub fn complete_fetch(
         &mut self,
         result: ReadScrollbackCellsResult,
@@ -365,12 +403,21 @@ impl ScrollbackViewport {
     ) {
         let old_sequence = self.cache_seq;
         if old_sequence != Some(content_seq) {
-            self.cache.clear();
+            if self.view_offset == 0 {
+                self.cache.clear();
+            }
             self.cache_seq = Some(content_seq);
         }
         for (index, row) in rows.into_iter().enumerate() {
             let absolute = first_row.saturating_add(i64::try_from(index).unwrap_or(i64::MAX));
-            self.cache.insert(absolute, row);
+            if self.view_offset > 0 {
+                self.cache.entry(absolute).or_insert(row);
+            } else {
+                self.cache.insert(absolute, row);
+            }
+        }
+        if self.held_live.is_some() && self.held_live_start.is_none() {
+            self.held_live_start = Some(live_start_row);
         }
         self.live_start_row = live_start_row;
         self.total_rows = total_rows.max(0);
@@ -383,6 +430,9 @@ impl ScrollbackViewport {
             self.view_offset = self.live_start_row.saturating_sub(anchor);
         }
         self.view_offset = self.view_offset.clamp(0, self.max_offset(visible_rows));
+        if self.view_offset == 0 && self.held_live.is_some() {
+            self.release_reading_view();
+        }
         self.sync_anchor();
         self.cap_cache_near_viewport();
         // Recompute rather than replaying a range queued against old geometry
@@ -417,6 +467,7 @@ impl ScrollbackViewport {
             return false;
         }
         self.view_offset = 0;
+        self.release_reading_view();
         self.anchor = None;
         self.queued = None;
         true

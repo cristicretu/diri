@@ -644,6 +644,14 @@ behind pass/fail status.
 
 ## Desktop integration
 
+While the desktop terminal is scrolled back, its renderer retains one local
+screen snapshot and preserves already fetched rows in its bounded 512-row
+history cache. This keeps Agent redraws and overlapping history replies from
+replacing text under the reader. The live grid continues receiving every
+update. Returning to live or entering the alternate screen releases the reading
+view; the next scroll fetches fresh history. This is client presentation state,
+not another terminal parser, Holder snapshot, or protocol change.
+
 The desktop app initializes a newly added SSH host immediately and displays the
 bootstrap state. The Engine returns only sanitized facts such as Build ID,
 protocol version, cwd, shell, and persistence level. It does not expose the full
