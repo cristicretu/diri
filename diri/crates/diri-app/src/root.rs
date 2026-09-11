@@ -2449,14 +2449,17 @@ impl RootView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let terminal = self.colors();
-        let bounds = window.inner_window_bounds().get_bounds();
+        // On macOS fullscreen, window bounds retain the windowed restore
+        // rectangle. Terminal layout must follow the live drawable viewport.
+        let viewport_size = window.viewport_size();
         let sidebar_width = if visible_sidebar {
             self.sidebar.read(cx).width()
         } else {
             0.0
         };
-        let card_width = (f32::from(bounds.size.width) - sidebar_width - inspector_width).max(0.0);
-        let card_height = f32::from(bounds.size.height).max(0.0);
+        let card_width =
+            (f32::from(viewport_size.width) - sidebar_width - inspector_width).max(0.0);
+        let card_height = f32::from(viewport_size.height).max(0.0);
         let selected = self
             .services
             .store
@@ -3332,7 +3335,7 @@ impl Render for RootView {
         } else {
             0.0
         };
-        let window_width = f32::from(window.inner_window_bounds().get_bounds().size.width);
+        let window_width = f32::from(window.viewport_size().width);
         let occupied_sidebar_width = if sidebar_visible { sidebar_width } else { 0.0 };
         self.inspector_max_width =
             (window_width - occupied_sidebar_width - 320.0).clamp(0.0, 720.0);
@@ -3978,6 +3981,72 @@ mod tests {
                     .unwrap(),
             ),
         })
+    }
+
+    #[gpui::test]
+    fn fullscreen_terminal_tracks_drawable_size_with_windowed_restore_bounds(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let services = test_services();
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.select(fixture.selected_session_id.unwrap());
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        let windowed = size(px(1000.0), px(700.0));
+        cx.simulate_resize(windowed);
+        cx.run_until_parked();
+        let original = root.read_with(cx, |root, cx| {
+            root.terminal.as_ref().unwrap().read(cx).geometry_for_test()
+        });
+
+        let fullscreen = size(px(1600.0), px(1000.0));
+        cx.simulate_resize(fullscreen);
+        root.update_in(cx, |_, window, cx| {
+            window.toggle_fullscreen();
+            // TestWindow::resize changes platform bounds without delivering a
+            // resize callback. Preserve the fullscreen drawable size while
+            // emulating macOS's saved windowed bounds for window restoration.
+            window.resize(windowed);
+            assert_eq!(window.viewport_size(), fullscreen);
+            assert_eq!(window.inner_window_bounds().get_bounds().size, windowed);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let expanded = root.read_with(cx, |root, cx| {
+            root.terminal.as_ref().unwrap().read(cx).geometry_for_test()
+        });
+        let before = original.0.unwrap();
+        let after = expanded.0.unwrap();
+        assert_eq!(
+            after.width - before.width,
+            600.0,
+            "terminal must fill fullscreen width"
+        );
+        assert_eq!(
+            after.height - before.height,
+            300.0,
+            "terminal must fill fullscreen height"
+        );
+        let before_grid = original.1.unwrap();
+        let after_grid = expanded.1.unwrap();
+        assert!(after_grid.0 > before_grid.0 && after_grid.1 > before_grid.1);
+
+        root.update_in(cx, |_, window, _| window.toggle_fullscreen());
+        cx.simulate_resize(windowed);
+        cx.run_until_parked();
+        let restored = root.read_with(cx, |root, cx| {
+            root.terminal.as_ref().unwrap().read(cx).geometry_for_test()
+        });
+        assert_eq!(
+            restored, original,
+            "leaving fullscreen must restore terminal geometry"
+        );
     }
 
     #[cfg(target_os = "macos")]

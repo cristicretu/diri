@@ -938,6 +938,16 @@ impl TerminalPane {
         cx.notify();
     }
 
+    #[cfg(test)]
+    pub(crate) fn geometry_for_test(&self) -> (Option<TerminalViewport>, Option<(u16, u16)>) {
+        let grid = self.selected_session().and_then(|session| {
+            self.residents
+                .get(&session.id)
+                .map(|resident| resident.last_size)
+        });
+        (self.viewport, grid)
+    }
+
     pub fn set_shell_chrome(
         &mut self,
         sidebar_visible: bool,
@@ -2279,12 +2289,12 @@ impl TerminalPane {
             .preferences()
             .terminal_font_size;
         let viewport = self.viewport.unwrap_or_else(|| {
-            let bounds = window.inner_window_bounds().get_bounds();
+            let size = window.viewport_size();
             TerminalViewport {
                 x: 0.0,
                 y: 0.0,
-                width: f32::from(bounds.size.width),
-                height: f32::from(bounds.size.height),
+                width: f32::from(size.width),
+                height: f32::from(size.height),
             }
         });
         let metrics = CellMetrics::measure(
