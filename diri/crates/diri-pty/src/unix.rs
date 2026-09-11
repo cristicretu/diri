@@ -105,11 +105,11 @@ impl Pty {
                 if libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0) < 0 {
                     return Err(io::Error::last_os_error());
                 }
-
-                let maximum = libc::getdtablesize();
-                for fd in 3..maximum {
-                    libc::close(fd);
-                }
+                // stdin is already the slave; pin this session as the
+                // foreground group so a parent `TIOCGPGRP` is defined
+                // before exec. Ignore failure: TIOCSCTTY already set pgrp.
+                let _ = libc::tcsetpgrp(0, libc::getpid());
+                close_extra_fds();
                 Ok(())
             });
         }
@@ -122,6 +122,17 @@ impl Pty {
     #[must_use]
     pub fn pid(&self) -> u32 {
         self.child.id()
+    }
+
+    /// The process group currently in the foreground on this PTY, if any.
+    ///
+    /// Call this on the owner, not on the live read stream: `tcgetpgrp` on
+    /// the same fd the pump is reading can lose canonical-mode input. Do not
+    /// extract a raw fd from a temporary clone either; closing that clone
+    /// before the call yields EBADF and looks like no job.
+    #[must_use]
+    pub fn foreground_pgid(&self) -> Option<i32> {
+        foreground_pgid(self.master.as_raw_fd()).or_else(|| proc_tpgid(self.child.id()))
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
@@ -211,6 +222,57 @@ fn exit_from(status: std::process::ExitStatus) -> Exit {
     status
         .signal()
         .map_or_else(|| Exit::Code(status.code().unwrap_or(-1)), Exit::Signal)
+}
+
+fn close_extra_fds() {
+    // GitHub runners set NOFILE to ~1M. Closing that range one fd at a
+    // time delays exec by seconds and the foreground-job tests time out.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        // SAFETY: after fork in the child; fds 0-2 stay the slave. musl has
+        // no close_range wrapper, so the syscall is used on gnu and musl.
+        if libc::syscall(libc::SYS_close_range, 3, libc::c_uint::MAX, 0) == 0 {
+            return;
+        }
+    }
+    unsafe {
+        // SAFETY: same child-side ownership. Linux before close_range (or a
+        // seccomp policy denying it) still needs every inherited fd closed.
+        // macOS uses this path directly.
+        let maximum = libc::getdtablesize();
+        for fd in 3..maximum {
+            libc::close(fd);
+        }
+    }
+}
+
+fn foreground_pgid(fd: RawFd) -> Option<i32> {
+    // SAFETY: `tcgetpgrp` on an owned PTY master; a bad fd returns -1.
+    let pgid = unsafe { libc::tcgetpgrp(fd) };
+    (pgid > 0).then_some(pgid)
+}
+
+/// Linux parents often see `tcgetpgrp(master) == 0` even after the child
+/// claimed the slave. `/proc/<pid>/stat` tpgid is the child's view of the
+/// same tty and does not require the caller to own it.
+fn proc_tpgid(pid: u32) -> Option<i32> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        tpgid_from_stat(&stat)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn tpgid_from_stat(stat: &str) -> Option<i32> {
+    let after = stat.get(stat.rfind(')')? + 2..)?;
+    let tpgid: i32 = after.split_whitespace().nth(5)?.parse().ok()?;
+    (tpgid > 0).then_some(tpgid)
 }
 
 /// Independently clonable handle on the PTY master.
@@ -352,6 +414,112 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pty_child_does_not_inherit_extra_descriptors() {
+        #[cfg(target_os = "linux")]
+        if let Ok(error) = std::env::var("DIRI_TEST_CLOSE_RANGE_ERRNO") {
+            block_close_range(error.parse().expect("errno"));
+        }
+
+        let file = File::open("/dev/null").expect("open sentinel");
+        // Deliberately inherit an fd without CLOEXEC, well above the stdio
+        // and shell startup descriptors, without replacing an existing fd.
+        // SAFETY: file is live; F_DUPFD returns a fresh descriptor on success.
+        let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 200) };
+        assert!(fd >= 200);
+        // SAFETY: fcntl returned a new descriptor owned by this test.
+        let sentinel = unsafe { OwnedFd::from_raw_fd(fd) };
+        let spec = PtySpec::new(
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "if [ -e \"/dev/fd/$1\" ]; then exit 42; fi; printf clean".into(),
+                "fd-test".into(),
+                sentinel.as_raw_fd().to_string(),
+            ],
+            "/",
+        );
+        let mut pty = Pty::spawn(&spec).expect("spawn");
+        let mut output = Vec::new();
+        pty.reader()
+            .expect("reader")
+            .read_to_end(&mut output)
+            .expect("output");
+        assert_eq!(
+            pty.wait().expect("wait"),
+            Exit::Code(0),
+            "inherited sentinel fd"
+        );
+        assert_eq!(output, b"clean");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pty_closes_descriptors_when_close_range_is_unavailable_or_denied() {
+        for error in [libc::ENOSYS, libc::EPERM] {
+            let output = Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "unix::tests::pty_child_does_not_inherit_extra_descriptors",
+                    "--nocapture",
+                ])
+                .env("DIRI_TEST_CLOSE_RANGE_ERRNO", error.to_string())
+                .output()
+                .expect("run isolated seccomp test");
+            assert!(
+                output.status.success(),
+                "close_range errno {error}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn block_close_range(error: u32) {
+        // Only this disposable test process and its children receive the
+        // filter. No privileges or host configuration are required.
+        let mut instructions = [
+            libc::sock_filter {
+                code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            },
+            libc::sock_filter {
+                code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                jt: 0,
+                jf: 1,
+                k: libc::SYS_close_range as u32,
+            },
+            libc::sock_filter {
+                code: (libc::BPF_RET | libc::BPF_K) as u16,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_ERRNO | error,
+            },
+            libc::sock_filter {
+                code: (libc::BPF_RET | libc::BPF_K) as u16,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_ALLOW,
+            },
+        ];
+        let filter = libc::sock_fprog {
+            len: instructions.len() as u16,
+            filter: instructions.as_mut_ptr(),
+        };
+        // SAFETY: no_new_privs only restricts this process; the filter points
+        // to initialized BPF instructions for the duration of prctl.
+        unsafe {
+            assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+            assert_eq!(
+                libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &filter),
+                0
+            );
+        }
+    }
+
+    #[test]
     fn structured_argv_environment_and_size_reach_the_child() {
         let spec = PtySpec::new(
             vec![
@@ -372,6 +540,66 @@ mod tests {
         reader.read_to_end(&mut output).expect("read output");
         assert_eq!(pty.wait().expect("wait"), Exit::Code(0));
         assert!(String::from_utf8_lossy(&output).contains("exact value:1"));
+    }
+
+    #[test]
+    fn tpgid_is_the_eighth_stat_field_after_a_spaced_comm() {
+        let stat = "42 (sleep 8) R 1 10 10 34816 99 0";
+        assert_eq!(tpgid_from_stat(stat), Some(99));
+        assert_eq!(tpgid_from_stat("42 (sleep 8) R 1"), None);
+        assert_eq!(tpgid_from_stat("no-paren 1 2 3 4 5 6"), None);
+    }
+
+    #[test]
+    fn foreground_pgid_tracks_a_job_other_than_the_shell() {
+        use std::time::{Duration, Instant};
+
+        // bash is on every CI image; zsh is not. Interactive + job control
+        // puts `sleep` in a process group other than the shell.
+        let spec = PtySpec::new(
+            vec![
+                "/bin/bash".into(),
+                "--norc".into(),
+                "--noprofile".into(),
+                "-i".into(),
+            ],
+            "/tmp",
+        )
+        .env("PATH", "/usr/bin:/bin")
+        .env("TERM", "xterm-256color")
+        .env("HOME", "/tmp")
+        .env("PS1", "$ ");
+        let pty = Pty::spawn(&spec).expect("spawn shell");
+        let child = pty.pid() as i32;
+        let mut reader = pty.reader().expect("reader");
+        reader.set_nonblocking(true).ok();
+        let mut writer = pty.writer().expect("writer");
+        let mut drain = [0u8; 4096];
+        let claimed = Instant::now() + Duration::from_secs(2);
+        let mut last = None;
+        while Instant::now() < claimed {
+            let _ = reader.read(&mut drain);
+            last = pty.foreground_pgid();
+            if last == Some(child) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(last, Some(child), "shell never claimed the tty");
+        writer.write_all(b"sleep 8\n").expect("write sleep");
+        writer.flush().expect("flush");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let _ = reader.read(&mut drain);
+            last = pty.foreground_pgid();
+            if last.is_some_and(|pgid| pgid > 0 && pgid != child) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("sleep never became the foreground group; last={last:?} child={child}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]

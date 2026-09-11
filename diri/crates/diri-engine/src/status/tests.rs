@@ -555,6 +555,43 @@ fn a_process_only_agent_goes_working_on_first_output_then_exits() {
 }
 
 #[test]
+fn a_shell_is_idle_at_a_prompt_and_working_only_for_a_foreground_job() {
+    let mut reducer =
+        StatusReducer::new(Authority::ProcessOnly, t0()).with_manifest("shell", Some("1"));
+    let now = t0() + Duration::from_secs(1);
+
+    let outcome = reducer.reduce(StatusSignal::PtyOutputActivity, now);
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert!(!outcome.turn_completed);
+
+    let outcome = reducer.reduce(StatusSignal::ForegroundJob { running: true }, now);
+    assert_eq!(outcome.status_change, Some(SessionStatus::Working));
+    assert!(!outcome.turn_completed);
+
+    // Output from `sleep` is not required; the job itself is the signal.
+    let outcome = reducer.reduce(
+        StatusSignal::ForegroundJob { running: true },
+        now + Duration::from_secs(1),
+    );
+    assert_eq!(outcome.status_change, None);
+
+    let outcome = reducer.reduce(
+        StatusSignal::ForegroundJob { running: false },
+        now + Duration::from_secs(2),
+    );
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert!(!outcome.turn_completed);
+}
+
+#[test]
+fn foreground_job_running_is_the_child_process_group_test() {
+    assert_eq!(super::foreground_job_running(0, Some(12)), None);
+    assert_eq!(super::foreground_job_running(42, None), None);
+    assert_eq!(super::foreground_job_running(42, Some(42)), Some(false));
+    assert_eq!(super::foreground_job_running(42, Some(99)), Some(true));
+}
+
+#[test]
 fn a_signalled_exit_is_reported_as_signalled() {
     let mut reducer = StatusReducer::new(Authority::HooksPrimary, t0());
     let outcome = reducer.reduce(

@@ -11,9 +11,10 @@ use std::time::{Duration, Instant};
 
 use diri_proto::frames::{Frame, FrameType, MAX_FRAME_BYTES};
 use diri_proto::remote_pty::{
-    ControlGranted, ControlRevoked, FullSnapshot, GridDelta, Hello, HelloAck, LaunchRequest,
-    LaunchResult, PHASE_ONE_HOLDER_CAPABILITIES, ProcessExit, RemoteCodec, RemoteError,
-    RemoteMessage, RemoteProcessState, ScrollbackResponse, validate_terminal_dimensions,
+    ControlGranted, ControlRevoked, FOREGROUND_PROCESS_PROTOCOL_MINOR, ForegroundProcess,
+    FullSnapshot, GridDelta, Hello, HelloAck, LaunchRequest, LaunchResult,
+    PHASE_ONE_HOLDER_CAPABILITIES, ProcessExit, RemoteCodec, RemoteError, RemoteMessage,
+    RemoteProcessState, ScrollbackResponse, validate_terminal_dimensions,
 };
 use diri_pty::{Exit, ExitWatcher, Pty, PtySpec, PtyStream};
 use diri_terminal_state::HeadlessScreen;
@@ -38,6 +39,8 @@ const MAX_PENDING_INPUT_BYTES: usize = 1 << 20;
 const OUTPUT_FRAME_BYTES: usize = 64 << 10;
 const REPLAY_BUDGET_BYTES: usize = 4 << 20;
 const PERSIST_OFFSET_INTERVAL: u64 = 1 << 20;
+const FOREGROUND_PROBE_AFTER_INPUT: Duration = Duration::from_millis(100);
+const FOREGROUND_PROBE_WHILE_JOB: Duration = Duration::from_secs(1);
 
 pub const PHASE_ONE_CAPABILITIES: &[diri_proto::remote_pty::RemoteCapability] =
     PHASE_ONE_HOLDER_CAPABILITIES;
@@ -415,6 +418,9 @@ struct Holder {
     pending_output_offset: u64,
     interactive_grid_budget: u8,
     last_persisted_offset: u64,
+    controller_protocol_minor: u16,
+    last_foreground_pid: Option<Option<i32>>,
+    foreground_probe_deadline: Option<Instant>,
 }
 
 impl Holder {
@@ -490,6 +496,9 @@ impl Holder {
             pending_output_offset: 0,
             interactive_grid_budget: 0,
             last_persisted_offset: 0,
+            controller_protocol_minor: 0,
+            last_foreground_pid: None,
+            foreground_probe_deadline: None,
         })
     }
 
@@ -556,9 +565,7 @@ impl Holder {
                 });
                 index
             });
-            let timeout = self
-                .dirty_since
-                .map_or(-1, |since| poll_timeout(since + DIFF_COALESCE));
+            let timeout = self.poll_timeout_ms();
             // SAFETY: `descriptors` owns initialized pollfd entries for the
             // duration of the call. A negative timeout sleeps indefinitely.
             let ready = unsafe {
@@ -624,6 +631,7 @@ impl Holder {
                 self.flush_output()?;
                 self.emit_grid_delta()?;
             }
+            self.emit_foreground_process()?;
         }
     }
 
@@ -947,6 +955,9 @@ impl Holder {
         self.state.controller_epoch = self.state.controller_epoch.saturating_add(1);
         let epoch = self.state.controller_epoch;
         connection.epoch = Some(epoch);
+        self.controller_protocol_minor = hello.protocol.minor;
+        let foreground_pid = self.pty.foreground_pgid();
+        self.last_foreground_pid = Some(foreground_pid);
         connection.queue(RemoteMessage::HelloAck(HelloAck {
             protocol: diri_proto::remote_pty::ProtocolVersion::CURRENT,
             holder_build_id: BUILD_ID.to_string(),
@@ -956,6 +967,7 @@ impl Holder {
             process_state: self.state.process_state.clone(),
             output_offset: self.state.output_offset,
             snapshot_sequence: self.state.snapshot_sequence,
+            foreground_pid,
         }))?;
         self.queue_replay(connection, hello.last_acknowledged_output_offset)?;
         self.state.snapshot_sequence = self.state.snapshot_sequence.saturating_add(1);
@@ -1005,6 +1017,7 @@ impl Holder {
         // next the actual echo/TUI response. Keep the fast path bounded to
         // those two frames so a keystroke cannot unthrottle a bulk stream.
         self.interactive_grid_budget = INTERACTIVE_GRID_BUDGET;
+        self.foreground_probe_deadline = Some(Instant::now() + FOREGROUND_PROBE_AFTER_INPUT);
         self.flush_input()
     }
 
@@ -1043,6 +1056,58 @@ impl Holder {
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn poll_timeout_ms(&self) -> libc::c_int {
+        let grid = self
+            .dirty_since
+            .map(|since| poll_timeout(since + DIFF_COALESCE));
+        let probe = self.foreground_probe_deadline.map(poll_timeout);
+        match (grid, probe) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => -1,
+        }
+    }
+
+    fn emit_foreground_process(&mut self) -> io::Result<()> {
+        if self.controller_protocol_minor < FOREGROUND_PROCESS_PROTOCOL_MINOR {
+            self.foreground_probe_deadline = None;
+            return Ok(());
+        }
+        if self
+            .connection
+            .as_ref()
+            .is_none_or(|connection| connection.epoch.is_none())
+        {
+            // No controller consumes these samples. An expired deadline must
+            // not keep poll(0) spinning after EOF, release, or a failed write.
+            self.foreground_probe_deadline = None;
+            return Ok(());
+        }
+        let pid = self.pty.foreground_pgid();
+        if self.last_foreground_pid != Some(pid) {
+            self.last_foreground_pid = Some(pid);
+            self.queue(RemoteMessage::ForegroundProcess(ForegroundProcess { pid }))?;
+        }
+        let child_pid = match self.state.process_state {
+            RemoteProcessState::Running { pid } => pid as i32,
+            RemoteProcessState::Exited { .. } => {
+                self.foreground_probe_deadline = None;
+                return Ok(());
+            }
+        };
+        let running = pid.is_some_and(|pgid| pgid != child_pid);
+        if running {
+            self.foreground_probe_deadline = Some(Instant::now() + FOREGROUND_PROBE_WHILE_JOB);
+        } else if self
+            .foreground_probe_deadline
+            .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            self.foreground_probe_deadline = None;
+        }
+        Ok(())
     }
 
     fn emit_grid_delta(&mut self) -> io::Result<()> {

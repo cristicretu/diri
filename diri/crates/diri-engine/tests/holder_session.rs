@@ -417,3 +417,46 @@ fn failed_holder_stop_keeps_the_live_session_tracked_until_retry() {
     assert!(registry.get("s_stop_retry").is_none());
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[test]
+fn a_held_shell_is_working_while_a_foreground_job_runs() {
+    let root = holders_dir("fgwork");
+    let logs = root.join("logs");
+    let holder = holder_config(&root);
+    let spec = SessionSpec {
+        id: "s_fgwork".into(),
+        pty: PtySpec::new(
+            vec![
+                "/bin/bash".into(),
+                "--norc".into(),
+                "--noprofile".into(),
+                "-i".into(),
+            ],
+            "/tmp",
+        )
+        .env("PATH", "/usr/bin:/bin")
+        .env("TERM", "xterm-256color")
+        .env("HOME", "/tmp")
+        .env("PS1", "$ "),
+        manifest_id: "shell".into(),
+        authority: Authority::ProcessOnly,
+        logs_dir: logs.to_path_buf(),
+        holder: Some(holder),
+        remote: None,
+        defer_launch: false,
+    };
+    let mut session = Session::spawn(spec, engine()).expect("spawn");
+    wait_until("idle shell prompt", Duration::from_secs(5), || {
+        matches!(session.status(), SessionStatus::Idle)
+    });
+
+    session.write_input(b"sleep 30\n").expect("write sleep");
+    wait_until("working foreground job", Duration::from_secs(3), || {
+        matches!(session.status(), SessionStatus::Working)
+    });
+
+    session
+        .terminate(Duration::from_secs(2))
+        .expect("terminate");
+    let _ = std::fs::remove_dir_all(root);
+}

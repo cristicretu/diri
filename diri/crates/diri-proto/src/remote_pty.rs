@@ -18,8 +18,9 @@ use crate::grid::{GridCodecError, GridUpdate};
 use crate::terminal::MouseModes;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 4;
+pub const PROTOCOL_MINOR: u16 = 5;
 pub const MOUSE_INPUT_PROTOCOL_MINOR: u16 = 4;
+pub const FOREGROUND_PROCESS_PROTOCOL_MINOR: u16 = 5;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_ARGUMENTS: usize = 512;
 pub const MAX_ENVIRONMENT_VARIABLES: usize = 4096;
@@ -48,6 +49,7 @@ const KIND_ERROR: u8 = 41;
 const KIND_GRID_DELTA: u8 = 42;
 const KIND_SCROLLBACK_REQUEST: u8 = 43;
 const KIND_SCROLLBACK_RESPONSE: u8 = 44;
+const KIND_FOREGROUND_PROCESS: u8 = 45;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -252,6 +254,9 @@ pub struct HelloAck {
     pub process_state: RemoteProcessState,
     pub output_offset: u64,
     pub snapshot_sequence: u64,
+    /// PTY foreground process group. Absent from protocol 1.4 HelloAck.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreground_pid: Option<i32>,
 }
 
 impl HelloAck {
@@ -663,6 +668,13 @@ pub struct ProcessExit {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ForegroundProcess {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<i32>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Signal {
     pub controller_epoch: u64,
     pub signal: i32,
@@ -745,6 +757,7 @@ pub enum RemoteMessage {
     ScrollbackRequest(ScrollbackRequest),
     ScrollbackResponse(ScrollbackResponse),
     Error(RemoteError),
+    ForegroundProcess(ForegroundProcess),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -930,6 +943,9 @@ impl RemoteCodec {
                 append_json(KIND_SCROLLBACK_RESPONSE, value, output, start)
             }
             RemoteMessage::Error(value) => append_json(KIND_ERROR, value, output, start),
+            RemoteMessage::ForegroundProcess(value) => {
+                append_json(KIND_FOREGROUND_PROCESS, value, output, start)
+            }
         })();
 
         if let Err(error) = result {
@@ -1129,13 +1145,16 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
             kind, payload,
         )?)),
         KIND_ERROR => Ok(RemoteMessage::Error(decode_json(kind, payload)?)),
+        KIND_FOREGROUND_PROCESS => Ok(RemoteMessage::ForegroundProcess(decode_json(
+            kind, payload,
+        )?)),
         _ => Err(RemoteCodecError::UnknownMessageType(kind)),
     }
 }
 
 fn validate_kind(kind: u8) -> Result<(), RemoteCodecError> {
     if (1..=FrameType::Mouse as u8).contains(&kind)
-        || (KIND_HELLO..=KIND_SCROLLBACK_RESPONSE).contains(&kind)
+        || (KIND_HELLO..=KIND_FOREGROUND_PROCESS).contains(&kind)
     {
         Ok(())
     } else {
@@ -1378,6 +1397,24 @@ mod tests {
             RemoteCodec::new().feed(&encoded).expect("decode"),
             vec![message]
         );
+    }
+
+    #[test]
+    fn foreground_process_round_trips_and_older_hello_ack_omits_the_pid() {
+        let message = RemoteMessage::ForegroundProcess(ForegroundProcess { pid: Some(456) });
+        let encoded = RemoteCodec::encode(&message).expect("encode");
+        assert_eq!(encoded[0], KIND_FOREGROUND_PROCESS);
+        assert_eq!(
+            RemoteCodec::new().feed(&encoded).expect("decode"),
+            vec![message]
+        );
+
+        let ack: HelloAck = serde_json::from_str(
+            r#"{"protocol":{"major":1,"minor":4},"holderBuildId":"b","sessionIncarnation":"i","capabilities":[],"controllerEpoch":1,"processState":{"state":"running","pid":12},"outputOffset":0,"snapshotSequence":1}"#,
+        )
+        .expect("legacy hello ack");
+        assert_eq!(ack.foreground_pid, None);
+        assert_eq!(ack.process_state, RemoteProcessState::Running { pid: 12 });
     }
 
     #[test]

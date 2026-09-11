@@ -1553,7 +1553,27 @@ impl Session {
             Transport::Remote(client) => client.write(bytes)?,
         }
         self.feed_signal(StatusSignal::UserKeystroke);
+        self.sample_shell_foreground();
         Ok(())
+    }
+
+    fn sample_shell_foreground(&self) {
+        if self.manifest_id != "shell" {
+            return;
+        }
+        match &self.transport {
+            Transport::Direct(pty) => {
+                let (child_pid, pgid) = {
+                    let pty = pty.lock().expect("pty");
+                    (pty.pid() as i32, pty.foreground_pgid())
+                };
+                apply_foreground_sample(&self.shared, &self.manifest_id, child_pid, pgid);
+            }
+            Transport::Held(client) => {
+                sample_held_foreground(&self.shared, client, &self.manifest_id);
+            }
+            Transport::Remote(_) => {}
+        }
     }
 
     fn observe_prompt_input(&self, bytes: &[u8]) {
@@ -1884,6 +1904,37 @@ fn apply(shared: &Shared, outcome: &ReducerOutcome) {
     }
 }
 
+fn apply_foreground_sample(
+    shared: &Shared,
+    manifest_id: &str,
+    child_pid: i32,
+    foreground_pgid: Option<i32>,
+) {
+    if manifest_id != "shell" {
+        return;
+    }
+    let Some(running) = crate::status::foreground_job_running(child_pid, foreground_pgid) else {
+        return;
+    };
+    let outcome = shared
+        .reducer
+        .lock()
+        .expect("reducer")
+        .reduce(StatusSignal::ForegroundJob { running }, SystemTime::now());
+    apply(shared, &outcome);
+}
+
+fn sample_held_foreground(shared: &Shared, client: &HolderClient, manifest_id: &str) {
+    if manifest_id != "shell" {
+        return;
+    }
+    let Ok(stat) = client.stat() else {
+        return;
+    };
+    shared.child_pid.store(stat.child_pid, Ordering::SeqCst);
+    apply_foreground_sample(shared, manifest_id, stat.child_pid, stat.foreground_pid);
+}
+
 /// Rescans the visible screen for artifact URLs every ~2s, only when the
 /// content actually changed and only when it plausibly contains a URL —
 /// most screens never pay more than a substring check.
@@ -2114,6 +2165,15 @@ fn handle_remote_message(
                 record_remote_exit(shared, ProcessExit { code, signal });
                 return RemoteConnectionDisposition::Exited;
             }
+            if let RemoteProcessState::Running { pid } = acknowledgement.process_state {
+                shared.child_pid.store(pid as i32, Ordering::SeqCst);
+                apply_foreground_sample(
+                    shared,
+                    manifest_id,
+                    pid as i32,
+                    acknowledgement.foreground_pid,
+                );
+            }
             *hello_accepted = true;
             RemoteConnectionDisposition::Continue
         }
@@ -2191,6 +2251,15 @@ fn handle_remote_message(
         }
         RemoteMessage::Error(error) if error.fatal => RemoteConnectionDisposition::Fatal,
         RemoteMessage::Error(_) => RemoteConnectionDisposition::Continue,
+        RemoteMessage::ForegroundProcess(foreground) => {
+            apply_foreground_sample(
+                shared,
+                manifest_id,
+                shared.child_pid.load(Ordering::SeqCst),
+                foreground.pid,
+            );
+            RemoteConnectionDisposition::Continue
+        }
         _ => RemoteConnectionDisposition::Fatal,
     }
 }
@@ -2485,6 +2554,17 @@ fn pump(
                 .expect("reducer")
                 .reduce(StatusSignal::Tick, last_tick);
             apply(&shared, &outcome);
+            // Sample from the PTY owner, not `reader`: `tcgetpgrp` on the
+            // live read fd can swallow canonical-mode input.
+            if manifest_id == "shell" {
+                let pgid = pty.lock().ok().and_then(|pty| pty.foreground_pgid());
+                apply_foreground_sample(
+                    &shared,
+                    &manifest_id,
+                    shared.child_pid.load(Ordering::SeqCst),
+                    pgid,
+                );
+            }
         }
     }
 
@@ -2926,6 +3006,7 @@ fn pump_held(
                 .expect("reducer")
                 .reduce(StatusSignal::Tick, SystemTime::now());
             apply(&shared, &outcome);
+            sample_held_foreground(&shared, &client, &manifest_id);
 
             if last_liveness.elapsed() >= LIVENESS_INTERVAL {
                 last_liveness = Instant::now();
@@ -3055,8 +3136,11 @@ fn pump_held(
             }
             if let Some(observation) = observation {
                 let outcome = reducer.reduce(StatusSignal::Screen(observation), now);
-                drop(reducer);
                 apply(&shared, &outcome);
+            }
+            drop(reducer);
+            if !replaying {
+                sample_held_foreground(&shared, &client, &manifest_id);
             }
         }
     }
@@ -3496,6 +3580,6 @@ mod notification_tests {
         assert!(shared.state_version.load(Ordering::SeqCst) > 0);
         apply_remote_output(&shared, &engine, "shell", &mut seq, end, bytes, false).unwrap();
         assert!(!shared.screen.lock().unwrap().has_notifications());
-        assert_eq!(*shared.status.lock().unwrap(), SessionStatus::Working);
+        assert_eq!(*shared.status.lock().unwrap(), SessionStatus::Idle);
     }
 }

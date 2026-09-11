@@ -5342,11 +5342,14 @@ impl Sidebar {
     /// One bounded 8 Hz wake for the whole sidebar, only while working marks
     /// are shown. A one-shot is rearmed by painting, so an unmounted sidebar
     /// cannot keep a background loop alive.
+    ///
+    /// Visibility/occlusion is GPUI's job (display-link stops when the
+    /// window is truly hidden). `is_window_active` is only OS focus, so
+    /// gating on it freezes a still-visible window on another monitor.
     fn schedule_activity_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let animate = self.working_row_rendered
             && (self.ui.visible || self.peek_open)
             && self.settings_nav.is_none()
-            && window.is_window_active()
             && !cx.reduce_motion();
         if !animate {
             self.activity_tick = None;
@@ -5355,11 +5358,10 @@ impl Sidebar {
                 cx.background_executor()
                     .timer(Duration::from_millis(125))
                     .await;
-                let _ = this.update_in(cx, |this, window, cx| {
+                let _ = this.update_in(cx, |this, _window, cx| {
                     this.activity_tick = None;
                     if (this.ui.visible || this.peek_open)
                         && this.settings_nav.is_none()
-                        && window.is_window_active()
                         && !cx.reduce_motion()
                     {
                         this.activity_frame = (this.activity_frame + 1) % 8;
@@ -7921,6 +7923,24 @@ mod tests {
             paints.get() > 0,
             "working animation froze without pointer input"
         );
+    }
+
+    #[gpui::test]
+    fn working_sidebar_keeps_animating_when_the_window_is_unfocused(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = drag_harness(cx);
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        cx.deactivate_window();
+        cx.run_until_parked();
+        for _ in 0..3 {
+            let frame = sidebar.read_with(cx, |sidebar, _| sidebar.activity_frame);
+            cx.executor().advance_clock(Duration::from_millis(125));
+            cx.run_until_parked();
+            assert_eq!(
+                sidebar.read_with(cx, |sidebar, _| sidebar.activity_frame),
+                (frame + 1) % 8,
+            );
+        }
     }
 
     #[gpui::test]

@@ -34,6 +34,8 @@ pub enum Authority {
     /// Codex: the screen drives state, notify confirms done.
     ScreenPrimary,
     /// Everything else: starting → working → exited, nothing more.
+    /// Shell is the exception: working follows the PTY foreground group, not
+    /// process liveness, so an idle login prompt is idle.
     ProcessOnly,
 }
 
@@ -100,6 +102,11 @@ pub enum StatusSignal {
     Screen(ScreenObservation),
     PtyOutputActivity,
     UserKeystroke,
+    /// The PTY foreground process group is, or is not, the session child.
+    /// Shell sessions use this to show work only while a foreground job runs.
+    ForegroundJob {
+        running: bool,
+    },
     ProcessExit {
         code: Option<i32>,
         signal: Option<i32>,
@@ -297,22 +304,11 @@ impl StatusReducer {
             return outcome;
         }
 
-        // processOnly: starting → working on first output, then only exit moves it.
+        // processOnly: starting → working on first output, then only exit
+        // moves it. A shell is still process-only, but an idle login prompt
+        // is not work: Working follows the foreground process group.
         if self.authority == Authority::ProcessOnly {
-            if matches!(signal, StatusSignal::PtyOutputActivity) {
-                if self.status == SessionStatus::Starting {
-                    self.state.turn_in_flight = true;
-                    self.set_status(SessionStatus::Working, &mut outcome);
-                }
-                self.state.last_signal_at = now;
-                self.publish_evidence(
-                    StatusEvidenceSource::ProcessLiveness,
-                    None,
-                    Some(StatusFallbackReason::ProcessOnly),
-                    now,
-                    &mut outcome,
-                );
-            }
+            self.reduce_process_only(signal, now, &mut outcome);
             return outcome;
         }
 
@@ -330,11 +326,13 @@ impl StatusReducer {
             StatusSignal::Tick => None,
             StatusSignal::PtyOutputActivity
             | StatusSignal::UserKeystroke
+            | StatusSignal::ForegroundJob { .. }
             | StatusSignal::ProcessExit { .. } => None,
         };
 
         match signal {
             StatusSignal::ProcessExit { .. } => {} // handled above
+            StatusSignal::ForegroundJob { .. } => {}
             StatusSignal::PtyOutputActivity => {
                 // Bytes alone do not establish work: late terminal repaints,
                 // title updates and status lines continue after a turn ends.
@@ -487,6 +485,64 @@ impl StatusReducer {
             self.evidence = Some(candidate.clone());
             outcome.status_evidence = Some(candidate);
         }
+    }
+
+    fn reduce_process_only(
+        &mut self,
+        signal: StatusSignal,
+        now: SystemTime,
+        outcome: &mut ReducerOutcome,
+    ) {
+        match signal {
+            StatusSignal::ForegroundJob { running } if self.tracks_shell_jobs() => {
+                self.state.last_signal_at = now;
+                self.apply_shell_job(running, now, outcome);
+            }
+            StatusSignal::PtyOutputActivity => {
+                self.state.last_signal_at = now;
+                if self.tracks_shell_jobs() {
+                    // Prompt output is not a job. Drop Starting so an older
+                    // Helper that never sends ForegroundJob cannot sit on
+                    // Loading forever; a later job sample still wins.
+                    if self.status == SessionStatus::Starting {
+                        self.set_status(SessionStatus::Idle, outcome);
+                    }
+                } else if self.status == SessionStatus::Starting {
+                    self.state.turn_in_flight = true;
+                    self.set_status(SessionStatus::Working, outcome);
+                }
+                self.publish_evidence(
+                    StatusEvidenceSource::ProcessLiveness,
+                    None,
+                    Some(StatusFallbackReason::ProcessOnly),
+                    now,
+                    outcome,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn tracks_shell_jobs(&self) -> bool {
+        self.manifest_id.as_deref() == Some("shell")
+    }
+
+    fn apply_shell_job(&mut self, running: bool, now: SystemTime, outcome: &mut ReducerOutcome) {
+        let next = if running {
+            self.state.turn_in_flight = true;
+            SessionStatus::Working
+        } else {
+            self.state.turn_in_flight = false;
+            SessionStatus::Idle
+        };
+        self.set_status(next, outcome);
+        self.publish_evidence(
+            StatusEvidenceSource::ProcessLiveness,
+            None,
+            Some(StatusFallbackReason::ProcessOnly),
+            now,
+            outcome,
+        );
     }
 
     fn set_status(&mut self, new: SessionStatus, outcome: &mut ReducerOutcome) {
@@ -923,6 +979,17 @@ impl StatusReducer {
             self.commit_idle(now, outcome);
         }
     }
+}
+
+/// Whether the PTY foreground group is a job other than the session child.
+/// `None` until both pids are known.
+#[must_use]
+pub fn foreground_job_running(child_pid: i32, foreground_pgid: Option<i32>) -> Option<bool> {
+    if child_pid <= 1 {
+        return None;
+    }
+    let pgid = foreground_pgid.filter(|pgid| *pgid > 0)?;
+    Some(pgid != child_pid)
 }
 
 fn needs_input_kind(state: ManifestState) -> Option<NeedsInputKind> {

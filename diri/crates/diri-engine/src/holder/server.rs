@@ -767,15 +767,14 @@ fn current_stat(shared: &Shared) -> HolderStat {
     let pty = shared.pty.lock().expect("pty");
     // SAFETY: kill with signal 0 only checks existence.
     let child_alive = unsafe { libc::kill(shared.child_pid, 0) } == 0;
-    let master_fd = pty.writer().map(|stream| stream.as_raw_fd()).unwrap_or(-1);
-    // SAFETY: tcgetpgrp on the master; -1 fd yields an error, mapped to None.
-    let foreground = unsafe { libc::tcgetpgrp(master_fd) };
     let size = pty.size().ok();
     HolderStat {
         child_pid: shared.child_pid,
         alive: !finished && child_alive,
         log_offset: shared.log.lock().expect("log").tail_offset(),
-        foreground_pid: (foreground > 0).then_some(foreground),
+        // Sample the live owner. A cloned writer dropped before `tcgetpgrp`
+        // leaves a closed fd, so every job looks like the idle shell.
+        foreground_pid: pty.foreground_pgid(),
         cols: size.map(|(cols, _)| cols),
         rows: size.map(|(_, rows)| rows),
         epoch_offset: Some(shared.epoch_offset),
