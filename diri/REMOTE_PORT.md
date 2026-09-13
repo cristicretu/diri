@@ -919,6 +919,13 @@ unknown. A terminal title is provisional and may follow later OSC updates.
 Confirmed native names take precedence; manual and Diri-assigned names remain
 authoritative. A stored first-prompt preview cannot replace a real name.
 
+Live prompt capture only fills an unnamed record (placeholder or unknown).
+After adoption or resume, the first input observed by a new Engine Session can
+be a follow-up, so it must not replace an established first-prompt title. An
+identity-bound provider read may repair that fallback to the conversation's
+actual first prompt. Subsequent live folds preserve the repaired value across
+list/inspect responses, update events and persistence.
+
 Codex activity, pending-name labels and unnamed placeholders are excluded from
 conversation names, and a matching cwd suffix and activity spinner are removed.
 The Engine repairs previously persisted transient Agent titles on load. Local

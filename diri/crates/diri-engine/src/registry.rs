@@ -1591,10 +1591,16 @@ fn fold_session_view(record: &mut SessionRecord, view: &SessionView) {
     if let Some(title) = terminal_title.and_then(|title| normalize_terminal_title(title, record)) {
         record.title = title;
         record.title_source = TitleSource::TerminalTitle;
-    } else if record.title_source != TitleSource::TerminalTitle
-        && view.title_source == Some(TitleSource::FirstPrompt)
+    } else if matches!(
+        record.title_source,
+        TitleSource::Placeholder | TitleSource::Unknown
+    ) && view.title_source == Some(TitleSource::FirstPrompt)
         && let Some(title) = view.title.as_deref().and_then(normalize_agent_title)
     {
+        // Prompt capture belongs to this Session attachment, not the durable
+        // conversation. After adoption/resume its first input may be a later
+        // turn. Only fill an unnamed record; otherwise this can overwrite a
+        // saved/provider first prompt on every live fold and fight refreshes.
         record.title = title;
         record.title_source = TitleSource::FirstPrompt;
     }
@@ -2749,6 +2755,115 @@ mod tests {
         fold_session_view(&mut cursor, &named_working);
         assert_eq!(cursor.title, "Fix the cursor session title");
         assert_eq!(cursor.title_source, TitleSource::FirstPrompt);
+    }
+
+    #[test]
+    fn first_prompt_title_survives_a_later_prompt_after_reconnect() {
+        let mut session = record("codex-title");
+        session.kind = AgentKind::CODEX;
+        session.cwd = "/work/lector".into();
+        session.title = "make this in a new worktree from main".into();
+        session.title_source = TitleSource::FirstPrompt;
+        // A newly attached Session has no captured prompt. Its first input can
+        // be a follow-up to the conversation whose title was already saved.
+        let view = SessionView {
+            id: session.id.to_string(),
+            status: SessionStatus::Working,
+            status_evidence: None,
+            needs_input: None,
+            last_turn_completed_at: None,
+            title: Some("make pr".into()),
+            title_source: Some(TitleSource::FirstPrompt),
+            terminal_title: Some("Action Required | lector".into()),
+            tail_offset: 0,
+            exited: false,
+        };
+        for _ in 0..3 {
+            fold_session_view(&mut session, &view);
+            assert_eq!(session.title, "make this in a new worktree from main");
+            assert_eq!(session.title_source, TitleSource::FirstPrompt);
+        }
+    }
+
+    #[test]
+    fn codex_provider_prompt_refresh_stays_consistent_with_live_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("codex-profile");
+        std::fs::create_dir_all(&config).unwrap();
+        let db = rusqlite::Connection::open(config.join("state_5.sqlite")).unwrap();
+        db.execute_batch(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT, title TEXT, first_user_message TEXT);",
+        ).unwrap();
+        let original = "make this in a new worktree from main";
+        db.execute(
+            "INSERT INTO threads VALUES ('thread-1', NULL, ?1, ?1)",
+            [original],
+        )
+        .unwrap();
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let mut session = record("codex-title");
+        session.kind = AgentKind::CODEX;
+        session.agent_session_id = Some("thread-1".into());
+        session.account_profile = Some(diri_proto::AgentAccountProfile {
+            id: "fixture".into(),
+            label: "Fixture".into(),
+            agent: "codex".into(),
+            host: None,
+            config_home: config.to_string_lossy().into_owned(),
+            is_default: false,
+        });
+        // Reproduce a title already overwritten by an older Engine after
+        // adoption, while the provider still knows the actual first prompt.
+        session.title = "make pr".into();
+        session.title_source = TitleSource::FirstPrompt;
+        registry
+            .spawn(
+                SessionSpec {
+                    id: "codex-title".into(),
+                    pty: crate::PtySpec::new(vec!["/bin/cat".into()], "/tmp"),
+                    manifest_id: "codex".into(),
+                    authority: crate::Authority::ProcessOnly,
+                    logs_dir: temp.path().join("logs"),
+                    holder: None,
+                    remote: None,
+                    defer_launch: false,
+                },
+                session,
+            )
+            .unwrap();
+        registry.sessions["codex-title"]
+            .paste_text("make pr")
+            .unwrap();
+        assert_eq!(
+            registry.sessions["codex-title"].view().title.as_deref(),
+            Some("make pr")
+        );
+
+        for pass in 0..3 {
+            // Exercise the refresh and watcher independently, without waiting
+            // on their production timers. Both publish session.updated.
+            registry.native_title_refresh_at = None;
+            let requests = registry.native_title_refresh_requests();
+            assert_eq!(requests.len(), 1);
+            let refreshed =
+                registry.apply_native_title_refreshes(scan_native_title_refreshes(requests));
+            assert_eq!(refreshed.len(), usize::from(pass == 0));
+            for (_, record) in &refreshed {
+                assert_eq!(record.title, original);
+            }
+            assert_eq!(registry.record("codex-title").unwrap().title, original);
+            assert_eq!(registry.records()[0].title, original);
+            for (_, record) in registry.changed_since(&mut HashMap::new()) {
+                assert_eq!(record.title, original);
+            }
+            registry.persist_now().unwrap();
+            let mut restored = Registry::new(engine(), temp.path().join("state.json"));
+            restored.load().unwrap();
+            assert_eq!(restored.record("codex-title").unwrap().title, original);
+        }
+        registry
+            .terminate("codex-title", std::time::Duration::from_secs(1))
+            .unwrap();
     }
 
     #[test]

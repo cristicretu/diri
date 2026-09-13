@@ -1,5 +1,33 @@
 # Conversation titles
 
+## Follow-up: titles flipping after reconnect
+
+The September 13 recording shows one row alternating between its original
+request and the later follow-up `make pr`. The native Codex database still
+contains the original request in both `title` and `first_user_message`, with
+no explicit name. The title fix in #281 correctly classifies this as
+`FirstPrompt`, but that exposed a conflict: `fold_session_view` could replace
+an existing `FirstPrompt` with the first input captured by the current Engine
+Session, which can be a later turn after adoption or resume. The native refresh
+then restores the original request, and the next live fold overwrites it again.
+
+Live prompt capture now only fills placeholder/unknown titles. Provider reads
+can still repair an incorrect fallback; terminal names, native renames and
+manual names retain their existing precedence. No new wire value, polling,
+provider lookup or session state is needed.
+
+Regression tests cover a saved first prompt surviving later input and a live
+PTY Session interleaved with a fixture Codex database refresh. The latter checks
+that refresh events, live records, list results, watcher events and persisted
+state all keep the same repaired title over repeated passes. Both tests fail on
+the previous implementation with `make pr` instead of the original title.
+
+Verification on `fix/conversation-title-flapping`, based on main `975009e`:
+`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D
+warnings`, `cargo test --workspace`, and `cargo build --workspace --release`
+all passed. The full test run used an environment permitting the fixture Unix
+sockets; the initial sandboxed run could not bind those sockets.
+
 ## September 2026 diagnosis
 
 The screenshot failures were reproducible at `Registry::fold_session_view`:
