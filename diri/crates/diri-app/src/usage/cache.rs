@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use super::model::UsageHourAgg;
 
-pub(crate) const CACHE_VERSION: u32 = 4;
+// Costs and priced-token coverage are persisted: adding Astra's bundled rate
+// requires reparsing existing transcripts, even when their bytes are unchanged.
+pub(crate) const CACHE_VERSION: u32 = 5;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct UsageFileEntry {

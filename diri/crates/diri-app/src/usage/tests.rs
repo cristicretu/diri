@@ -411,8 +411,8 @@ fn buckets_local_day_month_and_five_hour_blocks_like_swift() {
 }
 
 #[test]
-fn ordered_pricing_table_and_fnv_hash_match_the_swift_constants() {
-    assert_eq!(super::PRICING_ENTRY_COUNT, 15);
+fn ordered_pricing_table_and_fnv_hash_match_expected_values() {
+    assert_eq!(super::PRICING_ENTRY_COUNT, 16);
     for (model, input, output) in [
         ("claude-fable", 10.0, 50.0),
         ("claude-mythos", 10.0, 50.0),
@@ -428,6 +428,7 @@ fn ordered_pricing_table_and_fnv_hash_match_the_swift_constants() {
         assert_eq!((pricing.input, pricing.output), (input, output));
     }
     for (model, input, output) in [
+        ("gpt-6-astra", 10.0, 50.0),
         ("gpt-5.4-mini", 0.75, 4.5),
         ("gpt-5.4", 2.5, 15.0),
         ("gpt-5.5", 5.0, 30.0),
@@ -573,6 +574,59 @@ fn append(path: &Path, bytes: &[u8]) {
 
 fn assert_close(actual: f64, expected: f64) {
     assert!((actual - expected).abs() < 1e-12, "{actual} != {expected}");
+}
+
+#[test]
+fn astra_usage_reprices_version_four_cache_and_preserves_warm_history() {
+    let fixture = Fixture::new();
+    write_lines(
+        &fixture.codex.join("astra.jsonl"),
+        &[
+            json!({"type":"turn_context","payload":{"model":"gpt-6-astra"}}),
+            json!({"timestamp":"2026-07-22T10:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":20}}}}),
+        ],
+    );
+    let make_store = || {
+        fixture.store(
+            "2026-07-22T12:00:00Z",
+            "2026-07-22T00:00:00Z",
+            "2026-07-01T00:00:00Z",
+        )
+    };
+    let _ = make_store().refresh();
+
+    // Version 4 persisted Astra's tokens with no matching price. Keep file
+    // metadata and offsets intact: an unchanged rollout must still be repriced.
+    let mut cache = super::cache::load(&fixture.cache);
+    cache.version = 4;
+    for file in cache.files.values_mut() {
+        for hour in file.hours.values_mut() {
+            hour.c = 0.0;
+        }
+        for hours in file.details.values_mut() {
+            for detail in hours.values_mut() {
+                detail.tokens.c = 0.0;
+                detail.priced_tokens = 0;
+                detail.read_savings = 0.0;
+            }
+        }
+    }
+    super::cache::save(&fixture.cache, &cache).unwrap();
+
+    let mut restarted = make_store();
+    let snapshot = restarted.refresh();
+    assert_eq!(restarted.last_stats().files_parsed, 1);
+    assert_close(snapshot.codex.today.cost, 0.001_64);
+    let report = snapshot.history.report(snapshot.updated_at, 30);
+    assert_eq!(report.models.len(), 1);
+    assert_eq!(report.models[0].model, "gpt-6-astra");
+    assert_eq!(report.models[0].detail.priced_tokens, 120);
+    assert_close(report.models[0].detail.totals().cost, 0.001_64);
+    assert_eq!(report.total.totals(), snapshot.today());
+
+    let mut warm = make_store();
+    assert_eq!(warm.refresh().history, snapshot.history);
+    assert_eq!(warm.last_stats().bytes_parsed, 0);
 }
 
 #[test]
