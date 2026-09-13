@@ -1,4 +1,7 @@
 //! Desktop split views. Closing a pane drops its attachment, never its session.
+pub mod drag;
+use drag::{DockPresentation, DraggedWorkspace};
+
 use std::{collections::HashMap, sync::Arc};
 
 use diri_proto::{AgentKind, SessionId, SessionSpawnParams};
@@ -46,6 +49,7 @@ pub struct SplitWorkbench {
     auxiliary_pending: Option<SessionId>,
     picker: Option<SplitAxis>,
     error: Option<String>,
+    dock: DockPresentation,
 }
 
 impl EventEmitter<TerminalPaneEvent> for SplitWorkbench {}
@@ -87,6 +91,7 @@ impl SplitWorkbench {
             auxiliary_pending: None,
             picker: None,
             error: None,
+            dock: DockPresentation::default(),
         }
     }
 
@@ -158,6 +163,13 @@ impl SplitWorkbench {
             let before = self.layouts.clone();
             self.layouts.reconcile(|id| live.contains(id));
             if self.layouts != before {
+                self.persist();
+            }
+        }
+        if let Some(id) = selected.clone() {
+            let before = self.layouts.focus_history.clone();
+            self.layouts.visit(id);
+            if self.layouts.focus_history != before {
                 self.persist();
             }
         }
@@ -284,10 +296,15 @@ impl SplitWorkbench {
         let Some(selected) = self.selected.clone() else {
             return false;
         };
-        self.close(&selected, window, cx)
+        self.remove_pane(&selected, window, cx)
     }
 
-    fn close(&mut self, id: &SessionId, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    pub fn remove_pane(
+        &mut self,
+        id: &SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(next) = self.layouts.close(id) else {
             return false;
         };
@@ -374,7 +391,7 @@ impl SplitWorkbench {
                 .containing(&target)
                 .is_some_and(|tree| tree.contains(&auxiliary.id))
             {
-                self.close(&auxiliary.id, window, cx);
+                self.remove_pane(&auxiliary.id, window, cx);
             } else if self
                 .layouts
                 .split(target, auxiliary.id.clone(), SplitAxis::Below)
@@ -879,6 +896,12 @@ impl Render for SplitWorkbench {
                     cx,
                 );
             });
+            let drag = DraggedWorkspace {
+                session: id.clone(),
+                whole_workspace: false,
+            };
+            let preview = self.preview(&drag);
+
             let close_id = id.clone();
             let debug_id = id.clone();
             let active = self.selected.as_ref() == Some(&id);
@@ -913,6 +936,12 @@ impl Render for SplitWorkbench {
                                 .bg(colors.background)
                                 .child(
                                     div()
+                                        .id(SharedString::from(format!("drag-pane-{}", id.0)))
+                                        .cursor(gpui::CursorStyle::OpenHand)
+                                        .on_drag(drag, move |_, _, _, cx| {
+                                            cx.stop_propagation();
+                                            cx.new(|_| preview.clone())
+                                        })
                                         .text_size(px(10.0))
                                         .text_color(colors.secondary)
                                         .px(px(4.0))
@@ -949,7 +978,7 @@ impl Render for SplitWorkbench {
                                         .hover(|s| s.bg(colors.primary.alpha(0.1)))
                                         .child(sf_symbol("xmark", 10.0, colors.secondary))
                                         .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.close(&close_id, window, cx);
+                                            this.remove_pane(&close_id, window, cx);
                                         })),
                                 ),
                         ),

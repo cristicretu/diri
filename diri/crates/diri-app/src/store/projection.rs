@@ -18,6 +18,8 @@ const UNRANKED: usize = usize::MAX;
 #[derive(Clone, Debug, PartialEq)]
 pub struct SidebarRow {
     pub session: Arc<SessionRecord>,
+    /// Members of one vertical split tab; empty for an ordinary session row.
+    pub split_members: Vec<Arc<SessionRecord>>,
     /// Nesting level inside the group. Zero is a session a human started;
     /// deeper rows were spawned by an ancestor through the MCP tools.
     pub depth: u16,
@@ -58,6 +60,8 @@ pub struct SidebarProject {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SidebarProjection {
     pub projects: Vec<SidebarProject>,
+    pub split_groups: HashMap<SessionId, Vec<Arc<SessionRecord>>>,
+    pub split_owners: HashMap<SessionId, SessionId>,
     /// Flat ⌘1…⌘9 order over rows the user can actually see. Archived rows are
     /// omitted unless selected.
     pub ordered_sessions: Vec<Arc<SessionRecord>>,
@@ -81,13 +85,40 @@ pub(super) fn build_projection(
     selected: Option<&SessionId>,
     closing: &HashSet<SessionId>,
 ) -> SidebarProjection {
+    let mut split_groups = HashMap::new();
+    let mut split_owners = HashMap::new();
+    for tree in &prefs.split_layouts.layouts {
+        let members: Vec<_> = tree
+            .ids()
+            .iter()
+            .filter_map(|id| sessions.get(id))
+            .filter(|session| !session.is_archived() && !closing.contains(&session.id))
+            .cloned()
+            .collect();
+        if members.len() < 2 {
+            continue;
+        }
+        let Some(owner) = members
+            .iter()
+            .find(|session| !is_auxiliary_terminal(session))
+            .or_else(|| members.first())
+        else {
+            continue;
+        };
+        for member in &members {
+            split_owners.insert(member.id.clone(), owner.id.clone());
+        }
+        split_groups.insert(owner.id.clone(), members);
+    }
     let mut grouped: HashMap<ProjectId, Vec<Arc<SessionRecord>>> = HashMap::new();
     for session in sessions.values() {
         // Closing rows leave the sidebar as soon as the request is dispatched.
         // Workbench-owned terminal shells live under their primary agent and
         // are reopened there; exposing them as top-level rows would split one
         // workspace into two unrelated-looking sessions.
-        if closing.contains(&session.id) || is_auxiliary_terminal(session) {
+        if closing.contains(&session.id)
+            || (is_auxiliary_terminal(session) && !split_groups.contains_key(&session.id))
+        {
             continue;
         }
         grouped
@@ -136,7 +167,7 @@ pub(super) fn build_projection(
                 .then_with(|| left.id.0.cmp(&right.id.0))
         });
         let expanded = !collapsed_projects.contains(&project_id);
-        let (sessions, active) = build_tree(
+        let (mut sessions, active) = build_tree(
             active,
             &session_rank,
             &pinned_sessions,
@@ -144,6 +175,16 @@ pub(super) fn build_projection(
             expanded,
             prefs.sidebar_ordering,
         );
+        sessions.retain(|row| {
+            split_owners
+                .get(row.id())
+                .is_none_or(|owner| owner == row.id())
+        });
+        for row in &mut sessions {
+            if let Some(members) = split_groups.get(row.id()) {
+                row.split_members = members.clone();
+            }
+        }
         ranked.push((
             arrival,
             recent_activity,
@@ -177,7 +218,18 @@ pub(super) fn build_projection(
             .then_with(|| left.project.id.0.cmp(&right.project.id.0))
         },
     );
-    let result: Vec<SidebarProject> = ranked.into_iter().map(|(_, _, group)| group).collect();
+    let result: Vec<SidebarProject> = ranked
+        .into_iter()
+        .map(|(_, _, group)| group)
+        .filter(|group| {
+            !group.archived.is_empty()
+                || group.active.iter().any(|session| {
+                    split_owners
+                        .get(&session.id)
+                        .is_none_or(|owner| owner == &session.id)
+                })
+        })
+        .collect();
 
     let display_order = result
         .iter()
@@ -208,6 +260,8 @@ pub(super) fn build_projection(
 
     SidebarProjection {
         projects: result,
+        split_groups,
+        split_owners,
         ordered_sessions,
         display_order,
     }
@@ -262,6 +316,7 @@ fn build_tree(
         let is_collapsed = has_children && collapsed.contains(&session.id);
         if visible {
             rows.push(SidebarRow {
+                split_members: Vec::new(),
                 session: Arc::clone(session),
                 depth,
                 has_children,

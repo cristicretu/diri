@@ -8,6 +8,26 @@ pub const MAX_PANES: usize = 8;
 const MAX_LAYOUTS: usize = 64;
 pub const DIVIDER: f32 = 5.0;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DockEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl DockEdge {
+    pub const ALL: [Self; 4] = [Self::Left, Self::Right, Self::Top, Self::Bottom];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Left => "Add left split",
+            Self::Right => "Add right split",
+            Self::Top => "Add above",
+            Self::Bottom => "Add below",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SplitAxis {
@@ -89,6 +109,32 @@ impl SplitNode {
             Self::Session { .. } => false,
             Self::Split { first, second, .. } => {
                 first.split(target, new_id.clone(), axis) || second.split(target, new_id, axis)
+            }
+        }
+    }
+
+    fn dock(&mut self, target: &SessionId, incoming: Self, edge: DockEdge) -> bool {
+        match self {
+            Self::Session { id } if id == target => {
+                let previous = self.clone();
+                let (first, second) = match edge {
+                    DockEdge::Left | DockEdge::Top => (incoming, previous),
+                    DockEdge::Right | DockEdge::Bottom => (previous, incoming),
+                };
+                *self = Self::Split {
+                    axis: match edge {
+                        DockEdge::Left | DockEdge::Right => SplitAxis::Right,
+                        _ => SplitAxis::Below,
+                    },
+                    fraction: 0.5,
+                    first: Box::new(first),
+                    second: Box::new(second),
+                };
+                true
+            }
+            Self::Session { .. } => false,
+            Self::Split { first, second, .. } => {
+                first.dock(target, incoming.clone(), edge) || second.dock(target, incoming, edge)
             }
         }
     }
@@ -260,6 +306,9 @@ pub struct SplitLayouts {
     pub layouts: Vec<SplitNode>,
     #[serde(default)]
     pub hidden_auxiliary_parents: Vec<SessionId>,
+    /// Last focused member of each saved split workspace.
+    #[serde(default)]
+    pub focus_history: Vec<SessionId>,
 }
 
 impl Default for SplitLayouts {
@@ -268,11 +317,95 @@ impl Default for SplitLayouts {
             version: 1,
             layouts: Vec::new(),
             hidden_auxiliary_parents: Vec::new(),
+            focus_history: Vec::new(),
         }
     }
 }
 
 impl SplitLayouts {
+    /// Visit a member without producing one tab per split pane.
+    pub fn visit(&mut self, id: SessionId) {
+        let members = self
+            .containing(&id)
+            .map(|tree| tree.ids())
+            .unwrap_or_else(|| vec![id.clone()]);
+        let index = self
+            .focus_history
+            .iter()
+            .position(|tab| members.contains(tab));
+        self.focus_history.retain(|tab| !members.contains(tab));
+        self.focus_history.insert(
+            index
+                .unwrap_or(self.focus_history.len())
+                .min(self.focus_history.len()),
+            id,
+        );
+        if self.focus_history.len() > MAX_LAYOUTS {
+            self.focus_history.remove(0);
+        }
+    }
+
+    /// Validate and build the complete move before committing either workspace.
+    pub fn dock(
+        &mut self,
+        target: SessionId,
+        source: SessionId,
+        whole_workspace: bool,
+        edge: DockEdge,
+    ) -> bool {
+        let incoming = if whole_workspace {
+            self.containing(&source).cloned()
+        } else {
+            None
+        }
+        .unwrap_or_else(|| SplitNode::session(source.clone()));
+        if incoming.contains(&target) {
+            return false;
+        }
+        let moving = incoming.ids();
+        let existing = self
+            .containing(&target)
+            .map(|tree| tree.ids())
+            .unwrap_or_else(|| vec![target.clone()]);
+        let count = existing.iter().filter(|id| !moving.contains(id)).count() + moving.len();
+        if count > MAX_PANES {
+            return false;
+        }
+        let mut next = self.clone();
+        for id in &moving {
+            next.close(id);
+        }
+        if let Some(tree) = next.containing_mut(&target) {
+            tree.dock(&target, incoming, edge);
+        } else {
+            if next.layouts.len() >= MAX_LAYOUTS {
+                return false;
+            }
+            let mut tree = SplitNode::session(target.clone());
+            tree.dock(&target, incoming, edge);
+            next.layouts.push(tree);
+        }
+        // Preserve a tab for the source's remaining panes when its representative
+        // moves, and retain the destination's position when both tabs merge.
+        next.focus_history = self
+            .focus_history
+            .iter()
+            .filter_map(|tab| {
+                let members = self
+                    .containing(tab)
+                    .map(|tree| tree.ids())
+                    .unwrap_or_else(|| vec![tab.clone()]);
+                if members.contains(&target) {
+                    return Some(source.clone());
+                }
+                members.into_iter().find(|id| !moving.contains(id))
+            })
+            .collect();
+        next.visit(source);
+        *self = next;
+        true
+    }
+
     pub fn containing(&self, id: &SessionId) -> Option<&SplitNode> {
         self.layouts.iter().find(|layout| layout.contains(id))
     }
@@ -312,6 +445,11 @@ impl SplitLayouts {
             .remove(index)
             .retain(&|candidate| candidate != id)?;
         let ids = layout.ids();
+        for tab in &mut self.focus_history {
+            if tab == id {
+                *tab = ids[0].clone();
+            }
+        }
         if ids.len() > 1 {
             self.layouts.insert(index, layout);
         }
@@ -326,6 +464,19 @@ impl SplitLayouts {
             *self = Self::default();
             return;
         }
+        self.focus_history = self
+            .focus_history
+            .iter()
+            .filter_map(|id| {
+                if exists(id) {
+                    Some(id.clone())
+                } else {
+                    self.containing(id)
+                        .and_then(|tree| tree.ids().into_iter().find(&exists))
+                }
+            })
+            .collect();
+        self.focus_history.truncate(MAX_LAYOUTS);
         self.hidden_auxiliary_parents.retain(|id| exists(id));
         self.hidden_auxiliary_parents.truncate(MAX_LAYOUTS);
         self.layouts = std::mem::take(&mut self.layouts)
@@ -348,6 +499,10 @@ impl SplitLayouts {
                 Some(tree)
             })
             .collect();
+        let history = std::mem::take(&mut self.focus_history);
+        for id in history {
+            self.visit(id);
+        }
     }
 }
 
@@ -458,5 +613,101 @@ mod tests {
                 .iter()
                 .all(|(_, rect)| rect.width >= 0.0 && rect.height >= 0.0)
         );
+    }
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+    fn id(s: &str) -> SessionId {
+        SessionId::new(s)
+    }
+
+    #[test]
+    fn splitting_collapses_tabs_and_focusing_members_keeps_one_tab() {
+        let mut layouts = SplitLayouts::default();
+        layouts.visit(id("a"));
+        layouts.visit(id("b"));
+        layouts.visit(id("c"));
+        assert!(layouts.dock(id("a"), id("b"), true, DockEdge::Right));
+        assert_eq!(layouts.focus_history, vec![id("b"), id("c")]);
+        layouts.visit(id("a"));
+        assert_eq!(layouts.focus_history, vec![id("a"), id("c")]);
+        assert!(layouts.dock(id("b"), id("c"), true, DockEdge::Bottom));
+        assert_eq!(layouts.focus_history, vec![id("c")]);
+        assert_eq!(
+            layouts.containing(&id("a")).unwrap().ids(),
+            vec![id("a"), id("b"), id("c")]
+        );
+    }
+
+    #[test]
+    fn moving_a_whole_tab_preserves_its_nested_tree() {
+        let mut layouts = SplitLayouts::default();
+        layouts.split(id("a"), id("b"), SplitAxis::Below);
+        layouts.containing_mut(&id("a")).unwrap().resize(&[], 0.7);
+        let incoming = layouts.containing(&id("a")).unwrap().clone();
+        assert!(layouts.dock(id("c"), id("a"), true, DockEdge::Left));
+        let SplitNode::Split {
+            first,
+            second,
+            axis,
+            ..
+        } = layouts.containing(&id("c")).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(**first, incoming);
+        assert_eq!(**second, SplitNode::session(id("c")));
+        assert_eq!(*axis, SplitAxis::Right);
+    }
+
+    #[test]
+    fn moving_a_member_preserves_both_groups_and_can_reorder_within_a_group() {
+        let mut layouts = SplitLayouts::default();
+        layouts.split(id("a"), id("b"), SplitAxis::Right);
+        layouts.split(id("b"), id("c"), SplitAxis::Below);
+        layouts.visit(id("b"));
+        layouts.visit(id("d"));
+        assert!(layouts.dock(id("d"), id("b"), false, DockEdge::Left));
+        assert_eq!(layouts.focus_history, vec![id("a"), id("b")]);
+        assert_eq!(
+            layouts.containing(&id("a")).unwrap().ids(),
+            vec![id("a"), id("c")]
+        );
+        assert!(layouts.dock(id("d"), id("b"), false, DockEdge::Right));
+        assert_eq!(
+            layouts.containing(&id("d")).unwrap().ids(),
+            vec![id("d"), id("b")]
+        );
+        assert_eq!(layouts.focus_history.len(), 2);
+    }
+
+    #[test]
+    fn rejected_moves_are_atomic_and_limits_include_all_incoming_panes() {
+        let mut layouts = SplitLayouts::default();
+        layouts.split(id("a"), id("b"), SplitAxis::Right);
+        for i in 0..6 {
+            layouts.split(id("x"), id(&format!("x{i}")), SplitAxis::Below);
+        }
+        let before = layouts.clone();
+        assert!(!layouts.dock(id("a"), id("a"), false, DockEdge::Left));
+        assert!(!layouts.dock(id("b"), id("a"), true, DockEdge::Left));
+        assert!(!layouts.dock(id("x"), id("a"), true, DockEdge::Right));
+        assert_eq!(layouts, before);
+    }
+
+    #[test]
+    fn saved_groups_survive_representative_deletion_and_old_preferences() {
+        let mut layouts = SplitLayouts::default();
+        layouts.split(id("a"), id("b"), SplitAxis::Below);
+        layouts.visit(id("a"));
+        let json = serde_json::to_string(&layouts).unwrap();
+        let mut restored: SplitLayouts = serde_json::from_str(&json).unwrap();
+        restored.reconcile(|session| session != &id("a"));
+        assert_eq!(restored.focus_history, vec![id("b")]);
+        assert!(restored.layouts.is_empty());
+        let old: SplitLayouts = serde_json::from_str(r#"{"version":1,"layouts":[]}"#).unwrap();
+        assert!(old.focus_history.is_empty());
     }
 }

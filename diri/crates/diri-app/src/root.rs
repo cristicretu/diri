@@ -36,10 +36,11 @@ use crate::quote::Quote;
 use crate::recovery::{RecoveryAction, RecoveryKind, RecoveryNotice};
 use crate::seam::{SeamSlide, toggle_has_settled};
 use crate::session_surfaces::SessionSurfaces;
+use crate::sidebar::DraggedSidebarItem;
 use crate::sidebar::{PreviewScenario, Sidebar, SidebarEvent};
 use crate::sounds::{self, PlatformPlayer, SoundGate, StatusSound};
 use crate::split_layout::{Direction, Rect, SplitAxis};
-use crate::split_workbench::SplitWorkbench;
+use crate::split_workbench::{SplitWorkbench, drag::DraggedWorkspace};
 use crate::store::SpawnOptions;
 use crate::surface_shell::UtilitySurfaces;
 use crate::terminal_pane::{TerminalPane, TerminalPaneEvent, TerminalViewport};
@@ -367,6 +368,22 @@ impl RootView {
             .detach();
         }
         cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
+            match event {
+                SidebarEvent::GroupSessions { target, source } => {
+                    this.split_workbench.update(cx, |splits, cx| {
+                        splits.group_with(target.clone(), source, window, cx)
+                    });
+                    this.sync_auxiliary_terminal(window, cx);
+                    this.sidebar.update(cx, |_, cx| cx.notify());
+                }
+                SidebarEvent::HoverWorkspace { id, bounds } => {
+                    this.split_workbench.update(cx, |splits, cx| {
+                        splits.hover_tab(id.clone(), *bounds, window, cx)
+                    });
+                }
+                _ => {}
+            }
+
             if matches!(event, SidebarEvent::RefreshUsageLimits) {
                 let _ = this.services.usage_limits_refresh.try_send(());
             }
@@ -1383,6 +1400,14 @@ impl RootView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.key == "escape" && cx.has_active_drag() {
+            cx.stop_active_drag(window);
+            self.split_workbench
+                .update(cx, |splits, cx| splits.cancel_drag(cx));
+            cx.stop_propagation();
+            return;
+        }
+
         // The close dialog overlays the focused surface without taking its
         // focus. Handle its keys first so they cannot reach the terminal or
         // sidebar beneath it, and focus is preserved when closing is canceled.
@@ -1811,7 +1836,8 @@ impl RootView {
             return false;
         };
         self.collapsed_auxiliary_parents.remove(&parent);
-        self.split_workbench.update(cx, |splits, _| splits.show_auxiliary_for(&parent));
+        self.split_workbench
+            .update(cx, |splits, _| splits.show_auxiliary_for(&parent));
         self.sync_auxiliary_terminal(window, cx);
         if let Some(terminal) = &self.auxiliary_terminal {
             terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
@@ -1881,6 +1907,9 @@ impl RootView {
             self.auxiliary_terminal = None;
             self.auxiliary_id = None;
             self.auxiliary_parent = None;
+            if let Some(inspector) = &self.inspector {
+                inspector.update(cx, |inspector, cx| inspector.set_terminal_surface(None, cx));
+            }
         }
         self.split_workbench
             .update(cx, |splits, cx| splits.sync(window, cx));
@@ -2614,7 +2643,64 @@ impl RootView {
                 || selected
                     .as_ref()
                     .is_some_and(|id| self.auxiliary_spawn_parent.as_ref() == Some(id)));
+        self.split_workbench.update(cx, |splits, _| {
+            splits.set_viewport(
+                Rect {
+                    x: sidebar_width,
+                    y: 0.0,
+                    width: card_width,
+                    height: card_height,
+                },
+                visible_sidebar,
+                self.inspector_open,
+            )
+        });
         let mut card = div()
+            .id("terminal-workspace-card")
+            .on_drag_move(cx.listener(
+                |this, event: &gpui::DragMoveEvent<DraggedWorkspace>, _, cx| {
+                    let source = event.drag(cx).clone();
+                    this.split_workbench
+                        .update(cx, |splits, cx| splits.track_drag(source, cx));
+                },
+            ))
+            .on_drag_move(cx.listener(
+                |this, event: &gpui::DragMoveEvent<DraggedSidebarItem>, _, cx| {
+                    if let Some(id) = event.drag(cx).session_id().cloned() {
+                        this.split_workbench.update(cx, |splits, cx| {
+                            splits.track_drag(
+                                DraggedWorkspace {
+                                    session: id,
+                                    whole_workspace: false,
+                                },
+                                cx,
+                            )
+                        });
+                    }
+                },
+            ))
+            .on_drop(cx.listener(|this, source: &DraggedWorkspace, window, cx| {
+                this.split_workbench
+                    .update(cx, |splits, cx| splits.drop_workspace(source, window, cx));
+                this.sync_auxiliary_terminal(window, cx);
+            }))
+            .on_drop(
+                cx.listener(|this, source: &DraggedSidebarItem, window, cx| {
+                    if let Some(id) = source.session_id() {
+                        this.split_workbench.update(cx, |splits, cx| {
+                            splits.drop_workspace(
+                                &DraggedWorkspace {
+                                    session: id.clone(),
+                                    whole_workspace: false,
+                                },
+                                window,
+                                cx,
+                            )
+                        });
+                        this.sync_auxiliary_terminal(window, cx);
+                    }
+                }),
+            )
             .relative()
             .flex_1()
             .flex()
@@ -2798,6 +2884,13 @@ impl RootView {
                     .inset_0()
                     .child(self.split_workbench.clone()),
             );
+        }
+        if !self.preview
+            && let Some(overlay) = self
+                .split_workbench
+                .update(cx, |splits, cx| splits.drag_overlay(window, cx))
+        {
+            card = card.child(overlay);
         }
         card.child(card_outline).into_any_element()
     }
@@ -4149,6 +4242,208 @@ mod tests {
         assert_ne!(store.selected_session_id(), Some(&selected));
     }
 
+    #[gpui::test]
+    fn sidebar_drag_combines_vertical_tabs_and_cancel_keeps_the_group(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            cx.set_reduce_motion(true);
+            commands::bind_keys(cx, &Default::default());
+        });
+        let services = test_services();
+        let runtime = services.store.clone();
+        let template = SidebarPreviewFixture::make(PreviewScenario::Typical)
+            .list
+            .sessions[0]
+            .clone();
+        let ids: Vec<_> = ["drag-a", "drag-b", "drag-c"]
+            .into_iter()
+            .map(SessionId::new)
+            .collect();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store
+                .update_preferences(|prefs| prefs.sidebar_visible = true)
+                .unwrap();
+            let sessions = ids
+                .iter()
+                .map(|id| {
+                    let mut session = template.clone();
+                    session.id = id.clone();
+                    session.parent = None;
+                    session.title = id.0.clone();
+                    session.archived_at = None;
+                    session
+                })
+                .collect();
+            store.hydrate(diri_proto::SessionListResult {
+                sessions,
+                projects: vec![],
+            });
+            store.select(ids[0].clone());
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        cx.simulate_resize(size(px(1100.0), px(720.0)));
+        cx.run_until_parked();
+        let source = cx
+            .debug_bounds("SESSION_drag-b")
+            .expect("visible source session")
+            .center();
+        let destination = root
+            .read_with(cx, |root, cx| {
+                root.sidebar
+                    .read(cx)
+                    .row_bounds_for_test(&SessionId::new("drag-a"))
+            })
+            .unwrap()
+            .center();
+        cx.simulate_mouse_down(source, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            source + gpui::point(px(8.0), px(0.0)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_move(destination, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_up(destination, MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            runtime
+                .store
+                .read()
+                .unwrap()
+                .preferences()
+                .split_layouts
+                .containing(&ids[0])
+                .is_some(),
+            "drop must commit a layout"
+        );
+        assert!(
+            root.read_with(cx, |root, cx| root
+                .sidebar
+                .read(cx)
+                .row_bounds_for_test(&SessionId::new("drag-a")))
+                .is_some(),
+            "two vertical tabs become one shared group"
+        );
+        assert!(
+            root.read_with(cx, |root, cx| root
+                .sidebar
+                .read(cx)
+                .row_bounds_for_test(&SessionId::new("drag-b")))
+                .is_none(),
+            "members must not remain separate sidebar tabs"
+        );
+        let group_height = root
+            .read_with(cx, |root, cx| {
+                root.sidebar
+                    .read(cx)
+                    .row_bounds_for_test(&SessionId::new("drag-a"))
+            })
+            .unwrap()
+            .size
+            .height;
+        let ordinary_height = root
+            .read_with(cx, |root, cx| {
+                root.sidebar
+                    .read(cx)
+                    .row_bounds_for_test(&SessionId::new("drag-c"))
+            })
+            .unwrap()
+            .size
+            .height;
+        assert_eq!(
+            group_height, ordinary_height,
+            "a split group must occupy exactly one sidebar row"
+        );
+        assert!(cx.debug_bounds("SPLIT_PANE_drag-a").is_some());
+        assert!(cx.debug_bounds("SPLIT_PANE_drag-b").is_some());
+        assert!(
+            cx.debug_bounds("workspace-tabs").is_none(),
+            "no horizontal tab strip"
+        );
+        let before = runtime
+            .store
+            .read()
+            .unwrap()
+            .preferences()
+            .split_layouts
+            .clone();
+        let source = root
+            .read_with(cx, |root, cx| {
+                root.sidebar
+                    .read(cx)
+                    .row_bounds_for_test(&SessionId::new("drag-c"))
+            })
+            .unwrap()
+            .center();
+        let destination = gpui::point(px(1030.0), px(600.0));
+        cx.simulate_mouse_down(source, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            source + gpui::point(px(8.0), px(0.0)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_move(destination, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_keystrokes("escape");
+        assert!(!cx.update(|_, cx| cx.has_active_drag()));
+        cx.simulate_mouse_up(destination, MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            runtime.store.read().unwrap().preferences().split_layouts,
+            before
+        );
+        let group = root
+            .read_with(cx, |root, cx| {
+                root.sidebar
+                    .read(cx)
+                    .row_bounds_for_test(&SessionId::new("drag-a"))
+            })
+            .unwrap()
+            .center();
+        cx.simulate_mouse_down(source, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            source + gpui::point(px(8.0), px(0.0)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_move(group, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_up(group, MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            root.read_with(cx, |root, cx| root
+                .sidebar
+                .read(cx)
+                .row_bounds_for_test(&SessionId::new("drag-c")))
+                .is_none()
+        );
+        let mut store = runtime.store.write().unwrap();
+        assert_eq!(store.sessions().len(), 3);
+        assert_eq!(store.sidebar_projection().ordered_sessions.len(), 1);
+        drop(store);
+        runtime
+            .store
+            .write()
+            .unwrap()
+            .select(SessionId::new("drag-b"));
+        root.update_in(cx, |root, window, cx| {
+            root.sync_auxiliary_terminal(window, cx)
+        });
+        cx.simulate_keystrokes(&commands::test_chords("cmd-w"));
+        root.update(cx, |root, cx| root.sidebar.update(cx, |_, cx| cx.notify()));
+        cx.run_until_parked();
+        assert!(
+            root.read_with(cx, |root, cx| root
+                .sidebar
+                .read(cx)
+                .row_bounds_for_test(&SessionId::new("drag-b")))
+                .is_some(),
+            "ungrouped members return to the sidebar"
+        );
+        assert_eq!(runtime.store.read().unwrap().sessions().len(), 3);
+    }
+
     pub(super) fn test_services() -> Arc<AppServices> {
         Arc::new(AppServices {
             store: Arc::new(crate::store::StoreRuntime::inert()),
@@ -4170,7 +4465,10 @@ mod tests {
     fn fullscreen_terminal_tracks_drawable_size_with_windowed_restore_bounds(
         cx: &mut gpui::TestAppContext,
     ) {
-        cx.update(|cx| cx.set_reduce_motion(true));
+        cx.update(|cx| {
+            cx.set_reduce_motion(true);
+            commands::bind_keys(cx, &Default::default());
+        });
         let services = test_services();
         let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
         {
@@ -4235,7 +4533,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[gpui::test]
     fn switching_sidebar_conversations_keeps_terminal_focused(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| cx.set_reduce_motion(true));
+        cx.update(|cx| {
+            cx.set_reduce_motion(true);
+            commands::bind_keys(cx, &Default::default());
+        });
         let services = test_services();
         let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
         let runtime = services.store.clone();
@@ -4406,7 +4707,10 @@ mod tests {
     fn sidebar_peek_reveals_on_the_edge_and_leaves_the_layout_collapsed(
         cx: &mut gpui::TestAppContext,
     ) {
-        cx.update(|cx| cx.set_reduce_motion(true));
+        cx.update(|cx| {
+            cx.set_reduce_motion(true);
+            commands::bind_keys(cx, &Default::default());
+        });
         let services = test_services();
         let (root, cx) = cx.add_window_view(move |window, cx| {
             RootView::new(services, true, PreviewScenario::Typical, window, cx)
@@ -4662,7 +4966,10 @@ mod tests {
 
     #[gpui::test]
     fn sidebar_peek_docks_the_same_panel_on_one_motion_curve(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| cx.set_reduce_motion(true));
+        cx.update(|cx| {
+            cx.set_reduce_motion(true);
+            commands::bind_keys(cx, &Default::default());
+        });
         let services = test_services();
         let (root, cx) = cx.add_window_view(move |window, cx| {
             RootView::new(services, true, PreviewScenario::Typical, window, cx)

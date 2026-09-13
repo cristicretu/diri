@@ -912,6 +912,10 @@ fn linux_keystroke(id: CommandId, key: &str) -> Option<String> {
     if id == CommandId::HideApp {
         return None;
     }
+    // Keep the established Linux delegation binding when adding split-below.
+    if id == CommandId::SplitBelow {
+        return Some("ctrl-alt-shift-d".to_owned());
+    }
     // Cmd-Ctrl-D would otherwise collide with the inspector's Cmd-Shift-D
     // after translating macOS modifiers to Linux.
     if id == CommandId::DelegateSelectedSession {

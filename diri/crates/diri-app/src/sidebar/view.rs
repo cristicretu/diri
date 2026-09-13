@@ -1,3 +1,6 @@
+#[path = "split_groups.rs"]
+mod split_groups;
+
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -121,6 +124,14 @@ enum HorizontalFocusAction {
 
 #[derive(Clone, Debug)]
 pub(crate) enum SidebarEvent {
+    GroupSessions {
+        target: SessionId,
+        source: crate::split_workbench::drag::DraggedWorkspace,
+    },
+    HoverWorkspace {
+        id: SessionId,
+        bounds: Bounds<Pixels>,
+    },
     RefreshUsageLimits,
     ContinueAccount(SessionId),
     VisibilityChanged,
@@ -193,6 +204,7 @@ enum RowDrop {
     Insert(DropZone),
     Revive,
     Handoff,
+    Group,
     Refused(String),
 }
 
@@ -202,12 +214,16 @@ struct DragPreview {
     /// Escape cancelled the gesture. GPUI keeps the drag alive until the
     /// button comes up, so the ghost hides itself instead.
     hidden: bool,
+    workspace: Option<crate::split_workbench::drag::WorkspacePreview>,
 }
 
 impl Render for DragPreview {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.hidden {
-            return div();
+            return div().into_any_element();
+        }
+        if let Some(workspace) = &self.workspace {
+            return workspace.element(cx.reduce_motion());
         }
         div()
             .px(px(10.0))
@@ -221,6 +237,7 @@ impl Render for DragPreview {
             .text_size(px(Typo::META.size))
             .text_color(self.colors.primary)
             .child(self.label.clone())
+            .into_any_element()
     }
 }
 
@@ -303,6 +320,11 @@ impl Focusable for Sidebar {
 }
 
 impl Sidebar {
+    #[cfg(test)]
+    pub(crate) fn row_bounds_for_test(&self, id: &SessionId) -> Option<Bounds<Pixels>> {
+        self.row_bounds.borrow().get(id).copied()
+    }
+
     pub fn new(
         runtime: Option<Arc<StoreRuntime>>,
         preview: bool,
@@ -2066,6 +2088,7 @@ impl Sidebar {
                             label: drag_label.clone(),
                             colors,
                             hidden: false,
+                            workspace: None,
                         });
                         drag_entity.update(cx, |this, cx| {
                             this.begin_drag(dragged, preview.clone(), cx);
@@ -2507,8 +2530,8 @@ impl Sidebar {
         }
         // Reordering only ever moves a row inside its own sibling run, and
         // pinned rows sort ahead of the manual order, so a pin boundary is a
-        // run boundary too. Anywhere else the bands fall back to the handoff
-        // the core offers rather than drawing a marker the drop cannot honour.
+        // run boundary too. Other bands use the center-drop action rather
+        // than drawing a reorder marker that the drop cannot honour.
         let store = self.store.read().expect("session store lock poisoned");
         let sibling = store.preferences().sidebar_ordering == SidebarOrdering::Custom
             && !archived
@@ -2517,6 +2540,24 @@ impl Sidebar {
             && store.preferences().sidebar_pinned_sessions.contains(source) == row.pinned;
         if sibling && zone != DropZone::Onto {
             return Some(RowDrop::Insert(zone));
+        }
+        if !window.modifiers().alt {
+            let mut layouts = store.preferences().split_layouts.clone();
+            return Some(
+                if !archived
+                    && !target.is_archived()
+                    && layouts.dock(
+                        target.id.clone(),
+                        source.clone(),
+                        false,
+                        crate::split_layout::DockEdge::Right,
+                    )
+                {
+                    RowDrop::Group
+                } else {
+                    RowDrop::Refused("This session cannot be added to that split group.".into())
+                },
+            );
         }
         Some(
             match validate_handoff(store.sessions(), source, &target.id) {
@@ -2535,6 +2576,9 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if !row.split_members.is_empty() {
+            return self.split_group_row(row, colors, window, cx);
+        }
         let session = &row.session;
         let id = session.id.clone();
         let (selected, multi, drag_selection, migrating, unread) = {
@@ -2682,6 +2726,14 @@ impl Sidebar {
             DragItem::Sessions(ids) => format!("{} sessions", ids.len()).into(),
             _ => title.clone().into(),
         };
+        let workspace_preview =
+            (!archived && matches!(drag_item, DragItem::Session { .. })).then(|| {
+                crate::split_workbench::drag::WorkspacePreview {
+                    tree: crate::split_layout::SplitNode::session(id.clone()),
+                    labels: [(id.clone(), title.clone())].into_iter().collect(),
+                    colors,
+                }
+            });
         let drag_payload = DraggedSidebarItem(drag_item);
         let drag_entity = cx.entity();
         let row = div()
@@ -2774,6 +2826,7 @@ impl Sidebar {
                     label: drag_label.clone(),
                     colors,
                     hidden: false,
+                    workspace: workspace_preview.clone(),
                 });
                 drag_entity.update(cx, |this, cx| {
                     this.begin_drag(dragged, preview.clone(), cx);
@@ -2786,7 +2839,10 @@ impl Sidebar {
             // red at every row the pointer crosses; the refusal is explained
             // on release instead.
             .drag_over::<DraggedSidebarItem>({
-                let handoff = matches!(drop, Some(RowDrop::Handoff | RowDrop::Revive));
+                let handoff = matches!(
+                    drop,
+                    Some(RowDrop::Handoff | RowDrop::Group | RowDrop::Revive)
+                );
                 move |element, _, _, _| {
                     if handoff {
                         element
@@ -2798,6 +2854,37 @@ impl Sidebar {
                     }
                 }
             })
+            .on_drag_move(cx.listener({
+                let id = id.clone();
+                move |_,
+                      event: &gpui::DragMoveEvent<
+                    crate::split_workbench::drag::DraggedWorkspace,
+                >,
+                      _,
+                      cx| {
+                    if event.bounds.contains(&event.event.position) {
+                        cx.emit(SidebarEvent::HoverWorkspace {
+                            id: id.clone(),
+                            bounds: event.bounds,
+                        });
+                    }
+                }
+            }))
+            .drag_over::<crate::split_workbench::drag::DraggedWorkspace>(|style, _, _, _| {
+                style
+                    .bg(Palette::CLAY.alpha(0.15))
+                    .border_color(Palette::CLAY.alpha(0.6))
+            })
+            .on_drop(cx.listener({
+                let id = id.clone();
+                move |_, source: &crate::split_workbench::drag::DraggedWorkspace, _, cx| {
+                    cx.emit(SidebarEvent::GroupSessions {
+                        target: id.clone(),
+                        source: source.clone(),
+                    });
+                    cx.stop_propagation();
+                }
+            }))
             .on_drop(cx.listener({
                 let target = id.clone();
                 let drop = drop.clone();
@@ -3242,6 +3329,7 @@ impl Sidebar {
                         label: drag_label.clone(),
                         colors,
                         hidden: false,
+                        workspace: None,
                     });
                     drag_entity.update(cx, |this, cx| {
                         this.begin_drag(dragged, preview.clone(), cx);
@@ -5708,8 +5796,10 @@ impl Sidebar {
             }
             let drop = drop.unwrap_or(if &source == target {
                 RowDrop::Origin
-            } else {
+            } else if window.modifiers().alt {
                 RowDrop::Handoff
+            } else {
+                RowDrop::Group
             });
             match drop {
                 RowDrop::Origin => {
@@ -5726,6 +5816,13 @@ impl Sidebar {
                     }
                 }
                 RowDrop::Insert(zone) => self.reorder_session_beside(&source, target, zone),
+                RowDrop::Group => cx.emit(SidebarEvent::GroupSessions {
+                    target: target.clone(),
+                    source: crate::split_workbench::drag::DraggedWorkspace {
+                        session: source,
+                        whole_workspace: false,
+                    },
+                }),
                 RowDrop::Handoff => {
                     let proposal = {
                         let store = self.store.read().expect("session store lock poisoned");
@@ -6386,6 +6483,12 @@ fn recency_rows(
         .projects
         .iter()
         .flat_map(|group| &group.active)
+        .filter(|session| {
+            projection
+                .split_owners
+                .get(&session.id)
+                .is_none_or(|owner| owner == &session.id)
+        })
         .map(|session| {
             (
                 RecencyBucket::for_day(
@@ -6393,6 +6496,11 @@ fn recency_rows(
                     today,
                 ),
                 crate::store::SidebarRow {
+                    split_members: projection
+                        .split_groups
+                        .get(&session.id)
+                        .cloned()
+                        .unwrap_or_default(),
                     session: Arc::clone(session),
                     depth: 0,
                     has_children: false,
@@ -8586,12 +8694,23 @@ mod tests {
     }
 
     #[gpui::test]
-    fn dropping_onto_a_row_proposes_a_handoff(cx: &mut TestAppContext) {
+    fn option_drop_onto_a_row_proposes_a_handoff(cx: &mut TestAppContext) {
         let (sidebar, handoffs, cx) = drag_harness(cx);
         let claude = row_bounds(&sidebar, cx, "preview-claude");
         let codex = row_bounds(&sidebar, cx, "preview-codex");
 
-        drag_and_release(cx, claude.center(), codex.center());
+        let modifiers = Modifiers {
+            alt: true,
+            ..Modifiers::default()
+        };
+        cx.simulate_mouse_down(claude.center(), MouseButton::Left, modifiers);
+        cx.simulate_mouse_move(
+            claude.center() + point(px(0.0), px(6.0)),
+            MouseButton::Left,
+            modifiers,
+        );
+        cx.simulate_mouse_move(codex.center(), MouseButton::Left, modifiers);
+        cx.simulate_mouse_up(codex.center(), MouseButton::Left, modifiers);
 
         let handoffs = handoffs.borrow();
         assert_eq!(handoffs.len(), 1);
@@ -8651,7 +8770,7 @@ mod tests {
     fn a_pinned_row_never_offers_to_reorder_across_the_pin_boundary(cx: &mut TestAppContext) {
         // preview-claude is pinned, so the projection keeps it above every
         // unpinned sibling; a marker there would promise a move that never
-        // lands. Its bands offer the handoff instead, like a cousin's.
+        // lands. Its bands offer grouping instead, like a cousin's.
         let (sidebar, handoffs, cx) = drag_harness(cx);
         let claude = row_bounds(&sidebar, cx, "preview-claude");
         let shell = row_bounds(&sidebar, cx, "preview-shell");
@@ -8661,7 +8780,10 @@ mod tests {
         assert!(cx.debug_bounds("insertion-marker:After").is_none());
         cx.simulate_mouse_up(below, MouseButton::Left, Modifiers::default());
 
-        assert_eq!(handoffs.borrow().len(), 1);
+        assert!(
+            handoffs.borrow().is_empty(),
+            "ordinary drops group instead of handing off"
+        );
         assert_eq!(
             top_level_run(&sidebar, cx),
             ["preview-claude", "preview-codex", "preview-shell"]
@@ -8669,7 +8791,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_cousin_row_offers_a_handoff_from_every_band(cx: &mut TestAppContext) {
+    fn a_cousin_row_offers_grouping_from_every_band(cx: &mut TestAppContext) {
         // preview-cursor is codex's child: not a sibling of claude, so its
         // bands cannot mean "reorder" and fall back to the drop-onto action.
         let (sidebar, handoffs, cx) = drag_harness(cx);
@@ -8681,7 +8803,10 @@ mod tests {
         assert!(cx.debug_bounds("insertion-marker:Before").is_none());
         cx.simulate_mouse_up(edge, MouseButton::Left, Modifiers::default());
 
-        assert_eq!(handoffs.borrow().len(), 1);
+        assert!(
+            handoffs.borrow().is_empty(),
+            "ordinary drops group instead of handing off"
+        );
         assert_eq!(
             top_level_run(&sidebar, cx),
             ["preview-claude", "preview-codex", "preview-shell"]
