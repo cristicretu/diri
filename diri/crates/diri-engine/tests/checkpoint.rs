@@ -247,6 +247,7 @@ fn adoption_seeds_from_the_checkpoint_not_the_raw_tail() {
     ScreenCheckpoint {
         log_offset: planted_offset,
         history: Vec::new(),
+        history_metadata: Vec::new(),
         grid: synthetic_grid("PAINTED-FROM-CHECKPOINT"),
         marker_buffer: Vec::new(),
         alt_screen: false,
@@ -325,6 +326,7 @@ fn a_stale_checkpoint_falls_back_to_tail_replay() {
     ScreenCheckpoint {
         log_offset: log_tail(&logs, "s_fb"),
         history: Vec::new(),
+        history_metadata: Vec::new(),
         grid,
         marker_buffer: Vec::new(),
         alt_screen: false,

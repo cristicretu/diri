@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 
 use diri_proto::frames::{Frame, FrameType, MAX_FRAME_BYTES};
 use diri_proto::remote_pty::{
-    ControlGranted, ControlRevoked, FOREGROUND_PROCESS_PROTOCOL_MINOR, ForegroundProcess,
-    FullSnapshot, GridDelta, Hello, HelloAck, LaunchRequest, LaunchResult,
-    PHASE_ONE_HOLDER_CAPABILITIES, ProcessExit, RemoteCodec, RemoteError, RemoteMessage,
+    ANNOTATED_HOLDER_CAPABILITIES, ControlGranted, ControlRevoked,
+    FOREGROUND_PROCESS_PROTOCOL_MINOR, ForegroundProcess, FullSnapshot, GridDelta, Hello, HelloAck,
+    LaunchRequest, LaunchResult, ProcessExit, RemoteCodec, RemoteError, RemoteMessage,
     RemoteProcessState, ScrollbackResponse, validate_terminal_dimensions,
 };
 use diri_pty::{Exit, ExitWatcher, Pty, PtySpec, PtyStream};
@@ -43,7 +43,7 @@ const FOREGROUND_PROBE_AFTER_INPUT: Duration = Duration::from_millis(100);
 const FOREGROUND_PROBE_WHILE_JOB: Duration = Duration::from_secs(1);
 
 pub const PHASE_ONE_CAPABILITIES: &[diri_proto::remote_pty::RemoteCapability] =
-    PHASE_ONE_HOLDER_CAPABILITIES;
+    ANNOTATED_HOLDER_CAPABILITIES;
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -955,6 +955,7 @@ impl Holder {
         self.state.controller_epoch = self.state.controller_epoch.saturating_add(1);
         let epoch = self.state.controller_epoch;
         connection.epoch = Some(epoch);
+        connection.protocol_minor = hello.protocol.minor;
         self.controller_protocol_minor = hello.protocol.minor;
         let foreground_pid = self.pty.foreground_pgid();
         self.last_foreground_pid = Some(foreground_pid);
@@ -1251,6 +1252,7 @@ fn resolve_remote_executable(
 }
 
 struct Connection {
+    protocol_minor: u16,
     stream: UnixStream,
     codec: RemoteCodec,
     epoch: Option<u64>,
@@ -1261,6 +1263,7 @@ struct Connection {
 impl Connection {
     fn new(stream: UnixStream) -> Self {
         Self {
+            protocol_minor: 0,
             stream,
             codec: RemoteCodec::new(),
             epoch: None,
@@ -1269,7 +1272,26 @@ impl Connection {
         }
     }
 
-    fn queue(&mut self, message: RemoteMessage) -> io::Result<()> {
+    fn queue(&mut self, mut message: RemoteMessage) -> io::Result<()> {
+        if self.protocol_minor < diri_proto::remote_pty::TERMINAL_ANNOTATIONS_PROTOCOL_MINOR {
+            match &mut message {
+                RemoteMessage::HelloAck(value) => value.capabilities.retain(|capability| {
+                    *capability != diri_proto::remote_pty::RemoteCapability::TerminalAnnotations
+                }),
+                RemoteMessage::FullSnapshot(value) => {
+                    for row in &mut value.grid.changed_rows {
+                        row.metadata = Default::default();
+                    }
+                }
+                RemoteMessage::GridDelta(value) => {
+                    for row in &mut value.grid.changed_rows {
+                        row.metadata = Default::default();
+                    }
+                }
+                RemoteMessage::ScrollbackResponse(value) => value.result.metadata.clear(),
+                _ => {}
+            }
+        }
         RemoteCodec::encode_into(&message, &mut self.outbound).map_err(io::Error::other)
     }
 
@@ -1408,6 +1430,55 @@ fn terminate_process_group(pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn annotations_are_negotiated_without_breaking_old_controllers() {
+        use diri_proto::grid::{ChangedRow, GridCell, GridUpdate, LinkSpan};
+        for minor in [5, 6] {
+            let (stream, _peer) = UnixStream::pair().unwrap();
+            let mut connection = Connection::new(stream);
+            connection.protocol_minor = minor;
+            let mut row = ChangedRow::new(0, vec![GridCell::default(); 4]);
+            row.metadata.links.push(LinkSpan {
+                start: 0,
+                end: 4,
+                uri: "https://example.com".into(),
+            });
+            let mut grid = GridUpdate {
+                cols: 4,
+                rows: 1,
+                cursor_col: 0,
+                cursor_row: 0,
+                cursor_visible: true,
+                is_full_snapshot: true,
+                changed_rows: Vec::new(),
+            };
+            grid.is_full_snapshot = true;
+            grid.changed_rows.push(row);
+            connection
+                .queue(RemoteMessage::FullSnapshot(FullSnapshot {
+                    sequence: 1,
+                    alt_screen: false,
+                    bracketed_paste: false,
+                    mouse: Default::default(),
+                    grid,
+                }))
+                .unwrap();
+            let messages = RemoteCodec::new().feed(&connection.outbound).unwrap();
+            let RemoteMessage::FullSnapshot(snapshot) = &messages[0] else {
+                panic!("snapshot");
+            };
+            assert_eq!(
+                snapshot.grid.changed_rows[0].metadata.links.len(),
+                usize::from(minor >= 6)
+            );
+        }
+        assert_eq!(
+            serde_json::to_string(&diri_proto::remote_pty::RemoteCapability::TerminalAnnotations)
+                .unwrap(),
+            "\"terminal-annotations-v1\""
+        );
+    }
 
     #[test]
     fn pending_bytes_compact_after_a_complete_write() {

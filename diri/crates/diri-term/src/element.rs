@@ -41,6 +41,23 @@ pub enum TerminalReference {
     File(String),
 }
 
+pub type ReferenceSpan = (i64, usize, usize);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferenceHit {
+    pub reference: TerminalReference,
+    /// Absolute row, start column, exclusive end column.
+    pub spans: Vec<ReferenceSpan>,
+}
+
+impl TerminalReference {
+    pub fn destination(&self) -> &str {
+        match self {
+            Self::Url(value) | Self::File(value) => value,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RendererStats {
     pub frames: u64,
@@ -73,6 +90,7 @@ pub struct TerminalElement {
     ime_state: Arc<Mutex<TerminalImeState>>,
     focus_override: Option<bool>,
     suspended: bool,
+    hovered_reference: Option<ReferenceHit>,
 }
 
 #[derive(Default)]
@@ -382,6 +400,7 @@ impl TerminalElement {
             ime_state: Arc::new(Mutex::new(TerminalImeState::default())),
             focus_override: None,
             suspended: false,
+            hovered_reference: None,
         }
     }
 
@@ -429,6 +448,11 @@ impl TerminalElement {
     }
 
     #[must_use]
+    pub fn hovered_reference(mut self, hit: Option<ReferenceHit>) -> Self {
+        self.hovered_reference = hit;
+        self
+    }
+
     pub fn font_size(mut self, font_size: Pixels) -> Self {
         self.font_size = font_size;
         self
@@ -482,7 +506,7 @@ impl TerminalElement {
         let live_start_row = viewport.live_start_row();
         let mut buffer = write_lock(&self.buffer);
         viewport.hold_reading_view(&buffer);
-        let reading_held = viewport.view_offset() > 0;
+        let reading_held = viewport.is_reading();
         drop(viewport);
         let replaces_grid =
             update.is_full_snapshot || buffer.cols != update.cols || buffer.rows != update.rows;
@@ -523,6 +547,16 @@ impl TerminalElement {
         *mutex_lock(&self.shared.stats) = RendererStats::default();
     }
 
+    /// Cache key without cloning the potentially multi-megabyte reading view.
+    pub fn reference_revision(&self) -> (u64, i64, Option<u64>) {
+        let viewport = mutex_lock(&self.shared.viewport);
+        (
+            read_lock(&self.buffer).generation(),
+            viewport.view_offset(),
+            viewport.cache_seq(),
+        )
+    }
+
     #[must_use]
     pub fn viewport(&self) -> ScrollbackViewport {
         mutex_lock(&self.shared.viewport).clone()
@@ -543,21 +577,30 @@ impl TerminalElement {
         let mut viewport = mutex_lock(&self.shared.viewport);
         let changed = viewport.set_view_offset(offset, visible_rows);
         viewport.hold_reading_view(&read_lock(&self.buffer));
-        if changed && viewport.view_offset() == 0 {
+        if changed && !viewport.is_reading() {
             mutex_lock(&self.shared.selection).clear();
         }
         changed
+    }
+
+    /// Keep the displayed text stable while keyboard selection owns input.
+    pub fn pin_keyboard_selection(&self, pinned: bool) {
+        mutex_lock(&self.shared.viewport).pin_keyboard(pinned, &read_lock(&self.buffer));
     }
 
     pub fn scroll_to_live(&self, visible_rows: usize) -> bool {
         self.set_view_offset(0, visible_rows)
     }
 
+    pub fn adopt_history_geometry(&self, live_start: i64, total: i64, sequence: u64, rows: usize) {
+        mutex_lock(&self.shared.viewport).apply_geometry(live_start, total, sequence, rows);
+    }
+
     pub fn scroll_to_absolute(&self, absolute_row: i64, anchor: f32, visible_rows: usize) -> bool {
         let mut viewport = mutex_lock(&self.shared.viewport);
         let changed = viewport.scroll_to_absolute(absolute_row, anchor, visible_rows);
         viewport.hold_reading_view(&read_lock(&self.buffer));
-        if changed && viewport.view_offset() == 0 {
+        if changed && !viewport.is_reading() {
             mutex_lock(&self.shared.selection).clear();
         }
         changed
@@ -594,7 +637,7 @@ impl TerminalElement {
                 let mut viewport = mutex_lock(&self.shared.viewport);
                 let changed = viewport.scroll_by(lines, usize::from(event.visible_rows));
                 viewport.hold_reading_view(&read_lock(&self.buffer));
-                if changed && viewport.view_offset() == 0 {
+                if changed && !viewport.is_reading() {
                     mutex_lock(&self.shared.selection).clear();
                 }
             }
@@ -630,11 +673,14 @@ impl TerminalElement {
     }
 
     pub fn drag_selection(&self, col: usize, window_row: usize) {
-        let absolute_row = mutex_lock(&self.shared.viewport).absolute_row(window_row);
-        mutex_lock(&self.shared.selection).drag_to(SelectionPoint {
-            row: absolute_row,
-            col,
-        });
+        let viewport = mutex_lock(&self.shared.viewport);
+        let buffer = read_lock(&self.buffer);
+        mutex_lock(&self.shared.selection).drag_in_view(&viewport, &buffer, window_row, col);
+    }
+
+    pub fn begin_rectangle_selection(&self, col: usize, row: usize) {
+        let row = mutex_lock(&self.shared.viewport).absolute_row(row);
+        mutex_lock(&self.shared.selection).begin_rectangle(SelectionPoint { row, col });
     }
 
     pub fn select_word(&self, col: usize, window_row: usize) {
@@ -670,9 +716,25 @@ impl TerminalElement {
     /// indented/table column; file references remain confined to one row.
     #[must_use]
     pub fn reference_at(&self, col: usize, window_row: usize) -> Option<TerminalReference> {
+        self.reference_hit_at(col, window_row)
+            .map(|hit| hit.reference)
+    }
+
+    pub fn reference_hit_at(&self, col: usize, window_row: usize) -> Option<ReferenceHit> {
         let viewport = mutex_lock(&self.shared.viewport);
         let buffer = read_lock(&self.buffer);
         let absolute_row = viewport.absolute_row(window_row);
+        let metadata = viewport.row_metadata(&buffer, absolute_row);
+        if let Some(link) = metadata
+            .links
+            .iter()
+            .find(|link| usize::from(link.start) <= col && col < usize::from(link.end))
+        {
+            return reference_from_run(&link.uri).map(|reference| ReferenceHit {
+                reference,
+                spans: vec![(absolute_row, usize::from(link.start), usize::from(link.end))],
+            });
+        }
         let row = viewport.row_at_absolute(&buffer, absolute_row);
         let chars: Vec<char> = row
             .iter()
@@ -685,10 +747,13 @@ impl TerminalElement {
         if !is_reference_char(chars[col]) {
             return None;
         }
-        if let Some(url) = wrapped_url_at(col, absolute_row, |row| {
+        if let Some((url, spans)) = wrapped_url_at(col, absolute_row, |row| {
             viewport.row_at_absolute(&buffer, row)
         }) {
-            return Some(TerminalReference::Url(url));
+            return Some(ReferenceHit {
+                reference: TerminalReference::Url(url),
+                spans,
+            });
         }
         drop(buffer);
         let mut start = col;
@@ -700,7 +765,23 @@ impl TerminalElement {
             end += 1;
         }
         let candidate: String = chars[start..end].iter().collect();
-        reference_from_run(&candidate)
+        reference_from_run(&candidate).map(|reference| {
+            // Underline the target text, excluding punctuation wrappers.
+            let target = reference.destination();
+            let prefix = candidate
+                .find(target)
+                .map(|byte| candidate[..byte].chars().count())
+                .unwrap_or(0);
+            let target_start = start + prefix;
+            ReferenceHit {
+                spans: vec![(
+                    absolute_row,
+                    target_start,
+                    (target_start + target.chars().count()).min(end),
+                )],
+                reference,
+            }
+        })
     }
 
     #[must_use]
@@ -1009,7 +1090,7 @@ impl Element for TerminalElement {
         let cache_misses;
         let mut paint_from_cache = false;
 
-        if viewport.view_offset() > 0 {
+        if viewport.is_reading() {
             // History browsing composes owned rows per frame; quads are cheap
             // arithmetic, but shaping is not, so shaped lines are reused from
             // the absolute-row cache. Returning live still forces one complete
@@ -1143,6 +1224,28 @@ impl Element for TerminalElement {
                 &mut overlay_quads,
             );
         }
+        if let Some(hit) = &self.hovered_reference {
+            let top = viewport.absolute_row(0);
+            for &(row, start, end) in &hit.spans {
+                if row < top || row >= top + visible_rows as i64 {
+                    continue;
+                }
+                let origin = point(
+                    bounds.left() + metrics.cell_width * start as f32,
+                    bounds.top() + metrics.line_height * (row - top + 1) as f32 - px(2.0),
+                );
+                overlay_quads.push(fill(
+                    Bounds::new(
+                        origin,
+                        size(
+                            metrics.cell_width * end.saturating_sub(start) as f32,
+                            px(1.0),
+                        ),
+                    ),
+                    self.theme.foreground,
+                ));
+            }
+        }
         for span in mutex_lock(&self.shared.find_spans).iter().copied() {
             append_overlay_quad(
                 span.row,
@@ -1161,7 +1264,7 @@ impl Element for TerminalElement {
 
         let cursor_visible = cursor_should_render(focused, cursor.visible);
         let cursor = if cursor_visible
-            && viewport.view_offset() == 0
+            && !viewport.is_reading()
             && usize::from(cursor.row) < visible_rows
             && usize::from(cursor.col) < visible_cols
         {
@@ -1639,7 +1742,7 @@ fn wrapped_url_at(
     col: usize,
     clicked_row: i64,
     row_at: impl Fn(i64) -> Vec<GridCell>,
-) -> Option<String> {
+) -> Option<(String, Vec<ReferenceSpan>)> {
     const MAX_ROWS: usize = 16;
     const MAX_URL_BYTES: usize = 4096;
     let read_row = |row| {
@@ -1687,6 +1790,7 @@ fn wrapped_url_at(
                 while lane_start < start && chars[lane_start].is_whitespace() {
                     lane_start += 1;
                 }
+                let mut spans = vec![(start_row, start, end)];
                 let mut hit = behind == 0 && (start..end).contains(&col);
                 let mut at_edge = end == chars.len();
                 for ahead in 1..MAX_ROWS {
@@ -1700,7 +1804,7 @@ fn wrapped_url_at(
                     }
                     if next_start >= next.len() || next[next_start].is_whitespace() {
                         if closer.is_none() && ahead > 1 && hit {
-                            return url_from_run(&candidate);
+                            return url_from_run(&candidate).map(|url| (url, spans.clone()));
                         }
                         break;
                     }
@@ -1713,7 +1817,7 @@ fn wrapped_url_at(
                     if url_from_run(&fragment).is_some() || fragment.contains(['|', '│', '─', '━'])
                     {
                         if closer.is_none() && ahead > 1 && hit {
-                            return url_from_run(&candidate);
+                            return url_from_run(&candidate).map(|url| (url, spans.clone()));
                         }
                         break;
                     }
@@ -1721,12 +1825,13 @@ fn wrapped_url_at(
                         break;
                     }
                     candidate.push_str(&fragment);
+                    spans.push((row_number, next_start, next_end));
                     hit |= row_number == clicked_row && (next_start..next_end).contains(&col);
                     at_edge = next_end == next.len();
                     let complete = closer.map_or(!at_edge, |close| fragment.contains(close));
                     if complete {
                         if hit {
-                            return url_from_run(&candidate);
+                            return url_from_run(&candidate).map(|url| (url, spans.clone()));
                         }
                         break;
                     }
@@ -2445,6 +2550,7 @@ mod selection_repaint_tests {
         texts: &[&str],
     ) -> diri_proto::methods::ReadScrollbackCellsResult {
         diri_proto::methods::ReadScrollbackCellsResult {
+            metadata: Vec::new(),
             payload: diri_proto::grid::GridRowCodec::encode_rows(
                 &texts.iter().map(|text| row(text)).collect::<Vec<_>>(),
             )
@@ -2456,6 +2562,49 @@ mod selection_repaint_tests {
             cols: i64::from(COLS),
             content_seq: seq,
         }
+    }
+
+    #[test]
+    fn named_link_resolves_label_span_and_rejects_unsafe_destination() {
+        use diri_proto::grid::LinkSpan;
+        let element = populated_element();
+        let mut frame = update(false, &[(0, "label")]);
+        frame.changed_rows[0].metadata.links.push(LinkSpan {
+            start: 0,
+            end: 5,
+            uri: "https://example.com/pr/1".into(),
+        });
+        element.apply_damage(frame.clone());
+        let hit = element.reference_hit_at(2, 0).unwrap();
+        assert_eq!(hit.reference.destination(), "https://example.com/pr/1");
+        assert_eq!(hit.spans, vec![(0, 0, 5)]);
+        assert!(element.reference_hit_at(5, 0).is_none());
+        frame.changed_rows[0].metadata.links[0].uri = "javascript:alert(1)".into();
+        element.apply_damage(frame);
+        assert!(element.reference_hit_at(2, 0).is_none());
+    }
+
+    #[test]
+    fn keyboard_copy_holds_live_text_until_exit() {
+        let element = populated_element();
+        element.pin_keyboard_selection(true);
+        element.begin_selection(0, 0);
+        element.drag_selection(4, 0);
+        element.apply_damage(update(false, &[(0, "new")]));
+        assert_eq!(element.selected_text(), "zero");
+        assert_eq!(
+            element
+                .viewport()
+                .window_row(&super::read_lock(&element.buffer), 0),
+            row("zero")
+        );
+        element.pin_keyboard_selection(false);
+        assert_eq!(
+            element
+                .viewport()
+                .window_row(&super::read_lock(&element.buffer), 0),
+            row("new")
+        );
     }
 
     #[test]

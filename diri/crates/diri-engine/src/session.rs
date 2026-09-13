@@ -2754,13 +2754,18 @@ fn pump_held(
                     && tail - checkpoint.log_offset <= replay_budget as u64
             })
             .filter(|checkpoint| {
-                shared.screen.lock().expect("screen").restore(
+                let mut screen = shared.screen.lock().expect("screen");
+                let restored = screen.restore(
                     &checkpoint.history,
                     &checkpoint.grid,
                     checkpoint.alt_screen,
                     checkpoint.bracketed_paste,
                     checkpoint.mouse,
-                )
+                );
+                if restored {
+                    screen.restore_history_metadata(&checkpoint.history_metadata);
+                }
+                restored
             });
         match restored {
             Some(checkpoint) => (
@@ -3247,10 +3252,11 @@ fn persist_checkpoint(
     marker_buffer: &[u8],
     last_key: &mut Option<CheckpointKey>,
 ) {
-    let (history, grid, alt_screen, bracketed_paste, mouse, content_seq) = {
+    let (history, history_metadata, grid, alt_screen, bracketed_paste, mouse, content_seq) = {
         let screen = shared.screen.lock().expect("screen");
         (
             screen.history_snapshot(),
+            screen.history_metadata(),
             screen.full_snapshot(),
             screen.is_alt_screen(),
             screen.bracketed_paste(),
@@ -3272,6 +3278,7 @@ fn persist_checkpoint(
     let checkpoint = crate::checkpoint::ScreenCheckpoint {
         log_offset: offset,
         history,
+        history_metadata,
         grid,
         marker_buffer: marker_buffer.to_vec(),
         alt_screen,

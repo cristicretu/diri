@@ -1,6 +1,6 @@
 //! Scroll-invariant terminal selection over a composed history/live window.
 
-use diri_proto::grid::GridCell;
+use diri_proto::grid::{GridCell, TermStyle};
 
 use crate::buffer::GridBuffer;
 use crate::scrollback::ScrollbackViewport;
@@ -32,10 +32,21 @@ enum WordClass {
     Punctuation,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Granularity {
+    #[default]
+    Cell,
+    Word,
+    Line,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct TerminalSelection {
     anchor: Option<SelectionPoint>,
     head: Option<SelectionPoint>,
+    granularity: Granularity,
+    initial: Option<SelectionRange>,
+    rectangle: bool,
 }
 
 impl TerminalSelection {
@@ -50,11 +61,11 @@ impl TerminalSelection {
     }
 
     pub fn clear(&mut self) {
-        self.anchor = None;
-        self.head = None;
+        *self = Self::default();
     }
 
     pub fn begin(&mut self, point: SelectionPoint) {
+        self.clear();
         self.anchor = Some(point);
         self.head = Some(point);
     }
@@ -62,6 +73,57 @@ impl TerminalSelection {
     pub fn drag_to(&mut self, point: SelectionPoint) {
         if self.anchor.is_some() {
             self.head = Some(point);
+        }
+    }
+
+    pub fn begin_rectangle(&mut self, point: SelectionPoint) {
+        self.begin(point);
+        self.rectangle = true;
+    }
+
+    pub fn drag_in_view(
+        &mut self,
+        viewport: &ScrollbackViewport,
+        buffer: &GridBuffer,
+        row: usize,
+        col: usize,
+    ) {
+        let point = SelectionPoint {
+            row: viewport.absolute_row(row),
+            col,
+        };
+        let Some(initial) = self.initial else {
+            self.drag_to(point);
+            return;
+        };
+        let mut target = Self::default();
+        match self.granularity {
+            Granularity::Cell => {
+                self.drag_to(point);
+                return;
+            }
+            Granularity::Word => target.select_word(viewport, buffer, row, col),
+            Granularity::Line => target.select_line(viewport, buffer, row),
+        }
+        let Some(range) = target.range() else {
+            return;
+        };
+        if point < initial.start {
+            self.anchor = Some(initial.end);
+            self.head = Some(range.start);
+        } else {
+            self.anchor = Some(initial.start);
+            self.head = Some(initial.end.max(range.end));
+        }
+    }
+
+    fn columns(&self, range: SelectionRange, row: i64, cols: usize) -> (usize, usize) {
+        if self.rectangle {
+            let a = self.anchor.unwrap().col;
+            let b = self.head.unwrap().col;
+            (a.min(b).min(cols), a.max(b).saturating_add(1).min(cols))
+        } else {
+            columns_for_row(range, row, cols)
         }
     }
 
@@ -73,6 +135,7 @@ impl TerminalSelection {
         head_col: usize,
         head_row: usize,
     ) {
+        self.clear();
         self.anchor = Some(SelectionPoint {
             row: viewport.absolute_row(anchor_row),
             col: anchor_col,
@@ -92,6 +155,7 @@ impl TerminalSelection {
         window_row: usize,
         col: usize,
     ) {
+        self.clear();
         let row = viewport.window_row(buffer, window_row);
         if row.is_empty() {
             self.clear();
@@ -108,6 +172,8 @@ impl TerminalSelection {
                 row: absolute_row,
                 col: end,
             });
+            self.granularity = Granularity::Word;
+            self.initial = self.range();
             return;
         }
         let class = word_class(row[col]);
@@ -128,6 +194,8 @@ impl TerminalSelection {
             row: absolute_row,
             col: end,
         });
+        self.granularity = Granularity::Word;
+        self.initial = self.range();
     }
 
     /// Expands a triple-click to the complete visual row. Terminal padding is
@@ -139,6 +207,7 @@ impl TerminalSelection {
         buffer: &GridBuffer,
         window_row: usize,
     ) {
+        self.clear();
         let row = viewport.window_row(buffer, window_row);
         if row.is_empty() {
             self.clear();
@@ -153,6 +222,8 @@ impl TerminalSelection {
             row: absolute_row,
             col: row.len(),
         });
+        self.granularity = Granularity::Line;
+        self.initial = self.range();
     }
 
     #[must_use]
@@ -183,7 +254,7 @@ impl TerminalSelection {
         if absolute_row < range.start.row || absolute_row > range.end.row {
             return false;
         }
-        let (start, end) = columns_for_row(range, absolute_row, cols);
+        let (start, end) = self.columns(range, absolute_row, cols);
         start < end
     }
 
@@ -210,7 +281,7 @@ impl TerminalSelection {
         }
         (first..=last)
             .filter_map(|absolute_row| {
-                let (start_col, end_col) = columns_for_row(range, absolute_row, cols);
+                let (start_col, end_col) = self.columns(range, absolute_row, cols);
                 (start_col < end_col).then_some(SelectionSpan {
                     row: usize::try_from(absolute_row - window_top).ok()?,
                     start_col,
@@ -228,21 +299,40 @@ impl TerminalSelection {
             return String::new();
         };
         let cols = usize::from(buffer.cols);
-        let mut lines = Vec::new();
+        let mut text = String::new();
         for absolute_row in range.start.row..=range.end.row {
-            let (start_col, end_col) = columns_for_row(range, absolute_row, cols);
-            if start_col >= end_col {
-                lines.push(String::new());
-                continue;
-            }
+            let (start_col, end_col) = self.columns(range, absolute_row, cols);
             let row = viewport.row_at_absolute(buffer, absolute_row);
+            let metadata = viewport.row_metadata(buffer, absolute_row);
             let mut line = String::new();
-            for cell in &row[start_col..end_col] {
+            for (col, cell) in row.iter().enumerate().take(end_col).skip(start_col) {
+                if cell.scalar == 0 || cell.style.contains(TermStyle::WIDE_SPACER) {
+                    continue;
+                }
                 line.push(cell_char(*cell));
+                if let Some((_, extra)) = metadata
+                    .graphemes
+                    .iter()
+                    .find(|(x, _)| usize::from(*x) == col)
+                {
+                    line.push_str(extra);
+                }
             }
-            lines.push(line.trim_end_matches(' ').to_owned());
+            let wraps = !self.rectangle
+                && end_col == cols
+                && row
+                    .last()
+                    .is_some_and(|cell| cell.style.contains(TermStyle::SOFT_WRAP));
+            text.push_str(if wraps {
+                &line
+            } else {
+                line.trim_end_matches(' ')
+            });
+            if absolute_row < range.end.row && !wraps {
+                text.push('\n');
+            }
         }
-        lines.join("\n")
+        text
     }
 }
 
@@ -493,5 +583,65 @@ mod tests {
         assert!(selection.overlaps_row(0, 8));
         assert!(selection.overlaps_row(1, 8));
         assert!(!selection.overlaps_row(2, 8));
+    }
+}
+
+#[cfg(test)]
+mod qol_tests {
+    use super::*;
+    fn buffer(lines: &[&str], cols: u16) -> GridBuffer {
+        let mut buffer = GridBuffer::new(cols, lines.len() as u16);
+        for (y, line) in lines.iter().enumerate() {
+            for (x, ch) in line.chars().enumerate().take(cols as usize) {
+                buffer.cells[y * cols as usize + x].scalar = ch as u32;
+            }
+        }
+        buffer
+    }
+    #[test]
+    fn double_click_drag_keeps_whole_words_in_both_directions() {
+        let grid = buffer(&["one two three"], 16);
+        let view = ScrollbackViewport::default();
+        let mut selection = TerminalSelection::default();
+        selection.select_word(&view, &grid, 0, 5);
+        selection.drag_in_view(&view, &grid, 0, 10);
+        assert_eq!(selection.selected_text(&view, &grid), "two three");
+        selection.drag_in_view(&view, &grid, 0, 1);
+        assert_eq!(selection.selected_text(&view, &grid), "one two");
+    }
+    #[test]
+    fn triple_click_drag_keeps_whole_lines() {
+        let grid = buffer(&["one", "two", "three"], 8);
+        let view = ScrollbackViewport::default();
+        let mut selection = TerminalSelection::default();
+        selection.select_line(&view, &grid, 1);
+        selection.drag_in_view(&view, &grid, 2, 2);
+        assert_eq!(selection.selected_text(&view, &grid), "two\nthree");
+        selection.drag_in_view(&view, &grid, 0, 2);
+        assert_eq!(selection.selected_text(&view, &grid), "one\ntwo");
+    }
+    #[test]
+    fn rectangle_copies_only_requested_columns_in_reverse_drag() {
+        let grid = buffer(&["a 11 x", "b 22 y", "c 33 z"], 8);
+        let view = ScrollbackViewport::default();
+        let mut selection = TerminalSelection::default();
+        selection.begin_rectangle(SelectionPoint { row: 2, col: 3 });
+        selection.drag_to(SelectionPoint { row: 0, col: 2 });
+        assert_eq!(selection.selected_text(&view, &grid), "11\n22\n33");
+    }
+    #[test]
+    fn copying_unwraps_only_soft_lines_and_preserves_graphemes() {
+        let mut grid = buffer(&["abcdef", "ghi", "界 e"], 6);
+        let view = ScrollbackViewport::default();
+        let mut selection = TerminalSelection::default();
+        grid.cells[5].style |= TermStyle::SOFT_WRAP;
+        grid.cells[13].scalar = 0;
+        grid.cells[13].style |= TermStyle::WIDE_SPACER;
+        grid.annotations[2].graphemes.push((2, "\u{301}".into()));
+        selection.set_from_window(&view, 0, 0, 3, 2);
+        assert_eq!(
+            selection.selected_text(&view, &grid),
+            "abcdefghi\n界e\u{301}"
+        );
     }
 }

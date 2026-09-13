@@ -15,6 +15,7 @@ members = [
     "crates/diri-updater",
     "crates/diri-web",
 ]
+exclude = ["vendor/alacritty_terminal"]
 resolver = "2"
 
 [workspace.package]
@@ -23,7 +24,7 @@ rust-version = "1.95"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-alacritty_terminal = { version = "0.26", default-features = false }
+alacritty_terminal = { path = "vendor/alacritty_terminal", default-features = false }
 base64 = "0.23"
 diri-client = { path = "crates/diri-client" }
 diri-engine = { path = "crates/diri-engine" }

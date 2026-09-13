@@ -615,6 +615,9 @@ pub struct ReadScrollbackCellsParams {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReadScrollbackCellsResult {
+    /// Row-aligned optional metadata; absent on surviving older Helpers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metadata: Vec<crate::grid::RowMetadata>,
     #[serde(with = "base64_bytes")]
     pub payload: Vec<u8>,
     pub first_row: i64,

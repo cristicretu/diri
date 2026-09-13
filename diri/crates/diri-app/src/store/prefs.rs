@@ -131,6 +131,9 @@ pub struct Prefs {
     /// Follow native appearance changes; terminal_theme stores the resolved palette.
     pub follow_system_theme: bool,
     pub terminal_font_size: f32,
+    pub terminal_copy_on_select: bool,
+    pub terminal_hide_pointer: bool,
+    pub terminal_paste_protection: bool,
     /// Last size, position, and presentation mode of the main window.
     pub window_placement: Option<WindowPlacement>,
     /// Whether the leading sidebar was mounted when the app last ran.
@@ -191,6 +194,9 @@ impl Default for Prefs {
             terminal_theme: DEFAULT_THEME.to_owned(),
             follow_system_theme: false,
             terminal_font_size: 13.0,
+            terminal_copy_on_select: false,
+            terminal_hide_pointer: true,
+            terminal_paste_protection: true,
             window_placement: None,
             sidebar_visible: false,
             sidebar_width: 248.0,

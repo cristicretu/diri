@@ -3365,7 +3365,22 @@ impl UtilitySurfaces {
                             "Code font size",
                             font_control,
                             colors,
-                        )),
+                        ))
+                        .child(appearance_divider(colors))
+                        .child(toggle_row("Copy on selection", "Copy selected text when you release the mouse.", self.prefs.terminal_copy_on_select, "terminal_copy_on_select", colors, cx, |this,cx| {
+                            this.prefs.terminal_copy_on_select = !this.prefs.terminal_copy_on_select;
+                            this.persist_prefs(); cx.notify();
+                        }))
+                        .child(appearance_divider(colors))
+                        .child(toggle_row("Hide pointer while typing", "Show it again when you use the mouse.", self.prefs.terminal_hide_pointer, "terminal_hide_pointer", colors, cx, |this,cx| {
+                            this.prefs.terminal_hide_pointer = !this.prefs.terminal_hide_pointer;
+                            this.persist_prefs(); cx.notify();
+                        }))
+                        .child(appearance_divider(colors))
+                        .child(toggle_row("Review command pastes", "Review multiline pastes when the shell has not enabled bracketed paste.", self.prefs.terminal_paste_protection, "terminal_paste_protection", colors, cx, |this,cx| {
+                            this.prefs.terminal_paste_protection = !this.prefs.terminal_paste_protection;
+                            this.persist_prefs(); cx.notify();
+                        })),
                 ),
             colors,
         )

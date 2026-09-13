@@ -700,6 +700,9 @@ pub trait Handler {
     /// Set hyperlink.
     fn set_hyperlink(&mut self, _: Option<Hyperlink>) {}
 
+    /// Mark the beginning of a shell prompt (OSC 133 A).
+    fn mark_prompt(&mut self) {}
+
     /// Set mouse cursor icon.
     fn set_mouse_cursor_icon(&mut self, _: CursorIcon) {}
 
@@ -1390,6 +1393,9 @@ where
             },
 
             // Hyperlink.
+            b"133" if params.get(1) == Some(&b"A".as_slice()) => {
+                self.handler.mark_prompt();
+            },
             b"8" if params.len() > 2 => {
                 let link_params = params[1];
 

@@ -18,7 +18,8 @@ use crate::grid::{GridCodecError, GridUpdate};
 use crate::terminal::MouseModes;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 5;
+pub const PROTOCOL_MINOR: u16 = 6;
+pub const TERMINAL_ANNOTATIONS_PROTOCOL_MINOR: u16 = 6;
 pub const MOUSE_INPUT_PROTOCOL_MINOR: u16 = 4;
 pub const FOREGROUND_PROCESS_PROTOCOL_MINOR: u16 = 5;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
@@ -75,6 +76,8 @@ pub enum RemoteRole {
 #[serde(rename_all = "kebab-case")]
 pub enum RemoteCapability {
     FullSnapshot,
+    #[serde(rename = "terminal-annotations-v1")]
+    TerminalAnnotations,
     IncrementalGrid,
     ProcessExit,
     Signal,
@@ -109,6 +112,7 @@ impl RemoteCapability {
     #[must_use]
     pub const fn wire_name(self) -> &'static str {
         match self {
+            Self::TerminalAnnotations => "terminal-annotations-v1",
             Self::FullSnapshot => "full-snapshot",
             Self::IncrementalGrid => "incremental-grid",
             Self::ProcessExit => "process-exit",
@@ -158,6 +162,32 @@ pub const PHASE_ONE_HELPER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::ExecutableDiscovery,
     RemoteCapability::PersistenceProbe,
     RemoteCapability::AtomicActivation,
+];
+
+/// Optional terminal metadata is advertised independently of the survival contract.
+pub const ANNOTATED_HOLDER_CAPABILITIES: &[RemoteCapability] = &[
+    RemoteCapability::FullSnapshot,
+    RemoteCapability::IncrementalGrid,
+    RemoteCapability::ProcessExit,
+    RemoteCapability::Signal,
+    RemoteCapability::ControllerLease,
+    RemoteCapability::Scrollback,
+    RemoteCapability::TerminalAnnotations,
+];
+pub const ANNOTATED_HELPER_CAPABILITIES: &[RemoteCapability] = &[
+    RemoteCapability::FullSnapshot,
+    RemoteCapability::IncrementalGrid,
+    RemoteCapability::ProcessExit,
+    RemoteCapability::Signal,
+    RemoteCapability::ControllerLease,
+    RemoteCapability::Scrollback,
+    RemoteCapability::SessionManagement,
+    RemoteCapability::EnvironmentCapture,
+    RemoteCapability::DirectoryList,
+    RemoteCapability::ExecutableDiscovery,
+    RemoteCapability::PersistenceProbe,
+    RemoteCapability::AtomicActivation,
+    RemoteCapability::TerminalAnnotations,
 ];
 
 /// Authentication bearer shared only by the local Engine and one Holder.

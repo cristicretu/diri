@@ -11,14 +11,14 @@ use std::future::Future;
 use std::ops::Range;
 use std::pin::Pin;
 
-use diri_proto::grid::{GridCell, GridCodecError, GridRowCodec};
+use diri_proto::grid::{GridCell, GridCodecError, GridRowCodec, RowMetadata};
 use diri_proto::methods::ReadScrollbackCellsResult;
 use diri_proto::model::SessionId;
 use diri_proto::terminal::MouseModes;
 
 use crate::buffer::GridBuffer;
 
-const MAX_SCROLLBACK_CACHE_ROWS: usize = 512;
+const MAX_SCROLLBACK_CACHE_BYTES: usize = 4 * 1024 * 1024;
 
 pub type FetchFuture<'a> = Pin<
     Box<dyn Future<Output = Result<ReadScrollbackCellsResult, ScrollbackFetchError>> + Send + 'a>,
@@ -134,6 +134,7 @@ impl From<GridCodecError> for ScrollbackApplyError {
 #[derive(Clone, Debug, Default)]
 pub struct ScrollbackViewport {
     view_offset: i64,
+    keyboard_pinned: bool,
     /// Absolute row pinned to the top of the window while scrolled back.
     ///
     /// `view_offset` alone anchors the view to the *live edge*, so history
@@ -150,6 +151,7 @@ pub struct ScrollbackViewport {
     geometry_known: bool,
     cache_seq: Option<u64>,
     cache: BTreeMap<i64, Vec<GridCell>>,
+    annotations: BTreeMap<i64, RowMetadata>,
     /// One screen captured when leaving live. Agents can rewrite these rows
     /// in place; an absolute scroll anchor alone cannot preserve their text.
     held_live: Option<GridBuffer>,
@@ -159,6 +161,20 @@ pub struct ScrollbackViewport {
 }
 
 impl ScrollbackViewport {
+    pub(crate) fn is_reading(&self) -> bool {
+        self.keyboard_pinned || self.view_offset > 0
+    }
+
+    pub(crate) fn pin_keyboard(&mut self, pinned: bool, buffer: &GridBuffer) {
+        self.keyboard_pinned = pinned;
+        if !self.is_reading() {
+            self.release_reading_view();
+        } else {
+            self.hold_reading_view(buffer);
+        }
+        self.sync_anchor();
+    }
+
     #[must_use]
     pub const fn view_offset(&self) -> i64 {
         self.view_offset
@@ -219,7 +235,7 @@ impl ScrollbackViewport {
             return false;
         }
         self.view_offset = clamped;
-        if clamped == 0 {
+        if clamped == 0 && !self.keyboard_pinned {
             self.release_reading_view();
         }
         self.sync_anchor();
@@ -238,7 +254,7 @@ impl ScrollbackViewport {
     /// history. While geometry is unknown the offset is the state, and it
     /// carries over unchanged.
     fn sync_anchor(&mut self) {
-        self.anchor = (self.geometry_known && self.view_offset > 0)
+        self.anchor = (self.geometry_known && self.is_reading())
             .then(|| self.live_start_row.saturating_sub(self.view_offset));
     }
 
@@ -273,6 +289,28 @@ impl ScrollbackViewport {
             .saturating_add(i64::try_from(window_row).unwrap_or(i64::MAX))
     }
 
+    pub fn row_metadata(&self, buffer: &GridBuffer, row: i64) -> RowMetadata {
+        if let (Some(held), Some(start)) = (&self.held_live, self.held_live_start)
+            && row >= start
+            && row < start + i64::from(held.rows)
+        {
+            return held
+                .annotations
+                .get((row - start) as usize)
+                .cloned()
+                .unwrap_or_default();
+        }
+        if row >= self.live_start_row {
+            buffer
+                .annotations
+                .get((row - self.live_start_row) as usize)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            self.annotations.get(&row).cloned().unwrap_or_default()
+        }
+    }
+
     #[must_use]
     pub fn window_row_for_absolute(&self, absolute_row: i64) -> Option<i64> {
         absolute_row.checked_sub(self.absolute_row(0))
@@ -281,7 +319,7 @@ impl ScrollbackViewport {
     #[must_use]
     pub fn row_at_absolute(&self, buffer: &GridBuffer, absolute_row: i64) -> Vec<GridCell> {
         let cols = usize::from(buffer.cols);
-        if self.view_offset > 0
+        if self.is_reading()
             && let Some(held) = &self.held_live
             && let Ok(row) = usize::try_from(
                 absolute_row.saturating_sub(self.held_live_start.unwrap_or(self.live_start_row)),
@@ -302,7 +340,7 @@ impl ScrollbackViewport {
 
     #[must_use]
     pub fn window_row(&self, buffer: &GridBuffer, window_row: usize) -> Vec<GridCell> {
-        if self.view_offset == 0 {
+        if !self.is_reading() {
             return normalized_row(
                 buffer.row(window_row).unwrap_or_default(),
                 usize::from(buffer.cols),
@@ -321,7 +359,7 @@ impl ScrollbackViewport {
     /// Called at local navigation and before applying live damage. The live
     /// mirror keeps receiving every update; only the reading view is held.
     pub(crate) fn hold_reading_view(&mut self, buffer: &GridBuffer) {
-        if self.view_offset > 0 && self.held_live.is_none() {
+        if self.is_reading() && self.held_live.is_none() {
             self.held_live = Some(buffer.clone());
             self.held_live_start = self.geometry_known.then_some(self.live_start_row);
         }
@@ -333,6 +371,7 @@ impl ScrollbackViewport {
         // A later scroll starts a fresh reading view, including history that
         // may have been rewritten or evicted while this view was held.
         self.cache.clear();
+        self.annotations.clear();
         self.cache_seq = None;
         self.queued = None;
         // Live grid updates carry no history geometry. After following live,
@@ -375,6 +414,15 @@ impl ScrollbackViewport {
                 decoded: decoded.len(),
             });
         }
+        if (!result.metadata.is_empty() && result.metadata.len() != row_count)
+            || result
+                .metadata
+                .iter()
+                .any(|meta| !meta.validate(result.cols.max(0) as usize))
+        {
+            return Err(ScrollbackApplyError::Codec(GridCodecError::InvalidMetadata));
+        }
+        let existing: std::collections::BTreeSet<_> = self.cache.keys().copied().collect();
         self.apply_rows(
             decoded,
             result.first_row,
@@ -383,6 +431,14 @@ impl ScrollbackViewport {
             result.content_seq,
             visible_rows,
         );
+        for (index, metadata) in result.metadata.into_iter().enumerate() {
+            let row = result.first_row + index as i64;
+            if self.cache.contains_key(&row) && !(self.is_reading() && existing.contains(&row)) {
+                self.annotations.insert(row, metadata);
+            }
+        }
+        self.annotations
+            .retain(|row, _| self.cache.contains_key(row));
         Ok(())
     }
 
@@ -403,14 +459,15 @@ impl ScrollbackViewport {
     ) {
         let old_sequence = self.cache_seq;
         if old_sequence != Some(content_seq) {
-            if self.view_offset == 0 {
+            if !self.is_reading() {
                 self.cache.clear();
+                self.annotations.clear();
             }
             self.cache_seq = Some(content_seq);
         }
         for (index, row) in rows.into_iter().enumerate() {
             let absolute = first_row.saturating_add(i64::try_from(index).unwrap_or(i64::MAX));
-            if self.view_offset > 0 {
+            if self.is_reading() {
                 self.cache.entry(absolute).or_insert(row);
             } else {
                 self.cache.insert(absolute, row);
@@ -430,7 +487,7 @@ impl ScrollbackViewport {
             self.view_offset = self.live_start_row.saturating_sub(anchor);
         }
         self.view_offset = self.view_offset.clamp(0, self.max_offset(visible_rows));
-        if self.view_offset == 0 && self.held_live.is_some() {
+        if !self.is_reading() && self.held_live.is_some() {
             self.release_reading_view();
         }
         self.sync_anchor();
@@ -463,7 +520,8 @@ impl ScrollbackViewport {
 
     /// Alternate screen has no history. Entering it always returns to live.
     pub fn enter_alt_screen(&mut self) -> bool {
-        if self.view_offset == 0 {
+        self.keyboard_pinned = false;
+        if !self.is_reading() {
             return false;
         }
         self.view_offset = 0;
@@ -494,7 +552,13 @@ impl ScrollbackViewport {
 
     fn cap_cache_near_viewport(&mut self) {
         let anchor = self.live_start_row.saturating_sub(self.view_offset);
-        while self.cache.len() > MAX_SCROLLBACK_CACHE_ROWS {
+        let row_bytes = self
+            .cache
+            .values()
+            .next()
+            .map_or(1, |row| row.len().max(1) * std::mem::size_of::<GridCell>());
+        let maximum = MAX_SCROLLBACK_CACHE_BYTES / row_bytes;
+        while self.cache.len() > maximum {
             let Some((&first, _)) = self.cache.first_key_value() else {
                 break;
             };
@@ -503,8 +567,10 @@ impl ScrollbackViewport {
             };
             if first.abs_diff(anchor) >= last.abs_diff(anchor) {
                 self.cache.remove(&first);
+                self.annotations.remove(&first);
             } else {
                 self.cache.remove(&last);
+                self.annotations.remove(&last);
             }
         }
     }
@@ -680,6 +746,7 @@ mod tests {
                     .cloned()
                     .collect();
                 Ok(ReadScrollbackCellsResult {
+                    metadata: Vec::new(),
                     payload: GridRowCodec::encode_rows(&fetched)
                         .map_err(|error| ScrollbackFetchError::new(error.to_string()))?,
                     first_row,
@@ -740,6 +807,7 @@ mod tests {
         viewport
             .complete_fetch(
                 ReadScrollbackCellsResult {
+                    metadata: Vec::new(),
                     payload: GridRowCodec::encode_rows(&rows).unwrap(),
                     first_row: start,
                     row_count: i64::try_from(rows.len()).unwrap(),
@@ -790,6 +858,7 @@ mod tests {
             viewport
                 .complete_fetch(
                     ReadScrollbackCellsResult {
+                        metadata: Vec::new(),
                         payload: GridRowCodec::encode_rows(&rows).unwrap(),
                         first_row: start,
                         row_count: i64::try_from(rows.len()).unwrap(),
@@ -910,6 +979,7 @@ mod tests {
         viewport
             .complete_fetch(
                 ReadScrollbackCellsResult {
+                    metadata: Vec::new(),
                     payload: GridRowCodec::encode_rows(&response_rows).unwrap(),
                     first_row: 80,
                     row_count: 20,
@@ -963,15 +1033,18 @@ mod tests {
     #[test]
     fn scrollback_cache_keeps_a_bounded_window_near_the_viewport() {
         let mut viewport = ScrollbackViewport::default();
-        viewport.apply_rows(Vec::new(), 0, 2_000, 2_000, 1, 40);
-        viewport.set_view_offset(1_000, 40);
-        let rows = (0..2_000).map(|_| row("cached", 8)).collect();
-        viewport.apply_rows(rows, 0, 2_000, 2_000, 1, 40);
+        viewport.apply_rows(Vec::new(), 0, 40_000, 40_000, 1, 40);
+        viewport.set_view_offset(20_000, 40);
+        let rows = (0..40_000).map(|_| row("cached", 8)).collect();
+        viewport.apply_rows(rows, 0, 40_000, 40_000, 1, 40);
 
-        assert_eq!(viewport.cached_row_count(), MAX_SCROLLBACK_CACHE_ROWS);
-        assert!(viewport.cached_row(1_000).is_some());
+        assert_eq!(
+            viewport.cached_row_count(),
+            MAX_SCROLLBACK_CACHE_BYTES / (8 * std::mem::size_of::<GridCell>())
+        );
+        assert!(viewport.cached_row(20_000).is_some());
         assert!(viewport.cached_row(0).is_none());
-        assert!(viewport.cached_row(1_999).is_none());
+        assert!(viewport.cached_row(39_999).is_none());
     }
 
     #[test]

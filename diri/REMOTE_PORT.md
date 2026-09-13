@@ -551,6 +551,61 @@ the transport error and never queues or replays that effect.
 Stale epochs fail with a structured protocol error. Multiple read-only observers
 are a future enhancement and are not part of the completed baseline.
 
+## Terminal interaction metadata (September 2026)
+
+Terminal quality-of-life interactions remain desktop-owned: link discovery and
+activation, selection, copying, menus, paste review, export, and keyboard modes
+run in `diri-app` / `diri-term`. They do not execute SSH or change controller
+ownership. The existing local Engine RPC serves retained terminal rows.
+
+The shared terminal parser additionally retains OSC 8 targets, soft-wrap facts,
+wide-cell continuation facts, combining characters, and OSC 133 A prompt-start
+marks. These are terminal screen facts; the Holder does not infer commands,
+execute shell hooks, collect exit-code histories, or orchestrate workflows.
+Prompt marks are ignored on the alternate screen. Shell prompt navigation is a
+client interpretation of retained marks, not Agent status or hook ingestion.
+Shells must emit OSC 133; no remote shell configuration is installed.
+
+Protocol 1.6 advertises optional `terminal-annotations-v1`. Grid flag bit 2 adds
+an extension version byte (1), a big-endian u32 byte length, and bounded JSON
+row annotations after the unchanged RLE rows. Unknown versions, invalid spans,
+control characters in destinations, and oversized metadata fail decoding.
+The extension is capped at 256 KiB, targets at 2048 bytes. Exporters budget
+annotations per response; targets exceeding the available annotation budget
+remain ordinary text. Semantic wrap/prompt/wide bits are additive style bits.
+Scrollback carries optional row-aligned metadata under the same negotiated
+version. A pre-1.6 controller receives the original grid form; a new Engine
+attaching to an older live Holder sees missing annotations as unavailable,
+never as fabricated link or prompt facts. Required transport capabilities and
+all existing fail-closed bootstrap checks are unchanged.
+
+Full snapshots still contain only the visible grid and its annotations, cursor,
+modes, dimensions and sequence. History remains on demand. GridMirror, deltas,
+coalescing and slow-client full reseeds preserve annotation changes even when
+visible labels do not change. Checkpoint version 4 persists visible and history
+annotations; versions 2/3 remain readable with unavailable optional metadata.
+Oversized checkpoint annotations cause a cache-write failure, retaining the
+existing raw-log recovery path rather than persisting partial link state.
+
+VTE's OSC dispatch calls one new `mark_prompt` Handler method. The vendored
+alacritty_terminal 0.26.0 adds one cell flag and marks the cursor cell in that
+handler; its existing erase, scroll, resize and synchronized-update processing
+own marker lifetime. This small parser extension avoids a second parser or
+raw-output cursor guesses. Both vendored sources participate in the Helper
+Build ID. There is no new runtime dependency.
+
+The desktop's existing reading cache is bounded by 4 MiB of cells instead of
+512 rows, so selection can span the Engine's retained history. URI metadata is
+bounded on transport and pruned alongside cached rows. Only active edge drags
+run an autoscroll timer; hover keys use cell/content/viewport revisions without
+cloning the reading cache. No idle Holder timer or new Holder task is added.
+
+Acceptance adds metadata codec rejection and compatibility tests, annotation-
+only deltas, synchronized prompt marks, erase/scroll/resize and checkpoint
+round trips, selection and paste tests, and desktop interaction verification.
+The existing release performance, persistence, lease, and real-SSH gates remain
+mandatory.
+
 ## Wire protocol
 
 `diri-proto::remote_pty` is the versioned protocol authority. Protocol 1.3

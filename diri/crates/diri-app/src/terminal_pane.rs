@@ -3,6 +3,9 @@
 //! The daemon remains authoritative: this module only composes
 //! `diri-client::SessionAttachment`, `diri-term`, and the T9 session store.
 
+mod qol;
+use qol::QolState;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -597,6 +600,7 @@ impl Drop for ResidentTerminal {
 }
 
 pub struct TerminalPane {
+    qol: QolState,
     runtime: Arc<StoreRuntime>,
     _tokio_owner: Arc<tokio::runtime::Runtime>,
     tokio: Handle,
@@ -752,6 +756,7 @@ impl TerminalPane {
             focus,
             glyphs: HashMap::new(),
             session_links: SessionLinks::new(cx),
+            qol: QolState::default(),
             pending_resizes: HashMap::new(),
             resize_flush: None,
             resize_flush_armed: false,
@@ -1678,6 +1683,22 @@ impl TerminalPane {
         let Some((col, row)) = self.grid_cell_at(event.position, window) else {
             return;
         };
+        self.reset_qol_session(&id);
+        self.qol.menu = None;
+        if self.qol.paste.is_some() {
+            cx.stop_propagation();
+            return;
+        }
+        if event.button == MouseButton::Right
+            && (event.modifiers.alt
+                || self
+                    .residents
+                    .get(&id)
+                    .is_none_or(|r| !r.element.mouse_modes().is_reporting()))
+        {
+            self.open_terminal_menu(event.position, col, row, window, cx);
+            return;
+        }
         let owner = {
             let Some(resident) = self.residents.get(&id) else {
                 return;
@@ -1697,6 +1718,9 @@ impl TerminalPane {
         match owner {
             PointerOwner::LocalSelection => {
                 match event.click_count {
+                    1 if event.modifiers.alt && event.modifiers.shift => {
+                        resident.element.begin_rectangle_selection(col, row)
+                    }
                     1 => resident.element.begin_selection(col, row),
                     2 => resident.element.select_word(col, row),
                     _ => resident.element.select_line(row),
@@ -1704,21 +1728,11 @@ impl TerminalPane {
                 cx.notify();
             }
             PointerOwner::LocalReference => {
-                let reference = resident.element.reference_at(col, row);
-                match reference {
-                    Some(TerminalReference::Url(url)) => cx.open_url(&url),
-                    Some(TerminalReference::File(reference)) => {
-                        let Some(session) = self.selected_session() else {
-                            return;
-                        };
-                        cx.emit(TerminalPaneEvent::OpenFileReference {
-                            reference,
-                            cwd: session.cwd.clone(),
-                            session_id: session.id.clone(),
-                        });
-                    }
-                    None => {}
-                }
+                self.qol.pressed = resident
+                    .element
+                    .reference_hit_at(col, row)
+                    .map(|hit| (hit, (col, row)));
+                cx.stop_propagation();
             }
             PointerOwner::Terminal => {
                 let Some(button) = terminal_mouse_button(event.button) else {
@@ -1752,7 +1766,25 @@ impl TerminalPane {
         // disappeared between press and release (session teardown, a zero-size
         // re-seed). GPUI delivers `on_mouse_up_out` in capture phase, so an
         // ordinary release outside the pane still reaches this path and clamps.
+        self.qol.drag = None;
+        self.qol.autoscroll = None;
         let cell = self.grid_cell_at(event.position, window);
+        let copy_on_select = self
+            .runtime
+            .store
+            .read()
+            .expect("store")
+            .preferences()
+            .terminal_copy_on_select;
+        let inside = self.viewport.is_some_and(|viewport| {
+            let x = f32::from(event.position.x);
+            let y = f32::from(event.position.y);
+            x >= viewport.x
+                && x < viewport.x + viewport.width
+                && y >= viewport.y + Metrics::TITLE_BAR
+                && y < viewport.y + viewport.height
+        });
+        let pressed = self.qol.pressed.take();
         let Some(resident) = self.residents.get_mut(&id) else {
             return;
         };
@@ -1762,6 +1794,24 @@ impl TerminalPane {
             event.button,
             cell.is_some(),
         );
+        if owner == Some(PointerOwner::LocalReference) {
+            let hit = cell.and_then(|(col, row)| resident.element.reference_hit_at(col, row));
+            if let Some((pressed, point)) = pressed
+                && inside
+                && cell == Some(point)
+                && hit.as_ref() == Some(&pressed)
+            {
+                self.open_reference(pressed.reference, cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if owner == Some(PointerOwner::LocalSelection) {
+            if copy_on_select {
+                self.copy_selection(&CopySelection, window, cx);
+            }
+            return;
+        }
         if owner != Some(PointerOwner::Terminal) {
             return;
         }
@@ -1802,6 +1852,30 @@ impl TerminalPane {
         let Some((col, row)) = self.grid_cell_at(event.position, window) else {
             return;
         };
+        self.reset_qol_session(&id);
+        if self
+            .qol
+            .pressed
+            .as_ref()
+            .is_some_and(|(_, point)| *point != (col, row))
+        {
+            self.qol.pressed = None;
+        }
+        if event.pressed_button.is_none() {
+            let next = Some((col, row));
+            if self.qol.hover != next {
+                self.qol.hover = next;
+                cx.notify();
+            }
+        } else {
+            self.qol.hover = None;
+        }
+        let selecting = self.residents.get(&id).is_some_and(|r| {
+            r.pointer_owner == Some((MouseButton::Left, PointerOwner::LocalSelection))
+        });
+        if selecting {
+            self.update_selection_autoscroll(event.position, col, row, window, cx);
+        }
         let (dispatch, attachment) = {
             let Some(resident) = self.residents.get_mut(&id) else {
                 return;
@@ -1913,7 +1987,7 @@ impl TerminalPane {
         (height - Metrics::TITLE_BAR - GRID_VERTICAL_PADDING - GRID_LAYOUT_VERTICAL_CHROME).max(1.0)
     }
 
-    fn copy_selection(&mut self, _: &CopySelection, _window: &mut Window, cx: &mut Context<Self>) {
+    fn copy_selection(&mut self, _: &CopySelection, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.selected_id() else {
             return;
         };
@@ -1923,6 +1997,7 @@ impl TerminalPane {
         let text = resident.element.selected_text();
         if !text.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
+            self.show_terminal_feedback("Copied", window, cx);
         }
     }
 
@@ -1936,6 +2011,11 @@ impl TerminalPane {
     }
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        if self.qol.copy_mode.is_some() {
+            self.show_terminal_feedback("Exit copy mode before pasting", window, cx);
+            cx.stop_propagation();
+            return;
+        }
         let Some(item) = cx.read_from_clipboard() else {
             return;
         };
@@ -2001,6 +2081,14 @@ impl TerminalPane {
         let Some(text) = item.text() else {
             return;
         };
+        if self
+            .residents
+            .get(&id)
+            .is_some_and(|resident| resident.find.is_none())
+            && self.stage_paste_if_needed(&id, &text, cx)
+        {
+            return;
+        }
         let now = self.started_at.elapsed();
         let Some(resident) = self.residents.get_mut(&id) else {
             return;
@@ -2046,6 +2134,12 @@ impl TerminalPane {
             return;
         }
 
+        if self.handle_qol_key(event, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
+        self.qol.hover = None;
+        self.qol.hit = None;
         let switcher_key = switcher_key(event);
         let switcher_handled = {
             let mut store = self
@@ -2548,6 +2642,22 @@ impl TerminalPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.reset_qol_session(&session.id);
+        let hide_pointer = self
+            .runtime
+            .store
+            .read()
+            .expect("store")
+            .preferences()
+            .terminal_hide_pointer;
+        if self.focus.is_focused(window) {
+            cx.set_cursor_hide_mode(if hide_pointer {
+                gpui::CursorHideMode::OnTyping
+            } else {
+                gpui::CursorHideMode::Never
+            });
+        }
+        self.refresh_link_hover();
         if session.is_archived() {
             return self.render_archived_overlay(session, colors, cx);
         }
@@ -2566,7 +2676,16 @@ impl TerminalPane {
             .clone()
             .theme(theme)
             .font_size(px(font_size))
-            .focus_handle(self.focus.clone());
+            .focus_handle(self.focus.clone())
+            .hovered_reference(self.qol.hit.clone());
+        let element = if self.qol.copy_mode.is_some()
+            || self.qol.paste.is_some()
+            || self.qol.menu.is_some()
+        {
+            element.on_text_input(|_| {})
+        } else {
+            element
+        };
         let view_offset = resident.element.view_offset();
         let attachment_state = resident.attachment_state;
         let overflow = self.grid_row_overflow(resident.element.grid_rows(), font_size, window);
@@ -2574,6 +2693,8 @@ impl TerminalPane {
         let id_for_focus = session.id.clone();
         let follows_selection = matches!(self.session_source, SessionSource::FollowSelection);
         let mut body = div()
+            .id("terminal-grid-surface")
+            .debug_selector(|| "terminal-grid-surface".into())
             .relative()
             .flex_1()
             .overflow_hidden()
@@ -2581,6 +2702,19 @@ impl TerminalPane {
             .pb(px(10.0))
             .px(px(12.0))
             .bg(theme.background)
+            .cursor(if self.qol.hit.is_some() {
+                gpui::CursorStyle::PointingHand
+            } else {
+                gpui::CursorStyle::IBeam
+            })
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if !hovered {
+                    this.qol.hover = None;
+                    this.qol.hit = None;
+                    this.qol.hover_key_clear();
+                    cx.notify();
+                }
+            }))
             .track_focus(&self.focus)
             .on_mouse_down(
                 MouseButton::Left,
@@ -2690,7 +2824,7 @@ impl TerminalPane {
         if exited {
             body = body.child(self.render_exit_pill(session, colors, cx));
         }
-        body.into_any_element()
+        body.child(self.render_qol(colors, cx)).into_any_element()
     }
 
     /// Slim status pill over an exited session's last screen: says what happened
@@ -3121,6 +3255,36 @@ impl Render for TerminalPane {
             .on_action(cx.listener(Self::reset_zoom))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::copy_selection))
+            .on_action(
+                cx.listener(|this, _: &crate::commands::EnterCopyMode, window, cx| {
+                    this.enter_copy_mode(window, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::FindSelection, window, cx| {
+                    this.find_selection(window, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::ExportScrollback, window, cx| {
+                    this.read_terminal_history(None, window, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::PreviousPrompt, window, cx| {
+                    this.read_terminal_history(Some(false), window, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::commands::NextPrompt, window, cx| {
+                    this.read_terminal_history(Some(true), window, cx);
+                    cx.stop_propagation();
+                }),
+            )
             .on_key_down(cx.listener(Self::handle_key_down))
             .on_key_up(cx.listener(Self::handle_key_up))
             .on_modifiers_changed(cx.listener(Self::handle_modifiers_changed))
@@ -4427,6 +4591,227 @@ mod tests {
             cx.debug_bounds("show-sidebar").is_some(),
             "collapsing the sidebar must leave a way to reveal it"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes a terminal interaction preview to DIRI_QOL_SCREENSHOT"]
+    fn render_terminal_qol_screenshot() {
+        use diri_proto::grid::{ChangedRow, GridCell, LinkSpan};
+        use gpui::{AppContext as _, HeadlessAppContext};
+        let output = std::env::var("DIRI_QOL_SCREENSHOT").expect("output path");
+        let scene = std::env::var("DIRI_QOL_SCENE").unwrap_or_default();
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let session = fixture_session();
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        let window = cx
+            .open_window(gpui::size(px(800.0), px(600.0)), |window, cx| {
+                cx.new(|cx| {
+                    let mut pane = TerminalPane::new(runtime, tokio, window, cx);
+                    pane.set_viewport(
+                        TerminalViewport {
+                            x: 0.0,
+                            y: 0.0,
+                            width: 800.0,
+                            height: 600.0,
+                        },
+                        cx,
+                    );
+                    let mut grid = grid_frame(80, true);
+                    grid.rows = 28;
+                    for (y, text) in [
+                        "https://example.com/pull/42",
+                        "View pull request",
+                        "Build completed. Select output or right-click for terminal actions.",
+                    ]
+                    .iter()
+                    .enumerate()
+                    {
+                        let mut cells = vec![GridCell::BLANK; 80];
+                        for (cell, ch) in cells.iter_mut().zip(text.chars()) {
+                            cell.scalar = ch as u32;
+                        }
+                        let mut row = ChangedRow::new(y as u16, cells);
+                        if y == 1 {
+                            row.metadata.links.push(LinkSpan {
+                                start: 0,
+                                end: 17,
+                                uri: "https://example.com/pull/42".into(),
+                            });
+                        }
+                        grid.changed_rows.push(row);
+                    }
+                    let resident = pane.residents.get_mut(&id).unwrap();
+                    resident.element.apply_damage(grid);
+                    resident.last_size = (80, 28);
+                    resident.attachment_state = AttachmentState::Live;
+                    pane.focus(window, cx);
+                    pane.reset_qol_session(&id);
+                    pane.qol.hover = Some((2, 1));
+                    match scene.as_str() {
+                        "menu" => pane.open_terminal_menu(
+                            gpui::point(px(260.0), px(180.0)),
+                            2,
+                            1,
+                            window,
+                            cx,
+                        ),
+                        "paste" => {
+                            pane.stage_paste_if_needed(
+                                &id,
+                                "echo first command\necho second command",
+                                cx,
+                            );
+                        }
+                        "copy" => pane.enter_copy_mode(window, cx),
+                        _ => (),
+                    }
+                    pane
+                })
+            })
+            .expect("preview window");
+        cx.run_until_parked();
+        cx.capture_screenshot(window.into())
+            .expect("screenshot")
+            .save(output)
+            .expect("save");
+        cx.update_window(window.into(), |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn terminal_copy_mode_and_paste_review_keep_input_local(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let session = fixture_session();
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            assert!(pane.residents.contains_key(&id));
+            pane.enter_copy_mode(window, cx);
+            assert!(pane.qol.copy_mode.is_some());
+            for key in ["v", "right", "pageup", "a"] {
+                let event = KeyDownEvent {
+                    keystroke: Keystroke::parse(key).unwrap(),
+                    is_held: false,
+                    prefer_character_input: false,
+                };
+                assert!(pane.handle_qol_key(&event, window, cx));
+                assert!(pane.qol.copy_mode.is_some());
+            }
+            let escape = KeyDownEvent {
+                keystroke: Keystroke::parse("escape").unwrap(),
+                is_held: false,
+                prefer_character_input: false,
+            };
+            assert!(pane.handle_qol_key(&escape, window, cx));
+            assert!(pane.qol.copy_mode.is_none());
+            assert!(!pane.stage_paste_if_needed(&id, "ordinary text", cx));
+            assert!(pane.stage_paste_if_needed(&id, "echo one\necho two", cx));
+            assert!(pane.qol.paste.is_some());
+            assert!(pane.handle_qol_key(&escape, window, cx));
+            assert!(pane.qol.paste.is_none());
+            assert!(pane.stage_paste_if_needed(&id, "echo one\necho two", cx));
+            pane.residents.get_mut(&id).unwrap().bracketed_paste = true;
+            let enter = KeyDownEvent {
+                keystroke: Keystroke::parse("enter").unwrap(),
+                is_held: false,
+                prefer_character_input: false,
+            };
+            assert!(pane.handle_qol_key(&enter, window, cx));
+            assert!(pane.qol.paste.is_none());
+            assert_eq!(
+                pane.qol.feedback.as_deref(),
+                Some("Terminal changed. Paste again to review.")
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn terminal_selection_drag_reaches_outside_and_context_menu_dismisses(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let session = fixture_session();
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            pane.set_viewport(
+                TerminalViewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 800.0,
+                    height: 600.0,
+                },
+                cx,
+            );
+            let resident = pane.residents.get_mut(&id).unwrap();
+            resident.attachment_state = AttachmentState::Live;
+            resident.last_size = (80, 40);
+            resident.element.apply_damage(grid_frame(80, true));
+            cx.notify();
+        });
+        let bounds = cx
+            .debug_bounds("terminal-grid-surface")
+            .expect("terminal surface");
+        cx.simulate_mouse_down(bounds.center(), MouseButton::Left, Modifiers::default());
+        let outside = gpui::point(bounds.center().x, bounds.top() - px(8.0));
+        cx.simulate_mouse_move(outside, MouseButton::Left, Modifiers::default());
+        pane.read_with(cx, |pane, _| {
+            assert!(pane.qol.drag.is_some(), "outside move must arm autoscroll")
+        });
+        cx.simulate_mouse_up(outside, MouseButton::Left, Modifiers::default());
+        pane.read_with(cx, |pane, _| assert!(pane.qol.drag.is_none()));
+        cx.simulate_mouse_down(bounds.center(), MouseButton::Right, Modifiers::default());
+        cx.simulate_mouse_up(bounds.center(), MouseButton::Right, Modifiers::default());
+        assert!(cx.debug_bounds("terminal-context-menu").is_some());
+        cx.simulate_mouse_down(outside, MouseButton::Left, Modifiers::default());
+        pane.read_with(cx, |pane, _| assert!(pane.qol.menu.is_none()));
     }
 
     #[gpui::test]

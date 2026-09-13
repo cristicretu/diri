@@ -83,6 +83,11 @@ actions!(
         ResetZoom,
         Paste,
         CopySelection,
+        EnterCopyMode,
+        FindSelection,
+        ExportScrollback,
+        PreviousPrompt,
+        NextPrompt,
     ]
 );
 
@@ -136,6 +141,11 @@ pub enum CommandId {
     ResetZoom,
     Paste,
     CopySelection,
+    EnterCopyMode,
+    FindSelection,
+    ExportScrollback,
+    PreviousPrompt,
+    NextPrompt,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -596,6 +606,56 @@ pub const COMMANDS: &[CommandSpec] = &[
         Some("⌘C"),
         Some(TERMINAL_CONTEXT)
     ),
+    spec!(
+        EnterCopyMode,
+        "terminal-copy-mode",
+        Some("cmd-alt-c"),
+        Some("⌘⌥C"),
+        Some(TERMINAL_CONTEXT),
+        "Keyboard copy mode",
+        "doc.on.clipboard",
+        "copy keyboard terminal selection"
+    ),
+    spec!(
+        FindSelection,
+        "terminal-find-selection",
+        Some("cmd-alt-f"),
+        Some("⌘⌥F"),
+        Some(TERMINAL_CONTEXT),
+        "Find selection",
+        "magnifyingglass",
+        "find selection terminal"
+    ),
+    spec!(
+        ExportScrollback,
+        "terminal-export",
+        Some("cmd-shift-e"),
+        Some("⌘⇧E"),
+        Some(TERMINAL_CONTEXT),
+        "Open scrollback in editor",
+        "doc.text",
+        "terminal log export scrollback"
+    ),
+    spec!(
+        PreviousPrompt,
+        "terminal-previous-prompt",
+        Some("cmd-shift-up"),
+        Some("⌘⇧↑"),
+        Some(TERMINAL_CONTEXT),
+        "Previous shell prompt",
+        "arrow.up",
+        "terminal prompt previous"
+    ),
+    spec!(
+        NextPrompt,
+        "terminal-next-prompt",
+        Some("cmd-shift-down"),
+        Some("⌘⇧↓"),
+        Some(TERMINAL_CONTEXT),
+        "Next shell prompt",
+        "arrow.down",
+        "terminal prompt next"
+    ),
 ];
 
 pub fn command(id: CommandId) -> &'static CommandSpec {
@@ -776,6 +836,11 @@ impl CommandSpec {
             CommandId::ResetZoom => KeyBinding::new(key, ResetZoom, context),
             CommandId::Paste => KeyBinding::new(key, Paste, context),
             CommandId::CopySelection => KeyBinding::new(key, CopySelection, context),
+            CommandId::EnterCopyMode => KeyBinding::new(key, EnterCopyMode, context),
+            CommandId::FindSelection => KeyBinding::new(key, FindSelection, context),
+            CommandId::ExportScrollback => KeyBinding::new(key, ExportScrollback, context),
+            CommandId::PreviousPrompt => KeyBinding::new(key, PreviousPrompt, context),
+            CommandId::NextPrompt => KeyBinding::new(key, NextPrompt, context),
         }
     }
 }
@@ -1136,6 +1201,31 @@ impl CommandId {
                 description: "Paste clipboard contents into the terminal",
                 category: Terminal,
             },
+            Self::EnterCopyMode => ShortcutMetadata {
+                title: "Keyboard copy mode",
+                description: "Select terminal output with the keyboard",
+                category: ShortcutCategory::Terminal,
+            },
+            Self::FindSelection => ShortcutMetadata {
+                title: "Find selection",
+                description: "Search for the selected terminal text",
+                category: ShortcutCategory::Terminal,
+            },
+            Self::ExportScrollback => ShortcutMetadata {
+                title: "Open scrollback in editor",
+                description: "Open retained terminal output in your text editor",
+                category: ShortcutCategory::Terminal,
+            },
+            Self::PreviousPrompt => ShortcutMetadata {
+                title: "Previous shell prompt",
+                description: "Jump to the preceding OSC 133 shell prompt",
+                category: ShortcutCategory::Terminal,
+            },
+            Self::NextPrompt => ShortcutMetadata {
+                title: "Next shell prompt",
+                description: "Jump to the following OSC 133 shell prompt",
+                category: ShortcutCategory::Terminal,
+            },
             Self::CopySelection => ShortcutMetadata {
                 title: "Copy selection",
                 description: "Copy the terminal selection",
@@ -1229,6 +1319,11 @@ impl CommandId {
             Self::ResetZoom => Box::new(ResetZoom),
             Self::Paste => Box::new(Paste),
             Self::CopySelection => Box::new(CopySelection),
+            Self::EnterCopyMode => Box::new(EnterCopyMode),
+            Self::FindSelection => Box::new(FindSelection),
+            Self::ExportScrollback => Box::new(ExportScrollback),
+            Self::PreviousPrompt => Box::new(PreviousPrompt),
+            Self::NextPrompt => Box::new(NextPrompt),
         }
     }
 }

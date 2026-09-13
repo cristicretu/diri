@@ -169,8 +169,28 @@ pub fn encode_key(event: &KeyEvent, modifiers: Modifiers, modes: TermInputModes)
     produced.as_bytes().to_vec()
 }
 
+/// Bracketed prompts are safe unless the text contains framing/control bytes.
+#[must_use]
+pub fn paste_needs_confirmation(text: &str, bracketed: bool) -> bool {
+    (!bracketed && text.contains(['\n', '\r']))
+        || text
+            .chars()
+            .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
+}
+
 /// Encodes pasted UTF-8 text, optionally using DEC bracketed-paste framing.
 pub fn paste(text: &str, bracketed: bool) -> Vec<u8> {
+    let sanitized: String = text
+        .chars()
+        .map(|ch| {
+            if ch.is_control() && !matches!(ch, '\n' | '\r' | '\t') {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect();
+    let text = sanitized.as_str();
     if !bracketed {
         return text.as_bytes().to_vec();
     }
@@ -707,5 +727,27 @@ mod tests {
         assert_eq!(paste(text, true), b"\x1b[200~one\ntwo \xce\xbb\x1b[201~");
         assert_eq!(paste("", false), b"");
         assert_eq!(paste("", true), b"\x1b[200~\x1b[201~");
+    }
+}
+
+#[cfg(test)]
+mod paste_protection_tests {
+    use super::*;
+    #[test]
+    fn review_is_mode_aware_and_controls_cannot_escape_bracketing() {
+        assert!(paste_needs_confirmation("one\ntwo", false));
+        assert!(!paste_needs_confirmation("one\ntwo", true));
+        assert!(paste_needs_confirmation("\x1b[201~run", true));
+        assert!(paste_needs_confirmation("\x03", false));
+        let bytes = paste("hello\x1b[201~\x03\0world", true);
+        assert_eq!(
+            bytes
+                .windows(6)
+                .filter(|part| *part == b"\x1b[201~")
+                .count(),
+            1
+        );
+        assert!(!bytes.contains(&3));
+        assert!(!bytes.contains(&0));
     }
 }

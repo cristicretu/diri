@@ -28,6 +28,8 @@ fn source_build_id() -> String {
         workspace.join("Cargo.lock"),
         workspace.join("vendor/vte/Cargo.toml"),
         workspace.join("vendor/vte/src"),
+        workspace.join("vendor/alacritty_terminal/Cargo.toml"),
+        workspace.join("vendor/alacritty_terminal/src"),
         workspace.join("crates/diri-proto/Cargo.toml"),
         workspace.join("crates/diri-proto/src"),
         workspace.join("crates/diri-pty/Cargo.toml"),

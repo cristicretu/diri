@@ -3,6 +3,7 @@
 //! This is byte-for-byte compatible with
 //! `Sources/DirijorProtocol/Grid.swift`. All integers are big-endian.
 
+use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt;
 use std::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
@@ -60,6 +61,10 @@ impl TermStyle {
     pub const DIM: Self = Self(1 << 5);
     pub const ITALIC: Self = Self(1 << 6);
     pub const CROSSED_OUT: Self = Self(1 << 7);
+    /// Additive semantic bits; older renderers ignore these.
+    pub const SOFT_WRAP: Self = Self(1 << 8);
+    pub const WIDE_SPACER: Self = Self(1 << 9);
+    pub const PROMPT_START: Self = Self(1 << 10);
 
     #[must_use]
     pub const fn empty() -> Self {
@@ -149,17 +154,77 @@ impl Default for GridCell {
     }
 }
 
+/// Bounded per-row annotations. Targets are spans, never one String per cell.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RowMetadata {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<LinkSpan>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub graphemes: Vec<(u16, String)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LinkSpan {
+    pub start: u16,
+    pub end: u16,
+    pub uri: String,
+}
+
+pub const MAX_GRID_METADATA_BYTES: usize = 256 * 1024;
+pub const MAX_LINK_URI_BYTES: usize = 2048;
+
+impl RowMetadata {
+    pub fn is_empty(&self) -> bool {
+        self.links.is_empty() && self.graphemes.is_empty()
+    }
+
+    pub fn validate(&self, cols: usize) -> bool {
+        let mut end = 0;
+        for link in &self.links {
+            if link.start < end
+                || link.start >= link.end
+                || usize::from(link.end) > cols
+                || link.uri.is_empty()
+                || link.uri.len() > MAX_LINK_URI_BYTES
+                || link.uri.chars().any(char::is_control)
+            {
+                return false;
+            }
+            end = link.end;
+        }
+        let mut previous = None;
+        for (col, text) in &self.graphemes {
+            if usize::from(*col) >= cols
+                || previous.is_some_and(|p| p >= *col)
+                || text.len() > 64
+                || text.chars().any(char::is_control)
+            {
+                return false;
+            }
+            previous = Some(*col);
+        }
+        true
+    }
+}
+
 /// A changed row and its zero-based grid coordinate.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChangedRow {
     pub y: u16,
     pub cells: Vec<GridCell>,
+    pub metadata: RowMetadata,
 }
 
 impl ChangedRow {
     #[must_use]
     pub fn new(y: u16, cells: Vec<GridCell>) -> Self {
-        Self { y, cells }
+        Self {
+            y,
+            cells,
+            metadata: RowMetadata::default(),
+        }
     }
 }
 
@@ -208,14 +273,47 @@ impl GridUpdate {
         put_u16(&mut encoded, self.rows);
         put_u16(&mut encoded, self.cursor_col);
         put_u16(&mut encoded, self.cursor_row);
-        let flags = u8::from(self.cursor_visible) | (u8::from(self.is_full_snapshot) << 1);
+        let metadata: Vec<_> = self
+            .changed_rows
+            .iter()
+            .filter(|row| !row.metadata.is_empty())
+            .map(|row| (row.y, &row.metadata))
+            .collect();
+        let flags = u8::from(self.cursor_visible)
+            | (u8::from(self.is_full_snapshot) << 1)
+            | (u8::from(!metadata.is_empty()) << 2);
         encoded.push(flags);
         put_u16(&mut encoded, row_count);
         for row in &self.changed_rows {
             put_u16(&mut encoded, row.y);
             GridRowCodec::append_row(&row.cells, &mut encoded)?;
         }
+        if !metadata.is_empty() {
+            if self
+                .changed_rows
+                .iter()
+                .any(|row| !row.metadata.validate(row.cells.len()))
+            {
+                return Err(GridCodecError::InvalidMetadata);
+            }
+            let data =
+                serde_json::to_vec(&metadata).map_err(|_| GridCodecError::InvalidMetadata)?;
+            if data.len() > MAX_GRID_METADATA_BYTES {
+                return Err(GridCodecError::InvalidMetadata);
+            }
+            encoded.push(1); // annotation extension version
+            encoded.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            encoded.extend_from_slice(&data);
+        }
         Ok(encoded)
+    }
+
+    /// Preserve the original wire form for a surviving pre-1.6 controller.
+    pub fn without_annotations(mut self) -> Self {
+        for row in &mut self.changed_rows {
+            row.metadata = RowMetadata::default();
+        }
+        self
     }
 
     pub fn decode(payload: &[u8]) -> Result<Self, GridCodecError> {
@@ -230,7 +328,32 @@ impl GridUpdate {
         for _ in 0..row_count {
             let y = cursor.u16()?;
             let cells = GridRowCodec::read_row_from_cursor(&mut cursor)?;
-            changed_rows.push(ChangedRow { y, cells });
+            changed_rows.push(ChangedRow::new(y, cells));
+        }
+        if flags & 4 != 0 {
+            if cursor.u8()? != 1 {
+                return Err(GridCodecError::InvalidMetadata);
+            }
+            let length = cursor.u32()? as usize;
+            if length > MAX_GRID_METADATA_BYTES
+                || payload.len().saturating_sub(cursor.offset) != length
+            {
+                return Err(GridCodecError::InvalidMetadata);
+            }
+            let metadata: Vec<(u16, RowMetadata)> =
+                serde_json::from_slice(&payload[cursor.offset..])
+                    .map_err(|_| GridCodecError::InvalidMetadata)?;
+            let mut seen = std::collections::HashSet::new();
+            for (y, data) in metadata {
+                if !seen.insert(y) || !data.validate(usize::from(cols)) {
+                    return Err(GridCodecError::InvalidMetadata);
+                }
+                let row = changed_rows
+                    .iter_mut()
+                    .find(|row| row.y == y)
+                    .ok_or(GridCodecError::InvalidMetadata)?;
+                row.metadata = data;
+            }
         }
         Ok(Self {
             cols,
@@ -272,6 +395,7 @@ impl GridUpdate {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GridCodecError {
+    InvalidMetadata,
     UnexpectedEnd {
         offset: usize,
         needed: usize,
@@ -285,6 +409,7 @@ pub enum GridCodecError {
 impl fmt::Display for GridCodecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidMetadata => f.write_str("invalid or oversized terminal annotations"),
             Self::UnexpectedEnd {
                 offset,
                 needed,
@@ -782,5 +907,69 @@ mod tests {
                 _ => TermColor::Rgb(self.next() as u8, self.next() as u8, self.next() as u8),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod annotation_tests {
+    use super::*;
+    fn annotated() -> GridUpdate {
+        let mut row = ChangedRow::new(0, vec![GridCell::BLANK; 8]);
+        row.metadata.links.push(LinkSpan {
+            start: 0,
+            end: 4,
+            uri: "https://diri.dev".into(),
+        });
+        row.metadata.graphemes.push((0, "\u{301}".into()));
+        GridUpdate {
+            cols: 8,
+            rows: 1,
+            cursor_col: 0,
+            cursor_row: 0,
+            cursor_visible: true,
+            is_full_snapshot: true,
+            changed_rows: vec![row],
+        }
+    }
+    #[test]
+    fn annotations_round_trip_and_old_wire_stays_readable() {
+        let grid = annotated();
+        assert_eq!(GridUpdate::decode(&grid.encode().unwrap()).unwrap(), grid);
+        let legacy = grid.without_annotations();
+        let bytes = legacy.encode().unwrap();
+        assert_eq!(bytes[8] & 4, 0);
+        assert_eq!(GridUpdate::decode(&bytes).unwrap(), legacy);
+    }
+    #[test]
+    fn malformed_annotation_versions_lengths_and_coordinates_fail() {
+        let grid = annotated();
+        let mut bytes = grid.encode().unwrap();
+        let offset = grid.clone().without_annotations().encode().unwrap().len();
+        bytes[offset] = 9;
+        assert_eq!(
+            GridUpdate::decode(&bytes),
+            Err(GridCodecError::InvalidMetadata)
+        );
+        let mut bytes = grid.encode().unwrap();
+        bytes.pop();
+        assert_eq!(
+            GridUpdate::decode(&bytes),
+            Err(GridCodecError::InvalidMetadata)
+        );
+        let mut bad = grid.clone();
+        bad.changed_rows[0].metadata.links[0].end = 9;
+        assert_eq!(bad.encode(), Err(GridCodecError::InvalidMetadata));
+        let mut bad = grid;
+        bad.changed_rows[0].metadata.links[0].uri.push('\x1b');
+        assert_eq!(bad.encode(), Err(GridCodecError::InvalidMetadata));
+    }
+    #[test]
+    fn coalescing_replaces_annotations_even_when_text_is_unchanged() {
+        let mut first = annotated();
+        let mut second = first.clone();
+        second.is_full_snapshot = false;
+        second.changed_rows[0].metadata = RowMetadata::default();
+        first.coalesce(second);
+        assert!(first.changed_rows[0].metadata.is_empty());
     }
 }

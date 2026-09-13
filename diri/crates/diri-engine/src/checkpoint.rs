@@ -1,6 +1,6 @@
 //! Durable screen checkpoints: `<id>.screen.plist`. Version 2 remains
 //! load-compatible with the historical Swift checkpoint; version 3 preserves
-//! granular mouse state.
+//! granular mouse state, and version 4 adds bounded terminal annotations.
 //!
 //! A checkpoint pairs an RLE-encoded full grid with the exact raw-log offset
 //! it represents, so a restarted daemon can seed the emulator from a few
@@ -11,7 +11,7 @@
 //! malformed, stale, or future-version file is ignored and the bounded
 //! raw-log replay runs instead. The on-disk format is a property list (either
 //! binary or XML is read). Version 2's historical keys still load during an
-//! upgrade; a rollback safely treats version 3 as a cache miss and rebuilds
+//! upgrade; a rollback safely treats version 4 as a cache miss and rebuilds
 //! from the authoritative raw log.
 
 use std::path::Path;
@@ -23,13 +23,14 @@ use diri_proto::terminal::{MouseEncoding, MouseModes, MouseTrackingMode};
 // every adopted session to at most one line of history, so it is deliberately
 // treated as a cache miss and rebuilt from the authoritative raw log.
 const PREVIOUS_VERSION: u64 = 2;
-const CURRENT_VERSION: u64 = 3;
+const CURRENT_VERSION: u64 = 4;
 
 /// A decoded checkpoint, grid already validated.
 pub struct ScreenCheckpoint {
     pub log_offset: u64,
     /// Rows above the visible grid, oldest first.
     pub history: Vec<Vec<GridCell>>,
+    pub history_metadata: Vec<diri_proto::grid::RowMetadata>,
     pub grid: GridUpdate,
     /// Partial exit-marker bytes that were pending when the checkpoint was
     /// taken; replaying resumes with them so a marker split across the
@@ -53,7 +54,7 @@ impl ScreenCheckpoint {
         let value = plist::Value::from_file(path).ok()?;
         let dict = value.as_dictionary()?;
         let version = dict.get("version")?.as_unsigned_integer()?;
-        if !matches!(version, PREVIOUS_VERSION | CURRENT_VERSION) {
+        if !matches!(version, PREVIOUS_VERSION | 3 | CURRENT_VERSION) {
             return None;
         }
         let grid = GridUpdate::decode(as_data(dict.get("gridPayload")?)?).ok()?;
@@ -69,6 +70,25 @@ impl ScreenCheckpoint {
         if history
             .iter()
             .any(|row| row.len() != usize::from(grid.cols))
+        {
+            return None;
+        }
+        let history_metadata: Vec<diri_proto::grid::RowMetadata> = match dict.get("historyMetadata")
+        {
+            Some(value) => {
+                let bytes = as_data(value)?;
+                if bytes.len() > diri_proto::grid::MAX_GRID_METADATA_BYTES {
+                    return None;
+                }
+                serde_json::from_slice(bytes).ok()?
+            }
+            None => Vec::new(),
+        };
+        if !history_metadata.is_empty()
+            && (history_metadata.len() != history.len()
+                || history_metadata
+                    .iter()
+                    .any(|row| !row.validate(usize::from(grid.cols))))
         {
             return None;
         }
@@ -94,6 +114,7 @@ impl ScreenCheckpoint {
         Some(Self {
             log_offset: dict.get("logOffset")?.as_unsigned_integer()?,
             history,
+            history_metadata,
             grid,
             marker_buffer: as_data(dict.get("markerBuffer")?)?.to_vec(),
             alt_screen: dict.get("altScreen")?.as_boolean()?,
@@ -105,6 +126,11 @@ impl ScreenCheckpoint {
     /// Writes atomically (temp file + rename) as a binary plist.
     pub fn write_atomically(&self, path: &Path) -> std::io::Result<()> {
         let mut dict = plist::Dictionary::new();
+        let metadata = serde_json::to_vec(&self.history_metadata).map_err(std::io::Error::other)?;
+        if metadata.len() > diri_proto::grid::MAX_GRID_METADATA_BYTES {
+            return Err(std::io::Error::other("checkpoint annotations exceed limit"));
+        }
+        dict.insert("historyMetadata".into(), plist::Value::Data(metadata));
         dict.insert(
             "version".into(),
             plist::Value::Integer(CURRENT_VERSION.into()),
@@ -177,6 +203,7 @@ mod tests {
         let cells = vec![GridCell::BLANK; 4];
         ScreenCheckpoint {
             log_offset: 12345,
+            history_metadata: Vec::new(),
             history: vec![vec![GridCell::BLANK; 4]],
             grid: GridUpdate {
                 cols: 4,
@@ -192,6 +219,34 @@ mod tests {
             bracketed_paste: false,
             mouse: MouseModes::new(MouseTrackingMode::AnyMotion, MouseEncoding::Sgr),
         }
+    }
+
+    #[test]
+    fn annotations_survive_checkpoint_reload() {
+        use diri_proto::grid::{LinkSpan, RowMetadata, TermStyle};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("annotations.plist");
+        let mut checkpoint = sample();
+        let metadata = RowMetadata {
+            links: vec![LinkSpan {
+                start: 0,
+                end: 2,
+                uri: "https://example.com".into(),
+            }],
+            graphemes: vec![(0, "\u{301}".into())],
+        };
+        checkpoint.history_metadata.push(metadata.clone());
+        checkpoint.history[0][0].style |= TermStyle::PROMPT_START;
+        checkpoint.grid.changed_rows[0].metadata = metadata.clone();
+        checkpoint.write_atomically(&path).unwrap();
+        let restored = ScreenCheckpoint::load(&path).unwrap();
+        assert_eq!(restored.history_metadata, vec![metadata.clone()]);
+        assert_eq!(restored.grid.changed_rows[0].metadata, metadata);
+        assert!(
+            restored.history[0][0]
+                .style
+                .contains(TermStyle::PROMPT_START)
+        );
     }
 
     #[test]
