@@ -1966,6 +1966,10 @@ impl SessionStore {
         self.overview.dismiss();
     }
 
+    pub fn set_overview_columns(&mut self, columns: usize) {
+        self.overview.set_columns(columns);
+    }
+
     pub fn set_overview_mode(&mut self, mode: OverviewMode) {
         let sessions = self.ordered_sessions();
         self.overview.set_mode(mode, &sessions);

@@ -321,7 +321,7 @@ impl RootView {
         });
         let session_surfaces = (!preview).then(|| {
             let runtime = Arc::clone(&services.store);
-            cx.new(|cx| SessionSurfaces::new(runtime, cx))
+            cx.new(|cx| SessionSurfaces::new(runtime, Some(services.tokio.handle().clone()), cx))
         });
         let utility_surfaces = (!preview).then(|| {
             let runtime = Arc::clone(&services.store);
