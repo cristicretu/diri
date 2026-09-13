@@ -41,6 +41,8 @@ use crate::usage::{UsageFormat, UsageSnapshot};
 
 use crate::session_presentation::{activity_mark, is_loading, status_state, ui_agent_kind};
 
+use super::disclosure::{Disclosure, Frame as DisclosureFrame};
+
 use super::{
     CursorMove, DragItem, DropZone, Popover, PreviewScenario, SidebarPreviewFixture,
     SidebarUiState, drop_zone, move_before, move_past, move_to_end,
@@ -282,6 +284,11 @@ pub struct Sidebar {
     /// Bumped whenever the body swaps between sessions and settings, so the
     /// slide restarts on each swap instead of replaying a finished animation.
     body_generation: u64,
+    project_disclosures: HashMap<ProjectId, (Disclosure, Vec<crate::store::SidebarRow>)>,
+    archive_disclosures: HashMap<ProjectId, Disclosure>,
+    recency_disclosure: Option<Disclosure>,
+    disclosure_animating: bool,
+    disclosure_tick: Option<Task<()>>,
 }
 
 /// The sidebar state that asked for a native folder pick, captured when the
@@ -391,6 +398,11 @@ impl Sidebar {
             external_drop_feedback: None,
             settings_nav: None,
             body_generation: 0,
+            project_disclosures: HashMap::new(),
+            archive_disclosures: HashMap::new(),
+            recency_disclosure: None,
+            disclosure_animating: false,
+            disclosure_tick: None,
         };
         sidebar.ui.preview_account = preview;
         // Preview-only hook so headless screenshots can verify popover layout.
@@ -2006,7 +2018,7 @@ impl Sidebar {
         });
         let entity = cx.entity();
         let drag_label: SharedString = group.project.name.clone().into();
-        let mut section = div().flex().flex_col().gap(px(2.0)).child(
+        let mut section = div().flex_none().flex().flex_col().child(
             div()
                 .id(format!("project:{}", id.0))
                 .debug_selector({
@@ -2281,21 +2293,66 @@ impl Sidebar {
                 ),
         );
 
-        // The projection already folds a collapsed project away, so an empty
-        // row list here means "collapsed" without asking a second source.
-        for row in &group.sessions {
-            let shortcut = self.shortcut_for(row.id());
-            let id = row.id().clone();
-            let drop = self.row_drop_feedback(row, window, cx);
-            let marker = match drop {
-                Some(RowDrop::Insert(zone)) => Some((zone, row.depth)),
-                _ => None,
-            };
-            let rendered = self.session_row(row, shortcut, drop, colors, window, cx);
-            section = section.child(self.track_row_bounds(id, rendered, marker));
+        // Keep the last visible rows only for the close animation. The Store
+        // remains authoritative for keyboard navigation and selection.
+        let now = Instant::now();
+        let (motion, retained) = self
+            .project_disclosures
+            .entry(id.clone())
+            .or_insert_with(|| {
+                (
+                    Disclosure::new(
+                        !collapsed,
+                        group.sessions.len() + usize::from(!group.archived.is_empty()),
+                        now,
+                    ),
+                    Vec::new(),
+                )
+            });
+        if !collapsed {
+            retained.clone_from(&group.sessions);
+        } else {
+            // A session removed while closing must not survive in the visual tail.
+            retained.retain(|row| group.active.iter().any(|session| session.id == *row.id()));
         }
-        if !collapsed && !group.archived.is_empty() {
-            section = section.child(self.archived_bucket(group, colors, window, cx));
+        let frame = motion.update(
+            !collapsed,
+            retained.len() + usize::from(!group.archived.is_empty()),
+            now,
+            cx.reduce_motion(),
+        );
+        self.disclosure_animating |= frame.animating;
+        let rows = retained.clone();
+        if collapsed && !frame.animating {
+            retained.clear();
+        }
+        if frame.reveal > 0.0 {
+            let mut children = Vec::new();
+            for row in &rows {
+                let shortcut = self.shortcut_for(row.id());
+                let id = row.id().clone();
+                let drop = if collapsed {
+                    None
+                } else {
+                    self.row_drop_feedback(row, window, cx)
+                };
+                let marker = match drop {
+                    Some(RowDrop::Insert(zone)) => Some((zone, row.depth)),
+                    _ => None,
+                };
+                let rendered = self.session_row(row, shortcut, drop, colors, window, cx);
+                let rendered = if collapsed {
+                    rendered
+                } else {
+                    self.track_row_bounds(id, rendered, marker)
+                };
+                children.push((rendered, SIDEBAR_NAV_ROW_HEIGHT));
+            }
+            if !group.archived.is_empty() {
+                let (bucket, height) = self.archived_bucket(group, !collapsed, colors, window, cx);
+                children.push((bucket, height));
+            }
+            section = section.child(disclosure_body(children, &frame, !collapsed));
         }
         section.into_any_element()
     }
@@ -2378,7 +2435,7 @@ impl Sidebar {
             .preferences()
             .sidebar_recency_archives_expanded;
         let count = archived.len();
-        let mut section = div().flex().flex_col().gap(px(2.0)).child(
+        let mut section = div().flex_none().flex().flex_col().child(
             div()
                 .id("recency-archive-header")
                 .role(Role::Button)
@@ -2436,12 +2493,25 @@ impl Sidebar {
                         )),
                 ),
         );
-        if expanded {
+        let now = Instant::now();
+        let motion = self
+            .recency_disclosure
+            .get_or_insert_with(|| Disclosure::new(expanded, count, now));
+        let frame = motion.update(expanded, count, now, cx.reduce_motion());
+        self.disclosure_animating |= frame.animating;
+        if frame.reveal > 0.0 {
+            let mut children = Vec::new();
             for session in archived {
                 let id = session.id.clone();
                 let rendered = self.archived_row(&session, colors, window, cx);
-                section = section.child(self.track_row_bounds(id, rendered, None));
+                let rendered = if expanded {
+                    self.track_row_bounds(id, rendered, None)
+                } else {
+                    rendered
+                };
+                children.push((rendered, SIDEBAR_NAV_ROW_HEIGHT));
             }
+            section = section.child(disclosure_body(children, &frame, expanded));
         }
         Some(section.into_any_element())
     }
@@ -3022,10 +3092,11 @@ impl Sidebar {
     fn archived_bucket(
         &mut self,
         group: &crate::store::SidebarProject,
+        interactive: bool,
         colors: SemanticColors,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> (AnyElement, f32) {
         let project_id = group.project.id.clone();
         let expanded = self
             .store
@@ -3040,7 +3111,7 @@ impl Sidebar {
             .id(format!("archive:{}", project_id.0))
             .flex()
             .flex_col()
-            .gap(px(2.0))
+            .flex_none()
             .rounded(px(SIDEBAR_ROW_RADIUS))
             .when(targeted, |element| {
                 element
@@ -3132,14 +3203,33 @@ impl Sidebar {
                             )),
                     ),
             );
-        if expanded {
+        let now = Instant::now();
+        let motion = self
+            .archive_disclosures
+            .entry(project_id)
+            .or_insert_with(|| Disclosure::new(expanded, group.archived.len(), now));
+        let frame = motion.update(expanded, group.archived.len(), now, cx.reduce_motion());
+        self.disclosure_animating |= frame.animating;
+        let body_height =
+            (SIDEBAR_NAV_ROW_HEIGHT + 2.0) * group.archived.len() as f32 * frame.reveal;
+        if frame.reveal > 0.0 {
+            let mut children = Vec::new();
             for session in &group.archived {
                 let id = session.id.clone();
                 let rendered = self.archived_row(session, colors, window, cx);
-                bucket = bucket.child(self.track_row_bounds(id, rendered, None));
+                let rendered = if expanded && interactive {
+                    self.track_row_bounds(id, rendered, None)
+                } else {
+                    rendered
+                };
+                children.push((rendered, SIDEBAR_NAV_ROW_HEIGHT));
             }
+            bucket = bucket.child(disclosure_body(children, &frame, expanded && interactive));
         }
-        bucket.into_any_element()
+        (
+            bucket.into_any_element(),
+            SIDEBAR_NAV_ROW_HEIGHT + 4.0 + body_height,
+        )
     }
 
     fn archived_row(
@@ -6504,6 +6594,7 @@ fn reveal_tracked_row(
 impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.working_row_rendered = false;
+        self.disclosure_animating = false;
         if cx.reduce_motion() {
             self.activity_frame = 0;
         }
@@ -6551,6 +6642,28 @@ impl Render for Sidebar {
                 recency_archives_expanded,
             )
         };
+        self.project_disclosures.retain(|id, _| {
+            grouping == SidebarGrouping::Project
+                && projection
+                    .projects
+                    .iter()
+                    .any(|group| &group.project.id == id)
+        });
+        self.archive_disclosures.retain(|id, _| {
+            grouping == SidebarGrouping::Project
+                && projection
+                    .projects
+                    .iter()
+                    .any(|group| &group.project.id == id && !group.archived.is_empty())
+        });
+        if grouping != SidebarGrouping::Recency
+            || projection
+                .projects
+                .iter()
+                .all(|group| group.archived.is_empty())
+        {
+            self.recency_disclosure = None;
+        }
         let today = local_day_ordinal(wall_clock_millis()).unwrap_or(0);
         let focus_rows = match grouping {
             SidebarGrouping::Project => focus_rows(&projection, &expanded_archives),
@@ -6628,6 +6741,22 @@ impl Render for Sidebar {
             list
         });
 
+        if !self.disclosure_animating {
+            self.disclosure_tick = None;
+        } else if self.disclosure_tick.is_none() {
+            // A covered native window can stop delivering display-link
+            // callbacks. Like the activity mark, explicitly invalidate the
+            // cached sidebar; this one-shot ends with the finite disclosure.
+            self.disclosure_tick = Some(cx.spawn_in(window, async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+                let _ = this.update_in(cx, |this, _, cx| {
+                    this.disclosure_tick = None;
+                    cx.notify();
+                });
+            }));
+        }
         self.schedule_activity_tick(window, cx);
 
         let mut root = div()
@@ -6733,6 +6862,49 @@ impl Render for Sidebar {
         }
         root
     }
+}
+
+/// Clip a naturally laid out list; moving the clip never compresses text.
+fn disclosure_body(
+    rows: Vec<(AnyElement, f32)>,
+    frame: &DisclosureFrame,
+    interactive: bool,
+) -> AnyElement {
+    let height: f32 = rows.iter().map(|(_, height)| height + 2.0).sum();
+    let mut contents = div().absolute().top_0().left_0().w_full().flex().flex_col();
+    for (index, (row, height)) in rows.into_iter().enumerate() {
+        let progress = frame.rows.get(index).copied().unwrap_or(frame.reveal);
+        contents = contents.child(
+            div()
+                .relative()
+                .flex_none()
+                .mt(px(2.0))
+                .h(px(height))
+                .top(px(-6.0 * (1.0 - progress)))
+                .opacity(progress)
+                .child(row),
+        );
+    }
+    div()
+        .relative()
+        .flex_none()
+        .w_full()
+        .h(px(height * frame.reveal))
+        .overflow_hidden()
+        .child(contents)
+        // Closing rows are presentation only. Shield their hover, click and
+        // drag handlers until the clip finishes and the rows are discarded.
+        .when(!interactive, |body| {
+            body.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .occlude()
+                    .capture_any_mouse_down(|_, _, cx| cx.stop_propagation())
+                    .capture_any_mouse_up(|_, _, cx| cx.stop_propagation()),
+            )
+        })
+        .into_any_element()
 }
 
 fn icon_button(
@@ -9199,6 +9371,91 @@ mod tests {
             "project actions must open below their trigger"
         );
         assert_eq!(popover.size.width, px(184.0));
+    }
+
+    #[gpui::test]
+    fn disclosure_advances_without_pointer_or_display_link_callbacks(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        let project = cx.debug_bounds("PROJECT_preview-dirijor").unwrap();
+        cx.simulate_click(project.center(), Modifiers::default());
+        cx.run_until_parked();
+        let paints = Rc::new(std::cell::Cell::new(0));
+        let observed = Rc::clone(&paints);
+        let _subscription =
+            cx.update(|_, cx| cx.observe(&sidebar, move |_, _| observed.set(observed.get() + 1)));
+        // Native display-link delivery may pause while a window is covered.
+        // The finite disclosure must still invalidate its cached view.
+        cx.executor().advance_clock(Duration::from_millis(17));
+        cx.run_until_parked();
+        assert!(paints.get() > 0, "disclosure froze after its first frame");
+    }
+
+    #[gpui::test]
+    fn closing_project_rows_are_visible_but_cannot_be_selected(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        let row = row_bounds(&sidebar, cx, "preview-claude");
+        let selected = sidebar.read_with(cx, |sidebar, _| {
+            sidebar.store.read().unwrap().selected_session_id().cloned()
+        });
+        let project = cx.debug_bounds("PROJECT_preview-dirijor").unwrap();
+        cx.simulate_click(project.center(), Modifiers::default());
+        sidebar.update(cx, |sidebar, _| {
+            let (rows, _) = sidebar.focus_rows_snapshot();
+            assert!(!rows.iter().any(|row| row.id.0 == "preview-claude"));
+            assert!(
+                !sidebar.project_disclosures[&ProjectId::new("preview-dirijor")]
+                    .1
+                    .is_empty(),
+                "retain the visual tail until the close completes"
+            );
+        });
+        cx.simulate_click(row.center(), Modifiers::default());
+        sidebar.read_with(cx, |sidebar, _| {
+            assert_eq!(
+                sidebar.store.read().unwrap().selected_session_id().cloned(),
+                selected,
+                "a closing row must not receive clicks"
+            );
+        });
+        sidebar.update(cx, |sidebar, cx| {
+            let (motion, rows) = sidebar
+                .project_disclosures
+                .get_mut(&ProjectId::new("preview-dirijor"))
+                .unwrap();
+            motion.update(
+                false,
+                rows.len(),
+                Instant::now() + Duration::from_secs(1),
+                false,
+            );
+            cx.notify();
+        });
+        cx.run_until_parked();
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(
+                sidebar.project_disclosures[&ProjectId::new("preview-dirijor")]
+                    .1
+                    .is_empty()
+            );
+            assert!(
+                !sidebar
+                    .row_bounds
+                    .borrow()
+                    .contains_key(&SessionId::new("preview-claude"))
+            );
+            assert!(
+                sidebar.disclosure_tick.is_none(),
+                "settled disclosures must not schedule idle work"
+            );
+        });
     }
 
     #[gpui::test]
