@@ -910,6 +910,22 @@ The completed acceptance scenario is:
 5. Continue interacting with the same Agent process.
 ```
 
+## Conversation title authority
+
+The local Engine separates terminal presentation titles from native conversation
+names. `SessionRecord.titleSource` additively assigns value `5` to `TerminalTitle`;
+existing values retain their meaning and older readers decode new values as
+unknown. A terminal title is provisional and may follow later OSC updates.
+Confirmed native names take precedence; manual and Diri-assigned names remain
+authoritative. A stored first-prompt preview cannot replace a real name.
+
+Codex activity, pending-name labels and unnamed placeholders are excluded from
+conversation names, and a matching cwd suffix and activity spinner are removed.
+The Engine repairs previously persisted transient Agent titles on load. Local
+native names still come from the exact profile and thread identity; remote
+sessions use the existing terminal output and captured-prompt path. No remote
+store reads, thread-ID discovery, Helper behavior or protocol changes are added.
+
 ## Terminal notification ingestion
 
 The local Engine optionally extracts bounded OSC 9, OSC 777 and textual OSC 99

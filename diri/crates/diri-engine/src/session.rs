@@ -197,6 +197,8 @@ pub struct SessionView {
     pub last_turn_completed_at: Option<diri_proto::DateMillis>,
     pub title: Option<String>,
     pub title_source: Option<diri_proto::TitleSource>,
+    /// Raw OSC title, kept separate so a captured prompt cannot hide a later name.
+    pub terminal_title: Option<String>,
     pub tail_offset: u64,
     pub exited: bool,
 }
@@ -1084,6 +1086,7 @@ impl Session {
     }
 
     pub fn view(&self) -> SessionView {
+        let terminal_title = self.shared.title.lock().expect("title").clone();
         let prompt_title = self
             .shared
             .prompt_title
@@ -1094,12 +1097,13 @@ impl Session {
             (Some(title), Some(diri_proto::TitleSource::FirstPrompt))
         } else {
             (
-                self.shared.title.lock().expect("title").clone(),
-                Some(diri_proto::TitleSource::AgentProvided),
+                terminal_title.clone(),
+                Some(diri_proto::TitleSource::TerminalTitle),
             )
         };
         SessionView {
             id: self.shared.id.clone(),
+            terminal_title,
             status: self.shared.status.lock().expect("status").clone(),
             status_evidence: self
                 .shared

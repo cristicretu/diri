@@ -792,7 +792,22 @@ fn system_time_ms(time: SystemTime) -> f64 {
 #[derive(Default)]
 struct CodexTitleCandidates {
     explicit: Option<String>,
-    fallback: Option<String>,
+    fallback: Option<ProviderTitle>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ProviderTitle {
+    pub title: String,
+    pub source: diri_proto::TitleSource,
+}
+
+impl ProviderTitle {
+    pub(crate) fn named(title: String) -> Self {
+        Self {
+            title,
+            source: diri_proto::TitleSource::AgentProvided,
+        }
+    }
 }
 
 /// Resolves the title Codex currently exposes for `thread_id`. This follows
@@ -804,6 +819,7 @@ pub(crate) fn codex_title(home: &Path, thread_id: &str) -> Option<String> {
     profile_codex_title(None, home, thread_id)
 }
 
+#[cfg(test)]
 pub(crate) fn profile_codex_title(
     profile: Option<&diri_proto::AgentAccountProfile>,
     home: &Path,
@@ -815,11 +831,23 @@ pub(crate) fn profile_codex_title(
 /// One refresh pass over one profile. Connections, schema discovery and the
 /// bounded index read are shared by the requested sessions, then dropped. No
 /// persistent database connection or title cache can hide a provider rename.
+#[cfg(test)]
 pub(crate) fn profile_codex_titles(
     profile: Option<&diri_proto::AgentAccountProfile>,
     home: &Path,
     thread_ids: &[&str],
 ) -> HashMap<String, String> {
+    profile_codex_title_details(profile, home, thread_ids)
+        .into_iter()
+        .map(|(id, title)| (id, title.title))
+        .collect()
+}
+
+pub(crate) fn profile_codex_title_details(
+    profile: Option<&diri_proto::AgentAccountProfile>,
+    home: &Path,
+    thread_ids: &[&str],
+) -> HashMap<String, ProviderTitle> {
     let thread_ids: HashSet<_> = thread_ids
         .iter()
         .copied()
@@ -860,6 +888,7 @@ pub(crate) fn profile_codex_titles(
             candidate
                 .explicit
                 .or_else(|| indexed.remove(id))
+                .map(ProviderTitle::named)
                 .or(candidate.fallback)
                 .map(|title| (id.to_owned(), title))
         })
@@ -934,11 +963,20 @@ fn codex_database_titles(
                 let explicit = row.get::<_, Option<String>>(0)?;
                 let generated = row.get::<_, Option<String>>(1)?;
                 let first_prompt = row.get::<_, Option<String>>(2)?;
+                let generated = generated.and_then(clean_provider_title);
+                let first_prompt = first_prompt.and_then(clean_provider_title);
+                // Codex's `title` can be a copy of the first user message.
+                // A prompt preview must not replace an actual terminal name.
+                let source = if generated.is_some() && generated != first_prompt {
+                    diri_proto::TitleSource::AgentProvided
+                } else {
+                    diri_proto::TitleSource::FirstPrompt
+                };
                 Ok(CodexTitleCandidates {
                     explicit: explicit.and_then(clean_provider_title),
                     fallback: generated
-                        .and_then(clean_provider_title)
-                        .or_else(|| first_prompt.and_then(clean_provider_title)),
+                        .or(first_prompt)
+                        .map(|title| ProviderTitle { title, source }),
                 })
             })
             .optional()
@@ -1318,6 +1356,31 @@ mod tests {
         assert_eq!(entries[0].id, "thread-9");
         assert_eq!(entries[0].kind, HistoryKind::Codex);
         assert_eq!(entries[0].cwd, "/tmp");
+    }
+
+    #[test]
+    fn codex_prompt_previews_are_not_classified_as_conversation_names() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join(".codex");
+        std::fs::create_dir_all(&config).unwrap();
+        let db = Connection::open(config.join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT, title TEXT, first_user_message TEXT);
+            INSERT INTO threads VALUES ('prompt', NULL, 'please fix this', 'please fix this'),
+                ('named', 'Repair chat naming', 'please fix this', 'please fix this'),
+                ('legacy', NULL, 'Legacy custom title', 'please fix this');").unwrap();
+        let titles = profile_codex_title_details(None, home.path(), &["prompt", "named", "legacy"]);
+        assert_eq!(
+            titles["prompt"].source,
+            diri_proto::TitleSource::FirstPrompt
+        );
+        assert_eq!(
+            titles["named"].source,
+            diri_proto::TitleSource::AgentProvided
+        );
+        assert_eq!(
+            titles["legacy"].source,
+            diri_proto::TitleSource::AgentProvided
+        );
     }
 
     #[test]

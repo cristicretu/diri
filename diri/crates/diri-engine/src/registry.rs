@@ -96,7 +96,7 @@ pub(crate) struct NativeTitleRefreshRequest {
 
 pub(crate) struct NativeTitleRefreshResult {
     request: NativeTitleRefreshRequest,
-    title: Option<String>,
+    title: Option<crate::history::ProviderTitle>,
 }
 
 /// How long consecutive persists coalesce. Matches the Swift daemon's
@@ -776,7 +776,7 @@ impl Registry {
             let Some(title) = refresh.title else {
                 continue;
             };
-            if !apply_native_title(record, &title) {
+            if !apply_provider_title(record, &title) {
                 continue;
             }
             record.updated_at = DateMillis::from(std::time::SystemTime::now());
@@ -996,22 +996,24 @@ impl Registry {
             let title = match record.kind.id() {
                 diri_proto::AgentKind::CLAUDE_CODE_ID => transcript
                     .as_mut()
-                    .and_then(|transcript| transcript.latest_claude_title()),
+                    .and_then(|transcript| transcript.latest_claude_title())
+                    .map(crate::history::ProviderTitle::named),
                 diri_proto::AgentKind::CODEX_ID => {
                     let home = home?;
                     let agent_id = meta
                         .agent_session_id
                         .as_deref()
                         .or(record.agent_session_id.as_deref())?;
-                    crate::history::profile_codex_title(
+                    crate::history::profile_codex_title_details(
                         record.account_profile.as_ref(),
                         home,
-                        agent_id,
+                        &[agent_id],
                     )
+                    .remove(agent_id)
                 }
                 _ => None,
             }?;
-            normalize_agent_title(&title).filter(|title| !is_generic_terminal_title(title, record))
+            Some(title)
         });
         let cursor = self.records.get(id).and_then(|record| {
             if !is_local_cursor_record(record) {
@@ -1058,12 +1060,8 @@ impl Registry {
             record.title_source = TitleSource::FirstPrompt;
             changed = true;
         }
-        if let Some(title) = native_title
-            && (record.title != title || record.title_source != TitleSource::AgentProvided)
-        {
-            record.title = title;
-            record.title_source = TitleSource::AgentProvided;
-            changed = true;
+        if let Some(title) = native_title {
+            changed |= apply_provider_title(record, &title);
         }
         if changed {
             record.updated_at = DateMillis::from(std::time::SystemTime::now());
@@ -1435,8 +1433,11 @@ pub(crate) fn scan_native_title_refreshes(
     let mut codex_titles = HashMap::new();
     for group in codex_groups.values() {
         let ids: Vec<_> = group.iter().map(|r| r.agent_session_id.as_str()).collect();
-        let titles =
-            crate::history::profile_codex_titles(group[0].account_profile.as_ref(), &home, &ids);
+        let titles = crate::history::profile_codex_title_details(
+            group[0].account_profile.as_ref(),
+            &home,
+            &ids,
+        );
         for request in group {
             if let Some(title) = titles.get(&request.agent_session_id) {
                 codex_titles.insert(request.id.clone(), title.clone());
@@ -1460,7 +1461,8 @@ pub(crate) fn scan_native_title_refreshes(
                             Path::new(path),
                         )
                     })
-                    .and_then(|mut transcript| transcript.latest_claude_title()),
+                    .and_then(|mut transcript| transcript.latest_claude_title())
+                    .map(crate::history::ProviderTitle::named),
                 AgentKind::CODEX_ID => codex_titles.remove(&request.id),
                 _ => None,
             };
@@ -1487,7 +1489,10 @@ fn apply_cursor_conversation(
     }
     let accepts_generated_title = matches!(
         record.title_source,
-        TitleSource::Placeholder | TitleSource::FirstPrompt | TitleSource::Unknown
+        TitleSource::Placeholder
+            | TitleSource::FirstPrompt
+            | TitleSource::TerminalTitle
+            | TitleSource::Unknown
     );
     if accepts_generated_title
         && let Some(title) = conversation
@@ -1508,6 +1513,7 @@ fn accepts_native_title(source: TitleSource) -> bool {
         source,
         TitleSource::Placeholder
             | TitleSource::FirstPrompt
+            | TitleSource::TerminalTitle
             | TitleSource::AgentProvided
             | TitleSource::Unknown
     )
@@ -1530,6 +1536,35 @@ fn apply_native_title(record: &mut SessionRecord, title: &str) -> bool {
     true
 }
 
+fn apply_provider_title(
+    record: &mut SessionRecord,
+    candidate: &crate::history::ProviderTitle,
+) -> bool {
+    if candidate.source != TitleSource::FirstPrompt {
+        return apply_native_title(record, &candidate.title);
+    }
+    let title = crate::hooks::title_from_prompt(&candidate.title);
+    // Older builds promoted the database's prompt preview to AgentProvided.
+    // Demote only an exact match confirmed by this identity-bound store read.
+    let old_prompt = record.title_source == TitleSource::AgentProvided
+        && (record.title == candidate.title || record.title == title);
+    if !matches!(
+        record.title_source,
+        TitleSource::Placeholder | TitleSource::FirstPrompt | TitleSource::Unknown
+    ) && !old_prompt
+    {
+        return false;
+    }
+    if title.is_empty()
+        || (record.title == title && record.title_source == TitleSource::FirstPrompt)
+    {
+        return false;
+    }
+    record.title = title;
+    record.title_source = TitleSource::FirstPrompt;
+    true
+}
+
 fn is_local_cursor_record(record: &SessionRecord) -> bool {
     record.kind == diri_proto::AgentKind::CURSOR && record.host.is_none()
 }
@@ -1548,30 +1583,55 @@ fn fold_session_view(record: &mut SessionRecord, view: &SessionView) {
     {
         return;
     }
-    let Some(title) = view
-        .title
-        .as_deref()
-        .and_then(normalize_agent_title)
-        .filter(|title| !is_generic_terminal_title(title, record))
-    else {
-        return;
-    };
-    record.title = title;
-    record.title_source = view.title_source.unwrap_or(TitleSource::AgentProvided);
+    let terminal_title = view.terminal_title.as_deref().or_else(|| {
+        (view.title_source != Some(TitleSource::FirstPrompt))
+            .then_some(view.title.as_deref())
+            .flatten()
+    });
+    if let Some(title) = terminal_title.and_then(|title| normalize_terminal_title(title, record)) {
+        record.title = title;
+        record.title_source = TitleSource::TerminalTitle;
+    } else if record.title_source != TitleSource::TerminalTitle
+        && view.title_source == Some(TitleSource::FirstPrompt)
+        && let Some(title) = view.title.as_deref().and_then(normalize_agent_title)
+    {
+        record.title = title;
+        record.title_source = TitleSource::FirstPrompt;
+    }
 }
 
 /// Removes terminal-brand decorations accidentally persisted as conversation
 /// titles by older builds. User and Diri-assigned names are intentionally
 /// untouched; only titles attributed to the Agent/PTY are safe to repair.
 fn repair_persisted_agent_title(record: &mut SessionRecord) -> bool {
-    if record.title_source != TitleSource::AgentProvided {
+    // Once Codex has an identified native name, its literal text belongs to
+    // the conversation. A valid `/rename Ready` must not be parsed as activity.
+    if record.kind == AgentKind::CODEX
+        && record.title_source == TitleSource::AgentProvided
+        && record.agent_session_id.is_some()
+    {
         return false;
     }
-    match normalize_agent_title(&record.title)
-        .filter(|title| !is_generic_terminal_title(title, record))
-    {
+    if !matches!(
+        record.title_source,
+        TitleSource::AgentProvided | TitleSource::TerminalTitle
+    ) {
+        return false;
+    }
+    match normalize_terminal_title(&record.title, record) {
         Some(title) if title != record.title => {
             record.title = title;
+            if record.kind == AgentKind::CODEX {
+                record.title_source = TitleSource::TerminalTitle;
+            }
+            true
+        }
+        Some(_)
+            if record.kind == AgentKind::CODEX
+                && record.agent_session_id.is_none()
+                && record.title_source == TitleSource::AgentProvided =>
+        {
+            record.title_source = TitleSource::TerminalTitle;
             true
         }
         Some(_) => false,
@@ -1639,6 +1699,54 @@ fn normalize_agent_title(title: &str) -> Option<String> {
         .collect::<String>();
     let normalized = normalized.trim();
     (!normalized.is_empty()).then(|| normalized.to_owned())
+}
+
+/// OSC is a presentation surface: Codex combines activity, a thread name and
+/// the project, and temporarily replaces the name while generation is pending.
+/// Only a useful conversation component may become a provisional sidebar name.
+fn normalize_terminal_title(title: &str, record: &SessionRecord) -> Option<String> {
+    let mut title = normalize_agent_title(title)?;
+    if record.kind == AgentKind::CODEX {
+        if let Some((name, directory)) = title.rsplit_once(" | ")
+            && (directory
+                == record
+                    .cwd
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("")
+                || directory == record.cwd)
+        {
+            title = name.trim().to_owned();
+        }
+        let mut parts = Vec::new();
+        for part in title.split(" | ") {
+            let part = part
+                .trim_matches(|c: char| c.is_whitespace() || matches!(c, '\u{2800}'..='\u{28ff}'));
+            let compact = compact_alnum(&part.to_ascii_lowercase());
+            if matches!(
+                compact.as_str(),
+                "renaming"
+                    | "naming"
+                    | "untitled"
+                    | "newchat"
+                    | "actionrequired"
+                    | "working"
+                    | "thinking"
+                    | "idle"
+                    | "ready"
+                    | "done"
+            ) {
+                return None;
+            }
+            if part.is_empty() {
+                continue;
+            }
+            parts.push(part);
+        }
+        title = parts.join(" | ");
+    }
+    (!title.is_empty() && !is_generic_terminal_title(&title, record)).then_some(title)
 }
 
 fn is_generic_terminal_title(title: &str, record: &SessionRecord) -> bool {
@@ -1813,7 +1921,7 @@ mod tests {
         assert_eq!(refreshed.len(), 4);
         for result in refreshed {
             assert_eq!(
-                result.title.as_deref(),
+                result.title.as_ref().map(|title| title.title.as_str()),
                 Some(
                     result
                         .request
@@ -2531,6 +2639,7 @@ mod tests {
     #[test]
     fn pty_titles_are_filtered_fallbacks_and_never_override_user_renames() {
         let view = SessionView {
+            terminal_title: None,
             id: "claude".to_owned(),
             status: SessionStatus::Working,
             status_evidence: None,
@@ -2545,7 +2654,7 @@ mod tests {
         provisional.kind = AgentKind::CLAUDE_CODE;
         fold_session_view(&mut provisional, &view);
         assert_eq!(provisional.title, "Repair remote attach");
-        assert_eq!(provisional.title_source, TitleSource::AgentProvided);
+        assert_eq!(provisional.title_source, TitleSource::TerminalTitle);
 
         let mut renamed = record("renamed");
         renamed.kind = AgentKind::CLAUDE_CODE;
@@ -2560,7 +2669,7 @@ mod tests {
         first_prompt.title_source = TitleSource::FirstPrompt;
         fold_session_view(&mut first_prompt, &view);
         assert_eq!(first_prompt.title, "Repair remote attach");
-        assert_eq!(first_prompt.title_source, TitleSource::AgentProvided);
+        assert_eq!(first_prompt.title_source, TitleSource::TerminalTitle);
 
         let mut captured_prompt = record("captured-prompt");
         captured_prompt.kind = AgentKind::CODEX;
@@ -2640,6 +2749,214 @@ mod tests {
         fold_session_view(&mut cursor, &named_working);
         assert_eq!(cursor.title, "Fix the cursor session title");
         assert_eq!(cursor.title_source, TitleSource::FirstPrompt);
+    }
+
+    #[test]
+    fn codex_transient_terminal_titles_never_name_a_conversation() {
+        for title in [
+            "Action Required | dirijor",
+            "renaming... ⠂ | dirijor",
+            "Untitled",
+        ] {
+            let mut session = record("codex-title");
+            session.cwd = "/work/dirijor".into();
+            session.kind = AgentKind::CODEX;
+            session.title = "Fix chat naming".into();
+            session.title_source = TitleSource::FirstPrompt;
+            let view = SessionView {
+                terminal_title: None,
+                id: session.id.to_string(),
+                status: SessionStatus::Working,
+                status_evidence: None,
+                needs_input: None,
+                last_turn_completed_at: None,
+                title: Some(title.into()),
+                title_source: Some(TitleSource::AgentProvided),
+                tail_offset: 0,
+                exited: false,
+            };
+            fold_session_view(&mut session, &view);
+            assert_eq!(session.title, "Fix chat naming", "OSC title: {title}");
+        }
+    }
+
+    #[test]
+    fn codex_names_follow_terminal_updates_until_a_native_or_manual_name_arrives() {
+        let mut session = record("codex-title");
+        session.kind = AgentKind::CODEX;
+        session.cwd = "/work/anara".into();
+        let mut view = SessionView {
+            id: session.id.to_string(),
+            status: SessionStatus::Working,
+            status_evidence: None,
+            needs_input: None,
+            last_turn_completed_at: None,
+            title: Some("hey astra, check anara seo, fix it".into()),
+            title_source: Some(TitleSource::FirstPrompt),
+            terminal_title: Some("renaming... ⠋ | anara".into()),
+            tail_offset: 0,
+            exited: false,
+        };
+        fold_session_view(&mut session, &view);
+        assert_eq!(session.title, "hey astra, check anara seo, fix it");
+        assert_eq!(session.title_source, TitleSource::FirstPrompt);
+
+        for (osc, expected) in [
+            ("⠋ Repair Anara SEO | anara", "Repair Anara SEO"),
+            ("[ ! ] Action Required | anara", "Repair Anara SEO"),
+            ("renaming… ⠙ | anara", "Repair Anara SEO"),
+            ("Untitled", "Repair Anara SEO"),
+            ("⠙ Audit search indexing | anara", "Audit search indexing"),
+        ] {
+            view.terminal_title = Some(osc.into());
+            fold_session_view(&mut session, &view);
+            assert_eq!(session.title, expected);
+            assert_eq!(session.title_source, TitleSource::TerminalTitle);
+        }
+
+        session.agent_session_id = Some("thread-1".into());
+        assert!(apply_native_title(
+            &mut session,
+            "Full native conversation name"
+        ));
+        view.terminal_title = Some("Full native convers… | anara".into());
+        fold_session_view(&mut session, &view);
+        assert_eq!(session.title, "Full native conversation name");
+        assert_eq!(session.title_source, TitleSource::AgentProvided);
+
+        assert!(apply_native_title(&mut session, "Ready"));
+        fold_session_view(&mut session, &view);
+        assert_eq!(
+            session.title, "Ready",
+            "native names are literal conversation data"
+        );
+
+        for source in [TitleSource::UserRename, TitleSource::DirijorAssigned] {
+            session.title = "My chosen name".into();
+            session.title_source = source;
+            fold_session_view(&mut session, &view);
+            assert!(!apply_native_title(&mut session, "A later native name"));
+            assert_eq!(session.title, "My chosen name");
+        }
+    }
+
+    #[test]
+    fn codex_pty_names_update_even_after_the_first_prompt_was_captured() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let mut session = record("pty-title");
+        session.kind = AgentKind::CODEX;
+        session.cwd = "/tmp".into();
+        registry.spawn(SessionSpec {
+            id: "pty-title".into(),
+            pty: crate::PtySpec::new(vec!["/bin/sh".into(), "-c".into(),
+                "read -r prompt; printf '\\033]0;Repair chat naming | tmp\\007'; read -r next; printf '\\033]0;Verify chat naming | tmp\\007'; read -r end".into()], "/tmp"),
+            manifest_id: "codex".into(),
+            authority: crate::Authority::ProcessOnly,
+            logs_dir: temp.path().join("logs"),
+            holder: None,
+            remote: None,
+            defer_launch: false,
+        }, session).unwrap();
+        let mut published = HashMap::new();
+        for (input, expected) in [
+            ("please fix these titles", "Repair chat naming"),
+            ("verify it", "Verify chat naming"),
+        ] {
+            registry.sessions["pty-title"]
+                .send_text(input, true)
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                registry.changed_since(&mut published);
+                if registry.record("pty-title").unwrap().title == expected {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "title never reached {expected}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(
+                registry.sessions["pty-title"].view().title_source,
+                Some(TitleSource::FirstPrompt)
+            );
+            assert_eq!(
+                registry.record("pty-title").unwrap().title_source,
+                TitleSource::TerminalTitle
+            );
+        }
+        registry
+            .terminate("pty-title", std::time::Duration::from_secs(1))
+            .unwrap();
+    }
+
+    #[test]
+    fn codex_stuck_persisted_titles_recover_and_remain_updateable() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state.json");
+        let mut registry = Registry::new(engine(), state.clone());
+        for (id, title) in [
+            ("pending", "renaming... ⠋ | anara"),
+            ("action", "Action Required | anara"),
+            ("empty", "Untitled"),
+            ("named", "⠙ Repair SEO | anara"),
+            ("plain", "Repair SEO"),
+        ] {
+            let mut session = record(id);
+            session.kind = AgentKind::CODEX;
+            session.cwd = "/work/anara".into();
+            session.title = title.into();
+            session.title_source = TitleSource::AgentProvided;
+            registry.insert_record(session);
+        }
+        let mut manual = record("manual");
+        manual.kind = AgentKind::CODEX;
+        manual.title = "Untitled".into();
+        manual.title_source = TitleSource::UserRename;
+        registry.insert_record(manual);
+        registry.persist_now().unwrap();
+        let mut restored = Registry::new(engine(), state);
+        restored.load().unwrap();
+        for id in ["pending", "action", "empty"] {
+            assert_eq!(
+                restored.record(id).unwrap().title_source,
+                TitleSource::Placeholder
+            );
+        }
+        for id in ["named", "plain"] {
+            let session = restored.record(id).unwrap();
+            assert_eq!(session.title, "Repair SEO");
+            assert_eq!(session.title_source, TitleSource::TerminalTitle);
+        }
+        assert_eq!(restored.record("manual").unwrap().title, "Untitled");
+    }
+
+    #[test]
+    fn codex_saved_prompt_fallback_never_replaces_a_real_name() {
+        let fallback = crate::history::ProviderTitle {
+            title: "hey astra can you fix these titles".into(),
+            source: TitleSource::FirstPrompt,
+        };
+        let mut session = record("codex");
+        session.kind = AgentKind::CODEX;
+        assert!(apply_provider_title(&mut session, &fallback));
+        assert_eq!(session.title_source, TitleSource::FirstPrompt);
+        session.title_source = TitleSource::AgentProvided;
+        assert!(apply_provider_title(&mut session, &fallback));
+        assert_eq!(session.title_source, TitleSource::FirstPrompt);
+        for source in [
+            TitleSource::TerminalTitle,
+            TitleSource::AgentProvided,
+            TitleSource::UserRename,
+            TitleSource::DirijorAssigned,
+        ] {
+            session.title = "Repair chat naming".into();
+            session.title_source = source;
+            assert!(!apply_provider_title(&mut session, &fallback));
+            assert_eq!(session.title, "Repair chat naming");
+        }
     }
 
     #[test]
@@ -2780,6 +3097,7 @@ mod tests {
         session.kind = AgentKind::CLAUDE_CODE;
         session.status = SessionStatus::Working;
         let view = SessionView {
+            terminal_title: None,
             id: "completed".to_owned(),
             status: SessionStatus::Idle,
             status_evidence: None,

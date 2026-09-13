@@ -482,6 +482,8 @@ pub enum TitleSource {
     AgentProvided,
     DirijorAssigned,
     UserRename,
+    /// A provisional title extracted from terminal output, below native names.
+    TerminalTitle,
     Unknown,
 }
 
@@ -496,6 +498,7 @@ impl Serialize for TitleSource {
             Self::AgentProvided => 2,
             Self::DirijorAssigned => 3,
             Self::UserRename => 4,
+            Self::TerminalTitle => 5,
             Self::Unknown => -1,
         })
     }
@@ -512,6 +515,7 @@ impl<'de> Deserialize<'de> for TitleSource {
             2 => Self::AgentProvided,
             3 => Self::DirijorAssigned,
             4 => Self::UserRename,
+            5 => Self::TerminalTitle,
             _ => Self::Unknown,
         })
     }
