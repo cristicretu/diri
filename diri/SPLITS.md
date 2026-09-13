@@ -36,6 +36,9 @@ A split is **one vertical tab in the existing sidebar**, representing all its
 member sessions. It uses the ordinary sidebar row height and selection fill,
 with a combined title and pane count. Click it to restore the layout and last
 focused pane. Groups stay under their first member's project (or in recency).
+Inactive panes are dimmed by just 4%. Pointer focus updates during the input
+event, before terminal mouse reporting, with no focus animation or terminal
+remount.
 
 - Drag a sidebar session onto the center of another session to create a split
   group. The narrow top/bottom insertion bands keep their existing reorder

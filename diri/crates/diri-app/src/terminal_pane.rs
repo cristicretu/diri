@@ -2635,7 +2635,9 @@ impl TerminalPane {
                 MouseButton::Left,
                 cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
                     window.focus(&this.focus, cx);
-                    if follows_selection || this.select_on_focus {
+                    // SplitWorkbench selects fixed panes during capture,
+                    // before terminal mouse reporting can consume the event.
+                    if follows_selection {
                         this.runtime
                             .store
                             .write()

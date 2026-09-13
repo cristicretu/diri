@@ -905,84 +905,86 @@ impl Render for SplitWorkbench {
             let close_id = id.clone();
             let debug_id = id.clone();
             let active = self.selected.as_ref() == Some(&id);
-            surface =
-                surface.child(
-                    div()
-                        .id(SharedString::from(format!("split-pane-{}", id.0)))
-                        .debug_selector(move || format!("SPLIT_PANE_{}", debug_id.0))
-                        .absolute()
-                        .left(px(rect.x))
-                        .top(px(rect.y))
-                        .w(px(rect.width))
-                        .h(px(rect.height))
-                        .overflow_hidden()
-                        .child(terminal.clone())
-                        .child(div().absolute().left_0().top_0().w(px(3.0)).h(px(42.0)).bg(
-                            if active {
-                                colors.primary.alpha(0.7)
-                            } else {
-                                colors.primary.alpha(0.12)
-                            },
-                        ))
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("split-pane-controls-{}", id.0)))
-                                .absolute()
-                                .right(px(6.0))
-                                .top(px(7.0))
-                                .flex()
-                                .items_center()
-                                .gap(px(2.0))
-                                .bg(colors.background)
-                                .child(
-                                    div()
-                                        .id(SharedString::from(format!("drag-pane-{}", id.0)))
-                                        .cursor(gpui::CursorStyle::OpenHand)
-                                        .on_drag(drag, move |_, _, _, cx| {
-                                            cx.stop_propagation();
-                                            cx.new(|_| preview.clone())
-                                        })
-                                        .text_size(px(10.0))
-                                        .text_color(colors.secondary)
-                                        .px(px(4.0))
-                                        .child(format!("{}", index + 1)),
-                                )
-                                .child(
-                                    div()
-                                        .id(SharedString::from(format!("split-add-{}", id.0)))
-                                        .size(px(26.0))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded(px(4.0))
-                                        .cursor_pointer()
-                                        .hover(|s| s.bg(colors.primary.alpha(0.1)))
-                                        .child(sf_symbol("plus", 11.0, colors.secondary))
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.select(id.clone(), window, cx);
-                                            this.open_picker(SplitAxis::Right, window, cx);
-                                        })),
-                                )
-                                .child(
-                                    div()
-                                        .id(SharedString::from(format!(
-                                            "split-close-{}",
-                                            close_id.0
-                                        )))
-                                        .size(px(26.0))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded(px(4.0))
-                                        .cursor_pointer()
-                                        .hover(|s| s.bg(colors.primary.alpha(0.1)))
-                                        .child(sf_symbol("xmark", 10.0, colors.secondary))
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.remove_pane(&close_id, window, cx);
-                                        })),
-                                ),
-                        ),
-                );
+            let focus_id = id.clone();
+            surface = surface.child(
+                div()
+                    .id(SharedString::from(format!("split-pane-{}", id.0)))
+                    .debug_selector(move || format!("SPLIT_PANE_{}", debug_id.0))
+                    .absolute()
+                    .left(px(rect.x))
+                    .top(px(rect.y))
+                    .w(px(rect.width))
+                    .h(px(rect.height))
+                    .overflow_hidden()
+                    .opacity(if active { 1.0 } else { 0.96 })
+                    // Capture before terminal mouse reporting can consume
+                    // the event. Focus and active styling update together.
+                    .capture_any_mouse_down(cx.listener(
+                        move |this, event: &gpui::MouseDownEvent, window, cx| {
+                            if event.button == MouseButton::Left
+                                && this.selected.as_ref() != Some(&focus_id)
+                            {
+                                this.select(focus_id.clone(), window, cx);
+                            }
+                        },
+                    ))
+                    .child(terminal.clone())
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("split-pane-controls-{}", id.0)))
+                            .absolute()
+                            .right(px(6.0))
+                            .top(px(7.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(2.0))
+                            .bg(colors.background)
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("drag-pane-{}", id.0)))
+                                    .cursor(gpui::CursorStyle::OpenHand)
+                                    .on_drag(drag, move |_, _, _, cx| {
+                                        cx.stop_propagation();
+                                        cx.new(|_| preview.clone())
+                                    })
+                                    .text_size(px(10.0))
+                                    .text_color(colors.secondary)
+                                    .px(px(4.0))
+                                    .child(format!("{}", index + 1)),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("split-add-{}", id.0)))
+                                    .size(px(26.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(4.0))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(colors.primary.alpha(0.1)))
+                                    .child(sf_symbol("plus", 11.0, colors.secondary))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.select(id.clone(), window, cx);
+                                        this.open_picker(SplitAxis::Right, window, cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("split-close-{}", close_id.0)))
+                                    .size(px(26.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(4.0))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(colors.primary.alpha(0.1)))
+                                    .child(sf_symbol("xmark", 10.0, colors.secondary))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.remove_pane(&close_id, window, cx);
+                                    })),
+                            ),
+                    ),
+            );
         }
         surface = surface.children(
             dividers
@@ -1062,6 +1064,11 @@ mod tests {
     #[gpui::test]
     fn pane_navigation_keeps_entities_and_close_keeps_engine_sessions(cx: &mut TestAppContext) {
         let runtime = Arc::new(StoreRuntime::inert());
+        let preferences = tempfile::tempdir().unwrap();
+        *runtime.store.write().unwrap() =
+            crate::store::SessionStore::load(preferences.path().join("prefs.json"))
+                .unwrap()
+                .0;
         let a = session("a");
         let b = session("b");
         let c = session("c");
@@ -1101,6 +1108,53 @@ mod tests {
         assert_eq!(first_bounds.size.width, px(400.0));
         assert_eq!(third_bounds.size.height, px(300.0));
         assert_eq!(third_bounds.origin.y, px(305.0));
+        // Pane focus and its presentation must change in the pointer event,
+        // without waiting for StoreRuntime's asynchronous invalidation stream.
+        let entities = view.read_with(cx, |view, _| {
+            view.panes
+                .iter()
+                .map(|(id, pane)| (id.clone(), pane.entity_id()))
+                .collect::<HashMap<_, _>>()
+        });
+        let mut pointer_times = Vec::new();
+        for (id, bounds) in [(&c.id, third_bounds), (&a.id, first_bounds)]
+            .into_iter()
+            .cycle()
+            .take(40)
+        {
+            let started = std::time::Instant::now();
+            cx.simulate_mouse_down(
+                bounds.center(),
+                MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+            pointer_times.push(started.elapsed());
+            view.read_with(cx, |view, _| {
+                assert_eq!(
+                    view.selected.as_ref(),
+                    Some(id),
+                    "pane selection must update in the same pointer event"
+                );
+                assert!(
+                    view.panes
+                        .iter()
+                        .all(|(id, pane)| entities[id] == pane.entity_id())
+                );
+            });
+            view.update_in(cx, |view, window, cx| {
+                assert!(view.panes[id].read(cx).is_focused(window))
+            });
+            cx.simulate_mouse_up(
+                bounds.center(),
+                MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+        }
+        pointer_times.sort();
+        eprintln!(
+            "pane pointer switching, 40 events with persisted preferences: median {:?}, p95 {:?}",
+            pointer_times[20], pointer_times[37]
+        );
         view.update_in(cx, |view, window, cx| {
             assert_eq!(view.panes.len(), 3);
             let entities: HashMap<_, _> = view
