@@ -398,7 +398,7 @@ mod tests {
             .into_iter()
             .map(|id| engine.manifest(id).expect("manifest").rules.len())
             .sum();
-        assert_eq!(rules, 103, "the shipped ruleset lost rules");
+        assert_eq!(rules, 106, "the shipped ruleset lost rules");
 
         for id in engine.ids() {
             let expected_empty = matches!(id, "shell" | "generic" | "pi");
@@ -628,7 +628,7 @@ mod tests {
         let mut reducer = StatusReducer::new(Authority::ScreenPrimary, now);
         for (index, activity) in [
             "• Working (27m 01s • esc to interrupt)",
-            "─ Worked for 3m 48s ─────────────────",
+            "• Reviewing changes (28m 02s • esc to interrupt)",
         ]
         .into_iter()
         .enumerate()
@@ -659,12 +659,135 @@ mod tests {
     }
 
     #[test]
+    fn codex_completed_turn_with_queued_question_settles_idle() {
+        use crate::status::{Authority, StatusReducer, StatusSignal};
+        use diri_proto::SessionStatus;
+        use std::time::{Duration, SystemTime};
+
+        let engine = engine();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let mut reducer = StatusReducer::new(Authority::ScreenPrimary, now);
+        let mut snapshot = ScreenSnapshot {
+            lines: vec![
+                "• Working (27s • esc to interrupt)".into(),
+                "• Queued follow-up inputs".into(),
+                "  ? 1 question".into(),
+                "    ⌥ + ↑ to answer".into(),
+                "› Ask Codex to do anything".into(),
+                "gpt-6-astra high · ~/project".into(),
+            ],
+            osc_title: Some("Action Required | project".into()),
+            content_seq: 1,
+            ..ScreenSnapshot::default()
+        };
+        reducer.reduce(
+            StatusSignal::Screen(engine.evaluate(&snapshot, "codex").unwrap()),
+            now + Duration::from_secs(5),
+        );
+        assert_eq!(reducer.status(), &SessionStatus::Working);
+
+        snapshot.lines[0] = "─ Worked for 3m 48s ─────────────────".into();
+        snapshot.content_seq += 1;
+        reducer.reduce(
+            StatusSignal::Screen(engine.evaluate(&snapshot, "codex").unwrap()),
+            now + Duration::from_secs(6),
+        );
+        let outcome = reducer.reduce(StatusSignal::Tick, now + Duration::from_secs(7));
+        assert_eq!(reducer.status(), &SessionStatus::Idle);
+        assert!(outcome.turn_completed);
+        assert!(outcome.needs_input.is_none());
+    }
+
+    #[test]
+    fn codex_completed_turn_with_stale_spinner_settles_idle() {
+        use crate::status::{Authority, StatusReducer, StatusSignal};
+        use diri_proto::SessionStatus;
+        use std::time::{Duration, SystemTime};
+
+        let engine = engine();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let mut reducer = StatusReducer::new(Authority::ScreenPrimary, now);
+        let mut snapshot = cursor_snapshot(
+            &[
+                "• Working (27s • esc to interrupt)",
+                "› Ask Codex to do anything",
+            ],
+            Some("⠋ Working | project"),
+        );
+        snapshot.content_seq = 1;
+        reducer.reduce(
+            StatusSignal::Screen(engine.evaluate(&snapshot, "codex").unwrap()),
+            now + Duration::from_secs(5),
+        );
+        assert_eq!(reducer.status(), &SessionStatus::Working);
+        snapshot.lines[0] = "─ Worked for 3m 48s ─────────────────".into();
+        snapshot.content_seq += 1;
+        reducer.reduce(
+            StatusSignal::Screen(engine.evaluate(&snapshot, "codex").unwrap()),
+            now + Duration::from_secs(6),
+        );
+        let outcome = reducer.reduce(StatusSignal::Tick, now + Duration::from_secs(7));
+        assert_eq!(reducer.status(), &SessionStatus::Idle);
+        assert!(outcome.turn_completed);
+
+        // A new turn can start with the previous completion still visible.
+        snapshot
+            .lines
+            .insert(1, "• Reviewing (1s • esc to interrupt)".into());
+        snapshot.content_seq += 1;
+        reducer.reduce(
+            StatusSignal::Screen(engine.evaluate(&snapshot, "codex").unwrap()),
+            now + Duration::from_secs(8),
+        );
+        assert_eq!(reducer.status(), &SessionStatus::Working);
+    }
+
+    #[test]
+    fn codex_completion_requires_a_recent_prompt_and_preserves_blockers() {
+        let engine = engine();
+        let completed = "─ Worked for 3m 48s ─────────────────";
+        let mut snapshot = cursor_snapshot(&[completed], Some("⠋ Working | project"));
+        assert_eq!(
+            engine.evaluate(&snapshot, "codex").unwrap().state,
+            ManifestState::Working
+        );
+        snapshot
+            .lines
+            .extend((0..12).map(|i| format!("Output {i}")));
+        snapshot.lines.push("› Ask Codex to do anything".into());
+        assert_eq!(
+            engine.evaluate(&snapshot, "codex").unwrap().state,
+            ManifestState::Working
+        );
+
+        for (footer, expected) in [
+            ("Enter to submit answer", ManifestState::BlockedQuestion),
+            (
+                "Press enter to confirm or esc to cancel",
+                ManifestState::BlockedPermission,
+            ),
+        ] {
+            let snapshot = cursor_snapshot(
+                &[completed, "• Working (1s • esc to interrupt)", "›", footer],
+                Some("⠋ Working | project"),
+            );
+            assert_eq!(engine.evaluate(&snapshot, "codex").unwrap().state, expected);
+        }
+        let snapshot = cursor_snapshot(&[completed, "›"], Some("Action Required | project"));
+        assert_eq!(
+            engine.evaluate(&snapshot, "codex").unwrap().state,
+            ManifestState::BlockedPermission
+        );
+    }
+
+    #[test]
     fn codex_queue_override_requires_a_complete_recent_footer() {
         let engine = engine();
         let footer = [
             "• Queued follow-up inputs",
             "  ? 1 question",
             "    ⌥ + ↑ to answer",
+            "› Ask Codex to do anything",
         ];
         for missing in 0..footer.len() {
             let snapshot = ScreenSnapshot {

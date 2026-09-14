@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "id": "codex",
-  "version": "2026.09.10.2",
+  "version": "2026.09.14.2",
   "statusModel": "full",
   "agent": {
     "id": "codex",
@@ -64,12 +64,35 @@
   },
   "rules": [
     {
+      "id": "working-footer",
+      "state": "working",
+      "priority": 920,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 12,
+      "when": { "contains": "esc to interrupt" }
+    },
+    {
+      "id": "completed-turn-prompt",
+      "state": "idle",
+      "priority": 910,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 12,
+      "_notice": "A completed turn and input prompt outrank a stale OSC spinner. Active work and explicit blockers still win.",
+      "when": {
+        "all": [
+          { "lineRegex": "^\\s*─+ Worked for .+ ─+\\s*$" },
+          { "lineRegex": "^\\s*[\u276f\u203a]" },
+          { "not": { "contains": "esc to interrupt" } }
+        ]
+      }
+    },
+    {
       "id": "queued-follow-up-question",
       "state": "working",
       "priority": 940,
       "region": "bottom_non_empty_lines",
       "regionLines": 12,
-      "_notice": "Queued async questions do not block Codex, even when its OSC title says Action Required. Explicit answer and approval dialogs still outrank this footer.",
+      "_notice": "Queued async questions do not block an active turn. Require its interrupt footer before overriding Action Required as working.",
       "when": {
         "all": [
           {
@@ -80,6 +103,36 @@
           },
           {
             "lineRegex": "^\\s*[^\\w\\n]+to answer\\s*$"
+          },
+          {
+            "contains": "esc to interrupt"
+          }
+        ]
+      }
+    },
+    {
+      "id": "queued-follow-up-idle",
+      "state": "idle",
+      "priority": 940,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 12,
+      "_notice": "Queued async questions do not imply an active turn. A visible input prompt without an interrupt footer is idle, even when the OSC title still says Action Required. Explicit answer and approval dialogs still outrank this footer.",
+      "when": {
+        "all": [
+          {
+            "lineRegex": "^\\s*•\\s+Queued follow-up inputs\\s*$"
+          },
+          {
+            "lineRegex": "^\\s*\\?\\s+[1-9][0-9]* questions?\\s*$"
+          },
+          {
+            "lineRegex": "^\\s*[^\\w\\n]+to answer\\s*$"
+          },
+          {
+            "lineRegex": "^\\s*[\u276f\u203a]"
+          },
+          {
+            "not": { "contains": "esc to interrupt" }
           }
         ]
       }
