@@ -395,6 +395,7 @@ mod tests {
 
     fn session(id: &str, parent: Option<&str>) -> SessionRecord {
         SessionRecord {
+            attention_state: None,
             id: SessionId::new(id),
             kind: AgentKind::CODEX,
             cwd: format!("/repo/{id}"),

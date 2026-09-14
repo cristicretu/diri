@@ -52,6 +52,10 @@ impl SessionRecoveryCapsule {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HookActivitySeed {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_turn_id: Option<String>,
     pub version: u32,
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -232,6 +236,8 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let store = SessionRecoveryStore::new(directory.path().join("s_one"));
         let seed = HookActivitySeed {
+            native_request_id: None,
+            native_turn_id: None,
             claude_pending_work: None,
             version: HookActivitySeed::VERSION,
             kind: "claude-hook".into(),

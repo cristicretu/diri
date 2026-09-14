@@ -227,6 +227,8 @@ fn a_capsule_and_hook_seed_recover_a_holder_when_global_state_is_gone() {
         .expect("capsule");
     store
         .write_activity(&diri_proto::recovery::HookActivitySeed {
+            native_request_id: None,
+            native_turn_id: None,
             claude_pending_work: None,
             version: diri_proto::recovery::HookActivitySeed::VERSION,
             kind: "claude-hook".into(),
@@ -294,6 +296,7 @@ fn a_held_child_exit_is_observed_from_the_marker() {
 fn record(id: &str) -> diri_proto::SessionRecord {
     use diri_proto::*;
     SessionRecord {
+        attention_state: None,
         id: SessionId(id.into()),
         kind: AgentKind::SHELL,
         cwd: "/tmp".into(),

@@ -515,6 +515,7 @@ fn session(
         Resumability::NotResumable
     };
     SessionBuilder(SessionRecord {
+        attention_state: None,
         id: SessionId::new(id),
         kind,
         cwd: project.root.clone(),

@@ -1093,6 +1093,7 @@ mod tests {
     fn claude_session(host: Option<&str>) -> SessionRecord {
         use diri_proto::{DateMillis, ProjectId, Resumability, SessionId, TitleSource};
         SessionRecord {
+            attention_state: None,
             id: SessionId::new("s_1"),
             kind: AgentKind::CLAUDE_CODE,
             cwd: "/work/app".into(),

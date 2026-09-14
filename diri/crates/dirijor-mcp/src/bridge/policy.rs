@@ -212,6 +212,7 @@ mod tests {
 
     fn record(id: &str, project: &str, parent: Option<&str>) -> SessionRecord {
         SessionRecord {
+            attention_state: None,
             id: SessionId::new(id),
             kind: AgentKind::CODEX,
             cwd: format!("/tmp/{project}"),

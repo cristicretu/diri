@@ -30,6 +30,7 @@ fn pid(value: &str) -> ProjectId {
 
 fn session(value: &str, project: &str, created: f64) -> SessionRecord {
     SessionRecord {
+        attention_state: None,
         id: id(value),
         kind: AgentKind::CLAUDE_CODE,
         cwd: format!("/work/{project}"),
@@ -788,6 +789,31 @@ fn attention_and_needs_input_sort_use_proto_derivation() {
     );
 }
 
+fn add_attention_fixture(session: &mut SessionRecord) {
+    use diri_proto::attention::{ATTENTION_VERSION, AttentionEvent, AttentionKind, AttentionState};
+    session.attention_state = Some(AttentionState {
+        version: ATTENTION_VERSION,
+        epoch: session.id.0.clone(),
+        sequence: 1,
+        turn: 1,
+        working: true,
+        last_native_completion: None,
+        observed_at: None,
+        active_tools: Default::default(),
+        events: vec![AttentionEvent {
+            sequence: 1,
+            turn: 1,
+            kind: AttentionKind::Request,
+            occurred_at: session.updated_at,
+            resolved: false,
+            blocking: true,
+            detail: session.needs_input.clone(),
+        }],
+        native_requests: Default::default(),
+        native_completions: Default::default(),
+    });
+}
+
 #[test]
 fn hidden_needs_input_update_chimes_and_posts_once_its_window_expires() {
     let (mut store, mut effects) = hydrated(
@@ -799,6 +825,7 @@ fn hidden_needs_input_update_chimes_and_posts_once_its_window_expires() {
 
     let mut hidden = session("hidden", "p", 1.0);
     hidden.status = SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Permission);
+    add_attention_fixture(&mut hidden);
     store.upsert_session(hidden);
 
     // Nothing is announced on the transition itself, and nothing is due yet.
@@ -840,6 +867,7 @@ async fn the_settle_task_sleeps_on_the_window_and_then_publishes() {
         .upsert_session(session("visible", "p", 2.0));
     let mut blocked = session("blocked", "p", 1.0);
     blocked.status = SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Permission);
+    add_attention_fixture(&mut blocked);
     store
         .write()
         .expect("session store lock poisoned")
@@ -870,6 +898,7 @@ fn a_session_that_unblocks_inside_its_window_is_never_announced() {
 
     let mut blocked = session("hidden", "p", 1.0);
     blocked.status = SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Permission);
+    add_attention_fixture(&mut blocked);
     store.upsert_session(blocked.clone());
     assert!(store.next_attention_deadline().is_some());
 
@@ -877,6 +906,7 @@ fn a_session_that_unblocks_inside_its_window_is_never_announced() {
     // the settle task is not even kept awake for it.
     blocked.status = SessionStatus::Working;
     blocked.needs_input = None;
+    blocked.attention_state.as_mut().unwrap().events[0].resolved = true;
     store.upsert_session(blocked);
 
     assert!(store.next_attention_deadline().is_none());
@@ -888,7 +918,7 @@ fn a_session_that_unblocks_inside_its_window_is_never_announced() {
 }
 
 #[test]
-fn selecting_a_session_inside_its_window_leaves_the_chime_but_drops_the_banner() {
+fn selecting_a_session_inside_its_window_cancels_the_interruption() {
     let (mut store, mut effects) = hydrated(
         vec![session("visible", "p", 2.0)],
         vec![project("p", "P")],
@@ -898,20 +928,18 @@ fn selecting_a_session_inside_its_window_leaves_the_chime_but_drops_the_banner()
 
     let mut blocked = session("hidden", "p", 1.0);
     blocked.status = SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Permission);
+    add_attention_fixture(&mut blocked);
     store.upsert_session(blocked);
     store.select(id("hidden"));
 
-    let transitions = store.drain_settled_attention(
-        store
-            .next_attention_deadline()
-            .expect("needs-input update should arm a settle window"),
-    );
-    let transition = transitions.first().expect("the inbox records the event");
-    assert_eq!(transition.sound, None);
+    assert!(store.next_attention_deadline().is_none());
     assert!(
-        transition.notification.is_none(),
-        "the session the user is looking at needs no system banner"
+        store
+            .drain_settled_attention(Instant::now() + Duration::from_secs(60))
+            .is_empty()
     );
+    assert_eq!(store.notifications().entries().len(), 1);
+    assert!(store.notifications().entries()[0].read);
 }
 
 #[test]
@@ -1369,6 +1397,7 @@ fn failed_preference_write_does_not_publish_an_ephemeral_mutation() {
     let blocked_parent = tmp.path().join("not-a-directory");
     let path = blocked_parent.join("preferences.json");
     let (mut store, _) = SessionStore::load(path).expect("missing preference file loads defaults");
+    std::fs::remove_dir_all(&blocked_parent).expect("remove storage directory");
     std::fs::write(&blocked_parent, b"file").expect("create blocking file");
     let before = store.preferences().clone();
 
@@ -2331,7 +2360,10 @@ fn delivery_rechecks_read_focus_and_mute_after_the_event_was_queued() {
     assert!(!store.should_deliver_notification(&request));
     assert_eq!(store.notifications().unread_count(), 1);
     store.toggle_notification_mute(record.id.clone());
-    assert!(store.should_deliver_notification(&request));
+    assert!(
+        !store.should_deliver_notification(&request),
+        "unmuting cannot revive a canceled native request"
+    );
     store.toggle_notification_alerts();
     assert!(!store.should_deliver_notification(&request));
     store.toggle_notification_alerts();
@@ -2445,4 +2477,53 @@ fn auxiliary_tab_binding_waits_for_its_record_and_pins_restored_shells() {
             .id,
         id("new")
     );
+}
+
+#[test]
+fn notification_pipeline_redraws_interrupt_once() {
+    use diri_engine::detect::{ManifestEngine, ScreenSnapshot};
+    use diri_engine::status::{Authority, StatusReducer, StatusSignal};
+    let (engine, failed) =
+        ManifestEngine::load_dir(&diri_engine::detect::bundled_manifest_dir()).unwrap();
+    assert!(failed.is_empty());
+    let (mut store, _) = hydrated(
+        vec![session("visible", "p", 2.0)],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    let now = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    let mut reducer = StatusReducer::new(Authority::ScreenPrimary, now);
+    let mut record = session("hidden", "p", 1.0);
+    record.kind = AgentKind::CODEX;
+    let mut interruptions = 0;
+    for index in 0..20 {
+        let marker = if index % 2 == 0 { "!" } else { "·" };
+        let screen = ScreenSnapshot {
+            lines: vec![
+                format!("Tool output {index}"),
+                "› Ask Codex to do anything".into(),
+            ],
+            osc_title: Some(format!("[ {marker} ] Action Required | project")),
+            content_seq: index + 1,
+            ..Default::default()
+        };
+        let outcome = reducer.reduce(
+            StatusSignal::Screen(engine.evaluate(&screen, "codex").unwrap()),
+            now + Duration::from_secs(index * 2),
+        );
+        record.attention_state = reducer.attention_state().cloned();
+        record.status = reducer.status().clone();
+        record.needs_input = outcome.needs_input;
+        store.upsert_session(record.clone());
+        let transitions = store.drain_settled_attention(Instant::now() + Duration::from_secs(60));
+        interruptions += transitions
+            .iter()
+            .filter(|effect| effect.notification.is_some())
+            .count();
+    }
+    assert_eq!(
+        interruptions, 1,
+        "one pending request must produce one native interruption across title redraws"
+    );
+    assert_eq!(store.notifications().entries().len(), 1);
 }

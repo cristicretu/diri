@@ -512,8 +512,15 @@ impl Registry {
                         && let Some((signal, metadata)) = crate::hooks::parse_activity_seed(&seed)
                     {
                         let _ = self.apply_hook_metadata(&session_id, &metadata);
-                        if let Some(session) = self.sessions.get(&session_id) {
-                            session.feed_signal(signal);
+                        if let Some(session) = self.sessions.get(&session_id)
+                            && session
+                                .view()
+                                .attention_state
+                                .as_ref()
+                                .and_then(|state| state.observed_at)
+                                .is_none_or(|observed| seed.occurred_at_ms as f64 > observed.0)
+                        {
+                            session.feed_identified_signal(signal, metadata.identity.clone());
                         }
                     }
                     adopted.push(session_id);
@@ -1650,6 +1657,7 @@ fn repair_persisted_agent_title(record: &mut SessionRecord) -> bool {
 }
 
 fn fold_session_status(record: &mut SessionRecord, view: &SessionView) {
+    record.attention_state.clone_from(&view.attention_state);
     record.status.clone_from(&view.status);
     // Keep evidence only when it explains this exact canonical state. This is
     // both a mixed-version guard and protection against observing the reducer
@@ -1829,6 +1837,7 @@ fn recovered_record(capsule: diri_proto::recovery::SessionRecoveryCapsule) -> Se
     let now = DateMillis::from(std::time::SystemTime::now());
     let project_id = session_project_id(&capsule.cwd, None);
     SessionRecord {
+        attention_state: None,
         id: capsule.session_id,
         kind: AgentKind::new(capsule.manifest_id),
         cwd: capsule.cwd,
@@ -1943,6 +1952,7 @@ mod tests {
 
     fn record(id: &str) -> SessionRecord {
         SessionRecord {
+            attention_state: None,
             id: SessionId(id.into()),
             kind: AgentKind::SHELL,
             cwd: "/tmp".into(),
@@ -2645,6 +2655,7 @@ mod tests {
     #[test]
     fn pty_titles_are_filtered_fallbacks_and_never_override_user_renames() {
         let view = SessionView {
+            attention_state: None,
             terminal_title: None,
             id: "claude".to_owned(),
             status: SessionStatus::Working,
@@ -2767,6 +2778,7 @@ mod tests {
         // A newly attached Session has no captured prompt. Its first input can
         // be a follow-up to the conversation whose title was already saved.
         let view = SessionView {
+            attention_state: None,
             id: session.id.to_string(),
             status: SessionStatus::Working,
             status_evidence: None,
@@ -2879,6 +2891,7 @@ mod tests {
             session.title = "Fix chat naming".into();
             session.title_source = TitleSource::FirstPrompt;
             let view = SessionView {
+                attention_state: None,
                 terminal_title: None,
                 id: session.id.to_string(),
                 status: SessionStatus::Working,
@@ -2901,6 +2914,7 @@ mod tests {
         session.kind = AgentKind::CODEX;
         session.cwd = "/work/anara".into();
         let mut view = SessionView {
+            attention_state: None,
             id: session.id.to_string(),
             status: SessionStatus::Working,
             status_evidence: None,
@@ -3212,6 +3226,7 @@ mod tests {
         session.kind = AgentKind::CLAUDE_CODE;
         session.status = SessionStatus::Working;
         let view = SessionView {
+            attention_state: None,
             terminal_title: None,
             id: "completed".to_owned(),
             status: SessionStatus::Idle,

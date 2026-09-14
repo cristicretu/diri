@@ -22,9 +22,8 @@ use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::notifications::{
-    PendingAttention, SendTextCommand, StatusTransition, attention_signal,
-    immediate_transitions_for_update, migration_transition, prefs_sync_transition,
-    reach_failure_transition, settled_attention_transition,
+    SendTextCommand, StatusTransition, immediate_transitions_for_update, migration_transition,
+    prefs_sync_transition, reach_failure_transition,
 };
 use crate::switcher::{
     OverviewArrow, OverviewFilter, OverviewMode, OverviewOutcome, SessionOverviewState,
@@ -359,7 +358,6 @@ pub struct SessionStore {
     /// Attention states serving out their settle window, newest arming wins.
     /// Drained by the settle task in `StoreHandle`, which is what turns one of
     /// these into a chime and a banner — see `drain_settled_attention`.
-    attention_settle: HashMap<SessionId, PendingAttention>,
     notification_feed: crate::notification_feed::NotificationFeed,
     /// Wakes the settle task when a window is armed early enough to beat the
     /// one it is currently sleeping on.
@@ -395,7 +393,10 @@ impl SessionStore {
                 crate::notification_feed::NotificationFeed::load(&parent.join("notifications.json"))
             })
             .transpose()
-            .unwrap_or_default()
+            .unwrap_or_else(|error| {
+                eprintln!("diri: notification history unavailable; alerts suppressed: {error}");
+                Some(crate::notification_feed::NotificationFeed::unavailable())
+            })
             .unwrap_or_default();
         (
             Self {
@@ -438,7 +439,6 @@ impl SessionStore {
                 agents: HashMap::new(),
                 agent_catalog_scans: HashMap::new(),
                 agent_catalog_errors: HashMap::new(),
-                attention_settle: HashMap::new(),
                 notification_feed,
                 attention_wake: Arc::new(Notify::new()),
                 effects,
@@ -452,13 +452,7 @@ impl SessionStore {
     }
 
     fn notification_change(&self, dismiss: Vec<String>) {
-        if let Some(parent) = self.prefs_path.as_ref().and_then(|path| path.parent())
-            && let Err(error) = self
-                .notification_feed
-                .save(&parent.join("notifications.json"))
-        {
-            eprintln!("diri: could not save notification history: {error}");
-        }
+        self.notification_feed.invalidate(&dismiss);
         if !dismiss.is_empty() {
             self.emit(StoreEffect::StatusTransition(StatusTransition {
                 dismiss,
@@ -522,11 +516,10 @@ impl SessionStore {
                 return false;
             }
         }
-        self.notification_feed
-            .entries()
-            .iter()
-            .find(|entry| entry.id == request.identifier)
-            .is_none_or(|entry| !entry.read && !entry.resolved)
+        if !request.session_event {
+            return true;
+        }
+        self.notification_feed.deliverable(&request.identifier)
     }
 
     pub fn toggle_notification_alerts(&mut self) {
@@ -1430,19 +1423,14 @@ impl SessionStore {
         let sessions: Vec<_> = self.sessions.values().cloned().collect();
         let mut added = false;
         for session in sessions {
-            let request = match session.attention() {
-                AttentionLevel::NeedsInput | AttentionLevel::DoneUnseen => {
-                    Some(crate::notifications::attention_request(
-                        &session,
-                        false,
-                        self.agent_descriptor(session.effective_kind()),
-                    ))
-                }
-                _ => crate::notifications::failed_request(&session),
-            };
-            if let Some(request) = request {
-                added |= self.notification_feed.record(&session, &request, false);
-            }
+            let descriptor = self.agent_descriptor(session.effective_kind()).cloned();
+            added |= self.notification_feed.observe(
+                &session,
+                descriptor.as_ref(),
+                false,
+                true,
+                Instant::now(),
+            );
         }
         let dismissed = self
             .notification_feed
@@ -1498,6 +1486,8 @@ impl SessionStore {
                                     .status_sounds
                                     .then_some(crate::notifications::NotificationSound::Done),
                                 notification: Some(crate::notifications::NotificationRequest {
+                                    session_event: true,
+                                    guard: self.notification_feed.guard(&event.id),
                                     identifier: event.id,
                                     title: event.title,
                                     body: event.body,
@@ -1596,8 +1586,6 @@ impl SessionStore {
             &session,
             self.prefs.status_sounds,
         );
-        let attention = attention_signal(previous.as_deref(), &session);
-        let arriving_attention = session.attention();
         let arriving_archived = session.is_archived();
         // Closing the tab also drops the Engine record and deletes the
         // session's output log, so it may only happen where nothing is lost.
@@ -1618,33 +1606,26 @@ impl SessionStore {
             && previous
                 .as_deref()
                 .is_none_or(|record| !matches!(record.status, SessionStatus::Exited(_)));
-        let failure = (!self.closing.contains(&id)
-            && previous
-                .as_ref()
-                .is_some_and(|old| !matches!(old.status, SessionStatus::Exited(_))))
-        .then(|| crate::notifications::failed_request(&session))
-        .flatten();
         self.sessions.insert(id.clone(), Arc::new(session));
         self.reconcile_notifications();
-        if let Some(request) = failure {
-            let current = self.sessions.get(&id).expect("inserted");
-            let focused = self.notification_is_focused(&id);
-            if self.notification_feed.record(current, &request, focused) {
-                self.notification_change(Vec::new());
-                if !focused {
-                    self.emit(StoreEffect::StatusTransition(StatusTransition {
-                        dismiss: Vec::new(),
-                        sound: self
-                            .prefs
-                            .status_sounds
-                            .then_some(crate::notifications::NotificationSound::NeedsInput),
-                        notification: Some(request),
-                        in_app_banner: None,
-                    }));
-                }
-            }
+        let current = self.sessions.get(&id).expect("inserted");
+        let focused = self.notification_is_focused(&id);
+        let descriptor = self.agent_descriptor(current.effective_kind()).cloned();
+        if !self.closing.contains(&id)
+            && previous
+                .as_ref()
+                .is_none_or(|previous| previous.attention_state != current.attention_state)
+            && self.notification_feed.observe(
+                current,
+                descriptor.as_ref(),
+                focused,
+                false,
+                Instant::now(),
+            )
+        {
+            self.notification_change(Vec::new());
+            self.attention_wake.notify_one();
         }
-        self.settle_attention(&id, attention, arriving_attention, arriving_archived);
         // Spawn selects the id before the authoritative record arrives, and
         // only focus_session grants terminal residency -- without this, a
         // session created from the UI stays "Preparing terminal" forever.
@@ -1685,89 +1666,27 @@ impl SessionStore {
         self.reconcile_navigation();
     }
 
-    /// Arms, replaces, or abandons a session's settle window after an update.
-    ///
-    /// A fresh signal always re-arms: the newest reason to interrupt is the one
-    /// worth waiting on. Without a signal, a window whose state the session no
-    /// longer holds is dropped here rather than at the deadline, so a blip that
-    /// resolves immediately never even keeps the settle task awake.
-    fn settle_attention(
-        &mut self,
-        id: &SessionId,
-        signal: Option<AttentionLevel>,
-        attention: AttentionLevel,
-        archived: bool,
-    ) {
-        if let Some(level) = signal {
-            self.attention_settle.insert(
-                id.clone(),
-                PendingAttention::armed_at(level, Instant::now()),
-            );
-            self.attention_wake.notify_one();
-        } else if self
-            .attention_settle
-            .get(id)
-            .is_some_and(|pending| archived || pending.level != attention)
-        {
-            self.attention_settle.remove(id);
-        }
-    }
-
-    /// The earliest settle window still to run, for the task that sleeps on it.
-    #[must_use]
     pub fn next_attention_deadline(&self) -> Option<Instant> {
-        self.attention_settle
-            .values()
-            .map(|pending| pending.deadline)
-            .min()
+        self.notification_feed.next_deadline()
     }
 
-    /// Handle to the signal raised whenever a settle window is armed.
-    #[must_use]
     pub fn attention_wake(&self) -> Arc<Notify> {
         Arc::clone(&self.attention_wake)
     }
 
-    /// Turns every expired settle window into the chime and banner it earned,
-    /// judged against the session as it is now — not as it was when the window
-    /// was armed. States that did not survive produce nothing.
-    #[must_use]
     pub fn drain_settled_attention(&mut self, now: Instant) -> Vec<StatusTransition> {
-        let due: Vec<SessionId> = self
-            .attention_settle
-            .iter()
-            .filter(|(_, pending)| pending.deadline <= now)
-            .map(|(id, _)| id.clone())
-            .collect();
-        let mut transitions = Vec::with_capacity(due.len());
-        for id in due {
-            let Some(pending) = self.attention_settle.remove(&id) else {
-                continue;
-            };
-            let Some(session) = self.sessions.get(&id) else {
-                continue;
-            };
-            if let Some(transition) = settled_attention_transition(
-                session,
-                pending.level,
-                self.selected_session_id.as_ref(),
-                self.app_is_active && self.notification_surface_visible,
-                self.prefs.status_sounds,
-                self.agent_descriptor(session.effective_kind()),
-            ) {
-                let request = crate::notifications::attention_request(
-                    session,
-                    false,
-                    self.agent_descriptor(session.effective_kind()),
-                );
-                let focused = self.notification_is_focused(&id);
-                if self.notification_feed.record(session, &request, focused) {
-                    self.notification_change(Vec::new());
-                    transitions.push(transition);
-                }
-            }
-        }
+        let transitions = self
+            .notification_feed
+            .drain_due(now, self.prefs.status_sounds);
         transitions
+            .into_iter()
+            .filter(|effect| {
+                effect
+                    .notification
+                    .as_ref()
+                    .is_some_and(|request| self.should_deliver_notification(request))
+            })
+            .collect()
     }
 
     pub fn remove_session_record(&mut self, id: &SessionId) {
@@ -1776,7 +1695,6 @@ impl SessionStore {
         }
         self.sessions.remove(id);
         self.reconcile_notifications();
-        self.attention_settle.remove(id);
         self.closing.remove(id);
         self.sidebar_selection.remove(id);
         self.mru_order.retain(|candidate| candidate != id);

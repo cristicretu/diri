@@ -60,6 +60,7 @@ fn shell_spec(
 fn record(id: &str) -> diri_proto::SessionRecord {
     use diri_proto::*;
     SessionRecord {
+        attention_state: None,
         id: SessionId(id.into()),
         kind: AgentKind::SHELL,
         cwd: "/tmp".into(),

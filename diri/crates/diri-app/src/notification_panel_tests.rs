@@ -112,6 +112,34 @@ fn notification_services(count: usize) -> Arc<AppServices> {
         ));
         session.last_seen_at = None;
         session.updated_at = session.last_turn_completed_at.unwrap();
+        use diri_proto::attention::{
+            ATTENTION_VERSION, AttentionEvent, AttentionKind, AttentionState,
+        };
+        session.attention_state = Some(AttentionState {
+            version: ATTENTION_VERSION,
+            epoch: session.id.0.clone(),
+            sequence: 1,
+            turn: 1,
+            working: false,
+            last_native_completion: None,
+            observed_at: None,
+            active_tools: Default::default(),
+            events: vec![AttentionEvent {
+                sequence: 1,
+                turn: 1,
+                kind: if index % 4 == 1 {
+                    AttentionKind::Request
+                } else {
+                    AttentionKind::Completion
+                },
+                occurred_at: session.updated_at,
+                resolved: false,
+                blocking: true,
+                detail: None,
+            }],
+            native_requests: Default::default(),
+            native_completions: Default::default(),
+        });
         list.sessions.push(session);
         store.hydrate(list.clone());
     }

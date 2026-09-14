@@ -197,6 +197,7 @@ mod tests {
 
     fn record(id: &str, status: SessionStatus) -> SessionRecord {
         SessionRecord {
+            attention_state: None,
             id: SessionId::new(id),
             kind: AgentKind::CODEX,
             cwd: "/tmp/project".into(),

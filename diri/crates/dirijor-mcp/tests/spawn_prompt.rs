@@ -89,6 +89,7 @@ fn start_server(temp: &Path, fixture: &Path, parent_cwd: &Path) -> Arc<ControlSe
             .expect("parent project");
     let now = DateMillis::from(std::time::SystemTime::now());
     registry.insert_record(SessionRecord {
+        attention_state: None,
         id: SessionId::new("s_parent"),
         kind: AgentKind::CODEX,
         cwd: parent_cwd.to_string_lossy().into_owned(),

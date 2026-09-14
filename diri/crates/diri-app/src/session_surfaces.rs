@@ -1750,6 +1750,7 @@ mod tests {
 
     fn session(index: usize) -> SessionRecord {
         SessionRecord {
+            attention_state: None,
             id: SessionId::new(format!("running-{index:02}")),
             kind: ProtoAgentKind::CODEX,
             cwd: "/work/overview".into(),

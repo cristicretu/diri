@@ -654,6 +654,8 @@ impl RootView {
                 .on_click(cx.listener(|this, _, _, cx| {
                     #[cfg(target_os = "macos")]
                     this.notifier.post(&crate::notifications::NotificationRequest {
+                        session_event: false,
+                    guard: None,
                         identifier: "diri-notification-test".into(), title: "Diri notifications are ready".into(),
                         body: "You'll find agent updates in Notifications, even when Mac alerts are silenced.".into(),
                         thread_identifier: None, action_data: None, use_system_sound: false,

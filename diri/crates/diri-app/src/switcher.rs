@@ -558,6 +558,7 @@ mod tests {
 
     fn session(value: &str, status: SessionStatus) -> SessionRecord {
         SessionRecord {
+            attention_state: None,
             id: id(value),
             kind: AgentKind::CLAUDE_CODE,
             cwd: "/work/project".to_owned(),

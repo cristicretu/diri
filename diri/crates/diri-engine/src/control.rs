@@ -1955,7 +1955,7 @@ impl ControlServer {
         let mut registry = self.registry.lock().map_err(poisoned)?;
         let changed = registry.apply_hook_metadata(&session_id.0, &meta);
         if let Some(session) = registry.get(&session_id.0) {
-            session.feed_signal(signal);
+            session.feed_identified_signal(signal, meta.identity.clone());
         }
         if changed {
             let _ = registry.persist();
@@ -3041,6 +3041,7 @@ pub(crate) fn new_record(id: &str, kind: &str, cwd: &str) -> diri_proto::Session
     use diri_proto::{AgentKind, DateMillis, Resumability, SessionId, TitleSource};
     let now: DateMillis = std::time::SystemTime::now().into();
     diri_proto::SessionRecord {
+        attention_state: None,
         id: SessionId(id.to_string()),
         kind: AgentKind::new(kind),
         cwd: cwd.to_string(),
@@ -3775,6 +3776,7 @@ mod tests {
     fn test_record(id: &str) -> diri_proto::SessionRecord {
         use diri_proto::*;
         SessionRecord {
+            attention_state: None,
             id: SessionId(id.into()),
             kind: AgentKind::SHELL,
             cwd: "/tmp".into(),

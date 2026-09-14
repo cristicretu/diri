@@ -255,6 +255,16 @@ fn persist_hook_activity(kind: &str, event: Option<&str>, payload: &Value) {
         None
     };
     let seed = diri_proto::recovery::HookActivitySeed {
+        native_request_id: payload
+            .get("tool_use_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| id.len() <= 256)
+            .map(str::to_owned),
+        native_turn_id: payload
+            .get("turn-id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| id.len() <= 256)
+            .map(str::to_owned),
         version: diri_proto::recovery::HookActivitySeed::VERSION,
         kind: kind.to_owned(),
         event: event.filter(|value| !value.is_empty()).map(str::to_owned),
@@ -1341,6 +1351,7 @@ mod tests {
 
     fn record(id: &str, title: &str) -> SessionRecord {
         SessionRecord {
+            attention_state: None,
             id: SessionId::new(id),
             kind: AgentKind::CODEX,
             cwd: "/tmp".into(),

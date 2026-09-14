@@ -128,6 +128,7 @@ mod tests {
         status: SessionStatus,
     ) -> Arc<SessionRecord> {
         Arc::new(SessionRecord {
+            attention_state: None,
             id: SessionId::new(id),
             kind,
             cwd: "/tmp".into(),

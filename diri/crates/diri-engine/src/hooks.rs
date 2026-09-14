@@ -17,6 +17,7 @@ use crate::status::{ClaudeHook, StatusSignal, classify_risk};
 /// What a payload carries besides the signal itself.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct HookMetadata {
+    pub identity: crate::attention::SignalIdentity,
     pub agent_session_id: Option<String>,
     pub transcript_path: Option<String>,
     pub first_prompt_title: Option<String>,
@@ -40,6 +41,16 @@ pub fn parse_claude_hook(
         return None;
     }
     let mut meta = HookMetadata::default();
+    if event == "PreToolUse" {
+        meta.identity.started_tool = scoped_identity(payload, "session_id", "tool_use_id")
+            .zip(string(payload, "tool_name").filter(|name| name.len() <= 128));
+    }
+    if event == "PermissionRequest" {
+        meta.identity.request = scoped_identity(payload, "session_id", "tool_use_id");
+    }
+    if matches!(event, "PostToolUse" | "PostToolUseFailure") {
+        meta.identity.resolved_request = scoped_identity(payload, "session_id", "tool_use_id");
+    }
     let is_subagent = string(payload, "agent_id").is_some();
 
     // Identity rides on *every* payload, not just SessionStart: the transcript
@@ -62,6 +73,7 @@ pub fn parse_claude_hook(
             ClaudeHook::UserPromptSubmit
         }
         "PreToolUse" => ClaudeHook::PreToolUse,
+        "PostToolUse" | "PostToolUseFailure" => ClaudeHook::PostToolUse,
         "PermissionRequest" => {
             let (tool, summary) = tool_summary(payload);
             if !is_subagent {
@@ -125,12 +137,23 @@ pub fn parse_claude_hook(
     ))
 }
 
+// Length-prefixed JSON tuples avoid ambiguities and scope native ids to their conversation.
+fn scoped_identity(payload: &Value, scope: &str, key: &str) -> Option<String> {
+    let id = string(payload, key).filter(|id| !id.is_empty() && id.len() <= 256)?;
+    let scope = string(payload, scope).filter(|scope| scope.len() <= 256)?;
+    serde_json::to_string(&(scope, id)).ok()
+}
+
 /// Parses a Codex notify payload. Only turn-completion is meaningful.
 pub fn parse_codex_notify(payload: &Value) -> Option<(StatusSignal, HookMetadata)> {
     if string(payload, "type").as_deref() != Some("agent-turn-complete") {
         return None;
     }
     let mut meta = HookMetadata {
+        identity: crate::attention::SignalIdentity {
+            completion: scoped_identity(payload, "thread-id", "turn-id"),
+            ..Default::default()
+        },
         agent_session_id: string(payload, "thread-id"),
         ..Default::default()
     };
@@ -174,6 +197,8 @@ pub fn parse_activity_seed(
         ("transcript_path", seed.transcript_path.as_ref()),
         ("notification_type", seed.notification_type.as_ref()),
         ("tool_name", seed.tool_name.as_ref()),
+        ("tool_use_id", seed.native_request_id.as_ref()),
+        ("turn-id", seed.native_turn_id.as_ref()),
     ] {
         if let Some(value) = value {
             payload.insert(key.into(), Value::String(value.clone()));
@@ -550,6 +575,8 @@ mod tests {
     #[test]
     fn a_durable_seed_rehydrates_lifecycle_and_safe_identity() {
         let seed = diri_proto::recovery::HookActivitySeed {
+            native_request_id: None,
+            native_turn_id: None,
             claude_pending_work: None,
             version: diri_proto::recovery::HookActivitySeed::VERSION,
             kind: "claude-hook".into(),

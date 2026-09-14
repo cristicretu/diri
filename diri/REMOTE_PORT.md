@@ -945,6 +945,15 @@ required. Replayed output must not redeliver notifications. Alerts produced
 while the Engine is disconnected are not recovered from replay; reliable
 offline notification delivery remains an independent enhancement.
 
+The local Rust Engine persists causal attention identities and native-source
+receipts in a per-session SQLite journal. Adoption retains the journal namespace;
+a newly launched process creates a new namespace. The app consumes the additive
+`SessionRecord.attentionState` snapshot and owns its own durable inbox/interruption
+receipts. No journal, hook adapter or notification policy runs in the Holder, and
+no Helper protocol or required capability changes. The corresponding release
+gates include redraw/replay deduplication, restart/adoption identity, cancellation
+and receipt survival after history pruning; see `docs/notification-architecture-review.md`.
+
 ## Deferred enhancements
 
 The following are independent product enhancements, not unfinished remote

@@ -1,6 +1,7 @@
 //! Wire types and codecs for control messages, binary frames, grid updates, and daemon paths.
 
 pub mod accounts;
+pub mod attention;
 pub use accounts::*;
 pub mod control;
 pub mod frames;

@@ -190,6 +190,7 @@ const LIVE_HANDOVER_GAP: u64 = 256 << 10;
 /// What a session looks like from the outside.
 #[derive(Clone, Debug)]
 pub struct SessionView {
+    pub attention_state: Option<diri_proto::attention::AttentionState>,
     pub id: String,
     pub status: SessionStatus,
     pub status_evidence: Option<diri_proto::StatusEvidence>,
@@ -739,7 +740,7 @@ impl Session {
             0,
         ));
         let log = OutputLog::writer(&spec.logs_dir, &spec.id)?;
-        let shared = new_shared(&spec, log, &engine);
+        let shared = new_shared(&spec, log, &engine, true);
         *shared.remote_grid.lock().expect("remote grid") = Some(RemoteGridState {
             mirror: GridMirror::new(),
             revision: 0,
@@ -797,7 +798,7 @@ impl Session {
             remote.output_offset,
         ));
         let log = OutputLog::writer(&spec.logs_dir, &spec.id)?;
-        let shared = new_shared(&spec, log, &engine);
+        let shared = new_shared(&spec, log, &engine, false);
         shared
             .remote_output_offset
             .store(remote.output_offset, Ordering::SeqCst);
@@ -806,7 +807,14 @@ impl Session {
             revision: 0,
             pending: None,
         });
-        if let Some((status, needs_input)) = initial_status {
+        if let Some((status, needs_input)) = initial_status
+            && shared
+                .reducer
+                .lock()
+                .expect("reducer")
+                .attention_state()
+                .is_none_or(|state| state.sequence == 0)
+        {
             *shared.status.lock().expect("status") = status;
             *shared.needs_input.lock().expect("needs input") = needs_input;
         }
@@ -836,7 +844,7 @@ impl Session {
     fn spawn_direct(spec: SessionSpec, engine: Arc<ManifestEngine>) -> std::io::Result<Self> {
         let pty = Pty::spawn(&spec.pty)?;
         let log = OutputLog::writer(&spec.logs_dir, &spec.id)?;
-        let shared = new_shared(&spec, log, &engine);
+        let shared = new_shared(&spec, log, &engine, true);
         shared.child_pid.store(pty.pid() as i32, Ordering::SeqCst);
 
         let reader = pty.reader()?;
@@ -896,7 +904,7 @@ impl Session {
         let client = HolderClient::new(paths.socket());
         let floor = wait_for_holder(&client, &spec.logs_dir, &spec.id, pre_spawn_tail)
             .map_err(holder_io_error)?;
-        Self::attach(spec, client, floor, engine)
+        Self::attach(spec, client, floor, engine, true)
     }
 
     /// Spawns through a holder, but not yet: the exec waits for the first
@@ -912,7 +920,7 @@ impl Session {
         let paths = HolderPaths::new(&holder.holders_dir, &spec.id);
         let client = HolderClient::new(paths.socket());
         let log = OutputLog::reader(&spec.logs_dir, &spec.id)?;
-        let shared = new_shared(&spec, log, &engine);
+        let shared = new_shared(&spec, log, &engine, true);
         let deferred = Arc::new(DeferredLaunch::new());
 
         let pump = {
@@ -1036,8 +1044,16 @@ impl Session {
             spec.pty.cols = cols;
             spec.pty.rows = rows;
         }
-        let session = Self::attach(spec, client, floor, engine)?;
-        if let Some((status, needs_input)) = initial_status {
+        let session = Self::attach(spec, client, floor, engine, false)?;
+        if let Some((status, needs_input)) = initial_status
+            && session
+                .shared
+                .reducer
+                .lock()
+                .expect("reducer")
+                .attention_state()
+                .is_none_or(|state| state.sequence == 0)
+        {
             *session.shared.status.lock().expect("status") = status;
             *session.shared.needs_input.lock().expect("needs input") = needs_input;
         }
@@ -1051,9 +1067,10 @@ impl Session {
         client: HolderClient,
         exit_marker_floor: u64,
         engine: Arc<ManifestEngine>,
+        fresh: bool,
     ) -> std::io::Result<Self> {
         let log = OutputLog::reader(&spec.logs_dir, &spec.id)?;
-        let shared = new_shared(&spec, log, &engine);
+        let shared = new_shared(&spec, log, &engine, fresh);
         if let Ok(stat) = client.stat() {
             shared.child_pid.store(stat.child_pid, Ordering::SeqCst);
         }
@@ -1101,17 +1118,19 @@ impl Session {
                 Some(diri_proto::TitleSource::TerminalTitle),
             )
         };
+        let (attention_state, status_evidence) = {
+            let reducer = self.shared.reducer.lock().expect("reducer");
+            (
+                reducer.attention_state().cloned(),
+                reducer.evidence().cloned(),
+            )
+        };
         SessionView {
+            attention_state,
             id: self.shared.id.clone(),
             terminal_title,
             status: self.shared.status.lock().expect("status").clone(),
-            status_evidence: self
-                .shared
-                .reducer
-                .lock()
-                .expect("reducer")
-                .evidence()
-                .cloned(),
+            status_evidence,
             needs_input: self.shared.needs_input.lock().expect("needs input").clone(),
             last_turn_completed_at: *self
                 .shared
@@ -1556,7 +1575,17 @@ impl Session {
             Transport::Held(client) => client.write(bytes).map_err(holder_io_error)?,
             Transport::Remote(client) => client.write(bytes)?,
         }
-        self.feed_signal(StatusSignal::UserKeystroke);
+        // Match complete key packets: an arrow key or bracketed paste also
+        // contains ESC/newlines, but neither proves a submitted response.
+        let submits = matches!(
+            bytes,
+            b"\r" | b"\n" | b"\r\n" | b"\x03" | b"\x1b" | b"y" | b"n"
+        );
+        self.feed_signal(if submits {
+            StatusSignal::UserSubmission
+        } else {
+            StatusSignal::UserKeystroke
+        });
         self.sample_shell_foreground();
         Ok(())
     }
@@ -1658,12 +1687,20 @@ impl Session {
     /// Feeds an out-of-band signal — a hook callback, a notify — into the
     /// reducer.
     pub fn feed_signal(&self, signal: StatusSignal) -> ReducerOutcome {
+        self.feed_identified_signal(signal, Default::default())
+    }
+
+    pub fn feed_identified_signal(
+        &self,
+        signal: StatusSignal,
+        identity: crate::attention::SignalIdentity,
+    ) -> ReducerOutcome {
         let outcome = self
             .shared
             .reducer
             .lock()
             .expect("reducer")
-            .reduce(signal, SystemTime::now());
+            .reduce_identified(signal, identity, SystemTime::now());
         apply(&self.shared, &outcome);
         outcome
     }
@@ -1785,15 +1822,41 @@ impl Drop for Session {
     }
 }
 
-fn new_shared(spec: &SessionSpec, log: OutputLog, engine: &ManifestEngine) -> Arc<Shared> {
+fn new_shared(
+    spec: &SessionSpec,
+    log: OutputLog,
+    engine: &ManifestEngine,
+    fresh: bool,
+) -> Arc<Shared> {
     let manifest_version = engine
         .manifest(&spec.manifest_id)
         .map(|manifest| manifest.version.clone());
+    let reducer = StatusReducer::new(spec.authority, SystemTime::now())
+        .with_manifest(spec.manifest_id.clone(), manifest_version)
+        .with_attention_storage(
+            &spec.logs_dir.join(format!("{}.attention.sqlite", spec.id)),
+            fresh,
+        );
+    let initial_status = reducer.status().clone();
+    let initial_detail = reducer
+        .attention_state()
+        .and_then(|state| state.active_requests().find(|event| event.blocking))
+        .and_then(|event| event.detail.clone());
+    let initial_completion = reducer
+        .attention_state()
+        .and_then(|state| {
+            state
+                .events
+                .iter()
+                .rev()
+                .find(|event| event.kind == diri_proto::attention::AttentionKind::Completion)
+        })
+        .map(|event| event.occurred_at);
     Arc::new(Shared {
         id: spec.id.clone(),
-        status: Mutex::new(SessionStatus::Starting),
-        needs_input: Mutex::new(None),
-        last_turn_completed_at: Mutex::new(None),
+        status: Mutex::new(initial_status),
+        needs_input: Mutex::new(initial_detail),
+        last_turn_completed_at: Mutex::new(initial_completion),
         title: Mutex::new(None),
         prompt_title: Mutex::new(None),
         prompt_input: Mutex::new(PromptInputState::default()),
@@ -1802,10 +1865,7 @@ fn new_shared(spec: &SessionSpec, log: OutputLog, engine: &ManifestEngine) -> Ar
             HeadlessScreen::new(spec.pty.cols as usize, spec.pty.rows as usize)
                 .with_notifications(),
         ),
-        reducer: Mutex::new(
-            StatusReducer::new(spec.authority, SystemTime::now())
-                .with_manifest(spec.manifest_id.clone(), manifest_version),
-        ),
+        reducer: Mutex::new(reducer),
         exit: Mutex::new(None),
         exited: AtomicBool::new(false),
         stop: AtomicBool::new(false),
@@ -1861,7 +1921,7 @@ fn holder_io_error(error: crate::holder::HolderError) -> std::io::Error {
 /// only when something observable actually changed — that version is what the
 /// registry watcher polls instead of deep-diffing records.
 fn apply(shared: &Shared, outcome: &ReducerOutcome) {
-    let mut changed = false;
+    let mut changed = outcome.attention_changed;
     if let Some(status) = &outcome.status_change {
         {
             let mut current = shared.status.lock().expect("status");
@@ -3579,7 +3639,7 @@ mod notification_tests {
             defer_launch: false,
         };
         let log = OutputLog::open(temp.path(), &spec.id, 4096, 8192, false).unwrap();
-        let shared = new_shared(&spec, log, &engine);
+        let shared = new_shared(&spec, log, &engine, true);
         let mut seq = 0;
         let bytes = b"\x1b]777;notify;Build;Passed\x07";
         let end = apply_remote_output(&shared, &engine, "shell", &mut seq, 0, bytes, true).unwrap();

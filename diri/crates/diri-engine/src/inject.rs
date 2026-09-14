@@ -49,10 +49,12 @@ pub fn uuid_v4() -> String {
 /// Commands read `$DIRIJOR_CLI` / `$DIRIJOR_SOCKET` from the PTY env, so the
 /// file content is identical for all sessions and safe to write once.
 pub fn write_claude_hooks_file(inject_dir: &Path) -> io::Result<()> {
-    const EVENTS: [&str; 9] = [
+    const EVENTS: [&str; 11] = [
         "SessionStart",
         "UserPromptSubmit",
         "PreToolUse",
+        "PostToolUse",
+        "PostToolUseFailure",
         "PermissionRequest",
         "Notification",
         "Stop",

@@ -1540,6 +1540,7 @@ dependencies = [
  "base64 0.23.1",
  "block2 0.6.2",
  "diri-client",
+ "diri-engine",
  "diri-proto",
  "diri-term",
  "diri-ui",

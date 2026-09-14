@@ -69,6 +69,7 @@ pub enum ClaudeHook {
     SessionStart,
     UserPromptSubmit,
     PreToolUse,
+    PostToolUse,
     PermissionRequest {
         tool_name: Option<String>,
         input_summary: Option<String>,
@@ -102,6 +103,8 @@ pub enum StatusSignal {
     Screen(ScreenObservation),
     PtyOutputActivity,
     UserKeystroke,
+    /// Input accepted by the transport that can submit or dismiss a prompt.
+    UserSubmission,
     /// The PTY foreground process group is, or is not, the session child.
     /// Shell sessions use this to show work only while a foreground job runs.
     ForegroundJob {
@@ -128,6 +131,7 @@ pub struct ReducerOutcome {
     pub needs_input: Option<NeedsInputDetail>,
     /// Set when a turn just completed.
     pub turn_completed: bool,
+    pub attention_changed: bool,
 }
 
 /// The mutable belief and debounce tracking for one session.
@@ -205,6 +209,7 @@ impl InternalState {
 }
 
 pub struct StatusReducer {
+    attention: crate::attention::AttentionLifecycle,
     status: SessionStatus,
     authority: Authority,
     timing: ReducerTiming,
@@ -217,6 +222,7 @@ pub struct StatusReducer {
 impl StatusReducer {
     pub fn new(authority: Authority, spawned_at: SystemTime) -> Self {
         Self {
+            attention: Default::default(),
             status: SessionStatus::Starting,
             authority,
             timing: ReducerTiming::default(),
@@ -270,8 +276,75 @@ impl StatusReducer {
             .unwrap_or(SystemTime::UNIX_EPOCH);
     }
 
+    pub fn with_attention_path(self, path: &std::path::Path) -> Self {
+        self.with_attention_storage(path, false)
+    }
+
+    pub(crate) fn with_attention_storage(mut self, path: &std::path::Path, fresh: bool) -> Self {
+        self.attention = crate::attention::AttentionLifecycle::open(path);
+        if fresh {
+            self.attention.start_incarnation();
+        }
+        if let Some(state) = self.attention.snapshot() {
+            if let Some(request) = state.active_requests().find(|event| event.blocking) {
+                if let Some(detail) = &request.detail {
+                    self.status = SessionStatus::NeedsInput(detail.kind);
+                    self.state.pending_needs_input = Some(detail.clone());
+                }
+            } else if state.working {
+                self.status = SessionStatus::Working;
+                self.state.turn_in_flight = true;
+                self.state.hook_turn_in_flight = self.authority == Authority::HooksPrimary;
+            } else if state.sequence > 0 {
+                self.status = SessionStatus::Idle;
+            }
+        }
+        self
+    }
+
+    pub fn attention_state(&self) -> Option<&diri_proto::attention::AttentionState> {
+        self.attention.snapshot()
+    }
+
+    pub fn reduce_identified(
+        &mut self,
+        signal: StatusSignal,
+        mut identity: crate::attention::SignalIdentity,
+        now: SystemTime,
+    ) -> ReducerOutcome {
+        if let StatusSignal::ClaudeHook {
+            hook: ClaudeHook::PermissionRequest { tool_name, .. },
+            is_subagent: false,
+            ..
+        } = &signal
+        {
+            self.attention
+                .correlate_request(&mut identity, tool_name.as_deref());
+        }
+        if self.attention.duplicate(&identity) {
+            return ReducerOutcome {
+                attention_changed: self.attention.snapshot().is_none(),
+                ..Default::default()
+            };
+        }
+        let mut evidence = crate::attention::Evidence::from(&signal);
+        let mut outcome = self.reduce_status(signal, now);
+        evidence.completion &=
+            self.state.idle_strong || outcome.turn_completed || self.status == SessionStatus::Idle;
+        let mut identity = identity;
+        if !evidence.completion && !outcome.turn_completed {
+            identity.completion = None;
+        }
+        outcome.attention_changed = self.attention.observe(&evidence, &identity, &outcome, now);
+        outcome
+    }
+
     /// Folds one signal into the session's status.
     pub fn reduce(&mut self, signal: StatusSignal, now: SystemTime) -> ReducerOutcome {
+        self.reduce_identified(signal, Default::default(), now)
+    }
+
+    fn reduce_status(&mut self, signal: StatusSignal, now: SystemTime) -> ReducerOutcome {
         let mut outcome = ReducerOutcome::default();
 
         // Exited is absorbing: once dead, nothing changes it.
@@ -326,6 +399,7 @@ impl StatusReducer {
             StatusSignal::Tick => None,
             StatusSignal::PtyOutputActivity
             | StatusSignal::UserKeystroke
+            | StatusSignal::UserSubmission
             | StatusSignal::ForegroundJob { .. }
             | StatusSignal::ProcessExit { .. } => None,
         };
@@ -338,7 +412,7 @@ impl StatusReducer {
                 // title updates and status lines continue after a turn ends.
                 self.state.last_signal_at = now;
             }
-            StatusSignal::UserKeystroke => {
+            StatusSignal::UserKeystroke | StatusSignal::UserSubmission => {
                 self.state.last_signal_at = now;
                 self.state.hold_idle_against_screen = false;
                 if matches!(self.status, SessionStatus::NeedsInput(_)) {
@@ -702,7 +776,7 @@ impl StatusReducer {
                 self.state.turn_in_flight = true;
                 self.go_working(now, true, outcome);
             }
-            ClaudeHook::PreToolUse => self.go_working(now, true, outcome),
+            ClaudeHook::PreToolUse | ClaudeHook::PostToolUse => self.go_working(now, true, outcome),
             ClaudeHook::PermissionRequest {
                 tool_name,
                 input_summary,

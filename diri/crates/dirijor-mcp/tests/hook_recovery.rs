@@ -159,6 +159,8 @@ fn a_hook_records_its_safe_seed_before_unreachable_daemon_delivery() {
     assert_eq!(
         seed,
         HookActivitySeed {
+            native_request_id: None,
+            native_turn_id: None,
             claude_pending_work: None,
             version: HookActivitySeed::VERSION,
             kind: "claude-hook".into(),
