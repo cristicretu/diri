@@ -118,10 +118,14 @@ Validation on macOS arm64: `cargo fmt --all -- --check`, strict workspace
 Clippy, all **1,540 workspace tests passed** (32 explicitly ignored), and
 `cargo build --workspace --release` passed. The signed, isolated development
 bundle launched against its own Engine; the notification tray rendered and its
-Test alert action was exercised. Actual macOS banner visibility is unverified:
-automatic approval review blocked opening Notification Center because it could
-expose unrelated private notifications. This is not a claim of completed native
-delivery validation. The installed app was not replaced.
+Test alert action was exercised. A follow-up found that macOS notifications were
+disabled for the development bundle. With user approval, they were temporarily
+enabled and Test alert was triggered again, then the setting was restored to off
+and verified. Actual macOS banner visibility remains unverified: automatic
+approval review blocked both opening Notification Center and reading its
+accessibility tree because they could expose unrelated private notifications.
+This is not a claim of completed native delivery validation. The installed app
+was not replaced.
 
 A provider that exposes only a screen cannot reveal every request's true identity.
 The conservative fallback may keep an ambiguous prompt open until response or
