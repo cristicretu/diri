@@ -142,6 +142,30 @@ fn selecting_a_session_wakes_its_artifact_refresh_even_when_already_seen() {
 }
 
 #[test]
+fn archived_selection_and_opening_links_request_fresh_pr_state() {
+    let mut archived = session("old", "a", 1.0);
+    archived.archived_at = Some(DateMillis(3.0));
+    let (mut store, mut effects) = hydrated(
+        vec![session("one", "a", 2.0), archived],
+        vec![project("a", "A")],
+        Prefs::default(),
+    );
+    drain(&mut effects);
+    store.select(id("old"));
+    assert!(
+        drain(&mut effects).iter().any(
+            |effect| matches!(effect, StoreEffect::MarkSeen(session) if session == &id("old"))
+        )
+    );
+    store.refresh_session_links(id("old"));
+    assert!(
+        drain(&mut effects).iter().any(
+            |effect| matches!(effect, StoreEffect::MarkSeen(session) if session == &id("old"))
+        )
+    );
+}
+
+#[test]
 fn hydrate_restores_the_last_selected_session_instead_of_the_first() {
     let prefs = Prefs {
         last_selected_session: Some(id("two")),

@@ -5,10 +5,10 @@ use diri_proto::{ArtifactKind, PrCheck, PullRequestStatus, SessionArtifact};
 use diri_ui::{Icon, IconName};
 use gpui::{
     Anchor, Animation, AnimationExt, ClickEvent, Pixels, Point, ScrollStrategy,
-    UniformListScrollHandle, anchored, canvas, deferred, ease_out_quint, point, uniform_list,
+    UniformListScrollHandle, anchored, canvas, deferred, ease_out_quint, point, rgba, uniform_list,
 };
 use std::{cell::Cell, rc::Rc};
-const ROW_HEIGHT: f32 = 48.0;
+const ROW_HEIGHT: f32 = 40.0;
 pub(super) struct SessionLinks {
     open: bool,
     pull_request: Option<String>,
@@ -49,6 +49,7 @@ struct LinkRow {
     icon: IconName,
     status: Option<(String, gpui::Rgba)>,
     action: LinkAction,
+    details: Option<String>,
 }
 fn pr_state(pr: &PullRequestStatus) -> &'static str {
     match pr.state.as_str() {
@@ -58,6 +59,44 @@ fn pr_state(pr: &PullRequestStatus) -> &'static str {
         _ => "Open",
     }
 }
+fn pr_summary(pr: &PullRequestStatus) -> (String, gpui::Rgba) {
+    match pr.state.as_str() {
+        "MERGED" => ("Merged".into(), rgba(0xaf7cf7ff)),
+        "CLOSED" => ("Closed".into(), Ink::DANGER),
+        _ => check_summary(pr).unwrap_or_else(|| {
+            (
+                pr_state(pr).into(),
+                if pr.is_draft {
+                    Ink::GENERIC_WORKING
+                } else {
+                    Ink::FRESH
+                },
+            )
+        }),
+    }
+}
+
+/// Keep the newest captured PR within one click, even before its first fetch.
+fn primary_pr(session: &SessionRecord) -> Option<(&str, Option<&PullRequestStatus>)> {
+    let statuses = session.pull_requests.as_deref().unwrap_or_default();
+    if let Some(artifact) = session
+        .artifacts
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter(|a| {
+            a.kind == ArtifactKind::PullRequest || statuses.iter().any(|pr| pr.url == a.url)
+        })
+        .max_by(|a, b| a.first_seen_at.0.total_cmp(&b.first_seen_at.0))
+    {
+        return Some((
+            &artifact.url,
+            statuses.iter().find(|pr| pr.url == artifact.url),
+        ));
+    }
+    statuses.last().map(|pr| (pr.url.as_str(), Some(pr)))
+}
+
 fn check_summary(pr: &PullRequestStatus) -> Option<(String, gpui::Rgba)> {
     if pr.checks_failed > 0 {
         Some((
@@ -142,8 +181,9 @@ fn pr_row(pr: &PullRequestStatus) -> LinkRow {
         } else {
             IconName::PullRequest
         },
-        status: check_summary(pr),
-        action: LinkAction::PullRequest(pr.url.clone()),
+        status: Some(pr_summary(pr)),
+        action: LinkAction::Open(pr.url.clone()),
+        details: Some(pr.url.clone()),
     }
 }
 fn artifact_row(artifact: &SessionArtifact) -> LinkRow {
@@ -183,6 +223,7 @@ fn artifact_row(artifact: &SessionArtifact) -> LinkRow {
         icon,
         status: None,
         action: LinkAction::Open(artifact.url.clone()),
+        details: None,
     }
 }
 // The closed toolbar counts borrowed URLs; it does not clone titles, checks,
@@ -240,6 +281,7 @@ fn session_rows(session: &SessionRecord) -> Vec<LinkRow> {
                 icon: IconName::Monitor,
                 status: None,
                 action: LinkAction::Open(url),
+                details: None,
             });
         }
     }
@@ -258,6 +300,7 @@ fn detail_rows(pr: &PullRequestStatus) -> Vec<LinkRow> {
         icon: IconName::ExternalLink,
         status: None,
         action: LinkAction::Open(pr.url.clone()),
+        details: None,
     }];
     for check in sorted_checks(pr) {
         let (label, icon, tone) = match check.result.as_str() {
@@ -271,6 +314,7 @@ fn detail_rows(pr: &PullRequestStatus) -> Vec<LinkRow> {
             subtitle: check.detail.filter(|s| !s.is_empty()).unwrap_or_default(),
             icon,
             status: Some((label.into(), tone)),
+            details: None,
             action: LinkAction::Open(
                 check
                     .url
@@ -285,6 +329,7 @@ fn detail_rows(pr: &PullRequestStatus) -> Vec<LinkRow> {
                 .map_or_else(|| "No checks reported".into(), |(label, _)| label),
             icon: IconName::CheckCircle,
             status: None,
+            details: None,
             action: LinkAction::Open(format!("{}/checks", pr.url.trim_end_matches('/'))),
         });
     }
@@ -294,6 +339,7 @@ fn detail_rows(pr: &PullRequestStatus) -> Vec<LinkRow> {
             subtitle: comments_help(pr),
             icon: IconName::Comment,
             status: None,
+            details: None,
             action: LinkAction::Open(format!(
                 "{}#discussion_bucket",
                 pr.url.trim_end_matches('/')
@@ -385,7 +431,15 @@ impl TerminalPane {
                     (self.session_links.selected + 1).min(action_count.saturating_sub(1))
             }
             "up" => self.session_links.selected = self.session_links.selected.saturating_sub(1),
-            "enter" | "right" => {
+            "right"
+                if rows
+                    .get(self.session_links.selected)
+                    .is_some_and(|row| row.details.is_some()) =>
+            {
+                let url = rows[self.session_links.selected].details.as_ref().unwrap();
+                self.activate_link(&LinkAction::PullRequest(url.clone()), false, window, cx);
+            }
+            "enter" => {
                 if let Some(row) = rows.get(self.session_links.selected) {
                     self.activate_link(&row.action, event.keystroke.modifiers.alt, window, cx);
                 } else if has_account {
@@ -406,6 +460,56 @@ impl TerminalPane {
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let primary = primary_pr(session).map(|(url, status)| {
+            let url = url.to_owned();
+            let help = status
+                .and_then(|pr| pr.title.clone())
+                .unwrap_or_else(|| url.clone());
+            let label = pr_number(&url).map_or_else(|| "PR".into(), |n| format!("#{n}"));
+            let state = status.map(pr_state).unwrap_or("PR");
+            let tone = status.map_or(colors.secondary, |pr| match pr.state.as_str() {
+                "MERGED" => rgba(0xaf7cf7ff),
+                "CLOSED" => Ink::DANGER,
+                _ if pr.is_draft => colors.secondary,
+                _ => Ink::FRESH,
+            });
+            let icon = if state == "Merged" {
+                IconName::Merge
+            } else {
+                IconName::PullRequest
+            };
+            div()
+                .id("session-primary-pr")
+                .debug_selector(|| "session-primary-pr".into())
+                .h(px(Metrics::TOOLBAR_CONTROL_SIZE))
+                .px(px(6.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .rounded(px(Radius::ROW))
+                .hover(move |el| el.bg(Fill::subtle(colors)))
+                .cursor_pointer()
+                .text_size(px(Typo::META.size))
+                .text_color(tone)
+                .child(Icon::new(icon, 14.0, tone))
+                .child(label)
+                .child(state)
+                .tooltip(move |_, cx| {
+                    cx.new(|_| PaletteTooltip(format!("Open on GitHub · {help}"), colors))
+                        .into()
+                })
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    this.activate_link(
+                        &LinkAction::Open(url.clone()),
+                        event.modifiers().alt,
+                        window,
+                        cx,
+                    );
+                    cx.stop_propagation();
+                }))
+        });
         let count = link_count(session);
         let attention = active_check_attention(session);
         let help = attention.as_ref().map_or_else(
@@ -414,7 +518,7 @@ impl TerminalPane {
         );
         let open = self.session_links.open;
         let anchor = self.session_links.anchor.clone();
-        div()
+        let trigger = div()
             .relative()
             .child(
                 canvas(
@@ -458,6 +562,13 @@ impl TerminalPane {
                     this.close_session_links(window, cx);
                 } else {
                     this.session_links.open = true;
+                    if let Some(session) = this.selected_session() {
+                        this.runtime
+                            .store
+                            .read()
+                            .unwrap()
+                            .refresh_session_links(session.id.clone());
+                    }
                     this.session_links.selected = 0;
                     this.session_links
                         .scroll
@@ -466,7 +577,13 @@ impl TerminalPane {
                     cx.notify();
                 }
                 cx.stop_propagation();
-            }))
+            }));
+        div()
+            .flex()
+            .items_center()
+            .gap(px(2.0))
+            .when_some(primary, |el, primary| el.child(primary))
+            .child(trigger)
             .into_any_element()
     }
     fn render_link_row(
@@ -547,15 +664,40 @@ impl TerminalPane {
                                 .child(label),
                         )
                     })
-                    .child(Icon::new(
-                        if matches!(action, LinkAction::PullRequest(_)) {
-                            IconName::ChevronRight
-                        } else {
-                            IconName::ExternalLink
-                        },
-                        14.0,
-                        colors.tertiary,
-                    )),
+                    .when_some(row.details.clone(), |el, url| {
+                        el.child(
+                            div()
+                                .id(("session-link-details", index))
+                                .debug_selector(move || format!("session-link-details-{index}"))
+                                .size(px(26.0))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(Radius::CHIP))
+                                .hover(move |el| el.bg(Fill::selected(colors, true)))
+                                .child(Icon::new(IconName::ChevronRight, 14.0, colors.secondary))
+                                .tooltip(move |_, cx| {
+                                    cx.new(|_| {
+                                        PaletteTooltip("Checks and discussion · →".into(), colors)
+                                    })
+                                    .into()
+                                })
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.session_links.selected = index;
+                                    this.activate_link(
+                                        &LinkAction::PullRequest(url.clone()),
+                                        false,
+                                        window,
+                                        cx,
+                                    );
+                                    cx.stop_propagation();
+                                })),
+                        )
+                    })
+                    .when(row.details.is_none(), |el| {
+                        el.child(Icon::new(IconName::ExternalLink, 14.0, colors.tertiary))
+                    }),
             )
             .tooltip(move |_, cx| cx.new(|_| PaletteTooltip(help.clone(), colors)).into())
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
@@ -611,7 +753,7 @@ impl TerminalPane {
         );
         let header =
             div()
-                .h(px(48.0))
+                .h(px(36.0))
                 .px(px(16.0))
                 .flex()
                 .items_center()
@@ -836,7 +978,7 @@ impl TerminalPane {
                             div()
                                 .id("session-links-panel")
                                 .debug_selector(|| "session-links-panel".into())
-                                .w(px(400.0))
+                                .w(px(380.0))
                                 .max_w(window.viewport_size().width - px(24.0))
                                 .occlude()
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -993,11 +1135,11 @@ mod tests {
         assert_eq!(rows[1].status.as_ref().unwrap().0, "Checks passed");
         assert_eq!(
             rows[0].action,
-            LinkAction::PullRequest("https://github.com/diri/app/pull/181".into())
+            LinkAction::Open("https://github.com/diri/app/pull/181".into())
         );
         assert_eq!(
             rows[1].action,
-            LinkAction::PullRequest("https://github.com/diri/app/pull/180".into())
+            LinkAction::Open("https://github.com/diri/app/pull/180".into())
         );
         assert_eq!(rows[2].title, "Notion page");
         let details = detail_rows(&session.pull_requests.as_ref().unwrap()[0]);
@@ -1008,6 +1150,14 @@ mod tests {
         );
     }
     #[test]
+    fn merged_state_takes_priority_over_old_checks() {
+        let mut session = fixture();
+        session.pull_requests.as_mut().unwrap()[1].state = "MERGED".into();
+        let rows = session_rows(&session);
+        assert_eq!(rows[0].status.as_ref().unwrap().0, "Merged");
+    }
+
+    #[test]
     fn status_upgrades_a_generic_artifact_by_url() {
         let mut session = fixture();
         for kind in [ArtifactKind::Link, ArtifactKind::Unknown] {
@@ -1017,7 +1167,7 @@ mod tests {
             assert_eq!(rows[0].status.as_ref().unwrap().0, "1 check failed");
             assert_eq!(
                 rows[0].action,
-                LinkAction::PullRequest("https://github.com/diri/app/pull/181".into())
+                LinkAction::Open("https://github.com/diri/app/pull/181".into())
             );
         }
     }
@@ -1032,11 +1182,11 @@ mod tests {
         assert_eq!(rows.len(), 4);
         assert_eq!(
             rows.last().unwrap().action,
-            LinkAction::PullRequest("https://github.com/diri/app/pull/180".into())
+            LinkAction::Open("https://github.com/diri/app/pull/180".into())
         );
     }
     #[gpui::test]
-    fn mouse_and_keyboard_keep_detail_navigation_inside_the_menu(cx: &mut TestAppContext) {
+    fn mouse_and_keyboard_keep_explicit_detail_navigation_inside_the_menu(cx: &mut TestAppContext) {
         cx.update(|cx| cx.set_reduce_motion(true));
         let (runtime, tokio) = runtime(fixture());
         let (pane, cx) =
@@ -1047,7 +1197,7 @@ mod tests {
         cx.simulate_click(trigger.center(), Modifiers::default());
         cx.run_until_parked();
         assert!(pane.read_with(cx, |pane, _| pane.session_links.open));
-        let second = cx.debug_bounds("session-link-1").unwrap();
+        let second = cx.debug_bounds("session-link-details-1").unwrap();
         cx.simulate_click(second.center(), Modifiers::default());
         cx.run_until_parked();
         assert_eq!(
@@ -1060,7 +1210,7 @@ mod tests {
         cx.run_until_parked();
         assert!(pane.read_with(cx, |pane, _| pane.session_links.open
             && pane.session_links.pull_request.is_none()));
-        cx.simulate_keystrokes("up enter");
+        cx.simulate_keystrokes("up right");
         cx.run_until_parked();
         assert_eq!(
             pane.read_with(cx, |pane, _| pane.session_links.pull_request.clone())
@@ -1074,6 +1224,41 @@ mod tests {
         cx.simulate_click(point(px(10.0), px(300.0)), Modifiers::default());
         assert!(!pane.read_with(cx, |pane, _| pane.session_links.open));
     }
+    #[gpui::test]
+    fn primary_pr_and_menu_rows_open_github_in_one_click(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (runtime, tokio) = runtime(fixture());
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        cx.simulate_resize(size(px(900.0), px(700.0)));
+        cx.run_until_parked();
+        let position = cx.debug_bounds("session-primary-pr").unwrap().center();
+        cx.simulate_click(position, Modifiers::default());
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some("https://github.com/diri/app/pull/180")
+        );
+        assert!(!pane.read_with(cx, |p, _| p.session_links.open));
+        let trigger = cx.debug_bounds("session-links-trigger").unwrap().center();
+        cx.simulate_click(trigger, Modifiers::default());
+        cx.run_until_parked();
+        let position = cx.debug_bounds("session-link-0").unwrap().center();
+        cx.simulate_click(position, Modifiers::default());
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some("https://github.com/diri/app/pull/181")
+        );
+        assert!(!pane.read_with(cx, |p, _| p.session_links.open));
+        cx.simulate_click(trigger, Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("down enter");
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some("https://github.com/diri/app/pull/180")
+        );
+        assert!(!pane.read_with(cx, |p, _| p.session_links.open));
+    }
+
     #[test]
     fn closed_toolbar_only_flags_active_pull_requests() {
         let mut session = fixture();
@@ -1190,6 +1375,9 @@ mod tests {
             session.pull_requests = None;
             session.git_branch = None;
             session.title = "Plan the autumn launch".into();
+        }
+        if std::env::var_os("DIRI_VISUAL_MERGED").is_some() {
+            session.pull_requests.as_mut().unwrap()[0].state = "MERGED".into();
         }
         let (runtime, tokio) = runtime(session);
         if std::env::var_os("DIRI_VISUAL_LIGHT").is_some() {

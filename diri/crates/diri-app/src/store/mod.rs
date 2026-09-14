@@ -2507,6 +2507,13 @@ impl SessionStore {
             .unwrap_or_else(|| "/".to_owned())
     }
 
+    /// Opening the links surface is an explicit request for fresh PR metadata.
+    pub fn refresh_session_links(&self, id: SessionId) {
+        if self.sessions.contains_key(&id) {
+            self.emit(StoreEffect::MarkSeen(id));
+        }
+    }
+
     pub fn set_active(&mut self, active: bool) {
         if self.app_is_active == active {
             return;
@@ -2548,11 +2555,7 @@ impl SessionStore {
                 self.emit(StoreEffect::DetachAttachment(evicted));
             }
         }
-        if self
-            .sessions
-            .get(&id)
-            .is_some_and(|session| !session.is_archived())
-        {
+        if self.sessions.contains_key(&id) {
             // Selection is also the PR/artifact visibility signal. The
             // daemon uses mark_seen to wake a fresh foreground refresh, even
             // when there was no unseen completion to acknowledge.

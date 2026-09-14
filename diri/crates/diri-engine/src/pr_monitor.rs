@@ -236,7 +236,8 @@ fn sweep(
     pending: PendingWake,
     foreground_active: bool,
 ) -> Duration {
-    // PR URLs worth polling: sessions currently attached, or viewed recently.
+    // Fetch only attached/recently viewed PRs, but propagate their cached
+    // status to every record sharing the URL, including archived chats.
     // Merely being a live restored process is not evidence anyone is looking
     // at its PR pill.
     let records = {
@@ -257,9 +258,9 @@ fn sweep(
             .as_ref()
             .is_some_and(|seen| now_ms - seen.0 < RECENTLY_SEEN.as_millis() as f64);
         let attached = attach.has_sinks(&record.id.0);
-        if !(attached || recently_seen) {
-            continue;
-        }
+        let explicitly_viewed = pending.sessions.contains(&record.id.0);
+        let eligible = attached || recently_seen;
+        let mut seen_urls = HashSet::new();
         let urls: Vec<String> = record
             .artifacts
             .as_deref()
@@ -267,10 +268,19 @@ fn sweep(
             .iter()
             .filter(|artifact| artifact.kind == ArtifactKind::PullRequest)
             .map(|artifact| artifact.url.clone())
+            .chain(
+                record
+                    .pull_requests
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|pr| pr.url.clone()),
+            )
+            .filter(|url| seen_urls.insert(url.clone()))
             .collect();
         if !urls.is_empty() {
-            let interest = poll_interest(attached, foreground_active);
-            for url in &urls {
+            let interest = poll_interest(attached || explicitly_viewed, foreground_active);
+            for url in urls.iter().filter(|_| eligible) {
                 targets
                     .entry(url.clone())
                     .and_modify(|current| *current = (*current).max(interest))
@@ -292,7 +302,7 @@ fn sweep(
             wanted.push((record.id.0.clone(), urls));
         }
     }
-    if wanted.is_empty() {
+    if targets.is_empty() {
         forced_urls.clear();
         return IDLE_RECONCILE_INTERVAL;
     }
@@ -658,6 +668,80 @@ fn now() -> DateMillis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_updates_status_only_prs_and_every_session_sharing_the_url() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let url = "https://github.com/o/r/pull/12";
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../diri-proto/tests/fixtures/session_list_response.json"
+        ))
+        .unwrap();
+        let mut visible: diri_proto::SessionRecord =
+            serde_json::from_value(fixture["ok"]["sessions"][0].clone()).unwrap();
+        visible.id.0 = "visible".into();
+        visible.last_seen_at = Some(now());
+        visible.artifacts = None;
+        visible.pull_requests = Some(vec![
+            parse(br#"{"number":12,"state":"OPEN"}"#, url, DateMillis(0.0)).unwrap(),
+        ]);
+        let mut other = visible.clone();
+        other.id.0 = "other".into();
+        other.last_seen_at = None;
+        let state_file = temp.path().join("state.json");
+        std::fs::write(
+            &state_file,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1, "projects": [], "sessions": [visible, other]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let (engine, _) =
+            crate::detect::ManifestEngine::load_dir(&crate::detect::bundled_manifest_dir())
+                .unwrap();
+        let mut registry = Registry::new(Arc::new(engine), state_file);
+        registry.load().unwrap();
+        let registry = Arc::new(Mutex::new(registry));
+        let gh = temp.path().join("gh");
+        std::fs::write(
+            &gh,
+            "#!/bin/sh\nprintf '%s' '{\"number\":12,\"state\":\"MERGED\"}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut refresh = HashMap::from([(
+            url.to_owned(),
+            RefreshState {
+                last_attempt: Some(Instant::now()),
+                ..Default::default()
+            },
+        )]);
+        sweep(
+            &registry,
+            &EventBus::new(),
+            &AttachHub::new(),
+            gh.to_str().unwrap(),
+            &mut HashMap::new(),
+            &mut refresh,
+            &mut HashMap::new(),
+            &mut HashSet::new(),
+            PendingWake {
+                sessions: HashSet::from(["visible".into()]),
+                ..Default::default()
+            },
+            true,
+        );
+        for record in registry.lock().unwrap().records() {
+            assert_eq!(
+                record.pull_requests.unwrap()[0].state,
+                "MERGED",
+                "{} stayed stale",
+                record.id.0
+            );
+        }
+    }
 
     #[test]
     fn coordinates_come_out_of_a_pr_url() {
