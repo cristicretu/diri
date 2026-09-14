@@ -119,16 +119,35 @@ impl TerminalPane {
         }
     }
 
-    pub(super) fn open_reference(&mut self, reference: TerminalReference, cx: &mut Context<Self>) {
+    pub(super) fn open_reference(
+        &mut self,
+        reference: TerminalReference,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match reference {
             TerminalReference::Url(url) => cx.open_url(&url),
             TerminalReference::File(reference) => {
                 if let Some(session) = self.selected_session() {
-                    cx.emit(TerminalPaneEvent::OpenFileReference {
-                        reference,
-                        cwd: session.cwd.clone(),
-                        session_id: session.id.clone(),
-                    });
+                    if session.host.is_none() {
+                        match crate::code_intelligence::local_reference_url(
+                            std::path::Path::new(&session.cwd),
+                            &reference,
+                        ) {
+                            Some(url) => cx.open_url(url.as_str()),
+                            None => self.show_terminal_feedback(
+                                "Could not open this local file link",
+                                window,
+                                cx,
+                            ),
+                        }
+                    } else {
+                        cx.emit(TerminalPaneEvent::OpenFileReference {
+                            reference,
+                            cwd: session.cwd.clone(),
+                            session_id: session.id.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -212,7 +231,7 @@ impl TerminalPane {
         match action {
             MenuAction::Open => {
                 if let Some(hit) = target {
-                    self.open_reference(hit.reference, cx);
+                    self.open_reference(hit.reference, window, cx);
                 }
             }
             MenuAction::CopyLink => {
@@ -749,30 +768,6 @@ impl TerminalPane {
                     .text_size(px(11.0))
                     .text_color(colors.secondary)
                     .child(message.clone()),
-            );
-        }
-        if let Some(hit) = &self.qol.hit
-            && self.qol.menu.is_none()
-            && self.qol.copy_mode.is_none()
-        {
-            overlay = overlay.child(
-                div()
-                    .absolute()
-                    .bottom(px(6.0))
-                    .left(px(14.0))
-                    .right(px(14.0))
-                    .px(px(8.0))
-                    .py(px(4.0))
-                    .rounded(px(6.0))
-                    .bg(colors.floating_surface())
-                    .text_size(px(11.0))
-                    .text_color(colors.secondary)
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .child(format!(
-                        "{}  ·  ⌘-click to open",
-                        hit.reference.destination()
-                    )),
             );
         }
         if self.qol.copy_mode.is_some() {

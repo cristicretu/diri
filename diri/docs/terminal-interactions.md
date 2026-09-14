@@ -1,8 +1,13 @@
 # Terminal interactions
 
-- Hover a URL or file reference to underline it and preview its destination.
+- Hover a URL or file reference to underline it and show the pointer cursor.
+  Hover feedback stays on the link without a bottom banner covering output.
   Cmd-click opens on release; dragging cancels opening. Named OSC 8 links work
   when the session's Helper supports terminal annotations.
+  Local file links open in the Mac's default app, including HTML previews and
+  images outside the workspace. Relative paths use the session's working
+  directory; line/column suffixes are removed before opening the file.
+  Cmd-Shift-D continues to open the code sidebar explicitly.
 - Right-click for Open/Copy Link, Copy Selection, Find Selection, Paste,
   Keyboard Copy Mode, Open Scrollback in Editor, and shell prompt navigation.
   In mouse-aware terminal applications, Option-right-click opens Diri's menu.
@@ -41,7 +46,7 @@ The interaction audit used [Ghostty source at 5252b19](https://github.com/ghostt
 and [Herdr source at bafbc09](https://github.com/herdrdev/herdr/tree/bafbc0949dd996cf7fd0848c8965e254348cc11e).
 Diri implements these behaviors in its Rust Engine, shared parser and GPUI client.
 
-Visual fixtures: [hover and destination preview](screenshots/terminal-qol/hover.png),
+Visual fixtures: [link hover](screenshots/terminal-qol/hover.png),
 [terminal menu](screenshots/terminal-qol/menu.png), and paste review in
 [dark](screenshots/paste-review/dark.png) and
 [narrow light](screenshots/paste-review/light-narrow.png) appearances.

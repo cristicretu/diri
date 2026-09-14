@@ -1801,7 +1801,7 @@ impl TerminalPane {
                 && cell == Some(point)
                 && hit.as_ref() == Some(&pressed)
             {
-                self.open_reference(pressed.reference, cx);
+                self.open_reference(pressed.reference, window, cx);
             }
             cx.stop_propagation();
             return;
@@ -4717,6 +4717,94 @@ mod tests {
         cx.update_window(window.into(), |_, window, _| window.remove_window())
             .unwrap();
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn terminal_local_file_links_open_in_the_default_app(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let mut session = fixture_session();
+        session.host = None;
+        session.cwd = "/tmp/workspace".into();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(session.clone());
+            store.select(session.id);
+        }
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        let mut events = cx.events(&pane);
+        for (reference, expected) in [
+            (
+                "/Users/giga/Desktop/pr6037-current-tool-ui.png",
+                "file:///Users/giga/Desktop/pr6037-current-tool-ui.png",
+            ),
+            ("./preview.html", "file:///tmp/workspace/preview.html"),
+            (
+                "file:///tmp/my%20preview.html",
+                "file:///tmp/my%20preview.html",
+            ),
+            ("src/main.rs:42:7", "file:///tmp/workspace/src/main.rs"),
+        ] {
+            pane.update_in(cx, |pane, window, cx| {
+                pane.open_reference(TerminalReference::File(reference.into()), window, cx);
+            });
+            assert_eq!(cx.opened_url().as_deref(), Some(expected), "{reference}");
+            assert!(
+                events.try_recv().is_err(),
+                "local files must not reveal the inspector"
+            );
+        }
+        pane.update_in(cx, |pane, window, cx| {
+            pane.open_reference(
+                TerminalReference::Url("https://example.com".into()),
+                window,
+                cx,
+            );
+        });
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.com"));
+        pane.update_in(cx, |pane, window, cx| {
+            pane.open_reference(
+                TerminalReference::File("file://remote/tmp/preview.html".into()),
+                window,
+                cx,
+            );
+            assert_eq!(
+                pane.qol.feedback.as_deref(),
+                Some("Could not open this local file link")
+            );
+        });
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.com"));
+        assert!(events.try_recv().is_err());
+
+        pane.update_in(cx, |pane, window, cx| {
+            let mut session = (*pane.selected_session().unwrap()).clone();
+            session.host = Some("remote-host".into());
+            pane.runtime
+                .store
+                .write()
+                .unwrap()
+                .upsert_session(session.clone());
+            pane.open_reference(
+                TerminalReference::File("/tmp/preview.html".into()),
+                window,
+                cx,
+            );
+        });
+        assert!(matches!(
+            events.try_recv(),
+            Ok(TerminalPaneEvent::OpenFileReference { .. })
+        ));
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some("https://example.com"),
+            "remote paths must not open local files"
+        );
     }
 
     #[gpui::test]

@@ -27,6 +27,21 @@ const MAX_SYMBOL_BYTES: u64 = 256 * 1024;
 const MAX_SYMBOL_INDEX_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_SYMBOLS_PER_FILE: usize = 256;
 
+/// Prepare an explicitly activated local terminal file for the system opener.
+/// Unlike source browsing, this permits files outside the workspace and does
+/// not read their contents. The caller must establish that the session is local.
+pub(crate) fn local_reference_url(cwd: &Path, reference: &str) -> Option<url::Url> {
+    let parsed = parse_reference_fragment(reference)?;
+    let path = if let Ok(relative) = parsed.path.strip_prefix("~") {
+        PathBuf::from(std::env::var_os("HOME")?).join(relative)
+    } else if parsed.path.is_absolute() {
+        parsed.path
+    } else {
+        cwd.join(parsed.path)
+    };
+    url::Url::from_file_path(path).ok()
+}
+
 const IGNORED_DIRECTORIES: &[&str] = &[
     ".git",
     ".hg",
@@ -1359,6 +1374,34 @@ fn excerpt(text: &str, max_characters: usize) -> String {
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn local_terminal_links_resolve_without_workspace_or_source_file_restrictions() {
+        let cwd = Path::new("/tmp/workspace");
+        for (reference, expected) in [
+            ("../preview.html", "file:///tmp/workspace/../preview.html"),
+            ("/tmp/preview.png:9", "file:///tmp/preview.png"),
+            ("src/main.rs(42,7)", "file:///tmp/workspace/src/main.rs"),
+            (
+                "file://localhost/tmp/preview%20image.png#L2",
+                "file:///tmp/preview%20image.png",
+            ),
+            ("/tmp/preview #1.html", "file:///tmp/preview%20%231.html"),
+        ] {
+            assert_eq!(
+                local_reference_url(cwd, reference).unwrap().as_str(),
+                expected
+            );
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            assert_eq!(
+                local_reference_url(cwd, "~/Desktop/preview.png"),
+                url::Url::from_file_path(PathBuf::from(home).join("Desktop/preview.png")).ok(),
+            );
+        }
+        assert!(local_reference_url(cwd, "file://another-host/tmp/image.png").is_none());
+        assert!(local_reference_url(cwd, "file:///tmp/bad%XX.png").is_none());
+    }
 
     fn write(path: &Path, contents: impl AsRef<[u8]>) {
         if let Some(parent) = path.parent() {
