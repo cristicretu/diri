@@ -1254,12 +1254,15 @@ fn a_pending_confirmation_hides_the_row_only_once_confirmed() {
 
 #[test]
 fn prefs_round_trip_and_zoom_clamp() {
+    let missing_fields: Prefs = serde_json::from_str("{}").unwrap();
+    assert!(!missing_fields.terminal_paste_protection);
     let directory = tempdir().unwrap();
     let path = directory.path().join("nested/prefs.json");
     let prefs = Prefs {
         default_agent: AgentKind::GEMINI,
         default_spawn_host: Some("forge".to_owned()),
         terminal_font_size: 19.5,
+        terminal_paste_protection: true,
         window_placement: Some(WindowPlacement {
             display_uuid: Some("display-one".to_owned()),
             mode: WindowMode::Fullscreen,

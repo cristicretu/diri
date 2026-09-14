@@ -4601,6 +4601,14 @@ mod tests {
         use gpui::{AppContext as _, HeadlessAppContext};
         let output = std::env::var("DIRI_QOL_SCREENSHOT").expect("output path");
         let scene = std::env::var("DIRI_QOL_SCENE").unwrap_or_default();
+        let width: f32 = std::env::var("DIRI_QOL_WIDTH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(800.0);
+        let height: f32 = std::env::var("DIRI_QOL_HEIGHT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(600.0);
         let platform = gpui_platform::current_platform(true);
         let mut cx = HeadlessAppContext::with_platform(
             platform.text_system(),
@@ -4622,19 +4630,27 @@ mod tests {
         let id = session.id.clone();
         {
             let mut store = runtime.store.write().unwrap();
+            store
+                .update_preferences(|prefs| {
+                    prefs.terminal_paste_protection = true;
+                    if let Ok(theme) = std::env::var("DIRI_QOL_THEME") {
+                        prefs.terminal_theme = theme;
+                    }
+                })
+                .unwrap();
             store.upsert_session(session);
             store.select(id.clone());
         }
         let window = cx
-            .open_window(gpui::size(px(800.0), px(600.0)), |window, cx| {
+            .open_window(gpui::size(px(width), px(height)), |window, cx| {
                 cx.new(|cx| {
                     let mut pane = TerminalPane::new(runtime, tokio, window, cx);
                     pane.set_viewport(
                         TerminalViewport {
                             x: 0.0,
                             y: 0.0,
-                            width: 800.0,
-                            height: 600.0,
+                            width,
+                            height,
                         },
                         cx,
                     );
@@ -4680,7 +4696,9 @@ mod tests {
                         "paste" => {
                             pane.stage_paste_if_needed(
                                 &id,
-                                "echo first command\necho second command",
+                                &std::env::var("DIRI_QOL_PASTE").unwrap_or_else(|_| {
+                                    "echo first command\necho second command".into()
+                                }),
                                 cx,
                             );
                         }
@@ -4740,11 +4758,29 @@ mod tests {
             };
             assert!(pane.handle_qol_key(&escape, window, cx));
             assert!(pane.qol.copy_mode.is_none());
+            assert!(!pane.stage_paste_if_needed(&id, "echo one\necho two", cx));
+            assert!(pane.qol.paste.is_none());
+            pane.runtime
+                .store
+                .write()
+                .unwrap()
+                .update_preferences(|prefs| prefs.terminal_paste_protection = true)
+                .unwrap();
             assert!(!pane.stage_paste_if_needed(&id, "ordinary text", cx));
             assert!(pane.stage_paste_if_needed(&id, "echo one\necho two", cx));
             assert!(pane.qol.paste.is_some());
             assert!(pane.handle_qol_key(&escape, window, cx));
             assert!(pane.qol.paste.is_none());
+            assert!(pane.stage_paste_if_needed(&id, "echo one\necho two", cx));
+            for key in ["tab", "enter"] {
+                let event = KeyDownEvent {
+                    keystroke: Keystroke::parse(key).unwrap(),
+                    is_held: false,
+                    prefer_character_input: false,
+                };
+                assert!(pane.handle_qol_key(&event, window, cx));
+            }
+            assert!(pane.qol.paste.is_none(), "Tab then Enter cancels the paste");
             assert!(pane.stage_paste_if_needed(&id, "echo one\necho two", cx));
             pane.residents.get_mut(&id).unwrap().bracketed_paste = true;
             let enter = KeyDownEvent {

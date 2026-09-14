@@ -196,7 +196,7 @@ impl Default for Prefs {
             terminal_font_size: 13.0,
             terminal_copy_on_select: false,
             terminal_hide_pointer: true,
-            terminal_paste_protection: true,
+            terminal_paste_protection: false,
             window_placement: None,
             sidebar_visible: false,
             sidebar_width: 248.0,

@@ -27,9 +27,9 @@
   no prompt marks available.
 
 Settings → Terminal contains Copy on Selection (off by default), Hide Pointer
-While Typing (on), and Review Command Pastes (on). Paste review applies to
+While Typing (on), and Review Command Pastes (off by default). Paste review applies to
 multiline text outside bracketed paste and to control characters. Confirmed
-pastes remove unsafe control characters; ordinary bracketed Agent prompts
+pastes replace unsafe control characters with spaces; ordinary bracketed Agent prompts
 remain immediate. A reconnect or terminal mode change invalidates a pending
 paste review, so the user must paste again into the current terminal.
 
@@ -42,7 +42,17 @@ and [Herdr source at bafbc09](https://github.com/herdrdev/herdr/tree/bafbc0949dd
 Diri implements these behaviors in its Rust Engine, shared parser and GPUI client.
 
 Visual fixtures: [hover and destination preview](screenshots/terminal-qol/hover.png),
-[terminal menu](screenshots/terminal-qol/menu.png). To regenerate a scene on macOS,
+[terminal menu](screenshots/terminal-qol/menu.png), and paste review in
+[dark](screenshots/paste-review/dark.png) and
+[narrow light](screenshots/paste-review/light-narrow.png) appearances.
+To regenerate a scene on macOS,
 run the ignored `terminal_pane::tests::render_terminal_qol_screenshot` test with
 `DIRI_QOL_SCREENSHOT` set to an output PNG and `DIRI_QOL_SCENE` set to `hover`,
-`menu`, `paste`, or `copy`.
+`menu`, `paste`, or `copy`. For paste review, the fixture explicitly enables the
+opt-in setting. `DIRI_QOL_THEME`, `DIRI_QOL_WIDTH`, `DIRI_QOL_HEIGHT`, and
+`DIRI_QOL_PASTE` override the theme, window size, and clipboard text.
+
+Paste review uses a scrollable preview of up to 4,000 characters, with an explicit
+label when truncated. Enter pastes, Escape cancels, and Tab switches between
+Paste and Cancel. Saved preferences retain their value when upgrading; new
+preferences and files without the setting default to off.

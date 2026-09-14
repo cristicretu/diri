@@ -3377,7 +3377,7 @@ impl UtilitySurfaces {
                             this.persist_prefs(); cx.notify();
                         }))
                         .child(appearance_divider(colors))
-                        .child(toggle_row("Review command pastes", "Review multiline pastes when the shell has not enabled bracketed paste.", self.prefs.terminal_paste_protection, "terminal_paste_protection", colors, cx, |this,cx| {
+                        .child(toggle_row("Review command pastes", "Ask before pasting multiple lines into a shell or text with control characters.", self.prefs.terminal_paste_protection, "terminal_paste_protection", colors, cx, |this,cx| {
                             this.prefs.terminal_paste_protection = !this.prefs.terminal_paste_protection;
                             this.persist_prefs(); cx.notify();
                         })),

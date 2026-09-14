@@ -34,6 +34,7 @@ pub(super) struct PendingPaste {
     id: SessionId,
     generation: AttachmentGeneration,
     bracketed: bool,
+    cancel_selected: bool,
 }
 
 pub(super) struct CopyMode {
@@ -280,6 +281,7 @@ impl TerminalPane {
                 id: id.clone(),
                 generation: resident.attachment_generation,
                 bracketed: resident.bracketed_paste,
+                cancel_selected: false,
             });
             self.qol.copy_mode = None;
             cx.stop_propagation();
@@ -428,6 +430,19 @@ impl TerminalPane {
         if self.qol.paste.is_some() {
             match key {
                 "escape" => {
+                    self.qol.paste = None;
+                }
+                "tab" => {
+                    let paste = self.qol.paste.as_mut().expect("pending paste");
+                    paste.cancel_selected = !paste.cancel_selected;
+                }
+                "enter"
+                    if self
+                        .qol
+                        .paste
+                        .as_ref()
+                        .is_some_and(|paste| paste.cancel_selected) =>
+                {
                     self.qol.paste = None;
                 }
                 "enter" => self.confirm_terminal_paste(window, cx),
@@ -831,23 +846,182 @@ impl TerminalPane {
             overlay = overlay.child(items);
         }
         if let Some(paste) = &self.qol.paste {
-            let preview: String = paste
+            let has_controls = paste
                 .text
                 .chars()
-                .filter(|ch| !ch.is_control() || *ch == '\n' || *ch == '\t')
-                .take(300)
+                .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'));
+            let message = if has_controls {
+                "This text contains control characters. They’ll be replaced with spaces before pasting."
+            } else {
+                "This terminal may run each line as a command when you paste."
+            };
+            // Keep layout work bounded, and make any omitted content explicit.
+            let mut chars = paste.text.chars();
+            let preview: String = chars
+                .by_ref()
+                .take(4_000)
+                .map(|ch| {
+                    if ch.is_control() && !matches!(ch, '\n' | '\r' | '\t') {
+                        ' '
+                    } else {
+                        ch
+                    }
+                })
                 .collect();
-            overlay = overlay.child(div().absolute().inset_0().bg(colors.primary.alpha(0.15)).flex().items_center().justify_center()
-                .on_mouse_down(MouseButton::Left, |_,_,cx| cx.stop_propagation())
-                .child(div().w(px(360.0)).max_w_full().p(px(18.0)).rounded(px(12.0)).bg(colors.floating_surface()).shadow_md().flex().flex_col().gap(px(12.0))
-                    .child(div().text_color(colors.primary).child("Review paste"))
-                    .child(div().text_size(px(12.0)).text_color(colors.secondary).child("This paste may execute commands. Control characters will be removed."))
-                    .child(div().max_h(px(100.0)).overflow_hidden().text_size(px(11.0)).text_color(colors.secondary).child(preview))
-                    .child(div().flex().justify_end().gap(px(10.0))
-                        .child(div().id("cancel-terminal-paste").px(px(12.0)).py(px(7.0)).rounded(px(6.0)).cursor_pointer().text_color(colors.primary).child("Cancel")
-                            .on_click(cx.listener(|this,_,_,cx| { this.qol.paste=None; cx.notify(); })))
-                        .child(div().id("confirm-terminal-paste").px(px(12.0)).py(px(7.0)).rounded(px(6.0)).bg(colors.primary.alpha(0.1)).cursor_pointer().text_color(colors.primary).child("Paste")
-                            .on_click(cx.listener(|this,_,window,cx| this.confirm_terminal_paste(window,cx)))))));
+            let truncated = chars.next().is_some();
+            let viewport = self.viewport.unwrap_or_default();
+            let panel_width = (viewport.width - 40.0).clamp(0.0, 480.0);
+            let preview_height = (viewport.height - 300.0).clamp(40.0, 200.0);
+            let panel = div()
+                .id("terminal-paste-review")
+                .debug_selector(|| "terminal-paste-review".into())
+                .w(px(panel_width))
+                .max_w_full()
+                .text_color(colors.primary)
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .p(px(24.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(16.0))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .text_size(px(Typo::DISPLAY_TITLE.size))
+                                        .font_weight(Typo::DISPLAY_TITLE.weight)
+                                        .child("Paste into terminal?"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(Typo::ROW.size))
+                                        .line_height(px(20.0))
+                                        .text_color(colors.secondary)
+                                        .child(message),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .text_size(px(Typo::META.size))
+                                        .text_color(colors.secondary)
+                                        .child(if truncated {
+                                            "Clipboard preview · first 4,000 characters"
+                                        } else {
+                                            "Clipboard preview"
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .id("terminal-paste-preview")
+                                        .max_h(px(preview_height))
+                                        .overflow_y_scroll()
+                                        .p(px(12.0))
+                                        .rounded(px(Radius::ROW))
+                                        .bg(colors.primary.alpha(0.04))
+                                        .border_1()
+                                        .border_color(colors.floating_stroke())
+                                        .font_family(crate::fonts::mono_family())
+                                        .text_size(px(Typo::ROW.size))
+                                        .line_height(px(20.0))
+                                        .child(preview),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .px(px(24.0))
+                        .py(px(16.0))
+                        .border_t_1()
+                        .border_color(colors.floating_stroke())
+                        .flex()
+                        .justify_end()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .id("cancel-terminal-paste")
+                                .role(Role::Button)
+                                .border_1()
+                                .border_color(if paste.cancel_selected {
+                                    colors.secondary
+                                } else {
+                                    colors.primary.alpha(0.0)
+                                })
+                                .h(px(34.0))
+                                .px(px(12.0))
+                                .rounded(px(Radius::ROW))
+                                .flex()
+                                .items_center()
+                                .gap(px(10.0))
+                                .cursor_pointer()
+                                .text_size(px(Typo::ROW.size))
+                                .text_color(colors.primary)
+                                .hover(move |style| style.bg(colors.primary.alpha(0.06)))
+                                .active(move |style| style.bg(colors.primary.alpha(0.1)))
+                                .child("Cancel")
+                                .child(
+                                    div()
+                                        .text_size(px(Typo::META.size))
+                                        .text_color(colors.secondary)
+                                        .child("Esc"),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.qol.paste = None;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("confirm-terminal-paste")
+                                .role(Role::Button)
+                                .h(px(34.0))
+                                .px(px(14.0))
+                                .rounded(px(Radius::ROW))
+                                .flex()
+                                .items_center()
+                                .gap(px(10.0))
+                                .cursor_pointer()
+                                .text_size(px(Typo::ROW_EMPHASIZED.size))
+                                .font_weight(Typo::ROW_EMPHASIZED.weight)
+                                .bg(colors.primary)
+                                .text_color(colors.background)
+                                .hover(move |style| style.bg(colors.primary.alpha(0.88)))
+                                .active(move |style| style.bg(colors.primary.alpha(0.75)))
+                                .child("Paste")
+                                .child(
+                                    div()
+                                        .when(paste.cancel_selected, |hint| hint.invisible())
+                                        .child("↵"),
+                                )
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.confirm_terminal_paste(window, cx)
+                                })),
+                        ),
+                );
+            overlay = overlay.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .p(px(20.0))
+                    .occlude()
+                    .bg(gpui::rgba(0x00000038))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                    .child(FloatingSurface::new(colors, panel)),
+            );
         }
         overlay.into_any_element()
     }
