@@ -1,14 +1,14 @@
 //! One contextual home for session links. Status is always attached by URL.
 use super::*;
-use crate::palette_chrome::{PaletteTooltip, keycap, scroll_fades};
+use crate::palette_chrome::{PaletteTooltip, scroll_fades};
 use diri_proto::{ArtifactKind, PrCheck, PullRequestStatus, SessionArtifact};
 use diri_ui::{Icon, IconName};
 use gpui::{
-    Anchor, Animation, AnimationExt, ClickEvent, Pixels, Point, ScrollStrategy,
+    Anchor, Animation, AnimationExt, ClickEvent, FontWeight, Pixels, Point, ScrollStrategy,
     UniformListScrollHandle, anchored, canvas, deferred, ease_out_quint, point, rgba, uniform_list,
 };
 use std::{cell::Cell, rc::Rc};
-const ROW_HEIGHT: f32 = 40.0;
+const ROW_HEIGHT: f32 = 44.0;
 pub(super) struct SessionLinks {
     open: bool,
     pull_request: Option<String>,
@@ -74,27 +74,6 @@ fn pr_summary(pr: &PullRequestStatus) -> (String, gpui::Rgba) {
             )
         }),
     }
-}
-
-/// Keep the newest captured PR within one click, even before its first fetch.
-fn primary_pr(session: &SessionRecord) -> Option<(&str, Option<&PullRequestStatus>)> {
-    let statuses = session.pull_requests.as_deref().unwrap_or_default();
-    if let Some(artifact) = session
-        .artifacts
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .filter(|a| {
-            a.kind == ArtifactKind::PullRequest || statuses.iter().any(|pr| pr.url == a.url)
-        })
-        .max_by(|a, b| a.first_seen_at.0.total_cmp(&b.first_seen_at.0))
-    {
-        return Some((
-            &artifact.url,
-            statuses.iter().find(|pr| pr.url == artifact.url),
-        ));
-    }
-    statuses.last().map(|pr| (pr.url.as_str(), Some(pr)))
 }
 
 fn check_summary(pr: &PullRequestStatus) -> Option<(String, gpui::Rgba)> {
@@ -170,12 +149,7 @@ fn pr_row(pr: &PullRequestStatus) -> LinkRow {
             .clone()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| format!("Pull request #{}", pr.number)),
-        subtitle: format!(
-            "#{} · {} · {}",
-            pr.number,
-            pr_state(pr),
-            repository_name(&pr.url)
-        ),
+        subtitle: format!("#{} · {}", pr.number, repository_name(&pr.url)),
         icon: if pr.state == "MERGED" {
             IconName::Merge
         } else {
@@ -460,56 +434,6 @@ impl TerminalPane {
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let primary = primary_pr(session).map(|(url, status)| {
-            let url = url.to_owned();
-            let help = status
-                .and_then(|pr| pr.title.clone())
-                .unwrap_or_else(|| url.clone());
-            let label = pr_number(&url).map_or_else(|| "PR".into(), |n| format!("#{n}"));
-            let state = status.map(pr_state).unwrap_or("PR");
-            let tone = status.map_or(colors.secondary, |pr| match pr.state.as_str() {
-                "MERGED" => rgba(0xaf7cf7ff),
-                "CLOSED" => Ink::DANGER,
-                _ if pr.is_draft => colors.secondary,
-                _ => Ink::FRESH,
-            });
-            let icon = if state == "Merged" {
-                IconName::Merge
-            } else {
-                IconName::PullRequest
-            };
-            div()
-                .id("session-primary-pr")
-                .debug_selector(|| "session-primary-pr".into())
-                .h(px(Metrics::TOOLBAR_CONTROL_SIZE))
-                .px(px(6.0))
-                .flex_none()
-                .flex()
-                .items_center()
-                .gap(px(4.0))
-                .rounded(px(Radius::ROW))
-                .hover(move |el| el.bg(Fill::subtle(colors)))
-                .cursor_pointer()
-                .text_size(px(Typo::META.size))
-                .text_color(tone)
-                .child(Icon::new(icon, 14.0, tone))
-                .child(label)
-                .child(state)
-                .tooltip(move |_, cx| {
-                    cx.new(|_| PaletteTooltip(format!("Open on GitHub · {help}"), colors))
-                        .into()
-                })
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                    this.activate_link(
-                        &LinkAction::Open(url.clone()),
-                        event.modifiers().alt,
-                        window,
-                        cx,
-                    );
-                    cx.stop_propagation();
-                }))
-        });
         let count = link_count(session);
         let attention = active_check_attention(session);
         let help = attention.as_ref().map_or_else(
@@ -518,7 +442,7 @@ impl TerminalPane {
         );
         let open = self.session_links.open;
         let anchor = self.session_links.anchor.clone();
-        let trigger = div()
+        div()
             .relative()
             .child(
                 canvas(
@@ -577,13 +501,7 @@ impl TerminalPane {
                     cx.notify();
                 }
                 cx.stop_propagation();
-            }));
-        div()
-            .flex()
-            .items_center()
-            .gap(px(2.0))
-            .when_some(primary, |el, primary| el.child(primary))
-            .child(trigger)
+            }))
             .into_any_element()
     }
     fn render_link_row(
@@ -597,40 +515,49 @@ impl TerminalPane {
         let action = row.action.clone();
         let help = match &action {
             LinkAction::Open(url) | LinkAction::PullRequest(url) => {
-                format!("{}\n{}\n{}", row.title, row.subtitle, url)
+                format!("Open link\n{}\n{}\n{}", row.title, row.subtitle, url)
             }
             LinkAction::Account => row.subtitle.clone(),
         };
-        let icon_color = row
-            .status
-            .as_ref()
-            .map_or(colors.secondary, |(_, tone)| *tone);
         let selected = index == self.session_links.selected;
+        let metadata = div()
+            .h(px(14.0))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .text_size(px(Typo::META.size))
+            .line_height(px(14.0))
+            .text_color(colors.secondary)
+            .when(!row.subtitle.is_empty(), |el| {
+                el.child(div().min_w(px(0.0)).truncate().child(row.subtitle.clone()))
+            })
+            .when_some(row.status.clone(), |el, (label, tone)| {
+                el.when(!row.subtitle.is_empty(), |el| {
+                    el.child(div().flex_none().text_color(colors.tertiary).child("·"))
+                })
+                .child(div().flex_none().text_color(tone).child(label))
+            });
         div()
             .id(("session-link", index))
             .debug_selector(move || format!("session-link-{index}"))
             .h(px(row_height))
             .px(px(6.0))
-            .py(px(2.0))
             .child(
                 div()
                     .h_full()
                     .rounded(px(Radius::ROW))
-                    .px(px(10.0))
+                    .px(px(8.0))
                     .flex()
                     .items_center()
-                    .gap(px(6.0))
-                    .when(selected, |el| el.bg(Fill::selected(colors, true)))
-                    .hover(move |el| el.bg(Fill::subtle(colors)))
+                    .gap(px(8.0))
+                    .when(selected, |el| el.bg(Fill::subtle(colors)))
+                    .hover(move |el| el.bg(Fill::selected(colors, true)))
                     .cursor_pointer()
-                    .child(
-                        div()
-                            .w(px(28.0))
-                            .flex_none()
-                            .flex()
-                            .justify_center()
-                            .child(Icon::new(row.icon, 16.0, icon_color)),
-                    )
+                    .child(div().w(px(16.0)).flex_none().child(Icon::new(
+                        row.icon,
+                        16.0,
+                        colors.secondary,
+                    )))
                     .child(
                         div()
                             .min_w(px(0.0))
@@ -641,63 +568,64 @@ impl TerminalPane {
                             .child(
                                 div()
                                     .truncate()
-                                    .text_size(px(13.0))
+                                    .text_size(px(Typo::ROW.size))
+                                    .line_height(px(16.0))
                                     .text_color(colors.primary)
                                     .child(row.title.clone()),
                             )
-                            .when(!row.subtitle.is_empty(), |el| {
-                                el.child(
-                                    div()
-                                        .truncate()
-                                        .text_size(px(11.0))
-                                        .text_color(colors.secondary)
-                                        .child(row.subtitle.clone()),
-                                )
+                            .when(!row.subtitle.is_empty() || row.status.is_some(), |el| {
+                                el.child(metadata)
                             }),
                     )
-                    .when_some(row.status.clone(), |el, (label, tone)| {
-                        el.child(
-                            div()
-                                .flex_none()
-                                .text_size(px(11.0))
-                                .text_color(tone)
-                                .child(label),
-                        )
-                    })
-                    .when_some(row.details.clone(), |el, url| {
-                        el.child(
-                            div()
-                                .id(("session-link-details", index))
-                                .debug_selector(move || format!("session-link-details-{index}"))
-                                .size(px(26.0))
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(Radius::CHIP))
-                                .hover(move |el| el.bg(Fill::selected(colors, true)))
-                                .child(Icon::new(IconName::ChevronRight, 14.0, colors.secondary))
-                                .tooltip(move |_, cx| {
-                                    cx.new(|_| {
-                                        PaletteTooltip("Checks and discussion · →".into(), colors)
-                                    })
-                                    .into()
-                                })
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.session_links.selected = index;
-                                    this.activate_link(
-                                        &LinkAction::PullRequest(url.clone()),
-                                        false,
-                                        window,
-                                        cx,
-                                    );
-                                    cx.stop_propagation();
-                                })),
-                        )
-                    })
-                    .when(row.details.is_none(), |el| {
-                        el.child(Icon::new(IconName::ExternalLink, 14.0, colors.tertiary))
-                    }),
+                    .child(
+                        div()
+                            .w(px(24.0))
+                            .flex_none()
+                            .flex()
+                            .justify_center()
+                            .when_some(row.details.clone(), |el, url| {
+                                el.child(
+                                    div()
+                                        .id(("session-link-details", index))
+                                        .debug_selector(move || {
+                                            format!("session-link-details-{index}")
+                                        })
+                                        .size(px(24.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(Radius::CHIP))
+                                        .hover(move |el| el.bg(Fill::selected(colors, true)))
+                                        .child(Icon::new(
+                                            IconName::ChevronRight,
+                                            12.0,
+                                            colors.secondary,
+                                        ))
+                                        .tooltip(move |_, cx| {
+                                            cx.new(|_| {
+                                                PaletteTooltip(
+                                                    "Checks and discussion · →".into(),
+                                                    colors,
+                                                )
+                                            })
+                                            .into()
+                                        })
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.session_links.selected = index;
+                                            this.activate_link(
+                                                &LinkAction::PullRequest(url.clone()),
+                                                false,
+                                                window,
+                                                cx,
+                                            );
+                                            cx.stop_propagation();
+                                        })),
+                                )
+                            })
+                            .when(row.details.is_none(), |el| {
+                                el.child(Icon::new(IconName::ExternalLink, 12.0, colors.tertiary))
+                            }),
+                    ),
             )
             .tooltip(move |_, cx| cx.new(|_| PaletteTooltip(help.clone(), colors)).into())
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
@@ -751,62 +679,72 @@ impl TerminalPane {
             || "Links".into(),
             |pr| format!("Pull request #{}", pr.number),
         );
-        let header =
-            div()
-                .h(px(36.0))
-                .px(px(16.0))
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .child(div().w(px(28.0)).flex_none().flex().justify_center().child(
-                    if pr.is_some() {
-                        div()
-                            .id("session-links-back")
-                            .debug_selector(|| "session-links-back".into())
-                            .size(px(28.0))
-                            .rounded(px(Radius::ROW))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .hover(move |el| el.bg(Fill::subtle(colors)))
-                            .child(Icon::new(IconName::ChevronLeft, 16.0, colors.secondary))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.links_back(cx);
-                                cx.stop_propagation();
-                            }))
-                            .into_any_element()
-                    } else {
-                        Icon::new(IconName::ExternalLink, 16.0, colors.secondary).into_any_element()
-                    },
-                ))
-                .child(
+        let header = div()
+            .h(px(34.0))
+            .pl(px(14.0))
+            .pr(px(14.0))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .when(pr.is_some(), |el| {
+                el.child(
                     div()
-                        .min_w(px(0.0))
-                        .flex_1()
-                        .truncate()
-                        .text_size(px(13.0))
-                        .text_color(colors.primary)
-                        .child(title),
-                )
-                .child(
-                    keycap(colors)
-                        .id("session-links-close")
+                        .id("session-links-back")
+                        .debug_selector(|| "session-links-back".into())
+                        .size(px(20.0))
+                        .rounded(px(Radius::CHIP))
+                        .flex()
+                        .items_center()
+                        .justify_center()
                         .cursor_pointer()
-                        .child("esc")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.close_session_links(window, cx);
+                        .hover(move |el| el.bg(Fill::subtle(colors)))
+                        .child(Icon::new(IconName::ChevronLeft, 12.0, colors.secondary))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.links_back(cx);
                             cx.stop_propagation();
                         })),
-                );
-        let row_height = if pr.is_some() { 40.0 } else { ROW_HEIGHT };
+                )
+            })
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .flex_1()
+                    .truncate()
+                    .text_size(px(Typo::META.size))
+                    .line_height(px(14.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(colors.secondary)
+                    .child(title),
+            )
+            .child(
+                div()
+                    .id("session-links-close")
+                    .size(px(24.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(Radius::CHIP))
+                    .cursor_pointer()
+                    .hover(move |el| el.bg(Fill::subtle(colors)))
+                    .child(Icon::new(IconName::Close, 12.0, colors.tertiary))
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| PaletteTooltip("Close · Esc".into(), colors))
+                            .into()
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.close_session_links(window, cx);
+                        cx.stop_propagation();
+                    })),
+            );
+        let row_height = ROW_HEIGHT;
         let list_height = (row_count as f32 * row_height)
             .min(364.0)
             .min((f32::from(window.viewport_size().height) - 230.0).max(ROW_HEIGHT));
         let body = if rows.is_empty() {
             div()
-                .px(px(20.0))
-                .pb(px(18.0))
+                .px(px(14.0))
+                .pt(px(6.0))
+                .pb(px(14.0))
                 .text_size(px(13.0))
                 .text_color(colors.secondary)
                 .child("Links shared in this chat appear here.")
@@ -858,6 +796,8 @@ impl TerminalPane {
             .into_any_element()
         };
         let mut content = div()
+            .font_weight(FontWeight::NORMAL)
+            .line_height(px(16.0))
             .flex()
             .flex_col()
             .child(header)
@@ -869,14 +809,13 @@ impl TerminalPane {
                 .map(|host| self.runtime.store.read().unwrap().host_display_name(host));
             if session.git_branch.is_some() || host.is_some() || session.account_profile.is_some() {
                 let mut context = div()
-                    .mx(px(16.0))
-                    .pt(px(8.0))
-                    .pb(px(10.0))
+                    .mx(px(14.0))
+                    .py(px(10.0))
                     .border_t_1()
                     .border_color(colors.floating_stroke())
                     .flex()
                     .flex_col()
-                    .gap(px(8.0));
+                    .gap(px(6.0));
                 for (context_index, (icon, label, value)) in [
                     (IconName::Branch, "Branch", session.git_branch.clone()),
                     (IconName::Server, "Running on", host),
@@ -890,28 +829,29 @@ impl TerminalPane {
                                 .id(("session-links-context", context_index))
                                 .flex()
                                 .items_center()
-                                .gap(px(6.0))
+                                .gap(px(8.0))
                                 .text_size(px(11.0))
+                                .line_height(px(14.0))
                                 .text_color(colors.secondary)
                                 .child(
                                     div()
-                                        .w(px(28.0))
+                                        .w(px(16.0))
                                         .flex_none()
                                         .flex()
                                         .justify_center()
                                         .child(Icon::new(icon, 14.0, colors.tertiary)),
                                 )
-                                .child(label)
                                 .child(
                                     div()
                                         .min_w(px(0.0))
                                         .flex_1()
                                         .truncate()
-                                        .text_color(colors.primary)
+                                        .text_color(colors.secondary)
                                         .child(value.clone()),
                                 )
                                 .tooltip(move |_, cx| {
-                                    cx.new(|_| PaletteTooltip(value.clone(), colors)).into()
+                                    cx.new(|_| PaletteTooltip(format!("{label} · {value}"), colors))
+                                        .into()
                                 }),
                         );
                     }
@@ -928,16 +868,16 @@ impl TerminalPane {
                             .hover(move |el| el.bg(Fill::subtle(colors)))
                             .flex()
                             .items_center()
-                            .gap(px(6.0))
+                            .gap(px(8.0))
                             .text_size(px(11.0))
+                            .line_height(px(14.0))
                             .text_color(colors.secondary)
                             .cursor_pointer()
-                            .child(div().w(px(28.0)).flex().justify_center().child(Icon::new(
+                            .child(div().w(px(16.0)).flex().justify_center().child(Icon::new(
                                 IconName::Account,
                                 14.0,
                                 colors.tertiary,
                             )))
-                            .child("Account")
                             .child(
                                 div()
                                     .flex_1()
@@ -1225,20 +1165,14 @@ mod tests {
         assert!(!pane.read_with(cx, |pane, _| pane.session_links.open));
     }
     #[gpui::test]
-    fn primary_pr_and_menu_rows_open_github_in_one_click(cx: &mut TestAppContext) {
+    fn menu_rows_open_github_directly_without_a_toolbar_pr(cx: &mut TestAppContext) {
         cx.update(|cx| cx.set_reduce_motion(true));
         let (runtime, tokio) = runtime(fixture());
         let (pane, cx) =
             cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
         cx.simulate_resize(size(px(900.0), px(700.0)));
         cx.run_until_parked();
-        let position = cx.debug_bounds("session-primary-pr").unwrap().center();
-        cx.simulate_click(position, Modifiers::default());
-        assert_eq!(
-            cx.opened_url().as_deref(),
-            Some("https://github.com/diri/app/pull/180")
-        );
-        assert!(!pane.read_with(cx, |p, _| p.session_links.open));
+        assert!(cx.debug_bounds("session-primary-pr").is_none());
         let trigger = cx.debug_bounds("session-links-trigger").unwrap().center();
         cx.simulate_click(trigger, Modifiers::default());
         cx.run_until_parked();
@@ -1388,8 +1322,13 @@ mod tests {
                 .update_preferences(|prefs| prefs.terminal_theme = "dirijor-light".into())
                 .unwrap();
         }
+        let width = if std::env::var_os("DIRI_VISUAL_NARROW").is_some() {
+            340.0
+        } else {
+            900.0
+        };
         let window = cx
-            .open_window(size(px(900.0), px(560.0)), move |window, cx| {
+            .open_window(size(px(width), px(560.0)), move |window, cx| {
                 cx.new(|cx| {
                     let mut pane = TerminalPane::new(runtime, tokio, window, cx);
                     pane.session_links.open = true;
