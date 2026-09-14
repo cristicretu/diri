@@ -108,3 +108,21 @@ clean full-workspace test run is not claimed for this change.
 
 The rebuilt application must be run for the changes to take effect. Live user
 session records are not edited directly.
+
+## First-message capture before idle detection
+
+The 0.7.3 follow-up exposed a separate gap: terminal attachment input passed
+through an idle-only prompt collector, while Diri's send-text API captured its
+title directly. A first message submitted before an idle screen observation,
+or across a repaint to Working, could therefore leave the sidebar Untitled.
+The affected local Codex sessions had no completion-supplied thread ID and
+their OSC stream contained only the cwd and pending-name labels, so neither
+other title source could recover the name during that first turn.
+
+The collector now accepts composer input in Starting, Idle and Working.
+Permission/question responses clear its draft and do not become titles. The
+regressions use actual Session terminal writes, including bracketed paste,
+individual keystrokes and a status change before Enter, then inspect the
+Registry projection used by the sidebar. The startup regression failed before
+the change and passed afterward. Previously missed input is not reconstructed;
+existing sessions can still recover through their native completion metadata.

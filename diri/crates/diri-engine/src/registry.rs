@@ -2970,6 +2970,45 @@ mod tests {
     }
 
     #[test]
+    fn codex_terminal_input_names_a_session_before_the_first_idle_observation() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        let mut record = record("terminal-input-title");
+        record.kind = AgentKind::CODEX;
+        registry
+            .spawn(
+                SessionSpec {
+                    id: "terminal-input-title".into(),
+                    pty: crate::PtySpec::new(
+                        vec![
+                            "/bin/sh".into(),
+                            "-c".into(),
+                            "read -r prompt; read -r done".into(),
+                        ],
+                        "/tmp",
+                    ),
+                    manifest_id: "codex".into(),
+                    authority: crate::Authority::ScreenPrimary,
+                    logs_dir: temp.path().join("logs"),
+                    holder: None,
+                    remote: None,
+                    defer_launch: false,
+                },
+                record,
+            )
+            .unwrap();
+        let session = &registry.sessions["terminal-input-title"];
+        assert_eq!(session.status(), SessionStatus::Starting);
+        session
+            .write_input(b"\x1b[200~Fix chat naming\x1b[201~")
+            .unwrap();
+        session.write_input(b"\r").unwrap();
+        let record = registry.record("terminal-input-title").unwrap();
+        assert_eq!(record.title, "Fix chat naming");
+        assert_eq!(record.title_source, TitleSource::FirstPrompt);
+    }
+
+    #[test]
     fn codex_pty_names_update_even_after_the_first_prompt_was_captured() {
         let temp = tempfile::tempdir().unwrap();
         let mut registry = Registry::new(engine(), temp.path().join("state.json"));

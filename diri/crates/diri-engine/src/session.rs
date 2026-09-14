@@ -1622,18 +1622,21 @@ impl Session {
         }
         if !matches!(
             *self.shared.status.lock().expect("status"),
-            SessionStatus::Idle
+            SessionStatus::Starting | SessionStatus::Idle | SessionStatus::Working
         ) {
-            if matches!(bytes, b"\r" | b"\n") {
-                self.shared
-                    .prompt_input
-                    .lock()
-                    .expect("prompt input")
-                    .draft
-                    .clear();
-            }
+            // Dialog responses are not conversation names. Drop any partial
+            // composer draft too, so it cannot leak across a permission flow.
+            self.shared
+                .prompt_input
+                .lock()
+                .expect("prompt input")
+                .draft
+                .clear();
             return;
         }
+        // Screen classification trails input: Codex can accept its first
+        // prompt while we still report Starting, or repaint Working before
+        // the submit arrives. Neither state should discard composer text.
         let prompt = self
             .shared
             .prompt_input
@@ -3534,7 +3537,67 @@ pub fn authority_for(manifest_id: &str, engine: &ManifestEngine) -> Authority {
 
 #[cfg(test)]
 mod prompt_title_tests {
-    use super::PromptInputState;
+    use super::*;
+
+    #[test]
+    fn terminal_prompt_capture_survives_screen_timing_but_ignores_dialog_answers() {
+        let temp = tempfile::tempdir().unwrap();
+        let (engine, _) = ManifestEngine::load_dir(&crate::detect::bundled_manifest_dir()).unwrap();
+        let engine = Arc::new(engine);
+        for (index, initial) in [
+            SessionStatus::Starting,
+            SessionStatus::Idle,
+            SessionStatus::Working,
+            SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Permission),
+            SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Question),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let spec = SessionSpec {
+                id: format!("prompt-{index}"),
+                pty: PtySpec::new(vec!["/bin/sh".into()], "/tmp"),
+                manifest_id: "codex".into(),
+                authority: Authority::ScreenPrimary,
+                logs_dir: temp.path().to_path_buf(),
+                holder: None,
+                remote: None,
+                defer_launch: true,
+            };
+            // Keep the real Session input/reducer path, but hold input in the
+            // pre-launch queue so a PTY pump cannot race our status timeline.
+            let session = Session {
+                shared: new_shared(
+                    &spec,
+                    OutputLog::writer(temp.path(), &spec.id).unwrap(),
+                    &engine,
+                    true,
+                ),
+                transport: Transport::Held(HolderClient::new(temp.path().join("unused.sock"))),
+                pump: None,
+                manifest_id: spec.manifest_id.clone(),
+                deferred: Some(Arc::new(DeferredLaunch::new())),
+            };
+            *session.shared.status.lock().unwrap() = initial.clone();
+            for byte in b"Fix chat naming" {
+                session.write_input(&[*byte]).unwrap();
+            }
+            // A screen repaint can change the status between typing and Enter.
+            *session.shared.status.lock().unwrap() = SessionStatus::Working;
+            session.write_input(b"\r").unwrap();
+            if matches!(initial, SessionStatus::NeedsInput(_)) {
+                assert_eq!(session.view().title, None);
+                session.write_input(b"Real conversation prompt").unwrap();
+                session.write_input(b"\r").unwrap();
+                assert_eq!(
+                    session.view().title.as_deref(),
+                    Some("Real conversation prompt")
+                );
+            } else {
+                assert_eq!(session.view().title.as_deref(), Some("Fix chat naming"));
+            }
+        }
+    }
 
     #[test]
     fn committed_utf8_prompt_becomes_a_title_candidate() {
