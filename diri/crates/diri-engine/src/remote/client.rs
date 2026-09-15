@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 use diri_proto::frames::Frame;
 use diri_proto::remote_pty::{
     Hello, HelloAck, PHASE_ONE_HOLDER_CAPABILITIES, ProtocolVersion, RemoteCodec, RemoteMessage,
-    RemoteRole, ScrollbackRequest, ScrollbackResponse, SessionInspection, SessionSelector,
-    SessionToken, Signal, validate_terminal_dimensions,
+    RemoteProcessState, RemoteRole, ScrollbackRequest, ScrollbackResponse, SessionInspection,
+    SessionSelector, SessionToken, Signal, validate_terminal_dimensions,
 };
 
 use super::binding::RemoteBindingStore;
@@ -61,6 +61,9 @@ pub struct RemoteSessionClient {
     incarnation: String,
     checkpoint: diri_pty::checkpoint::CheckpointWriter<u64>,
     writer: Mutex<WriterState>,
+    reconnect_pid: AtomicU64,
+    accepted_controller_epoch: AtomicU64,
+    reconnect_epoch_floor: AtomicU64,
     observed_output_offset: AtomicU64,
     scheduled_output_offset: AtomicU64,
     next_request_id: AtomicU64,
@@ -100,6 +103,9 @@ impl RemoteSessionClient {
             incarnation,
             checkpoint,
             writer: Mutex::new(WriterState::default()),
+            reconnect_pid: AtomicU64::new(0),
+            accepted_controller_epoch: AtomicU64::new(0),
+            reconnect_epoch_floor: AtomicU64::new(0),
             observed_output_offset: AtomicU64::new(initial_output_offset),
             scheduled_output_offset: AtomicU64::new(initial_output_offset),
             next_request_id: AtomicU64::new(1),
@@ -107,7 +113,7 @@ impl RemoteSessionClient {
         })
     }
 
-    /// Permanently rejects further transport writes until explicit re-adoption.
+    /// Rejects further transport writes until explicit identity-checked recovery.
     /// Clearing queues ensures an uncertain operation can never be replayed.
     pub(crate) fn fail_closed(&self) {
         fail_writer(&mut self.writer.lock().expect("remote writer"));
@@ -115,6 +121,44 @@ impl RemoteSessionClient {
             .lock()
             .expect("scrollback requests")
             .clear();
+    }
+
+    /// Explicit recovery only, after the previous pump has joined. Old input,
+    /// resize, controller epochs and partial writes never cross this boundary.
+    pub(crate) fn restart_failed(&self, pid: u32) -> io::Result<()> {
+        let mut writer = self.writer.lock().expect("remote writer");
+        let next_epoch = self
+            .accepted_controller_epoch
+            .load(Ordering::SeqCst)
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("remote controller epoch exhausted"))?;
+        restart_failed_writer(&mut writer)?;
+        self.reconnect_epoch_floor
+            .store(next_epoch, Ordering::SeqCst);
+        self.reconnect_pid.store(u64::from(pid), Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub(crate) fn inspect_for_reconnect(&self, expected_pid: i32) -> io::Result<SessionInspection> {
+        let inspection = self.manager.inspect_for_reconnect(
+            &self.helper,
+            &SessionSelector {
+                session_id: self.session_id.clone(),
+                session_token: self.token.clone(),
+                expected_incarnation: Some(self.incarnation.clone()),
+            },
+        )?;
+        if inspection.session_id != self.session_id
+            || inspection.session_incarnation != self.incarnation
+            || inspection.holder_build_id != self.helper.build_id
+            || matches!(inspection.process_state, RemoteProcessState::Running { pid } if expected_pid > 0 && pid != expected_pid as u32)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "remote reconnect identity does not match the preserved session",
+            ));
+        }
+        Ok(inspection)
     }
 
     pub fn connect(
@@ -225,6 +269,8 @@ impl RemoteSessionClient {
         let mut writer = self.writer.lock().expect("remote writer");
         require_generation(&writer, generation)?;
         writer.controller_epoch = Some(epoch);
+        self.accepted_controller_epoch
+            .fetch_max(epoch, Ordering::SeqCst);
         writer.control_granted = false;
         Ok(())
     }
@@ -238,6 +284,20 @@ impl RemoteSessionClient {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "remote HelloAck identity, build, or protocol does not match",
+            ));
+        }
+        if acknowledgement.controller_epoch < self.reconnect_epoch_floor.load(Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "remote reconnect controller epoch did not advance",
+            ));
+        }
+        let expected_pid = self.reconnect_pid.load(Ordering::SeqCst);
+        if matches!(acknowledgement.process_state, RemoteProcessState::Running { pid } if expected_pid != 0 && u64::from(pid) != expected_pid)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "remote process identity changed after reconnect inspection",
             ));
         }
         if REQUIRED_CAPABILITIES
@@ -681,6 +741,18 @@ fn ensure_available(writer: &WriterState) -> io::Result<()> {
     }
 }
 
+fn restart_failed_writer(writer: &mut WriterState) -> io::Result<()> {
+    if !writer.failed {
+        return Err(io::Error::other("remote transport is not failed"));
+    }
+    let generation = writer.generation;
+    *writer = WriterState {
+        generation,
+        ..WriterState::default()
+    };
+    Ok(())
+}
+
 fn fail_writer(writer: &mut WriterState) {
     writer.failed = true;
     terminate_current(writer);
@@ -920,5 +992,35 @@ mod tests {
         terminate_current(&mut writer);
         assert!(!writer.uncertain_effect);
         assert_eq!(writer.queued_input, b"safe");
+    }
+    #[test]
+    fn explicit_restart_discards_uncertain_effects_and_revokes_the_old_writer() {
+        let (mut writer, _output) = pipe_writer();
+        let generation = writer.generation;
+        write_message(
+            &mut writer,
+            &RemoteMessage::Terminal(Frame::input(vec![b'x'; 128 * 1024])),
+        )
+        .unwrap();
+        assert!(writer.pending.front().unwrap().written > 0);
+        writer
+            .queued_input
+            .extend_from_slice(b"never replay later input");
+        writer.queued_resize = Some((132, 42));
+        fail_writer(&mut writer);
+        assert!(writer.uncertain_effect);
+        assert!(queue_input(&mut writer, b"rejected until recovery").is_err());
+        restart_failed_writer(&mut writer).unwrap();
+        assert!(writer.pending.is_empty());
+        assert!(writer.queued_input.is_empty());
+        assert!(writer.queued_resize.is_none());
+        assert_eq!(writer.pending_bytes, 0);
+        assert!(!writer.uncertain_effect);
+        assert!(!writer.control_granted);
+        assert!(require_generation(&writer, generation).is_err());
+        assert!(
+            restart_failed_writer(&mut writer).is_err(),
+            "live transport cannot be reset"
+        );
     }
 }

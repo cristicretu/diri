@@ -630,6 +630,21 @@ impl Registry {
         Arc::clone(&self.engine)
     }
 
+    pub(crate) fn reconnect_remote(
+        &mut self,
+        id: &str,
+        owner: &crate::session::RemoteReconnect,
+        inspected: diri_proto::remote_pty::RemoteProcessState,
+    ) -> std::io::Result<(bool, bool)> {
+        let session = self.sessions.get_mut(id).ok_or_else(|| not_found(id))?;
+        if !owner.matches(session) {
+            return Err(std::io::Error::other(
+                "session owner changed during reconnect",
+            ));
+        }
+        session.restart_failed_remote(Arc::clone(&self.engine), inspected)
+    }
+
     pub fn get(&self, id: &str) -> Option<&Session> {
         self.sessions.get(id)
     }
