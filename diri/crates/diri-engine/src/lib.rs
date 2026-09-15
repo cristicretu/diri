@@ -45,6 +45,7 @@ pub mod local_path;
 pub mod log;
 pub mod migrate;
 pub mod pr_monitor;
+mod preview_mux;
 pub mod pty;
 pub mod registry;
 pub mod remote;

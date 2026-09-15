@@ -15,10 +15,13 @@ impl SessionSurfaces {
             .iter()
             .filter_map(|id| {
                 self.live_previews
-                    .get(id)
-                    .map(|preview| (id.clone(), preview.element.clone()))
+                    .get(id.session()?)
+                    .map(|preview| (id.session().unwrap().clone(), preview.element.clone()))
             })
             .collect();
+        self.closing_previews
+            .extend(self.workspace_previews.elements());
+        self.workspace_previews.clear();
         self.live_previews.clear();
         self.peek
             .animate_to(0.0, cx.background_executor().now(), cx.reduce_motion());
@@ -26,8 +29,10 @@ impl SessionSurfaces {
 
     pub(crate) fn cancel_tab_peek_immediately(&mut self, cx: &mut Context<Self>) {
         self.peek.dismiss();
+        self.workspace_previews.clear();
         self.live_previews.clear();
         self.closing_previews.clear();
+        self.workspace_preview_views.clear();
         cx.notify();
     }
 
@@ -77,12 +82,34 @@ impl SessionSurfaces {
             if store.overview_state().is_visible() || store.switcher_state().is_visible() {
                 return;
             }
-            let selected = store.selected_session_id().cloned();
-            let sessions = crate::tab_navigation::selected_project_tabs(&mut store)
-                .sessions
-                .iter()
-                .map(|session| session.id.clone())
-                .collect();
+            let (sessions, selected) = if let Some(workspace_id) = &self.peek_workspace {
+                let workspace = store.workspace_catalog().snapshot().and_then(|snapshot| {
+                    snapshot
+                        .workspaces
+                        .iter()
+                        .find(|workspace| &workspace.id == workspace_id)
+                });
+                workspace
+                    .map(|workspace| {
+                        (
+                            workspace
+                                .tabs
+                                .iter()
+                                .map(|tab| PeekItem::Tab(tab.id.clone()))
+                                .collect(),
+                            workspace.selected_tab.clone().map(PeekItem::Tab),
+                        )
+                    })
+                    .unwrap_or_default()
+            } else {
+                let selected = store.selected_session_id().cloned().map(PeekItem::Session);
+                let sessions = crate::tab_navigation::selected_project_tabs(&mut store)
+                    .sessions
+                    .iter()
+                    .map(|session| PeekItem::Session(session.id.clone()))
+                    .collect();
+                (sessions, selected)
+            };
             self.peek.begin(sessions, selected.as_ref());
             self.peek_scroll.set_offset(point(px(0.0), px(0.0)));
         }
@@ -107,16 +134,30 @@ impl SessionSurfaces {
             cx.notify();
         }
     }
-    fn commit_tab_peek(&mut self, id: SessionId, cx: &mut Context<Self>) {
+    pub(super) fn commit_tab_peek(&mut self, id: PeekItem, cx: &mut Context<Self>) {
         if !self.peek.visible() {
             return;
         }
         let mut store = self.store.write().unwrap();
-        let activate = store.sessions().get(&id).is_some();
-        if activate {
-            store.select(id);
-        }
+        let workspace_selection = matches!(id, PeekItem::Tab(_));
+        let activate = match id {
+            PeekItem::Session(id) if store.sessions().contains_key(&id) => {
+                store.select(id);
+                true
+            }
+            PeekItem::Tab(tab_id) => self.peek_workspace.clone().is_some_and(|workspace_id| {
+                store.edit_workspace(diri_proto::workspace::WorkspaceMutation::SelectTab {
+                    workspace_id,
+                    tab_id,
+                })
+            }),
+            _ => false,
+        };
         drop(store);
+        if workspace_selection && !activate {
+            cx.notify();
+            return;
+        }
         self.dismiss_tab_peek(cx);
         if activate {
             cx.emit(TabPeekActivated);
@@ -193,6 +234,9 @@ impl SessionSurfaces {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if self.peek_workspace.is_some() {
+            return self.render_saved_tab_peek(window, cx);
+        }
         let colors = self.colors();
         let reduced = cx.reduce_motion();
         let width = if self.peek_width > 0.0 {
@@ -201,15 +245,15 @@ impl SessionSurfaces {
             f32::from(window.viewport_size().width)
         };
         let height = (f32::from(window.viewport_size().height) - self.peek_top).max(0.0);
-        let blend = self.peek.overview();
         let mut body = div().id("tab-peek-cards").relative().w_full().min_h_full();
         let sessions: Vec<_> = {
             let store = self.store.read().unwrap();
             let focused = self.peek.selected();
             let previous_count = self.peek.sessions.len();
-            self.peek
-                .sessions
-                .retain(|id| store.sessions().get(id).is_some());
+            self.peek.sessions.retain(|id| {
+                id.session()
+                    .is_some_and(|id| store.sessions().contains_key(id))
+            });
             if self.peek.sessions.len() != previous_count {
                 cx.notify();
             }
@@ -229,7 +273,11 @@ impl SessionSurfaces {
             self.peek
                 .sessions
                 .iter()
-                .filter_map(|id| store.sessions().get(id).cloned())
+                .filter_map(|id| {
+                    id.session()
+                        .and_then(|id| store.sessions().get(id))
+                        .cloned()
+                })
                 .collect()
         };
         let visible = visible_card_indices(
@@ -250,7 +298,7 @@ impl SessionSurfaces {
             .map(|session| session.id.clone())
             .collect();
         let focused = self.peek.selected();
-        wanted.sort_by_key(|id| Some(id) != focused.as_ref());
+        wanted.sort_by_key(|id| Some(id) != focused.as_ref().and_then(PeekItem::session));
         if let Some(runtime) = &self.tokio {
             let socket = self.client.socket_path().to_path_buf();
             self.live_previews.sync(wanted, |id| {
@@ -388,18 +436,32 @@ impl SessionSurfaces {
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if this.peek.visible() {
-                            this.commit_tab_peek(id.clone(), cx);
+                            this.commit_tab_peek(PeekItem::Session(id.clone()), cx);
                             cx.stop_propagation();
                         }
                     })),
             );
         }
-        body = body
-            .h(px(content_height))
-            .when(self.peek.is_closing(), |body| {
+        self.render_peek_frame(body.into_any_element(), content_height, width, height, cx)
+    }
+    pub(super) fn render_peek_frame(
+        &mut self,
+        content: AnyElement,
+        content_height: f32,
+        width: f32,
+        height: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = self.colors();
+        let reduced = cx.reduce_motion();
+        let blend = self.peek.overview();
+        let body = div().relative().child(content).h(px(content_height)).when(
+            self.peek.is_closing(),
+            |body| {
                 // Preserve the last scrolled pose after scroll interaction is disabled.
                 body.top(self.peek_scroll.offset().y)
-            });
+            },
+        );
         div()
             .id("tab-peek")
             .debug_selector(|| "TAB_PEEK".into())

@@ -1,5 +1,6 @@
 mod filter;
 mod tabs;
+mod workspaces;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -126,6 +127,8 @@ enum HorizontalFocusAction {
 
 #[derive(Clone, Debug)]
 pub(crate) enum SidebarEvent {
+    WorkspaceActivated(Option<diri_proto::workspace::WorkspaceId>),
+    WorkspaceTabActivated,
     RefreshUsageLimits,
     ContinueAccount(SessionId),
     VisibilityChanged,
@@ -230,6 +233,7 @@ impl Render for DragPreview {
 }
 
 pub struct Sidebar {
+    workspace_nav: workspaces::WorkspaceNavigation,
     store: Arc<RwLock<SessionStore>>,
     // Preview stores have no daemon adapter, so retain their effect receiver.
     _preview_effects: Option<mpsc::UnboundedReceiver<StoreEffect>>,
@@ -345,10 +349,14 @@ impl Sidebar {
                 None,
             )
         };
-        let (width, visible) = {
+        let (width, visible, active_workspace) = {
             let store = store.read().expect("session store lock poisoned");
             let prefs = store.preferences();
-            (prefs.sidebar_width, prefs.sidebar_visible)
+            (
+                prefs.sidebar_width,
+                prefs.sidebar_visible,
+                prefs.active_workspace.clone(),
+            )
         };
         let store_changes = runtime.map(|runtime| {
             let mut changes = runtime.changes();
@@ -387,6 +395,7 @@ impl Sidebar {
             tab_scroll: ScrollHandle::new(),
             last_tab_selection: None,
             last_tab_available_width: 0.0,
+            workspace_nav: workspaces::WorkspaceNavigation::new(cx, active_workspace),
             filter_query: Default::default(),
             filter_open: false,
             filter_focus: cx.focus_handle(),
@@ -1156,6 +1165,23 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.workspace_key(event, window, cx) {
+            return;
+        }
+        if self.workspace_nav.active.is_some() && self.focus_handle.is_focused(window) {
+            match event.keystroke.key.as_str() {
+                "up" => {
+                    self.relative_workspace_tab(-1, cx);
+                }
+                "down" => {
+                    self.relative_workspace_tab(1, cx);
+                }
+                "enter" | "escape" => cx.emit(SidebarEvent::WorkspaceTabActivated),
+                _ => return,
+            }
+            cx.stop_propagation();
+            return;
+        }
         if self.filter_focus.is_focused(window) && self.handle_filter_key(event, window, cx) {
             return;
         }
@@ -6022,12 +6048,15 @@ impl Sidebar {
     /// Keyboard equivalent for row-to-row drag: first invocation marks the
     /// selected source; after focus moves, the next opens the same proposal.
     pub fn mark_or_delegate_selected(&mut self, cx: &mut Context<Self>) -> bool {
-        let selected = self
-            .store
-            .read()
-            .expect("session store lock poisoned")
-            .selected_session_id()
-            .cloned();
+        let selected = if self.workspace_nav.active.is_some() {
+            self.workspace_focused_session()
+        } else {
+            self.store
+                .read()
+                .expect("session store lock poisoned")
+                .selected_session_id()
+                .cloned()
+        };
         let Some(target) = selected else {
             self.ui.delegation_notice = Some("Select a session first.".to_owned());
             cx.notify();
@@ -6134,6 +6163,9 @@ impl Sidebar {
     /// Selects the nth session (⌘1–⌘9 order, matching the row hints) and
     /// reports whether a session existed at that index.
     pub fn select_shortcut(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
+        if self.workspace_nav.active.is_some() {
+            return self.select_workspace_tab(index, cx);
+        }
         self.commit_rename();
         let id = {
             let mut store = self.store.write().expect("session store lock poisoned");
@@ -6157,6 +6189,13 @@ impl Sidebar {
     /// Selects the last session in sidebar order (⌘9, matching the browser
     /// convention where the last digit jumps to the final tab).
     pub fn select_last(&mut self, cx: &mut Context<Self>) -> bool {
+        if let Some(workspace) = self.workspace_record() {
+            return workspace
+                .tabs
+                .len()
+                .checked_sub(1)
+                .is_some_and(|index| self.select_workspace_tab(index, cx));
+        }
         let count = self
             .navigation_sessions(&mut self.store.write().expect("store"))
             .len();
@@ -6170,6 +6209,9 @@ impl Sidebar {
     /// ⌘←/⌘→), wrapping at both ends. Returns false when there are no
     /// sessions to move between.
     pub fn select_relative(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
+        if self.workspace_nav.active.is_some() {
+            return self.relative_workspace_tab(delta, cx);
+        }
         self.commit_rename();
         {
             let mut store = self.store.write().expect("session store lock poisoned");
@@ -6241,6 +6283,9 @@ impl Sidebar {
     /// other project, and one that crossed levels would silently re-parent a
     /// session, which is the daemon's call to make, not a keystroke's.
     pub fn reorder_selected(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
+        if self.workspace_nav.active.is_some() {
+            return self.reorder_workspace_tab(delta, cx);
+        }
         self.commit_rename();
         if self
             .store
@@ -6309,6 +6354,9 @@ impl Sidebar {
     /// ⌘R: start renaming the selected row inline, the same edit the context
     /// menu's "Rename…" opens. Returns false when nothing is selected.
     pub fn rename_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.workspace_nav.active.is_some() {
+            return self.rename_workspace_tab(window, cx);
+        }
         let selected = self
             .store
             .read()
@@ -6325,6 +6373,14 @@ impl Sidebar {
     /// ⌘⇧W: archive the selected session, where ⌘W removes it from the
     /// sidebar. Returns false when nothing is selected.
     pub fn archive_selected(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.workspace_nav.active.is_some() {
+            if let Some(id) = self.workspace_focused_session() {
+                self.archive_sessions(vec![id]);
+                cx.notify();
+                return true;
+            }
+            return false;
+        }
         let selected = self
             .store
             .read()
@@ -6345,6 +6401,9 @@ impl Sidebar {
     /// false when nothing is selected so ⌘W falls through to closing the
     /// window.
     pub fn close_selected_now(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.workspace_nav.active.is_some() {
+            return self.remove_workspace_tab(cx);
+        }
         let selected = self
             .store
             .read()
@@ -6651,6 +6710,7 @@ fn reveal_tracked_row(
 
 impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.reconcile_workspace_navigation(cx);
         self.working_row_rendered = false;
         self.disclosure_animating = false;
         if cx.reduce_motion() {
@@ -6866,6 +6926,8 @@ impl Render for Sidebar {
             .child(self.top_bar(colors, cx));
         if let Some(nav) = self.settings_nav.clone() {
             root = root.child(self.settings_body(&nav, colors, cx));
+        } else if self.workspace_nav.active.is_some() {
+            root = root.child(self.workspace_body(colors, cx));
         } else {
             let mut body = div()
                 .relative()
@@ -6873,6 +6935,7 @@ impl Render for Sidebar {
                 .min_h(px(0.0))
                 .flex()
                 .flex_col()
+                .child(div().mx(px(10.0)).child(self.workspace_control(colors, cx)))
                 .child(self.new_agent_row(colors, cx));
             if projection.projects.is_empty() && !self.filter_query.text().trim().is_empty() {
                 body = body.child(
@@ -6914,7 +6977,7 @@ impl Render for Sidebar {
         if let Some(feedback) = self.external_drop_feedback(colors, cx) {
             root = root.child(feedback);
         }
-        if self.settings_nav.is_none() {
+        if self.settings_nav.is_none() && self.workspace_nav.active.is_none() {
             root = root.child(self.filter_control(colors, window, cx));
         }
         root = root.child(self.account_footer(colors, cx));
@@ -6932,6 +6995,9 @@ impl Render for Sidebar {
         });
         if let Some(popover) = self.popover(colors, window, cx) {
             root = root.child(popover);
+        }
+        if let Some(menu) = self.workspace_popup(colors, cx) {
+            root = root.child(menu);
         }
         if let Some(card) = self.hover_card(colors) {
             root = root.child(card);

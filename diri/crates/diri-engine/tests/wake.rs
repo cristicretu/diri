@@ -430,6 +430,19 @@ fn previews_are_bounded_read_only_and_do_not_wake_a_stopped_tree() {
         !server.attach_hub().has_sinks(&id),
         "previews are not governor visibility"
     );
+    let mut excess_set = preview_set_socket(&server);
+    excess_set.set(vec![preview_member(&id, 1)]);
+    assert!(
+        matches!(
+            excess_set.next(),
+            diri_proto::preview_set::PreviewSetPacket::Unavailable {
+                reason: diri_proto::preview_set::PreviewUnavailable::AdmissionLimit,
+                ..
+            }
+        ),
+        "single and multiplexed previews share the admission budget"
+    );
+    drop(excess_set);
     let mut excess = UnixStream::connect(server.socket_path()).unwrap();
     excess
         .set_read_timeout(Some(Duration::from_secs(2)))
@@ -530,4 +543,160 @@ fn a_preview_receives_live_updates_without_a_desktop_attach() {
     drop(preview);
     control.request("session.kill", json!({"sessionID":id}));
     control.request("session.remove", json!({"sessionID":id}));
+}
+
+struct PreviewSetReader {
+    stream: BufReader<UnixStream>,
+    decoder: diri_proto::preview_set::PreviewSetDecoder,
+    queued: std::collections::VecDeque<diri_proto::preview_set::PreviewSetPacket>,
+}
+impl PreviewSetReader {
+    fn next(&mut self) -> diri_proto::preview_set::PreviewSetPacket {
+        loop {
+            if let Some(packet) = self.queued.pop_front() {
+                return packet;
+            }
+            let mut bytes = [0; 64 * 1024];
+            let count = self.stream.read(&mut bytes).unwrap();
+            assert!(count > 0, "preview set closed before expected packet");
+            self.queued
+                .extend(self.decoder.feed(&bytes[..count]).unwrap());
+        }
+    }
+    fn set(&mut self, members: Vec<diri_proto::preview_set::PreviewMember>) {
+        writeln!(
+            self.stream.get_mut(),
+            "{}",
+            serde_json::to_string(&diri_proto::preview_set::PreviewSetMembership { members })
+                .unwrap()
+        )
+        .unwrap();
+    }
+}
+fn preview_set_socket(server: &ControlServer) -> PreviewSetReader {
+    let mut stream = UnixStream::connect(server.socket_path()).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    writeln!(stream, "{}", json!({"preview_set":true,"version":1})).unwrap();
+    let mut stream = BufReader::new(stream);
+    let mut line = String::new();
+    stream.read_line(&mut line).unwrap();
+    let ready: diri_proto::preview_set::PreviewSetReady = serde_json::from_str(&line).unwrap();
+    assert_eq!(ready.version, 1);
+    PreviewSetReader {
+        stream,
+        decoder: Default::default(),
+        queued: Default::default(),
+    }
+}
+fn preview_member(id: &str, generation: u64) -> diri_proto::preview_set::PreviewMember {
+    diri_proto::preview_set::PreviewMember {
+        session_id: diri_proto::SessionId::new(id),
+        generation,
+    }
+}
+
+#[test]
+fn a_preview_set_keeps_sources_independent_and_preserves_stopped_processes() {
+    use diri_proto::preview_set::{PreviewSetPacket, PreviewUnavailable};
+    let temp = tempfile::tempdir().unwrap();
+    let server = start_server(temp.path());
+    let mut control = Control::connect(&server);
+    let stopped = spawn_cat(&mut control);
+    let pids = hibernate_and_verify_stopped(&mut control, &stopped);
+    let before = control.request("session.list", json!({}))["sessions"][0].clone();
+    let live = spawn_cat(&mut control);
+    let mut preview = preview_set_socket(&server);
+    preview.set(vec![
+        preview_member(&stopped, 1),
+        preview_member(&live, 2),
+        preview_member("missing", 3),
+    ]);
+    let mut grids = std::collections::HashSet::new();
+    let mut modes = 0;
+    let mut missing = false;
+    while grids.len() < 2 || modes < 2 || !missing {
+        match preview.next() {
+            PreviewSetPacket::Chunk { member, frame } => {
+                if let Some(grid) = frame.grid_payload().unwrap() {
+                    if grids.insert(member.session_id.0) {
+                        assert!(grid.is_full_snapshot);
+                    }
+                    assert_eq!((grid.cols, grid.rows), (80, 24));
+                } else {
+                    assert_eq!(frame.frame_type, FrameType::Modes);
+                    modes += 1;
+                }
+            }
+            PreviewSetPacket::Unavailable { member, reason } => {
+                assert_eq!(member, preview_member("missing", 3));
+                assert_eq!(reason, PreviewUnavailable::Missing);
+                missing = true;
+            }
+        }
+    }
+    assert!(grids.contains(&stopped) && grids.contains(&live));
+    assert!(!server.attach_hub().has_sinks(&stopped));
+    assert!(!server.attach_hub().has_sinks(&live));
+    control.request(
+        "session.send_text",
+        json!({"sessionID":live,"text":"mux-live","submit":true}),
+    );
+    loop {
+        if let PreviewSetPacket::Chunk { member, frame } = preview.next()
+            && member.session_id.0 == live
+            && let Some(grid) = frame.grid_payload().unwrap()
+        {
+            let text: String = grid
+                .changed_rows
+                .iter()
+                .flat_map(|row| &row.cells)
+                .filter_map(|cell| char::from_u32(cell.scalar))
+                .collect();
+            if text.contains("mux-live") {
+                break;
+            }
+        }
+    }
+    preview.set(vec![preview_member(&stopped, 4), preview_member(&live, 2)]);
+    loop {
+        if let PreviewSetPacket::Chunk { member, frame } = preview.next()
+            && member == preview_member(&stopped, 4)
+        {
+            assert!(
+                frame.grid_payload().unwrap().unwrap().is_full_snapshot,
+                "new membership generation starts with a full grid"
+            );
+            break;
+        }
+    }
+    writeln!(
+        preview.stream.get_mut(),
+        "{}",
+        json!({"members":[],"input":"must-not-run"})
+    )
+    .unwrap();
+    let mut tail = Vec::new();
+    preview.stream.read_to_end(&mut tail).unwrap();
+    assert!(
+        ps_states(&pids)
+            .iter()
+            .all(|(_, state)| state.starts_with('T'))
+    );
+    assert_eq!(tree_pids(&mut control, &stopped), pids);
+    let records = control.request("session.list", json!({}));
+    let after = records["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["id"] == stopped)
+        .unwrap();
+    for key in ["lastSeenAt", "hibernation"] {
+        assert_eq!(before[key], after[key], "preview set changed {key}");
+    }
+    for id in [stopped, live] {
+        control.request("session.kill", json!({"sessionID":id}));
+        control.request("session.remove", json!({"sessionID":id}));
+    }
 }

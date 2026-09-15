@@ -160,6 +160,8 @@ pub struct Prefs {
     pub sidebar_width: f32,
     pub sidebar_grouping: SidebarGrouping,
     pub tab_orientation: TabOrientation,
+    /// Initial workspace for new windows; each open window keeps its own selection.
+    pub active_workspace: Option<diri_proto::workspace::WorkspaceId>,
     pub sidebar_ordering: SidebarOrdering,
     /// The projectless recency view has one shared archive disclosure rather
     /// than one disclosure per hidden project header.
@@ -222,6 +224,7 @@ impl Default for Prefs {
             sidebar_width: 248.0,
             sidebar_grouping: SidebarGrouping::Project,
             tab_orientation: TabOrientation::Vertical,
+            active_workspace: None,
             sidebar_ordering: SidebarOrdering::Custom,
             sidebar_recency_archives_expanded: false,
             inspector_open: false,

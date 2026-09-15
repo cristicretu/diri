@@ -290,6 +290,8 @@ pub struct WorkbenchInspector {
     selected_tab: InspectorTab,
     details_tab: InspectorTab,
     workspace_session: Option<SessionId>,
+    // None follows legacy selection; Some(None) is an empty saved workspace.
+    session_context: Option<Option<SessionId>>,
     session_workspaces: HashMap<Option<SessionId>, SessionWorkspace>,
     workspace_tabs: Vec<WorkspaceTab>,
     workspace_active: Option<u64>,
@@ -421,6 +423,7 @@ impl WorkbenchInspector {
                 InspectorTab::Info
             },
             workspace_session,
+            session_context: None,
             session_workspaces: HashMap::new(),
             workspace_tabs,
             workspace_active,
@@ -514,8 +517,10 @@ impl WorkbenchInspector {
         terminal: Option<Entity<TerminalPane>>,
         cx: &mut Context<Self>,
     ) {
-        self.terminal_surface = terminal;
-        cx.notify();
+        if self.terminal_surface != terminal {
+            self.terminal_surface = terminal;
+            cx.notify();
+        }
     }
 
     #[must_use]
@@ -731,12 +736,7 @@ impl WorkbenchInspector {
     }
 
     fn selected_context(&self) -> Option<DiffContext> {
-        let store = self
-            .runtime
-            .store
-            .read()
-            .expect("session store lock poisoned");
-        let session = store.selected_session()?;
+        let session = self.selected_session()?;
         Some(DiffContext {
             id: session.id.clone(),
             cwd: PathBuf::from(&session.cwd),
@@ -1494,13 +1494,34 @@ impl WorkbenchInspector {
         }));
     }
 
+    /// A saved workspace supplies this window's focused pane; it never rewrites
+    /// the shared session selection used by other windows.
+    pub(crate) fn set_session_context(
+        &mut self,
+        context: Option<Option<SessionId>>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.session_context != context {
+            self.session_context = context;
+            self.refresh_if_context_changed(cx);
+            cx.notify();
+        }
+    }
+
     fn selected_session(&self) -> Option<SessionRecord> {
-        self.runtime
+        let store = self
+            .runtime
             .store
             .read()
-            .expect("session store lock poisoned")
-            .selected_session()
-            .cloned()
+            .expect("session store lock poisoned");
+        match &self.session_context {
+            Some(id) => id
+                .as_ref()
+                .and_then(|id| store.sessions().get(id))
+                .map(AsRef::as_ref),
+            None => store.selected_session(),
+        }
+        .cloned()
     }
 
     fn markdown_document(&mut self, source: &str) -> Arc<MarkdownDocument> {
@@ -6453,6 +6474,56 @@ mod tests {
                 .inspector_tab,
             InspectorTab::Info
         );
+    }
+
+    #[gpui::test]
+    fn saved_pane_context_is_window_local_and_empty_does_not_fall_back(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let ids: Vec<_> = fixture
+            .list
+            .sessions
+            .iter()
+            .map(|session| session.id.clone())
+            .collect();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.select(ids[0].clone());
+        }
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let first = cx.new(|cx| WorkbenchInspector::new(runtime.clone(), tokio.clone(), cx));
+        let second = cx.new(|cx| WorkbenchInspector::new(runtime.clone(), tokio.clone(), cx));
+        first.update(cx, |inspector, cx| {
+            inspector.set_session_context(Some(Some(ids[1].clone())), cx);
+            assert_eq!(inspector.selected_context().unwrap().id, ids[1]);
+            assert_eq!(inspector.selected_session().unwrap().id, ids[1]);
+            inspector.add_workspace(WorkspaceSurface::Browser, cx);
+        });
+        second.read_with(cx, |inspector, _| {
+            assert_eq!(inspector.selected_session().unwrap().id, ids[0])
+        });
+        assert_eq!(
+            runtime.store.read().unwrap().selected_session_id(),
+            Some(&ids[0])
+        );
+        first.update(cx, |inspector, cx| {
+            inspector.set_session_context(Some(None), cx);
+            assert!(inspector.selected_context().is_none());
+            assert!(inspector.selected_session().is_none());
+            inspector.set_session_context(Some(Some(ids[1].clone())), cx);
+            assert_eq!(
+                inspector.workspace_selected,
+                Some(WorkspaceSurface::Browser)
+            );
+            inspector.set_session_context(None, cx);
+            assert_eq!(inspector.selected_session().unwrap().id, ids[0]);
+        });
     }
 
     #[gpui::test]
