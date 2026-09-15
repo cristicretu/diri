@@ -24,6 +24,9 @@ use gpui::{
 #[path = "tab_peek_surface.rs"]
 mod tab_peek_surface;
 
+pub(crate) struct TabPeekActivated;
+impl gpui::EventEmitter<TabPeekActivated> for SessionSurfaces {}
+
 pub struct SessionSurfaces {
     peek: crate::tab_peek::TabPeek,
     peek_left: f32,
@@ -85,6 +88,30 @@ fn overview_columns(width: f32) -> usize {
 }
 
 impl SessionSurfaces {
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn configure_preview_fixture(
+        &mut self,
+        source: &crate::tab_preview::screenshot_fixture::Source,
+    ) {
+        self.client = Arc::new(diri_client::DaemonClient::with_socket_path(&source.socket));
+        self.tokio = Some(source.runtime.handle().clone());
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn preview_fixture_states(
+        &self,
+    ) -> Vec<tokio::sync::watch::Receiver<crate::tab_preview::PreviewState>> {
+        self.peek
+            .sessions
+            .iter()
+            .filter_map(|id| {
+                self.live_previews
+                    .get(id)
+                    .map(|preview| preview.state.clone())
+            })
+            .collect()
+    }
+
     pub fn new(
         runtime: Arc<StoreRuntime>,
         tokio: Option<tokio::runtime::Handle>,
@@ -2065,6 +2092,19 @@ mod tests {
             (original.read().unwrap().cols, original.read().unwrap().rows),
             (100, 40)
         );
+        // Moving two cards offscreen drops their sockets before dismissal.
+        cx.simulate_resize(size(px(250.0), px(700.0)));
+        assert!(cx.debug_bounds("TAB_PEEK_CARD_1").is_some());
+        assert!(cx.debug_bounds("TAB_PEEK_CARD_2").is_none());
+        executor.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while closed.load(Ordering::SeqCst) != 2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+        });
         cx.simulate_keystrokes("escape");
         assert!(!surfaces.read_with(cx, |s, _| s.peek.visible()));
         executor.block_on(async {

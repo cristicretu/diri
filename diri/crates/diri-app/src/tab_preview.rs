@@ -323,3 +323,120 @@ mod source_tests {
         assert_eq!(*state.borrow(), PreviewState::Unavailable);
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) mod screenshot_fixture {
+    use super::PreviewState;
+    use diri_proto::{
+        frames::{Frame, FrameCodec},
+        grid::{ChangedRow, GridCell, GridUpdate, TermColor, TermStyle},
+    };
+    use std::path::PathBuf;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    /// Synthetic Engine-local source used only by the full-workbench renderer.
+    pub(crate) struct Source {
+        pub(crate) runtime: tokio::runtime::Runtime,
+        pub(crate) socket: PathBuf,
+        _directory: tempfile::TempDir,
+    }
+    impl Source {
+        pub(crate) fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("preview.sock");
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let listener = {
+                let _entered = runtime.enter();
+                tokio::net::UnixListener::bind(&socket).unwrap()
+            };
+            runtime.spawn(async move {
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    tokio::spawn(async move {
+                        let mut stream = BufReader::new(stream);
+                        let mut line = String::new();
+                        stream.read_line(&mut line).await.unwrap();
+                        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        assert!(request.get("attach").is_none());
+                        let mut ack = serde_json::to_vec(&request).unwrap();
+                        ack.push(b'\n');
+                        stream.get_mut().write_all(&ack).await.unwrap();
+                        let lines = [
+                            "$ cargo test -p diri-engine",
+                            "",
+                            "running 4 tests",
+                            "test preserves_session_identity ... ok",
+                            "test preview_never_resizes ... ok",
+                            "test shared_terminal_grid ... ok",
+                            "test cancel_closes_preview ... ok",
+                            "",
+                            "test result: ok. 4 passed; 0 failed",
+                            "",
+                            "$ git status --short",
+                            " M crates/diri-app/src/tab_preview.rs",
+                            "",
+                            "$ ",
+                        ];
+                        let update = GridUpdate {
+                            cols: 80,
+                            rows: 24,
+                            cursor_col: 2,
+                            cursor_row: 13,
+                            cursor_visible: true,
+                            is_full_snapshot: true,
+                            changed_rows: lines
+                                .iter()
+                                .enumerate()
+                                .map(|(index, line)| {
+                                    ChangedRow::new(
+                                        index as u16,
+                                        line.chars()
+                                            .map(|ch| {
+                                                GridCell::new(
+                                                    ch as u32,
+                                                    if line.contains(" ... ok") {
+                                                        TermColor::Ansi(2)
+                                                    } else {
+                                                        TermColor::Default
+                                                    },
+                                                    TermColor::DefaultInverted,
+                                                    TermStyle::empty(),
+                                                )
+                                            })
+                                            .collect(),
+                                    )
+                                })
+                                .collect(),
+                        };
+                        stream
+                            .get_mut()
+                            .write_all(&FrameCodec::encode(&Frame::grid(&update).unwrap()).unwrap())
+                            .await
+                            .unwrap();
+                        let mut unexpected = Vec::new();
+                        stream.read_to_end(&mut unexpected).await.unwrap();
+                        assert!(unexpected.is_empty());
+                    });
+                }
+            });
+            Self {
+                runtime,
+                socket,
+                _directory: directory,
+            }
+        }
+        pub(crate) fn settle(&self, states: Vec<tokio::sync::watch::Receiver<PreviewState>>) {
+            self.runtime.block_on(async {
+                for mut state in states {
+                    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                        while *state.borrow() != PreviewState::Live {
+                            state.changed().await.unwrap();
+                        }
+                    })
+                    .await
+                    .unwrap();
+                }
+            });
+        }
+    }
+}

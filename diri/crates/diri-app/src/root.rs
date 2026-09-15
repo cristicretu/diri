@@ -962,6 +962,19 @@ impl RootView {
                 }
             }
         });
+        if let Some(surfaces) = &session_surfaces {
+            cx.subscribe_in(
+                surfaces,
+                window,
+                |this, _, _: &crate::session_surfaces::TabPeekActivated, window, cx| {
+                    if let Some(terminal) = &this.terminal {
+                        terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+                    }
+                    this.sync_auxiliary_terminal(window, cx);
+                },
+            )
+            .detach();
+        }
         let peek_observer = session_surfaces.as_ref().map(|surfaces| {
             let mut was_visible = false;
             let mut previous_offset = 0.0;
@@ -4344,6 +4357,58 @@ mod tests {
     }
 
     #[gpui::test]
+    fn tab_peek_commit_focuses_same_terminal_while_cancel_restores_prior_focus(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let services = test_services();
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.select(fixture.selected_session_id.unwrap());
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        cx.run_until_parked();
+        let (original, terminal_focus) = root.read_with(cx, |root, cx| {
+            (
+                root.terminal.as_ref().unwrap().clone(),
+                root.terminal
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .quote_focus_handle(),
+            )
+        });
+        for key in ["escape", "enter"] {
+            root.update_in(cx, |root, window, cx| {
+                window.focus(&root.focus, cx);
+                root.toggle_tab_peek(window, cx);
+            });
+            cx.simulate_keystrokes(key);
+            cx.run_until_parked();
+            root.update_in(cx, |root, window, cx| {
+                assert_eq!(root.terminal.as_ref(), Some(&original));
+                assert!(if key == "escape" {
+                    root.focus.is_focused(window)
+                } else {
+                    terminal_focus.is_focused(window)
+                });
+                assert!(
+                    !root
+                        .session_surfaces
+                        .as_ref()
+                        .unwrap()
+                        .read(cx)
+                        .tab_peek_visible()
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
     fn tab_peek_translation_does_not_resize_the_terminal(cx: &mut gpui::TestAppContext) {
         use crate::tab_peek::GestureFrame;
         let services = test_services();
@@ -4916,6 +4981,8 @@ mod tests {
         );
         cx.update(|cx| crate::fonts::init(cx));
         let services = test_services();
+        let live_source = std::env::var_os("DIRI_PEEK_LIVE")
+            .map(|_| crate::tab_preview::screenshot_fixture::Source::new());
         let mut fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
         let selected = fixture.selected_session_id.clone().unwrap();
         let project = fixture
@@ -4947,21 +5014,54 @@ mod tests {
         } else {
             1200.0
         };
-        let window=cx.open_window(size(px(width),px(800.0)),|window,cx|cx.new(|cx| {
-            let root=RootView::new(services,false,PreviewScenario::Empty,window,cx);
-            if std::env::var_os("DIRI_PEEK_HORIZONTAL").is_some() {
-                root.sidebar.update(cx, |sidebar, cx| sidebar.set_tab_orientation(crate::store::TabOrientation::Horizontal, cx)).unwrap();
-            }
-            let mut grid=GridBuffer::new(100,36);
-            let sample="$ pwd\n/Users/you/work/diri\n\n$ cargo test --workspace\n\nrunning 4 tests\ntest session_identity_survives ... ok\ntest preview_does_not_resize ... ok\ntest controller_stays_attached ... ok\ntest input_returns_to_terminal ... ok\n\ntest result: ok. 4 passed; 0 failed\n\n$ git status --short\n M crates/diri-app/src/tab_peek.rs\n M crates/diri-app/src/root.rs\n\n$ ";
-            for (y,line) in sample.lines().enumerate(){for (x,ch) in line.chars().enumerate(){grid.cells[y*100+x].scalar=ch as u32;}}
-            let terminal=root.terminal.as_ref().unwrap();
-            terminal.update(cx,|terminal,cx|{terminal.seed_preview_grid_for_test(grid);cx.notify();});
-            let buffers=terminal.read(cx).resident_preview_buffers();
-            root.session_surfaces.as_ref().unwrap().update(cx,|surface,cx|{surface.sync_resident_buffers(buffers);surface.tab_gesture(crate::tab_peek::GestureFrame::Tracking(distance),cx);});
-            root
-        })).unwrap();
+        let window = cx.open_window(size(px(width), px(800.0)), |window, cx| {
+            cx.new(|cx| {
+                let root = RootView::new(services, false, PreviewScenario::Empty, window, cx);
+                if std::env::var_os("DIRI_PEEK_HORIZONTAL").is_some() {
+                    root.sidebar.update(cx, |sidebar, cx| {
+                        sidebar.set_tab_orientation(crate::store::TabOrientation::Horizontal, cx)
+                    }).unwrap();
+                }
+                let mut grid = GridBuffer::new(100, 36);
+            let sample = "$ pwd\n/Users/you/work/diri\n\n$ cargo test --workspace\n\nrunning 4 tests\ntest session_identity_survives ... ok\ntest preview_does_not_resize ... ok\ntest controller_stays_attached ... ok\ntest input_returns_to_terminal ... ok\n\ntest result: ok. 4 passed; 0 failed\n\n$ git status --short\n M crates/diri-app/src/tab_peek.rs\n M crates/diri-app/src/root.rs\n\n$ ";
+                for (y, line) in sample.lines().enumerate() {
+                    for (x, ch) in line.chars().enumerate() {
+                        grid.cells[y * 100 + x].scalar = ch as u32;
+                    }
+                }
+                let terminal = root.terminal.as_ref().unwrap();
+                terminal.update(cx, |terminal, cx| {
+                    terminal.seed_preview_grid_for_test(grid);
+                    cx.notify();
+                });
+                let buffers = terminal.read(cx).resident_preview_buffers();
+                root.session_surfaces.as_ref().unwrap().update(cx, |surface, cx| {
+                    if let Some(source) = &live_source {
+                        surface.configure_preview_fixture(source);
+                    }
+                    surface.sync_resident_buffers(buffers);
+                    surface.tab_gesture(crate::tab_peek::GestureFrame::Tracking(distance), cx);
+                });
+                root
+            })
+        }).unwrap();
         cx.run_until_parked();
+        if let Some(source) = &live_source {
+            let states = cx
+                .update_window(window.into(), |root, _, cx| {
+                    root.downcast::<RootView>()
+                        .unwrap()
+                        .read(cx)
+                        .session_surfaces
+                        .as_ref()
+                        .unwrap()
+                        .read(cx)
+                        .preview_fixture_states()
+                })
+                .unwrap();
+            source.settle(states);
+            cx.run_until_parked();
+        }
         cx.capture_screenshot(window.into())
             .unwrap()
             .save(output)
