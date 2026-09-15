@@ -653,43 +653,55 @@ The vendored terminal parser allocates its pristine alternate grid on first
 screen entry, at the current dimensions. It retains that grid for subsequent
 switches and applies the existing cursor, erase, resize, reset and history rules.
 For a new 80×24 core this removes 46,848 requested heap bytes; first alternate
-entry pays that allocation instead. The 4 MiB history-cell budget and snapshot
-format are unchanged. This parser source already participates in Helper Build
+entry pays that allocation instead. Snapshot format is unchanged; retained
+history follows the stored-representation policy below. This parser source already participates in Helper Build
 IDs; existing Holders retain their original allocations until they exit.
 
 Spare parser history rows are allocated in batches sized by row bytes, capped at
 1,000 rows and approximately 64 KiB of new cell/row storage (at least one row).
 Required visible/history rows are always allocated. This bounds the eager reserve
-at first scroll without changing the 4 MiB retained-history cell allowance or
-serialized grid representation. Existing vector capacity and reflow-retained rows
+at first scroll in the dense comparison configuration without changing its
+history allowance or serialized grid representation. Existing vector capacity and reflow-retained rows
 remain separate from this reserve target. Smaller batches trade more occasional
 growth operations for lower memory; the resource and throughput harnesses verify
 that tradeoff. Parser source participates in the Helper Build ID as above.
 
-### Disabled compact-history storage experiment
+### Lossless compact history
 
-The `diri-terminal-state/compact-history` feature is an internal experiment and
-is not enabled by the Engine or Helper. It tests process-local compressed row
-blocks in the existing parser, with editable recent rows and exclusively owned
-history read caches. The experiment retains up to 10,000 physical rows under a
-4 MiB stored-history allowance (compressed payload, block/row allocation indexes,
-and editable history cell storage). Visible cells, cell-extra heap allocations,
-temporary codec/read/reflow work and caller-owned response buffers are separate
-from that allowance. The default build retains the history-cell policy above.
+The Engine and Remote Helper enable process-local compressed row blocks in the
+existing parser. Editable recent rows remain directly accessible; cold history
+uses typed Cell style palettes, UTF-8 scalars and style runs followed by DEFLATE.
+Row occupancy, flags, colors, links and combining marks survive exact round trips.
+There is one parser and no background compression task or terminal lock.
 
-This is not a parking/checkpoint format and does not change a wire codec. The
-candidate uses typed Cell style palettes, UTF-8 scalars and style runs followed
-by DEFLATE, preserving row occupancy, flags, colors, links and combining marks.
-`flate2`, already present in the lockfile, supplies compression instead of a new
-compressor implementation; serde/serde_json supply the typed internal layout.
-These are optional dependencies until the experiment passes acceptance.
+Retain up to 10,000 physical history rows under a 4 MiB stored-history allowance:
+compressed payload, allocated block/row indexes, and editable history cells.
+Discard only oldest history when either limit is reached. Visible cells,
+cell-extra heap allocations, temporary codec/read/reflow work and caller-owned
+response buffers are separate from this allowance. Reflow can alter physical row
+count and therefore evict oldest rows at the same cap. History capacity no longer
+shrinks merely because the terminal becomes wider.
 
-Activation requires actual-parser differential coverage for scrolling, partial
-regions, editing, primary/alternate screens, reset and resize/reflow; bounded
-history reads that release decoded blocks; checkpoint/adoption and Helper Scroll
-verification; adversarial stored-budget tests; and measured CPU, latency and
-requested-heap comparisons. The existing Helper/UDS gates remain unchanged.
-No transport, controller lease, on-disk state or protocol migration is implied.
+History reads decode bounded row blocks and release caches at exclusive borrow
+boundaries. Resizing untouched hard lines retains compressed payloads and pads
+only rows requested by a reader. Wrapped lines and edits retain the existing
+parser reflow algorithm. Shared index ranges split for wide reads and coalesce
+where possible when narrowing; this does not change terminal semantics.
+
+This is not a parking/checkpoint format and does not change a wire codec or
+on-disk state. `flate2`, already present in the lockfile, supplies compression
+instead of a new compressor implementation; serde/serde_json supply the typed
+internal layout. The dense feature configuration remains for differential tests
+and benchmark comparison only. Shipping Engine and Helper builds use the default
+compact configuration. Parser and dependency changes participate in Helper Build
+IDs; live Holders keep their original code and allocations until they exit.
+
+Acceptance covers actual-parser scrolling, partial regions, editing, both screens,
+reset and resize/reflow differentials; bounded history reads; checkpoint/adoption
+and Helper Scroll; high-entropy storage-budget eviction; and paired CPU, latency
+and requested-heap measurements. See `docs/verification/compact-history` for raw
+results and metric boundaries. Existing Helper/UDS latency gates remain unchanged.
+No transport or controller-lease migration is implied.
 
 ### Local Holder input compatibility
 

@@ -309,9 +309,9 @@ impl<T> Storage<T> {
     pub fn replace_inner(&mut self, vec: Vec<Row<T>>) {
         #[cfg(feature = "compact-history")]
         if let Some(compact) = &mut self.compact {
-            self.len = vec.len();
             let columns = vec.first().map_or(0, Row::len);
             compact.replace_rows(vec, self.visible_lines, columns);
+            self.len = compact.len();
             return;
         }
         self.len = vec.len();
@@ -324,8 +324,9 @@ impl<T> Storage<T> {
     pub fn take_all(&mut self) -> Vec<Row<T>> {
         #[cfg(feature = "compact-history")]
         if let Some(compact) = &mut self.compact {
-            self.len = 0;
-            return compact.drain_rows();
+            let rows = compact.drain_rows();
+            self.len = compact.len();
+            return rows;
         }
         self.truncate();
 
@@ -335,6 +336,15 @@ impl<T> Storage<T> {
         self.len = 0;
 
         buffer
+    }
+
+    pub fn prepare_reflow(&mut self, columns: usize) -> usize {
+        #[cfg(feature = "compact-history")]
+        if let Some(compact) = &mut self.compact {
+            return compact.prepare_reflow(columns);
+        }
+        let _ = columns;
+        self.len
     }
 
     /// Compute actual index in underlying storage given the requested index.

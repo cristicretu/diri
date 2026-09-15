@@ -253,14 +253,11 @@ impl ScreenSnapshot {
     }
 }
 
-/// Scrollback is byte-budgeted: enough history for a client's scrollback view
-/// without letting a build log grow daemon memory unboundedly. Divided by the
-/// per-line cell cost at construction.
-///
-/// 4 MiB works out to ~2,180 history rows at 80 columns (~870 at 200) per
-/// session. The original 1 MiB kept only 546 rows at 80 columns — shallower
-/// than one long compile's output, and users hit the floor scrolling back.
-const HISTORY_CELL_BUDGET_BYTES: usize = 4 << 20;
+/// Retain up to 10,000 physical history rows within 4 MiB of stored row
+/// representation. Cold rows are losslessly compressed; visible cells and
+/// temporary caller-owned responses are separate. Dense differential builds
+/// translate this allowance into a width-dependent row count.
+const HISTORY_STORAGE_BUDGET_BYTES: usize = 4 << 20;
 
 fn history_line_limit(cols: usize) -> usize {
     #[cfg(feature = "compact-history")]
@@ -271,7 +268,7 @@ fn history_line_limit(cols: usize) -> usize {
     #[cfg(not(feature = "compact-history"))]
     {
         let bytes_per_line = cols.max(1).saturating_mul(std::mem::size_of::<Cell>());
-        HISTORY_CELL_BUDGET_BYTES / bytes_per_line
+        HISTORY_STORAGE_BUDGET_BYTES / bytes_per_line
     }
 }
 
@@ -482,7 +479,7 @@ impl HeadlessScreen {
     fn settle(&mut self) {
         #[cfg(feature = "compact-history")]
         self.term
-            .bound_primary_history_storage(HISTORY_CELL_BUDGET_BYTES);
+            .bound_primary_history_storage(HISTORY_STORAGE_BUDGET_BYTES);
         self.drain_events();
         let rows = self.geometry.rows;
         self.current_damage_rows.resize(rows, false);
@@ -673,8 +670,9 @@ impl HeadlessScreen {
             let metadata = self.row_metadata(line);
             let row = &mut self.last_cells[base..base + cols];
             let mut row_changed = force_full || self.last_annotations[y] != metadata;
+            let source = &grid[line];
             for (x, previous) in row.iter_mut().enumerate() {
-                let cell = wire_cell(&grid[line][Column(x)]);
+                let cell = wire_cell(&source[Column(x)]);
                 row_changed |= *previous != cell;
                 *previous = cell;
             }
@@ -714,8 +712,9 @@ impl HeadlessScreen {
         for y in 0..rows {
             let line = Line(y as i32);
             let mut row = Vec::with_capacity(cols);
+            let source = &grid[line];
             for x in 0..cols {
-                row.push(wire_cell(&grid[line][Column(x)]));
+                row.push(wire_cell(&source[Column(x)]));
             }
             let mut changed = ChangedRow::new(y as u16, row);
             changed.metadata = self.row_metadata(line);
@@ -748,8 +747,9 @@ impl HeadlessScreen {
         for index in 0..history {
             let line = Line(index as i32 - history as i32);
             let mut row = Vec::with_capacity(cols);
+            let source = &self.term.grid()[line];
             for x in 0..cols {
-                row.push(wire_cell(&self.term.grid()[line][Column(x)]));
+                row.push(wire_cell(&source[Column(x)]));
             }
             rows.push(row);
             self.finish_history_read_batch(index + 1, index + 1 == history);
@@ -807,7 +807,11 @@ impl HeadlessScreen {
                     self.term.grid_mut()[line][Column(usize::from(*x))].push_zerowidth(ch);
                 }
             }
+            self.finish_history_read_batch(index + 1, index + 1 == count);
         }
+        #[cfg(feature = "compact-history")]
+        self.term
+            .bound_primary_history_storage(HISTORY_STORAGE_BUDGET_BYTES);
     }
 
     pub fn restore(
@@ -990,8 +994,9 @@ impl HeadlessScreen {
             let line = Line(index as i32 - history as i32);
             let mut text = String::with_capacity(cols);
             ranges.clear();
+            let source = &self.term.grid()[line];
             for x in 0..cols {
-                let cell = &self.term.grid()[line][Column(x)];
+                let cell = &source[Column(x)];
                 if cell
                     .flags
                     .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
@@ -1055,8 +1060,9 @@ impl HeadlessScreen {
         for index in start..end {
             let line = Line(index as i32 - history as i32);
             let mut row = Vec::with_capacity(cols);
+            let source = &self.term.grid()[line];
             for x in 0..cols {
-                row.push(wire_cell(&self.term.grid()[line][Column(x)]));
+                row.push(wire_cell(&source[Column(x)]));
             }
             rows.push(row);
             metadata.push(self.row_metadata_with_budget(
@@ -1091,8 +1097,9 @@ impl HeadlessScreen {
         // Reserve enough for JSON framing, including escaping. Both a full
         // viewport and any bounded scrollback page stay below the codec limit.
         let mut used = 0;
+        let source = &grid[line];
         for x in 0..self.geometry.cols {
-            let cell = &grid[line][Column(x)];
+            let cell = &source[Column(x)];
             if let Some(link) = cell.hyperlink() {
                 let uri = link.uri();
                 if let Some(last) = result.links.last_mut()
@@ -1135,8 +1142,9 @@ impl HeadlessScreen {
         for row in 0..self.geometry.rows {
             let line = Line(row as i32);
             let mut text = String::with_capacity(self.geometry.cols);
+            let source = &grid[line];
             for column in 0..self.geometry.cols {
-                let cell = &grid[line][Column(column)];
+                let cell = &source[Column(column)];
                 // These occupy terminal columns but are not textual spaces.
                 if cell
                     .flags
@@ -1226,8 +1234,9 @@ impl HeadlessScreen {
         let mut previous_link = None;
         let grid = self.term.grid();
         let line = Line(row as i32);
+        let source = &grid[line];
         for column in 0..self.geometry.cols {
-            let cell = &grid[line][Column(column)];
+            let cell = &source[Column(column)];
             let link = cell.hyperlink();
             if link != previous_link {
                 for byte in link.as_ref().map_or(&b""[..], |link| link.uri().as_bytes()) {
@@ -1725,7 +1734,7 @@ mod tests {
             );
             assert!(screen.lines().iter().any(|line| line == "retained history"));
             #[cfg(feature = "compact-history")]
-            assert!(screen.term.grid().history_storage_bytes() <= HISTORY_CELL_BUDGET_BYTES);
+            assert!(screen.term.grid().history_storage_bytes() <= HISTORY_STORAGE_BUDGET_BYTES);
 
             // Narrowing permits more rows again, including after an app reset.
             screen.resize(80, 24);
@@ -1743,13 +1752,13 @@ mod tests {
         #[cfg(not(feature = "compact-history"))]
         assert!(
             history_line_limit(4096) * 4096 * std::mem::size_of::<Cell>()
-                <= HISTORY_CELL_BUDGET_BYTES
+                <= HISTORY_STORAGE_BUDGET_BYTES
         );
         #[cfg(feature = "compact-history")]
         {
             let mut screen = HeadlessScreen::new(4096, 24);
             screen.feed("wide retained history\r\n".repeat(1000).as_bytes());
-            assert!(screen.term.grid().history_storage_bytes() <= HISTORY_CELL_BUDGET_BYTES);
+            assert!(screen.term.grid().history_storage_bytes() <= HISTORY_STORAGE_BUDGET_BYTES);
             assert_eq!(screen.term.grid().history_size(), 1000 + 1 - 24);
         }
     }
@@ -1913,7 +1922,7 @@ mod tests {
         assert_eq!(restored.scrollback().lines, original.scrollback().lines);
         assert_eq!(restored.history_metadata(), metadata);
         assert_eq!(restored.history_snapshot(), history);
-        assert!(restored.term.grid().history_storage_bytes() <= HISTORY_CELL_BUDGET_BYTES);
+        assert!(restored.term.grid().history_storage_bytes() <= HISTORY_STORAGE_BUDGET_BYTES);
     }
 
     #[test]

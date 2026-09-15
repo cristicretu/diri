@@ -7,7 +7,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use flate2::Compression;
 use flate2::read::DeflateDecoder;
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use super::Row;
 use crate::index::Column;
-use crate::term::cell::Cell;
+use crate::term::cell::{Cell, Flags};
 use crate::vte::ansi::Color;
 
 const MAX_BLOCK_ROWS: usize = 64;
@@ -27,6 +27,8 @@ const BLOCK_CELL_BYTES: usize = 128 * 1024;
 pub struct RowCodec<T> {
     encode: fn(&[Row<T>]) -> Box<[u8]>,
     decode: fn(&[u8]) -> Vec<Row<T>>,
+    resize_floor: fn(&[Row<T>]) -> Option<usize>,
+    resize_row: fn(&mut Row<T>, usize),
 }
 
 impl<T> Copy for RowCodec<T> {}
@@ -38,8 +40,11 @@ impl<T> Clone for RowCodec<T> {
 
 #[derive(Clone, Debug)]
 struct Block<T> {
-    bytes: Box<[u8]>,
+    bytes: Arc<[u8]>,
+    start: usize,
     count: usize,
+    columns: usize,
+    resize_floor: Option<usize>,
     decoded: OnceLock<Vec<Row<T>>>,
     dirty: bool,
 }
@@ -47,15 +52,32 @@ struct Block<T> {
 impl<T> Block<T> {
     fn new(rows: Vec<Row<T>>, codec: RowCodec<T>) -> Self {
         Self {
-            bytes: (codec.encode)(&rows),
+            bytes: (codec.encode)(&rows).into(),
+            start: 0,
             count: rows.len(),
+            columns: rows.first().map_or(0, Row::len),
+            resize_floor: (codec.resize_floor)(&rows),
             decoded: OnceLock::new(),
             dirty: false,
         }
     }
 
     fn rows(&self, codec: RowCodec<T>) -> &[Row<T>] {
-        self.decoded.get_or_init(|| (codec.decode)(&self.bytes))
+        self.decoded.get_or_init(|| self.decode_rows(codec))
+    }
+
+    fn decode_rows(&self, codec: RowCodec<T>) -> Vec<Row<T>> {
+        (codec.decode)(&self.bytes)
+            .into_iter()
+            .skip(self.start)
+            .take(self.count)
+            .map(|mut row| {
+                if row.len() != self.columns {
+                    (codec.resize_row)(&mut row, self.columns);
+                }
+                row
+            })
+            .collect()
     }
 
     fn row_mut(&mut self, index: usize, codec: RowCodec<T>) -> &mut Row<T> {
@@ -67,16 +89,18 @@ impl<T> Block<T> {
     fn release_cache(&mut self, codec: RowCodec<T>) {
         if let Some(rows) = self.decoded.take() {
             if self.dirty {
-                self.bytes = (codec.encode)(&rows);
+                self.bytes = (codec.encode)(&rows).into();
+                self.start = 0;
+                self.resize_floor = (codec.resize_floor)(&rows);
                 self.dirty = false;
             }
         }
     }
 
-    fn into_rows(self, codec: RowCodec<T>) -> Vec<Row<T>> {
+    fn into_rows(mut self, codec: RowCodec<T>) -> Vec<Row<T>> {
         self.decoded
-            .into_inner()
-            .unwrap_or_else(|| (codec.decode)(&self.bytes))
+            .take()
+            .unwrap_or_else(|| self.decode_rows(codec))
     }
 }
 
@@ -93,15 +117,24 @@ pub struct CompactRows<T> {
     visible: usize,
     block_rows: usize,
     len: usize,
+    reflowing_recent: bool,
+    needs_maintenance: bool,
+    last_budget: usize,
+}
+
+fn block_rows<T>(columns: usize) -> usize {
+    let bytes = columns
+        .saturating_mul(std::mem::size_of::<T>())
+        .saturating_add(std::mem::size_of::<Row<T>>())
+        .max(1);
+    let count = (BLOCK_CELL_BYTES / bytes).clamp(1, MAX_BLOCK_ROWS);
+    // Power-of-two blocks can split into smaller ranges without re-encoding.
+    1usize << count.ilog2()
 }
 
 impl<T> CompactRows<T> {
     pub fn new(rows: Vec<Row<T>>, visible: usize, columns: usize, codec: RowCodec<T>) -> Self {
         assert!(rows.len() >= visible);
-        let row_bytes = columns
-            .saturating_mul(std::mem::size_of::<T>())
-            .saturating_add(std::mem::size_of::<Row<T>>())
-            .max(1);
         let mut storage = Self {
             len: rows.len(),
             recent: rows.into(),
@@ -109,7 +142,10 @@ impl<T> CompactRows<T> {
             oldest: VecDeque::new(),
             codec,
             visible,
-            block_rows: (BLOCK_CELL_BYTES / row_bytes).clamp(1, MAX_BLOCK_ROWS),
+            block_rows: block_rows::<T>(columns),
+            reflowing_recent: false,
+            needs_maintenance: true,
+            last_budget: 0,
         };
         storage.seal_recent();
         storage.recent.shrink_to_fit();
@@ -123,6 +159,7 @@ impl<T> CompactRows<T> {
         self.len == 0
     }
 
+    #[inline]
     pub fn row(&self, mut index: usize) -> &Row<T> {
         assert!(index < self.len);
         if index < self.recent.len() {
@@ -137,8 +174,12 @@ impl<T> CompactRows<T> {
         &self.oldest[index - cold_rows]
     }
 
+    #[inline]
     pub fn row_mut(&mut self, mut index: usize) -> &mut Row<T> {
         assert!(index < self.len);
+        if index >= self.visible {
+            self.needs_maintenance = true;
+        }
         if index < self.recent.len() {
             return &mut self.recent[index];
         }
@@ -155,6 +196,7 @@ impl<T> CompactRows<T> {
     where
         T: Default,
     {
+        self.needs_maintenance |= count != 0;
         self.oldest.extend((0..count).map(|_| Row::new(columns)));
         self.len += count;
     }
@@ -162,6 +204,7 @@ impl<T> CompactRows<T> {
     /// Rotate left for positive counts, matching the dense storage's zero shift.
     pub fn rotate(&mut self, count: isize) {
         assert!(count.unsigned_abs() <= self.len);
+        self.needs_maintenance |= count != 0;
         if count < 0 {
             for _ in 0..count.unsigned_abs() {
                 let row = self.pop_oldest().expect("nonempty rotated storage");
@@ -178,6 +221,7 @@ impl<T> CompactRows<T> {
     }
 
     pub fn swap(&mut self, a: usize, b: usize) {
+        self.needs_maintenance |= a >= self.visible || b >= self.visible;
         if a == b {
             return;
         }
@@ -194,6 +238,7 @@ impl<T> CompactRows<T> {
 
     pub fn truncate(&mut self, len: usize) {
         assert!(len <= self.len);
+        self.needs_maintenance |= self.len != len;
         while self.len > len {
             if self.oldest.is_empty() {
                 if let Some(block) = self.blocks.back() {
@@ -210,6 +255,7 @@ impl<T> CompactRows<T> {
 
     pub fn set_visible(&mut self, visible: usize) {
         assert!(visible <= self.len);
+        self.needs_maintenance |= self.visible != visible;
         self.visible = visible;
         while self.recent.len() < visible && !self.blocks.is_empty() {
             let block = self.blocks.pop_front().expect("first block");
@@ -232,10 +278,19 @@ impl<T> CompactRows<T> {
     /// Stored bytes, excluding the visible cells and temporary decode work.
     pub fn history_storage_bytes(&self) -> usize {
         let row_bytes = |row: &Row<T>| row.len().saturating_mul(std::mem::size_of::<T>());
-        self.blocks
-            .iter()
-            .map(|block| block.bytes.len())
-            .sum::<usize>()
+        // Split ranges are adjacent and share one immutable allocation. Dirty
+        // edits can separate siblings; counting those allocations again is
+        // conservative and requires no allocation on the idle/cursor path.
+        let mut previous = std::ptr::null();
+        let mut payload = 0;
+        for block in &self.blocks {
+            let ptr = block.bytes.as_ptr();
+            if ptr != previous {
+                payload += block.bytes.len() + 2 * std::mem::size_of::<usize>();
+            }
+            previous = ptr;
+        }
+        payload
             + self.blocks.capacity() * std::mem::size_of::<Block<T>>()
             + self.recent.capacity() * std::mem::size_of::<Row<T>>()
             + self.oldest.capacity() * std::mem::size_of::<Row<T>>()
@@ -249,7 +304,11 @@ impl<T> CompactRows<T> {
     }
 
     /// Discard only the oldest history when the retained representation is full.
+    #[inline]
     pub fn bound_history_bytes(&mut self, budget: usize) {
+        if !self.needs_maintenance && self.last_budget == budget {
+            return;
+        }
         self.release_read_cache();
         while self.len > self.visible && self.history_storage_bytes() > budget {
             if self.oldest.is_empty() && self.blocks.len() > 1 {
@@ -263,6 +322,8 @@ impl<T> CompactRows<T> {
         if self.blocks.capacity() > self.blocks.len().saturating_mul(2).saturating_add(64) {
             self.blocks.shrink_to_fit();
         }
+        self.needs_maintenance = false;
+        self.last_budget = budget;
     }
 
     pub fn into_rows(self) -> Vec<Row<T>> {
@@ -276,6 +337,11 @@ impl<T> CompactRows<T> {
     }
 
     pub fn drain_rows(&mut self) -> Vec<Row<T>> {
+        if self.reflowing_recent {
+            let rows: Vec<_> = self.recent.drain(..).collect();
+            self.len -= rows.len();
+            return rows;
+        }
         let mut rows = Vec::with_capacity(self.len);
         rows.extend(self.recent.drain(..));
         for block in self.blocks.drain(..) {
@@ -287,7 +353,108 @@ impl<T> CompactRows<T> {
     }
 
     pub fn replace_rows(&mut self, rows: Vec<Row<T>>, visible: usize, columns: usize) {
+        self.needs_maintenance = true;
+        if self.reflowing_recent {
+            self.reflowing_recent = false;
+            self.len += rows.len();
+            self.recent = rows.into();
+            self.visible = visible;
+            self.seal_recent();
+            return;
+        }
         *self = Self::new(rows, visible, columns, self.codec);
+    }
+
+    /// Preserve cold hard lines that cannot participate in this reflow. Their
+    /// storage range stays compressed; only requested read rows gain padding.
+    pub fn prepare_reflow(&mut self, columns: usize) -> usize {
+        self.release_read_cache();
+        if !self.oldest.is_empty()
+            || self.blocks.is_empty()
+            || self
+                .blocks
+                .iter()
+                .any(|block| block.resize_floor.is_none_or(|floor| floor > columns))
+        {
+            return self.len;
+        }
+        self.coalesce_shared_ranges(block_rows::<T>(columns));
+        let next_rows = self.block_rows.min(block_rows::<T>(columns));
+        if next_rows != self.block_rows {
+            let mut blocks =
+                VecDeque::with_capacity(self.blocks.len() * self.block_rows / next_rows);
+            for block in self.blocks.drain(..) {
+                for offset in (0..block.count).step_by(next_rows) {
+                    blocks.push_back(Block {
+                        bytes: block.bytes.clone(),
+                        start: block.start + offset,
+                        count: next_rows,
+                        columns,
+                        resize_floor: block.resize_floor,
+                        decoded: OnceLock::new(),
+                        dirty: false,
+                    });
+                }
+            }
+            self.blocks = blocks;
+            self.block_rows = next_rows;
+        } else {
+            for block in &mut self.blocks {
+                block.columns = columns;
+            }
+        }
+        self.reflowing_recent = true;
+        self.recent.len()
+    }
+
+    /// Undo a wide resize's index splitting without decoding or recompressing
+    /// immutable payloads. Groups align from the oldest end; a small unmatched
+    /// newest prefix becomes editable. Independently edited ranges remain split.
+    fn coalesce_shared_ranges(&mut self, desired: usize) {
+        let mut next = desired;
+        while next > self.block_rows {
+            let group = next / self.block_rows;
+            let prefix = self.blocks.len() % group;
+            if self.blocks.len() < group {
+                next /= 2;
+                continue;
+            }
+            let mergeable = (prefix..self.blocks.len()).step_by(group).all(|start| {
+                let first = &self.blocks[start];
+                (1..group).all(|offset| {
+                    let block = &self.blocks[start + offset];
+                    Arc::ptr_eq(&first.bytes, &block.bytes)
+                        && block.start == first.start + offset * self.block_rows
+                })
+            });
+            if !mergeable {
+                next /= 2;
+                continue;
+            }
+            for _ in 0..prefix {
+                self.recent.extend(
+                    self.blocks
+                        .pop_front()
+                        .expect("range prefix")
+                        .into_rows(self.codec),
+                );
+            }
+            let mut merged = VecDeque::with_capacity(self.blocks.len() / group);
+            while let Some(mut first) = self.blocks.pop_front() {
+                for _ in 1..group {
+                    let block = self.blocks.pop_front().expect("complete range group");
+                    first.count += block.count;
+                    first.resize_floor = first
+                        .resize_floor
+                        .zip(block.resize_floor)
+                        .map(|(a, b)| a.max(b));
+                }
+                merged.push_back(first);
+            }
+            self.blocks = merged;
+            self.block_rows = next;
+            return;
+        }
     }
 
     fn pop_oldest(&mut self) -> Option<Row<T>> {
@@ -369,6 +536,36 @@ pub fn cell_codec() -> RowCodec<Cell> {
     RowCodec {
         encode: encode_cells,
         decode: decode_cells,
+        resize_floor: cell_resize_floor,
+        resize_row: resize_cell_row,
+    }
+}
+
+fn cell_resize_floor(rows: &[Row<Cell>]) -> Option<usize> {
+    let default = Cell::default();
+    let mut floor = 1;
+    for row in rows {
+        for column in 0..row.len() {
+            let cell = &row[Column(column)];
+            if cell.flags.contains(Flags::WRAPLINE) {
+                return None;
+            }
+            if cell != &default {
+                floor = floor.max(column + 1);
+            }
+        }
+    }
+    Some(floor)
+}
+
+fn resize_cell_row(row: &mut Row<Cell>, columns: usize) {
+    if columns > row.len() {
+        row.grow(columns);
+    } else {
+        assert!(
+            row.shrink(columns).is_none(),
+            "cold resize must not discard content"
+        );
     }
 }
 
@@ -591,6 +788,8 @@ mod tests {
         let expected = parser_rows();
         let mut actual = CompactRows::new(expected.clone(), 24, 80, cell_codec());
         let original_bytes = actual.history_storage_bytes();
+        // An unchanged grid must still obey a smaller subsequent allowance.
+        actual.bound_history_bytes(original_bytes);
         let budget = original_bytes / 2;
         actual.bound_history_bytes(budget);
         assert!(actual.history_storage_bytes() <= budget);
@@ -599,6 +798,136 @@ mod tests {
         assert_rows(&actual, &expected[..actual.len()]);
         actual.release_read_cache();
         assert!(actual.history_storage_bytes() <= budget);
+    }
+
+    #[test]
+    fn high_entropy_styles_obey_storage_budget_without_touching_visible_cells() {
+        use crate::vte::ansi::Rgb;
+        let mut random = 17u32;
+        let mut rows: Vec<Row<Cell>> = (0..1024).map(|_| Row::new(80)).collect();
+        for row in &mut rows {
+            for x in 0..80 {
+                random ^= random << 13;
+                random ^= random >> 17;
+                random ^= random << 5;
+                let cell = &mut row[Column(x)];
+                cell.c = char::from_u32(33 + random % 90).unwrap();
+                cell.fg = Color::Spec(Rgb {
+                    r: random as u8,
+                    g: (random >> 8) as u8,
+                    b: (random >> 16) as u8,
+                });
+            }
+        }
+        let expected = rows.clone();
+        let mut actual = CompactRows::new(rows, 24, 80, cell_codec());
+        let original = actual.history_storage_bytes();
+        assert!(original > 256 * 1024);
+        actual.bound_history_bytes(256 * 1024);
+        assert!(actual.history_storage_bytes() <= 256 * 1024);
+        assert!(actual.len() < expected.len());
+        assert!(actual.len() >= 24);
+        assert_rows(&actual, &expected[..actual.len()]);
+        actual.release_read_cache();
+        assert!(actual.history_storage_bytes() <= 256 * 1024);
+    }
+
+    #[test]
+    fn hard_line_resize_keeps_cold_payloads_compressed_and_splits_read_ranges() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static DECODED: AtomicUsize = AtomicUsize::new(0);
+        fn decode(bytes: &[u8]) -> Vec<Row<Cell>> {
+            DECODED.fetch_add(1, Ordering::Relaxed);
+            decode_cells(bytes)
+        }
+        let original = parser_rows();
+        let mut codec = cell_codec();
+        codec.decode = decode;
+        let mut storage = CompactRows::new(original.clone(), 24, 80, codec);
+        let original_ptr = storage.blocks.back().unwrap().bytes.as_ptr();
+        let count = storage.prepare_reflow(320);
+        assert!(count < storage.len());
+        let mut recent = storage.drain_rows();
+        for row in &mut recent {
+            resize_cell_row(row, 320);
+        }
+        storage.replace_rows(recent, 24, 320);
+        assert_eq!(
+            DECODED.load(Ordering::Relaxed),
+            0,
+            "resize decoded cold history"
+        );
+        assert_eq!(storage.block_rows, 16);
+        assert_eq!(storage.blocks.back().unwrap().bytes.as_ptr(), original_ptr);
+        for (index, row) in original.iter().cloned().enumerate() {
+            let mut expected = row;
+            resize_cell_row(&mut expected, 320);
+            assert_eq!(storage.row(index), &expected);
+        }
+        storage.release_read_cache();
+        assert!(DECODED.load(Ordering::Relaxed) > 0);
+        for columns in [4096, 80] {
+            storage.prepare_reflow(columns);
+            let mut recent = storage.drain_rows();
+            for row in &mut recent {
+                resize_cell_row(row, columns);
+            }
+            storage.replace_rows(recent, 24, columns);
+        }
+        assert_eq!(storage.block_rows, block_rows::<Cell>(80));
+        assert_eq!(storage.blocks.back().unwrap().bytes.as_ptr(), original_ptr);
+        assert_rows(&storage, &original);
+    }
+
+    #[test]
+    fn hard_line_parser_resize_matches_dense_across_cold_block_splits() {
+        struct Geometry(usize, usize);
+        impl Dimensions for Geometry {
+            fn total_lines(&self) -> usize {
+                self.1
+            }
+            fn screen_lines(&self) -> usize {
+                self.1
+            }
+            fn columns(&self) -> usize {
+                self.0
+            }
+        }
+        let config = Config {
+            scrolling_history: 1000,
+            ..Config::default()
+        };
+        let mut dense = Term::new(config.clone(), &Size, VoidListener);
+        let mut compact = Term::new(config, &Size, VoidListener);
+        compact.grid_mut().enable_compact_history();
+        let mut dense_parser: Processor = Processor::new();
+        let mut compact_parser: Processor = Processor::new();
+        for index in 0..500 {
+            let line = format!("\x1b[31m{index:06} 界 e\u{301}\x1b[0m\r\n");
+            dense_parser.advance(&mut dense, line.as_bytes());
+            compact_parser.advance(&mut compact, line.as_bytes());
+        }
+        for (columns, lines) in [
+            (320, 50),
+            (120, 40),
+            (139, 49),
+            (4096, 24),
+            (80, 24),
+            (9, 24),
+        ] {
+            dense.resize(Geometry(columns, lines));
+            compact.resize(Geometry(columns, lines));
+            assert_eq!(compact.grid().cursor, dense.grid().cursor);
+            assert_eq!(compact.grid().history_size(), dense.grid().history_size());
+            for line in -(dense.grid().history_size() as i32)..lines as i32 {
+                assert_eq!(
+                    compact.grid()[Line(line)],
+                    dense.grid()[Line(line)],
+                    "row {line} at {columns}x{lines}"
+                );
+                compact.grid_mut().release_history_read_cache();
+            }
+        }
     }
 
     #[test]
