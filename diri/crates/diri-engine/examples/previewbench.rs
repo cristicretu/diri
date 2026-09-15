@@ -5,7 +5,9 @@ use diri_engine::attach::AttachHub;
 use diri_engine::registry::Registry;
 use diri_engine::session::SessionSpec;
 use diri_engine::{Authority, ManifestEngine, PtySpec};
+use diri_proto::SessionId;
 use diri_proto::frames::{Frame, FrameCodec, FrameType};
+use diri_proto::preview_set::*;
 use serde_json::json;
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -146,6 +148,134 @@ impl Reader {
                     continue;
                 }
                 Err(_) => return None,
+            }
+        }
+    }
+}
+struct MuxReader {
+    stream: BufReader<UnixStream>,
+    decoder: PreviewSetDecoder,
+    queued: VecDeque<PreviewSetPacket>,
+    dimensions: BTreeMap<String, (u16, u16)>,
+    eof: bool,
+}
+impl MuxReader {
+    fn next(&mut self, deadline: Instant) -> Option<PreviewSetPacket> {
+        loop {
+            if let Some(packet) = self.queued.pop_front() {
+                return Some(packet);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            let mut bytes = [0; 64 * 1024];
+            match self.stream.read(&mut bytes) {
+                Ok(0) => {
+                    self.eof = true;
+                    return None;
+                }
+                Ok(count) => self
+                    .queued
+                    .extend(self.decoder.feed(&bytes[..count]).unwrap()),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(error) => panic!("mux read: {error}"),
+            }
+        }
+    }
+}
+fn open_mux(
+    hub: &AttachHub,
+    registry: &Arc<Mutex<Registry>>,
+    ids: &[String],
+) -> (MuxReader, std::thread::JoinHandle<()>) {
+    let (server, client) = UnixStream::pair().unwrap();
+    let hub = hub.clone();
+    let registry = Arc::clone(registry);
+    let worker = std::thread::spawn(move || {
+        let _ = hub.serve_preview_set(&registry, server, Vec::new());
+    });
+    client
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let mut stream = BufReader::new(client);
+    let mut line = String::new();
+    stream.read_line(&mut line).unwrap();
+    let ready: PreviewSetReady = serde_json::from_str(&line).unwrap();
+    assert_eq!(ready.version, PREVIEW_SET_VERSION);
+    let membership = PreviewSetMembership {
+        members: ids
+            .iter()
+            .map(|id| PreviewMember {
+                session_id: SessionId::new(id),
+                generation: 1,
+            })
+            .collect(),
+    };
+    let mut bytes = serde_json::to_vec(&membership).unwrap();
+    bytes.push(b'\n');
+    stream.get_mut().write_all(&bytes).unwrap();
+    let mut reader = MuxReader {
+        stream,
+        decoder: PreviewSetDecoder::default(),
+        queued: VecDeque::new(),
+        dimensions: BTreeMap::new(),
+        eof: false,
+    };
+    let mut modes = std::collections::HashSet::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while reader.dimensions.len() != ids.len() || modes.len() != ids.len() {
+        match reader.next(deadline).expect("mux initial seed") {
+            PreviewSetPacket::Unavailable { member, reason } => {
+                panic!("mux unavailable: {member:?} {reason:?}")
+            }
+            PreviewSetPacket::Chunk { member, frame } => {
+                if let Some(grid) = frame.grid_payload().unwrap() {
+                    if !reader.dimensions.contains_key(&member.session_id.0) {
+                        assert!(grid.is_full_snapshot);
+                    }
+                    reader
+                        .dimensions
+                        .insert(member.session_id.0, (grid.cols, grid.rows));
+                } else if frame.frame_type == FrameType::Modes {
+                    modes.insert(member.session_id.0);
+                }
+            }
+        }
+    }
+    (reader, worker)
+}
+#[derive(Default)]
+struct ReaderSamples {
+    dimensions: (u16, u16),
+    latency: Vec<u64>,
+    stamp: u128,
+    frames: u64,
+    bytes: u64,
+    eof: bool,
+    lifetime: u64,
+}
+impl ReaderSamples {
+    fn observe(&mut self, frame: &Frame) {
+        if let Some(grid) = frame.grid_payload().unwrap() {
+            self.frames += 1;
+            if let Some(row) = grid.changed_rows.iter().find(|row| row.y == 0) {
+                let text: String = row
+                    .cells
+                    .iter()
+                    .take(21)
+                    .filter_map(|cell| char::from_u32(cell.scalar))
+                    .collect();
+                if let Some(parsed) = text.strip_prefix('T').and_then(|s| s.parse::<u128>().ok())
+                    && parsed != self.stamp
+                {
+                    self.stamp = parsed;
+                    self.latency
+                        .push((now_ns().saturating_sub(parsed) / 1000) as u64);
+                }
             }
         }
     }
@@ -298,7 +428,8 @@ fn main() {
     let fps: u64 = args[2].parse().unwrap();
     let seconds: u64 = args.get(3).map_or(4, |a| a.parse().unwrap());
     assert!((2..=diri_proto::preview::MAX_PREVIEWS).contains(&count));
-    let diagnose = args.get(4).is_some_and(|arg| arg == "diagnose");
+    let diagnose = args.iter().any(|arg| arg == "diagnose");
+    let multiplex = args.iter().any(|arg| arg == "mux");
     let root = tempfile::tempdir().unwrap();
     let (engine, _) =
         ManifestEngine::load_dir(&diri_engine::detect::bundled_manifest_dir()).unwrap();
@@ -379,56 +510,88 @@ fn main() {
     let hub = AttachHub::new();
     let mut servers = Vec::new();
     let mut peers = Vec::new();
-    for id in &ids[..count] {
-        let (reader, server) = open(&hub, &registry, id, true, id == &ids[0]);
-        peers.push(reader);
+    let (mut slow, server) = open(&hub, &registry, &ids[0], true, true);
+    servers.push(server);
+    let mut mux = None;
+    if multiplex {
+        let (reader, server) = open_mux(&hub, &registry, &ids[1..count]);
+        mux = Some(reader);
         servers.push(server);
+    } else {
+        for id in &ids[1..count] {
+            let (reader, server) = open(&hub, &registry, id, true, false);
+            peers.push(reader);
+            servers.push(server);
+        }
     }
     let (mut active, server) = open(&hub, &registry, &ids[count], false, false);
     servers.push(server);
-    let mut slow = peers.remove(0);
     let end = Instant::now() + Duration::from_secs(seconds);
-    let readers: Vec<_> = peers
+    let mut readers: Vec<_> = peers
         .into_iter()
         .map(|mut reader| {
             std::thread::spawn(move || {
                 let reader_started = Instant::now();
-                let mut samples = Vec::new();
-                let mut stamp = 0;
-                let mut frames = 0;
+                let mut samples = ReaderSamples {
+                    dimensions: reader.dimensions,
+                    ..Default::default()
+                };
                 while let Some(frame) = reader.next(end) {
-                    if let Some(grid) = frame.grid_payload().unwrap() {
-                        frames += 1;
-                        if let Some(row) = grid.changed_rows.iter().find(|row| row.y == 0) {
-                            let text: String = row
-                                .cells
-                                .iter()
-                                .take(21)
-                                .filter_map(|cell| char::from_u32(cell.scalar))
-                                .collect();
-                            if let Some(parsed) =
-                                text.strip_prefix('T').and_then(|s| s.parse::<u128>().ok())
-                                && parsed != stamp
-                            {
-                                stamp = parsed;
-                                samples.push((now_ns().saturating_sub(stamp) / 1000) as u64);
-                            }
-                        }
-                    }
+                    samples.observe(&frame);
                 }
-                let bytes = reader.bytes;
+                samples.bytes = reader.bytes;
+                samples.eof = reader.eof;
+                samples.lifetime = reader_started.elapsed().as_millis() as u64;
                 let _ = reader.stream.get_ref().shutdown(std::net::Shutdown::Both);
-                (
-                    reader.dimensions,
-                    samples,
-                    frames,
-                    bytes,
-                    reader.eof,
-                    reader_started.elapsed().as_millis() as u64,
-                )
+                vec![samples]
             })
         })
         .collect();
+    if let Some(mut reader) = mux {
+        readers.push(std::thread::spawn(move || {
+            let reader_started = Instant::now();
+            let mut samples: BTreeMap<_, _> = reader
+                .dimensions
+                .iter()
+                .map(|(id, dimensions)| {
+                    (
+                        id.clone(),
+                        ReaderSamples {
+                            dimensions: *dimensions,
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect();
+            while let Some(packet) = reader.next(end) {
+                match packet {
+                    PreviewSetPacket::Chunk { member, frame } => {
+                        let sample = samples.get_mut(&member.session_id.0).unwrap();
+                        let frame_bytes = frame.payload.len() + 5;
+                        sample.bytes += (frame_bytes
+                            + PreviewSetHeader::Chunk {
+                                member,
+                                frame_bytes,
+                            }
+                            .encode()
+                            .unwrap()
+                            .len()) as u64;
+                        sample.observe(&frame);
+                    }
+                    PreviewSetPacket::Unavailable { member, reason } => {
+                        panic!("mux source became unavailable: {member:?} {reason:?}")
+                    }
+                }
+            }
+            let lifetime = reader_started.elapsed().as_millis() as u64;
+            for sample in samples.values_mut() {
+                sample.eof = reader.eof;
+                sample.lifetime = lifetime;
+            }
+            let _ = reader.stream.get_ref().shutdown(std::net::Shutdown::Both);
+            samples.into_values().collect()
+        }));
+    }
     let attached_rss = rss_kib();
     let attached_threads = thread_count();
     let start = Instant::now();
@@ -487,8 +650,19 @@ fn main() {
     let mut frames = 0;
     let mut bytes = 0;
     let mut groups: BTreeMap<(u16, u16), DimensionSamples> = BTreeMap::new();
-    for reader in readers {
-        let (dimensions, samples, f, b, eof, lifetime) = reader.join().unwrap();
+    for result in readers
+        .into_iter()
+        .flat_map(|reader| reader.join().unwrap())
+    {
+        let ReaderSamples {
+            dimensions,
+            latency: samples,
+            frames: f,
+            bytes: b,
+            eof,
+            lifetime,
+            ..
+        } = result;
         let group = groups.entry(dimensions).or_default();
         group.readers += 1;
         group.eof_readers += usize::from(eof);
@@ -564,7 +738,7 @@ fn main() {
     }
     println!(
         "{}",
-        json!({"count":count,"compiled_cap":diri_proto::preview::MAX_PREVIEWS,"fps":fps,"seconds":wall,
+        json!({"mode": if multiplex { "multiplex" } else { "separate" }, "stalled_preview_transport":"separate single-session socket in both modes", "count":count,"compiled_cap":diri_proto::preview::MAX_PREVIEWS,"fps":fps,"seconds":wall,
         "dimensions":"alternating 80x24 and 160x50","unattached_idle_cpu_seconds_per_second":unattached_idle_cpu,
         "rss_baseline_kib":baseline_rss,"baseline_threads":baseline_threads,"attached_threads":attached_threads,"peak_rss_kib":peak_rss,"normal_active_attachments":1,"stalled_previews":1,"rss_attached_kib":attached_rss,"rss_loaded_kib":loaded_rss,
         "process_cpu_seconds":cpu,"process_cpu_cores":cpu/wall,"input_p50_us":percentile(&input_us,50),
