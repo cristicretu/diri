@@ -74,13 +74,13 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
         ),
         ToolDefinition::new(
             "wait_for_agent",
-            "Wait for one session to finish a turn, need input, become idle, or exit without polling it from the model.",
+            "Wait for a session status without model polling. Already matching states return immediately; this does not acknowledge completion of a particular message. Exit or removal also ends the wait; inspect matched, removed, and session before assuming success.",
             json!({
                 "type": "object",
                 "properties": {
                     "session_id": {"type": "string"},
                     "until": {"type": "string", "enum": ["done", "needs_me", "idle", "exited"]},
-                    "timeout_s": {"type": "number", "default": 600}
+                    "timeout_s": {"type": "number", "default": 600, "minimum": 0, "maximum": 600}
                 },
                 "required": ["session_id"]
             }),
@@ -179,13 +179,13 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
         ),
         ToolDefinition::new(
             "wait_for_children",
-            "Wait until this session's selected child sessions settle, finish, or exit, then return all final statuses together.",
+            "Wait until selected child sessions settle, finish, or exit. Already matching states return immediately. Removed children are reported separately and cannot settle other working children. Omit session_ids for all direct children; an explicit empty array selects none.",
             json!({
                 "type": "object",
                 "properties": {
                     "session_ids": {"type": "array", "items": {"type": "string"}},
                     "until": {"type": "string", "enum": ["settled", "done", "exited"]},
-                    "timeout_s": {"type": "number", "default": 600}
+                    "timeout_s": {"type": "number", "default": 600, "minimum": 0, "maximum": 600}
                 }
             }),
         ),
@@ -226,7 +226,103 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
     if std::env::var_os("DIRIJOR_TEST_RUN_AVAILABLE").is_none() {
         tools.retain(|tool| tool.name != "test_run");
     }
+    for tool in &mut tools {
+        tool.input_schema["additionalProperties"] = json!(false);
+        for key in [
+            "kind",
+            "cwd",
+            "host",
+            "branch",
+            "base",
+            "name",
+            "repo",
+            "path",
+            "session_id",
+        ] {
+            if let Some(field) = tool.input_schema["properties"].get_mut(key) {
+                field["minLength"] = json!(1);
+            }
+        }
+        if let Some(field) = tool.input_schema["properties"].get_mut("session_ids") {
+            field["items"]["minLength"] = json!(1);
+        }
+    }
     tools
+}
+
+/// Validate the advertised argument contract before discovery, authorization,
+/// or any Engine call. Wrong optional types must never silently select defaults
+/// (especially submit, force, host, or the selection of child sessions).
+pub(crate) fn validate_arguments(tool: &str, arguments: &Value) -> Result<(), String> {
+    let mut definition = tool_definitions_for(&[])
+        .into_iter()
+        .find(|definition| definition.name == tool)
+        .ok_or_else(|| format!("unknown or unavailable tool: {tool}"))?;
+    // Kind aliases/custom commands are resolved against the live catalog by
+    // spawn; the static validator must not use an empty discovery enum.
+    if tool == "spawn_agent" {
+        definition.input_schema["properties"]["kind"]
+            .as_object_mut()
+            .unwrap()
+            .remove("enum");
+    }
+    validate_value(arguments, &definition.input_schema, "arguments")
+}
+
+fn validate_value(value: &Value, schema: &Value, path: &str) -> Result<(), String> {
+    let expected = schema["type"].as_str().unwrap_or("any");
+    let valid = match expected {
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "string" => value.is_string(),
+        "boolean" => value.is_boolean(),
+        "number" => value.as_f64().is_some_and(f64::is_finite),
+        _ => true,
+    };
+    if !valid {
+        return Err(format!("{path} must be {expected}"));
+    }
+    if let Some(allowed) = schema["enum"].as_array()
+        && !allowed.contains(value)
+    {
+        return Err(format!("{path} is not a supported value"));
+    }
+    if let Some(object) = value.as_object() {
+        if let Some(required) = schema["required"].as_array() {
+            for key in required.iter().filter_map(Value::as_str) {
+                if !object.contains_key(key) {
+                    return Err(format!("missing required argument: {key}"));
+                }
+            }
+        }
+        for (key, field) in object {
+            if let Some(field_schema) = schema["properties"].get(key) {
+                validate_value(field, field_schema, &format!("{path}.{key}"))?;
+            } else if schema["additionalProperties"] == false {
+                return Err(format!("unsupported argument: {key}"));
+            }
+        }
+    }
+    if let Some(entries) = value.as_array() {
+        for (index, entry) in entries.iter().enumerate() {
+            validate_value(entry, &schema["items"], &format!("{path}[{index}]"))?;
+        }
+    }
+    if let Some(text) = value.as_str() {
+        let length = text.chars().count() as u64;
+        if schema["minLength"].as_u64().is_some_and(|min| length < min)
+            || schema["maxLength"].as_u64().is_some_and(|max| length > max)
+        {
+            return Err(format!("{path} has an invalid length"));
+        }
+    }
+    if let Some(number) = value.as_f64()
+        && (schema["minimum"].as_f64().is_some_and(|min| number < min)
+            || schema["maximum"].as_f64().is_some_and(|max| number > max))
+    {
+        return Err(format!("{path} is outside the supported range"));
+    }
+    Ok(())
 }
 
 fn session_id_schema() -> Value {

@@ -13,6 +13,8 @@ use sha2::{Digest, Sha256};
 use crate::control::{ControlClient, ControlFailure, default_socket_path};
 use crate::tools::{ToolDefinition, tool_definitions_for};
 
+#[cfg(test)]
+mod audit_tests;
 mod policy;
 
 use policy::{McpPolicy, WRITE_POLICY, WriteAction};
@@ -27,6 +29,7 @@ const SPAWN_TIMEOUT: Duration = Duration::from_secs(300);
 pub struct Bridge {
     socket_path: PathBuf,
     caller: Option<String>,
+    cancellation: crate::cancellation::Cancellation,
 }
 
 impl Default for Bridge {
@@ -43,7 +46,30 @@ impl Bridge {
         Self {
             socket_path,
             caller,
+            cancellation: Default::default(),
         }
+    }
+
+    pub fn with_cancellation(mut self, cancellation: crate::cancellation::Cancellation) -> Self {
+        self.cancellation = cancellation;
+        self
+    }
+
+    fn connect(&self, timeout: Duration) -> Result<ControlClient, ControlFailure> {
+        if self.cancellation.is_cancelled() {
+            return Err(ControlFailure::Cancelled);
+        }
+        let mut client = ControlClient::connect(&self.socket_path, timeout)?
+            .with_cancellation(self.cancellation.clone())?;
+        let hello = client.request(Method::HELLO, json!({
+            "proto":diri_proto::WIRE_VERSION, "build":concat!("dirijor-mcp-", env!("CARGO_PKG_VERSION")),
+        }))?;
+        if hello["proto"].as_u64() != Some(u64::from(diri_proto::WIRE_VERSION))
+            || hello["engineKind"].as_str() != Some(diri_proto::RUST_ENGINE_KIND)
+        {
+            return Err(ControlFailure::Protocol("unsupported Engine identity or control protocol; update/restart Diri before using MCP".into()));
+        }
+        Ok(client)
     }
 
     pub fn tool_definitions(&self) -> Result<Vec<ToolDefinition>, String> {
@@ -68,6 +94,7 @@ impl Bridge {
     }
 
     pub fn call(&self, tool: &str, arguments: &Value) -> Result<Value, String> {
+        crate::tools::validate_arguments(tool, arguments)?;
         match tool {
             "spawn_agent" => self.spawn_agent(arguments),
             "list_agents" => self.list_agents(),
@@ -92,9 +119,13 @@ impl Bridge {
     }
 
     pub fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
-        let mut client =
-            ControlClient::connect(&self.socket_path, timeout).map_err(render_failure)?;
-        client.request(method, params).map_err(render_failure)
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| "invalid request timeout".to_owned())?;
+        let mut client = self.connect(timeout).map_err(render_failure)?;
+        client
+            .request_until(method.into(), params, deadline)
+            .map_err(render_failure)
     }
 
     fn request_typed<T: DeserializeOwned>(
@@ -115,6 +146,19 @@ impl Bridge {
         self.request_typed(Method::SESSION_LIST, json!({}), DEFAULT_TIMEOUT)
     }
 
+    fn sessions_before(&self, deadline: Instant) -> Result<Vec<SessionRecord>, ControlFailure> {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or(ControlFailure::Timeout)?;
+        let deadline = deadline.min(Instant::now() + DEFAULT_TIMEOUT);
+        let mut client = self.connect(remaining.min(DEFAULT_TIMEOUT))?;
+        let result = client.request_until(Method::SESSION_LIST.into(), json!({}), deadline)?;
+        serde_json::from_value::<SessionListResult>(result)
+            .map(|snapshot| snapshot.sessions)
+            .map_err(|_| ControlFailure::Protocol("invalid session snapshot".into()))
+    }
+
     fn spawn_agent(&self, arguments: &Value) -> Result<Value, String> {
         let snapshot = self.snapshot()?;
         McpPolicy::new(
@@ -132,6 +176,7 @@ impl Bridge {
     /// standalone `dirijor session spawn` command is a direct user automation
     /// surface and intentionally creates a root session without an MCP caller.
     pub fn spawn_user_session(&self, arguments: &Value) -> Result<Value, String> {
+        crate::tools::validate_arguments("spawn_agent", arguments)?;
         self.spawn_session(arguments, None)
     }
 
@@ -242,18 +287,63 @@ impl Bridge {
     fn wait_for_agent(&self, arguments: &Value) -> Result<Value, String> {
         let id = required_string(arguments, "session_id")?;
         let until = optional_string(arguments, "until").unwrap_or_else(|| "done".into());
-        let timeout_seconds = optional_number(arguments, "timeout_s")
-            .unwrap_or(600.0)
-            .max(0.0);
-        self.request(
-            Method::EVENTS_WAIT,
-            json!({
-                "sessionID": id,
-                "until": [until],
-                "timeoutMs": (timeout_seconds * 1000.0) as i64,
-            }),
-            Duration::from_secs_f64(timeout_seconds + 5.0),
-        )
+        let timeout =
+            Duration::from_secs_f64(optional_number(arguments, "timeout_s").unwrap_or(600.0));
+        let deadline = Instant::now() + timeout;
+        let snapshot_deadline = if timeout.is_zero() {
+            Instant::now() + DEFAULT_TIMEOUT
+        } else {
+            deadline
+        };
+        let refresh = || -> Result<Option<SessionRecord>, ControlFailure> {
+            Ok(self
+                .sessions_before(snapshot_deadline)?
+                .into_iter()
+                .find(|record| record.id.0 == id))
+        };
+        let matches = |record: &SessionRecord| match until.as_str() {
+            "done" | "idle" => matches!(record.status, SessionStatus::Idle),
+            "needs_me" => matches!(record.status, SessionStatus::NeedsInput(_)),
+            "exited" => matches!(record.status, SessionStatus::Exited(_)),
+            _ => false, // validated before dispatch
+        };
+        let terminal = |record: &Option<SessionRecord>| {
+            record.as_ref().is_none_or(|record| {
+                matches(record) || matches!(record.status, SessionStatus::Exited(_))
+            })
+        };
+        let mut latest = refresh().map_err(render_failure)?;
+        if latest.is_none() {
+            return Err(format!("no such session: {id}"));
+        }
+        if !terminal(&latest) && Instant::now() < deadline {
+            let mut client = self
+                .connect(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(DEFAULT_TIMEOUT),
+                )
+                .map_err(render_failure)?;
+            let result = client.subscribe_observing(
+                json!({
+                    "sessions":[id], "kinds":["session.updated", "session.removed"],
+                }),
+                deadline,
+                |_| {
+                    latest = refresh()?;
+                    Ok(!terminal(&latest))
+                },
+            );
+            if !matches!(result, Ok(()) | Err(ControlFailure::Timeout)) {
+                result.map_err(render_failure)?;
+            }
+        }
+        Ok(json!({
+            "session":latest,
+            "timedOut":!terminal(&latest),
+            "matched":latest.as_ref().is_some_and(matches),
+            "removed":latest.is_none(),
+        }))
     }
 
     fn read_output(&self, arguments: &Value) -> Result<Value, String> {
@@ -493,7 +583,17 @@ impl Bridge {
 
     fn wait_for_children(&self, arguments: &Value) -> Result<Value, String> {
         let caller = self.require_caller()?.to_owned();
-        let initial = self.sessions()?;
+        let timeout =
+            Duration::from_secs_f64(optional_number(arguments, "timeout_s").unwrap_or(600.0));
+        let deadline = Instant::now() + timeout;
+        let snapshot_deadline = if timeout.is_zero() {
+            Instant::now() + DEFAULT_TIMEOUT
+        } else {
+            deadline
+        };
+        let initial = self
+            .sessions_before(snapshot_deadline)
+            .map_err(render_failure)?;
         let lineage = Lineage::new(&initial, Some(&caller));
         let targets = child_subset(arguments, &lineage, &caller)?;
         if targets.is_empty() {
@@ -505,33 +605,30 @@ impl Bridge {
         }
         let wanted: HashSet<String> = targets.iter().map(|record| record.id.0.clone()).collect();
         let mode = optional_string(arguments, "until").unwrap_or_else(|| "settled".into());
-        let timeout = optional_number(arguments, "timeout_s")
-            .unwrap_or(600.0)
-            .max(0.0);
-        let deadline = Instant::now() + Duration::from_secs_f64(timeout);
-
-        let reassess = || -> Result<(Vec<SessionRecord>, bool), String> {
+        let reassess = || -> Result<(Vec<SessionRecord>, bool), ControlFailure> {
             let latest: Vec<SessionRecord> = self
-                .sessions()?
+                .sessions_before(snapshot_deadline)?
                 .into_iter()
                 .filter(|record| wanted.contains(&record.id.0))
                 .collect();
-            let settled = latest.len() != wanted.len()
-                || latest.iter().all(|record| reached(&mode, &record.status));
+            let settled = latest.iter().all(|record| reached(&mode, &record.status));
             Ok((latest, settled))
         };
-        let (mut latest, mut settled) = reassess()?;
+        let (mut latest, mut settled) = reassess().map_err(render_failure)?;
         if !settled && Instant::now() < deadline {
-            let mut client = ControlClient::connect(&self.socket_path, DEFAULT_TIMEOUT)
+            let mut client = self
+                .connect(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(DEFAULT_TIMEOUT),
+                )
                 .map_err(render_failure)?;
             let subscription = json!({
                 "sessions": wanted.iter().cloned().collect::<Vec<_>>(),
                 "kinds": ["session.updated", "session.removed"],
             });
-            let result = client.subscribe(subscription, deadline, |_, _, _| {
-                (latest, settled) = reassess().map_err(|message| {
-                    ControlFailure::Protocol(format!("could not refresh children: {message}"))
-                })?;
+            let result = client.subscribe_observing(subscription, deadline, |_| {
+                (latest, settled) = reassess()?;
                 Ok(!settled)
             });
             if !matches!(result, Ok(()) | Err(ControlFailure::Timeout)) {
@@ -543,6 +640,7 @@ impl Bridge {
             "timed_out": !settled,
             "children": latest.iter().map(|record| detailed(record, Relation::Child)).collect::<Vec<_>>(),
             "waited_for": mode,
+            "removed": wanted.iter().filter(|id| !latest.iter().any(|record| record.id.0 == **id)).collect::<Vec<_>>(),
         }))
     }
 
@@ -953,7 +1051,7 @@ fn child_subset<'a>(
 ) -> Result<Vec<&'a SessionRecord>, String> {
     let all = lineage.children(caller);
     let requested = optional_strings(arguments, "session_ids");
-    if requested.is_empty() {
+    if arguments.get("session_ids").is_none() {
         return Ok(all);
     }
     requested
@@ -983,7 +1081,7 @@ mod tests {
     use super::*;
     use diri_proto::{DateMillis, ProjectId, Resumability, TitleSource};
 
-    fn record(id: &str, parent: Option<&str>) -> SessionRecord {
+    pub(super) fn record(id: &str, parent: Option<&str>) -> SessionRecord {
         SessionRecord {
             attention_state: None,
             id: SessionId::new(id),
@@ -1031,6 +1129,20 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
+            let mut hello_line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut hello_line)
+                .unwrap();
+            let diri_proto::ControlMessage::Request { id, method, .. } =
+                serde_json::from_str(&hello_line).unwrap()
+            else {
+                panic!("hello");
+            };
+            assert_eq!(method, Method::HELLO);
+            serde_json::to_writer(&mut stream, &diri_proto::ControlMessage::Response {
+                id, result:Ok(json!({"proto":diri_proto::WIRE_VERSION, "engineKind":diri_proto::RUST_ENGINE_KIND})),
+            }).unwrap();
+            stream.write_all(b"\n").unwrap();
             let mut line = String::new();
             BufReader::new(stream.try_clone().unwrap())
                 .read_line(&mut line)

@@ -1,4 +1,4 @@
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -17,6 +17,7 @@ pub enum ControlFailure {
     Protocol(String),
     Daemon(ControlError),
     Timeout,
+    Cancelled,
 }
 
 impl std::fmt::Display for ControlFailure {
@@ -26,6 +27,7 @@ impl std::fmt::Display for ControlFailure {
             Self::Protocol(message) => formatter.write_str(message),
             Self::Daemon(error) => error.fmt(formatter),
             Self::Timeout => formatter.write_str("daemon request timed out"),
+            Self::Cancelled => formatter.write_str("request cancelled"),
         }
     }
 }
@@ -57,6 +59,9 @@ pub fn default_socket_path() -> PathBuf {
 pub struct ControlClient {
     stream: UnixStream,
     reader: BufReader<UnixStream>,
+    timeout: Duration,
+    cancellation: crate::cancellation::Cancellation,
+    _registration: Option<crate::cancellation::Registration>,
 }
 
 #[cfg(unix)]
@@ -66,16 +71,32 @@ impl ControlClient {
         stream.set_write_timeout(Some(timeout))?;
         stream.set_read_timeout(Some(timeout))?;
         let reader = BufReader::new(stream.try_clone()?);
-        Ok(Self { stream, reader })
+        Ok(Self {
+            stream,
+            reader,
+            timeout,
+            cancellation: Default::default(),
+            _registration: None,
+        })
     }
 
     pub fn connect_default(timeout: Duration) -> Result<Self, ControlFailure> {
         Self::connect(&default_socket_path(), timeout)
     }
 
-    pub fn set_read_timeout(&self, timeout: Duration) -> Result<(), ControlFailure> {
+    pub fn set_read_timeout(&mut self, timeout: Duration) -> Result<(), ControlFailure> {
+        self.timeout = timeout;
         self.stream.set_read_timeout(Some(timeout))?;
         Ok(())
+    }
+
+    pub fn with_cancellation(
+        mut self,
+        cancellation: crate::cancellation::Cancellation,
+    ) -> Result<Self, ControlFailure> {
+        self._registration = Some(cancellation.register(&self.stream)?);
+        self.cancellation = cancellation;
+        Ok(self)
     }
 
     pub fn request(
@@ -83,28 +104,58 @@ impl ControlClient {
         method: impl Into<String>,
         params: Value,
     ) -> Result<Value, ControlFailure> {
+        let deadline = Instant::now()
+            .checked_add(self.timeout)
+            .ok_or_else(|| ControlFailure::Protocol("invalid request timeout".into()))?;
+        self.request_until(method.into(), params, deadline)
+    }
+
+    pub(crate) fn request_until(
+        &mut self,
+        method: String,
+        params: Value,
+        deadline: Instant,
+    ) -> Result<Value, ControlFailure> {
         let id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
         let request = ControlMessage::Request {
             id,
-            method: method.into(),
+            method,
             params: Some(params),
         };
-        serde_json::to_writer(&mut self.stream, &request)
-            .map_err(|error| ControlFailure::Protocol(error.to_string()))?;
-        self.stream.write_all(b"\n")?;
-        self.stream.flush()?;
-
+        let mut bytes = serde_json::to_vec(&request)
+            .map_err(|_| ControlFailure::Protocol("could not encode daemon request".into()))?;
+        bytes.push(b'\n');
+        if bytes.len() > MAX_CONTROL_LINE_BYTES {
+            return Err(ControlFailure::Protocol(
+                "daemon request exceeds the frame limit; nothing was sent".into(),
+            ));
+        }
+        let mut written = 0;
+        while written < bytes.len() {
+            self.stream
+                .set_write_timeout(Some(self.remaining(deadline)?))?;
+            match self.stream.write(&bytes[written..]) {
+                Ok(0) => {
+                    return Err(ControlFailure::Protocol(
+                        "daemon closed the control connection".into(),
+                    ));
+                }
+                Ok(count) => written += count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(self.io_failure(error)),
+            }
+        }
         loop {
-            match self.read_message()? {
+            match self.read_message_until(deadline)? {
                 ControlMessage::Response {
                     id: response_id,
                     result,
                 } if response_id == id => return result.map_err(ControlFailure::Daemon),
                 ControlMessage::Event { .. } => continue,
-                other => {
-                    return Err(ControlFailure::Protocol(format!(
-                        "unexpected daemon message while waiting for request {id}: {other:?}"
-                    )));
+                _ => {
+                    return Err(ControlFailure::Protocol(
+                        "unexpected daemon message while waiting for a response".into(),
+                    ));
                 }
             }
         }
@@ -116,27 +167,37 @@ impl ControlClient {
         deadline: Instant,
         mut on_event: impl FnMut(&str, u64, &Value) -> Result<bool, ControlFailure>,
     ) -> Result<(), ControlFailure> {
-        let now = Instant::now();
-        if now >= deadline {
-            return Err(ControlFailure::Timeout);
-        }
-        self.set_read_timeout(deadline.saturating_duration_since(now))?;
-        let subscribed = self.request(diri_proto::Method::EVENTS_SUBSCRIBE, params)?;
+        self.subscribe_observing(params, deadline, |event| match event {
+            None => Ok(true),
+            Some((name, seq, params)) => on_event(name, seq, params),
+        })
+    }
+
+    /// The callback runs once after subscription is installed, then on events.
+    /// Read authoritative state on that first call to close the snapshot/event gap.
+    pub fn subscribe_observing(
+        &mut self,
+        params: Value,
+        deadline: Instant,
+        mut observe: impl FnMut(Option<(&str, u64, &Value)>) -> Result<bool, ControlFailure>,
+    ) -> Result<(), ControlFailure> {
+        let subscribed = self.request_until(
+            diri_proto::Method::EVENTS_SUBSCRIBE.into(),
+            params,
+            deadline,
+        )?;
         if subscribed.get("subscribed").and_then(Value::as_bool) != Some(true) {
             return Err(ControlFailure::Protocol(
                 "daemon did not acknowledge the event subscription".into(),
             ));
         }
-
+        if !observe(None)? {
+            return Ok(());
+        }
         loop {
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(ControlFailure::Timeout);
-            }
-            self.set_read_timeout(deadline.saturating_duration_since(now))?;
-            match self.read_message()? {
+            match self.read_message_until(deadline)? {
                 ControlMessage::Event { name, seq, params } => {
-                    if !on_event(&name, seq, &params)? {
+                    if !observe(Some((&name, seq, &params)))? {
                         return Ok(());
                     }
                 }
@@ -150,25 +211,55 @@ impl ControlClient {
         }
     }
 
-    fn read_message(&mut self) -> Result<ControlMessage, ControlFailure> {
+    fn remaining(&self, deadline: Instant) -> Result<Duration, ControlFailure> {
+        if self.cancellation.is_cancelled() {
+            return Err(ControlFailure::Cancelled);
+        }
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or(ControlFailure::Timeout)
+    }
+
+    fn io_failure(&self, error: io::Error) -> ControlFailure {
+        if self.cancellation.is_cancelled() {
+            ControlFailure::Cancelled
+        } else {
+            error.into()
+        }
+    }
+
+    fn read_message_until(&mut self, deadline: Instant) -> Result<ControlMessage, ControlFailure> {
         let mut line = Vec::new();
-        let read = self
-            .reader
-            .by_ref()
-            .take((MAX_CONTROL_LINE_BYTES + 1) as u64)
-            .read_until(b'\n', &mut line)?;
-        if read == 0 {
-            return Err(ControlFailure::Protocol(
-                "daemon closed the control connection".into(),
-            ));
+        loop {
+            // Recompute for every socket read, including partial JSON frames.
+            // A drip of bytes/events must not keep resetting the request timeout.
+            self.stream
+                .set_read_timeout(Some(self.remaining(deadline)?))?;
+            let buffered = match self.reader.fill_buf() {
+                Ok(bytes) if !bytes.is_empty() => bytes,
+                Ok(_) => {
+                    return Err(ControlFailure::Protocol(
+                        "daemon closed the control connection".into(),
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(self.io_failure(error)),
+            };
+            let newline = buffered.iter().position(|byte| *byte == b'\n');
+            let take = newline.map_or(buffered.len(), |position| position + 1);
+            if line.len() + take > MAX_CONTROL_LINE_BYTES {
+                return Err(ControlFailure::Protocol(
+                    "daemon message exceeds the frame limit".into(),
+                ));
+            }
+            line.extend_from_slice(&buffered[..take]);
+            self.reader.consume(take);
+            if newline.is_some() {
+                return serde_json::from_slice(&line)
+                    .map_err(|_| ControlFailure::Protocol("invalid daemon response".into()));
+            }
         }
-        if line.len() > MAX_CONTROL_LINE_BYTES {
-            return Err(ControlFailure::Protocol(format!(
-                "daemon message exceeds {MAX_CONTROL_LINE_BYTES} bytes"
-            )));
-        }
-        serde_json::from_slice(&line)
-            .map_err(|error| ControlFailure::Protocol(format!("invalid daemon response: {error}")))
     }
 }
 
@@ -191,6 +282,88 @@ impl ControlClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_deadline_survives_event_floods_and_partial_frames() {
+        for partial in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("engine.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let ControlMessage::Request { id, .. } = serde_json::from_str(&line).unwrap()
+                else {
+                    panic!("request");
+                };
+                let response = serde_json::to_vec(&ControlMessage::Response {
+                    id,
+                    result: Ok(serde_json::json!({})),
+                })
+                .unwrap();
+                let event = serde_json::to_vec(&ControlMessage::Event {
+                    name: "noise".into(),
+                    seq: 1,
+                    params: Value::Null,
+                })
+                .unwrap();
+                for byte in &response {
+                    std::thread::sleep(Duration::from_millis(10));
+                    let bytes = if partial {
+                        vec![*byte]
+                    } else {
+                        [event.as_slice(), b"\n"].concat()
+                    };
+                    if stream.write_all(&bytes).is_err() {
+                        return;
+                    }
+                }
+                if !partial {
+                    let _ = stream.write_all(&response);
+                }
+                let _ = stream.write_all(b"\n");
+            });
+            let mut client = ControlClient::connect(&path, Duration::from_millis(50)).unwrap();
+            let result = client.request("test", Value::Null);
+            drop(client);
+            worker.join().unwrap();
+            assert!(
+                matches!(result, Err(ControlFailure::Timeout)),
+                "incoming bytes extended the absolute deadline: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn protocol_errors_do_not_echo_daemon_payloads() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("engine.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            serde_json::to_writer(
+                &mut stream,
+                &ControlMessage::Request {
+                    id: 999,
+                    method: "unexpected".into(),
+                    params: Some(serde_json::json!({"secret":"private-test-payload"})),
+                },
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+        });
+        let mut client = ControlClient::connect(&path, Duration::from_secs(1)).unwrap();
+        let error = client.request("test", Value::Null).unwrap_err();
+        worker.join().unwrap();
+        assert!(!error.to_string().contains("private-test-payload"));
+    }
 
     #[test]
     fn explicit_socket_override_wins() {

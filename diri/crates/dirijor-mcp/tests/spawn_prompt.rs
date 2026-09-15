@@ -160,14 +160,30 @@ fn call_spawn_agent_through_mcp(socket: &Path, arguments: serde_json::Value) -> 
     });
     {
         let mut stdin = child.stdin.take().expect("MCP stdin");
+        for message in [
+            json!({"jsonrpc":"2.0", "id":"init", "method":"initialize", "params":{
+                "protocolVersion":"2025-06-18", "capabilities":{}, "clientInfo":{"name":"test", "version":"1"}
+            }}),
+            json!({"jsonrpc":"2.0", "method":"notifications/initialized"}),
+        ] {
+            serde_json::to_writer(&mut stdin, &message).unwrap();
+            stdin.write_all(b"\n").unwrap();
+        }
         serde_json::to_writer(&mut stdin, &request).expect("encode MCP call");
         stdin.write_all(b"\n").expect("write MCP call");
     }
 
     let mut line = String::new();
-    BufReader::new(child.stdout.take().expect("MCP stdout"))
+    let mut output = BufReader::new(child.stdout.take().expect("MCP stdout"));
+    output
         .read_line(&mut line)
-        .expect("read MCP response");
+        .expect("read initialize response");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&line).unwrap()["id"],
+        "init"
+    );
+    line.clear();
+    output.read_line(&mut line).expect("read MCP response");
     let status = child.wait().expect("wait for MCP server");
     let mut stderr = String::new();
     child
@@ -204,13 +220,20 @@ fn standalone_cli_spawn_creates_a_root_session_without_an_mcp_caller() {
 
     let server = start_server(temp.path(), &fixture, &repo);
     let bridge = Bridge::new(server.socket_path().to_path_buf(), None);
-    let spawned = bridge
-        .spawn_user_session(&json!({
-            "kind": "prompt-fixture",
-            "cwd": repo,
-            "name": "standalone CLI regression",
-        }))
-        .expect("standalone spawn");
+    let output = Command::new(env!("CARGO_BIN_EXE_dirijor"))
+        .args(["session", "spawn", "prompt-fixture", "--cwd"])
+        .arg(&repo)
+        .arg("--json")
+        .env("DIRIJOR_SOCKET", server.socket_path())
+        .env_remove("DIRIJOR_SESSION_ID")
+        .output()
+        .expect("spawn standalone CLI");
+    assert!(
+        output.status.success(),
+        "CLI spawn failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let spawned: serde_json::Value = serde_json::from_slice(&output.stdout).expect("CLI result");
     let id = spawned["id"].as_str().expect("session id");
     let sessions = bridge
         .request(Method::SESSION_LIST, json!({}), Duration::from_secs(3))

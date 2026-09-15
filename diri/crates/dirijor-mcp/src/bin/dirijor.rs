@@ -598,16 +598,21 @@ fn session_spawn(arguments: &[String]) -> Result<(), CliError> {
                 .map(|path| path.to_string_lossy().into_owned())
         })
         .ok_or_else(|| CliError::failure("could not determine the working directory"))?;
+    let mut params = json!({
+        "kind": kind,
+        "cwd": cwd,
+        "worktree": has_flag(arguments, "--worktree"),
+        "branch": option_value(arguments, "--branch"),
+        "prompt": option_value(arguments, "--prompt"),
+        "name": option_value(arguments, "--title").or_else(|| option_value(arguments, "--name")),
+        "host": option_value(arguments, "--host"),
+    });
+    params
+        .as_object_mut()
+        .expect("spawn object")
+        .retain(|_, value| !value.is_null());
     let result = bridge()
-        .spawn_user_session(&json!({
-            "kind": kind,
-            "cwd": cwd,
-            "worktree": has_flag(arguments, "--worktree"),
-            "branch": option_value(arguments, "--branch"),
-            "prompt": option_value(arguments, "--prompt"),
-            "name": option_value(arguments, "--title").or_else(|| option_value(arguments, "--name")),
-            "host": option_value(arguments, "--host"),
-        }))
+        .spawn_user_session(&params)
         .map_err(map_bridge_error)?;
     if has_flag(arguments, "--json") {
         print_json(&result);

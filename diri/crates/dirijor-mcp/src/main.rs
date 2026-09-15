@@ -1,4 +1,4 @@
-use std::io::{self, BufRead, Write};
+mod runtime;
 
 use dirijor_mcp::Bridge;
 use serde_json::{Value, json};
@@ -10,23 +10,18 @@ trait ToolBackend {
 
 struct DirectBackend {
     bridge: Bridge,
-    cached_tools: Option<Value>,
 }
 
 impl DirectBackend {
     fn new() -> Self {
         Self {
             bridge: Bridge::default(),
-            cached_tools: None,
         }
     }
 }
 
 impl ToolBackend for DirectBackend {
     fn tools(&mut self) -> Result<Value, String> {
-        if let Some(tools) = &self.cached_tools {
-            return Ok(tools.clone());
-        }
         let tools = json!({
             "tools": self
                 .bridge
@@ -35,7 +30,6 @@ impl ToolBackend for DirectBackend {
                 .map(|tool| tool.wire_value())
                 .collect::<Vec<_>>()
         });
-        self.cached_tools = Some(tools.clone());
         Ok(tools)
     }
 
@@ -54,7 +48,10 @@ fn error(id: Value, code: i64, message: impl Into<String>) -> Value {
 
 fn tool_content(result: Result<Value, String>) -> Value {
     let (value, is_error) = match result {
-        Ok(value) => (value, false),
+        Ok(value) => {
+            let is_error = value.get("ok") == Some(&Value::Bool(false));
+            (value, is_error)
+        }
         Err(message) => (Value::String(message), true),
     };
     let text = value.as_str().map_or_else(
@@ -68,6 +65,7 @@ fn initialize(params: &Value) -> Value {
     let version = params
         .get("protocolVersion")
         .and_then(Value::as_str)
+        .filter(|version| matches!(*version, "2024-11-05" | "2025-03-26" | "2025-06-18"))
         .unwrap_or("2025-06-18");
     let browser = if std::env::var_os("DIRIJOR_TEST_RUN_AVAILABLE").is_some() {
         " To test a web feature, use test_run with a preview URL from get_artifacts."
@@ -93,7 +91,7 @@ fn initialize(params: &Value) -> Value {
              only when the user explicitly wants a terminal or raw commands.\n\nTypical orchestration flow: spawn_agent \
              (optionally worktree:true and an initial prompt) → wait_for_agent(until:\"done\") \
              → read_output → send_prompt for follow-ups → release_agent when finished. \
-             Messages are delivered at most once. Reuse message_id on retries; never send a new copy because the agent is slow or its screen has not changed. Inspect unknown delivery outcomes. A delivery receipt does not mean the agent finished. \
+             Messages are delivered at most once. Reuse message_id on retries; never send a new copy because the agent is slow or its screen has not changed. Inspect unknown delivery outcomes. A delivery receipt does not mean the agent finished. Waits observe current status and may return immediately; verify output for the submitted task before treating it as completed. \
              get_artifacts returns PR/Linear/preview URLs and listening ports a session has \
              produced; PR entries include live GitHub status (state, review decision, checks, \
              comment counts, +/- lines).{browser}"
@@ -106,9 +104,29 @@ fn handle_message(message: Value, backend: &mut impl ToolBackend) -> Option<Valu
         Some(object) => object,
         None => return Some(error(Value::Null, -32600, "Invalid Request")),
     };
-    let method = object.get("method")?.as_str()?;
     let id = object.get("id").cloned();
-    let params = object.get("params").cloned().unwrap_or(Value::Null);
+    let response_id = id
+        .clone()
+        .filter(|id| id.is_string() || id.as_i64().is_some() || id.as_u64().is_some())
+        .unwrap_or(Value::Null);
+    let Some(method) = object.get("method").and_then(Value::as_str) else {
+        return Some(error(
+            response_id,
+            -32600,
+            "Invalid Request: method must be a string",
+        ));
+    };
+    if object.get("jsonrpc") != Some(&json!("2.0"))
+        || id
+            .as_ref()
+            .is_some_and(|id| !(id.is_string() || id.as_i64().is_some() || id.as_u64().is_some()))
+    {
+        return Some(error(response_id, -32600, "Invalid Request"));
+    }
+    let params = object.get("params").cloned().unwrap_or_else(|| json!({}));
+    if !params.is_object() {
+        return id.map(|id| error(id, -32602, "params must be an object"));
+    }
 
     match method {
         "initialize" => id.map(|id| success(id, initialize(&params))),
@@ -140,26 +158,7 @@ fn handle_message(message: Value, backend: &mut impl ToolBackend) -> Option<Valu
 }
 
 fn main() {
-    let stdin = io::stdin();
-    let mut stdout = io::BufWriter::new(io::stdout().lock());
-    let mut backend = DirectBackend::new();
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
-        if line.trim().is_empty() {
-            continue;
-        }
-        let response = match serde_json::from_str::<Value>(&line) {
-            Ok(message) => handle_message(message, &mut backend),
-            Err(_) => Some(error(Value::Null, -32700, "Parse error")),
-        };
-        if let Some(response) = response
-            && (serde_json::to_writer(&mut stdout, &response).is_err()
-                || stdout.write_all(b"\n").is_err()
-                || stdout.flush().is_err())
-        {
-            break;
-        }
-    }
+    runtime::serve();
 }
 
 #[cfg(test)]
@@ -178,6 +177,12 @@ mod tests {
                 .then(|| json!({"agents":[]}))
                 .ok_or_else(|| "unknown tool".to_owned())
         }
+    }
+
+    #[test]
+    fn unknown_delivery_is_not_marked_as_a_successful_tool_call() {
+        let result = tool_content(Ok(json!({"ok":false, "receipt":{"delivery":"unknown"}})));
+        assert_eq!(result["isError"], true);
     }
 
     #[test]

@@ -660,6 +660,38 @@ repaint without extra Enter, repeated and concurrent MCP calls, intentional
 repeats, conflicting identities, durable reopen/crash reservations, and
 corrupt/symlinked storage. Existing remote at-most-once transport gates remain.
 
+### MCP request lifecycle and waits
+
+The Rust MCP bridge verifies `Hello.proto` and the explicit Rust `engineKind`
+on every Engine connection before issuing a tool request. Missing, legacy, and
+unknown identities fail closed. This verification shares the operation's deadline
+and cancellation scope. Tool arguments are validated against the advertised
+schema before discovery, authorization, or effects; invalid optional values do
+not silently choose defaults such as submitting text or selecting a local host.
+
+Each stdio MCP process admits at most eight concurrent read calls and an ordered
+mutation worker with eight queued mutations. Excess calls fail before dispatch.
+The input loop remains available for protocol startup, ping, and cancellation.
+Cancellation closes a read call's Engine sockets or suppresses a queued mutation
+before it starts. Once a mutation starts, cancellation cannot promise to undo its
+effects and does not interrupt it. EOF cancels reads and drains accepted mutations.
+These are MCP cold-path resources; they add no Holder task, parser, or lock.
+
+Wait tools use a bounded event subscription followed by an authoritative snapshot,
+then re-read on updates/removals/drop markers. This closes the snapshot/subscribe
+race. A removed child is reported separately and does not settle another working
+child. Single-session waits stop on exit/removal even when the requested status
+cannot be reached. Waits observe current status, not a particular message's
+completion. Requests use absolute deadlines across partial frames and event
+traffic, and cancellation releases the local subscription connection.
+
+Acceptance adds real MCP subprocess tests for ping during blocked calls,
+cancellation, mutation ordering, overload, initialization, version negotiation,
+and oversized-frame recovery; fixture Engine tests cover wait races, validation,
+identity rejection, and deadline enforcement. A 50-ping debug sample while a tool
+was blocked measured approximately 37 microseconds median / 77 microseconds p95.
+See [the MCP reliability audit](docs/mcp-reliability-audit.md) for scope and limits.
+
 ## Wire protocol
 
 `diri-proto::remote_pty` is the versioned protocol authority. Protocol 1.3

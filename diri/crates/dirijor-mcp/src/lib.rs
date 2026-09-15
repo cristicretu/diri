@@ -6,6 +6,7 @@
 //! language runtime.
 
 pub mod bridge;
+pub mod cancellation;
 pub mod control;
 pub mod tools;
 
