@@ -2100,13 +2100,21 @@ mod tests {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("preview.sock");
-        let executor = tokio::runtime::Runtime::new().unwrap();
+        // GPUI's deterministic executor rejects wakes from foreign threads.
+        // Drive real socket tasks on this test thread while waiting for I/O.
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let listener = {
             let _entered = executor.enter();
             tokio::net::UnixListener::bind(&socket).unwrap()
         };
         let opened = Arc::new(AtomicUsize::new(0));
         let closed = Arc::new(AtomicUsize::new(0));
+        let began = std::time::Instant::now();
+        let events = Arc::new(std::sync::Mutex::new(Vec::<(String, u128)>::new()));
+        let server_events = events.clone();
         let server_opened = opened.clone();
         let server_closed = closed.clone();
         let server = executor.spawn(async move {
@@ -2114,6 +2122,7 @@ mod tests {
                 let (stream, _) = listener.accept().await.unwrap();
                 let opened = server_opened.clone();
                 let closed = server_closed.clone();
+                let events = server_events.clone();
                 tokio::spawn(async move {
                     let mut stream = BufReader::new(stream);
                     let mut line = String::new();
@@ -2138,10 +2147,18 @@ mod tests {
                         .write_all(&FrameCodec::encode(&Frame::grid(&update).unwrap()).unwrap())
                         .await
                         .unwrap();
+                    events.lock().unwrap().push((
+                        format!("opened {}", request["preview"]),
+                        began.elapsed().as_micros(),
+                    ));
                     opened.fetch_add(1, Ordering::SeqCst);
                     let mut effects = Vec::new();
                     stream.read_to_end(&mut effects).await.unwrap();
                     assert!(effects.is_empty());
+                    events.lock().unwrap().push((
+                        format!("EOF {}", request["preview"]),
+                        began.elapsed().as_micros(),
+                    ));
                     closed.fetch_add(1, Ordering::SeqCst);
                 });
             }
@@ -2218,9 +2235,22 @@ mod tests {
             (100, 40)
         );
         // Moving two cards offscreen drops their sockets before dismissal.
+        events
+            .lock()
+            .unwrap()
+            .push(("resize begins".into(), began.elapsed().as_micros()));
         cx.simulate_resize(size(px(250.0), px(700.0)));
         assert!(cx.debug_bounds("TAB_PEEK_CARD_1").is_some());
         assert!(cx.debug_bounds("TAB_PEEK_CARD_2").is_none());
+        surfaces.read_with(cx, |s, _| {
+            assert!(s.live_previews.get(&session(1).id).is_some());
+            assert!(s.live_previews.get(&session(2).id).is_none());
+            assert!(s.live_previews.get(&session(3).id).is_none());
+        });
+        events.lock().unwrap().push((
+            "slots retained running-01; dropped running-02/running-03".into(),
+            began.elapsed().as_micros(),
+        ));
         executor.block_on(async {
             tokio::time::timeout(std::time::Duration::from_secs(2), async {
                 while closed.load(Ordering::SeqCst) != 2 {
@@ -2228,7 +2258,14 @@ mod tests {
                 }
             })
             .await
-            .unwrap();
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{error}: opened {}, closed {}; events (microseconds): {:?}",
+                    opened.load(Ordering::SeqCst),
+                    closed.load(Ordering::SeqCst),
+                    events.lock().unwrap()
+                )
+            });
         });
         cx.simulate_keystrokes("escape");
         assert!(!surfaces.read_with(cx, |s, _| s.peek.visible()));
@@ -2241,6 +2278,10 @@ mod tests {
             .await
             .unwrap();
         });
+        eprintln!(
+            "preview lifecycle (microseconds): {:?}",
+            events.lock().unwrap()
+        );
         server.abort();
     }
 
