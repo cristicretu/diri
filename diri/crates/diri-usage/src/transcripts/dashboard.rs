@@ -5,7 +5,7 @@ use super::{UsageHourAgg, UsageProvider, UsageTotals};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub(crate) type ModelHours = BTreeMap<String, BTreeMap<i64, UsageDetail>>;
+pub type ModelHours = BTreeMap<String, BTreeMap<i64, UsageDetail>>;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct UsageDetail {
@@ -53,12 +53,12 @@ pub(crate) fn record_billed(hours: &mut ModelHours, model: &str, hour: i64, toke
         });
 }
 
-pub(crate) fn record(
+pub fn record(
     hours: &mut ModelHours,
     model: &str,
     hour: i64,
     tokens: UsageHourAgg,
-    pricing: Option<diri_usage::ModelPricing>,
+    pricing: Option<crate::ModelPricing>,
     reasoning: i64,
 ) {
     let detail = UsageDetail {
@@ -86,9 +86,9 @@ pub(crate) fn record(
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct UsageHistory {
-    pub(crate) claude: ModelHours,
-    pub(crate) codex: ModelHours,
-    pub(crate) cursor: ModelHours,
+    pub claude: ModelHours,
+    pub codex: ModelHours,
+    pub cursor: ModelHours,
 }
 
 #[derive(Clone, Debug)]
@@ -123,7 +123,7 @@ pub struct UsageReport {
 }
 
 impl UsageHistory {
-    pub(crate) fn merge(&mut self, provider: UsageProvider, details: &ModelHours) {
+    pub fn merge(&mut self, provider: UsageProvider, details: &ModelHours) {
         let destination = match provider {
             UsageProvider::Claude => &mut self.claude,
             UsageProvider::Codex => &mut self.codex,
@@ -210,4 +210,85 @@ pub fn date_label(day: i64) -> String {
     let m = mp + if mp < 10 { 3 } else { -9 };
     let y = yoe + era * 400 + i64::from(m <= 2);
     format!("{y:04}-{m:02}-{d:02}")
+}
+
+impl UsageHistory {
+    pub fn remote_summary(
+        &self,
+        collected_at: i64,
+        source_id: String,
+    ) -> Result<diri_proto::remote_pty::TranscriptUsageResult, &'static str> {
+        use diri_proto::remote_pty::{
+            MAX_USAGE_BUCKETS, TranscriptUsageBucket, TranscriptUsageResult,
+        };
+        let mut result = TranscriptUsageResult {
+            source_id,
+            collected_at,
+            buckets: Vec::new(),
+        };
+        let today = collected_at.div_euclid(86_400);
+        for (provider, models) in [("claude", &self.claude), ("codex", &self.codex)] {
+            for (model, hours) in models {
+                let mut days = BTreeMap::<i64, UsageDetail>::new();
+                for (&hour, &detail) in hours {
+                    let day = hour.div_euclid(24);
+                    if (today - 91..=today).contains(&day) {
+                        days.entry(day).or_default().merge(detail);
+                    }
+                }
+                for (day, detail) in days {
+                    if result.buckets.len() == MAX_USAGE_BUCKETS {
+                        return Err("remote usage bucket limit exceeded");
+                    }
+                    result.buckets.push(TranscriptUsageBucket {
+                        provider: provider.into(),
+                        model: model.clone(),
+                        day,
+                        input: detail.tokens.i,
+                        output: detail.tokens.o,
+                        cache_read: detail.tokens.cr,
+                        cache_write: detail.tokens.cw,
+                        reasoning: detail.reasoning,
+                        priced_tokens: detail.priced_tokens,
+                        estimated_usd: detail.tokens.c,
+                        read_savings_usd: detail.read_savings,
+                    });
+                }
+            }
+        }
+        result.validate()?;
+        Ok(result)
+    }
+
+    /// The caller replaces the per-host snapshot before building this projection.
+    pub fn merge_remote(
+        &mut self,
+        result: &diri_proto::remote_pty::TranscriptUsageResult,
+    ) -> Result<(), &'static str> {
+        result.validate()?;
+        for row in &result.buckets {
+            let provider = if row.provider == "claude" {
+                UsageProvider::Claude
+            } else {
+                UsageProvider::Codex
+            };
+            let detail = UsageDetail {
+                tokens: UsageHourAgg {
+                    i: row.input,
+                    o: row.output,
+                    cr: row.cache_read,
+                    cw: row.cache_write,
+                    c: row.estimated_usd,
+                },
+                reasoning: row.reasoning,
+                priced_tokens: row.priced_tokens,
+                read_savings: row.read_savings_usd,
+            };
+            self.merge(
+                provider,
+                &BTreeMap::from([(row.model.clone(), BTreeMap::from([(row.day * 24, detail)]))]),
+            );
+        }
+        Ok(())
+    }
 }

@@ -30,6 +30,8 @@ fn source_build_id() -> String {
         workspace.join("vendor/vte/src"),
         workspace.join("vendor/alacritty_terminal/Cargo.toml"),
         workspace.join("vendor/alacritty_terminal/src"),
+        workspace.join("crates/diri-usage/Cargo.toml"),
+        workspace.join("crates/diri-usage/src"),
         workspace.join("crates/diri-proto/Cargo.toml"),
         workspace.join("crates/diri-proto/src"),
         workspace.join("crates/diri-pty/Cargo.toml"),

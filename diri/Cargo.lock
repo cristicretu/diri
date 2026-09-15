@@ -1648,6 +1648,7 @@ dependencies = [
  "diri-proto",
  "diri-pty",
  "diri-terminal-state",
+ "diri-usage",
  "getrandom 0.4.3",
  "libc",
  "serde",
@@ -1694,6 +1695,13 @@ dependencies = [
 [[package]]
 name = "diri-usage"
 version = "0.1.0"
+dependencies = [
+ "diri-proto",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
 
 [[package]]
 name = "diri-web"

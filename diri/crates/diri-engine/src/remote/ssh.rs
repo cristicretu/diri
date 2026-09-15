@@ -22,6 +22,7 @@ pub struct SshTransport {
     executable: OsString,
     destination: String,
     control_path: PathBuf,
+    batch_mode: bool,
 }
 
 impl SshTransport {
@@ -31,12 +32,19 @@ impl SshTransport {
             executable: OsString::from("ssh"),
             destination: host.ssh.clone(),
             control_path: control_path.into(),
+            batch_mode: false,
         }
     }
 
     #[must_use]
     pub fn with_executable(mut self, executable: impl Into<OsString>) -> Self {
         self.executable = executable.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_batch_mode(mut self, enabled: bool) -> Self {
+        self.batch_mode = enabled;
         self
     }
 
@@ -60,6 +68,14 @@ impl SshTransport {
         ];
         push_control_path(&mut arguments, &self.control_path);
         push_keepalives(&mut arguments);
+        if self.batch_mode {
+            arguments.extend([
+                OsString::from("-o"),
+                OsString::from("BatchMode=yes"),
+                OsString::from("-o"),
+                OsString::from("StrictHostKeyChecking=yes"),
+            ]);
+        }
         arguments.push(OsString::from("--"));
         arguments.push(OsString::from(&self.destination));
         CommandSpec {
@@ -181,6 +197,14 @@ impl SshTransport {
         ];
         push_control_path(&mut arguments, &self.control_path);
         push_keepalives(&mut arguments);
+        if self.batch_mode {
+            arguments.extend([
+                OsString::from("-o"),
+                OsString::from("BatchMode=yes"),
+                OsString::from("-o"),
+                OsString::from("StrictHostKeyChecking=yes"),
+            ]);
+        }
         // End local option parsing before the user-configured destination.
         // A separator after the destination would instead become part of the
         // remote command sent to the login shell.
@@ -207,6 +231,14 @@ impl SshTransport {
             OsString::from("ControlPath=none"),
         ];
         push_keepalives(&mut arguments);
+        if self.batch_mode {
+            arguments.extend([
+                OsString::from("-o"),
+                OsString::from("BatchMode=yes"),
+                OsString::from("-o"),
+                OsString::from("StrictHostKeyChecking=yes"),
+            ]);
+        }
         arguments.push(OsString::from("--"));
         arguments.push(OsString::from(&self.destination));
         arguments.push(OsString::from(posix_shell_command(remote_command)));
@@ -240,6 +272,7 @@ pub enum HelperCommand {
     Environment,
     Directories,
     Executables,
+    Usage,
     Persistence,
 }
 
@@ -255,6 +288,7 @@ impl HelperCommand {
             Self::Environment => "environment",
             Self::Directories => "directories",
             Self::Executables => "executables",
+            Self::Usage => "usage",
             Self::Persistence => "persistence",
         }
     }

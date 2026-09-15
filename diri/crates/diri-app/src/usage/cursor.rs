@@ -14,7 +14,10 @@ use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-use super::{cache::CursorFetchWindow, model::UsageHourAgg, parser::fnv1a};
+pub(crate) use diri_usage::transcripts::cursor::CursorBatch;
+#[cfg(test)]
+use diri_usage::transcripts::cursor::event_hour;
+use diri_usage::transcripts::{CursorFetchWindow, cursor::CursorUsageEvent};
 
 const DASHBOARD_URL: &str = "https://cursor.com/api/dashboard/get-filtered-usage-events";
 const OAUTH_TOKEN_URL: &str = "https://api2.cursor.sh/oauth/token";
@@ -22,34 +25,7 @@ const OAUTH_TOKEN_URL: &str = "https://api2.cursor.sh/oauth/token";
 const OAUTH_CLIENT_ID: &str = "KbZUR41cY7W6zRSdpSUJ7I7mLYBKOCmB";
 const PAGE_SIZE: u32 = 100;
 const MAX_PAGES: u32 = 10;
-const OVERLAP_MS: i64 = 5 * 60 * 1000;
 const FETCH_TIMEOUT_SECS: u64 = 25;
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct CursorUsageEvent {
-    pub id: String,
-    pub timestamp_ms: i64,
-    pub model: String,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub cache_read_tokens: i64,
-    pub cache_write_tokens: i64,
-    pub cost: f64,
-}
-
-pub(crate) fn event_hour(event: &CursorUsageEvent) -> i64 {
-    event.timestamp_ms.div_euclid(3_600_000)
-}
-
-pub(crate) fn event_aggregate(event: &CursorUsageEvent) -> UsageHourAgg {
-    UsageHourAgg {
-        i: event.input_tokens,
-        o: event.output_tokens,
-        cr: event.cache_read_tokens,
-        cw: event.cache_write_tokens,
-        c: event.cost,
-    }
-}
 
 pub(crate) fn map_dashboard_event(value: &Value) -> Option<CursorUsageEvent> {
     let timestamp_ms = parse_timestamp_ms(value.get("timestamp"))?;
@@ -167,13 +143,6 @@ struct CursorAuth {
     session_token: String,
     refresh_token: Option<String>,
     machine_id: Option<String>,
-}
-
-/// A bounded page batch; only a complete walk may advance the committed watermark.
-pub(crate) struct CursorBatch {
-    pub events: Vec<CursorUsageEvent>,
-    pub window: CursorFetchWindow,
-    pub complete: bool,
 }
 
 /// One independent fetch at a time. Transcript updates never wait on this task.
@@ -559,14 +528,6 @@ fn float_value(value: &Value) -> f64 {
         .as_f64()
         .or_else(|| value.as_i64().map(|number| number as f64))
         .unwrap_or(0.0)
-}
-
-pub(crate) fn cursor_overlap_ms() -> i64 {
-    OVERLAP_MS
-}
-
-pub(crate) fn event_dedup_hash(id: &str) -> u64 {
-    fnv1a(id)
 }
 
 #[cfg(test)]

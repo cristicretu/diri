@@ -276,6 +276,7 @@ pub struct UtilitySurfaces {
     settings_tab: SettingsTab,
     usage: crate::usage::UsageSnapshot,
     usage_days: usize,
+    usage_host: Option<String>,
     usage_tokens: bool,
     usage_by_day: bool,
     release_notes: ReleaseNotesState,
@@ -425,6 +426,7 @@ impl UtilitySurfaces {
             settings_tab,
             usage: crate::usage::UsageSnapshot::default(),
             usage_days: 30,
+            usage_host: None,
             usage_tokens: false,
             usage_by_day: false,
             release_notes: ReleaseNotesState::default(),
@@ -6194,9 +6196,29 @@ mod tests {
         surfaces.update(cx, |surfaces, cx| {
             surfaces.open_settings_tab(SettingsTab::Usage, cx);
             surfaces.usage.updated_at = 1_788_523_200;
+            surfaces.usage.remote = vec![crate::usage::RemoteUsageSnapshot {
+                host: "forge".into(),
+                name: "Forge".into(),
+                status: crate::usage::RemoteUsageStatus::Unavailable,
+                data: None,
+            }];
         });
         cx.run_until_parked();
-        for selector in ["usage-range-7", "usage-tokens", "usage-by-day"] {
+        for selector in [
+            "usage-range-7",
+            "usage-tokens",
+            "usage-source-forge",
+            "usage-by-day",
+        ] {
+            if selector == "usage-by-day" {
+                surfaces.update(cx, |surfaces, cx| {
+                    surfaces
+                        .settings_scroll
+                        .set_offset(point(px(0.0), px(-300.0)));
+                    cx.notify();
+                });
+                cx.run_until_parked();
+            }
             let bounds = cx.debug_bounds(selector).expect("visible usage control");
             cx.simulate_click(bounds.center(), Modifiers::default());
             cx.run_until_parked();
@@ -6205,6 +6227,7 @@ mod tests {
             assert_eq!(surfaces.usage_days, 7);
             assert!(surfaces.usage_tokens);
             assert!(surfaces.usage_by_day);
+            assert_eq!(surfaces.usage_host.as_deref(), Some("forge"));
         });
         assert!(settings_tab_matches(SettingsTab::Usage, "cache savings"));
         assert!(settings_tab_matches(SettingsTab::Usage, "cost"));
@@ -6296,9 +6319,36 @@ mod tests {
                             .ok()
                             .and_then(|v| v.parse().ok())
                             .unwrap_or(30);
+                        let remote = if std::env::var_os("DIRI_VISUAL_REMOTE").is_some() {
+                            let data = history
+                                .remote_summary(now, "a".repeat(32))
+                                .expect("remote fixture");
+                            vec![
+                                crate::usage::RemoteUsageSnapshot {
+                                    host: "forge".into(),
+                                    name: "Forge".into(),
+                                    status: crate::usage::RemoteUsageStatus::Ready,
+                                    data: Some(Arc::new(data.clone())),
+                                },
+                                crate::usage::RemoteUsageSnapshot {
+                                    host: "build".into(),
+                                    name: "Build server".into(),
+                                    status: crate::usage::RemoteUsageStatus::Unavailable,
+                                    data: Some(Arc::new(
+                                        diri_proto::remote_pty::TranscriptUsageResult {
+                                            source_id: "b".repeat(32),
+                                            ..data
+                                        },
+                                    )),
+                                },
+                            ]
+                        } else {
+                            Vec::new()
+                        };
                         surfaces.set_usage(
                             crate::usage::UsageSnapshot {
                                 updated_at: now,
+                                remote,
                                 history: Arc::new(history),
                                 ..Default::default()
                             },

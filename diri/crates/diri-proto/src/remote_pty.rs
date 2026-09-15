@@ -18,7 +18,7 @@ use crate::grid::{GridCodecError, GridUpdate};
 use crate::terminal::MouseModes;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 6;
+pub const PROTOCOL_MINOR: u16 = 7;
 pub const TERMINAL_ANNOTATIONS_PROTOCOL_MINOR: u16 = 6;
 pub const MOUSE_INPUT_PROTOCOL_MINOR: u16 = 4;
 pub const FOREGROUND_PROCESS_PROTOCOL_MINOR: u16 = 5;
@@ -92,6 +92,8 @@ pub enum RemoteCapability {
     /// Helper can resolve a bounded batch of executable names against the
     /// account login PATH and validate user-selected executable paths.
     ExecutableDiscovery,
+    /// Short-lived transcript accounting; never part of a Holder handshake.
+    TranscriptUsage,
     /// Helper CLI can execute the detach/supervisor persistence probe.
     PersistenceProbe,
     /// Uploaded Helper can activate itself without replacing different bytes.
@@ -123,6 +125,7 @@ impl RemoteCapability {
             Self::EnvironmentCapture => "environment-capture",
             Self::DirectoryList => "directory-list",
             Self::ExecutableDiscovery => "executable-discovery",
+            Self::TranscriptUsage => "transcript-usage",
             Self::PersistenceProbe => "persistence-probe",
             Self::AtomicActivation => "atomic-activation",
             Self::AgentEvents => "agent-events",
@@ -160,6 +163,7 @@ pub const PHASE_ONE_HELPER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::EnvironmentCapture,
     RemoteCapability::DirectoryList,
     RemoteCapability::ExecutableDiscovery,
+    RemoteCapability::TranscriptUsage,
     RemoteCapability::PersistenceProbe,
     RemoteCapability::AtomicActivation,
 ];
@@ -185,6 +189,7 @@ pub const ANNOTATED_HELPER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::EnvironmentCapture,
     RemoteCapability::DirectoryList,
     RemoteCapability::ExecutableDiscovery,
+    RemoteCapability::TranscriptUsage,
     RemoteCapability::PersistenceProbe,
     RemoteCapability::AtomicActivation,
     RemoteCapability::TerminalAnnotations,
@@ -1549,5 +1554,170 @@ mod tests {
                 max: MAX_FRAME_BYTES,
             })
         );
+    }
+}
+
+/// Bounded summary contract for the stateless `usage` command. No transcript
+/// text, paths, session identifiers or credentials belong in this response.
+pub const MAX_USAGE_BUCKETS: usize = 4096;
+pub const MAX_USAGE_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptUsageResult {
+    /// Stable identity of this remote account’s usage store (deduplicates SSH aliases).
+    pub source_id: String,
+    pub collected_at: i64,
+    pub buckets: Vec<TranscriptUsageBucket>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptUsageBucket {
+    pub provider: String,
+    pub model: String,
+    /// Epoch day (UTC). The display does not need individual request times.
+    pub day: i64,
+    pub input: i64,
+    pub output: i64,
+    pub cache_read: i64,
+    pub cache_write: i64,
+    pub reasoning: i64,
+    pub priced_tokens: i64,
+    pub estimated_usd: f64,
+    pub read_savings_usd: f64,
+}
+
+impl TranscriptUsageResult {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.source_id.len() != 32
+            || !self.source_id.bytes().all(|b| b.is_ascii_hexdigit())
+            || self.collected_at <= 0
+            || self.buckets.len() > MAX_USAGE_BUCKETS
+        {
+            return Err("invalid remote usage summary");
+        }
+        let today = self.collected_at.div_euclid(86_400);
+        let mut tokens = 0_i64;
+        let mut keys = std::collections::HashSet::new();
+        for row in &self.buckets {
+            if !matches!(row.provider.as_str(), "claude" | "codex")
+                || row.model.is_empty()
+                || row.model.len() > 128
+                || row.model.chars().any(char::is_control)
+                || !(today - 91..=today).contains(&row.day)
+                || !keys.insert((&row.provider, &row.model, row.day))
+            {
+                return Err("invalid remote usage bucket");
+            }
+            let mut total = 0_i64;
+            for value in [row.input, row.output, row.cache_read, row.cache_write] {
+                if value < 0 {
+                    return Err("invalid remote usage counts");
+                }
+                total = total
+                    .checked_add(value)
+                    .ok_or("remote usage counts overflow")?;
+            }
+            tokens = tokens
+                .checked_add(total)
+                .ok_or("remote usage counts overflow")?;
+            if tokens > 1_000_000_000_000_000
+                || row.reasoning < 0
+                || row.reasoning > row.output
+                || row.priced_tokens < 0
+                || row.priced_tokens > total
+                || [row.estimated_usd, row.read_savings_usd]
+                    .iter()
+                    .any(|v| !v.is_finite() || *v < 0.0 || *v > 1e12)
+            {
+                return Err("invalid remote usage totals");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptUsageRequest {
+    #[serde(default)]
+    pub profiles: Vec<TranscriptUsageDirectory>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptUsageDirectory {
+    pub provider: String,
+    pub config_home: String,
+}
+impl TranscriptUsageRequest {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.profiles.len() > 64 {
+            return Err("too many usage profile directories");
+        }
+        for profile in &self.profiles {
+            if !matches!(profile.provider.as_str(), "claude" | "codex")
+                || profile.config_home.len() > 4096
+                || profile.config_home.chars().any(char::is_control)
+                || !(profile.config_home.starts_with('/') || profile.config_home.starts_with("~/"))
+                || profile.config_home.split('/').any(|part| part == "..")
+            {
+                return Err("invalid usage profile directory");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+    #[test]
+    fn summary_rejects_negative_duplicate_overflow_and_unbounded_values() {
+        let mut result = TranscriptUsageResult {
+            source_id: "a".repeat(32),
+            collected_at: 1_788_523_200,
+            buckets: vec![TranscriptUsageBucket {
+                provider: "codex".into(),
+                model: "gpt-5.4".into(),
+                day: 1_788_523_200 / 86_400,
+                input: 100,
+                ..Default::default()
+            }],
+        };
+        assert!(result.validate().is_ok());
+        result.buckets[0].input = -1;
+        assert!(result.validate().is_err());
+        result.buckets[0].input = i64::MAX;
+        result.buckets[0].output = 1;
+        assert!(result.validate().is_err());
+        result.buckets[0].input = 100;
+        result.buckets[0].output = 0;
+        result.buckets[0].estimated_usd = f64::INFINITY;
+        assert!(result.validate().is_err());
+        result.buckets[0].estimated_usd = 0.0;
+        result.buckets.push(result.buckets[0].clone());
+        assert!(result.validate().is_err());
+        result.buckets = vec![result.buckets[0].clone(); MAX_USAGE_BUCKETS + 1];
+        assert!(result.validate().is_err());
+    }
+    #[test]
+    fn profile_directories_are_validated_as_data() {
+        for path in ["relative", "~/../secrets", "/tmp/path\ncommand"] {
+            let request = TranscriptUsageRequest {
+                profiles: vec![TranscriptUsageDirectory {
+                    provider: "claude".into(),
+                    config_home: path.into(),
+                }],
+            };
+            assert!(request.validate().is_err());
+        }
+        let request = TranscriptUsageRequest {
+            profiles: vec![TranscriptUsageDirectory {
+                provider: "codex".into(),
+                config_home: "~/account with 'quotes' $(no-shell)".into(),
+            }],
+        };
+        assert!(request.validate().is_ok());
     }
 }
