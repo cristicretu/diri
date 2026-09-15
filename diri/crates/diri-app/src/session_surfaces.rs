@@ -9,18 +9,16 @@ use crate::store::{SessionStore, StoreRuntime};
 use crate::switcher::{
     OverviewArrow, OverviewFilter, OverviewLane, OverviewMode, SwitcherKey, display_title,
 };
-use diri_proto::{
-    AgentKind as ProtoAgentKind, AttentionLevel, RiskHint, SessionId, SessionRecord, SessionStatus,
-};
+use diri_proto::{AgentKind as ProtoAgentKind, AttentionLevel, RiskHint, SessionId, SessionRecord};
 use diri_term::element::{SharedGridBuffer, TerminalElement};
 use diri_ui::{
     AgentKind, AgentLogo, HairlineDivider, Ink, Palette, Radius, SemanticColors, StatusGlyph,
     StatusState,
 };
 use gpui::{
-    AnyElement, BoxShadow, ClickEvent, Context, Entity, FocusHandle, FontWeight, KeyDownEvent,
-    KeyUpEvent, ModifiersChangedEvent, MouseButton, Render, ScrollHandle, SharedString, Task,
-    Window, div, point, prelude::*, px, rgba,
+    Animation, AnimationExt, AnyElement, BoxShadow, ClickEvent, Context, Entity, FocusHandle,
+    FontWeight, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton, Render, ScrollHandle,
+    SharedString, Task, Window, div, ease_out_quint, point, prelude::*, px, rgba,
 };
 
 pub struct SessionSurfaces {
@@ -28,16 +26,60 @@ pub struct SessionSurfaces {
     focus_handle: FocusHandle,
     resident_previews: HashMap<SessionId, TerminalElement>,
     status_glyphs: HashMap<(SessionId, u16, diri_ui::AgentKind), Entity<StatusGlyph>>,
-    overview_board_scroll: ScrollHandle,
-    overview_lane_scrolls: HashMap<OverviewLane, ScrollHandle>,
+    overview_grid_scroll: ScrollHandle,
+    client: Arc<diri_client::DaemonClient>,
+    tokio: Option<tokio::runtime::Handle>,
+    screens: HashMap<SessionId, ScreenPreview>,
+    screen_requests: HashMap<SessionId, ScreenRequest>,
+    overview_was_visible: bool,
+    overview_generation: usize,
     overview_list_scroll: ScrollHandle,
     /// This view is `.cached()` in RootView, so ambient window redraws no
     /// longer reach it: store changes must notify it directly.
     _store_changes: Task<()>,
 }
 
+enum ScreenPreview {
+    Ready(Vec<String>),
+    Empty,
+    Unavailable,
+}
+
+struct ScreenRequest {
+    _task: Task<()>,
+    abort: tokio::task::AbortHandle,
+}
+
+impl Drop for ScreenRequest {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
+}
+
+// Keep the latest useful part of the screen readable, including its prompt.
+// This is plain text from the Engine's parser, never a second ANSI parser.
+fn screen_excerpt(text: &str) -> Vec<String> {
+    let lines: Vec<_> = text.lines().collect();
+    let end = lines
+        .iter()
+        .rposition(|line| !line.trim().is_empty())
+        .map_or(0, |i| i + 1);
+    lines[end.saturating_sub(12)..end]
+        .iter()
+        .map(|line| line.chars().take(160).collect())
+        .collect()
+}
+
+fn overview_columns(width: f32) -> usize {
+    ((width - 48.0 + 16.0) / 336.0).floor().clamp(1.0, 5.0) as usize
+}
+
 impl SessionSurfaces {
-    pub fn new(runtime: Arc<StoreRuntime>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        runtime: Arc<StoreRuntime>,
+        tokio: Option<tokio::runtime::Handle>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut changes = runtime.changes();
         let store_changes = cx.spawn(async move |this, cx| {
             loop {
@@ -56,11 +98,13 @@ impl SessionSurfaces {
             focus_handle: cx.focus_handle(),
             resident_previews: HashMap::new(),
             status_glyphs: HashMap::new(),
-            overview_board_scroll: ScrollHandle::new(),
-            overview_lane_scrolls: OverviewLane::ALL
-                .into_iter()
-                .map(|lane| (lane, ScrollHandle::new()))
-                .collect(),
+            overview_grid_scroll: ScrollHandle::new(),
+            client: Arc::clone(runtime.client()),
+            tokio,
+            screens: HashMap::new(),
+            screen_requests: HashMap::new(),
+            overview_was_visible: false,
+            overview_generation: 0,
             overview_list_scroll: ScrollHandle::new(),
             _store_changes: store_changes,
         }
@@ -68,7 +112,7 @@ impl SessionSurfaces {
 
     fn colors(&self) -> SemanticColors {
         let store = self.store.read().expect("session store lock poisoned");
-        crate::app_theme::colors(&store.preferences().terminal_theme)
+        crate::app_theme::colors(store.theme_id())
     }
 
     /// T11 supplies the same resident buffer used by the mounted terminal. A
@@ -132,6 +176,16 @@ impl Render for SessionSurfaces {
                 store.switcher_state().is_visible(),
             )
         };
+        if !overview_visible && self.overview_was_visible {
+            self.screen_requests.clear();
+            self.screens.clear();
+        }
+        if overview_visible && !self.overview_was_visible {
+            self.overview_generation = self.overview_generation.wrapping_add(1);
+            self.overview_grid_scroll.scroll_to_item(0);
+            self.overview_list_scroll.scroll_to_item(0);
+        }
+        self.overview_was_visible = overview_visible;
         if overview_visible || switcher_visible {
             let session_ids: HashSet<_> = {
                 let store = self.store.read().expect("session store lock poisoned");
@@ -164,13 +218,12 @@ impl Render for SessionSurfaces {
 
 const SWITCHER_PREVIEW_WIDTH: f32 = 620.0;
 const SWITCHER_PREVIEW_HEIGHT: f32 = 348.0;
-const OVERVIEW_LANE_WIDTH: f32 = 272.0;
 
 impl SessionSurfaces {
     pub(crate) fn handle_key_down(
         &mut self,
         event: &KeyDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let mut store = self.store.write().expect("session store lock poisoned");
@@ -202,6 +255,7 @@ impl SessionSurfaces {
             return;
         }
 
+        store.set_overview_columns(overview_columns(f32::from(window.viewport_size().width)));
         let handled = match event.keystroke.key.as_str() {
             "escape" => store.overview_escape(),
             "backspace" | "delete" => store.overview_backspace(),
@@ -225,8 +279,33 @@ impl SessionSurfaces {
             _ => false,
         };
         if handled {
+            drop(store);
+            self.reveal_overview_focus(window);
             cx.stop_propagation();
             cx.notify();
+        }
+        // Boundary arrows, Backspace on an empty query, and stray typing
+        // belong to this overlay too; never send them to the covered PTY.
+        if !modifiers.platform && !modifiers.control {
+            cx.stop_propagation();
+        }
+    }
+
+    fn reveal_overview_focus(&self, window: &Window) {
+        let mut store = self.store.write().expect("session store lock poisoned");
+        let sessions = store.ordered_sessions();
+        let state = store.overview_state();
+        if let Some(index) = state
+            .visible_sessions(&sessions)
+            .position(|s| Some(&s.id) == state.focused())
+        {
+            if state.mode() == OverviewMode::Grid {
+                self.overview_grid_scroll.scroll_to_item(
+                    index / overview_columns(f32::from(window.viewport_size().width)),
+                );
+            } else {
+                self.overview_list_scroll.scroll_to_item(index);
+            }
         }
     }
 
@@ -488,70 +567,86 @@ impl SessionSurfaces {
             .bg(colors.primary.alpha(0.045))
             .border_1()
             .border_color(colors.primary.alpha(0.07))
-            .child(self.mode_button(OverviewMode::Board, state.mode(), "Board", colors, cx))
+            .child(self.mode_button(OverviewMode::Grid, state.mode(), "Gallery", colors, cx))
             .child(self.mode_button(OverviewMode::List, state.mode(), "List", colors, cx));
 
-        let header = div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(px(10.0))
-            .h(px(50.0))
-            .px(px(20.0))
-            .child(
-                div()
-                    .text_size(px(16.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(colors.primary)
-                    .child("All Sessions"),
-            )
-            .child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(colors.tertiary)
-                    .child(summary),
-            )
-            .child(div().flex_1())
-            .child(
-                div()
-                    .text_size(px(11.0))
-                    .text_color(colors.tertiary)
-                    .child(format!(
-                        "{} to select",
-                        crate::commands::primary_click_label()
-                    )),
-            )
-            .child(mode_selector)
-            .child(
-                div()
-                    .id("close-overview")
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .size(px(26.0))
-                    .rounded_full()
-                    .bg(colors.primary.alpha(0.045))
-                    .border_1()
-                    .border_color(colors.primary.alpha(0.07))
-                    .text_size(px(11.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(colors.secondary)
-                    .cursor_pointer()
-                    .hover(|style| style.bg(colors.primary.alpha(0.10)))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.store
-                            .write()
-                            .expect("session store lock poisoned")
-                            .dismiss_overview();
-                        cx.notify();
-                    }))
-                    .child(sf_symbol_weighted(
-                        "xmark",
-                        11.0,
-                        SymbolWeight::Semibold,
-                        colors.secondary,
-                    )),
-            );
+        let header =
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(10.0))
+                .h(px(64.0))
+                .px(px(24.0))
+                .child(
+                    div()
+                        .text_size(px(16.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(colors.primary)
+                        .child("Sessions"),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(colors.tertiary)
+                        .child(summary),
+                )
+                .child(div().flex_1())
+                .when(f32::from(window.viewport_size().width) >= 800.0, |header| {
+                    header.child(div().text_size(px(11.0)).text_color(colors.tertiary).child(
+                        format!("{} to select", crate::commands::primary_click_label()),
+                    ))
+                })
+                .child(mode_selector)
+                .child(
+                    div()
+                        .id("overview-refresh")
+                        .h(px(28.0))
+                        .px(px(9.0))
+                        .flex()
+                        .items_center()
+                        .rounded(px(Radius::ROW))
+                        .cursor_pointer()
+                        .text_size(px(11.0))
+                        .text_color(colors.secondary)
+                        .hover(|s| s.bg(colors.primary.alpha(0.07)))
+                        .child("Refresh")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.screen_requests.clear();
+                            this.screens.clear();
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    div()
+                        .id("close-overview")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(26.0))
+                        .rounded_full()
+                        .bg(colors.primary.alpha(0.045))
+                        .border_1()
+                        .border_color(colors.primary.alpha(0.07))
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(colors.secondary)
+                        .cursor_pointer()
+                        .hover(|style| style.bg(colors.primary.alpha(0.10)))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.store
+                                .write()
+                                .expect("session store lock poisoned")
+                                .dismiss_overview();
+                            cx.notify();
+                        }))
+                        .child(sf_symbol_weighted(
+                            "xmark",
+                            11.0,
+                            SymbolWeight::Semibold,
+                            colors.secondary,
+                        )),
+                );
 
         let mut filters = div()
             .id("overview-filters")
@@ -560,7 +655,7 @@ impl SessionSurfaces {
             .items_center()
             .gap(px(6.0))
             .h(px(38.0))
-            .px(px(20.0))
+            .px(px(24.0))
             .overflow_x_scroll();
         filters = filters.child(self.filter_chip(
             OverviewFilter::All,
@@ -586,32 +681,60 @@ impl SessionSurfaces {
                 ));
             }
         }
-        if !state.query().is_empty() {
-            filters = filters.child(
+        let search = div()
+            .id("overview-search")
+            .flex()
+            .items_center()
+            .gap(px(9.0))
+            .mx(px(24.0))
+            .mb(px(12.0))
+            .px(px(12.0))
+            .h(px(38.0))
+            .flex_none()
+            .rounded(px(Radius::ROW))
+            .bg(colors.primary.alpha(0.035))
+            .border_1()
+            .border_color(colors.primary.alpha(0.12))
+            .on_click(cx.listener(|this, _, window, cx| window.focus(&this.focus_handle, cx)))
+            .child(sf_symbol("magnifyingglass", 14.0, colors.secondary))
+            .child(
                 div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap(px(5.0))
-                    .h(px(22.0))
-                    .px(px(9.0))
-                    .rounded_full()
-                    .bg(colors.primary.alpha(0.10))
-                    .border_1()
-                    .border_color(colors.primary.alpha(0.16))
-                    .text_size(px(11.0))
-                    .text_color(colors.primary)
-                    .child(sf_symbol("magnifyingglass", 11.0, colors.secondary))
-                    .child(state.query().to_owned())
-                    .child(div().text_color(colors.tertiary).child("⌫")),
-            );
-        }
+                    .min_w_0()
+                    .flex_1()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .text_size(px(13.0))
+                    .text_color(if state.query().is_empty() {
+                        colors.tertiary
+                    } else {
+                        colors.primary
+                    })
+                    .child(if state.query().is_empty() {
+                        "Type to find a session, folder, branch, or agent…".to_owned()
+                    } else {
+                        state.query().to_owned()
+                    }),
+            )
+            .when(!state.query().is_empty(), |search| {
+                search.child(
+                    div()
+                        .id("overview-clear-search")
+                        .cursor_pointer()
+                        .text_size(px(11.0))
+                        .text_color(colors.secondary)
+                        .child("Clear")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.store.write().unwrap().overview_escape();
+                            cx.notify();
+                        })),
+                )
+            });
 
         let visible_count = state.visible_sessions(&sessions).count();
         let body = if visible_count == 0 {
-            self.overview_empty_state(&state, colors)
-        } else if state.mode() == OverviewMode::Board {
-            self.overview_board(&sessions, &state, colors, window, cx)
+            self.overview_empty_state(&state, colors, cx)
+        } else if state.mode() == OverviewMode::Grid {
+            self.overview_gallery(&sessions, &state, colors, window, cx)
         } else {
             self.overview_list(&sessions, &state, colors, window, cx)
         };
@@ -620,12 +743,14 @@ impl SessionSurfaces {
             .flex()
             .flex_none()
             .flex_col()
-            .bg(rgba(0x171921ff))
+            .bg(colors.background)
             .child(header)
+            .child(search)
             .child(filters)
             .child(HairlineDivider::horizontal(colors));
 
         let content = div()
+            .id("overview-content")
             .debug_selector(|| "OVERVIEW_CONTENT".into())
             .absolute()
             .inset_0()
@@ -637,18 +762,52 @@ impl SessionSurfaces {
             .overflow_hidden()
             .occlude()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(|_, _, cx| cx.stop_propagation())
             .child(chrome)
             .child(body)
+            .child(
+                div()
+                    .flex_none()
+                    .h(px(34.0))
+                    .px(px(24.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(18.0))
+                    .border_t_1()
+                    .border_color(colors.primary.alpha(0.07))
+                    .text_size(px(11.0))
+                    .text_color(colors.secondary)
+                    .child("↑ ↓ ← →  Navigate")
+                    .child("↵  Open session")
+                    .child("esc  Back")
+                    .child(div().flex_1())
+                    .when(f32::from(window.viewport_size().width) >= 800.0, |footer| {
+                        footer.child("Screen previews · refresh on open")
+                    }),
+            )
             .when(!state.selection().is_empty(), |content| {
                 content.child(self.bulk_close_bar(state.selection().len(), visible_count, cx))
             });
+
+        let content = if cx.reduce_motion() {
+            content.into_any_element()
+        } else {
+            content
+                .with_animation(
+                    ("overview-entry", self.overview_generation),
+                    Animation::new(std::time::Duration::from_millis(120))
+                        .with_easing(ease_out_quint()),
+                    |view, value| view.opacity(value),
+                )
+                .into_any_element()
+        };
 
         div()
             .id("overview-scrim")
             .absolute()
             .inset_0()
             .size_full()
-            .bg(rgba(0x000000ff))
+            .bg(colors.background)
             .occlude()
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|this, _, _, cx| {
@@ -688,11 +847,12 @@ impl SessionSurfaces {
             })
             .cursor_pointer()
             .hover(|style| style.bg(colors.primary.alpha(if active { 0.12 } else { 0.055 })))
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_click(cx.listener(move |this, _, window, cx| {
                 this.store
                     .write()
                     .expect("session store lock poisoned")
                     .set_overview_mode(mode);
+                this.reveal_overview_focus(window);
                 cx.notify();
             }))
             .child(label)
@@ -729,11 +889,12 @@ impl SessionSurfaces {
             })
             .cursor_pointer()
             .hover(|style| style.bg(colors.primary.alpha(if active { 0.12 } else { 0.05 })))
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_click(cx.listener(move |this, _, window, cx| {
                 this.store
                     .write()
                     .expect("session store lock poisoned")
                     .set_overview_filter(filter);
+                this.reveal_overview_focus(window);
                 cx.notify();
             }))
             .child(label)
@@ -745,6 +906,7 @@ impl SessionSurfaces {
         &self,
         state: &crate::switcher::SessionOverviewState,
         colors: SemanticColors,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
         let title = if !state.query().is_empty() {
             format!("No matches for “{}”", state.query())
@@ -756,6 +918,7 @@ impl SessionSurfaces {
                 }
             }
         };
+        let filtered = !state.query().is_empty() || state.filter() != OverviewFilter::All;
         div()
             .flex()
             .flex_1()
@@ -777,10 +940,45 @@ impl SessionSurfaces {
                     .text_color(colors.secondary)
                     .child(title),
             )
+            .child(div().text_size(px(12.0)).child(if filtered {
+                "Try another name, folder, or branch."
+            } else {
+                "Start a session from your workspace to see it here."
+            }))
+            .child(
+                div()
+                    .id("overview-empty-action")
+                    .mt(px(8.0))
+                    .px(px(14.0))
+                    .py(px(8.0))
+                    .rounded(px(Radius::ROW))
+                    .bg(colors.primary.alpha(0.07))
+                    .text_color(colors.primary)
+                    .text_size(px(12.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(colors.primary.alpha(0.12)))
+                    .child(if filtered {
+                        "Show all sessions"
+                    } else {
+                        "Back to workspace"
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let mut store = this.store.write().unwrap();
+                        if filtered {
+                            if !store.overview_state().query().is_empty() {
+                                store.overview_escape();
+                            }
+                            store.set_overview_filter(OverviewFilter::All);
+                        } else {
+                            store.dismiss_overview();
+                        }
+                        cx.notify();
+                    })),
+            )
             .into_any_element()
     }
 
-    fn overview_board(
+    fn overview_gallery(
         &mut self,
         sessions: &[SessionRecord],
         state: &crate::switcher::SessionOverviewState,
@@ -788,103 +986,42 @@ impl SessionSurfaces {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let lanes: Vec<_> = match state.filter() {
-            OverviewFilter::All => OverviewLane::ALL.to_vec(),
-            OverviewFilter::Lane(lane) => vec![lane],
-        };
-        let bottom_padding = if state.selection().is_empty() {
-            18.0
-        } else {
-            82.0
-        };
-        let mut board = div()
-            .id("overview-board")
-            .debug_selector(|| "OVERVIEW_BOARD".into())
+        let columns = overview_columns(f32::from(window.viewport_size().width));
+        self.store.write().unwrap().set_overview_columns(columns);
+        let visible: Vec<_> = state.visible_sessions(sessions).collect();
+        let mut gallery = div()
+            .id("overview-gallery")
+            .debug_selector(|| "OVERVIEW_GALLERY".into())
             .flex()
+            .flex_col()
             .flex_1()
-            .min_w_0()
             .min_h_0()
-            .items_stretch()
-            .gap(px(12.0))
-            .px(px(20.0))
-            .pt(px(14.0))
-            .pb(px(bottom_padding))
-            .track_scroll(&self.overview_board_scroll)
-            .overflow_x_scroll();
-        // Do not reinterpret a vertical wheel as horizontal board movement;
-        // the lane under the pointer owns that axis.
-        board.style().restrict_scroll_to_axis = Some(true);
-        for lane in lanes {
-            let lane_sessions = state.lane_sessions(lane, sessions);
-            let count = lane_sessions.len();
-            let lane_scroll = self
-                .overview_lane_scrolls
-                .get(&lane)
-                .expect("every overview lane has a scroll handle")
-                .clone();
-            let mut cards = div()
-                .id(SharedString::from(format!(
-                    "overview-lane-{}",
-                    lane.label()
-                )))
-                .debug_selector(|| format!("OVERVIEW_LANE_{}", lane.label().to_uppercase()))
-                .flex()
-                .flex_1()
-                .flex_col()
-                .min_h_0()
-                .gap(px(10.0))
-                .p(px(10.0))
-                .pt(px(8.0))
-                .track_scroll(&lane_scroll)
-                .overflow_y_scroll();
-            cards.style().restrict_scroll_to_axis = Some(true);
-            for session in lane_sessions {
-                cards = cards.child(self.overview_card(session, state, colors, window, cx));
+            .min_w_0()
+            .gap(px(16.0))
+            .p(px(24.0))
+            .pb(px(if state.selection().is_empty() {
+                24.0
+            } else {
+                82.0
+            }))
+            .track_scroll(&self.overview_grid_scroll)
+            .overflow_y_scroll();
+        for row in visible.chunks(columns) {
+            let mut cards = div().flex().flex_none().gap(px(16.0));
+            for session in row {
+                cards = cards.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(self.overview_card(session, state, colors, window, cx)),
+                );
             }
-            board = board.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_none()
-                    .w(px(OVERVIEW_LANE_WIDTH))
-                    .min_h_0()
-                    .overflow_hidden()
-                    .rounded(px(Radius::PANEL))
-                    .bg(colors.primary.alpha(0.026))
-                    .border_1()
-                    .border_color(colors.primary.alpha(0.065))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_none()
-                            .items_center()
-                            .gap(px(6.0))
-                            .h(px(36.0))
-                            .px(px(11.0))
-                            .text_size(px(11.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(colors.secondary)
-                            .child(lane.label())
-                            .child(div().flex_1())
-                            .child(
-                                div()
-                                    .min_w(px(20.0))
-                                    .h(px(20.0))
-                                    .px(px(6.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_full()
-                                    .bg(colors.primary.alpha(0.055))
-                                    .text_color(colors.tertiary)
-                                    .child(count.to_string()),
-                            ),
-                    )
-                    .child(HairlineDivider::horizontal(colors))
-                    .child(cards),
-            );
+            for _ in row.len()..columns {
+                cards = cards.child(div().flex_1().min_w_0());
+            }
+            gallery = gallery.child(cards);
         }
-        board.into_any_element()
+        gallery.into_any_element()
     }
 
     fn overview_list(
@@ -935,12 +1072,12 @@ impl SessionSurfaces {
         let id = session.id.clone();
         let close_id = id.clone();
         let status = self.status_glyph(session, 14.0, colors, window, cx);
-        let preview = self.render_grid_or_logo(session, 34.0, 6.5, colors);
+        let preview = self.overview_preview(session, colors, cx);
 
         let mut thumbnail = div()
             .relative()
             .w_full()
-            .h(px(112.0))
+            .h(px(178.0))
             .rounded(px(Radius::ROW))
             .overflow_hidden()
             .bg(colors.background)
@@ -978,7 +1115,7 @@ impl SessionSurfaces {
                     .left(px(6.0))
                     .size(px(20.0))
                     .rounded_full()
-                    .bg(rgba(0x20222bd9))
+                    .bg(colors.floating_surface())
                     .flex()
                     .items_center()
                     .justify_center()
@@ -1076,13 +1213,41 @@ impl SessionSurfaces {
                             .overflow_hidden()
                             .text_ellipsis()
                             .child(display_title(session)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .px(px(2.0))
+                    .pb(px(4.0))
+                    .text_size(px(11.0))
+                    .text_color(colors.secondary)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(format!(
+                                "{}{}",
+                                Path::new(&session.cwd)
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or(&session.cwd),
+                                session
+                                    .git_branch
+                                    .as_ref()
+                                    .map(|b| format!("  /  {b}"))
+                                    .unwrap_or_default()
+                            )),
                     )
                     .child(
                         div()
                             .flex_none()
-                            .text_size(px(11.0))
-                            .text_color(state_badge_color(session, colors))
-                            .child(state_badge(session)),
+                            .text_color(status_color(session, colors))
+                            .child(OverviewLane::for_session(session).label()),
                     ),
             )
             .into_any_element()
@@ -1107,7 +1272,7 @@ impl SessionSurfaces {
             .flex_none()
             .items_center()
             .gap(px(10.0))
-            .h(px(68.0))
+            .h(px(94.0))
             .px(px(10.0))
             .rounded(px(Radius::ROW))
             .bg(colors.primary.alpha(if selected {
@@ -1151,12 +1316,12 @@ impl SessionSurfaces {
             .child(
                 div()
                     .flex_none()
-                    .w(px(88.0))
-                    .h(px(50.0))
+                    .w(px(160.0))
+                    .h(px(76.0))
                     .rounded(px(Radius::BADGE))
                     .overflow_hidden()
                     .bg(colors.background)
-                    .child(self.render_grid_or_logo(session, 24.0, 4.5, colors)),
+                    .child(self.overview_preview(session, colors, cx)),
             )
             .child(status)
             .child(
@@ -1248,7 +1413,7 @@ impl SessionSurfaces {
                     .px(px(16.0))
                     .py(px(10.0))
                     .rounded_full()
-                    .bg(rgba(0x2a2c35f5))
+                    .bg(colors.floating_surface())
                     .border_1()
                     .border_color(colors.primary.alpha(0.10))
                     .shadow_lg()
@@ -1318,6 +1483,125 @@ impl SessionSurfaces {
                                 format!("Close {count} Sessions")
                             }),
                     ),
+            )
+            .into_any_element()
+    }
+
+    fn request_screen(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        if !self.store.read().unwrap().overview_state().is_visible()
+            || self.screens.contains_key(&id)
+            || self.screen_requests.contains_key(&id)
+            || self.screen_requests.len() >= 4
+        {
+            return;
+        }
+        let Some(tokio) = &self.tokio else {
+            return;
+        };
+        let client = Arc::clone(&self.client);
+        let request_id = id.clone();
+        let request = tokio.spawn(async move {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                client.read_screen(&request_id),
+            )
+            .await
+        });
+        let abort = request.abort_handle();
+        let task_id = id.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let preview = match request.await {
+                Ok(Ok(Ok(screen))) => {
+                    let lines = screen_excerpt(&screen.text);
+                    if lines.is_empty() {
+                        ScreenPreview::Empty
+                    } else {
+                        ScreenPreview::Ready(lines)
+                    }
+                }
+                _ => ScreenPreview::Unavailable,
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.screen_requests.remove(&task_id);
+                if this.store.read().unwrap().overview_state().is_visible() {
+                    this.screens.insert(task_id, preview);
+                }
+                cx.notify();
+            });
+        });
+        self.screen_requests
+            .insert(id, ScreenRequest { _task: task, abort });
+    }
+
+    fn overview_preview(
+        &self,
+        session: &SessionRecord,
+        colors: SemanticColors,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let weak = cx.entity().downgrade();
+        let id = session.id.clone();
+        let mut preview = div()
+            .relative()
+            .size_full()
+            .overflow_hidden()
+            .bg(colors.background);
+        if let Some(ScreenPreview::Ready(lines)) = self.screens.get(&id) {
+            preview = preview.child(
+                div()
+                    .p(px(12.0))
+                    .text_size(px(10.0))
+                    .line_height(px(12.5))
+                    .font_family(crate::fonts::mono_family())
+                    .text_color(colors.secondary)
+                    .whitespace_nowrap()
+                    .child(lines.join("\n")),
+            );
+        } else {
+            let label = match self.screens.get(&id) {
+                Some(ScreenPreview::Unavailable) => "Preview unavailable",
+                Some(ScreenPreview::Empty) => "No screen output yet",
+                _ => "Loading preview…",
+            };
+            preview = preview.child(
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(10.0))
+                    .child(
+                        AgentLogo::new(ui_agent_kind(session.effective_kind()), 28.0, colors)
+                            .badged(false),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(colors.tertiary)
+                            .child(label),
+                    ),
+            );
+        }
+        if self.screens.contains_key(&id) || self.screen_requests.contains_key(&id) {
+            return preview.into_any_element();
+        }
+        // Prepaint receives the scroll viewport's clip. Offscreen sessions do
+        // no I/O; completions repaint and allow the next four visible requests.
+        preview
+            .child(
+                gpui::canvas(
+                    move |bounds, window, cx| {
+                        if bounds.intersects(&window.content_mask().bounds) {
+                            cx.defer(move |cx| {
+                                let _ = weak.update(cx, |this, cx| this.request_screen(id, cx));
+                            });
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
             )
             .into_any_element()
     }
@@ -1428,55 +1712,6 @@ fn status_color(session: &SessionRecord, colors: SemanticColors) -> gpui::Rgba {
     }
 }
 
-fn state_badge(session: &SessionRecord) -> String {
-    if session.hibernation.is_some() {
-        "asleep".to_owned()
-    } else if matches!(session.status, SessionStatus::Exited(_)) {
-        "ended".to_owned()
-    } else if let Some(bytes) = session
-        .memory_bytes
-        .filter(|bytes| *bytes > 2 * 1_073_741_824)
-    {
-        format!("{:.1} GB", bytes as f64 / 1_073_741_824.0)
-    } else {
-        session
-            .git_branch
-            .as_deref()
-            .map(clamp_branch)
-            .unwrap_or_default()
-    }
-}
-
-fn state_badge_color(session: &SessionRecord, colors: SemanticColors) -> gpui::Rgba {
-    if session
-        .hibernation
-        .as_ref()
-        .is_some_and(|info| info.reason == diri_proto::HibernationReason::MemoryPressure)
-        || session
-            .memory_bytes
-            .is_some_and(|bytes| bytes > 6 * 1_073_741_824)
-    {
-        Ink::ATTENTION
-    } else {
-        colors.tertiary
-    }
-}
-
-fn clamp_branch(branch: &str) -> String {
-    let characters: Vec<_> = branch.chars().collect();
-    if characters.len() <= 18 {
-        branch.to_owned()
-    } else {
-        format!(
-            "{}…{}",
-            characters[..8].iter().collect::<String>(),
-            characters[characters.len() - 8..]
-                .iter()
-                .collect::<String>()
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1484,7 +1719,7 @@ mod tests {
 
     use diri_proto::{
         AgentKind as ProtoAgentKind, DateMillis, Project, ProjectId, Resumability,
-        SessionListResult, TitleSource,
+        SessionListResult, SessionStatus, TitleSource,
     };
     use gpui::{ScrollDelta, ScrollWheelEvent, StyleRefinement, TestAppContext, size};
 
@@ -1496,8 +1731,12 @@ mod tests {
     impl Render for OverviewHarness {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             let background_scrolls = Arc::clone(&self.background_scrolls);
+            let background_keys = Arc::clone(&self.background_scrolls);
             div()
                 .size_full()
+                .on_key_down(move |_, _, _| {
+                    background_keys.fetch_add(1, Ordering::Relaxed);
+                })
                 .child(div().absolute().inset_0().on_scroll_wheel(move |_, _, _| {
                     background_scrolls.fetch_add(1, Ordering::Relaxed);
                 }))
@@ -1511,6 +1750,7 @@ mod tests {
 
     fn session(index: usize) -> SessionRecord {
         SessionRecord {
+            attention_state: None,
             id: SessionId::new(format!("running-{index:02}")),
             kind: ProtoAgentKind::CODEX,
             cwd: "/work/overview".into(),
@@ -1547,118 +1787,153 @@ mod tests {
     }
 
     #[gpui::test]
-    fn overflowing_overview_lane_scrolls_without_reaching_the_background(cx: &mut TestAppContext) {
+    fn gallery_scrolls_without_reaching_the_background(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
         let runtime = Arc::new(StoreRuntime::inert());
-        runtime
-            .store
-            .write()
-            .expect("session store lock poisoned")
-            .hydrate(SessionListResult {
-                sessions: (0..18).map(session).collect(),
-                projects: vec![Project {
-                    id: ProjectId::new("overview"),
-                    root: "/work/overview".into(),
-                    name: "Overview".into(),
-                    pinned_order: None,
-                    host: None,
-                }],
-            });
-        runtime
-            .store
-            .write()
-            .expect("session store lock poisoned")
-            .toggle_overview();
-
+        runtime.store.write().unwrap().hydrate(SessionListResult {
+            sessions: (0..18).map(session).collect(),
+            projects: vec![],
+        });
+        runtime.store.write().unwrap().toggle_overview();
         let background_scrolls = Arc::new(AtomicUsize::new(0));
-        let background_probe = Arc::clone(&background_scrolls);
-        let (view, cx) = cx.add_window_view(move |_window, cx| OverviewHarness {
-            surfaces: cx.new(|cx| SessionSurfaces::new(runtime, cx)),
-            background_scrolls: background_probe,
+        let probe = Arc::clone(&background_scrolls);
+        let (view, cx) = cx.add_window_view(move |_, cx| OverviewHarness {
+            surfaces: cx.new(|cx| SessionSurfaces::new(runtime, None, cx)),
+            background_scrolls: probe,
         });
         cx.simulate_resize(size(px(1100.0), px(700.0)));
-
-        let surfaces = view.read_with(cx, |harness, _| harness.surfaces.clone());
-        let lane_bounds = cx
-            .debug_bounds("OVERVIEW_LANE_RUNNING")
-            .expect("running lane should render");
-        let board_bounds = cx
-            .debug_bounds("OVERVIEW_BOARD")
-            .expect("overview board should render");
-        let content_bounds = cx
-            .debug_bounds("OVERVIEW_CONTENT")
-            .expect("overview content should render");
+        let surfaces = view.read_with(cx, |h, _| h.surfaces.clone());
+        let bounds = cx.debug_bounds("OVERVIEW_GALLERY").unwrap();
         assert_eq!(
-            content_bounds.size,
-            size(px(1100.0), px(700.0)),
-            "the opaque overview surface must cover the full cached viewport"
+            cx.debug_bounds("OVERVIEW_CONTENT").unwrap().size,
+            size(px(1100.0), px(700.0))
         );
-        assert!(
-            lane_bounds.size.height > px(300.0),
-            "the lane viewport must receive the available window height"
+        assert!(bounds.size.height > px(300.0));
+        assert_eq!(
+            surfaces.read_with(cx, |s, _| s.overview_grid_scroll.max_offset().x),
+            px(0.0)
         );
-        let max_offset = surfaces.read_with(cx, |surfaces, _| {
-            surfaces
-                .overview_lane_scrolls
-                .get(&OverviewLane::Running)
-                .expect("running scroll handle")
-                .max_offset()
-        });
-        assert!(
-            max_offset.y > px(0.0),
-            "overflowing lane must have a bounded, scrollable viewport"
-        );
-        assert!(
-            surfaces
-                .read_with(cx, |surfaces, _| surfaces
-                    .overview_board_scroll
-                    .max_offset())
-                .x
-                > px(0.0),
-            "the five-lane board should expose horizontal overflow"
-        );
-
+        assert!(surfaces.read_with(cx, |s, _| s.overview_grid_scroll.max_offset().y) > px(0.0));
         cx.simulate_event(ScrollWheelEvent {
-            position: lane_bounds.center(),
+            position: bounds.center(),
             delta: ScrollDelta::Pixels(point(px(0.0), px(-80.0))),
             ..ScrollWheelEvent::default()
         });
-
-        let offset = surfaces.read_with(cx, |surfaces, _| {
-            surfaces
-                .overview_lane_scrolls
-                .get(&OverviewLane::Running)
-                .expect("running scroll handle")
-                .offset()
-        });
-        assert!(
-            offset.y < px(0.0),
-            "wheel input should move the overview lane (content: {content_bounds:?}, board: {board_bounds:?}, lane: {lane_bounds:?}, offset: {offset:?}, max: {max_offset:?}, background events: {})",
-            background_scrolls.load(Ordering::Relaxed),
-        );
+        assert!(surfaces.read_with(cx, |s, _| s.overview_grid_scroll.offset().y) < px(0.0));
+        assert_eq!(background_scrolls.load(Ordering::Relaxed), 0);
+        cx.simulate_resize(size(px(680.0), px(700.0)));
         assert_eq!(
-            surfaces
-                .read_with(cx, |surfaces, _| surfaces.overview_board_scroll.offset())
-                .x,
-            px(0.0),
-            "vertical lane scrolling must not shift the board sideways"
+            surfaces.read_with(cx, |s, _| s.overview_grid_scroll.max_offset().x),
+            px(0.0)
         );
+    }
 
-        cx.simulate_event(ScrollWheelEvent {
-            position: lane_bounds.center(),
-            delta: ScrollDelta::Pixels(point(px(-80.0), px(0.0))),
-            ..ScrollWheelEvent::default()
+    #[gpui::test]
+    fn overview_keeps_boundary_keys_away_from_the_terminal(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        runtime.store.write().unwrap().hydrate(SessionListResult {
+            sessions: vec![session(0)],
+            projects: vec![],
         });
-        assert!(
-            surfaces
-                .read_with(cx, |surfaces, _| surfaces.overview_board_scroll.offset())
-                .x
-                < px(0.0),
-            "horizontal trackpad input should move the lane board"
+        runtime.store.write().unwrap().toggle_overview();
+        let escaped = Arc::new(AtomicUsize::new(0));
+        let probe = Arc::clone(&escaped);
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let surfaces = cx.new(|cx| SessionSurfaces::new(runtime, None, cx));
+            surfaces.read(cx).focus_handle.clone().focus(window, cx);
+            OverviewHarness {
+                surfaces,
+                background_scrolls: probe,
+            }
+        });
+        cx.simulate_keystrokes("left up backspace tab right down");
+        assert_eq!(escaped.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn previews_keep_recent_output_and_blank_lines_without_unbounded_text() {
+        let text = (0..20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let excerpt = screen_excerpt(&format!("{text}\n\n  "));
+        assert_eq!(excerpt.len(), 12);
+        assert_eq!(excerpt.first().unwrap(), "line 8");
+        assert_eq!(excerpt.last().unwrap(), "line 19");
+        assert_eq!(screen_excerpt("hello\n\n> "), vec!["hello", "", "> "]);
+        assert!(screen_excerpt(" \n\n").is_empty());
+        assert_eq!(screen_excerpt(&"界".repeat(500))[0].chars().count(), 160);
+    }
+
+    #[test]
+    fn gallery_columns_follow_available_width() {
+        assert_eq!(overview_columns(680.0), 1);
+        assert_eq!(overview_columns(900.0), 2);
+        assert_eq!(overview_columns(1100.0), 3);
+        assert_eq!(overview_columns(1800.0), 5);
+        assert_eq!(overview_columns(0.0), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes deterministic overview screenshots"]
+    fn render_overview_screenshot() {
+        use gpui::HeadlessAppContext;
+        let output = std::env::var("DIRI_VISUAL_OUTPUT").expect("set DIRI_VISUAL_OUTPUT");
+        let light = std::env::var_os("DIRI_VISUAL_LIGHT").is_some();
+        let width = std::env::var("DIRI_VISUAL_WIDTH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1200.0);
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
         );
-        assert_eq!(
-            background_scrolls.load(Ordering::Relaxed),
-            0,
-            "overview wheel input must not leak to the terminal behind it"
-        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let window = cx.open_window(size(px(width), px(820.0)), |_, cx| {
+            let runtime = Arc::new(StoreRuntime::inert());
+            let titles = ["Make session switching feel effortless", "Review authentication changes", "Fix the flaky reconnect test", "Update the onboarding flow", "Local development server", "Investigate slow workspace startup"];
+            let mut sessions: Vec<_> = titles.iter().enumerate().map(|(i, title)| {
+                let mut s = session(i);
+                s.title = (*title).into();
+                s.cwd = if i % 2 == 0 { "/work/diri" } else { "/work/anara" }.into();
+                s.kind = if i % 2 == 0 { ProtoAgentKind::CODEX } else { ProtoAgentKind::CLAUDE_CODE };
+                s
+            }).collect();
+            sessions[1].status = SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Permission);
+            {
+                let mut store = runtime.store.write().unwrap();
+                store.hydrate(SessionListResult { sessions, projects: vec![Project { id: ProjectId::new("overview"), root: "/work".into(), name: "Workspace".into(), pinned_order: None, host: None }] });
+                store.update_preferences(|p| p.terminal_theme = if light { "dirijor-light" } else { "dirijor-dark" }.into()).unwrap();
+                store.toggle_overview();
+                match std::env::var("DIRI_VISUAL_STATE").as_deref() {
+                    Ok("empty") => { store.append_overview_query("missing-session"); }
+                    Ok("list") => store.set_overview_mode(OverviewMode::List),
+                    Ok("selected") => { store.toggle_overview_selection(session(0).id); }
+                    _ => {}
+                }
+            }
+            let surfaces = cx.new(|cx| {
+                let mut view = SessionSurfaces::new(runtime, None, cx);
+                let samples = [
+                    "› Improve the session overview\n\n• Read session_surfaces.rs\n• Read switcher.rs\n\n  The gallery now follows the window width.\n  Checking keyboard navigation and previews.\n\n  cargo test -p diri-app\n  test result: ok. 42 passed\n\n› ",
+                    "╭─ Claude Code ──────────────────────╮\n│ /work/anara                       │\n╰───────────────────────────────────╯\n\n  I found two issues in the auth callback.\n  The redirect needs to preserve state.\n\n  Allow editing src/auth/callback.ts?\n\n  ❯ 1. Yes\n    2. No\n",
+                    "$ cargo test reconnect -- --nocapture\n\nrunning 3 tests\ntest preserves_session_identity ... ok\ntest restores_terminal_snapshot ... ok\ntest rejects_stale_controller ... ok\n\ntest result: ok. 3 passed; 0 failed\n\n$ git diff --stat\n src/reconnect.rs | 12 +++++---\n$ ",
+                ];
+                for i in 0..6 { view.screens.insert(session(i).id, ScreenPreview::Ready(screen_excerpt(samples[i % samples.len()]))); }
+                view
+            });
+            cx.new(|_| OverviewHarness { surfaces, background_scrolls: Arc::new(AtomicUsize::new(0)) })
+        }).unwrap();
+        cx.run_until_parked();
+        cx.capture_screenshot(window.into())
+            .unwrap()
+            .save(output)
+            .unwrap();
     }
 }

@@ -4,12 +4,12 @@ use crate::usage::dashboard::{UsageReport, date_label};
 use crate::usage::{UsageFormat, UsageSnapshot};
 use gpui::relative;
 
-const PROVIDERS: [&str; 2] = ["Claude Code", "Codex"];
+const PROVIDERS: [&str; 3] = ["Claude Code", "Codex", "Cursor"];
 fn provider_color(provider: usize, colors: SemanticColors) -> Rgba {
-    if provider == 0 {
-        rgba(0xcf876dff)
-    } else {
-        colors.secondary
+    match provider {
+        0 => rgba(0xcf876dff),
+        2 => rgba(0x6d8fcfff),
+        _ => colors.secondary,
     }
 }
 
@@ -26,7 +26,7 @@ impl UtilitySurfaces {
         if self.usage.updated_at == 0 {
             return settings_page("Usage", div().flex().flex_col().gap(px(8.0)).py(px(24.0))
                 .child(label("Reading local usage…", 14.0, colors.primary))
-                .child(label("Preparing costs and token history from your Claude Code and Codex transcripts.", 12.0, colors.secondary)), colors).into_any_element();
+                .child(label("Preparing costs and token history from local Claude Code and Codex transcripts, plus billed Cursor usage when signed in.", 12.0, colors.secondary)), colors).into_any_element();
         }
         let report = self
             .usage
@@ -129,7 +129,7 @@ impl UtilitySurfaces {
                                 .font_weight(FontWeight::MEDIUM),
                             )
                             .child(label(
-                                "At model rates, not your subscription bill",
+                                "Claude and Codex at model rates. Cursor is billed usage.",
                                 11.0,
                                 colors.tertiary,
                             )),
@@ -200,15 +200,15 @@ impl UtilitySurfaces {
         if loaded && total.total_tokens() == 0 {
             content = content.child(div().p(px(20.0)).rounded(px(8.0)).bg(colors.primary.alpha(0.035)).flex().flex_col().gap(px(6.0))
                 .child(label("Your usage starts with a conversation", 14.0, colors.primary))
-                .child(label("Use Claude Code or Codex on this Mac. Available transcript history appears here automatically.", 12.0, colors.secondary))
+                .child(label("Use Claude Code, Codex, or Cursor on this Mac. Transcript history and signed-in Cursor usage appear here automatically.", 12.0, colors.secondary))
                 .child(label("Try a longer date range to see earlier activity.", 12.0, colors.secondary)));
         }
         content = content.child(hero).child(metrics).child(self.usage_breakdown(&report, colors, cx))
             .child(div().flex().flex_col().gap(px(7.0))
                 .child(label("About these estimates", 12.0, colors.primary).font_weight(FontWeight::MEDIUM))
-                .child(label(format!("{:.1}% of tokens model priced · {} unpriced tokens · No provider billing data", ratio(report.total.priced_tokens as f64, total.total_tokens() as f64) * 100.0, UsageFormat::tokens(total.total_tokens() - report.total.priced_tokens)), 11.0, colors.secondary))
-                .child(label("Uses Diri’s bundled model rates. Unpriced usage is excluded from cost. Cache read savings compare cached reads with uncached input rates; cache write premiums are excluded.", 11.0, colors.tertiary))
-                .child(label("Updates automatically from available local Claude Code and Codex transcripts, including sessions outside Diri. Remote usage is not included in this detailed view.", 11.0, colors.tertiary)));
+                .child(label(format!("{:.1}% of tokens priced · {} unpriced tokens", ratio(report.total.priced_tokens as f64, total.total_tokens() as f64) * 100.0, UsageFormat::tokens(total.total_tokens() - report.total.priced_tokens)), 11.0, colors.secondary))
+                .child(label("Uses Diri’s bundled model rates for Claude and Codex. Cursor costs come from billed dashboard events. Unpriced Claude/Codex usage is excluded from cost. Cache read savings compare cached reads with uncached input rates; cache write premiums are excluded.", 11.0, colors.tertiary))
+                .child(label("Updates automatically from local Claude Code and Codex transcripts, including sessions outside Diri, plus billed Cursor usage when signed in. Remote Claude/Codex usage is not included in this detailed view.", 11.0, colors.tertiary)));
         settings_page("Usage", content, colors).into_any_element()
     }
 
@@ -258,7 +258,7 @@ impl UtilitySurfaces {
             );
             bar =
                 bar.tooltip(move |_, cx| cx.new(|_| UsageTooltip(tooltip.clone(), colors)).into());
-            for provider in (0..2).rev() {
+            for provider in (0..3).rev() {
                 bar = bar.child(
                     div()
                         .w_full()
@@ -354,7 +354,8 @@ impl UtilitySurfaces {
                     .justify_end()
                     .gap(px(12.0))
                     .child(provider_label(0, colors))
-                    .child(provider_label(1, colors)),
+                    .child(provider_label(1, colors))
+                    .child(provider_label(2, colors)),
             )
     }
 

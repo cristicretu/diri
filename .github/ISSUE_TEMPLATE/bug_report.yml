@@ -1,81 +1,63 @@
 name: Bug report
-description: Something in diri behaves wrong
+description: Report a reproducible problem in Diri.
 labels: [bug]
 body:
+  - type: markdown
+    attributes:
+      value: >-
+        Check for an existing issue and try the latest release when possible.
+        Report vulnerabilities [privately](https://github.com/cristicretu/diri/security/advisories/new).
+        Redact credentials, private prompts, and personal paths from anything you attach.
   - type: textarea
     id: what-happened
     attributes:
-      label: What happened
-      description: What you did, what you expected, what you got instead.
+      label: What happened?
+      description: Describe the result and what you expected instead.
     validations:
       required: true
-
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Include the smallest sequence that triggers the problem and how often it happens.
+      placeholder: |
+        1. Open a project…
+        2. Start a session…
+        3. …
+    validations:
+      required: true
   - type: input
     id: version
     attributes:
-      label: diri version
-      description: The version row in the account popover, or `diri --version`.
-      placeholder: "0.4.1"
+      label: Diri version
+      description: Use the version shown in Settings or the diagnostics report.
+      placeholder: "Release version or source commit"
     validations:
       required: true
-
   - type: textarea
     id: platform
     attributes:
-      label: Operating environment
-      description: >
-        On Linux include distro, kernel (`uname -a`), X11 or Wayland, GPU,
-        and desktop environment. On macOS include the version and chip.
-      placeholder: "Ubuntu 22.04; kernel 6.8; Wayland; AMD Radeon; GNOME"
+      label: Environment
+      description: >-
+        Include your OS version and installation method (DMG, Homebrew, AppImage,
+        Debian package, or source). On macOS, include your chip. For Linux
+        rendering issues, include X11/Wayland, desktop environment, GPU, and driver.
+      placeholder: "macOS 15, Apple M3, Homebrew"
     validations:
       required: true
-
-  - type: dropdown
-    id: package
-    attributes:
-      label: Installation format
-      options:
-        - Linux AppImage
-        - Linux Debian package
-        - macOS DMG / Homebrew
-        - Built from source
-    validations:
-      required: true
-
-  - type: dropdown
+  - type: input
     id: agent
     attributes:
-      label: Which agent
-      description: Status detection differs per agent, so this usually matters.
-      options:
-        - Claude Code
-        - Codex
-        - Cursor
-        - Gemini
-        - A shell
-        - Something else
-        - Not agent-specific
-    validations:
-      required: true
-
+      label: Agent and host
+      description: If session-related, include the agent CLI version and whether it runs locally or over SSH.
+      placeholder: "Claude Code, version …, local"
   - type: textarea
-    id: daemon
+    id: diagnostics
     attributes:
-      label: Privacy-safe diagnostics
-      description: >
-        In Settings → General → Support, choose Copy diagnostics, review the
-        exact report, and paste it here. If the app will not open, use
-        `dirijor doctor` when the CLI is on your PATH.
-      render: markdown
-
-  - type: textarea
-    id: logs
-    attributes:
-      label: Relevant log lines
-      description: >
-        On Linux, from `$XDG_STATE_HOME/diri/logs/dirijord.log` (normally
-        `~/.local/state/diri/logs/dirijord.log`); on macOS, from
-        `~/Library/Application Support/Dirijor/logs/dirijord.log`. Please skim
-        for paths or prompt text you would rather not post. Raw logs are an
-        optional fallback; Copy diagnostics never includes them.
-      render: shell
+      label: Diagnostics or screenshots
+      description: >-
+        Optional. In Settings → General → Support, choose Copy diagnostics,
+        review the report, and paste it here. If Diri will not open, run
+        `dirijor doctor` when the CLI is on PATH. For incorrect agent status,
+        use Session Inspector → Info → Why Diri thinks this → Copy status debug info.
+        Include only the relevant, redacted output.

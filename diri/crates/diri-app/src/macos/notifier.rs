@@ -148,7 +148,13 @@ impl NativeNotifier {
 
     pub fn post(&self, notification: &DiriNotification) {
         let Some(inner) = &self.inner else { return };
-        let active = Arc::new(AtomicBool::new(true));
+        let active = notification
+            .guard
+            .as_ref()
+            .map_or_else(|| Arc::new(AtomicBool::new(true)), |guard| guard.0.clone());
+        if !active.load(Ordering::SeqCst) {
+            return;
+        }
         {
             let mut pending = inner.pending.borrow_mut();
             if pending.len() >= 200

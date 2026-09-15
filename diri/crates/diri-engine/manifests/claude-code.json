@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "id": "claude-code",
-  "version": "2026.08.15.1",
+  "version": "2026.09.07.1",
   "statusModel": "full",
   "agent": {
     "id": "claude-code",
@@ -190,7 +190,44 @@
       "priority": 900,
       "region": "osc_title",
       "when": {
-        "regex": "^[\u2800-\u28ff]"
+        "regex": "^[\u2800-\u28ff\u25d0-\u25d3]"
+      }
+    },
+    {
+      "id": "working-live-turn",
+      "state": "working",
+      "priority": 890,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 12,
+      "when": {
+        "any": [
+          {
+            "lineRegex": "^\\s*[\u23f8\u23f5].*esc to interrupt(?:\\s|\u00b7|$)"
+          },
+          {
+            "lineRegex": "^\\s*[*\u00b7\u2722\u2736\u273b\u273d]\\s+\\S.*\u2026(?:\\s+\\(\\d+[smh](?:\\s|\u00b7)|\\s*$)"
+          }
+        ]
+      }
+    },
+    {
+      "id": "working-background-agents",
+      "state": "working",
+      "priority": 880,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 12,
+      "when": {
+        "lineRegex": "^\\s*[*\u00b7\u2722\u2736\u273b\u273d]\\s+Waiting for [1-9]\\d* background agents? to finish\\s*$"
+      }
+    },
+    {
+      "id": "working-background-mcp",
+      "state": "working",
+      "priority": 880,
+      "region": "bottom_non_empty_lines",
+      "regionLines": 12,
+      "when": {
+        "regex": "(?m)^[*\u00b7\u2722\u2736\u273b\u273d][ \\t]+\\S[^\\n]*?(?:\\n[ \\t]+[^\\n]*?){0,3}\u00b7(?:[ \\t]+|\\n[ \\t]*)[1-9]\\d*(?:[ \\t]+|\\n[ \\t]*)MCP(?:[ \\t]+|\\n[ \\t]*)tasks?(?:[ \\t]+|\\n[ \\t]*)still(?:[ \\t]+|\\n[ \\t]*)running[ \\t]*$"
       }
     },
     {

@@ -1,0 +1,2 @@
+# Cloudflare Pages handles HTTPS and .html normalization.
+/index.html / 301

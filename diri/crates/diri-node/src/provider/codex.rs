@@ -3,8 +3,9 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use diri_proto::LoginMode;
+use diri_proto::control::MAX_CONTROL_LINE_BYTES;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 use crate::error::{NodeError, NodeResult};
@@ -108,16 +109,13 @@ impl CodexAppServer {
             .await?;
 
         let response = async {
-            let mut line = String::new();
             loop {
-                line.clear();
-                let bytes = self.stdout.read_line(&mut line).await?;
-                if bytes == 0 {
+                let Some(line) = read_bounded_provider_line(&mut self.stdout).await? else {
                     return Err(NodeError::Provider(
                         "Codex app-server closed its output".into(),
                     ));
-                }
-                let value: Value = serde_json::from_str(&line)?;
+                };
+                let value: Value = serde_json::from_slice(&line)?;
                 if value.get("id").and_then(Value::as_u64) != Some(id) {
                     // Notifications are deliberately consumed here. The node
                     // records authoritative usage separately and clients ask
@@ -144,6 +142,36 @@ impl CodexAppServer {
         self.stdin.write_all(&line).await?;
         self.stdin.flush().await?;
         Ok(())
+    }
+}
+
+async fn read_bounded_provider_line<R>(reader: &mut R) -> NodeResult<Option<Vec<u8>>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(line))
+            };
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |position| position + 1);
+        let payload = newline.unwrap_or(available.len());
+        if line.len().saturating_add(payload) > MAX_CONTROL_LINE_BYTES {
+            return Err(NodeError::Provider(format!(
+                "Codex app-server line exceeds {MAX_CONTROL_LINE_BYTES} bytes"
+            )));
+        }
+        line.extend_from_slice(&available[..payload]);
+        reader.consume(consumed);
+        if newline.is_some() {
+            return Ok(Some(line));
+        }
     }
 }
 

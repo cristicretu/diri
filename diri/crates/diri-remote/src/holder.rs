@@ -11,9 +11,10 @@ use std::time::{Duration, Instant};
 
 use diri_proto::frames::{Frame, FrameType, MAX_FRAME_BYTES};
 use diri_proto::remote_pty::{
-    ControlGranted, ControlRevoked, FullSnapshot, GridDelta, Hello, HelloAck, LaunchRequest,
-    LaunchResult, PHASE_ONE_HOLDER_CAPABILITIES, ProcessExit, RemoteCodec, RemoteError,
-    RemoteMessage, RemoteProcessState, ScrollbackResponse, validate_terminal_dimensions,
+    ANNOTATED_HOLDER_CAPABILITIES, ControlGranted, ControlRevoked,
+    FOREGROUND_PROCESS_PROTOCOL_MINOR, ForegroundProcess, FullSnapshot, GridDelta, Hello, HelloAck,
+    LaunchRequest, LaunchResult, ProcessExit, RemoteCodec, RemoteError, RemoteMessage,
+    RemoteProcessState, ScrollbackResponse, validate_terminal_dimensions,
 };
 use diri_pty::{Exit, ExitWatcher, Pty, PtySpec, PtyStream};
 use diri_terminal_state::HeadlessScreen;
@@ -38,9 +39,11 @@ const MAX_PENDING_INPUT_BYTES: usize = 1 << 20;
 const OUTPUT_FRAME_BYTES: usize = 64 << 10;
 const REPLAY_BUDGET_BYTES: usize = 4 << 20;
 const PERSIST_OFFSET_INTERVAL: u64 = 1 << 20;
+const FOREGROUND_PROBE_AFTER_INPUT: Duration = Duration::from_millis(100);
+const FOREGROUND_PROBE_WHILE_JOB: Duration = Duration::from_secs(1);
 
 pub const PHASE_ONE_CAPABILITIES: &[diri_proto::remote_pty::RemoteCapability] =
-    PHASE_ONE_HOLDER_CAPABILITIES;
+    ANNOTATED_HOLDER_CAPABILITIES;
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -415,6 +418,9 @@ struct Holder {
     pending_output_offset: u64,
     interactive_grid_budget: u8,
     last_persisted_offset: u64,
+    controller_protocol_minor: u16,
+    last_foreground_pid: Option<Option<i32>>,
+    foreground_probe_deadline: Option<Instant>,
 }
 
 impl Holder {
@@ -490,6 +496,9 @@ impl Holder {
             pending_output_offset: 0,
             interactive_grid_budget: 0,
             last_persisted_offset: 0,
+            controller_protocol_minor: 0,
+            last_foreground_pid: None,
+            foreground_probe_deadline: None,
         })
     }
 
@@ -556,9 +565,7 @@ impl Holder {
                 });
                 index
             });
-            let timeout = self
-                .dirty_since
-                .map_or(-1, |since| poll_timeout(since + DIFF_COALESCE));
+            let timeout = self.poll_timeout_ms();
             // SAFETY: `descriptors` owns initialized pollfd entries for the
             // duration of the call. A negative timeout sleeps indefinitely.
             let ready = unsafe {
@@ -624,6 +631,7 @@ impl Holder {
                 self.flush_output()?;
                 self.emit_grid_delta()?;
             }
+            self.emit_foreground_process()?;
         }
     }
 
@@ -947,6 +955,10 @@ impl Holder {
         self.state.controller_epoch = self.state.controller_epoch.saturating_add(1);
         let epoch = self.state.controller_epoch;
         connection.epoch = Some(epoch);
+        connection.protocol_minor = hello.protocol.minor;
+        self.controller_protocol_minor = hello.protocol.minor;
+        let foreground_pid = self.pty.foreground_pgid();
+        self.last_foreground_pid = Some(foreground_pid);
         connection.queue(RemoteMessage::HelloAck(HelloAck {
             protocol: diri_proto::remote_pty::ProtocolVersion::CURRENT,
             holder_build_id: BUILD_ID.to_string(),
@@ -956,6 +968,7 @@ impl Holder {
             process_state: self.state.process_state.clone(),
             output_offset: self.state.output_offset,
             snapshot_sequence: self.state.snapshot_sequence,
+            foreground_pid,
         }))?;
         self.queue_replay(connection, hello.last_acknowledged_output_offset)?;
         self.state.snapshot_sequence = self.state.snapshot_sequence.saturating_add(1);
@@ -1005,6 +1018,7 @@ impl Holder {
         // next the actual echo/TUI response. Keep the fast path bounded to
         // those two frames so a keystroke cannot unthrottle a bulk stream.
         self.interactive_grid_budget = INTERACTIVE_GRID_BUDGET;
+        self.foreground_probe_deadline = Some(Instant::now() + FOREGROUND_PROBE_AFTER_INPUT);
         self.flush_input()
     }
 
@@ -1043,6 +1057,58 @@ impl Holder {
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn poll_timeout_ms(&self) -> libc::c_int {
+        let grid = self
+            .dirty_since
+            .map(|since| poll_timeout(since + DIFF_COALESCE));
+        let probe = self.foreground_probe_deadline.map(poll_timeout);
+        match (grid, probe) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => -1,
+        }
+    }
+
+    fn emit_foreground_process(&mut self) -> io::Result<()> {
+        if self.controller_protocol_minor < FOREGROUND_PROCESS_PROTOCOL_MINOR {
+            self.foreground_probe_deadline = None;
+            return Ok(());
+        }
+        if self
+            .connection
+            .as_ref()
+            .is_none_or(|connection| connection.epoch.is_none())
+        {
+            // No controller consumes these samples. An expired deadline must
+            // not keep poll(0) spinning after EOF, release, or a failed write.
+            self.foreground_probe_deadline = None;
+            return Ok(());
+        }
+        let pid = self.pty.foreground_pgid();
+        if self.last_foreground_pid != Some(pid) {
+            self.last_foreground_pid = Some(pid);
+            self.queue(RemoteMessage::ForegroundProcess(ForegroundProcess { pid }))?;
+        }
+        let child_pid = match self.state.process_state {
+            RemoteProcessState::Running { pid } => pid as i32,
+            RemoteProcessState::Exited { .. } => {
+                self.foreground_probe_deadline = None;
+                return Ok(());
+            }
+        };
+        let running = pid.is_some_and(|pgid| pgid != child_pid);
+        if running {
+            self.foreground_probe_deadline = Some(Instant::now() + FOREGROUND_PROBE_WHILE_JOB);
+        } else if self
+            .foreground_probe_deadline
+            .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            self.foreground_probe_deadline = None;
+        }
+        Ok(())
     }
 
     fn emit_grid_delta(&mut self) -> io::Result<()> {
@@ -1186,6 +1252,7 @@ fn resolve_remote_executable(
 }
 
 struct Connection {
+    protocol_minor: u16,
     stream: UnixStream,
     codec: RemoteCodec,
     epoch: Option<u64>,
@@ -1196,6 +1263,7 @@ struct Connection {
 impl Connection {
     fn new(stream: UnixStream) -> Self {
         Self {
+            protocol_minor: 0,
             stream,
             codec: RemoteCodec::new(),
             epoch: None,
@@ -1204,7 +1272,26 @@ impl Connection {
         }
     }
 
-    fn queue(&mut self, message: RemoteMessage) -> io::Result<()> {
+    fn queue(&mut self, mut message: RemoteMessage) -> io::Result<()> {
+        if self.protocol_minor < diri_proto::remote_pty::TERMINAL_ANNOTATIONS_PROTOCOL_MINOR {
+            match &mut message {
+                RemoteMessage::HelloAck(value) => value.capabilities.retain(|capability| {
+                    *capability != diri_proto::remote_pty::RemoteCapability::TerminalAnnotations
+                }),
+                RemoteMessage::FullSnapshot(value) => {
+                    for row in &mut value.grid.changed_rows {
+                        row.metadata = Default::default();
+                    }
+                }
+                RemoteMessage::GridDelta(value) => {
+                    for row in &mut value.grid.changed_rows {
+                        row.metadata = Default::default();
+                    }
+                }
+                RemoteMessage::ScrollbackResponse(value) => value.result.metadata.clear(),
+                _ => {}
+            }
+        }
         RemoteCodec::encode_into(&message, &mut self.outbound).map_err(io::Error::other)
     }
 
@@ -1343,6 +1430,55 @@ fn terminate_process_group(pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn annotations_are_negotiated_without_breaking_old_controllers() {
+        use diri_proto::grid::{ChangedRow, GridCell, GridUpdate, LinkSpan};
+        for minor in [5, 6] {
+            let (stream, _peer) = UnixStream::pair().unwrap();
+            let mut connection = Connection::new(stream);
+            connection.protocol_minor = minor;
+            let mut row = ChangedRow::new(0, vec![GridCell::default(); 4]);
+            row.metadata.links.push(LinkSpan {
+                start: 0,
+                end: 4,
+                uri: "https://example.com".into(),
+            });
+            let mut grid = GridUpdate {
+                cols: 4,
+                rows: 1,
+                cursor_col: 0,
+                cursor_row: 0,
+                cursor_visible: true,
+                is_full_snapshot: true,
+                changed_rows: Vec::new(),
+            };
+            grid.is_full_snapshot = true;
+            grid.changed_rows.push(row);
+            connection
+                .queue(RemoteMessage::FullSnapshot(FullSnapshot {
+                    sequence: 1,
+                    alt_screen: false,
+                    bracketed_paste: false,
+                    mouse: Default::default(),
+                    grid,
+                }))
+                .unwrap();
+            let messages = RemoteCodec::new().feed(&connection.outbound).unwrap();
+            let RemoteMessage::FullSnapshot(snapshot) = &messages[0] else {
+                panic!("snapshot");
+            };
+            assert_eq!(
+                snapshot.grid.changed_rows[0].metadata.links.len(),
+                usize::from(minor >= 6)
+            );
+        }
+        assert_eq!(
+            serde_json::to_string(&diri_proto::remote_pty::RemoteCapability::TerminalAnnotations)
+                .unwrap(),
+            "\"terminal-annotations-v1\""
+        );
+    }
 
     #[test]
     fn pending_bytes_compact_after_a_complete_write() {

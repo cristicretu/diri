@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use diri_engine::holder::HolderClient;
+use diri_engine::holder::{HolderClient, HolderManagerPaths, process_tree};
 use diri_engine::session::{HolderConfig, Session, SessionSpec};
 use diri_engine::{Authority, ManifestEngine, PtySpec};
 
@@ -219,7 +219,7 @@ fn idle(count: usize) {
     let sessions: Vec<Session> = (0..count)
         .map(|index| {
             Session::spawn(
-                spec(&format!("s_idle_{index}"), "sleep 600", &root, 153, 39),
+                spec(&format!("s_idle_{index}"), "exec sleep 600", &root, 153, 39),
                 engine(),
             )
             .expect("spawn")
@@ -228,33 +228,45 @@ fn idle(count: usize) {
     // Let startup settle before measuring what steady state costs.
     std::thread::sleep(Duration::from_secs(5));
 
+    let manager_paths = HolderManagerPaths::new(&holder_config(&root).holders_dir);
+    let manager_pid: i32 = std::fs::read_to_string(manager_paths.pid_file())
+        .expect("private manager pid")
+        .trim()
+        .parse()
+        .expect("pid");
+    let mut pids: Vec<_> = process_tree::enumerate(manager_pid)
+        .into_iter()
+        .map(|sample| sample.pid)
+        .collect();
+    pids.push(std::process::id() as i32);
+    pids.sort_unstable();
+    pids.dedup();
+    let footprint = diri_engine::governor::footprint_of(&pids);
+    assert!(footprint > 0, "process footprint measurement unavailable");
+    println!(
+        "idle fleet: {} processes, {:.2} MiB physical footprint (macOS) / RSS (Linux)",
+        pids.len(),
+        footprint as f64 / 1048576.0
+    );
     let sample_secs = 10;
-    let before = cpu_seconds();
+    let before = diri_engine::governor::cpu_time_of(&pids);
+    let started = Instant::now();
     std::thread::sleep(Duration::from_secs(sample_secs));
-    let used = cpu_seconds() - before;
+    let after = diri_engine::governor::cpu_time_of(&pids);
+    let used = after
+        .checked_sub(before)
+        .expect("a measured process exited") as f64
+        / 1e9;
+    let elapsed = started.elapsed().as_secs_f64();
     println!(
         "idle {count} sessions      {:.2}% of one core over {sample_secs}s ({:.1} ms per session per second)",
-        used / sample_secs as f64 * 100.0,
-        used * 1000.0 / sample_secs as f64 / count.max(1) as f64
+        used / elapsed * 100.0,
+        used * 1000.0 / elapsed / count as f64
     );
     for mut session in sessions {
         let _ = session.terminate(Duration::from_secs(2));
     }
     let _ = std::fs::remove_dir_all(&root);
-}
-
-/// CPU seconds this process and its children have used.
-fn cpu_seconds() -> f64 {
-    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
-    let mut total = 0.0;
-    for who in [libc::RUSAGE_SELF, libc::RUSAGE_CHILDREN] {
-        // SAFETY: `usage` is a valid, fully initialized rusage.
-        if unsafe { libc::getrusage(who, &mut usage) } == 0 {
-            total += usage.ru_utime.tv_sec as f64 + usage.ru_utime.tv_usec as f64 / 1e6;
-            total += usage.ru_stime.tv_sec as f64 + usage.ru_stime.tv_usec as f64 / 1e6;
-        }
-    }
-    total
 }
 
 fn main() {
@@ -263,6 +275,10 @@ fn main() {
         .nth(2)
         .and_then(|a| a.parse().ok())
         .unwrap_or(20);
+    assert!(
+        (1..=256).contains(&count),
+        "count must be between 1 and 256"
+    );
     match mode.as_str() {
         "startup" => startup(count),
         "attach" => attach(count),

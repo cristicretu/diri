@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 
-use crate::log::{DEFAULT_RING_CAPACITY, OutputLog};
+use crate::log::OutputLog;
 use crate::pty::{Pty, PtySpec};
 
 use super::client::HolderClient;
@@ -283,7 +283,10 @@ fn open_log(spec: &HolderLaunchSpec) -> HolderResult<OutputLog> {
     } else {
         super::protocol::DEFAULT_DISK_CAPACITY as usize
     };
-    OutputLog::open(directory, session, DEFAULT_RING_CAPACITY, capacity, false)
+    // The Holder only appends and reports offsets. Its consumers either read
+    // the durable file themselves or receive the separate bounded live queue;
+    // retaining a second raw-output ring here has no reader.
+    OutputLog::open(directory, session, 0, capacity, false)
         .map_err(|error| HolderError::io("open output log", error))
 }
 
@@ -764,15 +767,14 @@ fn current_stat(shared: &Shared) -> HolderStat {
     let pty = shared.pty.lock().expect("pty");
     // SAFETY: kill with signal 0 only checks existence.
     let child_alive = unsafe { libc::kill(shared.child_pid, 0) } == 0;
-    let master_fd = pty.writer().map(|stream| stream.as_raw_fd()).unwrap_or(-1);
-    // SAFETY: tcgetpgrp on the master; -1 fd yields an error, mapped to None.
-    let foreground = unsafe { libc::tcgetpgrp(master_fd) };
     let size = pty.size().ok();
     HolderStat {
         child_pid: shared.child_pid,
         alive: !finished && child_alive,
         log_offset: shared.log.lock().expect("log").tail_offset(),
-        foreground_pid: (foreground > 0).then_some(foreground),
+        // Sample the live owner. A cloned writer dropped before `tcgetpgrp`
+        // leaves a closed fd, so every job looks like the idle shell.
+        foreground_pid: pty.foreground_pgid(),
         cols: size.map(|(cols, _)| cols),
         rows: size.map(|(_, rows)| rows),
         epoch_offset: Some(shared.epoch_offset),
@@ -797,5 +799,43 @@ fn set_nonblocking(fd: i32) {
         if flags >= 0 {
             libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn holder_log_retains_no_duplicate_output_and_replays_from_disk() {
+        let root = tempfile::tempdir().unwrap();
+        let spec = HolderLaunchSpec {
+            session_id: "s_log".into(),
+            socket_path: String::new(),
+            pid_file_path: String::new(),
+            log_file_path: root.path().join("s_log.bin").to_string_lossy().into_owned(),
+            argv: Vec::new(),
+            cwd: String::new(),
+            environment: Default::default(),
+            cols: 80,
+            rows: 24,
+            disk_capacity: 4096,
+        };
+        let mut writer = open_log(&spec).unwrap();
+        let bytes = b"\x1b[2Joutput retained in the durable log\r\n";
+        for _ in 0..200 {
+            writer.append(bytes).unwrap();
+        }
+        writer.flush().unwrap();
+        let tail = writer.tail_offset();
+        assert_eq!(
+            writer.ring_start_offset(),
+            tail,
+            "the Holder never reads its ring"
+        );
+        let mut reader = OutputLog::reader(root.path(), "s_log").unwrap();
+        let (start, replay) = reader.read(tail - bytes.len() as u64, bytes.len());
+        assert_eq!(start, tail - bytes.len() as u64);
+        assert_eq!(replay, bytes, "log rotation must preserve the final output");
     }
 }

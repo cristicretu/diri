@@ -18,6 +18,7 @@ mod regions;
 
 pub use manifest::{Manifest, ManifestState, RegionKind, StatusModel};
 pub use redact::redact;
+pub(crate) use regions::prompt_box_body;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -268,6 +269,71 @@ mod tests {
         engine
     }
 
+    #[test]
+    fn claude_live_work_outranks_its_visible_input_box() {
+        let engine = engine();
+        for (title, activity) in [
+            ("◐ Working", ""),
+            ("◑ Working", ""),
+            ("◒ Working", ""),
+            ("◓ Working", ""),
+            ("✳ Project", "⏵ processing · esc to interrupt"),
+            ("✳ Project", "✻ Thinking… (12s · ↓ 100 tokens)"),
+            ("✳ Project", "✻ Waiting for 2 background agents to finish"),
+            ("✳ Project", "✻ Working… · 2 MCP tasks still running"),
+        ] {
+            let snapshot = ScreenSnapshot {
+                lines: vec![
+                    activity.into(),
+                    "──────────".into(),
+                    "❯".into(),
+                    "──────────".into(),
+                ],
+                osc_title: Some(title.into()),
+                ..Default::default()
+            };
+            let observation = engine
+                .evaluate(&snapshot, "claude-code")
+                .expect("Claude rule");
+            assert_eq!(
+                observation.state,
+                ManifestState::Working,
+                "title={title}, activity={activity}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_work_indicators_do_not_hide_blockers_or_match_user_prompt_text() {
+        let engine = engine();
+        let mut blocked = ScreenSnapshot::from_lines([
+            "✻ Working… · 2 MCP tasks still running",
+            "Do you want to proceed?",
+            "❯ 1. Yes",
+            "2. No",
+            "esc to cancel",
+        ]);
+        blocked.osc_title = Some("◐ Working".into());
+        assert_eq!(
+            engine.evaluate(&blocked, "claude-code").unwrap().state,
+            ManifestState::BlockedPermission
+        );
+        for text in [
+            "❯ ✻ Waiting for 2 background agents to finish",
+            "❯ ✻ Working… · 2 MCP tasks still running",
+            "❯ ⏵ processing · esc to interrupt",
+            "1 background shell · ↓ to view",
+        ] {
+            let mut idle = ScreenSnapshot::from_lines([text]);
+            idle.osc_title = Some("✳ Project".into());
+            assert_eq!(
+                engine.evaluate(&idle, "claude-code").unwrap().state,
+                ManifestState::Idle,
+                "{text}"
+            );
+        }
+    }
+
     /// Every manifest decoding is also the proof that every pattern in them
     /// compiles under the `regex` crate — the one real risk in moving off ICU,
     /// since `regex` has no backreferences or lookaround. A pattern that needed
@@ -332,7 +398,7 @@ mod tests {
             .into_iter()
             .map(|id| engine.manifest(id).expect("manifest").rules.len())
             .sum();
-        assert_eq!(rules, 99, "the shipped ruleset lost rules");
+        assert_eq!(rules, 106, "the shipped ruleset lost rules");
 
         for id in engine.ids() {
             let expected_empty = matches!(id, "shell" | "generic" | "pi");
@@ -548,6 +614,285 @@ mod tests {
             lines: lines.iter().map(|line| (*line).to_owned()).collect(),
             osc_title: osc_title.map(str::to_owned),
             ..ScreenSnapshot::default()
+        }
+    }
+
+    #[test]
+    fn codex_queued_follow_up_question_keeps_session_working() {
+        use crate::status::{Authority, StatusReducer, StatusSignal};
+        use diri_proto::SessionStatus;
+        use std::time::{Duration, SystemTime};
+
+        let engine = engine();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let mut reducer = StatusReducer::new(Authority::ScreenPrimary, now);
+        for (index, activity) in [
+            "• Working (27m 01s • esc to interrupt)",
+            "• Reviewing changes (28m 02s • esc to interrupt)",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let snapshot = ScreenSnapshot {
+                lines: vec![
+                    activity.into(),
+                    "• Queued follow-up inputs".into(),
+                    "  ? 1 question".into(),
+                    "    ⌥ + ↑ to answer".into(),
+                    "› Ask Codex to do anything".into(),
+                    "gpt-6-astra high · ~/project".into(),
+                ],
+                osc_title: Some("Action Required | project".into()),
+                content_seq: index as u64 + 1,
+                ..ScreenSnapshot::default()
+            };
+            let observation = engine.evaluate(&snapshot, "codex").expect("queue rule");
+            assert_eq!(observation.state, ManifestState::Working, "{observation:?}");
+            let outcome = reducer.reduce(
+                StatusSignal::Screen(observation),
+                now + Duration::from_secs(index as u64),
+            );
+            assert_eq!(reducer.status(), &SessionStatus::Working);
+            assert!(outcome.needs_input.is_none(), "queued input is nonblocking");
+            assert!(!outcome.turn_completed);
+        }
+    }
+
+    #[test]
+    fn codex_completed_turn_with_queued_question_settles_idle() {
+        use crate::status::{Authority, StatusReducer, StatusSignal};
+        use diri_proto::SessionStatus;
+        use std::time::{Duration, SystemTime};
+
+        let engine = engine();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let mut reducer = StatusReducer::new(Authority::ScreenPrimary, now);
+        let mut snapshot = ScreenSnapshot {
+            lines: vec![
+                "• Working (27s • esc to interrupt)".into(),
+                "• Queued follow-up inputs".into(),
+                "  ? 1 question".into(),
+                "    ⌥ + ↑ to answer".into(),
+                "› Ask Codex to do anything".into(),
+                "gpt-6-astra high · ~/project".into(),
+            ],
+            osc_title: Some("Action Required | project".into()),
+            content_seq: 1,
+            ..ScreenSnapshot::default()
+        };
+        reducer.reduce(
+            StatusSignal::Screen(engine.evaluate(&snapshot, "codex").unwrap()),
+            now + Duration::from_secs(5),
+        );
+        assert_eq!(reducer.status(), &SessionStatus::Working);
+
+        snapshot.lines[0] = "─ Worked for 3m 48s ─────────────────".into();
+        snapshot.content_seq += 1;
+        reducer.reduce(
+            StatusSignal::Screen(engine.evaluate(&snapshot, "codex").unwrap()),
+            now + Duration::from_secs(6),
+        );
+        let outcome = reducer.reduce(StatusSignal::Tick, now + Duration::from_secs(7));
+        assert_eq!(reducer.status(), &SessionStatus::Idle);
+        assert!(outcome.turn_completed);
+        assert!(outcome.needs_input.is_none());
+    }
+
+    #[test]
+    fn codex_completed_turn_with_stale_spinner_settles_idle() {
+        use crate::status::{Authority, StatusReducer, StatusSignal};
+        use diri_proto::SessionStatus;
+        use std::time::{Duration, SystemTime};
+
+        let engine = engine();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let mut reducer = StatusReducer::new(Authority::ScreenPrimary, now);
+        let mut snapshot = cursor_snapshot(
+            &[
+                "• Working (27s • esc to interrupt)",
+                "› Ask Codex to do anything",
+            ],
+            Some("⠋ Working | project"),
+        );
+        snapshot.content_seq = 1;
+        reducer.reduce(
+            StatusSignal::Screen(engine.evaluate(&snapshot, "codex").unwrap()),
+            now + Duration::from_secs(5),
+        );
+        assert_eq!(reducer.status(), &SessionStatus::Working);
+        snapshot.lines[0] = "─ Worked for 3m 48s ─────────────────".into();
+        snapshot.content_seq += 1;
+        reducer.reduce(
+            StatusSignal::Screen(engine.evaluate(&snapshot, "codex").unwrap()),
+            now + Duration::from_secs(6),
+        );
+        let outcome = reducer.reduce(StatusSignal::Tick, now + Duration::from_secs(7));
+        assert_eq!(reducer.status(), &SessionStatus::Idle);
+        assert!(outcome.turn_completed);
+
+        // A new turn can start with the previous completion still visible.
+        snapshot
+            .lines
+            .insert(1, "• Reviewing (1s • esc to interrupt)".into());
+        snapshot.content_seq += 1;
+        reducer.reduce(
+            StatusSignal::Screen(engine.evaluate(&snapshot, "codex").unwrap()),
+            now + Duration::from_secs(8),
+        );
+        assert_eq!(reducer.status(), &SessionStatus::Working);
+    }
+
+    #[test]
+    fn codex_completion_requires_a_recent_prompt_and_preserves_blockers() {
+        let engine = engine();
+        let completed = "─ Worked for 3m 48s ─────────────────";
+        let mut snapshot = cursor_snapshot(&[completed], Some("⠋ Working | project"));
+        assert_eq!(
+            engine.evaluate(&snapshot, "codex").unwrap().state,
+            ManifestState::Working
+        );
+        snapshot
+            .lines
+            .extend((0..12).map(|i| format!("Output {i}")));
+        snapshot.lines.push("› Ask Codex to do anything".into());
+        assert_eq!(
+            engine.evaluate(&snapshot, "codex").unwrap().state,
+            ManifestState::Working
+        );
+
+        for (footer, expected) in [
+            ("Enter to submit answer", ManifestState::BlockedQuestion),
+            (
+                "Press enter to confirm or esc to cancel",
+                ManifestState::BlockedPermission,
+            ),
+        ] {
+            let snapshot = cursor_snapshot(
+                &[completed, "• Working (1s • esc to interrupt)", "›", footer],
+                Some("⠋ Working | project"),
+            );
+            assert_eq!(engine.evaluate(&snapshot, "codex").unwrap().state, expected);
+        }
+        let snapshot = cursor_snapshot(&[completed, "›"], Some("Action Required | project"));
+        assert_eq!(
+            engine.evaluate(&snapshot, "codex").unwrap().state,
+            ManifestState::BlockedPermission
+        );
+    }
+
+    #[test]
+    fn codex_queue_override_requires_a_complete_recent_footer() {
+        let engine = engine();
+        let footer = [
+            "• Queued follow-up inputs",
+            "  ? 1 question",
+            "    ⌥ + ↑ to answer",
+            "› Ask Codex to do anything",
+        ];
+        for missing in 0..footer.len() {
+            let snapshot = ScreenSnapshot {
+                lines: footer
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| *index != missing)
+                    .map(|(_, line)| (*line).into())
+                    .collect(),
+                osc_title: Some("Action Required | project".into()),
+                ..ScreenSnapshot::default()
+            };
+            let observation = engine.evaluate(&snapshot, "codex").unwrap();
+            assert_eq!(observation.state, ManifestState::BlockedPermission);
+        }
+
+        let mut snapshot = ScreenSnapshot {
+            lines: footer.iter().map(|line| (*line).into()).collect(),
+            osc_title: Some("Action Required | project".into()),
+            ..ScreenSnapshot::default()
+        };
+        snapshot
+            .lines
+            .extend((0..12).map(|i| format!("Output {i}")));
+        let observation = engine.evaluate(&snapshot, "codex").unwrap();
+        assert_eq!(observation.state, ManifestState::BlockedPermission);
+    }
+
+    #[test]
+    fn codex_action_required_redraws_keep_the_same_notification_identity() {
+        use crate::status::{Authority, StatusReducer, StatusSignal};
+        use std::time::{Duration, SystemTime};
+
+        let engine = engine();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let mut reducer = StatusReducer::new(Authority::ScreenPrimary, now);
+        let mut first = None;
+        for seconds in 0..20 {
+            // Generic action-required attention must retain its identity
+            // across redraws when no nonblocking queue footer is visible.
+            let snapshot = ScreenSnapshot {
+                lines: vec![
+                    format!("• Ran tool {seconds}"),
+                    format!("• Working (27m {seconds:02}s • esc to interrupt)"),
+                    "› Ask Codex to do anything".into(),
+                ],
+                osc_title: Some("Action Required | project".into()),
+                content_seq: seconds + 1,
+                ..ScreenSnapshot::default()
+            };
+            let observation = engine.evaluate(&snapshot, "codex").expect("title rule");
+            let outcome = reducer.reduce(
+                StatusSignal::Screen(observation),
+                now + Duration::from_secs(seconds),
+            );
+            assert!(
+                !outcome.turn_completed,
+                "an action-required title is not completion"
+            );
+            let mut detail = outcome.needs_input.expect("action-required attention");
+            // Notification identity includes the summary and kind, excluding
+            // repaint timestamps. The rest of the detail must stay stable too.
+            detail.occurred_at = now.into();
+            if let Some(first) = &first {
+                assert_eq!(&detail, first, "redraw must not create a new alert");
+            } else {
+                first = Some(detail);
+            }
+        }
+    }
+
+    #[test]
+    fn codex_visible_prompts_outrank_the_generic_action_required_title() {
+        let engine = engine();
+        for (footer, expected, rule) in [
+            (
+                "Enter to submit answer",
+                ManifestState::BlockedQuestion,
+                "submit-answer",
+            ),
+            (
+                "Press enter to confirm or esc to cancel",
+                ManifestState::BlockedPermission,
+                "confirm-prompt",
+            ),
+        ] {
+            let snapshot = cursor_snapshot(
+                &[
+                    "• Queued follow-up inputs",
+                    "  ? 2 questions",
+                    "    ⌥ + ↑ to answer",
+                    "╭────────────────────╮",
+                    "│ Which option?      │",
+                    "╰────────────────────╯",
+                    footer,
+                ],
+                Some("Action Required | project"),
+            );
+            let observation = engine.evaluate(&snapshot, "codex").expect("prompt rule");
+            assert_eq!(observation.state, expected);
+            assert_eq!(observation.matched_rule_id, rule);
+            assert_eq!(
+                observation.prompt_excerpt.as_deref().map(str::trim),
+                Some("Which option?")
+            );
         }
     }
 

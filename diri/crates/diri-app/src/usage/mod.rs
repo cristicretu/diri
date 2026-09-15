@@ -1,10 +1,12 @@
-//! Incremental, daemon-free usage accounting for Claude Code and Codex transcripts.
+//! Incremental usage accounting for Claude Code, Codex, and Cursor.
 //!
-//! Costs are computed locally from the transcripts on disk; nothing is sent
-//! anywhere. The separate limits reader queries provider-reported subscription
-//! windows without deriving quota percentages from these estimates.
+//! Claude and Codex costs come from local transcripts. Cursor usage is fetched
+//! from Cursor's dashboard API using the signed-in IDE/CLI session. The
+//! separate limits reader queries provider-reported subscription windows
+//! without deriving quota percentages from these estimates.
 
 mod cache;
+mod cursor;
 pub mod dashboard;
 mod fleet;
 pub(crate) mod limits;
@@ -15,6 +17,7 @@ mod store;
 mod timestamp;
 mod watcher;
 
+pub(crate) use cursor::{CursorBatch, CursorRefresh};
 pub(crate) use fleet::merge_fleet_usage;
 pub use model::{ProviderUsage, UsageHourAgg, UsageSnapshot, UsageTotals};
 pub use pricing::PRICING_ENTRY_COUNT;

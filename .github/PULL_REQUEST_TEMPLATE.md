@@ -1,17 +1,11 @@
-## Why
+## Change
 
-<!-- What problem does this solve? Link an issue when one exists. -->
-
-## What changed
-
-<!-- Keep this focused enough to review. -->
+<!-- Explain the problem and what changes for the user. Link an issue if relevant. -->
+<!-- Keep one purpose per PR. Include a screenshot or recording for UI changes. -->
 
 ## Verification
 
-<!-- Commands run and manual behavior checked. -->
-
-- [ ] `./scripts/check.sh` passes, or I explained why a check is not applicable.
-- [ ] Existing sessions still survive app and daemon restarts, or the migration is documented.
-- [ ] I considered security and privacy impact (processes, IPC, logs, updates, remote hosts).
-- [ ] User-visible behavior or setup changes are documented.
-- [ ] UI changes include a screenshot or short recording.
+<!-- List the checks you ran and their results, including manual checks. -->
+<!-- Explain anything untested. See CONTRIBUTING.md for commands. -->
+<!-- When relevant, cover running sessions during restart/reconnect, protocol or
+     stored-format compatibility, and security/privacy impact. -->

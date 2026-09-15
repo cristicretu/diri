@@ -11,7 +11,7 @@ import sys
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-POLICY_PATH = ROOT / "license-policy.json"
+POLICY_PATH = ROOT / "scripts" / "license-policy.json"
 RUST_WORKSPACE = ROOT / "diri"
 
 

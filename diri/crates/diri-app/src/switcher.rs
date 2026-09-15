@@ -2,7 +2,7 @@
 //!
 //! The state machines are deliberately independent of GPUI. This keeps the
 //! release-to-commit behavior deterministic and lets the app shell render the
-//! same state as either a board or a compact list.
+//! same state as either a gallery or a compact list.
 
 use std::collections::HashSet;
 
@@ -193,7 +193,7 @@ impl SessionSwitcherState {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum OverviewMode {
     #[default]
-    Board,
+    Grid,
     List,
 }
 
@@ -288,6 +288,7 @@ pub struct SessionOverviewState {
     query: String,
     selection: HashSet<SessionId>,
     focused: Option<SessionId>,
+    columns: usize,
 }
 
 impl SessionOverviewState {
@@ -336,6 +337,10 @@ impl SessionOverviewState {
 
     pub fn dismiss(&mut self) {
         self.visible = false;
+    }
+
+    pub fn set_columns(&mut self, columns: usize) {
+        self.columns = columns.max(1);
     }
 
     pub fn set_mode(&mut self, mode: OverviewMode, sessions: &[SessionRecord]) {
@@ -452,7 +457,25 @@ impl SessionOverviewState {
                 OverviewArrow::Left | OverviewArrow::Up => current.saturating_sub(1),
                 OverviewArrow::Right | OverviewArrow::Down => (current + 1).min(visible.len() - 1),
             },
-            OverviewMode::Board => self.board_target(arrow, &visible, current),
+            OverviewMode::Grid => match arrow {
+                OverviewArrow::Left => current.saturating_sub(1),
+                OverviewArrow::Right => (current + 1).min(visible.len() - 1),
+                OverviewArrow::Up => {
+                    if current >= self.columns.max(1) {
+                        current - self.columns.max(1)
+                    } else {
+                        current
+                    }
+                }
+                OverviewArrow::Down => {
+                    let columns = self.columns.max(1);
+                    if current / columns < (visible.len() - 1) / columns {
+                        (current + columns).min(visible.len() - 1)
+                    } else {
+                        current
+                    }
+                }
+            },
         };
         let changed = self.focused.as_ref() != Some(&visible[next].id);
         self.focused = Some(visible[next].id.clone());
@@ -464,19 +487,16 @@ impl SessionOverviewState {
         sessions: &'a [SessionRecord],
     ) -> impl Iterator<Item = &'a SessionRecord> + 'a {
         sessions.iter().filter(|session| {
-            self.filter.matches(session) && fuzzy_matches(&self.query, &display_title(session))
+            self.filter.matches(session)
+                && [
+                    display_title(session).as_str(),
+                    &session.cwd,
+                    session.git_branch.as_deref().unwrap_or_default(),
+                    session.kind.id(),
+                ]
+                .iter()
+                .any(|text| fuzzy_matches(&self.query, text))
         })
-    }
-
-    #[must_use]
-    pub fn lane_sessions<'a>(
-        &'a self,
-        lane: OverviewLane,
-        sessions: &'a [SessionRecord],
-    ) -> Vec<&'a SessionRecord> {
-        self.visible_sessions(sessions)
-            .filter(|session| OverviewLane::for_session(session) == lane)
-            .collect()
     }
 
     pub fn reconcile(&mut self, sessions: &[SessionRecord]) {
@@ -497,52 +517,6 @@ impl SessionOverviewState {
             .next()
             .map(|session| session.id.clone());
         self.focused = first;
-    }
-
-    fn board_target(
-        &self,
-        arrow: OverviewArrow,
-        visible: &[&SessionRecord],
-        current: usize,
-    ) -> usize {
-        let current_lane = OverviewLane::for_session(visible[current]);
-        let lane_items: Vec<_> = visible
-            .iter()
-            .enumerate()
-            .filter(|(_, session)| OverviewLane::for_session(session) == current_lane)
-            .map(|(index, _)| index)
-            .collect();
-        let lane_position = lane_items
-            .iter()
-            .position(|index| *index == current)
-            .unwrap_or(0);
-
-        match arrow {
-            OverviewArrow::Up => lane_items[lane_position.saturating_sub(1)],
-            OverviewArrow::Down => lane_items[(lane_position + 1).min(lane_items.len() - 1)],
-            OverviewArrow::Left | OverviewArrow::Right => {
-                let step = if arrow == OverviewArrow::Left { -1 } else { 1 };
-                let current_lane_index = OverviewLane::ALL
-                    .iter()
-                    .position(|lane| *lane == current_lane)
-                    .unwrap_or(0) as isize;
-                let mut target_lane = current_lane_index + step;
-                while (0..OverviewLane::ALL.len() as isize).contains(&target_lane) {
-                    let lane = OverviewLane::ALL[target_lane as usize];
-                    let candidates: Vec<_> = visible
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, session)| OverviewLane::for_session(session) == lane)
-                        .map(|(index, _)| index)
-                        .collect();
-                    if !candidates.is_empty() {
-                        return candidates[lane_position.min(candidates.len() - 1)];
-                    }
-                    target_lane += step;
-                }
-                current
-            }
-        }
     }
 }
 
@@ -584,6 +558,7 @@ mod tests {
 
     fn session(value: &str, status: SessionStatus) -> SessionRecord {
         SessionRecord {
+            attention_state: None,
             id: id(value),
             kind: AgentKind::CLAUDE_CODE,
             cwd: "/work/project".to_owned(),
@@ -742,7 +717,21 @@ mod tests {
     }
 
     #[test]
-    fn board_arrows_preserve_row_across_nonempty_lanes_and_list_is_linear() {
+    fn overview_searches_folder_branch_and_agent() {
+        let mut record = session("Repair login", SessionStatus::Working);
+        record.cwd = "/work/atlas".into();
+        record.git_branch = Some("fix/token-refresh".into());
+        let sessions = vec![record];
+        for query in ["atlas", "token-refresh", sessions[0].kind.id()] {
+            let mut state = SessionOverviewState::default();
+            state.open(&sessions);
+            state.append_query(query, &sessions);
+            assert_eq!(state.visible_sessions(&sessions).count(), 1, "{query}");
+        }
+    }
+
+    #[test]
+    fn gallery_arrows_follow_columns_and_list_is_linear() {
         let sessions = vec![
             session("run-1", SessionStatus::Working),
             session("run-2", SessionStatus::Starting),
@@ -765,8 +754,9 @@ mod tests {
         ];
         let mut overview = SessionOverviewState::default();
         overview.open(&sessions);
+        overview.set_columns(2);
         overview.move_focus(OverviewArrow::Down, &sessions);
-        assert_eq!(overview.focused(), Some(&id("run-2")));
+        assert_eq!(overview.focused(), Some(&id("wait-1")));
         overview.move_focus(OverviewArrow::Right, &sessions);
         assert_eq!(overview.focused(), Some(&id("wait-2")));
         overview.move_focus(OverviewArrow::Right, &sessions);
@@ -778,6 +768,24 @@ mod tests {
     }
 
     #[test]
+    fn gallery_vertical_boundaries_keep_the_column() {
+        let sessions: Vec<_> = (0..5)
+            .map(|i| session(&format!("session-{i}"), SessionStatus::Working))
+            .collect();
+        let mut state = SessionOverviewState::default();
+        state.open(&sessions);
+        state.set_columns(3);
+        state.move_focus(OverviewArrow::Right, &sessions);
+        assert!(!state.move_focus(OverviewArrow::Up, &sessions));
+        assert_eq!(state.focused(), Some(&sessions[1].id));
+        state.move_focus(OverviewArrow::Down, &sessions);
+        assert_eq!(state.focused(), Some(&sessions[4].id));
+        assert!(!state.move_focus(OverviewArrow::Down, &sessions));
+        state.move_focus(OverviewArrow::Up, &sessions);
+        assert_eq!(state.focused(), Some(&sessions[1].id));
+    }
+
+    #[test]
     fn filters_query_and_selection_reconcile_without_ghosts() {
         let sessions = vec![
             session("Alpha compile", SessionStatus::Working),
@@ -785,7 +793,7 @@ mod tests {
         ];
         let mut overview = SessionOverviewState::default();
         overview.open(&sessions);
-        overview.append_query("ac", &sessions);
+        overview.append_query("alco", &sessions);
         assert_eq!(
             overview
                 .visible_sessions(&sessions)

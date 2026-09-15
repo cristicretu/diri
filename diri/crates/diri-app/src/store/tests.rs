@@ -30,6 +30,7 @@ fn pid(value: &str) -> ProjectId {
 
 fn session(value: &str, project: &str, created: f64) -> SessionRecord {
     SessionRecord {
+        attention_state: None,
         id: id(value),
         kind: AgentKind::CLAUDE_CODE,
         cwd: format!("/work/{project}"),
@@ -138,6 +139,30 @@ fn selecting_a_session_wakes_its_artifact_refresh_even_when_already_seen() {
         drain(&mut effects)
             .into_iter()
             .any(|effect| matches!(effect, StoreEffect::MarkSeen(session) if session == id("two")))
+    );
+}
+
+#[test]
+fn archived_selection_and_opening_links_request_fresh_pr_state() {
+    let mut archived = session("old", "a", 1.0);
+    archived.archived_at = Some(DateMillis(3.0));
+    let (mut store, mut effects) = hydrated(
+        vec![session("one", "a", 2.0), archived],
+        vec![project("a", "A")],
+        Prefs::default(),
+    );
+    drain(&mut effects);
+    store.select(id("old"));
+    assert!(
+        drain(&mut effects).iter().any(
+            |effect| matches!(effect, StoreEffect::MarkSeen(session) if session == &id("old"))
+        )
+    );
+    store.refresh_session_links(id("old"));
+    assert!(
+        drain(&mut effects).iter().any(
+            |effect| matches!(effect, StoreEffect::MarkSeen(session) if session == &id("old"))
+        )
     );
 }
 
@@ -788,6 +813,31 @@ fn attention_and_needs_input_sort_use_proto_derivation() {
     );
 }
 
+fn add_attention_fixture(session: &mut SessionRecord) {
+    use diri_proto::attention::{ATTENTION_VERSION, AttentionEvent, AttentionKind, AttentionState};
+    session.attention_state = Some(AttentionState {
+        version: ATTENTION_VERSION,
+        epoch: session.id.0.clone(),
+        sequence: 1,
+        turn: 1,
+        working: true,
+        last_native_completion: None,
+        observed_at: None,
+        active_tools: Default::default(),
+        events: vec![AttentionEvent {
+            sequence: 1,
+            turn: 1,
+            kind: AttentionKind::Request,
+            occurred_at: session.updated_at,
+            resolved: false,
+            blocking: true,
+            detail: session.needs_input.clone(),
+        }],
+        native_requests: Default::default(),
+        native_completions: Default::default(),
+    });
+}
+
 #[test]
 fn hidden_needs_input_update_chimes_and_posts_once_its_window_expires() {
     let (mut store, mut effects) = hydrated(
@@ -799,6 +849,7 @@ fn hidden_needs_input_update_chimes_and_posts_once_its_window_expires() {
 
     let mut hidden = session("hidden", "p", 1.0);
     hidden.status = SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Permission);
+    add_attention_fixture(&mut hidden);
     store.upsert_session(hidden);
 
     // Nothing is announced on the transition itself, and nothing is due yet.
@@ -840,6 +891,7 @@ async fn the_settle_task_sleeps_on_the_window_and_then_publishes() {
         .upsert_session(session("visible", "p", 2.0));
     let mut blocked = session("blocked", "p", 1.0);
     blocked.status = SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Permission);
+    add_attention_fixture(&mut blocked);
     store
         .write()
         .expect("session store lock poisoned")
@@ -870,6 +922,7 @@ fn a_session_that_unblocks_inside_its_window_is_never_announced() {
 
     let mut blocked = session("hidden", "p", 1.0);
     blocked.status = SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Permission);
+    add_attention_fixture(&mut blocked);
     store.upsert_session(blocked.clone());
     assert!(store.next_attention_deadline().is_some());
 
@@ -877,6 +930,7 @@ fn a_session_that_unblocks_inside_its_window_is_never_announced() {
     // the settle task is not even kept awake for it.
     blocked.status = SessionStatus::Working;
     blocked.needs_input = None;
+    blocked.attention_state.as_mut().unwrap().events[0].resolved = true;
     store.upsert_session(blocked);
 
     assert!(store.next_attention_deadline().is_none());
@@ -888,7 +942,7 @@ fn a_session_that_unblocks_inside_its_window_is_never_announced() {
 }
 
 #[test]
-fn selecting_a_session_inside_its_window_leaves_the_chime_but_drops_the_banner() {
+fn selecting_a_session_inside_its_window_cancels_the_interruption() {
     let (mut store, mut effects) = hydrated(
         vec![session("visible", "p", 2.0)],
         vec![project("p", "P")],
@@ -898,20 +952,18 @@ fn selecting_a_session_inside_its_window_leaves_the_chime_but_drops_the_banner()
 
     let mut blocked = session("hidden", "p", 1.0);
     blocked.status = SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Permission);
+    add_attention_fixture(&mut blocked);
     store.upsert_session(blocked);
     store.select(id("hidden"));
 
-    let transitions = store.drain_settled_attention(
-        store
-            .next_attention_deadline()
-            .expect("needs-input update should arm a settle window"),
-    );
-    let transition = transitions.first().expect("the inbox records the event");
-    assert_eq!(transition.sound, None);
+    assert!(store.next_attention_deadline().is_none());
     assert!(
-        transition.notification.is_none(),
-        "the session the user is looking at needs no system banner"
+        store
+            .drain_settled_attention(Instant::now() + Duration::from_secs(60))
+            .is_empty()
     );
+    assert_eq!(store.notifications().entries().len(), 1);
+    assert!(store.notifications().entries()[0].read);
 }
 
 #[test]
@@ -1254,12 +1306,15 @@ fn a_pending_confirmation_hides_the_row_only_once_confirmed() {
 
 #[test]
 fn prefs_round_trip_and_zoom_clamp() {
+    let missing_fields: Prefs = serde_json::from_str("{}").unwrap();
+    assert!(!missing_fields.terminal_paste_protection);
     let directory = tempdir().unwrap();
     let path = directory.path().join("nested/prefs.json");
     let prefs = Prefs {
         default_agent: AgentKind::GEMINI,
         default_spawn_host: Some("forge".to_owned()),
         terminal_font_size: 19.5,
+        terminal_paste_protection: true,
         window_placement: Some(WindowPlacement {
             display_uuid: Some("display-one".to_owned()),
             mode: WindowMode::Fullscreen,
@@ -1366,6 +1421,7 @@ fn failed_preference_write_does_not_publish_an_ephemeral_mutation() {
     let blocked_parent = tmp.path().join("not-a-directory");
     let path = blocked_parent.join("preferences.json");
     let (mut store, _) = SessionStore::load(path).expect("missing preference file loads defaults");
+    std::fs::remove_dir_all(&blocked_parent).expect("remove storage directory");
     std::fs::write(&blocked_parent, b"file").expect("create blocking file");
     let before = store.preferences().clone();
 
@@ -1628,7 +1684,7 @@ fn auxiliary_terminal_inherits_context_without_becoming_sidebar_selection() {
 
     assert!(store.spawn_auxiliary_terminal(id("one")));
     let effects = drain(&mut effects);
-    let Some(StoreEffect::SpawnAuxiliary(params)) = effects.first() else {
+    let Some(StoreEffect::SpawnAuxiliary { params, .. }) = effects.first() else {
         panic!("expected auxiliary spawn, got {effects:?}");
     };
     assert_eq!(params.kind, AgentKind::SHELL);
@@ -2328,10 +2384,170 @@ fn delivery_rechecks_read_focus_and_mute_after_the_event_was_queued() {
     assert!(!store.should_deliver_notification(&request));
     assert_eq!(store.notifications().unread_count(), 1);
     store.toggle_notification_mute(record.id.clone());
-    assert!(store.should_deliver_notification(&request));
+    assert!(
+        !store.should_deliver_notification(&request),
+        "unmuting cannot revive a canceled native request"
+    );
     store.toggle_notification_alerts();
     assert!(!store.should_deliver_notification(&request));
     store.toggle_notification_alerts();
     store.mark_notifications_read(&record.id);
     assert!(!store.should_deliver_notification(&request));
+}
+
+#[test]
+fn auxiliary_tab_spawns_bind_exact_ids_and_deduplicate_pending_requests() {
+    let primary = session("parent", "p", 1.0);
+    let (mut store, mut effects) = hydrated(
+        vec![primary],
+        vec![project("p", "Project")],
+        Prefs::default(),
+    );
+    drain(&mut effects);
+    assert!(store.spawn_auxiliary_terminal_slot(id("parent"), 0));
+    assert!(store.spawn_auxiliary_terminal_slot(id("parent"), 1));
+    assert!(store.spawn_auxiliary_terminal_slot(id("parent"), 1));
+    let spawns = drain(&mut effects);
+    assert_eq!(spawns.len(), 2);
+    let mut first = session("first", "p", 10.0);
+    first.kind = AgentKind::SHELL;
+    first.parent = Some(id("parent"));
+    let mut second = first.clone();
+    second.id = id("second");
+    second.created_at = diri_proto::DateMillis(5.0); // Result order and creation order do not identify tabs.
+    store.upsert_session(first);
+    store.upsert_session(second);
+    store.finish_auxiliary_spawn(id("parent"), 1, Some(id("second")));
+    store.finish_auxiliary_spawn(id("parent"), 0, Some(id("first")));
+    assert_eq!(
+        store
+            .auxiliary_terminal_for_slot(&id("parent"), 0)
+            .unwrap()
+            .id,
+        id("first")
+    );
+    assert_eq!(
+        store
+            .auxiliary_terminal_for_slot(&id("parent"), 1)
+            .unwrap()
+            .id,
+        id("second")
+    );
+    store.sessions.remove(&id("first"));
+    assert!(
+        store
+            .auxiliary_terminal_for_slot(&id("parent"), 0)
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .auxiliary_terminal_for_slot(&id("parent"), 1)
+            .unwrap()
+            .id,
+        id("second")
+    );
+    assert!(store.spawn_auxiliary_terminal_slot(id("parent"), 2));
+    store.finish_auxiliary_spawn(id("parent"), 2, None);
+    assert!(!store.auxiliary_spawn_pending(&id("parent"), 2));
+    assert!(
+        store.spawn_auxiliary_terminal_slot(id("parent"), 2),
+        "failed requests can be retried"
+    );
+}
+
+#[test]
+fn auxiliary_tab_binding_waits_for_its_record_and_pins_restored_shells() {
+    let primary = session("parent", "p", 1.0);
+    let mut shell = session("restored", "p", 2.0);
+    shell.kind = AgentKind::SHELL;
+    shell.parent = Some(id("parent"));
+    let (mut store, mut effects) = hydrated(
+        vec![primary, shell.clone()],
+        vec![project("p", "Project")],
+        Prefs::default(),
+    );
+    drain(&mut effects);
+    assert_eq!(
+        store
+            .auxiliary_terminal_for_slot(&id("parent"), 0)
+            .unwrap()
+            .id,
+        id("restored")
+    );
+    assert!(store.spawn_auxiliary_terminal_slot(id("parent"), 1));
+    store.finish_auxiliary_spawn(id("parent"), 1, Some(id("new")));
+    assert!(store.auxiliary_spawn_pending(&id("parent"), 1));
+    assert!(store.spawn_auxiliary_terminal_slot(id("parent"), 1));
+    assert_eq!(
+        drain(&mut effects).len(),
+        1,
+        "RPC acknowledgement before the event cannot spawn twice"
+    );
+    shell.id = id("new");
+    shell.created_at = diri_proto::DateMillis(100.0);
+    store.upsert_session(shell);
+    assert!(!store.auxiliary_spawn_pending(&id("parent"), 1));
+    assert_eq!(
+        store
+            .auxiliary_terminal_for_slot(&id("parent"), 0)
+            .unwrap()
+            .id,
+        id("restored")
+    );
+    assert_eq!(
+        store
+            .auxiliary_terminal_for_slot(&id("parent"), 1)
+            .unwrap()
+            .id,
+        id("new")
+    );
+}
+
+#[test]
+fn notification_pipeline_redraws_interrupt_once() {
+    use diri_engine::detect::{ManifestEngine, ScreenSnapshot};
+    use diri_engine::status::{Authority, StatusReducer, StatusSignal};
+    let (engine, failed) =
+        ManifestEngine::load_dir(&diri_engine::detect::bundled_manifest_dir()).unwrap();
+    assert!(failed.is_empty());
+    let (mut store, _) = hydrated(
+        vec![session("visible", "p", 2.0)],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    let now = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    let mut reducer = StatusReducer::new(Authority::ScreenPrimary, now);
+    let mut record = session("hidden", "p", 1.0);
+    record.kind = AgentKind::CODEX;
+    let mut interruptions = 0;
+    for index in 0..20 {
+        let marker = if index % 2 == 0 { "!" } else { "·" };
+        let screen = ScreenSnapshot {
+            lines: vec![
+                format!("Tool output {index}"),
+                "› Ask Codex to do anything".into(),
+            ],
+            osc_title: Some(format!("[ {marker} ] Action Required | project")),
+            content_seq: index + 1,
+            ..Default::default()
+        };
+        let outcome = reducer.reduce(
+            StatusSignal::Screen(engine.evaluate(&screen, "codex").unwrap()),
+            now + Duration::from_secs(index * 2),
+        );
+        record.attention_state = reducer.attention_state().cloned();
+        record.status = reducer.status().clone();
+        record.needs_input = outcome.needs_input;
+        store.upsert_session(record.clone());
+        let transitions = store.drain_settled_attention(Instant::now() + Duration::from_secs(60));
+        interruptions += transitions
+            .iter()
+            .filter(|effect| effect.notification.is_some())
+            .count();
+    }
+    assert_eq!(
+        interruptions, 1,
+        "one pending request must produce one native interruption across title redraws"
+    );
+    assert_eq!(store.notifications().entries().len(), 1);
 }

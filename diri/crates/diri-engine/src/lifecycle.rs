@@ -79,6 +79,7 @@ mod tests {
 
     fn record() -> SessionRecord {
         SessionRecord {
+            attention_state: None,
             id: SessionId::new("session"),
             kind: AgentKind::CODEX,
             cwd: "/repo".into(),

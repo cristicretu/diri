@@ -7,17 +7,23 @@
 //! working app rather than a hole where one used to be.
 
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::process::CommandExt as _;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::error::{Result, UpdateError};
+use crate::net::MAX_ARCHIVE_BYTES;
 
 /// Seconds the helper waits for diri to exit before giving up untouched.
 const EXIT_GRACE_SECONDS: u32 = 60;
+const MAX_EXPANDED_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRIES: u64 = 100_000;
+const MAX_ZIP_COMMENT_BYTES: u64 = 65_535;
 
 /// Expands the downloaded zip and returns the `.app` inside it.
 pub fn unpack(archive: &Path, into: &Path) -> Result<PathBuf> {
+    validate_zip_limits(archive)?;
     if into.exists() {
         fs::remove_dir_all(into)?;
     }
@@ -32,12 +38,214 @@ pub fn unpack(archive: &Path, into: &Path) -> Result<PathBuf> {
         .arg(into)
         .output()?;
     if !output.status.success() {
+        let _ = fs::remove_dir_all(into);
         return Err(UpdateError::tool(
             "ditto",
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         ));
     }
+    if let Err(error) = validate_expanded_limits(into) {
+        let _ = fs::remove_dir_all(into);
+        return Err(error);
+    }
     find_app(into)
+}
+
+fn validate_zip_limits(archive: &Path) -> Result<()> {
+    const EOCD_SIGNATURE: [u8; 4] = *b"PK\x05\x06";
+    const CENTRAL_SIGNATURE: [u8; 4] = *b"PK\x01\x02";
+    const EOCD_BYTES: u64 = 22;
+    const CENTRAL_HEADER_BYTES: usize = 46;
+
+    let mut file = fs::File::open(archive)?;
+    let archive_len = file.metadata()?.len();
+    if archive_len == 0 || archive_len > MAX_ARCHIVE_BYTES {
+        return Err(UpdateError::Integrity(format!(
+            "update archive must be between 1 and {MAX_ARCHIVE_BYTES} bytes"
+        )));
+    }
+    let tail_len = archive_len.min(EOCD_BYTES + MAX_ZIP_COMMENT_BYTES);
+    file.seek(SeekFrom::End(-i64::try_from(tail_len).unwrap_or(i64::MAX)))?;
+    let mut tail = vec![0_u8; usize::try_from(tail_len).unwrap_or(usize::MAX)];
+    file.read_exact(&mut tail)?;
+    let eocd_index = (0..=tail.len().saturating_sub(4))
+        .rev()
+        .find(|index| {
+            tail[*index..].starts_with(&EOCD_SIGNATURE)
+                && tail.len().saturating_sub(*index) >= usize::try_from(EOCD_BYTES).unwrap()
+                && *index
+                    + usize::try_from(EOCD_BYTES).unwrap()
+                    + usize::from(le_u16(&tail[*index..], 20))
+                    == tail.len()
+        })
+        .ok_or_else(|| UpdateError::Integrity("archive has no ZIP directory".to_owned()))?;
+    if tail.len().saturating_sub(eocd_index) < usize::try_from(EOCD_BYTES).unwrap() {
+        return Err(UpdateError::Integrity(
+            "archive has a truncated ZIP directory".to_owned(),
+        ));
+    }
+    let eocd = &tail[eocd_index..];
+    let comment_len = usize::from(le_u16(eocd, 20));
+    if eocd_index + usize::try_from(EOCD_BYTES).unwrap() + comment_len != tail.len() {
+        return Err(UpdateError::Integrity(
+            "archive has trailing data after its ZIP directory".to_owned(),
+        ));
+    }
+    let disk = le_u16(eocd, 4);
+    let directory_disk = le_u16(eocd, 6);
+    let entries_on_disk = le_u16(eocd, 8);
+    let entries = le_u16(eocd, 10);
+    let directory_size = u64::from(le_u32(eocd, 12));
+    let directory_offset = u64::from(le_u32(eocd, 16));
+    if disk != 0
+        || directory_disk != 0
+        || entries_on_disk != entries
+        || entries == u16::MAX
+        || directory_size == u64::from(u32::MAX)
+        || directory_offset == u64::from(u32::MAX)
+    {
+        return Err(UpdateError::Integrity(
+            "multi-disk and ZIP64 update archives are not accepted".to_owned(),
+        ));
+    }
+    let entries = u64::from(entries);
+    if entries > MAX_ARCHIVE_ENTRIES {
+        return Err(UpdateError::Integrity(
+            "archive has too many entries".to_owned(),
+        ));
+    }
+    let directory_end = directory_offset
+        .checked_add(directory_size)
+        .ok_or_else(|| UpdateError::Integrity("archive directory overflows".to_owned()))?;
+    let eocd_offset = archive_len - tail_len + u64::try_from(eocd_index).unwrap_or(u64::MAX);
+    if directory_end != eocd_offset || directory_end > archive_len {
+        return Err(UpdateError::Integrity(
+            "archive directory points outside the download".to_owned(),
+        ));
+    }
+
+    file.seek(SeekFrom::Start(directory_offset))?;
+    let mut expanded = 0_u64;
+    for _ in 0..entries {
+        let mut header = [0_u8; CENTRAL_HEADER_BYTES];
+        file.read_exact(&mut header)?;
+        if header[..4] != CENTRAL_SIGNATURE {
+            return Err(UpdateError::Integrity(
+                "archive contains a malformed directory entry".to_owned(),
+            ));
+        }
+        let uncompressed = u64::from(le_u32(&header, 24));
+        if uncompressed == u64::from(u32::MAX) {
+            return Err(UpdateError::Integrity(
+                "ZIP64 update entries are not accepted".to_owned(),
+            ));
+        }
+        expanded = expanded
+            .checked_add(uncompressed)
+            .ok_or_else(|| UpdateError::Integrity("expanded archive size overflows".to_owned()))?;
+        if expanded > MAX_EXPANDED_BYTES {
+            return Err(UpdateError::Integrity(format!(
+                "archive expands beyond {MAX_EXPANDED_BYTES} bytes"
+            )));
+        }
+        if zip_entry_is_symlink(&header) {
+            return Err(UpdateError::Integrity(
+                "archive contains a symbolic link".to_owned(),
+            ));
+        }
+        let name_len = usize::from(le_u16(&header, 28));
+        let extra_len = u64::from(le_u16(&header, 30));
+        let entry_comment_len = u64::from(le_u16(&header, 32));
+        let mut name = vec![0_u8; name_len];
+        file.read_exact(&mut name)?;
+        validate_zip_entry_name(&name)?;
+        file.seek(SeekFrom::Current(
+            i64::try_from(extra_len + entry_comment_len).unwrap_or(i64::MAX),
+        ))?;
+        if file.stream_position()? > directory_end {
+            return Err(UpdateError::Integrity(
+                "archive directory entry exceeds its bounds".to_owned(),
+            ));
+        }
+    }
+    if file.stream_position()? != directory_end {
+        return Err(UpdateError::Integrity(
+            "archive directory contains unaccounted data".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_zip_entry_name(name: &[u8]) -> Result<()> {
+    let name = std::str::from_utf8(name)
+        .map_err(|_| UpdateError::Integrity("archive path is not UTF-8".to_owned()))?;
+    if name.is_empty() || name.contains(['\\', '\0']) {
+        return Err(UpdateError::Integrity("archive path is unsafe".to_owned()));
+    }
+    let path = Path::new(name);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::RootDir))
+    {
+        return Err(UpdateError::Integrity(format!(
+            "archive path escapes staging: {name:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_expanded_limits(root: &Path) -> Result<()> {
+    let mut pending = vec![root.to_owned()];
+    let mut entries = 0_u64;
+    let mut bytes = 0_u64;
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            entries += 1;
+            if entries > MAX_ARCHIVE_ENTRIES {
+                return Err(UpdateError::Integrity(
+                    "archive has too many entries".to_owned(),
+                ));
+            }
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            } else if file_type.is_symlink() {
+                return Err(UpdateError::Integrity(
+                    "archive expanded a symbolic link".to_owned(),
+                ));
+            } else if file_type.is_file() {
+                bytes = bytes.saturating_add(entry.metadata()?.len());
+                if bytes > MAX_EXPANDED_BYTES {
+                    return Err(UpdateError::Integrity(format!(
+                        "archive expands beyond {MAX_EXPANDED_BYTES} bytes"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn zip_entry_is_symlink(central_header: &[u8]) -> bool {
+    const UNIX_FILE_TYPE_MASK: u32 = 0o170000;
+    const UNIX_SYMLINK: u32 = 0o120000;
+    let unix_mode = le_u32(central_header, 38) >> 16;
+    unix_mode & UNIX_FILE_TYPE_MASK == UNIX_SYMLINK
+}
+
+fn le_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
+}
+
+fn le_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ])
 }
 
 fn find_app(directory: &Path) -> Result<PathBuf> {
@@ -155,6 +363,27 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_paths_cannot_escape_staging() {
+        assert!(validate_zip_entry_name(b"diri.app/Contents/MacOS/diri").is_ok());
+        for name in [
+            b"../Applications/diri.app".as_slice(),
+            b"/Applications/diri.app".as_slice(),
+            b"dir\\file".as_slice(),
+            b"bad\0name".as_slice(),
+        ] {
+            assert!(validate_zip_entry_name(name).is_err(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn archive_symlinks_are_rejected_before_extraction() {
+        let mut header = [0_u8; 46];
+        let external_attributes = (0o120777_u32) << 16;
+        header[38..42].copy_from_slice(&external_attributes.to_le_bytes());
+        assert!(zip_entry_is_symlink(&header));
+    }
 
     fn script() -> String {
         installer_script(

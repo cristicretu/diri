@@ -1,6 +1,6 @@
 [package]
 name = "diri-app"
-version = "0.6.0"
+version = "0.7.3"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -29,6 +29,7 @@ entitlements = "../../assets/diri.entitlements"
 background-app = false
 
 [dependencies]
+base64.workspace = true
 diri-web = { path = "../diri-web" }
 qrcode = { version = "0.14", default-features = false }
 raw-window-handle.workspace = true
@@ -40,7 +41,7 @@ diri-updater.workspace = true
 diri-usage.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
-image.workspace = true
+image = { workspace = true, features = ["ico"] }
 libc = "0.2"
 nucleo-matcher.workspace = true
 notify.workspace = true
@@ -55,6 +56,7 @@ unicode-segmentation.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+diri-engine.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 gpui_platform = { workspace = true, features = ["test-support"] }
 # Pauses the clock so the notification settle window is exercised without
@@ -88,6 +90,8 @@ objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
     "NSImageCell",
     "NSImageView",
     "NSImageRep",
+    "NSMenu",
+    "NSMenuItem",
     "NSPanel",
     "NSParagraphStyle",
     "NSResponder",
@@ -107,6 +111,9 @@ objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
     "objc2-core-foundation",
 ] }
 objc2-foundation = { version = "=0.3.2", default-features = false, features = [
+    "NSData",
+    "NSURLSession",
+    "NSURLResponse",
     "NSArray",
     "NSAttributedString",
     "NSBundle",

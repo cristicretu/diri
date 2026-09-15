@@ -12,6 +12,28 @@ withdrawn. Closing or archiving a session resolves its notifications; the
 history remains available. Failed exits notify; clean exits and sessions
 closed through the app do not.
 
+For Claude, a parent work hook keeps the turn active until a completion hook
+arrives with no reported running background tasks or scheduled session work.
+Repeated stops while that work remains pending, idle reminders and child-agent
+callbacks do not produce “finished” alerts. Permission and question alerts
+remain enabled. A drained parent stop completes once; older Claude versions
+that omit background-work metadata retain their normal stop behavior.
+
+Long tool calls and idle-looking input boxes cannot expire hook authority. If
+signals disappear, status can become unknown; elapsed time alone never finishes
+the turn. Sessions without work hooks use terminal detection, including Claude's
+braille/half-circle title spinners, live-turn footer and background-agent/MCP
+activity. Visible permission and question prompts outrank those working rules.
+
+The hook CLI retains an optional aggregate `claudePendingWork` boolean and
+bounded native request/turn IDs in the version-1 activity seed. Task contents and scheduled prompts are never
+stored. Metadata-free reminders retain the fact for the same conversation;
+child callbacks cannot replace the parent's recovery signal. Old seeds without
+the additive field continue to load.
+
+See the [live Claude validation](claude-notification-validation.md) for observed
+foreground, background-agent, permission and idle-reminder behavior.
+
 A notification for the selected, visible session in the active app is recorded
 as read and makes no sound or desktop banner. A selected session behind
 Settings, the launcher or an overlay can still notify. Delivery is checked
@@ -48,6 +70,12 @@ Kitty queries, icons, encoded payloads and callback actions are ignored.
 Inputs, multipart state and event queues are bounded; repeated identical
 terminal messages within five seconds are coalesced.
 
+Codex's generic `Action Required` title can remain visible while it continues
+working with a queued question. A queued question enters the inbox quietly;
+becoming blocking can interrupt once for that same event. Changing tool output,
+animated title markers and elapsed time are not new prompts. A visible question
+or permission prompt takes precedence and supplies its own prompt details.
+
 The same terminal sequences work over Diri's Remote PTY Holder transport while
 the local Engine is connected. The local Engine derives events from live raw
 output; the Holder does not run hooks or store product notifications. Replay
@@ -55,11 +83,19 @@ cannot redeliver terminal alerts. Structured remote Claude/Codex hooks and
 reliable notification delivery while the Engine is disconnected remain
 separate enhancements; see [REMOTE_PORT.md](../REMOTE_PORT.md).
 
-History is app-local `notifications.json`, beside preferences: versioned,
-atomically saved, owner-only on Unix and bounded to 200 events. It retains
-bounded user-visible titles/bodies. Notification payloads are not added to
-operational logs. Read state belongs to this app installation, not to remote
-Holders or other clients.
+History is app-local `notifications.sqlite`, beside preferences. Existing
+version-1 `notifications.json` history migrates transactionally. The inbox is
+bounded to 200 entries; durable admission receipts survive clearing and pruning.
+The Engine independently persists event identities in per-session attention
+journals, so reconnecting does not invent new requests. Native delivery is an
+at-most-once attempt: a crash after reservation may lose an alert, while the inbox
+entry survives. Storage failures suppress ephemeral alerts and log a diagnostic.
+
+Titles/bodies are bounded and stored in owner-only files. Notification payloads
+are not added to operational logs. Read state belongs to this app installation,
+not remote Holders or other clients. See the
+[architecture decision and source review](notification-architecture-review.md)
+for evidence correlation, recovery and coverage limits.
 
 ## Source comparison with cmux
 
@@ -77,8 +113,8 @@ terminal notification ingress and delivery diagnostics. References:
 [session opening](https://github.com/manaflow-ai/cmux/blob/7d5d308450eac2991e748c6387d8718704be891a/Sources/AppDelegate%2BNotificationOpen.swift).
 
 Remaining notification differences include transcript-derived completion
-summaries, agent background-work metadata, notification webhooks/mobile
-forwarding, full Kitty notification protocol support, and reliable offline
+summaries, notification webhooks/mobile forwarding, full Kitty notification
+protocol support, and reliable offline
 remote events. Terminal-scraped statuses still depend on each agent manifest.
 
 Other product gaps, in priority order:

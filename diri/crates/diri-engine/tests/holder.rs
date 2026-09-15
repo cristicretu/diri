@@ -37,6 +37,8 @@ fn spec(paths: &HolderPaths, logs: &Path, argv: &[&str]) -> HolderLaunchSpec {
                 std::env::var("PATH").unwrap_or_default(),
             ),
             ("TERM".to_string(), "xterm-256color".to_string()),
+            ("HOME".to_string(), "/tmp".to_string()),
+            ("PS1".to_string(), "$ ".to_string()),
         ]),
         cols: 80,
         rows: 24,
@@ -245,6 +247,35 @@ fn a_second_holder_for_the_same_session_refuses_to_double_run() {
 
     client.kill_tree().expect("kill");
     first.join().expect("join").expect("first run ends cleanly");
+}
+
+#[test]
+fn stat_reports_a_foreground_job_other_than_the_shell() {
+    let root = holders_dir("fgjob");
+    let logs = root.join("logs");
+    let paths = HolderPaths::new(&root, "s_fgjob");
+    let launch = spec(&paths, &logs, &["/bin/bash", "--norc", "--noprofile", "-i"]);
+    let server = std::thread::spawn(move || HolderServer::run(launch));
+    let client = HolderClient::new(paths.socket());
+    wait_until("holder ready", Duration::from_secs(5), || client.is_alive());
+
+    let child = client.stat().expect("stat").child_pid;
+    wait_until("shell claimed tty", Duration::from_secs(2), || {
+        client
+            .stat()
+            .ok()
+            .is_some_and(|stat| stat.foreground_pid == Some(child))
+    });
+    client.write(b"sleep 8\n").expect("write sleep");
+    wait_until("foreground job", Duration::from_secs(3), || {
+        client.stat().ok().is_some_and(|stat| {
+            stat.foreground_pid
+                .is_some_and(|pgid| pgid > 0 && pgid != child)
+        })
+    });
+
+    client.kill_tree().expect("kill");
+    server.join().expect("join").expect("clean end");
 }
 
 #[test]

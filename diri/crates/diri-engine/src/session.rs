@@ -190,6 +190,7 @@ const LIVE_HANDOVER_GAP: u64 = 256 << 10;
 /// What a session looks like from the outside.
 #[derive(Clone, Debug)]
 pub struct SessionView {
+    pub attention_state: Option<diri_proto::attention::AttentionState>,
     pub id: String,
     pub status: SessionStatus,
     pub status_evidence: Option<diri_proto::StatusEvidence>,
@@ -197,6 +198,8 @@ pub struct SessionView {
     pub last_turn_completed_at: Option<diri_proto::DateMillis>,
     pub title: Option<String>,
     pub title_source: Option<diri_proto::TitleSource>,
+    /// Raw OSC title, kept separate so a captured prompt cannot hide a later name.
+    pub terminal_title: Option<String>,
     pub tail_offset: u64,
     pub exited: bool,
 }
@@ -765,7 +768,7 @@ impl Session {
             0,
         ));
         let log = OutputLog::writer(&spec.logs_dir, &spec.id)?;
-        let shared = new_shared(&spec, log, &engine);
+        let shared = new_shared(&spec, log, &engine, true);
         *shared.remote_grid.lock().expect("remote grid") = Some(RemoteGridState {
             mirror: GridMirror::new(),
             revision: 0,
@@ -823,7 +826,7 @@ impl Session {
             remote.output_offset,
         ));
         let log = OutputLog::writer(&spec.logs_dir, &spec.id)?;
-        let shared = new_shared(&spec, log, &engine);
+        let shared = new_shared(&spec, log, &engine, false);
         shared
             .remote_output_offset
             .store(remote.output_offset, Ordering::SeqCst);
@@ -832,7 +835,14 @@ impl Session {
             revision: 0,
             pending: None,
         });
-        if let Some((status, needs_input)) = initial_status {
+        if let Some((status, needs_input)) = initial_status
+            && shared
+                .reducer
+                .lock()
+                .expect("reducer")
+                .attention_state()
+                .is_none_or(|state| state.sequence == 0)
+        {
             *shared.status.lock().expect("status") = status;
             *shared.needs_input.lock().expect("needs input") = needs_input;
         }
@@ -862,7 +872,7 @@ impl Session {
     fn spawn_direct(spec: SessionSpec, engine: Arc<ManifestEngine>) -> std::io::Result<Self> {
         let pty = Pty::spawn(&spec.pty)?;
         let log = OutputLog::writer(&spec.logs_dir, &spec.id)?;
-        let shared = new_shared(&spec, log, &engine);
+        let shared = new_shared(&spec, log, &engine, true);
         shared.child_pid.store(pty.pid() as i32, Ordering::SeqCst);
 
         let reader = pty.reader()?;
@@ -922,7 +932,7 @@ impl Session {
         let client = HolderClient::new(paths.socket());
         let floor = wait_for_holder(&client, &spec.logs_dir, &spec.id, pre_spawn_tail)
             .map_err(holder_io_error)?;
-        Self::attach(spec, client, floor, engine)
+        Self::attach(spec, client, floor, engine, true)
     }
 
     /// Spawns through a holder, but not yet: the exec waits for the first
@@ -938,7 +948,7 @@ impl Session {
         let paths = HolderPaths::new(&holder.holders_dir, &spec.id);
         let client = HolderClient::new(paths.socket());
         let log = OutputLog::reader(&spec.logs_dir, &spec.id)?;
-        let shared = new_shared(&spec, log, &engine);
+        let shared = new_shared(&spec, log, &engine, true);
         let deferred = Arc::new(DeferredLaunch::new());
 
         let pump = {
@@ -1062,8 +1072,16 @@ impl Session {
             spec.pty.cols = cols;
             spec.pty.rows = rows;
         }
-        let session = Self::attach(spec, client, floor, engine)?;
-        if let Some((status, needs_input)) = initial_status {
+        let session = Self::attach(spec, client, floor, engine, false)?;
+        if let Some((status, needs_input)) = initial_status
+            && session
+                .shared
+                .reducer
+                .lock()
+                .expect("reducer")
+                .attention_state()
+                .is_none_or(|state| state.sequence == 0)
+        {
             *session.shared.status.lock().expect("status") = status;
             *session.shared.needs_input.lock().expect("needs input") = needs_input;
         }
@@ -1077,9 +1095,10 @@ impl Session {
         client: HolderClient,
         exit_marker_floor: u64,
         engine: Arc<ManifestEngine>,
+        fresh: bool,
     ) -> std::io::Result<Self> {
         let log = OutputLog::reader(&spec.logs_dir, &spec.id)?;
-        let shared = new_shared(&spec, log, &engine);
+        let shared = new_shared(&spec, log, &engine, fresh);
         if let Ok(stat) = client.stat() {
             shared.child_pid.store(stat.child_pid, Ordering::SeqCst);
         }
@@ -1112,6 +1131,7 @@ impl Session {
     }
 
     pub fn view(&self) -> SessionView {
+        let terminal_title = self.shared.title.lock().expect("title").clone();
         let prompt_title = self
             .shared
             .prompt_title
@@ -1122,20 +1142,23 @@ impl Session {
             (Some(title), Some(diri_proto::TitleSource::FirstPrompt))
         } else {
             (
-                self.shared.title.lock().expect("title").clone(),
-                Some(diri_proto::TitleSource::AgentProvided),
+                terminal_title.clone(),
+                Some(diri_proto::TitleSource::TerminalTitle),
+            )
+        };
+        let (attention_state, status_evidence) = {
+            let reducer = self.shared.reducer.lock().expect("reducer");
+            (
+                reducer.attention_state().cloned(),
+                reducer.evidence().cloned(),
             )
         };
         SessionView {
+            attention_state,
             id: self.shared.id.clone(),
+            terminal_title,
             status: self.shared.status.lock().expect("status").clone(),
-            status_evidence: self
-                .shared
-                .reducer
-                .lock()
-                .expect("reducer")
-                .evidence()
-                .cloned(),
+            status_evidence,
             needs_input: self.shared.needs_input.lock().expect("needs input").clone(),
             last_turn_completed_at: *self
                 .shared
@@ -1581,8 +1604,38 @@ impl Session {
             Transport::Held(client) => client.write(bytes).map_err(holder_io_error)?,
             Transport::Remote(client) => client.write(bytes)?,
         }
-        self.feed_signal(StatusSignal::UserKeystroke);
+        // Match complete key packets: an arrow key or bracketed paste also
+        // contains ESC/newlines, but neither proves a submitted response.
+        let submits = matches!(
+            bytes,
+            b"\r" | b"\n" | b"\r\n" | b"\x03" | b"\x1b" | b"y" | b"n"
+        );
+        self.feed_signal(if submits {
+            StatusSignal::UserSubmission
+        } else {
+            StatusSignal::UserKeystroke
+        });
+        self.sample_shell_foreground();
         Ok(())
+    }
+
+    fn sample_shell_foreground(&self) {
+        if self.manifest_id != "shell" {
+            return;
+        }
+        match &self.transport {
+            Transport::Direct(pty) => {
+                let (child_pid, pgid) = {
+                    let pty = pty.lock().expect("pty");
+                    (pty.pid() as i32, pty.foreground_pgid())
+                };
+                apply_foreground_sample(&self.shared, &self.manifest_id, child_pid, pgid);
+            }
+            Transport::Held(client) => {
+                sample_held_foreground(&self.shared, client, &self.manifest_id);
+            }
+            Transport::Remote(_) => {}
+        }
     }
 
     fn observe_prompt_input(&self, bytes: &[u8]) {
@@ -1598,18 +1651,21 @@ impl Session {
         }
         if !matches!(
             *self.shared.status.lock().expect("status"),
-            SessionStatus::Idle
+            SessionStatus::Starting | SessionStatus::Idle | SessionStatus::Working
         ) {
-            if matches!(bytes, b"\r" | b"\n") {
-                self.shared
-                    .prompt_input
-                    .lock()
-                    .expect("prompt input")
-                    .draft
-                    .clear();
-            }
+            // Dialog responses are not conversation names. Drop any partial
+            // composer draft too, so it cannot leak across a permission flow.
+            self.shared
+                .prompt_input
+                .lock()
+                .expect("prompt input")
+                .draft
+                .clear();
             return;
         }
+        // Screen classification trails input: Codex can accept its first
+        // prompt while we still report Starting, or repaint Working before
+        // the submit arrives. Neither state should discard composer text.
         let prompt = self
             .shared
             .prompt_input
@@ -1663,18 +1719,30 @@ impl Session {
     /// Feeds an out-of-band signal — a hook callback, a notify — into the
     /// reducer.
     pub fn feed_signal(&self, signal: StatusSignal) -> ReducerOutcome {
+        self.feed_identified_signal(signal, Default::default())
+    }
+
+    pub fn feed_identified_signal(
+        &self,
+        signal: StatusSignal,
+        identity: crate::attention::SignalIdentity,
+    ) -> ReducerOutcome {
         let outcome = self
             .shared
             .reducer
             .lock()
             .expect("reducer")
-            .reduce(signal, SystemTime::now());
+            .reduce_identified(signal, identity, SystemTime::now());
         apply(&self.shared, &outcome);
         outcome
     }
 
     pub fn claude_hook(&self, hook: ClaudeHook, is_subagent: bool) -> ReducerOutcome {
-        self.feed_signal(StatusSignal::ClaudeHook { hook, is_subagent })
+        self.feed_signal(StatusSignal::ClaudeHook {
+            hook,
+            is_subagent,
+            pending_work: None,
+        })
     }
 
     /// Ends the session, killing the child's whole tree.
@@ -1786,15 +1854,41 @@ impl Drop for Session {
     }
 }
 
-fn new_shared(spec: &SessionSpec, log: OutputLog, engine: &ManifestEngine) -> Arc<Shared> {
+fn new_shared(
+    spec: &SessionSpec,
+    log: OutputLog,
+    engine: &ManifestEngine,
+    fresh: bool,
+) -> Arc<Shared> {
     let manifest_version = engine
         .manifest(&spec.manifest_id)
         .map(|manifest| manifest.version.clone());
+    let reducer = StatusReducer::new(spec.authority, SystemTime::now())
+        .with_manifest(spec.manifest_id.clone(), manifest_version)
+        .with_attention_storage(
+            &spec.logs_dir.join(format!("{}.attention.sqlite", spec.id)),
+            fresh,
+        );
+    let initial_status = reducer.status().clone();
+    let initial_detail = reducer
+        .attention_state()
+        .and_then(|state| state.active_requests().find(|event| event.blocking))
+        .and_then(|event| event.detail.clone());
+    let initial_completion = reducer
+        .attention_state()
+        .and_then(|state| {
+            state
+                .events
+                .iter()
+                .rev()
+                .find(|event| event.kind == diri_proto::attention::AttentionKind::Completion)
+        })
+        .map(|event| event.occurred_at);
     Arc::new(Shared {
         id: spec.id.clone(),
-        status: Mutex::new(SessionStatus::Starting),
-        needs_input: Mutex::new(None),
-        last_turn_completed_at: Mutex::new(None),
+        status: Mutex::new(initial_status),
+        needs_input: Mutex::new(initial_detail),
+        last_turn_completed_at: Mutex::new(initial_completion),
         title: Mutex::new(None),
         prompt_title: Mutex::new(None),
         prompt_input: Mutex::new(PromptInputState::default()),
@@ -1803,10 +1897,7 @@ fn new_shared(spec: &SessionSpec, log: OutputLog, engine: &ManifestEngine) -> Ar
             HeadlessScreen::new(spec.pty.cols as usize, spec.pty.rows as usize)
                 .with_notifications(),
         ),
-        reducer: Mutex::new(
-            StatusReducer::new(spec.authority, SystemTime::now())
-                .with_manifest(spec.manifest_id.clone(), manifest_version),
-        ),
+        reducer: Mutex::new(reducer),
         exit: Mutex::new(None),
         exited: AtomicBool::new(false),
         stop: AtomicBool::new(false),
@@ -1862,7 +1953,7 @@ fn holder_io_error(error: crate::holder::HolderError) -> std::io::Error {
 /// only when something observable actually changed — that version is what the
 /// registry watcher polls instead of deep-diffing records.
 fn apply(shared: &Shared, outcome: &ReducerOutcome) {
-    let mut changed = false;
+    let mut changed = outcome.attention_changed;
     if let Some(status) = &outcome.status_change {
         {
             let mut current = shared.status.lock().expect("status");
@@ -1907,6 +1998,37 @@ fn apply(shared: &Shared, outcome: &ReducerOutcome) {
     if changed {
         shared.bump_state_version();
     }
+}
+
+fn apply_foreground_sample(
+    shared: &Shared,
+    manifest_id: &str,
+    child_pid: i32,
+    foreground_pgid: Option<i32>,
+) {
+    if manifest_id != "shell" {
+        return;
+    }
+    let Some(running) = crate::status::foreground_job_running(child_pid, foreground_pgid) else {
+        return;
+    };
+    let outcome = shared
+        .reducer
+        .lock()
+        .expect("reducer")
+        .reduce(StatusSignal::ForegroundJob { running }, SystemTime::now());
+    apply(shared, &outcome);
+}
+
+fn sample_held_foreground(shared: &Shared, client: &HolderClient, manifest_id: &str) {
+    if manifest_id != "shell" {
+        return;
+    }
+    let Ok(stat) = client.stat() else {
+        return;
+    };
+    shared.child_pid.store(stat.child_pid, Ordering::SeqCst);
+    apply_foreground_sample(shared, manifest_id, stat.child_pid, stat.foreground_pid);
 }
 
 /// Rescans the visible screen for artifact URLs every ~2s, only when the
@@ -2139,6 +2261,15 @@ fn handle_remote_message(
                 record_remote_exit(shared, ProcessExit { code, signal });
                 return RemoteConnectionDisposition::Exited;
             }
+            if let RemoteProcessState::Running { pid } = acknowledgement.process_state {
+                shared.child_pid.store(pid as i32, Ordering::SeqCst);
+                apply_foreground_sample(
+                    shared,
+                    manifest_id,
+                    pid as i32,
+                    acknowledgement.foreground_pid,
+                );
+            }
             *hello_accepted = true;
             RemoteConnectionDisposition::Continue
         }
@@ -2216,6 +2347,15 @@ fn handle_remote_message(
         }
         RemoteMessage::Error(error) if error.fatal => RemoteConnectionDisposition::Fatal,
         RemoteMessage::Error(_) => RemoteConnectionDisposition::Continue,
+        RemoteMessage::ForegroundProcess(foreground) => {
+            apply_foreground_sample(
+                shared,
+                manifest_id,
+                shared.child_pid.load(Ordering::SeqCst),
+                foreground.pid,
+            );
+            RemoteConnectionDisposition::Continue
+        }
         _ => RemoteConnectionDisposition::Fatal,
     }
 }
@@ -2510,6 +2650,17 @@ fn pump(
                 .expect("reducer")
                 .reduce(StatusSignal::Tick, last_tick);
             apply(&shared, &outcome);
+            // Sample from the PTY owner, not `reader`: `tcgetpgrp` on the
+            // live read fd can swallow canonical-mode input.
+            if manifest_id == "shell" {
+                let pgid = pty.lock().ok().and_then(|pty| pty.foreground_pgid());
+                apply_foreground_sample(
+                    &shared,
+                    &manifest_id,
+                    shared.child_pid.load(Ordering::SeqCst),
+                    pgid,
+                );
+            }
         }
     }
 
@@ -2699,13 +2850,18 @@ fn pump_held(
                     && tail - checkpoint.log_offset <= replay_budget as u64
             })
             .filter(|checkpoint| {
-                shared.screen.lock().expect("screen").restore(
+                let mut screen = shared.screen.lock().expect("screen");
+                let restored = screen.restore(
                     &checkpoint.history,
                     &checkpoint.grid,
                     checkpoint.alt_screen,
                     checkpoint.bracketed_paste,
                     checkpoint.mouse,
-                )
+                );
+                if restored {
+                    screen.restore_history_metadata(&checkpoint.history_metadata);
+                }
+                restored
             });
         match restored {
             Some(checkpoint) => (
@@ -2764,6 +2920,11 @@ fn pump_held(
     // and the loop just goes back to reading the file from the offset it had
     // reached.
     let mut live: Option<crate::holder::HolderOutputStream> = None;
+    // An adopted Holder keeps the same executable for this session's life.
+    // Remember a completed negative negotiation; otherwise every log wakeup
+    // reconnects just to receive the same unsupported-operation response.
+    // Transport errors remain retryable, as do interrupted supported streams.
+    let mut output_stream_supported = true;
     // Reused across passes: a fresh allocation per pass would charge every
     // byte of output an allocation it does not need.
     let mut live_run: Vec<u8> = Vec::new();
@@ -2783,20 +2944,24 @@ fn pump_held(
         // holder begins filling a queue this loop is not yet reading, and once
         // that queue is full the pump waits on it for every chunk. Waiting for
         // a drained log keeps the handover to a few frames.
-        if live.is_none() && drained {
-            if let Ok(Some(stream)) = client.open_output_stream() {
-                // A drained log does not mean the holder is where the log
-                // ends: writes are queued, so it can be megabytes further on.
-                // Subscribing across that distance is the worst case — the
-                // holder fills a queue this loop cannot read until the file
-                // catches up, then drops it for being full, and both ends
-                // repeat. Take the subscription only when the gap is small
-                // enough to close immediately, and otherwise keep tailing and
-                // try again the next time the log runs dry.
-                live_from = stream.start_offset();
-                if live_from.saturating_sub(offset) <= LIVE_HANDOVER_GAP {
-                    live = Some(stream);
+        if output_stream_supported && live.is_none() && drained {
+            match client.open_output_stream() {
+                Ok(Some(stream)) => {
+                    // A drained log does not mean the holder is where the log
+                    // ends: writes are queued, so it can be megabytes further on.
+                    // Subscribing across that distance is the worst case — the
+                    // holder fills a queue this loop cannot read until the file
+                    // catches up, then drops it for being full, and both ends
+                    // repeat. Take the subscription only when the gap is small
+                    // enough to close immediately, and otherwise keep tailing and
+                    // try again the next time the log runs dry.
+                    live_from = stream.start_offset();
+                    if live_from.saturating_sub(offset) <= LIVE_HANDOVER_GAP {
+                        live = Some(stream);
+                    }
                 }
+                Ok(None) => output_stream_supported = false,
+                Err(_) => {}
             }
             drained = false;
         }
@@ -2805,7 +2970,17 @@ fn pump_held(
         let from_log;
         let (start, chunk): (u64, &[u8]) = match live.as_mut().filter(|_| streaming) {
             Some(stream) => {
-                match stream.next_run_into(shared.quiet_tick(), LOG_READ_BUDGET, &mut live_run) {
+                // Once a redraw is pending, the next empty read is what
+                // publishes it. Waiting the ordinary idle tick here held an
+                // otherwise complete mouse-driven TUI frame for 100 ms. Keep
+                // draining within the batch deadline, then publish even if
+                // the child produces no more output. Truly idle sessions
+                // retain their existing blocking wait.
+                let timeout = publish_pending.map_or_else(
+                    || shared.quiet_tick(),
+                    |started| OUTPUT_BATCH_CEILING.saturating_sub(started.elapsed()),
+                );
+                match stream.next_run_into(timeout, LOG_READ_BUDGET, &mut live_run) {
                     // Contiguous by construction, and checked anyway: a run
                     // that does not start where the last one ended means
                     // something raced, and the log is the authority to fall
@@ -2932,6 +3107,7 @@ fn pump_held(
                 .expect("reducer")
                 .reduce(StatusSignal::Tick, SystemTime::now());
             apply(&shared, &outcome);
+            sample_held_foreground(&shared, &client, &manifest_id);
 
             if last_liveness.elapsed() >= LIVENESS_INTERVAL {
                 last_liveness = Instant::now();
@@ -3061,8 +3237,11 @@ fn pump_held(
             }
             if let Some(observation) = observation {
                 let outcome = reducer.reduce(StatusSignal::Screen(observation), now);
-                drop(reducer);
                 apply(&shared, &outcome);
+            }
+            drop(reducer);
+            if !replaying {
+                sample_held_foreground(&shared, &client, &manifest_id);
             }
         }
     }
@@ -3169,10 +3348,11 @@ fn persist_checkpoint(
     marker_buffer: &[u8],
     last_key: &mut Option<CheckpointKey>,
 ) {
-    let (history, grid, alt_screen, bracketed_paste, mouse, content_seq) = {
+    let (history, history_metadata, grid, alt_screen, bracketed_paste, mouse, content_seq) = {
         let screen = shared.screen.lock().expect("screen");
         (
             screen.history_snapshot(),
+            screen.history_metadata(),
             screen.full_snapshot(),
             screen.is_alt_screen(),
             screen.bracketed_paste(),
@@ -3194,6 +3374,7 @@ fn persist_checkpoint(
     let checkpoint = crate::checkpoint::ScreenCheckpoint {
         log_offset: offset,
         history,
+        history_metadata,
         grid,
         marker_buffer: marker_buffer.to_vec(),
         alt_screen,
@@ -3385,7 +3566,67 @@ pub fn authority_for(manifest_id: &str, engine: &ManifestEngine) -> Authority {
 
 #[cfg(test)]
 mod prompt_title_tests {
-    use super::PromptInputState;
+    use super::*;
+
+    #[test]
+    fn terminal_prompt_capture_survives_screen_timing_but_ignores_dialog_answers() {
+        let temp = tempfile::tempdir().unwrap();
+        let (engine, _) = ManifestEngine::load_dir(&crate::detect::bundled_manifest_dir()).unwrap();
+        let engine = Arc::new(engine);
+        for (index, initial) in [
+            SessionStatus::Starting,
+            SessionStatus::Idle,
+            SessionStatus::Working,
+            SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Permission),
+            SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Question),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let spec = SessionSpec {
+                id: format!("prompt-{index}"),
+                pty: PtySpec::new(vec!["/bin/sh".into()], "/tmp"),
+                manifest_id: "codex".into(),
+                authority: Authority::ScreenPrimary,
+                logs_dir: temp.path().to_path_buf(),
+                holder: None,
+                remote: None,
+                defer_launch: true,
+            };
+            // Keep the real Session input/reducer path, but hold input in the
+            // pre-launch queue so a PTY pump cannot race our status timeline.
+            let session = Session {
+                shared: new_shared(
+                    &spec,
+                    OutputLog::writer(temp.path(), &spec.id).unwrap(),
+                    &engine,
+                    true,
+                ),
+                transport: Transport::Held(HolderClient::new(temp.path().join("unused.sock"))),
+                pump: None,
+                manifest_id: spec.manifest_id.clone(),
+                deferred: Some(Arc::new(DeferredLaunch::new())),
+            };
+            *session.shared.status.lock().unwrap() = initial.clone();
+            for byte in b"Fix chat naming" {
+                session.write_input(&[*byte]).unwrap();
+            }
+            // A screen repaint can change the status between typing and Enter.
+            *session.shared.status.lock().unwrap() = SessionStatus::Working;
+            session.write_input(b"\r").unwrap();
+            if matches!(initial, SessionStatus::NeedsInput(_)) {
+                assert_eq!(session.view().title, None);
+                session.write_input(b"Real conversation prompt").unwrap();
+                session.write_input(b"\r").unwrap();
+                assert_eq!(
+                    session.view().title.as_deref(),
+                    Some("Real conversation prompt")
+                );
+            } else {
+                assert_eq!(session.view().title.as_deref(), Some("Fix chat naming"));
+            }
+        }
+    }
 
     #[test]
     fn committed_utf8_prompt_becomes_a_title_candidate() {
@@ -3490,7 +3731,7 @@ mod notification_tests {
             defer_launch: false,
         };
         let log = OutputLog::open(temp.path(), &spec.id, 4096, 8192, false).unwrap();
-        let shared = new_shared(&spec, log, &engine);
+        let shared = new_shared(&spec, log, &engine, true);
         let mut seq = 0;
         let bytes = b"\x1b]777;notify;Build;Passed\x07";
         let end = apply_remote_output(&shared, &engine, "shell", &mut seq, 0, bytes, true).unwrap();
@@ -3502,6 +3743,6 @@ mod notification_tests {
         assert!(shared.state_version.load(Ordering::SeqCst) > 0);
         apply_remote_output(&shared, &engine, "shell", &mut seq, end, bytes, false).unwrap();
         assert!(!shared.screen.lock().unwrap().has_notifications());
-        assert_eq!(*shared.status.lock().unwrap(), SessionStatus::Working);
+        assert_eq!(*shared.status.lock().unwrap(), SessionStatus::Idle);
     }
 }

@@ -139,6 +139,7 @@ fn hook(hook: ClaudeHook) -> StatusSignal {
     StatusSignal::ClaudeHook {
         hook,
         is_subagent: false,
+        pending_work: None,
     }
 }
 
@@ -382,6 +383,7 @@ fn subagent_events_never_move_the_parent() {
         StatusSignal::ClaudeHook {
             hook: ClaudeHook::Stop,
             is_subagent: true,
+            pending_work: None,
         },
         now + Duration::from_millis(100),
     );
@@ -550,6 +552,43 @@ fn a_process_only_agent_goes_working_on_first_output_then_exits() {
         }
         other => panic!("expected an exit, got {other:?}"),
     }
+}
+
+#[test]
+fn a_shell_is_idle_at_a_prompt_and_working_only_for_a_foreground_job() {
+    let mut reducer =
+        StatusReducer::new(Authority::ProcessOnly, t0()).with_manifest("shell", Some("1"));
+    let now = t0() + Duration::from_secs(1);
+
+    let outcome = reducer.reduce(StatusSignal::PtyOutputActivity, now);
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert!(!outcome.turn_completed);
+
+    let outcome = reducer.reduce(StatusSignal::ForegroundJob { running: true }, now);
+    assert_eq!(outcome.status_change, Some(SessionStatus::Working));
+    assert!(!outcome.turn_completed);
+
+    // Output from `sleep` is not required; the job itself is the signal.
+    let outcome = reducer.reduce(
+        StatusSignal::ForegroundJob { running: true },
+        now + Duration::from_secs(1),
+    );
+    assert_eq!(outcome.status_change, None);
+
+    let outcome = reducer.reduce(
+        StatusSignal::ForegroundJob { running: false },
+        now + Duration::from_secs(2),
+    );
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert!(!outcome.turn_completed);
+}
+
+#[test]
+fn foreground_job_running_is_the_child_process_group_test() {
+    assert_eq!(super::foreground_job_running(0, Some(12)), None);
+    assert_eq!(super::foreground_job_running(42, None), None);
+    assert_eq!(super::foreground_job_running(42, Some(42)), Some(false));
+    assert_eq!(super::foreground_job_running(42, Some(99)), Some(true));
 }
 
 #[test]
@@ -791,6 +830,104 @@ fn a_recent_work_hook_outranks_an_idle_prompt_during_a_tool_call() {
     assert!(
         reducer
             .reduce(hook(ClaudeHook::Stop), t0() + Duration::from_secs(3))
+            .turn_completed
+    );
+}
+
+#[test]
+fn claude_long_tool_calls_do_not_publish_finished_between_tools() {
+    let mut reducer = StatusReducer::new(Authority::HooksPrimary, t0());
+    let mut now = settled(&mut reducer, t0());
+    reducer.reduce(hook(ClaudeHook::UserPromptSubmit), now);
+    let mut completions = 0;
+    for seq in 1..=3 {
+        reducer.reduce(hook(ClaudeHook::PreToolUse), now);
+        // Claude's input box can remain visible throughout a long tool call.
+        reducer.reduce(
+            StatusSignal::Screen(observation(ManifestState::Idle, seq)),
+            now + Duration::from_millis(100),
+        );
+        for seconds in 1..=30 {
+            let outcome = reducer.reduce(StatusSignal::Tick, now + Duration::from_secs(seconds));
+            completions += usize::from(outcome.turn_completed);
+        }
+        now += Duration::from_secs(30);
+    }
+    assert_eq!(
+        completions, 0,
+        "active Claude tools must not emit finished notifications"
+    );
+    assert_eq!(reducer.status(), &SessionStatus::Working);
+    assert!(reducer.reduce(hook(ClaudeHook::Stop), now).turn_completed);
+    assert!(!reducer.reduce(hook(ClaudeHook::Stop), now).turn_completed);
+}
+
+#[test]
+fn claude_idle_redraws_and_subagent_completion_do_not_finish_the_parent_turn() {
+    let mut reducer = StatusReducer::new(Authority::HooksPrimary, t0());
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(hook(ClaudeHook::UserPromptSubmit), now);
+    reducer.reduce(hook(ClaudeHook::SubagentStart("child".into())), now);
+    for seq in 1..=120 {
+        let at = now + Duration::from_secs(seq);
+        if seq == 30 {
+            reducer.reduce(hook(ClaudeHook::SubagentStop("child".into())), at);
+        }
+        let frame = reducer.reduce(
+            StatusSignal::Screen(observation(ManifestState::Idle, seq)),
+            at,
+        );
+        let tick = reducer.reduce(StatusSignal::Tick, at);
+        assert!(!frame.turn_completed && !tick.turn_completed);
+        assert_eq!(reducer.status(), &SessionStatus::Working);
+    }
+    assert!(
+        reducer
+            .reduce(hook(ClaudeHook::Stop), now + Duration::from_secs(121))
+            .turn_completed
+    );
+}
+
+#[test]
+fn claude_screen_fallback_still_completes_when_no_work_hook_was_received() {
+    let mut reducer = StatusReducer::new(Authority::HooksPrimary, t0());
+    let now = settled(&mut reducer, t0());
+    // Remote/adopted sessions may only have terminal observations.
+    reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::Working, 1)),
+        now,
+    );
+    reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::Idle, 2)),
+        now,
+    );
+    let completed = reducer.reduce(StatusSignal::Tick, now + Duration::from_secs(1));
+    assert!(completed.turn_completed);
+    assert_eq!(reducer.status(), &SessionStatus::Idle);
+    assert!(
+        !reducer
+            .reduce(StatusSignal::Tick, now + Duration::from_secs(2))
+            .turn_completed
+    );
+}
+
+#[test]
+fn claude_answering_a_screen_blocker_resumes_the_hook_owned_turn() {
+    let mut reducer = StatusReducer::new(Authority::HooksPrimary, t0());
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(hook(ClaudeHook::UserPromptSubmit), now);
+    reducer.reduce(StatusSignal::Screen(blocker(1, "Allow tool?")), now);
+    for seq in 2..=4 {
+        let outcome = reducer.reduce(
+            StatusSignal::Screen(observation(ManifestState::Idle, seq)),
+            now + Duration::from_secs(seq * 10),
+        );
+        assert!(!outcome.turn_completed);
+    }
+    assert_eq!(reducer.status(), &SessionStatus::Working);
+    assert!(
+        reducer
+            .reduce(hook(ClaudeHook::Stop), now + Duration::from_secs(41))
             .turn_completed
     );
 }

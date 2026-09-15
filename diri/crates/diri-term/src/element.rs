@@ -12,7 +12,8 @@ use gpui::{
     point, px, relative, size,
 };
 
-use crate::buffer::{ApplySummary, GridBuffer};
+use crate::blocks::BlockGlyph;
+use crate::buffer::{ApplySummary, ChangedRenderRow, GridBuffer};
 use crate::find::{
     FindSnapshot, FindSpan, NavigationTarget, SearchJob, SearchRequest, SearchResult,
     TerminalFindModel,
@@ -38,6 +39,23 @@ type TextInputCallback = Arc<dyn Fn(&str) + Send + Sync>;
 pub enum TerminalReference {
     Url(String),
     File(String),
+}
+
+pub type ReferenceSpan = (i64, usize, usize);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferenceHit {
+    pub reference: TerminalReference,
+    /// Absolute row, start column, exclusive end column.
+    pub spans: Vec<ReferenceSpan>,
+}
+
+impl TerminalReference {
+    pub fn destination(&self) -> &str {
+        match self {
+            Self::Url(value) | Self::File(value) => value,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -72,6 +90,7 @@ pub struct TerminalElement {
     ime_state: Arc<Mutex<TerminalImeState>>,
     focus_override: Option<bool>,
     suspended: bool,
+    hovered_reference: Option<ReferenceHit>,
 }
 
 #[derive(Default)]
@@ -283,6 +302,40 @@ struct CachedRow {
     line: ShapedLine,
 }
 
+impl CachedRow {
+    fn move_vertically(&mut self, dy: Pixels) {
+        for quad in self
+            .background_quads
+            .iter_mut()
+            .chain(self.decoration_quads.iter_mut())
+        {
+            quad.bounds.origin.y += dy;
+        }
+    }
+}
+
+/// Move the existing viewport cache with a full-height scroll. This is only a
+/// reuse hint: the caller compares every cell before accepting a prepared row.
+/// Sparse damage and render-context changes never rotate the cache.
+fn align_scrolled_rows(cache: &mut [Option<CachedRow>], damage: &[ChangedRenderRow]) -> usize {
+    if cache.len() < 2 || damage.len() != cache.len() {
+        return 0;
+    }
+    for changed in [damage.first().unwrap(), damage.last().unwrap()] {
+        if let Some(previous) = cache
+            .iter()
+            .position(|entry| entry.as_ref().is_some_and(|row| row.cells == changed.cells))
+        {
+            let offset = (previous + cache.len() - changed.row) % cache.len();
+            if offset != 0 {
+                cache.rotate_left(offset);
+                return offset;
+            }
+        }
+    }
+    0
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RowRenderContext {
     theme_signature: u64,
@@ -316,6 +369,7 @@ struct CursorPaint {
     col: u16,
     quad: PaintQuad,
     glyph: Option<ShapedLine>,
+    block: Option<BlockGlyph>,
 }
 
 impl TerminalElement {
@@ -346,6 +400,7 @@ impl TerminalElement {
             ime_state: Arc::new(Mutex::new(TerminalImeState::default())),
             focus_override: None,
             suspended: false,
+            hovered_reference: None,
         }
     }
 
@@ -393,6 +448,11 @@ impl TerminalElement {
     }
 
     #[must_use]
+    pub fn hovered_reference(mut self, hit: Option<ReferenceHit>) -> Self {
+        self.hovered_reference = hit;
+        self
+    }
+
     pub fn font_size(mut self, font_size: Pixels) -> Self {
         self.font_size = font_size;
         self
@@ -442,8 +502,12 @@ impl TerminalElement {
         // Absolute rows keep a selection attached while the viewport moves,
         // but not when the daemon replaces cells at those rows. Damage is
         // row-granular, so unrelated live output and history remain selected.
-        let live_start_row = mutex_lock(&self.shared.viewport).live_start_row();
+        let mut viewport = mutex_lock(&self.shared.viewport);
+        let live_start_row = viewport.live_start_row();
         let mut buffer = write_lock(&self.buffer);
+        viewport.hold_reading_view(&buffer);
+        let reading_held = viewport.is_reading();
+        drop(viewport);
         let replaces_grid =
             update.is_full_snapshot || buffer.cols != update.cols || buffer.rows != update.rows;
         let damaged_cols = usize::from(if replaces_grid {
@@ -452,7 +516,7 @@ impl TerminalElement {
             update.cols
         });
         let mut selection = mutex_lock(&self.shared.selection);
-        let selection_overlaps_damage = if selection.range().is_none() {
+        let selection_overlaps_damage = if reading_held || selection.range().is_none() {
             false
         } else if replaces_grid {
             (0..buffer.rows.max(update.rows)).any(|row| {
@@ -483,6 +547,16 @@ impl TerminalElement {
         *mutex_lock(&self.shared.stats) = RendererStats::default();
     }
 
+    /// Cache key without cloning the potentially multi-megabyte reading view.
+    pub fn reference_revision(&self) -> (u64, i64, Option<u64>) {
+        let viewport = mutex_lock(&self.shared.viewport);
+        (
+            read_lock(&self.buffer).generation(),
+            viewport.view_offset(),
+            viewport.cache_seq(),
+        )
+    }
+
     #[must_use]
     pub fn viewport(&self) -> ScrollbackViewport {
         mutex_lock(&self.shared.viewport).clone()
@@ -500,15 +574,36 @@ impl TerminalElement {
     }
 
     pub fn set_view_offset(&self, offset: i64, visible_rows: usize) -> bool {
-        mutex_lock(&self.shared.viewport).set_view_offset(offset, visible_rows)
+        let mut viewport = mutex_lock(&self.shared.viewport);
+        let changed = viewport.set_view_offset(offset, visible_rows);
+        viewport.hold_reading_view(&read_lock(&self.buffer));
+        if changed && !viewport.is_reading() {
+            mutex_lock(&self.shared.selection).clear();
+        }
+        changed
+    }
+
+    /// Keep the displayed text stable while keyboard selection owns input.
+    pub fn pin_keyboard_selection(&self, pinned: bool) {
+        mutex_lock(&self.shared.viewport).pin_keyboard(pinned, &read_lock(&self.buffer));
     }
 
     pub fn scroll_to_live(&self, visible_rows: usize) -> bool {
-        mutex_lock(&self.shared.viewport).scroll_to_live(visible_rows)
+        self.set_view_offset(0, visible_rows)
+    }
+
+    pub fn adopt_history_geometry(&self, live_start: i64, total: i64, sequence: u64, rows: usize) {
+        mutex_lock(&self.shared.viewport).apply_geometry(live_start, total, sequence, rows);
     }
 
     pub fn scroll_to_absolute(&self, absolute_row: i64, anchor: f32, visible_rows: usize) -> bool {
-        mutex_lock(&self.shared.viewport).scroll_to_absolute(absolute_row, anchor, visible_rows)
+        let mut viewport = mutex_lock(&self.shared.viewport);
+        let changed = viewport.scroll_to_absolute(absolute_row, anchor, visible_rows);
+        viewport.hold_reading_view(&read_lock(&self.buffer));
+        if changed && !viewport.is_reading() {
+            mutex_lock(&self.shared.selection).clear();
+        }
+        changed
     }
 
     /// Updates daemon-owned terminal modes and reports whether entering the
@@ -539,7 +634,12 @@ impl TerminalElement {
         let route = mutex_lock(&self.shared.scroll_router).route(modes, event)?;
         match route {
             WheelRoute::Local { lines } => {
-                mutex_lock(&self.shared.viewport).scroll_by(lines, usize::from(event.visible_rows));
+                let mut viewport = mutex_lock(&self.shared.viewport);
+                let changed = viewport.scroll_by(lines, usize::from(event.visible_rows));
+                viewport.hold_reading_view(&read_lock(&self.buffer));
+                if changed && !viewport.is_reading() {
+                    mutex_lock(&self.shared.selection).clear();
+                }
             }
             // This route leaves the viewport still while the foreground
             // program may repaint beneath the selection's coordinates.
@@ -573,11 +673,14 @@ impl TerminalElement {
     }
 
     pub fn drag_selection(&self, col: usize, window_row: usize) {
-        let absolute_row = mutex_lock(&self.shared.viewport).absolute_row(window_row);
-        mutex_lock(&self.shared.selection).drag_to(SelectionPoint {
-            row: absolute_row,
-            col,
-        });
+        let viewport = mutex_lock(&self.shared.viewport);
+        let buffer = read_lock(&self.buffer);
+        mutex_lock(&self.shared.selection).drag_in_view(&viewport, &buffer, window_row, col);
+    }
+
+    pub fn begin_rectangle_selection(&self, col: usize, row: usize) {
+        let row = mutex_lock(&self.shared.viewport).absolute_row(row);
+        mutex_lock(&self.shared.selection).begin_rectangle(SelectionPoint { row, col });
     }
 
     pub fn select_word(&self, col: usize, window_row: usize) {
@@ -597,7 +700,6 @@ impl TerminalElement {
     }
 
     /// The web URL whose text spans the given window cell, if any.
-    /// Wrapped multi-row URLs are out of scope: the scan is per logical row.
     #[must_use]
     pub fn link_at(&self, col: usize, window_row: usize) -> Option<String> {
         match self.reference_at(col, window_row) {
@@ -610,18 +712,34 @@ impl TerminalElement {
     ///
     /// The full whitespace-delimited row run is inspected, so clicking a line
     /// number or punctuation wrapper resolves the same reference as clicking
-    /// the path itself. Multi-row references are deliberately out of scope.
+    /// the path itself. URLs can continue across terminal rows or within an
+    /// indented/table column; file references remain confined to one row.
     #[must_use]
     pub fn reference_at(&self, col: usize, window_row: usize) -> Option<TerminalReference> {
+        self.reference_hit_at(col, window_row)
+            .map(|hit| hit.reference)
+    }
+
+    pub fn reference_hit_at(&self, col: usize, window_row: usize) -> Option<ReferenceHit> {
         let viewport = mutex_lock(&self.shared.viewport);
         let buffer = read_lock(&self.buffer);
         let absolute_row = viewport.absolute_row(window_row);
+        let metadata = viewport.row_metadata(&buffer, absolute_row);
+        if let Some(link) = metadata
+            .links
+            .iter()
+            .find(|link| usize::from(link.start) <= col && col < usize::from(link.end))
+        {
+            return reference_from_run(&link.uri).map(|reference| ReferenceHit {
+                reference,
+                spans: vec![(absolute_row, usize::from(link.start), usize::from(link.end))],
+            });
+        }
         let row = viewport.row_at_absolute(&buffer, absolute_row);
         let chars: Vec<char> = row
             .iter()
             .map(|cell| crate::selection::cell_char(*cell))
             .collect();
-        drop(buffer);
         if col >= chars.len() {
             return None;
         }
@@ -629,6 +747,15 @@ impl TerminalElement {
         if !is_reference_char(chars[col]) {
             return None;
         }
+        if let Some((url, spans)) = wrapped_url_at(col, absolute_row, |row| {
+            viewport.row_at_absolute(&buffer, row)
+        }) {
+            return Some(ReferenceHit {
+                reference: TerminalReference::Url(url),
+                spans,
+            });
+        }
+        drop(buffer);
         let mut start = col;
         while start > 0 && is_reference_char(chars[start - 1]) {
             start -= 1;
@@ -638,7 +765,23 @@ impl TerminalElement {
             end += 1;
         }
         let candidate: String = chars[start..end].iter().collect();
-        reference_from_run(&candidate)
+        reference_from_run(&candidate).map(|reference| {
+            // Underline the target text, excluding punctuation wrappers.
+            let target = reference.destination();
+            let prefix = candidate
+                .find(target)
+                .map(|byte| candidate[..byte].chars().count())
+                .unwrap_or(0);
+            let target_start = start + prefix;
+            ReferenceHit {
+                spans: vec![(
+                    absolute_row,
+                    target_start,
+                    (target_start + target.chars().count()).min(end),
+                )],
+                reference,
+            }
+        })
     }
 
     #[must_use]
@@ -947,7 +1090,7 @@ impl Element for TerminalElement {
         let cache_misses;
         let mut paint_from_cache = false;
 
-        if viewport.view_offset() > 0 {
+        if viewport.is_reading() {
             // History browsing composes owned rows per frame; quads are cheap
             // arithmetic, but shaping is not, so shaped lines are reused from
             // the absolute-row cache. Returning live still forces one complete
@@ -1027,13 +1170,30 @@ impl Element for TerminalElement {
                 buffer.snapshot_damage(&mut generations, visible_rows, visible_cols, force)
             };
             cursor = damage.cursor;
-            cache_misses = damage.changed_rows.len() as u64;
-            cache_hits = visible_rows.saturating_sub(damage.changed_rows.len()) as u64;
+            let mut misses = 0;
 
             let mut cache = mutex_lock(&self.shared.row_cache);
             cache.truncate(visible_rows);
             cache.resize_with(visible_rows, || None);
+            let offset = if force {
+                0
+            } else {
+                align_scrolled_rows(&mut cache, &damage.changed_rows)
+            };
             for changed in damage.changed_rows {
+                if !force
+                    && let Some(prepared) = cache[changed.row].as_mut()
+                    && prepared.cells == changed.cells
+                {
+                    // Shapes are independent of row position. Backgrounds and
+                    // decorations carry absolute bounds and must move with it.
+                    let old_row = (changed.row + offset) % visible_rows;
+                    let dy =
+                        metrics.y_for_row(changed.row as u16) - metrics.y_for_row(old_row as u16);
+                    prepared.move_vertically(dy);
+                    continue;
+                }
+                misses += 1;
                 cache[changed.row] = Some(self.prepare_row(
                     changed.cells,
                     changed.row as u16,
@@ -1042,6 +1202,8 @@ impl Element for TerminalElement {
                     window,
                 ));
             }
+            cache_misses = misses;
+            cache_hits = visible_rows as u64 - misses;
             // No composed copies: paint reads the row cache directly (see
             // `paint_from_cache`), so a frame with zero changed rows clones
             // nothing — previously every prepaint re-cloned all rows' quads
@@ -1062,6 +1224,28 @@ impl Element for TerminalElement {
                 &mut overlay_quads,
             );
         }
+        if let Some(hit) = &self.hovered_reference {
+            let top = viewport.absolute_row(0);
+            for &(row, start, end) in &hit.spans {
+                if row < top || row >= top + visible_rows as i64 {
+                    continue;
+                }
+                let origin = point(
+                    bounds.left() + metrics.cell_width * start as f32,
+                    bounds.top() + metrics.line_height * (row - top + 1) as f32 - px(2.0),
+                );
+                overlay_quads.push(fill(
+                    Bounds::new(
+                        origin,
+                        size(
+                            metrics.cell_width * end.saturating_sub(start) as f32,
+                            px(1.0),
+                        ),
+                    ),
+                    self.theme.foreground,
+                ));
+            }
+        }
         for span in mutex_lock(&self.shared.find_spans).iter().copied() {
             append_overlay_quad(
                 span.row,
@@ -1080,7 +1264,7 @@ impl Element for TerminalElement {
 
         let cursor_visible = cursor_should_render(focused, cursor.visible);
         let cursor = if cursor_visible
-            && viewport.view_offset() == 0
+            && !viewport.is_reading()
             && usize::from(cursor.row) < visible_rows
             && usize::from(cursor.col) < visible_cols
         {
@@ -1102,6 +1286,12 @@ impl Element for TerminalElement {
                     self.theme.cursor,
                 ),
                 glyph: self.shape_cursor_glyph(cell, metrics, window),
+                block: self
+                    .theme
+                    .resolve_cell(cell)
+                    .visible
+                    .then(|| BlockGlyph::from_scalar(cell.scalar))
+                    .flatten(),
             })
         } else {
             None
@@ -1256,6 +1446,16 @@ impl Element for TerminalElement {
 
             if let Some(cursor) = prepaint.cursor.take() {
                 window.paint_quad(cursor.quad);
+                if let Some(block) = cursor.block {
+                    for rect in block.rectangles(
+                        bounds.origin,
+                        metrics,
+                        usize::from(cursor.col),
+                        cursor.row,
+                    ) {
+                        window.paint_quad(fill(rect, self.theme.cursor_text));
+                    }
+                }
                 if let Some(glyph) = cursor.glyph {
                     let origin = point(
                         bounds.left() + metrics.x_for_col(cursor.col),
@@ -1351,11 +1551,26 @@ fn append_row_quads(
             && !cell
                 .style
                 .contains(diri_proto::grid::TermStyle::CROSSED_OUT)
+            && BlockGlyph::from_scalar(cell.scalar).is_none()
     });
     if is_plain {
         return;
     }
     append_background_quads(row, row_index, origin, metrics, theme, background_quads);
+    // Keep blocks in the foreground layer, above selection/search backgrounds
+    // and below the cursor. The same path serves cached live rows and history.
+    for (col, cell) in row.iter().enumerate() {
+        if let Some(block) = BlockGlyph::from_scalar(cell.scalar) {
+            let style = theme.resolve_cell(*cell);
+            if style.visible {
+                decoration_quads.extend(
+                    block
+                        .rectangles(origin, metrics, col, row_index)
+                        .map(|bounds| fill(bounds, style.foreground)),
+                );
+            }
+        }
+    }
     append_decoration_quads(row, row_index, origin, metrics, theme, decoration_quads);
 }
 
@@ -1497,7 +1712,7 @@ fn styled_font(base: &Font, style: ResolvedCellStyle) -> Font {
 }
 
 fn render_char(cell: GridCell, visible: bool) -> char {
-    if !visible || cell.scalar == 0 {
+    if !visible || cell.scalar == 0 || BlockGlyph::from_scalar(cell.scalar).is_some() {
         return ' ';
     }
     char::from_u32(cell.scalar)
@@ -1516,6 +1731,129 @@ fn url_from_run(run: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Grid cells do not carry soft-wrap or OSC 8 targets. Reconstruct visible URLs
+/// conservatively: bare links continue only at the terminal's right edge;
+/// prose/table links need an opening wrapper and its matching closing wrapper.
+/// Read through the viewport so cached history and held reading views agree
+/// with what the user actually clicked. Both lookbehind and URL size are bounded.
+fn wrapped_url_at(
+    col: usize,
+    clicked_row: i64,
+    row_at: impl Fn(i64) -> Vec<GridCell>,
+) -> Option<(String, Vec<ReferenceSpan>)> {
+    const MAX_ROWS: usize = 16;
+    const MAX_URL_BYTES: usize = 4096;
+    let read_row = |row| {
+        row_at(row)
+            .into_iter()
+            .map(crate::selection::cell_char)
+            .collect::<Vec<_>>()
+    };
+    for behind in 0..MAX_ROWS {
+        let start_row = clicked_row.checked_sub(behind as i64)?;
+        let chars = read_row(start_row);
+        let mut start = 0;
+        while start < chars.len() {
+            if chars[start].is_whitespace() {
+                start += 1;
+                continue;
+            }
+            let end = reference_run_end(&chars, start);
+            let mut candidate: String = chars[start..end].iter().collect();
+            let closer = match chars[start] {
+                '(' => Some(')'),
+                '[' => Some(']'),
+                '{' => Some('}'),
+                '<' => Some('>'),
+                '\'' => Some('\''),
+                '"' => Some('"'),
+                _ => None,
+            };
+            let already_closed = closer.is_some_and(|close| candidate[1..].contains(close));
+            if url_from_run(&candidate).is_some()
+                && !already_closed
+                && (closer.is_some() || end == chars.len())
+                && candidate.len() <= MAX_URL_BYTES
+            {
+                // A double-space gutter (or a drawn table border) separates
+                // columns. Single spaces belong to the label before the URL.
+                let mut lane_start = (0..start)
+                    .rev()
+                    .find(|&i| {
+                        matches!(chars[i], '|' | '│')
+                            || (chars[i].is_whitespace()
+                                && (i == 0 || chars[i - 1].is_whitespace()))
+                    })
+                    .map_or(0, |i| i + 1);
+                while lane_start < start && chars[lane_start].is_whitespace() {
+                    lane_start += 1;
+                }
+                let mut spans = vec![(start_row, start, end)];
+                let mut hit = behind == 0 && (start..end).contains(&col);
+                let mut at_edge = end == chars.len();
+                for ahead in 1..MAX_ROWS {
+                    let row_number = start_row.checked_add(ahead as i64)?;
+                    let next = read_row(row_number);
+                    let mut next_start = if at_edge { 0 } else { lane_start };
+                    if closer.is_some() {
+                        while next_start < next.len() && next[next_start].is_whitespace() {
+                            next_start += 1;
+                        }
+                    }
+                    if next_start >= next.len() || next[next_start].is_whitespace() {
+                        if closer.is_none() && ahead > 1 && hit {
+                            return url_from_run(&candidate).map(|url| (url, spans.clone()));
+                        }
+                        break;
+                    }
+                    // Do not jump to another table column across an empty cell.
+                    if !at_edge && next_start != lane_start {
+                        break;
+                    }
+                    let next_end = reference_run_end(&next, next_start);
+                    let fragment: String = next[next_start..next_end].iter().collect();
+                    if url_from_run(&fragment).is_some() || fragment.contains(['|', '│', '─', '━'])
+                    {
+                        if closer.is_none() && ahead > 1 && hit {
+                            return url_from_run(&candidate).map(|url| (url, spans.clone()));
+                        }
+                        break;
+                    }
+                    if candidate.len() + fragment.len() > MAX_URL_BYTES {
+                        break;
+                    }
+                    candidate.push_str(&fragment);
+                    spans.push((row_number, next_start, next_end));
+                    hit |= row_number == clicked_row && (next_start..next_end).contains(&col);
+                    at_edge = next_end == next.len();
+                    let complete = closer.map_or(!at_edge, |close| fragment.contains(close));
+                    if complete {
+                        if hit {
+                            return url_from_run(&candidate).map(|url| (url, spans.clone()));
+                        }
+                        break;
+                    }
+                    if !at_edge
+                        && (closer.is_none()
+                            || next.get(next_end + 1).is_some_and(|ch| !ch.is_whitespace()))
+                    {
+                        break;
+                    }
+                }
+            }
+            start = end;
+        }
+    }
+    None
+}
+
+fn reference_run_end(chars: &[char], start: usize) -> usize {
+    chars[start..]
+        .iter()
+        .position(|ch| ch.is_whitespace())
+        .map_or(chars.len(), |length| start + length)
 }
 
 fn trim_reference_run(run: &str) -> &str {
@@ -1632,6 +1970,101 @@ fn write_lock<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
 }
 
 #[cfg(test)]
+mod block_tests {
+    use super::*;
+    use diri_proto::grid::{TermColor, TermStyle};
+
+    #[test]
+    fn anara_blocks_fill_their_cell_and_keep_adjacent_text_in_place() {
+        let metrics =
+            CellMetrics::from_measurements(px(8.5), px(12.0), px(5.0), px(0.0), FontId(0));
+        for (ch, top, height) in [('█', 0.0, 17.0), ('▀', 0.0, 8.5), ('▄', 8.5, 8.5)] {
+            let cell = GridCell::new(
+                ch as u32,
+                TermColor::Default,
+                TermColor::DefaultInverted,
+                TermStyle::empty(),
+            );
+            let mut backgrounds = Vec::new();
+            let mut foregrounds = Vec::new();
+            append_row_quads(
+                &[cell],
+                1,
+                point(px(2.0), px(3.0)),
+                metrics,
+                TermTheme::default(),
+                &mut backgrounds,
+                &mut foregrounds,
+            );
+            assert_eq!(
+                foregrounds.len(),
+                1,
+                "{ch} must use cell geometry, not font ink bounds"
+            );
+            assert_eq!(
+                foregrounds[0].bounds,
+                Bounds::new(point(px(2.0), px(20.0 + top)), size(px(8.5), px(height)))
+            );
+            let terminal = TerminalElement::with_buffer(GridBuffer::default());
+            let (text, _) = terminal.row_text_and_runs(&[
+                cell,
+                GridCell::new('A' as u32, cell.fg, cell.bg, cell.style),
+            ]);
+            assert_eq!(
+                text, " A",
+                "the block must reserve one text column without painting a second glyph"
+            );
+        }
+    }
+
+    #[test]
+    fn blocks_preserve_terminal_colors_styles_and_source_text() {
+        let metrics =
+            CellMetrics::from_measurements(px(8.0), px(12.0), px(4.0), px(0.0), FontId(0));
+        for theme in [TermTheme::DIRIJOR_DARK, TermTheme::DIRIJOR_LIGHT] {
+            for style in [
+                TermStyle::empty(),
+                TermStyle::DIM,
+                TermStyle::INVERSE,
+                TermStyle::BOLD | TermStyle::ITALIC,
+                TermStyle::INVISIBLE,
+            ] {
+                let cell = GridCell::new(
+                    '█' as u32,
+                    TermColor::Rgb(120, 150, 180),
+                    TermColor::Rgb(20, 30, 40),
+                    style,
+                );
+                let mut backgrounds = Vec::new();
+                let mut foregrounds = Vec::new();
+                append_row_quads(
+                    &[cell],
+                    0,
+                    Point::default(),
+                    metrics,
+                    theme,
+                    &mut backgrounds,
+                    &mut foregrounds,
+                );
+                assert_eq!(backgrounds.len(), 1);
+                if style.contains(TermStyle::INVISIBLE) {
+                    assert!(foregrounds.is_empty());
+                } else {
+                    assert_eq!(foregrounds.len(), 1);
+                    assert_eq!(
+                        foregrounds[0].background,
+                        fill(foregrounds[0].bounds, theme.resolve_cell(cell).foreground).background
+                    );
+                }
+                let mut buffer = GridBuffer::new(1, 1);
+                buffer.cells[0] = cell;
+                assert_eq!(buffer.row_text_with_columns(0).unwrap().0, "█");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod link_tests {
     use std::sync::{Arc, Mutex};
 
@@ -1641,6 +2074,164 @@ mod link_tests {
         TerminalImeState, TerminalInputHandler, TerminalReference, file_reference_from_run,
         mutex_lock, reference_from_run, url_from_run,
     };
+
+    fn terminal_with_rows(rows: &[&str]) -> super::TerminalElement {
+        let cols = rows.iter().map(|row| row.chars().count()).max().unwrap();
+        let mut buffer = crate::buffer::GridBuffer::new(cols as u16, rows.len() as u16);
+        for (row, text) in rows.iter().enumerate() {
+            for (col, ch) in text.chars().enumerate() {
+                buffer.cells[row * cols + col].scalar = u32::from(ch);
+            }
+        }
+        super::TerminalElement::new(Arc::new(std::sync::RwLock::new(buffer)))
+    }
+
+    #[test]
+    fn wrapped_url_in_table_opens_full_pr_from_either_row() {
+        let terminal = terminal_with_rows(&[
+            "  #6396 — Safari banner (https://github.com/anaralabs/anara/   Updates the existing PR",
+            "  pull/6396)                                                 routing.",
+        ]);
+        for (row, start, end) in [(0, 24, 56), (1, 2, 12)] {
+            for col in start..end {
+                assert_eq!(
+                    terminal.link_at(col, row).as_deref(),
+                    Some("https://github.com/anaralabs/anara/pull/6396"),
+                    "click at row {row}, col {col}"
+                );
+            }
+        }
+        assert_eq!(terminal.link_at(60, 0), None);
+        assert_eq!(terminal.link_at(60, 1), None);
+        assert_eq!(terminal.link_at(1, 1), None);
+    }
+
+    #[test]
+    fn wrapped_url_spans_three_indented_rows_and_keeps_query_and_fragment() {
+        let terminal = terminal_with_rows(&[
+            "  See (https://github.com/anaralabs/",
+            "  anara/pull/6396?diff=split&",
+            "  view=1#discussion).",
+            "                                        ",
+        ]);
+        for (col, row) in [(8, 0), (4, 1), (5, 2)] {
+            assert_eq!(
+                terminal.link_at(col, row).as_deref(),
+                Some("https://github.com/anaralabs/anara/pull/6396?diff=split&view=1#discussion")
+            );
+        }
+    }
+
+    #[test]
+    fn wrapped_url_at_terminal_edge_works_from_each_fragment() {
+        let terminal =
+            terminal_with_rows(&["https://github.com/anaralabs/", "anara/pull/6396 next"]);
+        for (col, row) in [(12, 0), (5, 1)] {
+            assert_eq!(
+                terminal.link_at(col, row).as_deref(),
+                Some("https://github.com/anaralabs/anara/pull/6396")
+            );
+        }
+        assert_eq!(terminal.link_at(16, 1), None);
+    }
+
+    #[test]
+    fn wrapped_url_can_end_exactly_at_terminal_edge() {
+        let terminal = terminal_with_rows(&["https://example.com/", "12345678901234567890"]);
+        for row in 0..2 {
+            assert_eq!(
+                terminal.link_at(5, row).as_deref(),
+                Some("https://example.com/12345678901234567890")
+            );
+        }
+    }
+
+    #[test]
+    fn wrapped_url_in_second_table_column_stays_in_its_column() {
+        let terminal = terminal_with_rows(&[
+            "  PR  See (https://github.com/anaralabs/   Details",
+            "  42  anara/pull/6396)                   More",
+        ]);
+        assert_eq!(
+            terminal.link_at(7, 1).as_deref(),
+            Some("https://github.com/anaralabs/anara/pull/6396")
+        );
+        assert_eq!(terminal.link_at(2, 1), None);
+        assert_eq!(terminal.link_at(42, 1), None);
+        let bordered = terminal_with_rows(&[
+            "│ (https://github.com/anaralabs/ │ Details │",
+            "│ anara/pull/6396)              │ More    │",
+        ]);
+        assert_eq!(
+            bordered.link_at(3, 1).as_deref(),
+            Some("https://github.com/anaralabs/anara/pull/6396")
+        );
+    }
+
+    #[test]
+    fn wrapped_url_does_not_join_unrelated_rows_or_table_cells() {
+        for rows in [
+            vec![
+                "  (https://example.com)",
+                "  unrelated/path)",
+                "                              ",
+            ],
+            vec![
+                "  (https://example.com/",
+                "  ────────────────────",
+                "  pull/6396)",
+            ],
+            vec![
+                "  (https://example.com/   Text",
+                "                         unrelated/path)",
+            ],
+            vec![
+                "  (https://example.com/",
+                "  unrelated prose)",
+                "                              ",
+            ],
+            vec![
+                "  https://example.com/",
+                "  unrelated/path)",
+                "                              ",
+            ],
+            vec!["https://example.com/", "https://example.org/"],
+        ] {
+            let terminal = terminal_with_rows(&rows);
+            assert_eq!(
+                terminal.link_at(3, 0).as_deref(),
+                Some(
+                    rows[0]
+                        .split_whitespace()
+                        .next()
+                        .unwrap()
+                        .trim_matches(['(', ')'])
+                ),
+                "{rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapped_url_resolves_across_cached_history_and_live_grid() {
+        let terminal = terminal_with_rows(&[
+            "  pull/6396)",
+            "                                                                ",
+        ]);
+        let history = terminal_with_rows(&["  PR (https://github.com/anaralabs/anara/"]);
+        let cells = super::read_lock(&history.buffer).cells.clone();
+        {
+            let mut viewport = mutex_lock(&terminal.shared.viewport);
+            viewport.apply_rows(vec![cells], 0, 1, 3, 1, 2);
+            viewport.set_view_offset(1, 2);
+        }
+        for (col, row) in [(8, 0), (5, 1)] {
+            assert_eq!(
+                terminal.link_at(col, row).as_deref(),
+                Some("https://github.com/anaralabs/anara/pull/6396")
+            );
+        }
+    }
 
     #[test]
     fn terminal_renderer_never_creates_autonomous_frame_tasks() {
@@ -1907,6 +2498,41 @@ mod selection_repaint_tests {
         element
     }
 
+    #[test]
+    fn streaming_redraw_preserves_scrolled_reading_window() {
+        let element = populated_element();
+        mutex_lock(&element.shared.viewport).apply_rows(
+            vec![row("history")],
+            7,
+            8,
+            11,
+            1,
+            usize::from(ROWS),
+        );
+        element.set_view_offset(1, usize::from(ROWS));
+        let reading = element
+            .viewport()
+            .compose(&super::read_lock(&element.buffer), usize::from(ROWS));
+
+        // An agent redraws its live screen while the reader is one row up.
+        element.apply_damage(update(true, &[(0, "new"), (1, "output"), (2, "below")]));
+
+        assert_eq!(
+            element
+                .viewport()
+                .compose(&super::read_lock(&element.buffer), usize::from(ROWS)),
+            reading,
+            "streaming must not replace text already visible to a scrolled reader",
+        );
+        element.scroll_to_live(usize::from(ROWS));
+        assert_eq!(
+            element
+                .viewport()
+                .window_row(&super::read_lock(&element.buffer), 0),
+            row("new")
+        );
+    }
+
     fn wheel(delta: f32) -> WheelEvent {
         WheelEvent {
             delta: WheelDelta::Lines(delta),
@@ -1915,6 +2541,144 @@ mod selection_repaint_tests {
             visible_rows: ROWS,
             line_height: 16.0,
         }
+    }
+
+    fn history_reply(
+        first: i64,
+        live: i64,
+        seq: u64,
+        texts: &[&str],
+    ) -> diri_proto::methods::ReadScrollbackCellsResult {
+        diri_proto::methods::ReadScrollbackCellsResult {
+            metadata: Vec::new(),
+            payload: diri_proto::grid::GridRowCodec::encode_rows(
+                &texts.iter().map(|text| row(text)).collect::<Vec<_>>(),
+            )
+            .unwrap(),
+            first_row: first,
+            row_count: texts.len() as i64,
+            live_start_row: live,
+            total_rows: live + i64::from(ROWS),
+            cols: i64::from(COLS),
+            content_seq: seq,
+        }
+    }
+
+    #[test]
+    fn named_link_resolves_label_span_and_rejects_unsafe_destination() {
+        use diri_proto::grid::LinkSpan;
+        let element = populated_element();
+        let mut frame = update(false, &[(0, "label")]);
+        frame.changed_rows[0].metadata.links.push(LinkSpan {
+            start: 0,
+            end: 5,
+            uri: "https://example.com/pr/1".into(),
+        });
+        element.apply_damage(frame.clone());
+        let hit = element.reference_hit_at(2, 0).unwrap();
+        assert_eq!(hit.reference.destination(), "https://example.com/pr/1");
+        assert_eq!(hit.spans, vec![(0, 0, 5)]);
+        assert!(element.reference_hit_at(5, 0).is_none());
+        frame.changed_rows[0].metadata.links[0].uri = "javascript:alert(1)".into();
+        element.apply_damage(frame);
+        assert!(element.reference_hit_at(2, 0).is_none());
+    }
+
+    #[test]
+    fn keyboard_copy_holds_live_text_until_exit() {
+        let element = populated_element();
+        element.pin_keyboard_selection(true);
+        element.begin_selection(0, 0);
+        element.drag_selection(4, 0);
+        element.apply_damage(update(false, &[(0, "new")]));
+        assert_eq!(element.selected_text(), "zero");
+        assert_eq!(
+            element
+                .viewport()
+                .window_row(&super::read_lock(&element.buffer), 0),
+            row("zero")
+        );
+        element.pin_keyboard_selection(false);
+        assert_eq!(
+            element
+                .viewport()
+                .window_row(&super::read_lock(&element.buffer), 0),
+            row("new")
+        );
+    }
+
+    #[test]
+    fn scrolling_before_first_fetch_holds_live_text_and_selection() {
+        let element = populated_element();
+        element.route_wheel(wheel(1.0));
+        element.apply_damage(update(false, &[(0, "new")]));
+        element
+            .complete_scrollback_fetch(history_reply(7, 8, 2, &["history"]), usize::from(ROWS))
+            .unwrap();
+        assert_eq!(
+            element
+                .viewport()
+                .compose(&super::read_lock(&element.buffer), 3),
+            vec![row("history"), row("zero"), row("one")]
+        );
+        element.begin_selection(0, 1);
+        element.drag_selection(4, 1);
+        element.apply_damage(update(false, &[(0, "again")]));
+        assert_eq!(element.selected_text(), "zero");
+        element.scroll_to_live(3);
+        assert_eq!(element.selected_text(), "");
+        element.route_wheel(wheel(1.0));
+        element
+            .complete_scrollback_fetch(history_reply(17, 18, 3, &["fresh"]), 3)
+            .unwrap();
+        assert_eq!(
+            element.view_offset(),
+            1,
+            "a new scroll starts at the current live edge"
+        );
+        assert_eq!(
+            element
+                .viewport()
+                .compose(&super::read_lock(&element.buffer), 3),
+            vec![row("fresh"), row("again"), row("one")]
+        );
+    }
+
+    #[test]
+    fn overlapping_history_replies_and_live_growth_preserve_reading_text() {
+        let element = populated_element();
+        element
+            .complete_scrollback_fetch(history_reply(6, 8, 1, &["hist six", "hist sev"]), 3)
+            .unwrap();
+        element.set_view_offset(2, 3);
+        let reading = element
+            .viewport()
+            .compose(&super::read_lock(&element.buffer), 3);
+        for seq in 2..10 {
+            element.apply_damage(update(true, &[(0, "new"), (1, "output"), (2, "below")]));
+            element
+                .complete_scrollback_fetch(
+                    history_reply(7, 8 + seq as i64, seq, &["changed", "changed"]),
+                    3,
+                )
+                .unwrap();
+            assert_eq!(
+                element
+                    .viewport()
+                    .compose(&super::read_lock(&element.buffer), 3),
+                reading
+            );
+            assert_eq!(element.viewport().absolute_row(0), 6);
+        }
+        element.set_modes(true, MouseModes::OFF);
+        assert_eq!(element.view_offset(), 0);
+        assert!(element.viewport().cached_row(6).is_none());
+        assert_eq!(
+            element
+                .viewport()
+                .window_row(&super::read_lock(&element.buffer), 0),
+            row("new")
+        );
     }
 
     fn visible_selection_count(element: &TerminalElement) -> usize {
@@ -2035,5 +2799,97 @@ mod selection_repaint_tests {
 
         assert_eq!(element.selected_text(), "");
         assert_eq!(visible_selection_count(&element), 0);
+    }
+}
+
+#[cfg(test)]
+mod live_scroll_cache_tests {
+    use super::*;
+
+    fn cells(ch: u8) -> Vec<GridCell> {
+        let mut cell = GridCell::BLANK;
+        cell.scalar = u32::from(ch);
+        vec![cell; 8]
+    }
+
+    fn cache() -> Vec<Option<CachedRow>> {
+        (b'a'..=b'd')
+            .enumerate()
+            .map(|(row, ch)| {
+                Some(CachedRow {
+                    cells: cells(ch),
+                    background_quads: vec![fill(
+                        Bounds::new(point(px(3.), px(row as f32 * 20.)), size(px(80.), px(20.))),
+                        gpui::black(),
+                    )],
+                    decoration_quads: vec![fill(
+                        Bounds::new(
+                            point(px(3.), px(row as f32 * 20. + 18.)),
+                            size(px(80.), px(1.)),
+                        ),
+                        gpui::white(),
+                    )],
+                    line: ShapedLine::default(),
+                })
+            })
+            .collect()
+    }
+
+    fn damage(text: &[u8]) -> Vec<ChangedRenderRow> {
+        text.iter()
+            .enumerate()
+            .map(|(row, &ch)| ChangedRenderRow {
+                row,
+                generation: 1,
+                cells: cells(ch),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scrolling_reuses_shapes_and_moves_backgrounds_and_decorations_both_ways() {
+        for (text, expected_offset, matched_rows) in [
+            (b"bcde", 1, vec![0, 1, 2]),
+            (b"zabc", 3, vec![1, 2, 3]),
+            (b"cdef", 2, vec![0, 1]),
+        ] {
+            let mut cache = cache();
+            let damage = damage(text);
+            let offset = align_scrolled_rows(&mut cache, &damage);
+            assert_eq!(offset, expected_offset);
+            for row in matched_rows {
+                let prepared = cache[row].as_mut().unwrap();
+                assert_eq!(prepared.cells, damage[row].cells);
+                let previous = (row + offset) % 4;
+                prepared.move_vertically(px((row as f32 - previous as f32) * 20.));
+                assert_eq!(
+                    prepared.background_quads[0].bounds.origin,
+                    point(px(3.), px(row as f32 * 20.))
+                );
+                assert_eq!(
+                    prepared.decoration_quads[0].bounds.origin,
+                    point(px(3.), px(row as f32 * 20. + 18.))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_damage_and_unrelated_redraw_do_not_rotate_the_cache() {
+        let mut cache = cache();
+        assert_eq!(align_scrolled_rows(&mut cache, &damage(b"b")), 0);
+        assert_eq!(align_scrolled_rows(&mut cache, &damage(b"wxyz")), 0);
+        for (row, ch) in (b'a'..=b'd').enumerate() {
+            assert_eq!(cache[row].as_ref().unwrap().cells, cells(ch));
+        }
+    }
+
+    #[test]
+    fn a_scroll_hint_does_not_make_edited_rows_reusable() {
+        let mut cache = cache();
+        let mut damage = damage(b"bcde");
+        damage[1].cells[0].bg = diri_proto::grid::TermColor::Ansi(1);
+        assert_eq!(align_scrolled_rows(&mut cache, &damage), 1);
+        assert_ne!(cache[1].as_ref().unwrap().cells, damage[1].cells);
     }
 }

@@ -37,6 +37,9 @@ actions!(
         ToggleOverview,
         OpenWorktrees,
         OpenSettings,
+        // Palette destination: open Settings even when it is already visible.
+        // OpenSettings retains the Cmd+, toggle behavior.
+        ShowSettings,
         ToggleSidebar,
         FocusSidebar,
         ToggleInspector,
@@ -80,6 +83,11 @@ actions!(
         ResetZoom,
         Paste,
         CopySelection,
+        EnterCopyMode,
+        FindSelection,
+        ExportScrollback,
+        PreviousPrompt,
+        NextPrompt,
     ]
 );
 
@@ -133,6 +141,11 @@ pub enum CommandId {
     ResetZoom,
     Paste,
     CopySelection,
+    EnterCopyMode,
+    FindSelection,
+    ExportScrollback,
+    PreviousPrompt,
+    NextPrompt,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -294,8 +307,8 @@ pub const COMMANDS: &[CommandSpec] = &[
         Some("cmd-p"),
         Some("⌘P"),
         Some(APP_CONTEXT),
-        "Open Folder…",
-        "magnifyingglass",
+        "Open project…",
+        "folder",
         "folder project directory jump goto find"
     ),
     spec!(
@@ -303,7 +316,10 @@ pub const COMMANDS: &[CommandSpec] = &[
         "history",
         Some("cmd-shift-h"),
         Some("⇧⌘H"),
-        Some(APP_CONTEXT)
+        Some(APP_CONTEXT),
+        "Search chats",
+        "clock.fill",
+        "history conversations past resume"
     ),
     spec!(
         ToggleOverview,
@@ -590,6 +606,56 @@ pub const COMMANDS: &[CommandSpec] = &[
         Some("⌘C"),
         Some(TERMINAL_CONTEXT)
     ),
+    spec!(
+        EnterCopyMode,
+        "terminal-copy-mode",
+        Some("cmd-alt-c"),
+        Some("⌘⌥C"),
+        Some(TERMINAL_CONTEXT),
+        "Keyboard copy mode",
+        "doc.on.clipboard",
+        "copy keyboard terminal selection"
+    ),
+    spec!(
+        FindSelection,
+        "terminal-find-selection",
+        Some("cmd-alt-f"),
+        Some("⌘⌥F"),
+        Some(TERMINAL_CONTEXT),
+        "Find selection",
+        "magnifyingglass",
+        "find selection terminal"
+    ),
+    spec!(
+        ExportScrollback,
+        "terminal-export",
+        Some("cmd-shift-e"),
+        Some("⌘⇧E"),
+        Some(TERMINAL_CONTEXT),
+        "Open scrollback in editor",
+        "doc.text",
+        "terminal log export scrollback"
+    ),
+    spec!(
+        PreviousPrompt,
+        "terminal-previous-prompt",
+        Some("cmd-shift-up"),
+        Some("⌘⇧↑"),
+        Some(TERMINAL_CONTEXT),
+        "Previous shell prompt",
+        "arrow.up",
+        "terminal prompt previous"
+    ),
+    spec!(
+        NextPrompt,
+        "terminal-next-prompt",
+        Some("cmd-shift-down"),
+        Some("⌘⇧↓"),
+        Some(TERMINAL_CONTEXT),
+        "Next shell prompt",
+        "arrow.down",
+        "terminal prompt next"
+    ),
 ];
 
 pub fn command(id: CommandId) -> &'static CommandSpec {
@@ -671,6 +737,12 @@ impl CommandSpec {
             Some(Some(binding)) if Keystroke::parse(binding).is_ok() => Keystroke::parse(binding)
                 .ok()
                 .map(|key| shortcut_label_for_keystroke(&key)),
+            #[cfg(not(target_os = "macos"))]
+            _ if self.id == CommandId::DelegateSelectedSession => {
+                linux_keystroke(self.id, self.keystroke?)
+                    .and_then(|key| Keystroke::parse(&key).ok())
+                    .map(|key| shortcut_label_for_keystroke(&key))
+            }
             _ => self
                 .keystroke
                 .and_then(|binding| platform_keystroke(self.id, binding))
@@ -764,6 +836,11 @@ impl CommandSpec {
             CommandId::ResetZoom => KeyBinding::new(key, ResetZoom, context),
             CommandId::Paste => KeyBinding::new(key, Paste, context),
             CommandId::CopySelection => KeyBinding::new(key, CopySelection, context),
+            CommandId::EnterCopyMode => KeyBinding::new(key, EnterCopyMode, context),
+            CommandId::FindSelection => KeyBinding::new(key, FindSelection, context),
+            CommandId::ExportScrollback => KeyBinding::new(key, ExportScrollback, context),
+            CommandId::PreviousPrompt => KeyBinding::new(key, PreviousPrompt, context),
+            CommandId::NextPrompt => KeyBinding::new(key, NextPrompt, context),
         }
     }
 }
@@ -775,13 +852,42 @@ fn platform_keystroke(_id: CommandId, key: &str) -> Option<String> {
 
 #[cfg(not(target_os = "macos"))]
 fn platform_keystroke(id: CommandId, key: &str) -> Option<String> {
+    linux_keystroke(id, key)
+}
+
+#[cfg(any(test, not(target_os = "macos")))]
+fn linux_keystroke(id: CommandId, key: &str) -> Option<String> {
     if id == CommandId::HideApp {
         return None;
     }
-    let key = key
-        .replace("cmd-ctrl-", "ctrl-shift-")
-        .replace("cmd-", "ctrl-");
-    Some(key)
+    // Cmd-Ctrl-D would otherwise collide with the inspector's Cmd-Shift-D
+    // after translating macOS modifiers to Linux.
+    if id == CommandId::DelegateSelectedSession {
+        return Some("ctrl-alt-d".to_owned());
+    }
+    Some(linux_chord(key))
+}
+
+/// Maps a macOS `cmd-` chord onto the string `simulate_keystrokes` must send
+/// on this OS. GPUI treats `cmd` as Super on Linux; shipped bindings use Ctrl.
+#[cfg(test)]
+pub(crate) fn test_chords(spec: &str) -> String {
+    spec.split_whitespace()
+        .map(|token| {
+            if cfg!(target_os = "macos") {
+                token.to_owned()
+            } else {
+                linux_chord(token)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(any(test, not(target_os = "macos")))]
+fn linux_chord(key: &str) -> String {
+    key.replace("cmd-ctrl-", "ctrl-shift-")
+        .replace("cmd-", "ctrl-")
 }
 
 #[cfg(target_os = "macos")]
@@ -1095,6 +1201,31 @@ impl CommandId {
                 description: "Paste clipboard contents into the terminal",
                 category: Terminal,
             },
+            Self::EnterCopyMode => ShortcutMetadata {
+                title: "Keyboard copy mode",
+                description: "Select terminal output with the keyboard",
+                category: ShortcutCategory::Terminal,
+            },
+            Self::FindSelection => ShortcutMetadata {
+                title: "Find selection",
+                description: "Search for the selected terminal text",
+                category: ShortcutCategory::Terminal,
+            },
+            Self::ExportScrollback => ShortcutMetadata {
+                title: "Open scrollback in editor",
+                description: "Open retained terminal output in your text editor",
+                category: ShortcutCategory::Terminal,
+            },
+            Self::PreviousPrompt => ShortcutMetadata {
+                title: "Previous shell prompt",
+                description: "Jump to the preceding OSC 133 shell prompt",
+                category: ShortcutCategory::Terminal,
+            },
+            Self::NextPrompt => ShortcutMetadata {
+                title: "Next shell prompt",
+                description: "Jump to the following OSC 133 shell prompt",
+                category: ShortcutCategory::Terminal,
+            },
             Self::CopySelection => ShortcutMetadata {
                 title: "Copy selection",
                 description: "Copy the terminal selection",
@@ -1188,6 +1319,11 @@ impl CommandId {
             Self::ResetZoom => Box::new(ResetZoom),
             Self::Paste => Box::new(Paste),
             Self::CopySelection => Box::new(CopySelection),
+            Self::EnterCopyMode => Box::new(EnterCopyMode),
+            Self::FindSelection => Box::new(FindSelection),
+            Self::ExportScrollback => Box::new(ExportScrollback),
+            Self::PreviousPrompt => Box::new(PreviousPrompt),
+            Self::NextPrompt => Box::new(NextPrompt),
         }
     }
 }
@@ -1230,12 +1366,41 @@ mod tests {
     }
 
     #[test]
+    fn linux_default_bindings_do_not_collide() {
+        let mut bindings = HashSet::new();
+        for command in COMMANDS {
+            for key in command
+                .keystroke
+                .into_iter()
+                .chain(command.alternate_keystrokes.iter().copied())
+            {
+                let Some(key) = linux_keystroke(command.id, key) else {
+                    continue;
+                };
+                assert!(
+                    bindings.insert((command.context, key.clone())),
+                    "duplicate Linux binding for {:?}: {key}",
+                    command.id
+                );
+            }
+        }
+    }
+
+    #[test]
     fn shortcut_labels_come_from_the_bound_command() {
         let terminal = command(CommandId::NewTerminal);
         #[cfg(target_os = "macos")]
         assert_eq!(terminal.shortcut_label().as_deref(), Some("⌥⌘T"));
         #[cfg(not(target_os = "macos"))]
         assert_eq!(terminal.shortcut_label().as_deref(), Some("Ctrl+Alt+T"));
+
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(
+            command(CommandId::DelegateSelectedSession)
+                .shortcut_label_for(&ShortcutOverrides::new())
+                .as_deref(),
+            Some("Ctrl+Alt+D")
+        );
 
         let settings = command(CommandId::OpenSettings);
         #[cfg(target_os = "macos")]
@@ -1324,8 +1489,9 @@ mod tests {
     #[test]
     fn conflicts_include_alternate_bindings() {
         let overrides = ShortcutOverrides::new();
-        let conflict = shortcut_conflict(CommandId::OpenLauncher, "cmd-[", &overrides)
-            .expect("navigation alternate should be reserved");
+        let conflict =
+            shortcut_conflict(CommandId::OpenLauncher, &test_chords("cmd-["), &overrides)
+                .expect("navigation alternate should be reserved");
         assert_eq!(conflict.id, CommandId::SelectPreviousSession);
     }
 

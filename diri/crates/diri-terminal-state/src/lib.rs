@@ -24,7 +24,9 @@ use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
-use diri_proto::grid::{ChangedRow, GridCell, GridRowCodec, GridUpdate, TermColor, TermStyle};
+use diri_proto::grid::{
+    ChangedRow, GridCell, GridRowCodec, GridUpdate, LinkSpan, RowMetadata, TermColor, TermStyle,
+};
 use diri_proto::terminal::{
     MouseEncoding, MouseModes, MouseTrackingMode, TerminalMouseEvent, TerminalMouseModifiers,
     encode_mouse_event,
@@ -43,6 +45,7 @@ pub struct GridMirror {
     cursor_row: u16,
     cursor_visible: bool,
     sequence: Option<u64>,
+    annotations: Vec<RowMetadata>,
     alt_screen: bool,
     bracketed_paste: bool,
     mouse: MouseModes,
@@ -109,6 +112,16 @@ impl GridMirror {
     }
 
     fn update_metadata(&mut self, grid: &GridUpdate) {
+        if grid.is_full_snapshot {
+            self.annotations.clear();
+        }
+        self.annotations
+            .resize(usize::from(grid.rows), RowMetadata::default());
+        for row in &grid.changed_rows {
+            if let Some(target) = self.annotations.get_mut(usize::from(row.y)) {
+                target.clone_from(&row.metadata);
+            }
+        }
         self.cols = grid.cols;
         self.rows = grid.rows;
         self.cursor_col = grid.cursor_col;
@@ -151,10 +164,12 @@ impl GridMirror {
         }
         let changed_rows = (0..rows)
             .map(|row| {
-                ChangedRow::new(
+                let mut changed = ChangedRow::new(
                     row as u16,
                     self.cells[row * cols..(row + 1) * cols].to_vec(),
-                )
+                );
+                changed.metadata = self.annotations.get(row).cloned().unwrap_or_default();
+                changed
             })
             .collect();
         Some(GridUpdate {
@@ -203,7 +218,10 @@ fn validate_grid(grid: &GridUpdate) -> Result<(), MirrorError> {
         return Err(MirrorError::InvalidGrid("cursor is outside the grid"));
     }
     for row in &grid.changed_rows {
-        if row.y >= grid.rows || row.cells.len() != usize::from(grid.cols) {
+        if row.y >= grid.rows
+            || row.cells.len() != usize::from(grid.cols)
+            || !row.metadata.validate(usize::from(grid.cols))
+        {
             return Err(MirrorError::InvalidGrid(
                 "changed row is outside the grid or has the wrong width",
             ));
@@ -245,8 +263,8 @@ impl ScreenSnapshot {
 const HISTORY_CELL_BUDGET_BYTES: usize = 4 << 20;
 
 fn history_line_limit(cols: usize) -> usize {
-    let bytes_per_line = cols.max(1) * std::mem::size_of::<alacritty_terminal::term::cell::Cell>();
-    (HISTORY_CELL_BUDGET_BYTES / bytes_per_line).max(64)
+    let bytes_per_line = cols.max(1).saturating_mul(std::mem::size_of::<Cell>());
+    HISTORY_CELL_BUDGET_BYTES / bytes_per_line
 }
 
 /// Fixed screen geometry handed to the emulator.
@@ -327,6 +345,7 @@ pub struct HeadlessScreen {
     ///
     /// [`grid_update`]: HeadlessScreen::grid_update
     last_cells: Vec<GridCell>,
+    last_annotations: Vec<RowMetadata>,
     last_grid_cols: usize,
     last_grid_rows: usize,
 }
@@ -362,6 +381,7 @@ impl HeadlessScreen {
             replies: Vec::new(),
             title_changed: false,
             last_cells: Vec::new(),
+            last_annotations: Vec::new(),
             last_grid_cols: 0,
             last_grid_rows: 0,
         };
@@ -506,11 +526,34 @@ impl HeadlessScreen {
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
-        self.geometry = Geometry {
+        let geometry = Geometry {
             cols: cols.max(1),
             rows: rows.max(1),
         };
+        if self.geometry.cols == geometry.cols && self.geometry.rows == geometry.rows {
+            return;
+        }
+        let old_limit = history_line_limit(self.geometry.cols);
+        let new_limit = history_line_limit(geometry.cols);
+        // A narrower screen needs the larger row allowance before reflow to
+        // retain wrapped history. When widening, reflow first: rows may merge,
+        // and trimming beforehand would discard history that still fits.
+        if new_limit > old_limit {
+            self.term.set_options(Config {
+                scrolling_history: new_limit,
+                ..Config::default()
+            });
+        }
+        self.geometry = geometry;
         self.term.resize(self.geometry);
+        if new_limit < old_limit {
+            // set_options updates the primary history even while the alternate
+            // screen is active, and preserves the limit across terminal reset.
+            self.term.set_options(Config {
+                scrolling_history: new_limit,
+                ..Config::default()
+            });
+        }
         self.settle();
     }
 
@@ -589,6 +632,7 @@ impl HeadlessScreen {
         let force_full = full || geometry_changed;
         if geometry_changed {
             self.last_cells = vec![GridCell::BLANK; cols * rows];
+            self.last_annotations = vec![RowMetadata::default(); rows];
             self.last_grid_cols = cols;
             self.last_grid_rows = rows;
         }
@@ -602,27 +646,31 @@ impl HeadlessScreen {
                 .filter(|dirty| **dirty)
                 .count()
         };
-        let mut changed = Vec::with_capacity(candidate_count);
+        let mut changed = Vec::new();
         for y in 0..rows {
             if !force_full && !self.pending_damage_rows.get(y).copied().unwrap_or(false) {
                 continue;
             }
             let line = Line(y as i32);
             let base = y * cols;
-            let mut row = Vec::with_capacity(cols);
-            let mut row_changed = force_full;
-            for x in 0..cols {
+            let metadata = self.row_metadata(line);
+            let row = &mut self.last_cells[base..base + cols];
+            let mut row_changed = force_full || self.last_annotations[y] != metadata;
+            for (x, previous) in row.iter_mut().enumerate() {
                 let cell = wire_cell(&grid[line][Column(x)]);
-                if !row_changed && self.last_cells[base + x] != cell {
-                    row_changed = true;
-                }
-                row.push(cell);
+                row_changed |= *previous != cell;
+                *previous = cell;
             }
             if !row_changed {
                 continue;
             }
-            self.last_cells[base..base + cols].copy_from_slice(&row);
-            changed.push(ChangedRow::new(y as u16, row));
+            if changed.is_empty() {
+                changed.reserve_exact(candidate_count);
+            }
+            let mut changed_row = ChangedRow::new(y as u16, row.to_vec());
+            self.last_annotations[y].clone_from(&metadata);
+            changed_row.metadata = metadata;
+            changed.push(changed_row);
         }
         self.pending_damage_rows.fill(false);
 
@@ -652,7 +700,9 @@ impl HeadlessScreen {
             for x in 0..cols {
                 row.push(wire_cell(&grid[line][Column(x)]));
             }
-            all.push(ChangedRow::new(y as u16, row));
+            let mut changed = ChangedRow::new(y as u16, row);
+            changed.metadata = self.row_metadata(line);
+            all.push(changed);
         }
         let cursor = grid.cursor.point;
         GridUpdate {
@@ -688,6 +738,38 @@ impl HeadlessScreen {
             rows.push(row);
         }
         rows
+    }
+
+    pub fn history_metadata(&self) -> Vec<RowMetadata> {
+        let count = self.term.grid().history_size();
+        (0..count)
+            .map(|index| self.row_metadata(Line(index as i32 - count as i32)))
+            .collect()
+    }
+
+    pub fn restore_history_metadata(&mut self, rows: &[RowMetadata]) {
+        let count = self.term.grid().history_size();
+        if rows.len() != count {
+            return;
+        }
+        for (index, metadata) in rows.iter().enumerate() {
+            let line = Line(index as i32 - count as i32);
+            for link in &metadata.links {
+                let link_value = alacritty_terminal::term::cell::Hyperlink::new(
+                    None::<String>,
+                    link.uri.clone(),
+                );
+                for x in link.start..link.end {
+                    self.term.grid_mut()[line][Column(usize::from(x))]
+                        .set_hyperlink(Some(link_value.clone()));
+                }
+            }
+            for (x, text) in &metadata.graphemes {
+                for ch in text.chars() {
+                    self.term.grid_mut()[line][Column(usize::from(*x))].push_zerowidth(ch);
+                }
+            }
+        }
     }
 
     pub fn restore(
@@ -744,7 +826,7 @@ impl HeadlessScreen {
             for (x, cell) in row.cells.iter().enumerate() {
                 // The initial clear already produced true blank cells;
                 // leaving them untouched keeps sparse checkpoints cheap.
-                if *cell == GridCell::BLANK {
+                if *cell == GridCell::BLANK || cell.style.contains(TermStyle::WIDE_SPACER) {
                     continue;
                 }
                 bytes.extend_from_slice(format!("\x1b[{};{}H", row.y + 1, x + 1).as_bytes());
@@ -788,6 +870,33 @@ impl HeadlessScreen {
             .as_bytes(),
         );
         self.feed(&bytes);
+        for row in &update.changed_rows {
+            for (x, cell) in row.cells.iter().enumerate() {
+                let target = &mut self.term.grid_mut()[Line(i32::from(row.y))][Column(x)];
+                restore_semantic_flags(target, *cell);
+                if let Some(link) = row
+                    .metadata
+                    .links
+                    .iter()
+                    .find(|link| usize::from(link.start) <= x && x < usize::from(link.end))
+                {
+                    target.set_hyperlink(Some(alacritty_terminal::term::cell::Hyperlink::new(
+                        None::<String>,
+                        link.uri.clone(),
+                    )));
+                }
+                if let Some((_, text)) = row
+                    .metadata
+                    .graphemes
+                    .iter()
+                    .find(|(col, _)| usize::from(*col) == x)
+                {
+                    for ch in text.chars() {
+                        target.push_zerowidth(ch);
+                    }
+                }
+            }
+        }
         // Force the next grid_update to be a full frame: the diff baseline
         // predates the restore.
         self.last_grid_cols = 0;
@@ -881,6 +990,14 @@ impl HeadlessScreen {
             rows.push(row);
         }
         diri_proto::ReadScrollbackCellsResult {
+            metadata: (start..end)
+                .map(|index| {
+                    self.row_metadata_with_budget(
+                        Line(index as i32 - history as i32),
+                        (diri_proto::grid::MAX_GRID_METADATA_BYTES / 8) / rows.len().max(1),
+                    )
+                })
+                .collect(),
             payload: GridRowCodec::encode_rows(&rows).unwrap_or_default(),
             first_row: start as i64,
             row_count: rows.len() as i64,
@@ -889,6 +1006,57 @@ impl HeadlessScreen {
             cols: cols as i64,
             content_seq: self.content_seq,
         }
+    }
+
+    /// Export only bounded annotations. Oversized targets remain ordinary text.
+    fn row_metadata(&self, line: Line) -> RowMetadata {
+        self.row_metadata_with_budget(
+            line,
+            (diri_proto::grid::MAX_GRID_METADATA_BYTES / 8) / self.geometry.rows.max(1),
+        )
+    }
+
+    fn row_metadata_with_budget(&self, line: Line, budget: usize) -> RowMetadata {
+        let mut result = RowMetadata::default();
+        let grid = self.term.grid();
+        // Reserve enough for JSON framing, including escaping. Both a full
+        // viewport and any bounded scrollback page stay below the codec limit.
+        let mut used = 0;
+        for x in 0..self.geometry.cols {
+            let cell = &grid[line][Column(x)];
+            if let Some(link) = cell.hyperlink() {
+                let uri = link.uri();
+                if let Some(last) = result.links.last_mut()
+                    && last.end == x as u16
+                    && last.uri == uri
+                {
+                    last.end += 1;
+                } else if !uri.is_empty()
+                    && uri.len() <= diri_proto::grid::MAX_LINK_URI_BYTES
+                    && !uri.chars().any(char::is_control)
+                    && used + uri.len() + 48 <= budget
+                {
+                    used += uri.len() + 48;
+                    result.links.push(LinkSpan {
+                        start: x as u16,
+                        end: x as u16 + 1,
+                        uri: uri.to_owned(),
+                    });
+                }
+            }
+            if let Some(chars) = cell.zerowidth() {
+                let text: String = chars
+                    .iter()
+                    .copied()
+                    .filter(|ch| !ch.is_control())
+                    .collect();
+                if !text.is_empty() && text.len() <= 64 && used + text.len() + 16 <= budget {
+                    used += text.len() + 16;
+                    result.graphemes.push((x as u16, text));
+                }
+            }
+        }
+        result
     }
 
     /// The visible grid as plain text, trailing blank lines removed.
@@ -969,14 +1137,37 @@ impl HeadlessScreen {
         // FNV-1a is sufficient for change detection and much cheaper than
         // constructing SipHash state for every damaged row. Grid publication
         // still compares the actual cells, so this fingerprint never decides
-        // wire correctness.
+        // wire correctness. Style bits still belong in the digest: Cursor
+        // paints its composer caret as inverse video without changing glyphs,
+        // and those frames must advance `content_seq` or the attach pump
+        // suppresses them.
         let mut digest = 0xcbf2_9ce4_8422_2325u64;
         let mut filled = 0;
+        let mut previous_link = None;
         let grid = self.term.grid();
         let line = Line(row as i32);
         for column in 0..self.geometry.cols {
-            let character = grid[line][Column(column)].c;
+            let cell = &grid[line][Column(column)];
+            let link = cell.hyperlink();
+            if link != previous_link {
+                for byte in link.as_ref().map_or(&b""[..], |link| link.uri().as_bytes()) {
+                    digest ^= u64::from(*byte);
+                    digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+                digest ^= column as u64;
+                digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+                previous_link = link;
+            }
+            if let Some(chars) = cell.zerowidth() {
+                for ch in chars {
+                    digest ^= u64::from(*ch);
+                    digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+            let character = cell.c;
             digest ^= u64::from(character);
+            digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+            digest ^= u64::from(wire_style(cell.flags).bits());
             digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
             if character != ' ' && character != '\0' {
                 filled += 1;
@@ -1073,7 +1264,16 @@ impl HeadlessScreen {
 /// The existing Rust wire vocabulary uses `Default`/`DefaultInverted` for the
 /// two default colors, ANSI indices for 0–255, and stable protocol style bits.
 fn wire_cell(cell: &alacritty_terminal::term::cell::Cell) -> GridCell {
-    let scalar = if cell.c == '\0' { 32 } else { cell.c as u32 };
+    let scalar = if cell
+        .flags
+        .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+    {
+        0
+    } else if cell.c == '\0' {
+        32
+    } else {
+        cell.c as u32
+    };
     GridCell::new(
         scalar,
         wire_color(cell.fg),
@@ -1106,6 +1306,15 @@ fn wire_color(color: Color) -> TermColor {
 
 fn wire_style(flags: Flags) -> TermStyle {
     let mut style = TermStyle::empty();
+    if flags.contains(Flags::WRAPLINE) {
+        style |= TermStyle::SOFT_WRAP;
+    }
+    if flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+        style |= TermStyle::WIDE_SPACER;
+    }
+    if flags.contains(Flags::PROMPT_START) {
+        style |= TermStyle::PROMPT_START;
+    }
     if flags.intersects(Flags::BOLD | Flags::DIM_BOLD) {
         style |= TermStyle::BOLD;
     }
@@ -1191,6 +1400,18 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
+fn restore_semantic_flags(target: &mut Cell, source: GridCell) {
+    if source.style.contains(TermStyle::SOFT_WRAP) {
+        target.flags.insert(Flags::WRAPLINE);
+    }
+    if source.style.contains(TermStyle::PROMPT_START) {
+        target.flags.insert(Flags::PROMPT_START);
+    }
+    if source.style.contains(TermStyle::WIDE_SPACER) {
+        target.flags.insert(Flags::WIDE_CHAR_SPACER);
+    }
+}
+
 fn emulator_cell(cell: GridCell) -> Cell {
     let mut flags = Flags::empty();
     if cell.style.contains(TermStyle::BOLD) {
@@ -1214,7 +1435,7 @@ fn emulator_cell(cell: GridCell) -> Cell {
     if cell.style.contains(TermStyle::CROSSED_OUT) {
         flags.insert(Flags::STRIKEOUT);
     }
-    Cell {
+    let mut result = Cell {
         c: char::from_u32(cell.scalar)
             .filter(|_| cell.scalar != 0)
             .unwrap_or(' '),
@@ -1222,7 +1443,9 @@ fn emulator_cell(cell: GridCell) -> Cell {
         bg: emulator_color(cell.bg),
         flags,
         extra: None,
-    }
+    };
+    restore_semantic_flags(&mut result, cell);
+    result
 }
 
 fn emulator_color(color: TermColor) -> Color {
@@ -1360,6 +1583,32 @@ mod tests {
     }
 
     #[test]
+    fn a_style_only_repaint_advances_content_seq() {
+        // Cursor hides the hardware cursor and paints its composer caret as
+        // inverse video. Arrows and space then restyle cells without changing
+        // glyphs; those frames must still look like new content or the attach
+        // pump suppresses them.
+        let mut screen = HeadlessScreen::new(80, 24);
+        screen.feed(b"hello");
+        let after_text = screen.content_seq();
+        let _ = screen.grid_update(true);
+
+        screen.feed(b"\r\x1b[7mh\x1b[27m");
+        assert!(
+            screen.content_seq() > after_text,
+            "a style-only caret move must look like new content"
+        );
+        assert_eq!(screen.lines(), vec!["hello"]);
+
+        let update = screen.grid_update(false);
+        let first = &update.changed_rows[0].cells[0];
+        assert!(
+            first.style.contains(TermStyle::INVERSE),
+            "the restyled cell must reach the wire"
+        );
+    }
+
+    #[test]
     fn the_alternate_screen_is_detected() {
         let mut screen = HeadlessScreen::new(80, 24);
         assert!(!screen.is_alt_screen());
@@ -1375,6 +1624,91 @@ mod tests {
         screen.feed(b"hello\r\n");
         screen.resize(40, 10);
         assert_eq!(screen.lines(), vec!["hello"]);
+    }
+
+    #[test]
+    fn resize_keeps_history_within_the_cell_budget() {
+        for alternate in [false, true] {
+            let mut screen = HeadlessScreen::new(80, 24);
+            screen.feed("retained history\r\n".repeat(6000).as_bytes());
+            if alternate {
+                screen.feed(b"\x1b[?1049h");
+            }
+            screen.resize(320, 24);
+            if alternate {
+                screen.feed(b"\x1b[?1049l");
+            }
+            let history = screen.term.grid().history_size();
+            assert!(
+                history <= history_line_limit(320),
+                "{history} rows after widening (alternate={alternate})"
+            );
+            assert!(screen.lines().iter().any(|line| line == "retained history"));
+
+            // Narrowing permits more rows again, including after an app reset.
+            screen.resize(80, 24);
+            screen.feed(b"\x1bc");
+            screen.feed("new history\r\n".repeat(6000).as_bytes());
+            assert_eq!(screen.term.grid().history_size(), history_line_limit(80));
+        }
+    }
+
+    #[test]
+    fn history_budget_does_not_have_a_wide_terminal_exception() {
+        assert!(
+            history_line_limit(4096) * 4096 * std::mem::size_of::<Cell>()
+                <= HISTORY_CELL_BUDGET_BYTES
+        );
+    }
+
+    #[test]
+    fn incremental_grid_matches_fresh_snapshots_through_damage_and_resize() {
+        let mut screen = HeadlessScreen::new(24, 8);
+        let mut mirror = Vec::new();
+        screen.grid_update(true).apply(&mut mirror);
+        let operations: &[&[u8]] = &[
+            b"hello\r\nworld",
+            b"\x1b[1;31mcolored\x1b[0m",
+            b"\x1b[H",
+            b"\x1b[C\x1b[D",
+            b"\x1b[2J",
+            "wide: 界🙂".as_bytes(),
+            b"\x1b[?1049h",
+            b"\x1b[3;5Halternate",
+            b"\x1b[?1049l",
+            b"\x1b[2;6r\x1b[6;1H\n\n\x1b[r",
+            b"\x1b[2;1H\x1b[L",
+            b"\x1b[M",
+            b"\x1b[?2026hheld\x1b[?2026l",
+            b"\x1b[?25l",
+        ];
+        for round in 0..80 {
+            if round % 7 == 0 {
+                screen.resize(16 + round % 13, 4 + round % 8);
+            }
+            // Several feeds accumulate before each publication; byte-sized
+            // chunks also exercise escapes and UTF-8 split across PTY reads.
+            for bytes in operations.iter().cycle().skip(round).take(3) {
+                for byte in bytes.iter() {
+                    screen.feed(std::slice::from_ref(byte));
+                }
+            }
+            let update = screen.grid_update(round % 11 == 0);
+            update.apply(&mut mirror);
+            let snapshot = screen.full_snapshot();
+            let mut expected = Vec::new();
+            snapshot.apply(&mut expected);
+            assert_eq!(mirror, expected, "publication {round}");
+            assert_eq!(
+                (update.cursor_col, update.cursor_row, update.cursor_visible),
+                (
+                    snapshot.cursor_col,
+                    snapshot.cursor_row,
+                    snapshot.cursor_visible
+                )
+            );
+            assert!(screen.grid_update(false).changed_rows.is_empty());
+        }
     }
 
     #[test]
@@ -1522,5 +1856,116 @@ mod tests {
             MouseModes::new(MouseTrackingMode::Off, MouseEncoding::Sgr),
             "1006 is independent of tracking"
         );
+    }
+}
+
+#[cfg(test)]
+mod qol_tests {
+    use super::*;
+    #[test]
+    fn hyperlink_only_changes_advance_sequence_and_survive_mirror_reseed() {
+        let mut screen = HeadlessScreen::new(40, 4);
+        screen.feed(b"\x1b]8;;https://one.example\x07View PR\x1b]8;;\x07");
+        let first = screen.grid_update(true);
+        assert_eq!(
+            first.changed_rows[0].metadata.links[0].uri,
+            "https://one.example"
+        );
+        let before = screen.content_seq();
+        screen.feed(b"\r\x1b]8;;https://two.example\x07View PR\x1b]8;;\x07");
+        assert!(screen.content_seq() > before);
+        let delta = screen.grid_update(false);
+        assert_eq!(
+            delta.changed_rows[0].metadata.links[0].uri,
+            "https://two.example"
+        );
+        let mut mirror = GridMirror::new();
+        mirror
+            .apply_snapshot(1, &first, false, false, MouseModes::OFF)
+            .unwrap();
+        mirror
+            .apply_delta(2, &delta, false, false, MouseModes::OFF)
+            .unwrap();
+        assert_eq!(mirror.full_update().unwrap(), screen.full_snapshot());
+    }
+    #[test]
+    fn prompt_markers_obey_sync_erase_scrollback_and_alt_screen() {
+        let mut screen = HeadlessScreen::new(8, 2);
+        screen.feed(b"\x1b[?2026h\x1b]133;A\x07$ ");
+        assert!(
+            !screen
+                .full_snapshot()
+                .changed_rows
+                .iter()
+                .flat_map(|r| &r.cells)
+                .any(|c| c.style.contains(TermStyle::PROMPT_START))
+        );
+        screen.feed(b"\x1b[?2026l");
+        assert!(
+            screen.full_snapshot().changed_rows[0].cells[0]
+                .style
+                .contains(TermStyle::PROMPT_START)
+        );
+        screen.feed(b"\r\ncommand\r\n");
+        let history = screen.scrollback_cells(0, 10);
+        let rows = GridRowCodec::decode_rows(&history.payload, history.row_count as usize).unwrap();
+        assert!(rows[0][0].style.contains(TermStyle::PROMPT_START));
+        screen.feed(b"\x1b[?1049h\x1b]133;A\x07$ ");
+        assert!(
+            !screen
+                .full_snapshot()
+                .changed_rows
+                .iter()
+                .flat_map(|r| &r.cells)
+                .any(|c| c.style.contains(TermStyle::PROMPT_START))
+        );
+        screen.feed(b"\x1b[?1049l\x1b[H\x1b[2J");
+        assert!(
+            !screen
+                .full_snapshot()
+                .changed_rows
+                .iter()
+                .flat_map(|r| &r.cells)
+                .any(|c| c.style.contains(TermStyle::PROMPT_START))
+        );
+    }
+    #[test]
+    fn wrap_wide_glyph_and_combining_metadata_survive_restore() {
+        let mut screen = HeadlessScreen::new(6, 3);
+        screen.feed("abcdefghi\r\n界e\u{301}".as_bytes());
+        let snapshot = screen.full_snapshot();
+        assert!(
+            snapshot.changed_rows[0].cells[5]
+                .style
+                .contains(TermStyle::SOFT_WRAP)
+        );
+        assert_eq!(snapshot.changed_rows[2].cells[1].scalar, 0);
+        assert_eq!(
+            snapshot.changed_rows[2].metadata.graphemes,
+            vec![(2, "\u{301}".into())]
+        );
+        let mut restored = HeadlessScreen::new(6, 3);
+        assert!(restored.restore(&[], &snapshot, false, false, MouseModes::OFF));
+        assert_eq!(restored.full_snapshot(), snapshot);
+    }
+    #[test]
+    fn named_links_remain_available_in_history_and_after_restore() {
+        let mut screen = HeadlessScreen::new(80, 2);
+        screen.feed(b"\x1b]8;;https://example.org/pr/42\x07View PR\x1b]8;;\x07\r\nsecond\r\nthird");
+        let history = screen.scrollback_cells(0, 128);
+        assert_eq!(
+            history.metadata[0].links[0].uri,
+            "https://example.org/pr/42"
+        );
+        let mut restored = HeadlessScreen::new(80, 2);
+        assert!(restored.restore(
+            &screen.history_snapshot(),
+            &screen.full_snapshot(),
+            false,
+            false,
+            MouseModes::OFF
+        ));
+        restored.restore_history_metadata(&screen.history_metadata());
+        assert_eq!(restored.scrollback_cells(0, 128).metadata, history.metadata);
     }
 }

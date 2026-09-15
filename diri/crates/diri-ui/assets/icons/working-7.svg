@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="white" stroke-width="1.4" stroke-linecap="round">
+<path d="M 8.000 4.500 L 8.000 2.000" opacity="0.15"/>
+<path d="M 10.475 5.525 L 12.243 3.757" opacity="0.22"/>
+<path d="M 11.500 8.000 L 14.000 8.000" opacity="0.3"/>
+<path d="M 10.475 10.475 L 12.243 12.243" opacity="0.4"/>
+<path d="M 8.000 11.500 L 8.000 14.000" opacity="0.55"/>
+<path d="M 5.525 10.475 L 3.757 12.243" opacity="0.7"/>
+<path d="M 4.500 8.000 L 2.000 8.000" opacity="0.85"/>
+<path d="M 5.525 5.525 L 3.757 3.757" opacity="1"/>
+</svg>

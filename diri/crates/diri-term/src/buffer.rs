@@ -1,4 +1,4 @@
-use diri_proto::grid::{GridCell, GridUpdate};
+use diri_proto::grid::{GridCell, GridUpdate, RowMetadata};
 
 /// Cursor state carried by every daemon grid update.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -39,6 +39,7 @@ pub struct GridBuffer {
     pub cols: u16,
     pub rows: u16,
     pub cells: Vec<GridCell>,
+    pub annotations: Vec<RowMetadata>,
     pub cursor: CursorState,
     generation: u64,
     row_generations: Vec<u64>,
@@ -53,6 +54,7 @@ impl GridBuffer {
             cols,
             rows,
             cells: vec![GridCell::BLANK; usize::from(cols) * row_count],
+            annotations: vec![RowMetadata::default(); row_count],
             cursor: CursorState::default(),
             generation: 0,
             row_generations: vec![0; row_count],
@@ -178,6 +180,7 @@ impl GridBuffer {
             // Reuse the allocation: a live resize re-seeds this buffer on every
             // step of the drag, and dropping the old Vec each time hands the
             // allocator a screen's worth of churn for nothing.
+            self.annotations = vec![RowMetadata::default(); new_rows];
             self.cells.clear();
             self.cells.resize(new_cols * new_rows, GridCell::BLANK);
             self.row_generations.resize(new_rows, 0);
@@ -204,9 +207,11 @@ impl GridBuffer {
             let end = start + new_cols;
             let target = &mut self.cells[start..end];
             let copied = changed_row.cells.len().min(new_cols);
-            let differs = target[..copied] != changed_row.cells[..copied]
+            let differs = self.annotations[row] != changed_row.metadata
+                || target[..copied] != changed_row.cells[..copied]
                 || target[copied..].iter().any(|cell| *cell != GridCell::BLANK);
             if differs {
+                self.annotations[row] = changed_row.metadata;
                 target[..copied].copy_from_slice(&changed_row.cells[..copied]);
                 target[copied..].fill(GridCell::BLANK);
                 self.dirty_rows[row] = true;

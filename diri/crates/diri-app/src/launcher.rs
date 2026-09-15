@@ -50,7 +50,7 @@ const RECIPE_ROW_GROUP: &str = "recipe-row";
 /// following the caret.
 const COMPOSER_FONT_SIZE: f32 = 13.0;
 const COMPOSER_LINE_HEIGHT: f32 = 19.0;
-const COMPOSER_MIN_LINES: usize = 3;
+const COMPOSER_MIN_LINES: usize = 2;
 const COMPOSER_MAX_LINES: usize = 9;
 const COMPOSER_INSET: f32 = 8.0;
 const COMPOSER_PADDING: f32 = 16.0;
@@ -88,7 +88,6 @@ fn recipe_surface_height(recipe_count: usize, editor_open: bool, budget: f32) ->
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct LauncherSurfaceFills {
     composer: gpui::Rgba,
-    shelf: gpui::Rgba,
 }
 
 fn launcher_colors_for_theme(theme_id: &str) -> SemanticColors {
@@ -98,7 +97,6 @@ fn launcher_colors_for_theme(theme_id: &str) -> SemanticColors {
 fn launcher_surface_fills(colors: SemanticColors) -> LauncherSurfaceFills {
     LauncherSurfaceFills {
         composer: colors.floating_surface(),
-        shelf: colors.sidebar_surface(),
     }
 }
 
@@ -139,7 +137,7 @@ pub(crate) struct LauncherOverlay {
     mode: LauncherMode,
     /// The active destination draft survives a temporary handoff proposal.
     saved_new_prompt: Option<String>,
-    handoff_delivery: HandoffDeliveryState,
+    delivery: DeliveryState,
     /// Drafts containing paths validated on this Mac cannot be submitted to a
     /// remote Agent. Pure text/quotes do not carry this restriction.
     session_drafts_with_local_paths: HashSet<SessionId>,
@@ -272,15 +270,15 @@ enum LauncherMode {
     Handoff(HandoffProposal),
 }
 
-/// One acknowledged handoff at a time. Tickets prevent a late completion
+/// One acknowledged submission at a time. Tickets prevent a late completion
 /// from an old proposal from closing or annotating a newer composer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct HandoffDeliveryState {
+struct DeliveryState {
     next_ticket: u64,
     pending: Option<u64>,
 }
 
-impl HandoffDeliveryState {
+impl DeliveryState {
     fn begin(&mut self) -> Option<u64> {
         if self.pending.is_some() {
             return None;
@@ -329,6 +327,7 @@ impl LauncherOverlay {
                             .update(cx, |this, cx| {
                                 this.resume_pending_recipe_activation(cx);
                                 if this.open
+                                    && !this.delivery.is_sending()
                                     && matches!(this.target, LauncherTarget::NewSession)
                                     && matches!(this.mode, LauncherMode::NewSession)
                                     && this.active_recipe.is_none()
@@ -360,7 +359,7 @@ impl LauncherOverlay {
             session_drafts: HashMap::new(),
             mode: LauncherMode::NewSession,
             saved_new_prompt: None,
-            handoff_delivery: HandoffDeliveryState::default(),
+            delivery: DeliveryState::default(),
             session_drafts_with_local_paths: HashSet::new(),
             selected_harness,
             selected_root,
@@ -389,6 +388,12 @@ impl LauncherOverlay {
     }
 
     pub(crate) fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.delivery.is_sending() {
+            self.open = true;
+            window.focus(&self.focus, cx);
+            cx.notify();
+            return;
+        }
         self.restore_new_prompt();
         self.switch_target(LauncherTarget::NewSession);
         self.drop_notice = None;
@@ -419,7 +424,7 @@ impl LauncherOverlay {
     pub(crate) fn toggle(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.open {
             self.close(cx);
-            false
+            self.open
         } else {
             self.open(window, cx);
             true
@@ -436,6 +441,9 @@ impl LauncherOverlay {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.delivery.is_sending() {
+            return;
+        }
         self.restore_new_prompt();
         self.switch_target(LauncherTarget::NewSession);
         self.selected_root = root;
@@ -463,6 +471,9 @@ impl LauncherOverlay {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.delivery.is_sending() {
+            return;
+        }
         self.restore_new_prompt();
         self.switch_target(LauncherTarget::Session(session_id.clone()));
         self.prompt.append_context(insertion);
@@ -484,6 +495,9 @@ impl LauncherOverlay {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.delivery.is_sending() {
+            return;
+        }
         self.session_drafts_with_local_paths
             .insert(session_id.clone());
         self.open_for_session(session_id, insertion, notice, window, cx);
@@ -532,12 +546,15 @@ impl LauncherOverlay {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.delivery.is_sending() {
+            return;
+        }
         self.restore_new_prompt();
         self.saved_new_prompt = Some(self.prompt.text().to_owned());
         self.prompt.clear();
         self.prompt.insert_multiline(&proposal.summary);
         self.mode = LauncherMode::Handoff(proposal);
-        self.handoff_delivery.invalidate();
+        self.delivery.invalidate();
         self.fallback_notice = None;
         self.picker = None;
         self.open = true;
@@ -550,7 +567,9 @@ impl LauncherOverlay {
     }
 
     fn close(&mut self, cx: &mut Context<Self>) {
-        if !self.open {
+        if !self.open
+            || (self.delivery.is_sending() && matches!(self.mode, LauncherMode::Handoff(_)))
+        {
             return;
         }
         self.open = false;
@@ -570,7 +589,7 @@ impl LauncherOverlay {
         if !matches!(self.mode, LauncherMode::Handoff(_)) {
             return;
         }
-        self.handoff_delivery.invalidate();
+        self.delivery.invalidate();
         self.prompt.clear();
         if let Some(prompt) = self.saved_new_prompt.take()
             && !prompt.is_empty()
@@ -850,6 +869,7 @@ impl LauncherOverlay {
         };
         match self.resolve_recipe(&recipe) {
             Ok(resolved) if !self.preview => {
+                self.preview_recipe(&recipe);
                 self.complete_recipe_activation(resolved, cx);
             }
             Err(RecipeIssue::AgentsLoading) if !self.preview => {
@@ -899,15 +919,14 @@ impl LauncherOverlay {
         cx: &mut Context<Self>,
     ) {
         self.pending_recipe_activation = None;
-        self.services
+        let params = self
+            .services
             .store
             .store
-            .write()
-            .expect("session store lock poisoned")
-            .spawn_kind(resolved.kind, resolved.options);
-        self.new_session_draft.clear();
-        self.prompt.clear();
-        self.close(cx);
+            .read()
+            .expect("store lock")
+            .spawn_params(resolved.kind, resolved.options);
+        self.begin_submission(Some(params), cx);
     }
 
     /// Store readiness is asynchronous, but a recipe activation is not a
@@ -1341,10 +1360,19 @@ impl LauncherOverlay {
     /// `None` means it can. The submit button used to just sit there dimmed
     /// with no explanation, which reads as "broken" rather than "not yet".
     fn blocker(&self) -> Option<String> {
+        if self.delivery.is_sending() {
+            return Some(
+                if matches!(self.mode, LauncherMode::Handoff(_)) {
+                    "Sending handoff…"
+                } else if matches!(self.target, LauncherTarget::NewSession) {
+                    "Starting session… Open it from the sidebar if setup needs attention."
+                } else {
+                    "Sending prompt…"
+                }
+                .to_owned(),
+            );
+        }
         if let LauncherMode::Handoff(proposal) = &self.mode {
-            if self.handoff_delivery.is_sending() {
-                return Some("Sending handoff…".to_owned());
-            }
             let store = self
                 .services
                 .store
@@ -1408,7 +1436,10 @@ impl LauncherOverlay {
     }
 
     fn can_submit(&self) -> bool {
-        !self.preview && !self.prompt.text().trim().is_empty() && self.blocker().is_none()
+        !self.preview
+            && !self.delivery.is_sending()
+            && !self.prompt.text().trim().is_empty()
+            && self.blocker().is_none()
     }
 
     fn submit(&mut self, cx: &mut Context<Self>) -> bool {
@@ -1416,7 +1447,7 @@ impl LauncherOverlay {
             return false;
         }
         if let Some(command) = handoff_command(&self.mode, self.prompt.text()) {
-            let Some(ticket) = self.handoff_delivery.begin() else {
+            let Some(ticket) = self.delivery.begin() else {
                 return false;
             };
             self.fallback_notice = None;
@@ -1434,7 +1465,7 @@ impl LauncherOverlay {
                     Err(error) => Err(format!("handoff task stopped: {error}")),
                 };
                 let _ = this.update(cx, |this, cx| {
-                    if !this.handoff_delivery.settle(ticket) {
+                    if !this.delivery.settle(ticket) {
                         return;
                     }
                     match result {
@@ -1455,50 +1486,126 @@ impl LauncherOverlay {
             cx.notify();
             return true;
         }
+        let target = self.target.clone();
+        let spawn = if matches!(target, LauncherTarget::NewSession) {
+            let recipe = self.current_recipe("One-off launch".to_owned());
+            let Ok(resolved) = self.resolve_recipe(&recipe) else {
+                return false;
+            };
+            Some(
+                self.services
+                    .store
+                    .store
+                    .read()
+                    .expect("store lock")
+                    .spawn_params(resolved.kind, resolved.options),
+            )
+        } else {
+            None
+        };
+        self.begin_submission(spawn, cx)
+    }
+
+    fn begin_submission(
+        &mut self,
+        spawn: Option<diri_proto::SessionSpawnParams>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let target = self.target.clone();
+        let Some(ticket) = self.delivery.begin() else {
+            return false;
+        };
+        self.services
+            .store
+            .store
+            .write()
+            .expect("store lock")
+            .dismiss_action_failure();
         let prompt = self.prompt.text().trim().to_owned();
-        match &self.target {
-            LauncherTarget::NewSession => {
-                let recipe = self.current_recipe("One-off launch".to_owned());
-                let Ok(resolved) = self.resolve_recipe(&recipe) else {
-                    return false;
-                };
-                self.services
-                    .store
-                    .store
-                    .write()
-                    .expect("session store lock poisoned")
-                    .spawn_kind(resolved.kind, resolved.options);
-                self.new_session_draft.clear();
-                self.active_recipe = None;
-                self.recipe_project_edited = false;
+        let client = Arc::clone(self.services.store.client());
+        let runtime = Arc::clone(&self.services.tokio);
+        self.fallback_notice = None;
+        self.picker = None;
+        cx.spawn(async move |this, cx| {
+            let destination = target.clone();
+            let task = runtime.spawn(async move {
+                client.wait_until_connected(Duration::from_secs(5)).await?;
+                if let Some(params) = spawn {
+                    client.spawn(params).await.map(Some)
+                } else if let LauncherTarget::Session(id) = destination {
+                    client.send_text(&id, prompt, true).await.map(|()| None)
+                } else {
+                    unreachable!()
+                }
+            });
+            let result = task
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result.map_err(|error| error.to_string()));
+            let _ = this.update(cx, |this, cx| {
+                this.finish_submission(ticket, target, result, cx);
+            });
+        })
+        .detach();
+        cx.notify();
+        true
+    }
+
+    fn finish_submission(
+        &mut self,
+        ticket: u64,
+        target: LauncherTarget,
+        result: Result<Option<SessionId>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.delivery.settle(ticket) {
+            return;
+        }
+        match result {
+            Ok(created) => {
+                let mut store = self.services.store.store.write().expect("store lock");
+                if let Some(id) = created
+                    && self.open
+                {
+                    store.apply_spawn_result(id);
+                }
+                match target {
+                    LauncherTarget::NewSession => {
+                        self.new_session_draft.clear();
+                        self.active_recipe = None;
+                        self.recipe_project_edited = false;
+                    }
+                    LauncherTarget::Session(id) => {
+                        if self.open {
+                            store.select(id.clone());
+                        }
+                        self.session_drafts.remove(&id);
+                        self.session_drafts_with_local_paths.remove(&id);
+                    }
+                }
+                drop(store);
+                self.services.store.publish_local_change();
+                self.prompt.clear();
+                self.drop_notice = None;
+                self.close(cx);
             }
-            LauncherTarget::Session(id) => {
-                // Selection can attach or resume terminal state, so it belongs
-                // to explicit confirmation—not the Finder release that merely
-                // opened this draft.
+            Err(error) => {
+                let message = if error.contains("initial_prompt_delivery_failed") {
+                    "Session opened. Check its terminal before sending again. Your draft is saved."
+                } else {
+                    "Couldn’t confirm delivery. Check the session before sending again. Your draft is saved."
+                };
+                self.fallback_notice = Some(message.into());
                 self.services
                     .store
                     .store
                     .write()
-                    .expect("session store lock poisoned")
-                    .select(id.clone());
-                let _ = self
-                    .services
-                    .store
-                    .notification_action_sender()
-                    .send(SendTextCommand {
-                        session_id: id.clone(),
-                        text: prompt,
-                        submit: true,
-                    });
-                self.session_drafts.remove(id);
-                self.session_drafts_with_local_paths.remove(id);
+                    .expect("store lock")
+                    .report_prompt_delivery_failure(error);
+                self.services.store.publish_local_change();
+                cx.notify();
             }
         }
-        self.prompt.clear();
-        self.drop_notice = None;
-        self.close(cx);
-        true
     }
 
     pub(crate) fn handle_key_down(
@@ -1509,9 +1616,12 @@ impl LauncherOverlay {
     ) -> bool {
         // Submission is already explicit at this point. Freeze the editor
         // until the daemon acknowledges it so post-submit edits cannot be
-        // mistaken for content that was delivered, and Escape cannot claim to
-        // cancel bytes already in flight.
-        if self.handoff_delivery.is_sending() {
+        // mistaken for content that was delivered. Escape may reveal the
+        // workspace for Agent startup prompts; it does not cancel delivery.
+        if self.delivery.is_sending() {
+            if event.keystroke.key == "escape" {
+                self.close(cx);
+            }
             return true;
         }
         if self.handle_recipe_editor_key(event, cx) {
@@ -2809,45 +2919,82 @@ impl LauncherOverlay {
             return self.render_folder_step(colors, cx);
         }
         let can_submit = self.can_submit();
+        let ready = !self.prompt.text().trim().is_empty()
+            && self.blocker().is_none()
+            && !self.delivery.is_sending();
         let harness_open = self.picker == Some(Picker::Harness);
         let project_open = self.picker == Some(Picker::Project);
         let recipe_open = self.picker == Some(Picker::Recipe);
-        let recipe_count = self.recipes().len();
-        let text_height = composer_text_height(self.prompt.line_count());
+        let text_height = composer_text_height(self.prompt.line_count()).max(64.0);
         let composer_height = text_height + COMPOSER_CONTROLS_HEIGHT;
-        let recipe_picker_budget = recipe_picker_height(viewport_height, composer_height);
-        let recipe_picker_height = recipe_surface_height(
-            recipe_count,
+        let picker_top = 38.0 + composer_height + 8.0;
+        let recipe_height = recipe_surface_height(
+            self.recipes().len(),
             self.recipe_editor.is_some(),
-            recipe_picker_budget,
+            recipe_picker_height(viewport_height, composer_height),
         );
-        // The pickers hang off the bottom of the panel, which now moves with
-        // the composer.
-        let picker_top = TITLE_HEIGHT + TITLE_GAP + composer_height + SHELF_HEIGHT + 8.0;
-        let harness_label = self.selected_harness_label();
-        let project_label = self.selected_project_label();
         let fresh_worktree = matches!(self.selected_worktree, WorktreePolicy::Fresh { .. });
         let worktree_enabled = fresh_worktree || self.selected_host.is_none();
-        let logo = ui_agent_kind(&self.selected_harness);
-        let fills = launcher_surface_fills(colors);
-
-        // Wrapped lines are children of a scroll container so the composer's
-        // handle can scroll BY LINE to keep the caret on screen — the whole
-        // point of the rewrite. An empty prompt shows the placeholder in the
-        // same row the caret is on, so the two do not fight over the baseline.
+        let project_label = self.selected_project_label();
+        let host_label = self.host_label(self.selected_host.as_deref());
+        let project_name = project_label
+            .strip_suffix(&format!(" · {host_label}"))
+            .unwrap_or(&project_label)
+            .to_owned();
+        let branch = if fresh_worktree {
+            "New worktree".to_owned()
+        } else {
+            let store = self.services.store.store.read().expect("store lock");
+            store
+                .sessions()
+                .values()
+                .find(|session| {
+                    session.cwd == self.selected_root && session.host == self.selected_host
+                })
+                .and_then(|session| session.git_branch.clone())
+                .unwrap_or_else(|| "Current folder".to_owned())
+        };
+        let context_item = |id: &'static str, symbol: &'static str, label: String| {
+            div()
+                .id(id)
+                .min_w(px(0.0))
+                .max_w(px(220.0))
+                .h(px(30.0))
+                .px(px(6.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .rounded(px(6.0))
+                .text_size(px(12.0))
+                .text_color(colors.primary.alpha(0.9))
+                .cursor_pointer()
+                .role(Role::Button)
+                .aria_label(label.clone())
+                .hover(move |row| row.bg(colors.primary.alpha(0.06)))
+                .child(sf_symbol(symbol, 12.0, colors.secondary))
+                .child(div().min_w(px(0.0)).text_ellipsis().child(label))
+        };
         let prompt = if self.prompt.is_empty() {
             div()
+                .relative()
                 .h(px(COMPOSER_LINE_HEIGHT))
                 .flex()
                 .items_center()
                 .when(focused, |line| {
-                    line.child(div().text_color(colors.primary.alpha(0.92)).child(CARET))
+                    line.child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .w(px(1.0))
+                            .h(px(17.0))
+                            .bg(colors.primary.alpha(0.92)),
+                    )
                 })
                 .child(div().text_color(colors.tertiary).child(
                     if self.selected_harness.is_terminal() {
                         "Enter a shell command…"
                     } else {
-                        "Describe the task…"
+                        "Do anything…"
                     },
                 ))
                 .into_any_element()
@@ -2870,80 +3017,70 @@ impl LauncherOverlay {
                 .into_any_element()
         };
 
-        let panel = div()
+        div()
             .relative()
             .w(px(PANEL_WIDTH))
             .flex()
             .flex_col()
             .child(
                 div()
-                    .relative()
-                    .h(px(TITLE_HEIGHT))
+                    .mx(px(12.0))
+                    .h(px(44.0))
+                    .px(px(8.0))
+                    .pb(px(6.0))
+                    .rounded_tl(px(14.0))
+                    .rounded_tr(px(14.0))
+                    .bg(colors.primary.alpha(0.025))
                     .flex()
-                    .flex_row_reverse()
                     .items_center()
-                    .justify_between()
-                    .px(px(COMPOSER_INSET))
+                    .gap(px(10.0))
                     .child(
-                        div()
-                            .text_size(px(22.0))
-                            .font_weight(FontWeight::NORMAL)
-                            .text_color(colors.primary.alpha(0.94))
-                            .child(if self.selected_harness.is_terminal() { "Run a command" } else { "What should we work on?" }),
+                        context_item("launcher-project-button", "folder", project_name).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.toggle_picker(Picker::Project);
+                                cx.notify();
+                            }),
+                        ),
                     )
                     .child(
-                        div()
-                            .id("launcher-recipes-button")
-                            .debug_selector(|| "launcher-recipes-button".into())
-                            .h(px(28.0))
-                            .px(px(9.0))
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .rounded(px(CONTROL_RADIUS))
-                            .role(Role::Button)
-                            .aria_label("Open launch recipes")
-                            .aria_keyshortcuts("Meta+R")
-                            .cursor_pointer()
-                            .bg(if recipe_open {
-                                colors.primary.alpha(0.10)
+                        context_item(
+                            "launcher-host-button",
+                            "desktopcomputer",
+                            if self.selected_host.is_none() {
+                                "Local".into()
                             } else {
-                                colors.primary.alpha(0.0)
+                                host_label
+                            },
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_picker(Picker::Project);
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        context_item("launcher-worktree-button", "arrow.branch", branch)
+                            .aria_label(if fresh_worktree {
+                                "Use current folder"
+                            } else {
+                                "Create a new worktree"
                             })
-                            .hover(move |button| button.bg(colors.primary.alpha(0.07)))
-                            .active(move |button| button.bg(colors.primary.alpha(0.11)))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.toggle_picker(Picker::Recipe);
-                                cx.notify();
-                            }))
-                            .child(sf_symbol("square.stack.3d.up", 10.0, Palette::CLAY))
-                            .child(
-                                div()
-                                    .text_size(px(10.0))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(colors.secondary)
-                                    .child(if recipe_count == 0 {
-                                        "Recipes".to_owned()
-                                    } else {
-                                        format!("Recipes  {recipe_count}")
-                                    }),
-                            ),
+                            .when(worktree_enabled, |button| {
+                                button.on_click(cx.listener(|this, _, _, cx| {
+                                    this.toggle_worktree();
+                                    cx.notify();
+                                }))
+                            }),
                     ),
             )
             .child(
                 div()
                     .relative()
-                    .mt(px(TITLE_GAP))
-                    .mx(px(COMPOSER_INSET))
+                    .mt(px(-6.0))
                     .h(px(composer_height))
-                    .rounded(px(Radius::PANEL))
-                    .bg(fills.composer)
+                    .rounded(px(20.0))
+                    .bg(colors.primary.alpha(0.065))
                     .border_1()
-                    .border_color(if focused {
-                        Palette::CLAY.alpha(0.42)
-                    } else {
-                        colors.primary.alpha(0.09)
-                    })
+                    .border_color(colors.primary.alpha(if focused { 0.14 } else { 0.08 }))
                     .cursor_text()
                     .on_mouse_down(MouseButton::Left, {
                         let focus = self.focus.clone();
@@ -2966,321 +3103,213 @@ impl LauncherOverlay {
                             .px(px(10.0))
                             .pb(px(8.0))
                             .flex()
-                            .items_end()
+                            .items_center()
                             .justify_between()
                             .child(
                                 div()
                                     .flex()
                                     .items_center()
-                                    .gap(px(8.0))
-                                    .when(self.selected_root.is_empty(), |row| {
-                                        row.child(
-                                            div()
-                                                .id("launcher-add-project")
-                                                .h(px(CONTROL_SIZE))
-                                                .px(px(9.0))
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .gap(px(6.0))
-                                                .rounded(px(CONTROL_RADIUS))
-                                                .cursor_pointer()
-                                                .hover(move |button| {
-                                                    button.bg(Fill::subtle(colors))
-                                                })
-                                                .active(move |button| {
-                                                    button.bg(colors.primary.alpha(0.10))
-                                                })
-                                                .child(sf_symbol("plus", 11.0, colors.secondary))
-                                                .child(
-                                                    div()
-                                                        .text_size(px(10.0))
-                                                        .text_color(colors.secondary)
-                                                        .child("Choose folder"),
-                                                )
-                                                .on_click(cx.listener(|this, _, window, cx| {
-                                                    this.choose_folder(window, cx);
-                                                })),
-                                        )
-                                    })
+                                    .gap(px(3.0))
                                     .child(
                                         div()
-                                            .text_size(px(10.0))
-                                            .text_color(colors.tertiary)
-                                            .child("⇧↵  New line"),
-                                    ),
+                                            .id("launcher-recipes-button")
+                                            .debug_selector(|| "launcher-recipes-button".into())
+                                            .h(px(30.0))
+                                            .px(px(8.0))
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(9.0))
+                                            .rounded(px(8.0))
+                                            .cursor_pointer()
+                                            .role(Role::Button)
+                                            .aria_label("Open launch recipes")
+                                            .aria_keyshortcuts("Meta+R")
+                                            .hover(move |button| {
+                                                button.bg(colors.primary.alpha(0.07))
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.toggle_picker(Picker::Recipe);
+                                                cx.notify();
+                                            }))
+                                            .child(sf_symbol("plus", 15.0, colors.primary))
+                                            .child(
+                                                div()
+                                                    .text_size(px(12.0))
+                                                    .text_color(colors.secondary)
+                                                    .child("Recipes"),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("launcher-details-button")
+                                            .size(px(30.0))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded(px(8.0))
+                                            .role(Role::Button)
+                                            .aria_label("Session title and worktree options")
+                                            .cursor_pointer()
+                                            .hover(move |button| {
+                                                button.bg(colors.primary.alpha(0.07))
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.edit_launch_details(cx)
+                                            }))
+                                            .child(sf_symbol("gearshape", 12.0, colors.tertiary)),
+                                    )
+                                    .when(self.show_account_picker(), |row| {
+                                        row.child(self.account_picker_button(colors, cx))
+                                    }),
                             )
                             .child(
                                 div()
                                     .flex()
                                     .items_center()
-                                    .gap(px(7.0))
+                                    .gap(px(8.0))
                                     .child(
                                         div()
                                             .id("launcher-harness-button")
-                                            .h(px(CONTROL_SIZE))
-                                            .px(px(10.0))
+                                            .h(px(30.0))
+                                            .px(px(7.0))
                                             .flex()
                                             .items_center()
                                             .gap(px(7.0))
-                                            .rounded(px(CONTROL_RADIUS))
+                                            .rounded(px(8.0))
+                                            .role(Role::Button)
+                                            .aria_label("Choose agent")
                                             .cursor_pointer()
-                                            .text_size(px(12.0))
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(colors.secondary)
-                                            .bg(if harness_open {
-                                                colors.primary.alpha(0.10)
-                                            } else {
-                                                Fill::subtle(colors)
-                                            })
+                                            .text_size(px(13.0))
+                                            .text_color(colors.primary)
                                             .hover(move |button| {
-                                                button.bg(colors.primary.alpha(0.09))
+                                                button.bg(colors.primary.alpha(0.07))
                                             })
-                                            .active(move |button| {
-                                                button.bg(colors.primary.alpha(0.12))
-                                            })
-                                            .child(AgentLogo::new(logo, 16.0, colors).badged(false))
-                                            .child(harness_label)
-                                            .child(sf_symbol("chevron.down", 7.5, colors.tertiary))
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.toggle_picker(Picker::Harness);
                                                 cx.notify();
-                                            })),
+                                            }))
+                                            .child(self.selected_harness_label())
+                                            .child(sf_symbol("chevron.down", 9.0, colors.tertiary)),
                                     )
-                                    .when(matches!(self.selected_harness.id(), "codex" | "claude-code"), |row| row.child(self.account_picker_button(colors, cx)))
                                     .child(
                                         div()
                                             .id("launcher-submit")
-                                            .role(Role::Button)
-                                            .aria_label(if self.selected_harness.is_terminal() { "Run command" } else { "Start session" })
-                                            .h(px(CONTROL_SIZE))
-                                            .px(px(12.0))
-                                            .gap(px(7.0))
+                                            .size(px(30.0))
+                                            .rounded_full()
                                             .flex()
                                             .items_center()
                                             .justify_center()
-                                            .rounded(px(CONTROL_RADIUS))
-                                            .bg(if can_submit {
+                                            .role(Role::Button)
+                                            .aria_label(if self.selected_harness.is_terminal() {
+                                                "Run command"
+                                            } else {
+                                                "Start session"
+                                            })
+                                            .bg(if ready {
                                                 colors.primary
                                             } else {
-                                                Fill::subtle(colors)
+                                                colors.primary.alpha(0.14)
                                             })
                                             .when(can_submit, |button| {
                                                 button
                                                     .cursor_pointer()
-                                                    .hover(move |button| button.opacity(0.86))
-                                                    .active(move |button| button.opacity(0.72))
+                                                    .hover(|button| button.opacity(0.85))
+                                                    .active(|button| button.opacity(0.7))
                                                     .on_click(cx.listener(|this, _, _, cx| {
                                                         this.submit(cx);
                                                     }))
                                             })
-                                            .text_size(px(12.0))
-                                            .text_color(if can_submit {
-                                                colors.background
-                                            } else {
-                                                colors.tertiary
-                                            })
-                                            .child(if self.selected_harness.is_terminal() { "Run command" } else { "Start session" })
                                             .child(sf_symbol_weighted(
-                                                "chevron.up",
-                                                10.0,
-                                                SymbolWeight::Bold,
-                                                if can_submit {
+                                                if self.delivery.is_sending() {
+                                                    "ellipsis"
+                                                } else {
+                                                    "arrow.up"
+                                                },
+                                                13.0,
+                                                SymbolWeight::Semibold,
+                                                if ready {
                                                     colors.background
                                                 } else {
-                                                    colors.tertiary
+                                                    colors.secondary
                                                 },
                                             )),
                                     ),
                             ),
                     ),
             )
-            .child(
-                div()
-                    .relative()
-                    .mx(px(16.0))
-                    .h(px(SHELF_HEIGHT))
-                    .px(px(12.0))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .rounded_bl(px(Radius::PANEL))
-                    .rounded_br(px(Radius::PANEL))
-                    .bg(fills.shelf)
-                    .border_1()
-                    .border_color(colors.primary.alpha(0.055))
-                    .child(
-                        div()
-                            .id("launcher-project-button")
-                            .h(px(CONTROL_SIZE - 2.0))
-                            .px(px(8.0))
-                            .flex()
-                            .items_center()
-                            .gap(px(7.0))
-                            .rounded(px(CONTROL_RADIUS - 1.0))
-                            .cursor_pointer()
-                            .bg(if project_open {
-                                colors.primary.alpha(0.08)
-                            } else {
-                                colors.primary.alpha(0.0)
-                            })
-                            .hover(move |button| button.bg(colors.primary.alpha(0.08)))
-                            .active(move |button| button.bg(colors.primary.alpha(0.11)))
-                            .child(sf_symbol("folder", 11.0, colors.secondary))
-                            .child(
-                                div()
-                                    .text_size(px(12.0))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(colors.primary.alpha(0.86))
-                                    .child(project_label),
-                            )
-                            .child(sf_symbol("chevron.down", 8.0, colors.tertiary))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.toggle_picker(Picker::Project);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(4.0))
-                            .child(
-                                div()
-                                    .id("launcher-details-button")
-                                    .size(px(CONTROL_SIZE - 2.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(CONTROL_RADIUS - 1.0))
-                                    .role(Role::Button)
-                                    .aria_label("Edit recipe name, session title, and branch")
-                                    .aria_keyshortcuts("Meta+Shift+R")
-                                    .cursor_pointer()
-                                    .hover(move |button| button.bg(colors.primary.alpha(0.08)))
-                                    .active(move |button| button.bg(colors.primary.alpha(0.11)))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.edit_launch_details(cx);
-                                    }))
-                                    .child(sf_symbol(
-                                        "gearshape",
-                                        10.0,
-                                        if self.selected_title.is_some()
-                                            || matches!(
-                                                self.selected_worktree,
-                                                WorktreePolicy::Fresh { branch: Some(_) }
-                                            )
-                                        {
-                                            Palette::CLAY
-                                        } else {
-                                            colors.tertiary
-                                        },
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .id("launcher-worktree-button")
-                                    .h(px(CONTROL_SIZE - 2.0))
-                                    .px(px(8.0))
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(6.0))
-                                    .rounded(px(CONTROL_RADIUS - 1.0))
-                                    .text_size(px(10.0))
-                                    .text_color(if worktree_enabled {
-                                        colors.secondary
-                                    } else {
-                                        colors.tertiary
-                                    })
-                                    .bg(if fresh_worktree {
-                                        Palette::CLAY.alpha(0.12)
-                                    } else {
-                                        colors.primary.alpha(0.0)
-                                    })
-                                    .when(worktree_enabled, |button| {
-                                        button
-                                            .cursor_pointer()
-                                            .hover(move |button| {
-                                                button.bg(colors.primary.alpha(0.08))
-                                            })
-                                            .active(move |button| {
-                                                button.bg(colors.primary.alpha(0.11))
-                                            })
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.toggle_worktree();
-                                                cx.notify();
-                                            }))
-                                    })
-                                    .child(sf_symbol(
-                                        "point.3.filled.connected.trianglepath.dotted",
-                                        10.0,
-                                        if fresh_worktree {
-                                            Palette::CLAY
-                                        } else {
-                                            colors.tertiary
-                                        },
-                                    ))
-                                    .child(if fresh_worktree {
-                                        "New worktree"
-                                    } else {
-                                        "Current folder"
-                                    }),
-                            ),
-                    ),
-            )
-            .when(self.picker.is_none(), |panel| {
-                panel.child(self.render_recipe_shortcuts(colors, cx))
-            })
             .when_some(
-                self.picker.is_some().then(|| self.blocker().or_else(|| self.fallback_notice.clone())).flatten(),
-                |panel, message| {
+                self.fallback_notice.clone().or_else(|| {
+                    // An empty task needs only its placeholder. Real blockers remain visible.
+                    (!self.prompt.is_empty() || self.delivery.is_sending())
+                        .then(|| self.blocker())
+                        .flatten()
+                }),
+                |panel, notice| {
                     panel.child(
                         div()
                             .id("launcher-readiness-message")
-                            .mx(px(COMPOSER_INSET))
-                            .mt(px(12.0))
+                            .px(px(12.0))
+                            .mt(px(10.0))
                             .text_size(px(12.0))
-                            .line_height(px(18.0))
+                            .line_height(px(17.0))
                             .text_color(colors.secondary)
-                            .child(message),
+                            .child(notice),
                     )
                 },
             )
             .when(self.selected_harness.is_terminal(), |panel| {
                 panel.child(
-                    div().id("launcher-agent-setup").mx(px(COMPOSER_INSET)).mt(px(12.0))
-                        .flex().flex_col().gap(px(6.0))
-                        .child(div().text_size(px(12.0)).line_height(px(18.0)).text_color(colors.secondary)
-                            .child("Terminal runs shell commands. To describe a task in plain language, choose a coding agent."))
-                        .child(div().id("launcher-setup-agents").role(Role::Button)
-                            .aria_label("Set up a coding agent").text_size(px(12.0)).text_color(colors.primary)
-                            .py(px(5.0)).cursor_pointer()
-                            .hover(move |button| button.text_color(Palette::CLAY))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.open = false;
-                                this.picker = None;
-                                cx.emit(LauncherEvent::ManageAgents(this.selected_host.clone()));
-                                cx.notify();
-                            }))
-                            .child("Set up a coding agent…")),
+                    div()
+                        .id("launcher-agent-setup")
+                        .mt(px(10.0))
+                        .px(px(12.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(colors.secondary)
+                                .child("Terminal runs shell commands."),
+                        )
+                        .child(
+                            div()
+                                .id("launcher-setup-agents")
+                                .role(Role::Button)
+                                .aria_label("Set up a coding agent")
+                                .text_size(px(11.0))
+                                .text_color(colors.primary)
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.open = false;
+                                    this.picker = None;
+                                    cx.emit(LauncherEvent::ManageAgents(
+                                        this.selected_host.clone(),
+                                    ));
+                                    cx.notify();
+                                }))
+                                .child("Set up an agent…"),
+                        ),
                 )
             })
             .when(harness_open, |panel| {
                 panel.child(
                     self.floating(picker_top, cx)
-                        .right(px(COMPOSER_INSET))
+                        .right(px(0.0))
                         .child(self.render_harness_picker(colors, cx)),
                 )
             })
             .when(self.picker == Some(Picker::Account), |panel| {
-                panel.child(div().absolute().right(px(COMPOSER_INSET)).bottom(px(SHELF_HEIGHT + COMPOSER_CONTROLS_HEIGHT + 8.0))
-                    .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.stop_propagation()))
-                    .child(self.render_account_picker(colors, cx)))
+                panel.child(
+                    self.floating(picker_top, cx)
+                        .left(px(12.0))
+                        .child(self.render_account_picker(colors, cx)),
+                )
             })
             .when(project_open, |panel| {
                 panel.child(
                     self.floating(picker_top, cx)
-                        .left(px(COMPOSER_INSET))
+                        .left(px(12.0))
                         .child(self.render_project_picker(colors, cx)),
                 )
             })
@@ -3288,15 +3317,11 @@ impl LauncherOverlay {
                 panel.child(
                     div()
                         .mt(px(RECIPE_PICKER_GAP))
-                        .ml(px(COMPOSER_INSET))
-                        .w(px(PANEL_WIDTH - 2.0 * COMPOSER_INSET))
-                        .h(px(recipe_picker_height))
+                        .w_full()
+                        .h(px(recipe_height))
                         .overflow_hidden()
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                        )
-                        .child(self.render_recipe_picker(recipe_picker_height, colors, cx)),
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(self.render_recipe_picker(recipe_height, colors, cx)),
                 )
             })
             .when_some(self.drop_notice.clone(), |panel, notice| {
@@ -3304,29 +3329,14 @@ impl LauncherOverlay {
                     div()
                         .id("launcher-drop-notice")
                         .mt(px(9.0))
-                        .mx(px(COMPOSER_INSET))
-                        .px(px(9.0))
-                        .py(px(7.0))
-                        .flex()
-                        .items_start()
-                        .gap(px(7.0))
-                        .rounded(px(Radius::ROW))
-                        .bg(Ink::ATTENTION.alpha(0.08))
-                        .border_1()
-                        .border_color(Ink::ATTENTION.alpha(0.20))
-                        .child(sf_symbol("exclamationmark.triangle", 11.0, Ink::ATTENTION))
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_size(px(10.0))
-                                .line_height(px(14.0))
-                                .text_color(colors.secondary)
-                                .child(notice),
-                        ),
+                        .px(px(12.0))
+                        .text_size(px(11.0))
+                        .line_height(px(16.0))
+                        .text_color(colors.secondary)
+                        .child(notice),
                 )
-            });
-
-        panel.into_any_element()
+            })
+            .into_any_element()
     }
 
     fn render_handoff_panel(
@@ -3338,7 +3348,7 @@ impl LauncherOverlay {
         let LauncherMode::Handoff(proposal) = &self.mode else {
             unreachable!("handoff panel requires a handoff proposal");
         };
-        let sending = self.handoff_delivery.is_sending();
+        let sending = self.delivery.is_sending();
         let can_submit = self.can_submit();
         let blocker = self.blocker();
         let text_height = composer_text_height(self.prompt.line_count());
@@ -3762,11 +3772,6 @@ impl LauncherOverlay {
                     .flex()
                     .items_center()
                     .gap(px(8.0))
-                    .rounded_bl(px(Radius::PANEL))
-                    .rounded_br(px(Radius::PANEL))
-                    .bg(fills.shelf)
-                    .border_1()
-                    .border_color(colors.primary.alpha(0.055))
                     .child(AgentLogo::new(logo, 17.0, colors).badged(false))
                     .child(
                         div()
@@ -3817,6 +3822,17 @@ impl LauncherOverlay {
                         ),
                 )
             })
+            .when_some(self.fallback_notice.clone(), |panel, message| {
+                panel.child(
+                    div()
+                        .mx(px(COMPOSER_INSET))
+                        .mt(px(10.0))
+                        .text_size(px(12.0))
+                        .line_height(px(18.0))
+                        .text_color(colors.secondary)
+                        .child(message),
+                )
+            })
             .into_any_element()
     }
 
@@ -3855,8 +3871,15 @@ impl Render for LauncherOverlay {
         // Soft-wrapping needs the text system, which only exists here. Doing
         // it before the panel is built is what lets the composer size itself
         // to the prompt and scroll the caret into view.
+        let text_width = if matches!(self.target, LauncherTarget::NewSession)
+            && matches!(self.mode, LauncherMode::NewSession)
+        {
+            PANEL_WIDTH - 2.0 * COMPOSER_PADDING - 2.0
+        } else {
+            COMPOSER_TEXT_WIDTH
+        };
         self.prompt.layout(
-            px(COMPOSER_TEXT_WIDTH),
+            px(text_width),
             gpui::font(crate::fonts::ui_family()),
             px(COMPOSER_FONT_SIZE),
             window,
@@ -3868,9 +3891,8 @@ impl Render for LauncherOverlay {
             .store
             .read()
             .expect("session store lock poisoned")
-            .preferences()
-            .terminal_theme
-            .clone();
+            .theme_id()
+            .to_owned();
         let colors = launcher_colors_for_theme(&theme_id);
         let focused = self.focus.is_focused(window);
         root.size_full()
@@ -3911,11 +3933,33 @@ impl Render for LauncherOverlay {
                     .text_size(px(12.0))
                     .text_color(colors.secondary)
                     .hover(move |button| button.bg(Fill::subtle(colors)))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(|this, _, _, cx| this.close(cx)))
                     .child("Back")
                     .child(div().text_color(colors.tertiary).child("esc")),
             )
-            .child(self.render_panel(window.viewport_size().height.as_f32(), colors, focused, cx))
+            .child(
+                div()
+                    .relative()
+                    .child(self.render_panel(
+                        window.viewport_size().height.as_f32(),
+                        colors,
+                        focused,
+                        cx,
+                    ))
+                    .when(self.delivery.is_sending(), |panel| {
+                        panel.child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .occlude()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_mouse_down(MouseButton::Right, |_, _, cx| {
+                                    cx.stop_propagation()
+                                }),
+                        )
+                    }),
+            )
     }
 }
 
@@ -4117,6 +4161,84 @@ mod tests {
             #[cfg(unix)]
             daemon_startup: None,
         })
+    }
+
+    #[gpui::test]
+    fn composer_keeps_failed_drafts_and_closes_only_after_acknowledgement(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        runtime
+            .store
+            .write()
+            .expect("store")
+            .set_agent_catalog(diri_proto::AgentReadinessResult {
+                agents: vec![diri_proto::AgentReadinessItem {
+                    kind: AgentKind::CODEX,
+                    binary: "codex".into(),
+                    path: Some("/usr/bin/codex".into()),
+                    ..diri_proto::AgentReadinessItem::default()
+                }],
+                ..diri_proto::AgentReadinessResult::default()
+            });
+        let services = test_services(runtime);
+        let (launcher, cx) =
+            cx.add_window_view(move |_, cx| LauncherOverlay::new(services, false, cx));
+        launcher.update_in(cx, |launcher, window, cx| {
+            launcher.open(window, cx);
+            launcher.selected_root = "/tmp".into();
+            launcher.selected_harness = AgentKind::CODEX;
+            launcher.prompt.insert_multiline("Review the changes");
+            assert!(launcher.submit(cx));
+            assert!(launcher.open);
+            assert_eq!(launcher.prompt.text(), "Review the changes");
+            assert!(!launcher.submit(cx), "double click cannot launch twice");
+            launcher.handle_key_down(&key("escape"), window, cx);
+            launcher.open_for_session(SessionId::new("other"), "different draft", None, window, cx);
+            assert!(
+                !launcher.open,
+                "Escape reveals the workspace without cancelling delivery"
+            );
+            launcher.open(window, cx);
+            assert!(launcher.open);
+            assert_eq!(launcher.target, LauncherTarget::NewSession);
+            assert_eq!(launcher.prompt.text(), "Review the changes");
+            let ticket = launcher.delivery.pending.expect("awaiting daemon");
+            launcher.finish_submission(
+                ticket,
+                LauncherTarget::NewSession,
+                Err("test delivery failed".into()),
+                cx,
+            );
+            assert!(launcher.open);
+            assert!(launcher.can_submit());
+            assert_eq!(launcher.prompt.text(), "Review the changes");
+            assert!(
+                launcher
+                    .fallback_notice
+                    .as_deref()
+                    .unwrap()
+                    .contains("Your draft is saved")
+            );
+            assert!(launcher.submit(cx));
+            let retry = launcher.delivery.pending.unwrap();
+            launcher.finish_submission(
+                ticket,
+                LauncherTarget::NewSession,
+                Ok(Some(SessionId::new("stale"))),
+                cx,
+            );
+            assert!(
+                launcher.open,
+                "stale completion cannot erase the retry draft"
+            );
+            launcher.finish_submission(
+                retry,
+                LauncherTarget::NewSession,
+                Ok(Some(SessionId::new("created"))),
+                cx,
+            );
+            assert!(!launcher.open);
+            assert!(launcher.prompt.is_empty());
+        });
     }
 
     #[gpui::test]
@@ -4647,11 +4769,11 @@ mod tests {
 
         launcher.read_with(cx, |launcher, _| {
             assert!(
-                !launcher.open,
-                "readiness must complete the original activation"
+                launcher.open && launcher.delivery.is_sending(),
+                "readiness begins delivery; only acknowledgement can close the composer"
             );
             assert!(launcher.pending_recipe_activation.is_none());
-            assert!(launcher.prompt.is_empty());
+            assert_eq!(launcher.prompt.text(), "Review the change");
         });
     }
 
@@ -4976,6 +5098,19 @@ mod tests {
         assert!(Path::new(&repository_root).is_dir(), "fixture root exists");
         {
             let mut store = runtime.store.write().expect("store lock");
+            let mut fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+            let project_id = fixture.list.sessions[0].project_id.clone();
+            fixture
+                .list
+                .projects
+                .retain(|project| project.id == project_id);
+            fixture.list.projects[0].root.clone_from(&repository_root);
+            fixture.list.projects[0].name = "diri".into();
+            fixture.list.sessions.truncate(1);
+            fixture.list.sessions[0].cwd.clone_from(&repository_root);
+            fixture.list.sessions[0].host = None;
+            fixture.list.sessions[0].git_branch = Some("main".into());
+            store.hydrate(fixture.list);
             store.set_agent_catalog(diri_proto::AgentReadinessResult {
                 agents: vec![diri_proto::AgentReadinessItem {
                     kind: AgentKind::CODEX,
@@ -5123,7 +5258,6 @@ mod tests {
 
         assert_eq!(colors, expected);
         assert_eq!(fills.composer, expected.floating_surface());
-        assert_eq!(fills.shelf, expected.sidebar_surface());
     }
 
     #[test]
@@ -5295,8 +5429,8 @@ mod tests {
     }
 
     #[test]
-    fn handoff_delivery_accepts_one_send_and_ignores_stale_completions() {
-        let mut delivery = HandoffDeliveryState::default();
+    fn delivery_accepts_one_send_and_ignores_stale_completions() {
+        let mut delivery = DeliveryState::default();
         let first = delivery.begin().expect("first send");
         assert!(delivery.is_sending());
         assert_eq!(delivery.begin(), None, "double submit must be refused");

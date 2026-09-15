@@ -46,6 +46,7 @@ mod tests {
     fn former_platform_symbols_resolve_to_svg_icons() {
         for name in [
             "terminal",
+            "bell",
             "magnifyingglass",
             "folder",
             "gearshape",

@@ -42,8 +42,10 @@ fn main() {
     // client asks for a diff after every echo.
     let mut typing = HeadlessScreen::new(COLS, ROWS);
     let _ = typing.grid_update(true);
+    let mut alternate = false;
     let typing_time = measure(|| {
-        typing.feed(black_box(b"x\x08"));
+        alternate = !alternate;
+        typing.feed(black_box(if alternate { b"x\x08" } else { b"y\x08" }));
         black_box(typing.grid_update(false));
     });
 

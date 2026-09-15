@@ -5,6 +5,7 @@ use std::time::Duration;
 use diri_proto::control::{
     ControlMessage, JsonValue, MAX_CONTROL_LINE_BYTES, decode_line, encode_line,
 };
+use diri_proto::net::is_safe_plaintext_address;
 use diri_proto::{
     AccountCatalogResult, AccountInstallation, AccountLoginStartParams, AccountProfile,
     AccountProfileParams, AccountSetDefaultParams, AccountUpsertParams, BlobChunk, BlobHasParams,
@@ -18,7 +19,7 @@ use diri_proto::{
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 use crate::client::{CLIENT_BUILD, ClientError};
@@ -438,7 +439,16 @@ impl NodeClient {
     }
 
     async fn connect(&self) -> Result<(TcpStream, NodeHelloResult), ClientError> {
-        let address = endpoint_address(&self.config.endpoint)?;
+        let endpoint = endpoint_address(&self.config.endpoint)?;
+        let address = tokio::net::lookup_host(endpoint)
+            .await
+            .map_err(ClientError::io)?
+            .find(|address| is_safe_plaintext_address(*address))
+            .ok_or_else(|| {
+                ClientError::protocol(
+                    "node endpoint must resolve to loopback or a Tailscale address",
+                )
+            })?;
         let stream = TcpStream::connect(address).await.map_err(ClientError::io)?;
         stream.set_nodelay(true).map_err(ClientError::io)?;
         let (read, mut write) = stream.into_split();
@@ -483,24 +493,44 @@ async fn read_response<R: AsyncBufReadExt + Unpin>(
     reader: &mut R,
     expected_id: u64,
 ) -> Result<JsonValue, ClientError> {
-    let mut line = Vec::new();
-    let bytes = reader
-        .read_until(b'\n', &mut line)
-        .await
-        .map_err(ClientError::io)?;
-    if bytes == 0 {
+    let Some(line) = read_bounded_line(reader).await? else {
         return Err(ClientError::disconnected("node closed the connection"));
-    }
-    if line.len() > MAX_CONTROL_LINE_BYTES {
-        return Err(ClientError::protocol(
-            "node response exceeded the wire limit",
-        ));
-    }
+    };
     match decode_line(&line).map_err(ClientError::json)? {
         ControlMessage::Response { id, result } if id == expected_id => result.map_err(Into::into),
         other => Err(ClientError::protocol(format!(
             "unexpected node response: {other:?}"
         ))),
+    }
+}
+
+async fn read_bounded_line<R>(reader: &mut R) -> Result<Option<Vec<u8>>, ClientError>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf().await.map_err(ClientError::io)?;
+        if available.is_empty() {
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(line))
+            };
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |position| position + 1);
+        let payload = newline.unwrap_or(available.len());
+        if line.len().saturating_add(payload) > MAX_CONTROL_LINE_BYTES {
+            return Err(ClientError::protocol(format!(
+                "node response exceeds {MAX_CONTROL_LINE_BYTES} bytes"
+            )));
+        }
+        line.extend_from_slice(&available[..payload]);
+        reader.consume(consumed);
+        if newline.is_some() {
+            return Ok(Some(line));
+        }
     }
 }
 
@@ -578,6 +608,16 @@ fn random_lease_id() -> Result<String, ClientError> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn oversized_node_response_is_rejected_during_the_read() {
+        let bytes = vec![b'x'; MAX_CONTROL_LINE_BYTES + 1];
+        let mut reader = BufReader::new(bytes.as_slice());
+        let error = read_bounded_line(&mut reader)
+            .await
+            .expect_err("must reject");
+        assert!(error.to_string().contains("exceeds"));
+    }
+
     #[test]
     fn token_files_accept_plain_or_explicit_json_but_not_short_values() {
         let token = "a".repeat(64);
@@ -634,5 +674,17 @@ mod tests {
             "100.64.0.2:7337"
         );
         assert!(endpoint_address("https://example.com").is_err());
+    }
+
+    #[tokio::test]
+    async fn client_refuses_to_send_a_bearer_to_a_lan_address() {
+        let client = NodeClient::new(NodeClientConfig {
+            endpoint: "192.168.1.20:7337".into(),
+            token: "a".repeat(64),
+            expected_node_id: None,
+            build: "test".into(),
+        });
+        let error = client.hello().await.expect_err("LAN must be refused");
+        assert!(error.to_string().contains("loopback or a Tailscale"));
     }
 }

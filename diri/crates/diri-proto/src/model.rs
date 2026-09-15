@@ -482,6 +482,8 @@ pub enum TitleSource {
     AgentProvided,
     DirijorAssigned,
     UserRename,
+    /// A provisional title extracted from terminal output, below native names.
+    TerminalTitle,
     Unknown,
 }
 
@@ -496,6 +498,7 @@ impl Serialize for TitleSource {
             Self::AgentProvided => 2,
             Self::DirijorAssigned => 3,
             Self::UserRename => 4,
+            Self::TerminalTitle => 5,
             Self::Unknown => -1,
         })
     }
@@ -512,6 +515,7 @@ impl<'de> Deserialize<'de> for TitleSource {
             2 => Self::AgentProvided,
             3 => Self::DirijorAssigned,
             4 => Self::UserRename,
+            5 => Self::TerminalTitle,
             _ => Self::Unknown,
         })
     }
@@ -741,6 +745,9 @@ pub struct ActivityEntry {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRecord {
+    /// Versioned Engine-owned attention identities; display text is never identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_state: Option<crate::attention::AttentionState>,
     /// Immutable launch binding: later catalog edits do not retarget resume or fork.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_profile: Option<crate::AgentAccountProfile>,
@@ -825,6 +832,25 @@ impl SessionRecord {
     }
 
     pub fn attention(&self) -> AttentionLevel {
+        // A shell's Starting/Working status describes process liveness, not
+        // an Agent turn. It has no completion event to clear an activity mark.
+        // A detected foreground Agent still uses the normal attention rules.
+        if self.effective_kind() == &AgentKind::SHELL
+            && matches!(
+                self.status,
+                SessionStatus::Starting | SessionStatus::Working | SessionStatus::Idle
+            )
+        {
+            return AttentionLevel::None;
+        }
+        if !matches!(self.status, SessionStatus::Exited(_))
+            && self.attention_state.as_ref().is_some_and(|state| {
+                state.version == crate::attention::ATTENTION_VERSION
+                    && state.active_requests().any(|event| event.blocking)
+            })
+        {
+            return AttentionLevel::NeedsInput;
+        }
         match self.status {
             SessionStatus::NeedsInput(_) => AttentionLevel::NeedsInput,
             SessionStatus::Working | SessionStatus::Starting => AttentionLevel::Working,

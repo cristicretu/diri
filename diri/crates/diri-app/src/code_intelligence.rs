@@ -27,6 +27,21 @@ const MAX_SYMBOL_BYTES: u64 = 256 * 1024;
 const MAX_SYMBOL_INDEX_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_SYMBOLS_PER_FILE: usize = 256;
 
+/// Prepare an explicitly activated local terminal file for the system opener.
+/// Unlike source browsing, this permits files outside the workspace and does
+/// not read their contents. The caller must establish that the session is local.
+pub(crate) fn local_reference_url(cwd: &Path, reference: &str) -> Option<url::Url> {
+    let parsed = parse_reference_fragment(reference)?;
+    let path = if let Ok(relative) = parsed.path.strip_prefix("~") {
+        PathBuf::from(std::env::var_os("HOME")?).join(relative)
+    } else if parsed.path.is_absolute() {
+        parsed.path
+    } else {
+        cwd.join(parsed.path)
+    };
+    url::Url::from_file_path(path).ok()
+}
+
 const IGNORED_DIRECTORIES: &[&str] = &[
     ".git",
     ".hg",
@@ -175,7 +190,7 @@ impl CodeIntelligence {
             return Vec::new();
         }
 
-        let query = query.trim();
+        let (query, target) = parse_colon_target(query.trim());
         let mut results = Vec::new();
         let index = self.index();
         for file in &index.files {
@@ -188,14 +203,14 @@ impl CodeIntelligence {
                 results.push(SearchHit {
                     relative_path: file.relative_path.clone(),
                     kind: SearchHitKind::File,
-                    line: None,
+                    line: target.map(|target| target.line),
                     preview: file.display_path.clone(),
                     score,
                 });
             }
         }
 
-        if !query.is_empty() {
+        if !query.is_empty() && target.is_none() {
             for symbol in &index.symbols {
                 let Some(mut score) = fuzzy_score(query, &symbol.name) else {
                     continue;
@@ -228,6 +243,138 @@ impl CodeIntelligence {
                 .then_with(|| left.kind.cmp(&right.kind))
         });
         results.truncate(limit);
+        results
+    }
+
+    /// Read one directory on a worker. Never traverse a symlink outside the root.
+    pub fn directory_entries(
+        &self,
+        relative: &Path,
+    ) -> Result<Vec<DirectoryEntry>, CodeIntelligenceError> {
+        let requested = self.workspace_root.join(relative);
+        let directory =
+            fs::canonicalize(&requested).map_err(|error| CodeIntelligenceError::Io {
+                path: relative.to_path_buf(),
+                operation: "read directory",
+                message: error.to_string(),
+            })?;
+        if !directory.starts_with(&self.workspace_root) {
+            return Err(CodeIntelligenceError::OutsideWorkspace { path: directory });
+        }
+        let entries = fs::read_dir(&directory).map_err(|error| CodeIntelligenceError::Io {
+            path: relative.to_path_buf(),
+            operation: "read directory",
+            message: error.to_string(),
+        })?;
+        let mut result = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| CodeIntelligenceError::Io {
+                path: relative.to_path_buf(),
+                operation: "read directory",
+                message: error.to_string(),
+            })?;
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            // Symlink targets must pass the same containment boundary as source opens.
+            let is_dir = if kind.is_symlink() {
+                let Ok(target) = entry.path().canonicalize() else {
+                    continue;
+                };
+                if !target.starts_with(&self.workspace_root) || target.is_dir() {
+                    continue;
+                }
+                false
+            } else {
+                kind.is_dir()
+            };
+            if !is_dir && !entry.path().is_file() {
+                continue;
+            }
+            result.push(DirectoryEntry {
+                relative_path: relative.join(entry.file_name()),
+                is_dir,
+            });
+        }
+        result.sort_by(|a, b| {
+            b.is_dir
+                .cmp(&a.is_dir)
+                .then_with(|| {
+                    a.relative_path
+                        .to_string_lossy()
+                        .to_lowercase()
+                        .cmp(&b.relative_path.to_string_lossy().to_lowercase())
+                })
+                .then_with(|| a.relative_path.cmp(&b.relative_path))
+        });
+        Ok(result)
+    }
+
+    /// Literal, smart-case workspace text search. Uses the ignore-aware file
+    /// index and bounded reads; callers can cancel obsolete queries between files.
+    pub fn search_content(
+        &self,
+        query: &str,
+        limit: usize,
+        cancelled: impl Fn() -> bool,
+    ) -> Vec<SearchHit> {
+        if query.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let case_sensitive = query.chars().any(char::is_uppercase);
+        let needle = if case_sensitive {
+            query.to_owned()
+        } else {
+            query.to_lowercase()
+        };
+        let mut results = Vec::new();
+        let mut remaining = MAX_SYMBOL_INDEX_BYTES;
+        for file in &self.index().files {
+            if cancelled() || remaining == 0 {
+                break;
+            }
+            let Ok((absolute_path, _)) =
+                self.resolve_workspace_file(&self.workspace_root.join(&file.relative_path))
+            else {
+                continue;
+            };
+            let Ok(metadata) = fs::metadata(&absolute_path) else {
+                continue;
+            };
+            if metadata.len() > MAX_SOURCE_BYTES || metadata.len() > remaining {
+                continue;
+            }
+            remaining = remaining.saturating_sub(metadata.len());
+            let Ok(source) = self.load_resolved(ResolvedReference {
+                absolute_path,
+                relative_path: file.relative_path.clone(),
+                target: None,
+            }) else {
+                continue;
+            };
+            for (index, line) in source.text.lines().enumerate() {
+                let matches = if case_sensitive {
+                    line.contains(&needle)
+                } else {
+                    line.to_lowercase().contains(&needle)
+                };
+                if matches {
+                    results.push(SearchHit {
+                        relative_path: file.relative_path.clone(),
+                        kind: SearchHitKind::Content,
+                        line: Some(index + 1),
+                        preview: excerpt(line.trim(), 180),
+                        score: 0,
+                    });
+                    if results.len() >= limit {
+                        return results;
+                    }
+                }
+            }
+        }
         results
     }
 
@@ -328,6 +475,12 @@ impl CodeIntelligence {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryEntry {
+    pub relative_path: PathBuf,
+    pub is_dir: bool,
+}
+
 #[derive(Clone, Debug)]
 struct WorkspaceIndex {
     files: Vec<IndexedFile>,
@@ -390,6 +543,7 @@ pub struct SearchHit {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SearchHitKind {
+    Content,
     Symbol,
     File,
 }
@@ -1221,6 +1375,34 @@ mod tests {
     use super::*;
     use std::process::Command;
 
+    #[test]
+    fn local_terminal_links_resolve_without_workspace_or_source_file_restrictions() {
+        let cwd = Path::new("/tmp/workspace");
+        for (reference, expected) in [
+            ("../preview.html", "file:///tmp/workspace/../preview.html"),
+            ("/tmp/preview.png:9", "file:///tmp/preview.png"),
+            ("src/main.rs(42,7)", "file:///tmp/workspace/src/main.rs"),
+            (
+                "file://localhost/tmp/preview%20image.png#L2",
+                "file:///tmp/preview%20image.png",
+            ),
+            ("/tmp/preview #1.html", "file:///tmp/preview%20%231.html"),
+        ] {
+            assert_eq!(
+                local_reference_url(cwd, reference).unwrap().as_str(),
+                expected
+            );
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            assert_eq!(
+                local_reference_url(cwd, "~/Desktop/preview.png"),
+                url::Url::from_file_path(PathBuf::from(home).join("Desktop/preview.png")).ok(),
+            );
+        }
+        assert!(local_reference_url(cwd, "file://another-host/tmp/image.png").is_none());
+        assert!(local_reference_url(cwd, "file:///tmp/bad%XX.png").is_none());
+    }
+
     fn write(path: &Path, contents: impl AsRef<[u8]>) {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).unwrap();
@@ -1232,6 +1414,80 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         fs::create_dir(temporary.path().join(".git")).unwrap();
         temporary
+    }
+
+    #[test]
+    fn explorer_lists_folders_first_including_empty_and_hidden_entries() {
+        let workspace = workspace();
+        fs::create_dir(workspace.path().join("z_empty")).unwrap();
+        fs::create_dir(workspace.path().join("src")).unwrap();
+        write(&workspace.path().join("a.rs"), "fn main() {}\n");
+        write(&workspace.path().join(".env.example"), "KEY=example\n");
+        let intelligence = CodeIntelligence::for_session(workspace.path()).unwrap();
+        let entries = intelligence.directory_entries(Path::new("")).unwrap();
+        let names: Vec<_> = entries
+            .iter()
+            .map(|entry| entry.relative_path.to_string_lossy())
+            .collect();
+        assert_eq!(names, ["src", "z_empty", ".env.example", "a.rs"]);
+        assert!(entries[0].is_dir && entries[1].is_dir && !entries[2].is_dir);
+        assert!(
+            intelligence
+                .directory_entries(Path::new("z_empty"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            intelligence.directory_entries(Path::new("..")),
+            Err(CodeIntelligenceError::OutsideWorkspace { .. })
+        ));
+        #[cfg(unix)]
+        {
+            let external = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(external.path(), workspace.path().join("escape")).unwrap();
+            assert!(matches!(
+                intelligence.directory_entries(Path::new("escape")),
+                Err(CodeIntelligenceError::OutsideWorkspace { .. })
+            ));
+            assert!(
+                !intelligence
+                    .directory_entries(Path::new(""))
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry.relative_path == Path::new("escape"))
+            );
+        }
+    }
+
+    #[test]
+    fn text_search_is_literal_smart_case_bounded_and_cancellable() {
+        let workspace = workspace();
+        write(
+            &workspace.path().join("src/file.rs"),
+            "// café Result<T>\n// CAFÉ result<t>\nlet value = 3;\n",
+        );
+        write(
+            &workspace.path().join("node_modules/ignored.js"),
+            "Result<T>",
+        );
+        write(&workspace.path().join("binary.dat"), b"Result<T>\0");
+        let intelligence = CodeIntelligence::for_session(workspace.path()).unwrap();
+        let matches = intelligence.search_content("result<t>", 20, || false);
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].line, Some(1));
+        assert_eq!(matches[1].line, Some(2));
+        assert_eq!(
+            intelligence.search_content("Result<T>", 20, || false).len(),
+            1
+        );
+        assert_eq!(intelligence.search_content("café", 20, || false).len(), 2);
+        assert_eq!(intelligence.search_content("result", 1, || false).len(), 1);
+        assert!(
+            intelligence
+                .search_content("result", 20, || true)
+                .is_empty()
+        );
+        assert!(intelligence.search_content("", 20, || false).is_empty());
     }
 
     #[test]
@@ -1363,6 +1619,9 @@ mod tests {
             Path::new("src/code_intelligence.rs")
         );
 
+        let location = intelligence.search("code_intelligence.rs:42", 10);
+        assert_eq!(location[0].line, Some(42));
+        assert_eq!(location[0].kind, SearchHitKind::File);
         let function = intelligence.search("render_viewer", 10);
         assert_eq!(function[0].kind, SearchHitKind::Symbol);
         assert_eq!(function[0].line, Some(2));

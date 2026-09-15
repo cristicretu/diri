@@ -1,34 +1,43 @@
 # Support
 
-Use [GitHub Discussions](https://github.com/cristicretu/diri/discussions) for
-setup questions, workflows, and ideas that are not yet concrete bug reports.
-Use [Issues](https://github.com/cristicretu/diri/issues) for reproducible bugs
-and scoped feature requests.
+[Discussions](https://github.com/cristicretu/diri/discussions) is for setup
+questions and workflows. Use a
+[bug report](https://github.com/cristicretu/diri/issues/new?template=bug_report.yml)
+for something broken or a
+[feature request](https://github.com/cristicretu/diri/issues/new?template=feature_request.yml)
+for a concrete improvement. Report vulnerabilities [privately](SECURITY.md).
 
-Before reporting a bug, check the latest release. In the app, open **Settings →
-General → Support → Copy diagnostics**, preview the exact report, and then copy
-it into the issue. The report is deliberately limited to app/platform/daemon
-metadata, agent availability, remote-host ids and reachability state, and
-storage reachability. Review it before posting publicly anyway.
+## Report a bug
 
-If the app will not open or the action is unavailable, run `dirijor doctor`
-when the CLI is on `PATH`. Include the Diri version, macOS version and chip, the
-agent involved, reproduction steps, and the smallest useful log excerpt.
+Check for an existing issue and try the latest release when possible. Include:
 
-Logs under `~/Library/Application Support/Dirijor` may contain prompt text,
-command output, repository paths, or secrets printed by a process. Redact them
-before posting publicly.
+- Steps to reproduce, expected behavior, and what actually happens.
+- Diri version, OS version, and installation method.
+- Agent CLI version and local or SSH host, if relevant.
 
-## Status debug info
+On macOS, include your chip. For Linux rendering problems, include the display
+server, desktop environment, GPU, and driver; see the
+[Linux troubleshooting guide](diri/LINUX.md#troubleshooting-graphics-and-display-startup).
 
-If an agent is shown as working, waiting, done, or unknown at the wrong time,
-open **Session Inspector → Info → Why Diri thinks this**. The disclosure shows
-the structured authority, manifest/rule id, timing guards, and fallback reason;
-it never includes a screen capture or prompt. Use **Copy status debug info** for
-a bounded snippet suitable for an issue.
+## Collect diagnostics
 
-User-provided manifest identifiers are validated at the copy boundary. Invalid
-or path-like ids are omitted instead of being redacted after the fact.
+Open **Settings → General → Support → Copy diagnostics**, review the report,
+and paste it into the issue. It includes app, platform, and Engine metadata;
+agent availability; remote-host identifiers and reachability; and storage
+reachability. It does not include raw logs.
 
-Report security issues privately as described in [SECURITY.md](SECURITY.md),
-not through Discussions or a public issue.
+If the app will not open, run `dirijor doctor` when the CLI is on `PATH`.
+For incorrect session status, use **Session Inspector → Info → Why Diri thinks
+this → Copy status debug info**. This gives the detection rule and timing
+context without a screen capture or prompt.
+
+Raw logs are an optional fallback:
+
+| Platform | Default Engine log |
+| :--- | :--- |
+| macOS | `~/Library/Application Support/Dirijor/logs/dirijord.log` |
+| Linux | `~/.local/state/diri/logs/dirijord.log` |
+
+Linux paths follow `XDG_STATE_HOME` when set. Logs and screenshots can contain
+prompts, command output, personal paths, and credentials. Share only relevant
+excerpts and redact private content before posting.

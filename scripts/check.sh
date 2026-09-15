@@ -30,6 +30,7 @@ echo "==> Shell and release publishing guards"
 bash -n "${root}"/scripts/*.sh "${root}"/diri/scripts/*.sh
 bash "${root}/diri/scripts/test-publish-github-release.sh"
 bash "${root}/diri/scripts/test-publish-homebrew-cask.sh"
+python3 "${root}/ios/scripts/test-prepare-simulator.py"
 
 echo "==> Rust workspace"
 (

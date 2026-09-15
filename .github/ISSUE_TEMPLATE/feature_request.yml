@@ -1,0 +1,28 @@
+name: Feature request
+description: Propose a focused improvement to Diri.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Describe the workflow you want to improve. For early ideas or setup
+        questions, use [Discussions](https://github.com/cristicretu/diri/discussions).
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and where does Diri get in the way?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Describe the smallest change that would help.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Current workaround
+      description: How do you handle this today? Include alternatives you considered.

@@ -15,6 +15,7 @@ use diri_proto::remote_pty::{
 };
 
 use super::binding::RemoteBindingStore;
+use super::bootstrap::RemoteTarget;
 use super::effect::{EffectOutcome, EffectWriteError, write_at_most_once};
 use super::manager::{InstalledHelper, RemoteManager};
 
@@ -262,7 +263,7 @@ impl RemoteSessionClient {
             &mut writer,
             &RemoteMessage::Signal(Signal {
                 controller_epoch: epoch,
-                signal,
+                signal: remote_signal(self.helper.target, signal)?,
             }),
         )
         .map_err(Into::into)
@@ -469,6 +470,29 @@ fn require_generation(writer: &WriterState, generation: u64) -> io::Result<()> {
     }
 }
 
+fn remote_signal(target: RemoteTarget, signal: i32) -> io::Result<i32> {
+    // Existing holders interpret signal numbers using their own operating system.
+    match signal {
+        libc::SIGCONT => Ok(match target {
+            RemoteTarget::LinuxX86_64 | RemoteTarget::LinuxAarch64 => 18,
+            RemoteTarget::MacosAarch64 => 19,
+        }),
+        libc::SIGSTOP => Ok(match target {
+            RemoteTarget::LinuxX86_64 | RemoteTarget::LinuxAarch64 => 19,
+            RemoteTarget::MacosAarch64 => 17,
+        }),
+        libc::SIGHUP => Ok(1),
+        libc::SIGINT => Ok(2),
+        libc::SIGQUIT => Ok(3),
+        libc::SIGKILL => Ok(9),
+        libc::SIGTERM => Ok(15),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unsupported remote signal",
+        )),
+    }
+}
+
 fn terminate_current(writer: &mut WriterState) {
     writer.input.take();
     if let Some(mut child) = writer.child.take() {
@@ -497,6 +521,43 @@ mod tests {
     use diri_proto::frames::FrameType;
 
     use super::*;
+
+    #[test]
+    fn unsupported_signals_are_rejected_before_delivery() {
+        for target in RemoteTarget::ALL {
+            for signal in [0, -1, libc::SIGUSR1, libc::SIGUSR2, libc::SIGCHLD] {
+                assert_eq!(
+                    remote_signal(target, signal).unwrap_err().kind(),
+                    io::ErrorKind::InvalidInput
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn signals_use_the_receiving_operating_system_numbers() {
+        for (target, stop, resume) in [
+            (RemoteTarget::LinuxX86_64, 19, 18),
+            (RemoteTarget::LinuxAarch64, 19, 18),
+            (RemoteTarget::MacosAarch64, 17, 19),
+        ] {
+            for (native, expected) in [
+                (libc::SIGCONT, resume),
+                (libc::SIGSTOP, stop),
+                (libc::SIGINT, 2),
+                (libc::SIGTERM, 15),
+                (libc::SIGKILL, 9),
+                (libc::SIGHUP, 1),
+                (libc::SIGQUIT, 3),
+            ] {
+                assert_eq!(
+                    remote_signal(target, native).unwrap(),
+                    expected,
+                    "native signal {native} for {target:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn mouse_input_falls_back_for_live_protocol_1_3_holders() {

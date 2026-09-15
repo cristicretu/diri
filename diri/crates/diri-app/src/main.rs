@@ -29,6 +29,7 @@ pub mod navigation;
 mod notification_feed;
 pub mod notifications;
 pub mod palette;
+mod palette_chrome;
 mod phone_access;
 mod platform;
 pub mod query_editor;
@@ -38,6 +39,7 @@ mod recovery;
 pub mod review_prompt;
 pub mod root;
 pub mod seam;
+mod session_presentation;
 mod session_surfaces;
 pub mod settings;
 pub mod sidebar;
@@ -83,7 +85,8 @@ use crate::commands::{
 use crate::store::{StoreRuntime, WindowMode, WindowPlacement};
 use crate::updates::UpdateHandle;
 use crate::usage::{
-    TranscriptInvalidation, TranscriptWatcher, UsageSnapshot, UsageStore, merge_fleet_usage,
+    CursorBatch, CursorRefresh, TranscriptInvalidation, TranscriptWatcher, UsageSnapshot,
+    UsageStore, merge_fleet_usage,
 };
 
 pub mod store;
@@ -173,6 +176,11 @@ pub(crate) struct AppServices {
 
 fn main() {
     #[cfg(all(target_os = "macos", debug_assertions))]
+    if std::env::var_os("DIRI_NATIVE_MENU_SMOKE").is_some() {
+        macos::menu_bar::smoke_test();
+        return;
+    }
+    #[cfg(all(target_os = "macos", debug_assertions))]
     if std::env::var_os("DIRI_NATIVE_BROWSER_SMOKE").is_some() {
         macos::browser::smoke_test();
         return;
@@ -261,73 +269,13 @@ fn main() {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         tokio.spawn(async move {
-            let mut store = UsageStore::new();
-            let roots = store.watch_roots();
-            let Some(returned_store) =
-                publish_usage_refresh(store, &usage_tx, None, &usage_home).await
-            else {
-                return;
-            };
-            store = returned_store;
-            let mut watcher = TranscriptWatcher::new(&roots).ok();
-            let mut invalidated = HashSet::<PathBuf>::new();
-            let mut reconcile = false;
-            let mut refresh_due: Option<tokio::time::Instant> = None;
-            let mut reconciliation = tokio::time::interval(USAGE_RECONCILE_INTERVAL);
-            reconciliation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            reconciliation.tick().await; // initial full refresh already completed above
-            loop {
-                tokio::select! {
-                    event = async {
-                        match watcher.as_mut() {
-                            Some(watcher) => watcher.recv().await,
-                            None => std::future::pending().await,
-                        }
-                    } => {
-                        match event {
-                            Some(TranscriptInvalidation::Paths(paths)) => {
-                                invalidated.extend(paths);
-                            }
-                            Some(TranscriptInvalidation::Reconcile) | None => {
-                                reconcile = true;
-                            }
-                        }
-                        refresh_due = Some(tokio::time::Instant::now() + USAGE_REFRESH_DEBOUNCE);
-                    }
-                    _ = async {
-                        if let Some(deadline) = refresh_due {
-                            tokio::time::sleep_until(deadline).await;
-                        } else {
-                            std::future::pending().await
-                        }
-                    } => {
-                        refresh_due = None;
-                        let paths = (!reconcile).then(|| invalidated.drain().collect::<Vec<_>>());
-                        invalidated.clear();
-                        reconcile = false;
-                        let Some(returned_store) =
-                            publish_usage_refresh(store, &usage_tx, paths, &usage_home).await
-                        else {
-                            return;
-                        };
-                        store = returned_store;
-                    }
-                    _ = reconciliation.tick() => {
-                        // FSEvents can coalesce/drop events. A rare reconciliation
-                        // preserves correctness without tying a recursive walk to
-                        // every session status/resource update.
-                        let Some(returned_store) =
-                            publish_usage_refresh(store, &usage_tx, None, &usage_home).await
-                        else {
-                            return;
-                        };
-                        store = returned_store;
-                        invalidated.clear();
-                        reconcile = false;
-                        refresh_due = None;
-                    }
-                }
-            }
+            run_usage_updates(
+                UsageStore::new(),
+                usage_tx,
+                usage_home,
+                CursorRefresh::default(),
+            )
+            .await;
         });
     }
     let (usage_limits_refresh, mut limits_requests) = tokio::sync::mpsc::channel(1);
@@ -484,6 +432,114 @@ fn main() {
     });
 }
 
+async fn run_usage_updates(
+    mut store: UsageStore,
+    usage_tx: tokio::sync::watch::Sender<UsageSnapshot>,
+    usage_home: PathBuf,
+    mut cursor: CursorRefresh,
+) {
+    cursor.start(&usage_home, store.cursor_fetch_window());
+    let mut cursor_interval = tokio::time::interval(Duration::from_secs(60));
+    cursor_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    cursor_interval.tick().await;
+    let mut reconciliation = tokio::time::interval(USAGE_RECONCILE_INTERVAL);
+    reconciliation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    reconciliation.tick().await; // initial full refresh follows below
+    let roots = store.watch_roots();
+    let Some(returned_store) = publish_usage_refresh(store, &usage_tx, None, &usage_home).await
+    else {
+        return;
+    };
+    store = returned_store;
+    let mut watcher = TranscriptWatcher::new(&roots).ok();
+    let mut invalidated = HashSet::<PathBuf>::new();
+    let mut reconcile = false;
+    let mut refresh_due: Option<tokio::time::Instant> = None;
+    loop {
+        tokio::select! {
+            _ = cursor_interval.tick() => {
+                cursor.start(&usage_home, store.cursor_fetch_window());
+            }
+            result = cursor.next() => {
+                if let Ok(batch) = result {
+                    let Some(returned_store) = publish_cursor_batch(store, batch, &usage_tx).await else {
+                        return;
+                    };
+                    store = returned_store;
+                }
+            }
+            event = async {
+                match watcher.as_mut() {
+                    Some(watcher) => watcher.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match event {
+                    Some(TranscriptInvalidation::Paths(paths)) => {
+                        invalidated.extend(paths);
+                    }
+                    Some(TranscriptInvalidation::Reconcile) | None => {
+                        reconcile = true;
+                    }
+                }
+                refresh_due = Some(tokio::time::Instant::now() + USAGE_REFRESH_DEBOUNCE);
+            }
+            _ = async {
+                if let Some(deadline) = refresh_due {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                refresh_due = None;
+                let paths = (!reconcile).then(|| invalidated.drain().collect::<Vec<_>>());
+                invalidated.clear();
+                reconcile = false;
+                let Some(returned_store) =
+                    publish_usage_refresh(store, &usage_tx, paths, &usage_home).await
+                else {
+                    return;
+                };
+                store = returned_store;
+            }
+            _ = reconciliation.tick() => {
+                // FSEvents can coalesce/drop events. A rare reconciliation
+                // preserves correctness without tying a recursive walk to
+                // every session status/resource update.
+                let Some(returned_store) =
+                    publish_usage_refresh(store, &usage_tx, None, &usage_home).await
+                else {
+                    return;
+                };
+                store = returned_store;
+                invalidated.clear();
+                reconcile = false;
+                refresh_due = None;
+            }
+        }
+    }
+}
+
+async fn publish_cursor_batch(
+    mut store: UsageStore,
+    batch: CursorBatch,
+    usage_tx: &tokio::sync::watch::Sender<UsageSnapshot>,
+) -> Option<UsageStore> {
+    let (store, cursor, history) = tokio::task::spawn_blocking(move || {
+        let cursor = store.ingest_cursor_batch(batch);
+        let history = store.cursor_history();
+        (store, cursor, history)
+    })
+    .await
+    .ok()?;
+    usage_tx.send_modify(|snapshot| {
+        snapshot.cursor = cursor;
+        snapshot.updated_at = usage::Clock::read(&usage::SystemClock).unix_seconds;
+        Arc::make_mut(&mut snapshot.history).cursor = history;
+    });
+    Some(store)
+}
+
 async fn publish_usage_refresh(
     mut store: UsageStore,
     usage_tx: &tokio::sync::watch::Sender<UsageSnapshot>,
@@ -558,6 +614,10 @@ fn open_main_window(
             // surfaces even though only the sidebar used that material.
             window_background: WindowBackgroundAppearance::Opaque,
             app_id: Some(app_id),
+            // Diri paints the whole titlebar. Keep AppKit from turning presses on
+            // its controls into window drags; RootView explicitly moves the
+            // window from unhandled titlebar presses instead.
+            app_owns_titlebar_drag: cfg!(target_os = "macos"),
             titlebar: Some(TitlebarOptions {
                 title,
                 appears_transparent: cfg!(target_os = "macos"),
@@ -650,4 +710,43 @@ fn load_system_fonts(cx: &mut App) {
 #[cfg(not(target_os = "macos"))]
 fn load_system_fonts(cx: &mut App) {
     fonts::init(cx);
+}
+
+#[cfg(test)]
+mod usage_refresh_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cursor_regression_slow_fetch_does_not_block_local_updates() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = usage::ScanPaths::for_home(home.path());
+        std::fs::create_dir_all(&paths.roots[0].0).unwrap();
+        // An empty local store still has a published timestamp and must finish
+        // startup even while Cursor is waiting indefinitely on a response.
+        let store = UsageStore::with_paths_and_clock(paths, usage::SystemClock);
+        let (usage_tx, mut usage_rx) = tokio::sync::watch::channel(UsageSnapshot::default());
+        let cursor = CursorRefresh::with_task(tokio::spawn(std::future::pending()));
+        let worker = tokio::spawn(run_usage_updates(
+            store,
+            usage_tx,
+            home.path().to_owned(),
+            cursor,
+        ));
+        tokio::time::timeout(Duration::from_secs(5), usage_rx.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(usage_rx.borrow_and_update().updated_at, 0);
+        // Advance the real reconciliation loop deterministically; this must
+        // publish again while the same Cursor fetch remains pending.
+        tokio::time::pause();
+        tokio::time::advance(USAGE_RECONCILE_INTERVAL).await;
+        tokio::time::resume();
+        tokio::time::timeout(Duration::from_secs(5), usage_rx.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        worker.abort();
+        let _ = worker.await;
+    }
 }

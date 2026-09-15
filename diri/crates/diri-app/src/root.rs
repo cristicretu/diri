@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use diri_proto::{AgentKind, SessionId, SessionRecord, SessionStatus};
 use diri_ui::{FloatingSurface, Ink, Metrics, Radius, SemanticColors, Typo};
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, Context, CursorStyle, DragMoveEvent, Entity,
-    FocusHandle, Focusable, FontWeight, KeyContext, KeyDownEvent, KeyUpEvent,
+    Animation, AnimationExt, AnyElement, App, BoxShadow, Context, CursorStyle, DragMoveEvent,
+    Entity, FocusHandle, Focusable, FontWeight, KeyContext, KeyDownEvent, KeyUpEvent,
     ModifiersChangedEvent, MouseButton, Render, StyleRefinement, Subscription, Task, Window,
     deferred, div, ease_out_quint, prelude::*, px, rgba,
 };
@@ -45,8 +45,32 @@ use crate::workbench::WorkbenchLayout;
 
 #[path = "notification_panel.rs"]
 mod notification_panel;
+#[cfg(test)]
+#[path = "notification_panel_tests.rs"]
+mod notification_panel_tests;
 
 const WINDOW_BOUNDS_SAVE_DELAY: Duration = Duration::from_millis(150);
+const SIDEBAR_PEEK_INSET: f32 = 10.0;
+const SIDEBAR_PEEK_DWELL: Duration = Duration::from_millis(20);
+const SIDEBAR_PEEK_REVEAL: Duration = Duration::from_millis(140);
+const SIDEBAR_PEEK_TRIGGER_WIDTH: f32 = 24.0;
+
+fn sync_system_theme(runtime: &crate::store::StoreRuntime, appearance: gpui::WindowAppearance) {
+    let dark = matches!(
+        appearance,
+        gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+    );
+    let mut store = runtime.store.write().expect("store lock");
+    let mut candidate = store.preferences().clone();
+    if !candidate.apply_system_theme(dark) {
+        return;
+    }
+    let changed = store.update_preferences(|prefs| *prefs = candidate).is_ok();
+    drop(store);
+    if changed {
+        runtime.publish_local_change();
+    }
+}
 
 pub(crate) fn cached_window_overlay<T: Render>(view: Entity<T>) -> impl IntoElement {
     view.cached(StyleRefinement::default().absolute().inset_0())
@@ -183,6 +207,10 @@ pub struct RootView {
     browser: std::rc::Rc<std::cell::RefCell<NativeBrowser>>,
     services: Arc<AppServices>,
     focus: FocusHandle,
+    /// A press on otherwise-unhandled titlebar chrome. Button presses stop the
+    /// mouse-down before it bubbles here, so even a one-pixel move remains a
+    /// button click rather than becoming a window drag.
+    titlebar_drag_armed: bool,
     resize_origin: Option<(f32, f32)>,
     /// The sidebar open/close currently being painted, if any.
     sidebar_slide: Option<SeamSlide>,
@@ -190,6 +218,14 @@ pub struct RootView {
     /// from this rather than from the settled width so it picks up wherever the
     /// previous frame left the panel.
     sidebar_seam: f32,
+    /// The panel is always mounted in one absolute slot. Only this exposure
+    /// and its floating treatment change; the layout seam independently makes room.
+    sidebar_panel_slide: Option<SeamSlide>,
+    sidebar_panel_width: f32,
+    sidebar_float_slide: Option<SeamSlide>,
+    sidebar_float: f32,
+    sidebar_floating: bool,
+    sidebar_peek_dwell: Option<Task<()>>,
     auxiliary_terminal: Option<Entity<TerminalPane>>,
     auxiliary_id: Option<SessionId>,
     auxiliary_parent: Option<SessionId>,
@@ -219,6 +255,8 @@ pub struct RootView {
     notification_panel_open: bool,
     notification_filter_unread: bool,
     notification_selected: usize,
+    notification_scroll: gpui::UniformListScrollHandle,
+    notification_options_open: bool,
     notification_focus: FocusHandle,
     notification_health: String,
     pending_notification_open: Option<(SessionId, Option<String>)>,
@@ -257,8 +295,21 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        if !preview {
+            sync_system_theme(&services.store, window.appearance());
+        }
+        let appearance_observer = (!preview).then(|| {
+            let runtime = Arc::clone(&services.store);
+            window.observe_window_appearance(move |window, _| {
+                sync_system_theme(&runtime, window.appearance())
+            })
+        });
         let sidebar_runtime = (!preview).then(|| Arc::clone(&services.store));
-        let sidebar = cx.new(|cx| Sidebar::new(sidebar_runtime, preview, preview_scenario, cx));
+        let sidebar = cx.new(|cx| {
+            let mut sidebar = Sidebar::new(sidebar_runtime, preview, preview_scenario, cx);
+            sidebar.set_surface_in_parent();
+            sidebar
+        });
         let terminal = (!preview || preview_scenario == PreviewScenario::Empty).then(|| {
             let runtime = Arc::clone(&services.store);
             let tokio = Arc::clone(&services.tokio);
@@ -266,11 +317,11 @@ impl RootView {
         });
         let navigation = (!preview).then(|| {
             let runtime = Arc::clone(&services.store);
-            cx.new(|cx| NavigationOverlay::new(runtime, window, cx))
+            cx.new(|cx| NavigationOverlay::new(runtime, Arc::clone(&services.tokio), window, cx))
         });
         let session_surfaces = (!preview).then(|| {
             let runtime = Arc::clone(&services.store);
-            cx.new(|cx| SessionSurfaces::new(runtime, cx))
+            cx.new(|cx| SessionSurfaces::new(runtime, Some(services.tokio.handle().clone()), cx))
         });
         let utility_surfaces = (!preview).then(|| {
             let runtime = Arc::clone(&services.store);
@@ -407,7 +458,14 @@ impl RootView {
                     surfaces.open_add_remote_host(window, cx);
                 });
             }
+            if matches!(event, SidebarEvent::OpenWhatsNew)
+                && let Some(surfaces) = &this.utility_surfaces
+            {
+                surfaces.update(cx, |surfaces, cx| surfaces.open_whats_new(cx));
+            }
             if matches!(event, SidebarEvent::VisibilityChanged) {
+                this.sidebar_peek_dwell = None;
+                this.sidebar_floating = false;
                 this.begin_sidebar_slide(cx);
                 // Settings navigation lives in the sidebar, so hiding the
                 // sidebar is also the way out of settings.
@@ -418,6 +476,14 @@ impl RootView {
                     this.sidebar_revealed_for_settings = false;
                     surfaces.update(cx, |surfaces, cx| surfaces.dismiss(cx));
                 }
+            }
+            if matches!(event, SidebarEvent::PeekChanged) {
+                this.sidebar_floating = true;
+                // Establish the floating shape offscreen; exits retain it.
+                if this.sidebar_panel_width == 0.0 {
+                    this.sidebar_float = 1.0;
+                }
+                this.begin_sidebar_panel_slide(Instant::now(), cx);
             }
             cx.notify();
         })
@@ -480,10 +546,46 @@ impl RootView {
                 inspector,
                 window,
                 |this, _, event, window, cx| match event {
-                    InspectorEvent::Close => this.set_inspector_open(false, cx),
-                    InspectorEvent::WorkspaceChanged(surface) => {
+                    InspectorEvent::Close => {
+                        // A removed focus path cannot route workbench shortcuts.
+                        window.focus(&this.focus, cx);
+                        this.inspector_toggled_at = None;
+                        this.set_inspector_open(false, cx);
+                        this.inspector_toggled_at = None;
+                    }
+                    InspectorEvent::SessionChanged => {
+                        this.inspector_open = this
+                            .inspector
+                            .as_ref()
+                            .is_some_and(|inspector| inspector.read(cx).is_visible());
+                        this.inspector_toggled_at = None;
+                        this.begin_inspector_slide(cx);
+                        cx.notify();
+                    }
+                    InspectorEvent::WorkspaceChanged(surface)
+                    | InspectorEvent::WorkspaceRestored(surface) => {
+                        let focus_workspace = matches!(event, InspectorEvent::WorkspaceChanged(_));
+                        if focus_workspace {
+                            window.focus(&this.focus, cx);
+                        }
+                        #[cfg(target_os = "macos")]
+                        if *surface == crate::inspector::WorkspaceSurface::Browser
+                            && let Some(inspector) = &this.inspector
+                            && let Some(id) = inspector.read(cx).active_workspace_id()
+                        {
+                            this.browser.borrow_mut().select_tab(id);
+                            let state = this.browser.borrow().state();
+                            let blank = state.url.is_none();
+                            inspector.update(cx, |inspector, cx| {
+                                inspector.set_browser_state(state, cx);
+                                if blank && focus_workspace {
+                                    inspector.focus_browser_address(window, cx);
+                                }
+                            });
+                        }
                         if let Some(terminal) = &this.auxiliary_terminal
                             && *surface == crate::inspector::WorkspaceSurface::Terminal
+                            && focus_workspace
                         {
                             terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
                         }
@@ -492,14 +594,21 @@ impl RootView {
                     InspectorEvent::RequestTerminal => {
                         this.ensure_auxiliary_terminal(window, cx);
                     }
-                    InspectorEvent::WorkspaceClosed(surface) => {
+                    InspectorEvent::WorkspaceClosed { surface, id } => {
+                        #[cfg(not(target_os = "macos"))]
+                        let _ = id;
                         #[cfg(target_os = "macos")]
                         if *surface == crate::inspector::WorkspaceSurface::Browser {
-                            this.browser.borrow_mut().clear();
+                            this.browser.borrow_mut().close_tab(*id);
                         }
-                        if *surface == crate::inspector::WorkspaceSurface::Terminal {
+                        if *surface == crate::inspector::WorkspaceSurface::Terminal
+                            && !this.inspector.as_ref().is_some_and(|inspector| {
+                                inspector.read(cx).workspace_needs_terminal()
+                            })
+                        {
                             this.hide_auxiliary_terminal(window, cx);
                         }
+                        window.focus(&this.focus, cx);
                         cx.notify();
                     }
                     InspectorEvent::Browser(action) => {
@@ -766,6 +875,11 @@ impl RootView {
                                 if open_settings && let Some(surfaces) = &this.utility_surfaces {
                                     surfaces.update(cx, |surfaces, cx| surfaces.open_settings(cx));
                                 }
+                                if let Some(inspector) = &this.inspector {
+                                    inspector.update(cx, |inspector, cx| {
+                                        inspector.sync_workspace_session(cx)
+                                    });
+                                }
                                 this.sync_auxiliary_terminal(window, cx);
                                 cx.notify();
                             })
@@ -818,9 +932,12 @@ impl RootView {
                 if this
                     .update_in(cx, |this, _window, cx| {
                         if let Some(inspector) = this.inspector.clone() {
-                            let state = this.browser.borrow().state();
-                            inspector
-                                .update(cx, |inspector, cx| inspector.set_browser_state(state, cx));
+                            let states = this.browser.borrow().tab_states();
+                            inspector.update(cx, |inspector, cx| {
+                                for (id, state) in states {
+                                    inspector.set_browser_tab_state(id, state, cx);
+                                }
+                            });
                             cx.notify();
                         }
                     })
@@ -842,8 +959,15 @@ impl RootView {
             browser,
             services,
             focus: cx.focus_handle(),
+            titlebar_drag_armed: false,
             resize_origin: None,
             sidebar_slide: None,
+            sidebar_panel_slide: None,
+            sidebar_panel_width: sidebar_seam,
+            sidebar_float_slide: None,
+            sidebar_float: 0.0,
+            sidebar_floating: false,
+            sidebar_peek_dwell: None,
             sidebar_seam,
             auxiliary_terminal: None,
             auxiliary_id: None,
@@ -867,6 +991,8 @@ impl RootView {
             notification_panel_open: false,
             notification_filter_unread: true,
             notification_selected: 0,
+            notification_scroll: gpui::UniformListScrollHandle::new(),
+            notification_options_open: false,
             notification_focus: cx.focus_handle(),
             pending_notification_open: None,
             notification_health:
@@ -883,7 +1009,10 @@ impl RootView {
             menu_bar,
             #[cfg(target_os = "macos")]
             notifier,
-            _subscriptions: std::iter::once(activation).chain(bounds_observer).collect(),
+            _subscriptions: std::iter::once(activation)
+                .chain(bounds_observer)
+                .chain(appearance_observer)
+                .collect(),
             _service_events: service_events,
             _surface_sync: surface_sync,
             _workbench_sync: workbench_sync,
@@ -939,7 +1068,7 @@ impl RootView {
             .store
             .read()
             .expect("session store lock poisoned");
-        crate::app_theme::colors(&store.preferences().terminal_theme)
+        crate::app_theme::colors(store.theme_id())
     }
 
     fn show_quote_feedback(
@@ -1190,6 +1319,19 @@ impl RootView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // The close dialog overlays the focused surface without taking its
+        // focus. Handle its keys first so they cannot reach the terminal or
+        // sidebar beneath it, and focus is preserved when closing is canceled.
+        if self.sidebar.read(cx).pending_close_copy().is_some() {
+            self.sidebar
+                .update(cx, |sidebar, cx| match event.keystroke.key.as_str() {
+                    "enter" => sidebar.confirm_close(cx),
+                    "escape" => sidebar.cancel_close(cx),
+                    _ => {}
+                });
+            cx.stop_propagation();
+            return;
+        }
         if self.notification_panel_open && self.notification_key(event, window, cx) {
             return;
         }
@@ -1241,10 +1383,36 @@ impl RootView {
             cx.stop_propagation();
             return;
         }
+        if self.inspector_open
+            && !self.launcher.read(cx).is_open()
+            && !self
+                .navigation
+                .as_ref()
+                .is_some_and(|view| view.read(cx).is_open())
+            && !self
+                .utility_surfaces
+                .as_ref()
+                .is_some_and(|view| view.read(cx).is_open())
+            && let Some(inspector) = &self.inspector
+            && inspector.update(cx, |inspector, cx| {
+                inspector.browser_shortcut(event, window, cx)
+            })
+        {
+            cx.stop_propagation();
+            return;
+        }
         // The sidebar is a real keyboard surface. Let its bubble handler own
         // navigation and rename input instead of mirroring the same keystroke
         // into the live terminal during root capture.
         if self.sidebar.read(cx).is_focused(window) {
+            return;
+        }
+        if self
+            .navigation
+            .as_ref()
+            .is_some_and(|navigation| navigation.read(cx).is_open())
+        {
+            // The focused palette owns input even over the composer or Settings.
             return;
         }
         if self.launcher.read(cx).is_open() {
@@ -1325,8 +1493,10 @@ impl RootView {
                 }
             }
             CommandId::ToggleHistory => {
-                if let Some(surfaces) = &self.utility_surfaces {
-                    surfaces.update(cx, |surfaces, cx| surfaces.toggle_history(cx));
+                if let Some(navigation) = &self.navigation {
+                    navigation.update(cx, |navigation, cx| {
+                        navigation.toggle_history(&ToggleHistory, window, cx)
+                    });
                 }
             }
             CommandId::ToggleOverview => {
@@ -1335,11 +1505,17 @@ impl RootView {
                 }
             }
             CommandId::OpenWorktrees => {
+                if let Some(navigation) = &self.navigation {
+                    navigation.update(cx, |navigation, cx| navigation.dismiss(cx));
+                }
                 if let Some(surfaces) = &self.utility_surfaces {
                     surfaces.update(cx, |surfaces, cx| surfaces.open_worktrees(cx));
                 }
             }
             CommandId::OpenSettings => {
+                if let Some(navigation) = &self.navigation {
+                    navigation.update(cx, |navigation, cx| navigation.dismiss(cx));
+                }
                 if let Some(surfaces) = &self.utility_surfaces {
                     surfaces.update(cx, |surfaces, cx| surfaces.toggle_settings(cx));
                 }
@@ -1364,7 +1540,12 @@ impl RootView {
                 self.sidebar
                     .update(cx, |sidebar, cx| sidebar.focus(window, cx));
             }
-            CommandId::ToggleInspector => self.toggle_inspector(cx),
+            CommandId::ToggleInspector => {
+                self.toggle_inspector(cx);
+                if !self.inspector_open {
+                    window.focus(&self.focus, cx);
+                }
+            }
             CommandId::ToggleAuxiliaryTerminal => {
                 self.open_auxiliary_terminal(window, cx);
             }
@@ -1526,16 +1707,23 @@ impl RootView {
             terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
             return true;
         }
-        if self.auxiliary_spawn_parent.as_ref() == Some(&parent) {
-            return true;
-        }
-        let spawned = self
-            .services
-            .store
-            .store
-            .write()
-            .expect("session store lock poisoned")
-            .spawn_auxiliary_terminal(parent.clone());
+        let slot = self
+            .inspector
+            .as_ref()
+            .map_or(0, |inspector| inspector.read(cx).terminal_slot());
+        let spawned = {
+            let mut store = self
+                .services
+                .store
+                .store
+                .write()
+                .expect("session store lock poisoned");
+            if slot == 0 {
+                store.spawn_auxiliary_terminal(parent.clone())
+            } else {
+                store.spawn_auxiliary_terminal_slot(parent.clone(), slot)
+            }
+        };
         if spawned {
             self.auxiliary_spawn_parent = Some(parent);
             cx.notify();
@@ -1576,18 +1764,25 @@ impl RootView {
         if self.preview {
             return;
         }
-        let (selected, auxiliary, spawn_failed) = {
-            let store = self
+        let slot = self
+            .inspector
+            .as_ref()
+            .map_or(0, |inspector| inspector.read(cx).terminal_slot());
+        let (selected, auxiliary, spawn_pending) = {
+            let mut store = self
                 .services
                 .store
                 .store
-                .read()
+                .write()
                 .expect("session store lock poisoned");
             let selected = store.selected_session_id().cloned();
             let auxiliary = selected
                 .as_ref()
-                .and_then(|parent| store.auxiliary_terminal_for(parent));
-            (selected, auxiliary, store.last_action_error().is_some())
+                .and_then(|parent| store.auxiliary_terminal_for_slot(parent, slot));
+            let pending = selected
+                .as_ref()
+                .is_some_and(|parent| store.auxiliary_spawn_pending(parent, slot));
+            (selected, auxiliary, pending)
         };
 
         if selected
@@ -1647,13 +1842,6 @@ impl RootView {
             return;
         }
 
-        let spawn_still_pending = selected
-            .as_ref()
-            .is_some_and(|selected| self.auxiliary_spawn_parent.as_ref() == Some(selected))
-            && !spawn_failed;
-        if spawn_still_pending {
-            return;
-        }
         let had_auxiliary_state = self.auxiliary_terminal.is_some()
             || self.auxiliary_id.is_some()
             || self.auxiliary_parent.is_some()
@@ -1664,6 +1852,9 @@ impl RootView {
         self.auxiliary_spawn_parent = None;
         if let Some(inspector) = &self.inspector {
             inspector.update(cx, |inspector, cx| inspector.set_terminal_surface(None, cx));
+        }
+        if spawn_pending {
+            self.auxiliary_spawn_parent = selected;
         }
         if had_auxiliary_state {
             cx.notify();
@@ -1793,11 +1984,42 @@ impl RootView {
     /// Reduced-motion users get the settled width immediately.
     fn begin_sidebar_slide(&mut self, cx: &mut Context<Self>) {
         let to = self.settled_sidebar_seam(cx);
+        let now = Instant::now();
         self.sidebar_slide = (!cx.reduce_motion())
-            .then(|| SeamSlide::begin(self.sidebar_seam, to))
+            .then(|| SeamSlide::begin_at(self.sidebar_seam, to, now))
             .flatten();
         if self.sidebar_slide.is_none() {
             self.sidebar_seam = to;
+        }
+        self.begin_sidebar_panel_slide(now, cx);
+    }
+
+    fn begin_sidebar_panel_slide(&mut self, now: Instant, cx: &mut Context<Self>) {
+        let sidebar = self.sidebar.read(cx);
+        let to = if sidebar.is_visible() || sidebar.is_peeking() {
+            sidebar.width()
+        } else {
+            0.0
+        };
+        let float_to = if self.sidebar_floating { 1.0 } else { 0.0 };
+        self.sidebar_panel_slide = (!cx.reduce_motion())
+            .then(|| SeamSlide::begin_at(self.sidebar_panel_width, to, now))
+            .flatten()
+            .map(|slide| {
+                if sidebar.is_peeking() {
+                    slide.with_duration(SIDEBAR_PEEK_REVEAL)
+                } else {
+                    slide
+                }
+            });
+        self.sidebar_float_slide = (!cx.reduce_motion())
+            .then(|| SeamSlide::begin_at(self.sidebar_float, float_to, now))
+            .flatten();
+        if self.sidebar_panel_slide.is_none() {
+            self.sidebar_panel_width = to;
+        }
+        if self.sidebar_float_slide.is_none() {
+            self.sidebar_float = float_to;
         }
     }
 
@@ -2227,14 +2449,17 @@ impl RootView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let terminal = self.colors();
-        let bounds = window.inner_window_bounds().get_bounds();
+        // On macOS fullscreen, window bounds retain the windowed restore
+        // rectangle. Terminal layout must follow the live drawable viewport.
+        let viewport_size = window.viewport_size();
         let sidebar_width = if visible_sidebar {
             self.sidebar.read(cx).width()
         } else {
             0.0
         };
-        let card_width = (f32::from(bounds.size.width) - sidebar_width - inspector_width).max(0.0);
-        let card_height = f32::from(bounds.size.height).max(0.0);
+        let card_width =
+            (f32::from(viewport_size.width) - sidebar_width - inspector_width).max(0.0);
+        let card_height = f32::from(viewport_size.height).max(0.0);
         let selected = self
             .services
             .store
@@ -2290,6 +2515,7 @@ impl RootView {
         if terminal_in_workspace_panel && let Some(auxiliary) = &self.auxiliary_terminal {
             auxiliary.update(cx, |terminal, cx| {
                 terminal.set_shell_chrome(visible_sidebar, true, cx);
+                terminal.set_header_trailing_inset(0.0, cx);
                 terminal.set_viewport(
                     TerminalViewport {
                         x: sidebar_width + card_width,
@@ -2342,6 +2568,7 @@ impl RootView {
                 .overflow_hidden();
             if let Some(terminal) = &self.auxiliary_terminal {
                 terminal.update(cx, |terminal, cx| {
+                    terminal.set_header_trailing_inset(48.0, cx);
                     terminal.set_viewport(
                         TerminalViewport {
                             x: sidebar_width,
@@ -2373,9 +2600,10 @@ impl RootView {
                     div()
                         .id("close-auxiliary-terminal")
                         .absolute()
-                        .top(px(12.0))
+                        .top(px(9.0))
                         .right(px(12.0))
                         .size(px(24.0))
+                        .debug_selector(|| "close-auxiliary-terminal".into())
                         .flex()
                         .items_center()
                         .justify_center()
@@ -2424,6 +2652,7 @@ impl RootView {
             PreviewScenario::Stress => "Stress",
             PreviewScenario::Empty => "Empty",
             PreviewScenario::Artifacts => "Artifacts",
+            PreviewScenario::Fleet => "30 working sessions",
         };
         div()
             .size_full()
@@ -2898,47 +3127,63 @@ impl RootView {
             .id("recovery-notice")
             .debug_selector(|| "RECOVERY_NOTICE".to_owned())
             .absolute()
-            .top_0()
-            .left_0()
-            .right_0()
-            .h(px(42.0))
-            .px(px(14.0))
+            .bottom(px(16.0))
+            .right(px(16.0))
+            .w(px(380.0))
+            .max_w(gpui::relative(0.9))
+            .p(px(14.0))
             .flex()
-            .items_center()
-            .gap(px(9.0))
-            .bg(colors.sidebar_surface())
-            .border_b_1()
-            .border_color(colors.primary.alpha(0.08))
+            .flex_col()
+            .gap(px(8.0))
+            .rounded(px(Radius::PANEL))
+            .bg(colors.floating_surface())
+            .border_1()
+            .border_color(colors.floating_stroke())
+            .shadow_lg()
+            .occlude()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .text_color(colors.primary)
-            .child(div().size(px(7.0)).flex_none().rounded_full().bg(accent))
             .child(
                 div()
-                    .min_w(px(0.0))
-                    .flex_1()
+                    .pr(px(24.0))
                     .flex()
-                    .items_baseline()
-                    .gap(px(7.0))
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(sf_symbol(
+                        if matches!(
+                            notice.kind,
+                            RecoveryKind::ActionFailed | RecoveryKind::ManualAttention
+                        ) {
+                            "exclamationmark.triangle"
+                        } else {
+                            "arrow.triangle.2.circlepath"
+                        },
+                        13.0,
+                        accent,
+                    ))
                     .child(
                         div()
-                            .flex_none()
+                            .flex_1()
+                            .min_w(px(0.0))
                             .text_size(px(Typo::ROW_EMPHASIZED.size))
                             .font_weight(Typo::ROW_EMPHASIZED.weight)
                             .child(notice.title),
-                    )
-                    .child(
-                        div()
-                            .min_w(px(0.0))
-                            .text_ellipsis()
-                            .text_size(px(Typo::META.size))
-                            .text_color(colors.secondary)
-                            .child(bounded_notice_body(&notice.body)),
                     ),
+            )
+            .child(
+                div()
+                    .text_size(px(Typo::META.size))
+                    .line_height(px(18.0))
+                    .text_color(colors.secondary)
+                    .child(bounded_notice_body(&notice.body)),
             );
+        let mut actions = div().flex().items_center().gap(px(8.0));
         if let Some((action, label)) = notice.primary_action {
             let store = Arc::clone(&self.services.store.store);
-            bar = bar.child(
+            actions = actions.child(
                 div()
                     .id("recovery-primary-action")
+                    .self_start()
                     .h(px(27.0))
                     .px(px(9.0))
                     .flex_none()
@@ -2961,18 +3206,52 @@ impl RootView {
                     }),
             );
         }
+        let detail = notice.detail;
+        let has_actions = notice.primary_action.is_some() || detail.is_some();
+        if let Some(detail) = detail {
+            actions = actions.child(
+                div()
+                    .id("copy-recovery-details")
+                    .debug_selector(|| "copy-recovery-details".into())
+                    .h(px(28.0))
+                    .px(px(7.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(Radius::ROW))
+                    .cursor_pointer()
+                    .text_size(px(Typo::META.size))
+                    .text_color(colors.secondary)
+                    .hover(move |button| button.bg(colors.primary.alpha(0.06)))
+                    .child("Copy details")
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(detail.clone()));
+                        cx.stop_propagation();
+                    }),
+            );
+        }
+        if has_actions {
+            bar = bar.child(actions);
+        }
         if notice.dismissible {
             let store = Arc::clone(&self.services.store.store);
             bar = bar.child(
                 div()
                     .id("dismiss-recovery-notice")
-                    .size(px(24.0))
+                    .debug_selector(|| "dismiss-recovery-notice".into())
+                    .absolute()
+                    .top(px(9.0))
+                    .right(px(9.0))
+                    .size(px(28.0))
                     .flex_none()
                     .flex()
                     .items_center()
                     .justify_center()
                     .rounded(px(Radius::CHIP))
                     .cursor_pointer()
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| crate::palette_chrome::PaletteTooltip("Dismiss".into(), colors))
+                            .into()
+                    })
                     .hover(move |button| button.bg(colors.primary.alpha(0.06)))
                     .child(sf_symbol_weighted(
                         "xmark",
@@ -3008,6 +3287,7 @@ impl Render for RootView {
             self.open_notification(session, event, window, cx);
         }
         let colors = self.colors();
+        let launcher_open = self.launcher.read(cx).is_open();
         let recovery_notice = if self.preview {
             None
         } else {
@@ -3017,9 +3297,15 @@ impl Render for RootView {
                 .store
                 .read()
                 .expect("session store lock poisoned");
-            RecoveryNotice::resolve(store.daemon_state(), store.action_failure())
+            // The composer owns its inline failure while open. Once closed,
+            // the same failure remains available here without duplicate copy.
+            RecoveryNotice::resolve(
+                store.daemon_state(),
+                store.action_failure().filter(|failure| {
+                    !launcher_open || failure.title != crate::store::PROMPT_DELIVERY_FAILURE_TITLE
+                }),
+            )
         };
-        let recovery_height = if recovery_notice.is_some() { 42.0 } else { 0.0 };
         #[cfg(target_os = "macos")]
         self.notifier.set_badge(
             self.services
@@ -3030,7 +3316,6 @@ impl Render for RootView {
                 .notifications()
                 .unread_count(),
         );
-        let launcher_open = self.launcher.read(cx).is_open();
         let notification_surface_visible = !launcher_open
             && !self.notification_panel_open
             && !self
@@ -3045,7 +3330,12 @@ impl Render for RootView {
             .set_notification_surface_visible(notification_surface_visible);
         let sidebar_visible = self.sidebar.read(cx).is_visible();
         let sidebar_width = self.sidebar.read(cx).width();
-        let window_width = f32::from(window.inner_window_bounds().get_bounds().size.width);
+        let panel_width = if sidebar_visible || self.sidebar.read(cx).is_peeking() {
+            sidebar_width
+        } else {
+            0.0
+        };
+        let window_width = f32::from(window.viewport_size().width);
         let occupied_sidebar_width = if sidebar_visible { sidebar_width } else { 0.0 };
         self.inspector_max_width =
             (window_width - occupied_sidebar_width - 320.0).clamp(0.0, 720.0);
@@ -3058,6 +3348,14 @@ impl Render for RootView {
             0.0
         };
         let now = Instant::now();
+        self.sidebar_panel_width =
+            advance_seam(&mut self.sidebar_panel_slide, panel_width, now, window);
+        self.sidebar_float = advance_seam(
+            &mut self.sidebar_float_slide,
+            if self.sidebar_floating { 1.0 } else { 0.0 },
+            now,
+            window,
+        );
         self.sidebar_seam =
             advance_seam(&mut self.sidebar_slide, occupied_sidebar_width, now, window);
         self.inspector_seam = advance_seam(&mut self.inspector_slide, inspector_width, now, window);
@@ -3076,30 +3374,104 @@ impl Render for RootView {
         let mut key_context = KeyContext::new_with_defaults();
         key_context.add(APP_CONTEXT);
         key_context.add(SESSION_NAVIGATION_CONTEXT);
-        // Each panel keeps its full width and is pinned to the wrapper edge it
-        // lives against -- the sidebar's right, the inspector's left -- so
-        // narrowing a wrapper slides its panel out under the clip instead of
-        // squeezing every row's contents down with it.
+        let inset = SIDEBAR_PEEK_INSET * self.sidebar_float;
+        let radius = Radius::PANEL * self.sidebar_float;
+        let exposed = self.sidebar_panel_width;
+        // Keep workbench text from bleeding through the floating panel, then
+        // ease its material back to the docked theme alongside the geometry.
+        let mut sidebar_surface = colors.sidebar_surface();
+        sidebar_surface.a += (1.0 - sidebar_surface.a) * self.sidebar_float;
+        let peek_pointer_tracking = self.sidebar.read(cx).is_peeking().then(|| {
+            let region = gpui::Bounds::new(
+                gpui::point(px(0.0), px(0.0)),
+                gpui::size(px(sidebar_width + inset), window.viewport_size().height),
+            );
+            // Capture moves even when a terminal or menu handles the bubble
+            // phase. The gap and panel are one hover target, including the
+            // first stationary frame after the edge dwell opens it.
+            let sidebar = self.sidebar.downgrade();
+            gpui::canvas(
+                |_, _, _| (),
+                move |_, _, window, _| {
+                    let moving_sidebar = sidebar.clone();
+                    window.on_mouse_event(
+                        move |event: &gpui::MouseMoveEvent, phase, window, cx| {
+                            if phase == gpui::DispatchPhase::Capture {
+                                let _ = moving_sidebar.update(cx, |sidebar, cx| {
+                                    sidebar.hover_peek_region(
+                                        region.contains(&event.position),
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            }
+                        },
+                    );
+                    let sidebar = sidebar.clone();
+                    window.on_mouse_event(move |_: &gpui::MouseExitEvent, phase, window, cx| {
+                        if phase == gpui::DispatchPhase::Capture {
+                            let _ = sidebar.update(cx, |sidebar, cx| {
+                                sidebar.hover_peek_region(false, window, cx)
+                            });
+                        }
+                    });
+                },
+            )
+            .absolute()
+            .size_full()
+        });
         let sidebar_wrapper = div()
-            .relative()
-            .flex_none()
-            .h_full()
-            .overflow_hidden()
-            .w(px(seam))
-            .when(seam > 0.0, |wrapper| {
-                wrapper.child(
+            .id("sidebar-frame")
+            .absolute()
+            .left_0()
+            .top_0()
+            .bottom_0()
+            // Include the inset in the hover region so the edge and card
+            // are one continuous target, including during docking.
+            .w(px(exposed + inset * exposed / sidebar_width))
+            .when(exposed > 0.0, |wrapper| {
+                wrapper.occlude().child(
                     div()
+                        .id("sidebar-surface")
+                        .debug_selector(|| "sidebar-surface".into())
                         .absolute()
-                        .top(px(0.0))
+                        .top(px(inset))
+                        .bottom(px(inset))
                         .right(px(0.0))
-                        .h_full()
                         .w(px(sidebar_width))
+                        .rounded(px(radius))
+                        .bg(sidebar_surface)
+                        .occlude()
+                        .shadow(vec![BoxShadow {
+                            color: gpui::black().opacity(0.32 * self.sidebar_float),
+                            offset: gpui::point(px(0.0), px(8.0 * self.sidebar_float)),
+                            blur_radius: px(24.0 * self.sidebar_float),
+                            spread_radius: px(0.0),
+                            inset: false,
+                        }])
                         // A reactive boundary: the sidebar re-renders on its
                         // own notifies, not on the terminal's 60fps repaints.
                         .child(
                             self.sidebar
                                 .clone()
                                 .cached(StyleRefinement::default().size_full()),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .rounded(px(radius))
+                                .border_1()
+                                .border_color(colors.floating_stroke().opacity(self.sidebar_float)),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .right_0()
+                                .top_0()
+                                .bottom_0()
+                                .w(px(1.0))
+                                .bg(colors.sidebar_stroke().opacity(1.0 - self.sidebar_float)),
                         ),
                 )
             });
@@ -3109,7 +3481,6 @@ impl Render for RootView {
             .key_context(key_context)
             .relative()
             .size_full()
-            .pt(px(recovery_height))
             // Real SF Pro (registered from SFNS.ttf at startup) for every UI
             // surface; the terminal grid sets its own mono font.
             .font_family(crate::fonts::ui_family())
@@ -3119,6 +3490,31 @@ impl Render for RootView {
             // treatment above this base.
             .bg(colors.background)
             .track_focus(&self.focus)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, _| {
+                    let pointer_y = f32::from(event.position.y);
+                    this.titlebar_drag_armed =
+                        cfg!(target_os = "macos") && (0.0..Metrics::TITLE_BAR).contains(&pointer_y);
+                }),
+            )
+            .on_mouse_move(
+                cx.listener(|this, event: &gpui::MouseMoveEvent, window, _| {
+                    if this.titlebar_drag_armed && event.pressed_button == Some(MouseButton::Left) {
+                        this.titlebar_drag_armed = false;
+                        window.start_window_move();
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseUpEvent, window, _| {
+                    if this.titlebar_drag_armed && event.click_count == 2 {
+                        window.titlebar_double_click();
+                    }
+                    this.titlebar_drag_armed = false;
+                }),
+            )
             .capture_key_down(cx.listener(Self::on_key_down))
             .capture_key_up(cx.listener(Self::on_key_up))
             .on_action(cx.listener(Self::close_selected_session))
@@ -3155,6 +3551,15 @@ impl Render for RootView {
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 this.run_command(CommandId::OpenSettings, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &commands::ShowSettings, _, cx| {
+                if let Some(surfaces) = &this.utility_surfaces {
+                    surfaces.update(cx, |surfaces, cx| {
+                        if !surfaces.is_settings_open() {
+                            surfaces.open_settings(cx);
+                        }
+                    });
+                }
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| {
                 this.run_command(CommandId::ToggleSidebar, window, cx);
@@ -3256,7 +3661,7 @@ impl Render for RootView {
                     this.drag_inspector_resize(f32::from(event.event.position.x), cx);
                 },
             ))
-            .child(sidebar_wrapper)
+            .child(div().flex_none().h_full().w(px(seam)))
             .when(seam > 0.0, |root| root.child(self.resize_handle(cx)));
         if launcher_open {
             // Command-N behaves like an unsaved new tab: preserve the app
@@ -3313,6 +3718,37 @@ impl Render for RootView {
                 );
             }
         }
+        // This overlay never participates in the terminal's flex layout or
+        // viewport sizing. Keep it below dialogs and above workbench content.
+        root = root.child(sidebar_wrapper).children(peek_pointer_tracking);
+        if !sidebar_visible && seam == 0.0 && exposed == 0.0 && panel_width == 0.0 {
+            root = root.child(
+                div()
+                    .id("sidebar-peek-edge")
+                    .debug_selector(|| "sidebar-peek-edge".into())
+                    .absolute()
+                    .left_0()
+                    .top(px(36.0))
+                    .bottom_0()
+                    .w(px(SIDEBAR_PEEK_TRIGGER_WIDTH))
+                    .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
+                        this.sidebar_peek_dwell = None;
+                        if *hovered {
+                            this.sidebar_peek_dwell =
+                                Some(cx.spawn_in(window, async move |this, cx| {
+                                    cx.background_executor().timer(SIDEBAR_PEEK_DWELL).await;
+                                    let _ = this.update_in(cx, |this, window, cx| {
+                                        this.sidebar_peek_dwell = None;
+                                        this.sidebar.update(cx, |sidebar, cx| {
+                                            sidebar.hover_peek_region(true, window, cx);
+                                            sidebar.peek(window, cx);
+                                        });
+                                    });
+                                }));
+                        }
+                    })),
+            );
+        }
         if self.resize_origin.is_some()
             || self.terminal_resize_origin.is_some()
             || self.inspector_resize_origin.is_some()
@@ -3346,7 +3782,7 @@ impl Render for RootView {
         if let Some(picker) = self.quote_target_picker(colors, sidebar_width, cx) {
             root = root.child(deferred(picker));
         }
-        if let Some(panel) = self.notification_panel(colors, window, cx) {
+        if let Some(panel) = self.notification_panel(window, cx) {
             root = root.child(deferred(panel));
         }
         if let Some(status) = self.status_banner(colors, cx) {
@@ -3356,11 +3792,7 @@ impl Render for RootView {
             root = root.child(self.recovery_notice(notice, colors));
         }
         if let Some(build) = &self.services.dev_build {
-            root = root.child(dev_build_marker(
-                build.marker_label(),
-                colors,
-                recovery_height + 10.0,
-            ));
+            root = root.child(dev_build_marker(build.marker_label(), colors, 10.0));
         }
         root
     }
@@ -3478,11 +3910,64 @@ fn preview_hint(system_image: &str, label: &str, colors: SemanticColors) -> AnyE
 mod tests {
     use super::*;
     use crate::sidebar::{PreviewScenario, SidebarPreviewFixture};
+    use gpui::{Modifiers, point, size};
 
-    #[cfg(target_os = "macos")]
     #[gpui::test]
-    fn browser_stays_visible_through_every_resize(cx: &mut gpui::TestAppContext) {
-        let services = Arc::new(AppServices {
+    fn close_confirmation_keyboard_from_terminal(cx: &mut gpui::TestAppContext) {
+        check_close_confirmation_keyboard(cx, false);
+    }
+
+    #[gpui::test]
+    fn close_confirmation_keyboard_from_sidebar(cx: &mut gpui::TestAppContext) {
+        check_close_confirmation_keyboard(cx, true);
+    }
+
+    fn check_close_confirmation_keyboard(cx: &mut gpui::TestAppContext, sidebar_focused: bool) {
+        cx.update(|cx| commands::bind_keys(cx, &Default::default()));
+        let services = test_services();
+        let runtime = services.store.clone();
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let selected = fixture.selected_session_id.expect("selected session");
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.select(selected.clone());
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Typical, window, cx)
+        });
+        if sidebar_focused {
+            root.update_in(cx, |root, window, cx| {
+                root.sidebar
+                    .update(cx, |sidebar, cx| sidebar.focus(window, cx));
+            });
+        }
+
+        cx.simulate_keystrokes(&commands::test_chords("cmd-w"));
+        assert!(runtime.store.read().unwrap().pending_close().is_some());
+        cx.simulate_keystrokes("escape");
+        {
+            let store = runtime.store.read().unwrap();
+            assert!(
+                store.pending_close().is_none(),
+                "Escape must cancel closing"
+            );
+            assert_eq!(store.selected_session_id(), Some(&selected));
+        }
+
+        cx.simulate_keystrokes(&commands::test_chords("cmd-w"));
+        assert!(runtime.store.read().unwrap().pending_close().is_some());
+        cx.simulate_keystrokes("enter");
+        let store = runtime.store.read().unwrap();
+        assert!(
+            store.pending_close().is_none(),
+            "Enter must confirm closing"
+        );
+        assert_ne!(store.selected_session_id(), Some(&selected));
+    }
+
+    pub(super) fn test_services() -> Arc<AppServices> {
+        Arc::new(AppServices {
             store: Arc::new(crate::store::StoreRuntime::inert()),
             usage_tx: tokio::sync::watch::channel(crate::usage::UsageSnapshot::default()).0,
             usage_limits_refresh: tokio::sync::mpsc::channel(1).0,
@@ -3495,7 +3980,836 @@ mod tests {
                     .build()
                     .unwrap(),
             ),
+        })
+    }
+
+    #[gpui::test]
+    fn fullscreen_terminal_tracks_drawable_size_with_windowed_restore_bounds(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let services = test_services();
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.select(fixture.selected_session_id.unwrap());
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
         });
+        let windowed = size(px(1000.0), px(700.0));
+        cx.simulate_resize(windowed);
+        cx.run_until_parked();
+        let original = root.read_with(cx, |root, cx| {
+            root.terminal.as_ref().unwrap().read(cx).geometry_for_test()
+        });
+
+        let fullscreen = size(px(1600.0), px(1000.0));
+        cx.simulate_resize(fullscreen);
+        root.update_in(cx, |_, window, cx| {
+            window.toggle_fullscreen();
+            // TestWindow::resize changes platform bounds without delivering a
+            // resize callback. Preserve the fullscreen drawable size while
+            // emulating macOS's saved windowed bounds for window restoration.
+            window.resize(windowed);
+            assert_eq!(window.viewport_size(), fullscreen);
+            assert_eq!(window.inner_window_bounds().get_bounds().size, windowed);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let expanded = root.read_with(cx, |root, cx| {
+            root.terminal.as_ref().unwrap().read(cx).geometry_for_test()
+        });
+        let before = original.0.unwrap();
+        let after = expanded.0.unwrap();
+        assert_eq!(
+            after.width - before.width,
+            600.0,
+            "terminal must fill fullscreen width"
+        );
+        assert_eq!(
+            after.height - before.height,
+            300.0,
+            "terminal must fill fullscreen height"
+        );
+        let before_grid = original.1.unwrap();
+        let after_grid = expanded.1.unwrap();
+        assert!(after_grid.0 > before_grid.0 && after_grid.1 > before_grid.1);
+
+        root.update_in(cx, |_, window, _| window.toggle_fullscreen());
+        cx.simulate_resize(windowed);
+        cx.run_until_parked();
+        let restored = root.read_with(cx, |root, cx| {
+            root.terminal.as_ref().unwrap().read(cx).geometry_for_test()
+        });
+        assert_eq!(
+            restored, original,
+            "leaving fullscreen must restore terminal geometry"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn switching_sidebar_conversations_keeps_terminal_focused(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let services = test_services();
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let runtime = services.store.clone();
+        {
+            let mut store = services.store.store.write().unwrap();
+            store
+                .update_preferences(|prefs| *prefs = fixture.prefs)
+                .unwrap();
+            store.hydrate(fixture.list);
+            store.select(SessionId::new("preview-claude"));
+            store.select(SessionId::new("preview-codex"));
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        let mut input = root.update(cx, |root, cx| {
+            root.terminal
+                .as_ref()
+                .unwrap()
+                .update(cx, |terminal, _| terminal.capture_input_for_test())
+        });
+        // Explicit inspector navigation may take focus; restoring this same
+        // blank browser tab after a conversation switch must not.
+        root.update(cx, |root, cx| {
+            root.inspector
+                .as_ref()
+                .unwrap()
+                .update(cx, |inspector, cx| {
+                    inspector.select_workspace(crate::inspector::WorkspaceSurface::Browser, cx);
+                });
+        });
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        cx.run_until_parked();
+        root.update_in(cx, |root, window, cx| {
+            assert!(
+                !root.terminal.as_ref().unwrap().read(cx).is_focused(window),
+                "explicit browser tab activation still takes focus"
+            );
+        });
+        for peeking in [false, true] {
+            if peeking {
+                root.update(cx, |root, cx| {
+                    root.sidebar.update(cx, |sidebar, cx| sidebar.conceal(cx));
+                });
+                cx.run_until_parked();
+                let edge = cx.debug_bounds("sidebar-peek-edge").unwrap();
+                cx.simulate_mouse_move(edge.center(), None, Modifiers::default());
+                cx.executor().advance_clock(Duration::from_millis(25));
+                cx.run_until_parked();
+            }
+            for id in ["preview-claude", "preview-codex", "preview-claude"] {
+                // Debug selectors are paint-local; refresh the cached sidebar
+                // before locating a row, never after the click under test.
+                root.update(cx, |root, cx| root.sidebar.update(cx, |_, cx| cx.notify()));
+                cx.run_until_parked();
+                let session = cx
+                    .debug_bounds(if id == "preview-claude" {
+                        "SESSION_preview-claude"
+                    } else {
+                        "SESSION_preview-codex"
+                    })
+                    .unwrap_or_else(|| panic!("visible row {id} (peek={peeking})"));
+                cx.simulate_click(session.center(), Modifiers::default());
+                // The inert runtime has no effect worker. Deliver the real local
+                // change broadcast so inspector restoration runs after the click.
+                runtime.publish_local_change();
+                cx.run_until_parked();
+                root.update_in(cx, |root, window, cx| {
+                    assert!(
+                        root.terminal.as_ref().unwrap().read(cx).is_focused(window),
+                        "terminal must accept typing after sidebar selection (peek={peeking})"
+                    );
+                });
+                cx.simulate_input("a");
+                cx.simulate_keystrokes("enter");
+                let mut bytes = Vec::new();
+                while let Ok((target, chunk)) = input.try_recv() {
+                    assert_eq!(
+                        target,
+                        SessionId::new(id),
+                        "typing must reach the selected conversation"
+                    );
+                    bytes.extend(chunk);
+                }
+                assert_eq!(
+                    bytes, b"a\r",
+                    "typing must work without clicking the terminal"
+                );
+            }
+            if peeking {
+                cx.simulate_mouse_move(
+                    gpui::point(px(600.0), px(300.0)),
+                    None,
+                    Modifiers::default(),
+                );
+                cx.executor().advance_clock(Duration::from_millis(300));
+                cx.run_until_parked();
+                root.update_in(cx, |root, window, cx| {
+                    assert!(!root.sidebar.read(cx).is_peeking());
+                    assert!(root.terminal.as_ref().unwrap().read(cx).is_focused(window));
+                });
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn palette_settings_clicks_reach_themes_and_full_settings(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.set_reduce_motion(true);
+            crate::commands::bind_keys(cx, &Default::default());
+        });
+        let services = test_services();
+        let store = services.store.clone();
+        let original_theme = store.store.read().unwrap().theme_id().to_owned();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes(&commands::test_chords("cmd-k s e t t i n g s"));
+        cx.run_until_parked();
+        let position = cx.debug_bounds("palette-row-0").unwrap().center();
+        cx.simulate_click(position, Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("palette-back").is_some(),
+            "Settings opens a palette page"
+        );
+        let position = cx.debug_bounds("palette-row-0").unwrap().center();
+        cx.simulate_click(position, Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("down");
+        assert_ne!(store.store.read().unwrap().theme_id(), original_theme);
+        cx.simulate_keystrokes("escape");
+        assert_eq!(store.store.read().unwrap().theme_id(), original_theme);
+        cx.simulate_keystrokes(&commands::test_chords("cmd-k s e t t i n g s enter"));
+        cx.run_until_parked();
+        let position = cx.debug_bounds("palette-row-1").unwrap().center();
+        cx.simulate_click(position, Modifiers::default());
+        cx.run_until_parked();
+        root.read_with(cx, |root, cx| {
+            assert!(
+                root.utility_surfaces
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .is_settings_open()
+            );
+            assert!(!root.navigation.as_ref().unwrap().read(cx).is_open());
+        });
+        cx.simulate_keystrokes(&commands::test_chords(
+            "cmd-k s e t t i n g s enter down enter",
+        ));
+        cx.run_until_parked();
+        root.read_with(cx, |root, cx| {
+            assert!(
+                root.utility_surfaces
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .is_settings_open(),
+                "All settings keeps an already open Settings canvas visible"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn sidebar_peek_reveals_on_the_edge_and_leaves_the_layout_collapsed(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let services = test_services();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, true, PreviewScenario::Typical, window, cx)
+        });
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        root.update(cx, |root, cx| {
+            root.sidebar.update(cx, |sidebar, cx| sidebar.conceal(cx))
+        });
+        cx.run_until_parked();
+        let edge = cx
+            .debug_bounds("sidebar-peek-edge")
+            .expect("collapsed edge");
+        cx.simulate_mouse_move(edge.center(), None, Modifiers::default());
+        cx.executor().advance_clock(Duration::from_millis(5));
+        cx.simulate_mouse_move(
+            gpui::point(px(600.0), px(300.0)),
+            None,
+            Modifiers::default(),
+        );
+        cx.executor().advance_clock(Duration::from_millis(120));
+        cx.run_until_parked();
+        assert!(!root.read_with(cx, |root, cx| root.sidebar.read(cx).is_peeking()));
+        cx.simulate_mouse_move(edge.center(), None, Modifiers::default());
+        cx.executor().advance_clock(Duration::from_millis(25));
+        cx.run_until_parked();
+        root.read_with(cx, |root, cx| {
+            assert!(root.sidebar.read(cx).is_peeking());
+            assert!(!root.sidebar.read(cx).is_visible());
+            assert_eq!(
+                root.sidebar_seam, 0.0,
+                "peeking must not resize the terminal"
+            );
+            assert_eq!(root.sidebar_panel_width, root.sidebar.read(cx).width());
+        });
+        // Resting in the new inset must not start a close/reopen loop.
+        cx.simulate_mouse_move(
+            gpui::point(px(SIDEBAR_PEEK_INSET / 2.0), edge.center().y),
+            None,
+            Modifiers::default(),
+        );
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert!(root.read_with(cx, |root, cx| root.sidebar.read(cx).is_peeking()));
+        let floating = cx
+            .debug_bounds("sidebar-surface")
+            .expect("floating sidebar");
+        assert_eq!(
+            floating.origin,
+            gpui::point(px(SIDEBAR_PEEK_INSET), px(SIDEBAR_PEEK_INSET))
+        );
+        assert_eq!(floating.size.height, px(700.0 - 2.0 * SIDEBAR_PEEK_INSET));
+        let session = cx
+            .debug_bounds("SESSION_preview-claude")
+            .expect("peek session row");
+        cx.simulate_click(session.center(), Modifiers::default());
+        root.read_with(cx, |root, cx| {
+            assert_eq!(
+                root.sidebar.read(cx).selected_session().unwrap().id,
+                SessionId::new("preview-claude")
+            );
+            assert!(
+                root.sidebar.read(cx).is_peeking(),
+                "selecting a session keeps the peek interactive"
+            );
+        });
+        cx.simulate_mouse_move(
+            gpui::point(px(150.0), px(300.0)),
+            None,
+            Modifiers::default(),
+        );
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert!(root.read_with(cx, |root, cx| root.sidebar.read(cx).is_peeking()));
+        cx.simulate_mouse_move(
+            gpui::point(px(600.0), px(300.0)),
+            None,
+            Modifiers::default(),
+        );
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        assert!(root.read_with(cx, |root, cx| root.sidebar.read(cx).is_peeking()));
+        // Returning during the grace period cancels the pending dismissal.
+        cx.simulate_mouse_move(
+            gpui::point(px(150.0), px(300.0)),
+            None,
+            Modifiers::default(),
+        );
+        cx.executor().advance_clock(Duration::from_millis(300));
+        cx.run_until_parked();
+        assert!(root.read_with(cx, |root, cx| root.sidebar.read(cx).is_peeking()));
+        cx.simulate_mouse_move(
+            gpui::point(px(600.0), px(300.0)),
+            None,
+            Modifiers::default(),
+        );
+        cx.executor().advance_clock(Duration::from_millis(300));
+        cx.run_until_parked();
+        assert!(!root.read_with(cx, |root, cx| root.sidebar.read(cx).is_peeking()));
+        assert!(cx.debug_bounds("sidebar-peek-edge").is_some());
+
+        cx.simulate_mouse_move(edge.center(), None, Modifiers::default());
+        cx.executor().advance_clock(Duration::from_millis(120));
+        cx.run_until_parked();
+        let pin = cx.debug_bounds("sidebar-toggle").expect("peek pin control");
+        cx.simulate_click(pin.center(), Modifiers::default());
+        cx.simulate_mouse_move(
+            gpui::point(px(600.0), px(300.0)),
+            None,
+            Modifiers::default(),
+        );
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        root.read_with(cx, |root, cx| {
+            assert!(root.sidebar.read(cx).is_visible());
+            assert!(!root.sidebar.read(cx).is_peeking());
+            assert_eq!(root.sidebar_float, 0.0);
+            assert_eq!(root.sidebar_seam, root.sidebar.read(cx).width());
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn recovery_notice_keeps_titlebar_clear_and_supports_copy_and_dismiss(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let services = test_services();
+        let store = services.store.clone();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            let mut root = RootView::new(services, true, PreviewScenario::Typical, window, cx);
+            root.preview = false;
+            root.services
+                .store
+                .store
+                .write()
+                .unwrap()
+                .report_prompt_delivery_failure("diagnostic detail".into());
+            root
+        });
+        for width in [640.0, 1000.0] {
+            cx.simulate_resize(size(px(width), px(700.0)));
+            cx.run_until_parked();
+            let card = cx.debug_bounds("RECOVERY_NOTICE").unwrap();
+            assert!(card.top() > px(Metrics::TITLE_BAR));
+            assert!(card.right() <= px(width - 16.0));
+            assert!(card.bottom() <= px(684.0));
+            let button = cx.debug_bounds("copy-recovery-details").unwrap();
+            assert!(card.contains(&button.center()));
+            cx.simulate_click(button.center(), Modifiers::default());
+            assert_eq!(
+                cx.read_from_clipboard().unwrap().text().as_deref(),
+                Some("diagnostic detail")
+            );
+        }
+        let dismiss = cx.debug_bounds("dismiss-recovery-notice").unwrap().center();
+        cx.simulate_click(dismiss, Modifiers::default());
+        assert!(store.store.read().unwrap().action_failure().is_none());
+        root.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("copy-recovery-details").is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes a visual preview to DIRI_RECOVERY_SCREENSHOT"]
+    fn render_recovery_notice_screenshot() {
+        use gpui::{AppContext as _, HeadlessAppContext};
+        let output = std::env::var("DIRI_RECOVERY_SCREENSHOT").expect("output path");
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let services = test_services();
+        let width = if std::env::var_os("DIRI_RECOVERY_NARROW").is_some() {
+            640.0
+        } else {
+            1000.0
+        };
+        let window = cx.open_window(size(px(width), px(700.0)), |window, cx| {
+            cx.new(|cx| {
+                let mut root = RootView::new(services.clone(), true, PreviewScenario::Typical, window, cx);
+                root.preview = false;
+                let mut store = services.store.store.write().unwrap();
+                store.update_preferences(|prefs| {
+                    prefs.terminal_theme = if std::env::var_os("DIRI_RECOVERY_LIGHT").is_some() {
+                        "dirijor-light".into()
+                    } else {
+                        "dirijor-dark".into()
+                    };
+                }).unwrap();
+                store.report_prompt_delivery_failure("initial_prompt_delivery_failed: session s_123 was created, but initial prompt delivery was not confirmed: the agent never confirmed that it submitted".into());
+                drop(store);
+                services.store.publish_local_change();
+                root
+            })
+        }).expect("preview window");
+        cx.run_until_parked();
+        cx.capture_screenshot(window.into())
+            .expect("screenshot")
+            .save(output)
+            .expect("save");
+        cx.update_window(window.into(), |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes a visual preview to DIRI_PEEK_SCREENSHOT"]
+    fn render_sidebar_peek_screenshot() {
+        use gpui::{AppContext as _, HeadlessAppContext};
+        let output = std::env::var("DIRI_PEEK_SCREENSHOT").expect("DIRI_PEEK_SCREENSHOT");
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let services = test_services();
+        let window = cx
+            .open_window(size(px(1000.0), px(700.0)), |window, cx| {
+                cx.new(|cx| {
+                    let root = RootView::new(services, true, PreviewScenario::Typical, window, cx);
+                    root.sidebar.update(cx, |sidebar, cx| {
+                        sidebar.conceal(cx);
+                        sidebar.peek(window, cx);
+                        if std::env::var_os("DIRI_PEEK_PINNED").is_some() {
+                            sidebar.toggle(cx);
+                        }
+                    });
+                    root
+                })
+            })
+            .expect("preview window");
+        cx.run_until_parked();
+        cx.capture_screenshot(window.into())
+            .expect("peek screenshot")
+            .save(output)
+            .expect("save peek screenshot");
+        cx.update_window(window.into(), |_, window, _| window.remove_window())
+            .expect("close preview window");
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn sidebar_peek_docks_the_same_panel_on_one_motion_curve(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let services = test_services();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, true, PreviewScenario::Typical, window, cx)
+        });
+        root.update_in(cx, |root, window, cx| {
+            root.sidebar.update(cx, |sidebar, cx| {
+                sidebar.conceal(cx);
+                sidebar.peek(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        let sidebar = root.read_with(cx, |root, _| root.sidebar.clone());
+        root.update(cx, |root, cx| {
+            cx.set_reduce_motion(false);
+            root.sidebar.update(cx, |sidebar, cx| sidebar.toggle(cx));
+        });
+        root.read_with(cx, |root, cx| {
+            assert_eq!(root.sidebar, sidebar);
+            let width = sidebar.read(cx).width();
+            assert_eq!(
+                root.sidebar_panel_width, width,
+                "the peek stays fully exposed when pinned"
+            );
+            assert!(
+                root.sidebar_panel_slide.is_none(),
+                "the panel must not replay its reveal"
+            );
+            let seam = root.sidebar_slide.expect("content makes room gradually");
+            let float = root
+                .sidebar_float_slide
+                .expect("inset and corners ease into the dock");
+            let halfway = Instant::now() + crate::seam::SEAM_SLIDE / 2;
+            let occupied = seam.seam_at(width, halfway);
+            let floating = float.seam_at(0.0, halfway);
+            assert!(occupied > 0.0 && occupied < width);
+            assert!(floating > 0.0 && floating < 1.0);
+            assert!(
+                (occupied / width + floating - 1.0).abs() < 0.001,
+                "layout, inset, radius and shadow must share the same curve and clock"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn inspector_close_preserves_new_focus(cx: &mut gpui::TestAppContext) {
+        for command in [
+            None,
+            Some(CommandId::FocusSidebar),
+            Some(CommandId::ToggleCommandPalette),
+        ] {
+            let services = test_services();
+            let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+            services.store.store.write().unwrap().hydrate(fixture.list);
+            let (root, cx) = cx.add_window_view(move |window, cx| {
+                RootView::new(services, false, PreviewScenario::Empty, window, cx)
+            });
+            cx.simulate_resize(size(px(1200.0), px(800.0)));
+            root.update(cx, |root, cx| {
+                root.preview = false;
+                root.inspector_open = true;
+                root.inspector_seam = 440.0;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            // Move to another keyboard surface while the inspector closes.
+            let focused = root.update_in(cx, |root, window, cx| {
+                root.run_command(CommandId::ToggleInspector, window, cx);
+                if let Some(command) = command {
+                    root.run_command(command, window, cx);
+                } else {
+                    root.terminal
+                        .as_ref()
+                        .expect("terminal")
+                        .update(cx, |terminal, cx| {
+                            terminal.focus(window, cx);
+                        });
+                }
+                window.focused(cx).expect("new surface has focus")
+            });
+            root.update(cx, |root, cx| {
+                root.inspector_slide = None;
+                root.inspector_seam = 0.0;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            root.update_in(cx, |_, window, cx| {
+                assert_eq!(
+                    window.focused(cx),
+                    Some(focused),
+                    "inspector unmount must preserve the newly focused {command:?}"
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn inspector_shortcut_reopens_after_close_button(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| crate::commands::bind_keys(cx, &Default::default()));
+        let services = test_services();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, true, PreviewScenario::Artifacts, window, cx)
+        });
+        cx.simulate_resize(size(px(1200.0), px(800.0)));
+        root.update_in(cx, |root, window, cx| {
+            root.preview = false;
+            root.inspector_open = true;
+            root.inspector_seam = 440.0;
+            let inspector = root.inspector.as_ref().unwrap();
+            window.focus(&inspector.read(cx).focus_handle(cx), cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let close = cx.debug_bounds("INSPECTOR_CLOSE").expect("close button");
+        cx.simulate_click(close.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(!root.read_with(cx, |root, _| root.inspector_open));
+        root.update(cx, |root, cx| {
+            root.inspector_slide = None;
+            root.inspector_seam = 0.0;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes(&commands::test_chords("cmd-shift-d"));
+        cx.run_until_parked();
+        assert!(
+            root.read_with(cx, |root, _| root.inspector_open),
+            "shortcut must reopen after X removes the focused panel"
+        );
+    }
+
+    #[gpui::test]
+    fn notification_trigger_closes_an_open_panel_in_one_click(cx: &mut gpui::TestAppContext) {
+        let services = test_services();
+        let session = SidebarPreviewFixture::make(PreviewScenario::Typical)
+            .list
+            .sessions[0]
+            .clone();
+        {
+            let mut store = services.store.store.write().expect("store");
+            store.upsert_session(session.clone());
+            store.select(session.id);
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, true, PreviewScenario::Empty, window, cx)
+        });
+        cx.simulate_resize(size(px(1_000.0), px(700.0)));
+        cx.run_until_parked();
+        let trigger = cx
+            .debug_bounds("notification-inbox-button")
+            .expect("notification trigger");
+
+        root.update_in(cx, |root, window, cx| {
+            root.toggle_notifications(window, cx);
+            assert!(root.notification_panel_open);
+        });
+        cx.simulate_click(trigger.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            !root.read_with(cx, |root, _| root.notification_panel_open),
+            "clicking the notification trigger again must close the panel without reopening it"
+        );
+    }
+
+    #[gpui::test]
+    fn titlebar_controls_do_not_arm_window_drag_but_empty_chrome_does(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let services = test_services();
+        let session = SidebarPreviewFixture::make(PreviewScenario::Typical)
+            .list
+            .sessions[0]
+            .clone();
+        {
+            let mut store = services.store.store.write().expect("store");
+            store.upsert_session(session.clone());
+            store.select(session.id);
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, true, PreviewScenario::Empty, window, cx)
+        });
+        cx.simulate_resize(size(px(1_000.0), px(700.0)));
+        cx.run_until_parked();
+        for selector in [
+            "show-sidebar",
+            "session-links-trigger",
+            "notification-inbox-button",
+        ] {
+            let control = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("missing titlebar control {selector}"));
+            assert!(
+                control.center().y < px(Metrics::TITLE_BAR),
+                "fixture must place {selector} in the titlebar: {control:?}"
+            );
+            cx.simulate_event(gpui::MouseDownEvent {
+                position: control.center(),
+                modifiers: Modifiers::default(),
+                button: MouseButton::Left,
+                click_count: 1,
+                first_mouse: false,
+            });
+            assert!(
+                !root.read_with(cx, |root, _| root.titlebar_drag_armed),
+                "{selector} must remain a click even if the pointer moves by a pixel"
+            );
+            cx.simulate_event(gpui::MouseUpEvent {
+                position: point(px(500.0), px(100.0)),
+                modifiers: Modifiers::default(),
+                button: MouseButton::Left,
+                click_count: 1,
+            });
+        }
+
+        let trigger = cx.debug_bounds("session-links-trigger").unwrap().center();
+        cx.simulate_click(trigger, Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("session-links-panel").is_some(),
+            "the protected dropdown trigger must still activate normally"
+        );
+
+        cx.simulate_click(trigger, Modifiers::default());
+        cx.run_until_parked();
+        let empty_titlebar = point(px(520.0), px(20.0));
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: empty_titlebar,
+            modifiers: Modifiers::default(),
+            button: MouseButton::Left,
+            click_count: 1,
+            first_mouse: false,
+        });
+        assert_eq!(
+            root.read_with(cx, |root, _| root.titlebar_drag_armed),
+            cfg!(target_os = "macos"),
+            "macOS arms window move on empty chrome; Linux leaves it to the compositor"
+        );
+    }
+
+    #[gpui::test]
+    fn auxiliary_close_control_does_not_cover_terminal_identity(cx: &mut gpui::TestAppContext) {
+        let services = test_services();
+        let mut parent = SidebarPreviewFixture::make(PreviewScenario::Typical)
+            .list
+            .sessions[0]
+            .clone();
+        parent.parent = None;
+        let mut auxiliary = parent.clone();
+        auxiliary.id = SessionId::new("auxiliary-terminal");
+        auxiliary.kind = AgentKind::SHELL;
+        auxiliary.parent = Some(parent.id.clone());
+        auxiliary.title = crate::store::AUXILIARY_TERMINAL_TITLE.to_owned();
+        {
+            let mut store = services.store.store.write().expect("store");
+            store.upsert_session(parent.clone());
+            store.upsert_session(auxiliary);
+            store.select(parent.id.clone());
+            assert!(store.auxiliary_terminal_for(&parent.id).is_some());
+            assert_eq!(store.selected_session_id(), Some(&parent.id));
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        assert_eq!(
+            root.read_with(cx, |root, _| root.auxiliary_id.clone()),
+            Some(SessionId::new("auxiliary-terminal")),
+            "fixture must mount the auxiliary terminal before the first async refresh"
+        );
+        cx.simulate_resize(size(px(1_000.0), px(700.0)));
+        cx.run_until_parked();
+
+        assert_eq!(
+            root.read_with(cx, |root, _| root.auxiliary_id.clone()),
+            Some(SessionId::new("auxiliary-terminal")),
+            "fixture must mount the auxiliary terminal"
+        );
+
+        let identity = cx
+            .debug_bounds("terminal-session-identity-auxiliary-terminal")
+            .expect("auxiliary terminal identity");
+        let close = cx
+            .debug_bounds("close-auxiliary-terminal")
+            .expect("auxiliary terminal close control");
+        assert!(
+            identity.right() <= close.left(),
+            "the close control must occupy reserved title-bar space instead of covering {identity:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn notification_panel_uses_the_settings_canvas_top_edge(cx: &mut gpui::TestAppContext) {
+        let services = test_services();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        cx.simulate_resize(size(px(1_000.0), px(700.0)));
+        root.update_in(cx, |root, window, cx| {
+            root.run_command(CommandId::OpenSettings, window, cx);
+            root.toggle_notifications(window, cx);
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+
+        let settings = cx.debug_bounds("settings-shell").expect("settings shell");
+        let trigger = cx
+            .debug_bounds("notification-inbox-button")
+            .expect("settings notification trigger");
+        let panel = cx
+            .debug_bounds("notification-panel")
+            .expect("notification panel");
+        assert_eq!(trigger.top(), settings.top() + px(7.0));
+        assert!(
+            panel.top() <= settings.top() + px(14.0)
+                && panel.top() < settings.top() + px(Metrics::TITLE_BAR),
+            "Settings has no workbench navbar, so the panel must enter from its canvas edge: {panel:?}"
+        );
+
+        cx.simulate_click(trigger.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            !root.read_with(cx, |root, _| root.notification_panel_open),
+            "the Settings notification trigger must close its open panel in one click"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn browser_stays_visible_through_every_resize(cx: &mut gpui::TestAppContext) {
+        let services = test_services();
         let (root, cx) = cx.add_window_view(move |window, cx| {
             RootView::new(services, true, PreviewScenario::Artifacts, window, cx)
         });

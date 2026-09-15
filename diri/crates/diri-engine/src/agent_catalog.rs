@@ -187,7 +187,8 @@ impl AgentCatalogStore {
 
 #[must_use]
 pub fn resolve_local(binary: &str, configured: Option<&str>) -> ExecutableResolution {
-    let detected_path = resolve_on_path(binary, &std::env::var("PATH").unwrap_or_default());
+    let path = crate::local_path::search_path(None, std::env::vars());
+    let detected_path = resolve_on_path(binary, &path);
     let (configured_path, configured_error) = match configured {
         Some(path) => match validate_executable(path) {
             Ok(path) => (Some(path), None),
@@ -226,7 +227,7 @@ pub fn validate_executable(path: &str) -> io::Result<String> {
     })
 }
 
-fn resolve_on_path(binary: &str, path: &str) -> Option<String> {
+pub(crate) fn resolve_on_path(binary: &str, path: &str) -> Option<String> {
     if binary.contains('/') {
         return validate_executable(binary).ok();
     }

@@ -3,7 +3,7 @@
 //! These values are estimates, never authoritative provider billing. Callers
 //! must label them accordingly and prefer billed spend when available.
 
-pub const PRICING_ENTRY_COUNT: usize = 15;
+pub const PRICING_ENTRY_COUNT: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ModelPricing {
@@ -69,7 +69,15 @@ pub fn match_claude(model: &str) -> Option<ModelPricing> {
 
 /// Match OpenAI model names in specific-to-generic order.
 pub fn match_openai(model: &str) -> Option<ModelPricing> {
-    if model.contains("gpt-5.4-mini") {
+    if model == "gpt-6-astra" {
+        // Standard API-equivalent rates, verified 2026-09-13:
+        // https://developers.openai.com/api/docs/models/gpt-6-astra
+        // These base estimates exclude service-tier and long-context premiums.
+        Some(ModelPricing {
+            input: 10.0,
+            output: 50.0,
+        })
+    } else if model.contains("gpt-5.4-mini") {
         Some(ModelPricing {
             input: 0.75,
             output: 4.5,
@@ -151,6 +159,14 @@ pub fn claude_estimate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn astra_usage_has_a_standard_cost_estimate() {
+        // 60 uncached input + 40 cached input + 20 output tokens.
+        let cost = openai_estimate("gpt-6-astra", 60, 20, 40).expect("Astra usage must be priced");
+        assert!((cost - 0.001_64).abs() < 1e-12);
+        assert_eq!(match_openai("gpt-6-unknown"), None);
+    }
 
     #[test]
     fn estimates_keep_cache_rates_distinct() {

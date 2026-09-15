@@ -8,8 +8,11 @@ workspace_dir="$(cd "${script_dir}/.." && pwd)"
 
 cd "${workspace_dir}"
 cargo bench --locked -p diri-terminal-state --bench terminal_throughput
+cargo bench --locked -p diri-terminal-state --bench terminal_fleet
+cargo test --locked -p vte
 cargo bench --locked -p diri-term --bench terminal_renderer -- \
     --warm-up-time 1 --measurement-time 2 --sample-size 10
 cargo test --locked --release -p diri-engine --test holder \
     holder_input_latency_is_reported -- --ignored --exact --nocapture
 cargo test --locked --release -p diri-engine --test attach -- --nocapture
+cargo test --locked --release -p diri-engine --test holder_output_compat -- --nocapture

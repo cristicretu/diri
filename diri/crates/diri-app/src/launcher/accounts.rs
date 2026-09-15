@@ -85,6 +85,16 @@ impl LauncherOverlay {
         cx.notify();
     }
 
+    pub(super) fn show_account_picker(&self) -> bool {
+        matches!(self.selected_harness.id(), "codex" | "claude-code")
+            && (self.selected_account.is_some()
+                || self.accounts_error.is_some()
+                || self.accounts.profiles.iter().any(|profile| {
+                    profile.agent == self.selected_harness.id()
+                        && profile.host == self.selected_host
+                }))
+    }
+
     pub(super) fn account_picker_button(
         &self,
         colors: SemanticColors,
@@ -101,13 +111,12 @@ impl LauncherOverlay {
             .role(Role::Button)
             .aria_label("Choose account profile")
             .h(px(CONTROL_SIZE))
-            .max_w(px(170.0))
+            .max_w(px(135.0))
             .px(px(8.0))
             .flex()
             .items_center()
             .gap(px(6.0))
             .rounded(px(CONTROL_RADIUS))
-            .bg(Fill::subtle(colors))
             .text_size(px(11.0))
             .text_color(colors.secondary)
             .cursor_pointer()

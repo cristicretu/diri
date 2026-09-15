@@ -22,9 +22,8 @@ use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::notifications::{
-    PendingAttention, SendTextCommand, StatusTransition, attention_signal,
-    immediate_transitions_for_update, migration_transition, prefs_sync_transition,
-    reach_failure_transition, settled_attention_transition,
+    SendTextCommand, StatusTransition, immediate_transitions_for_update, migration_transition,
+    prefs_sync_transition, reach_failure_transition,
 };
 use crate::switcher::{
     OverviewArrow, OverviewFilter, OverviewMode, OverviewOutcome, SessionOverviewState,
@@ -116,7 +115,10 @@ pub enum StoreEffect {
     Spawn(SessionSpawnParams),
     /// A shell owned by a workbench pane. Unlike a top-level spawn, its
     /// response must not replace the selected sidebar session.
-    SpawnAuxiliary(SessionSpawnParams),
+    SpawnAuxiliary {
+        params: SessionSpawnParams,
+        slot: usize,
+    },
     /// Wake the client's idempotent reconnect loop out of backoff.
     RetryConnection,
     /// `session.migrate` — move a Claude session between local and a host.
@@ -174,6 +176,8 @@ impl RetryAction {
         }
     }
 }
+
+pub(crate) const PROMPT_DELIVERY_FAILURE_TITLE: &str = "Check prompt delivery";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActionFailure {
@@ -295,6 +299,8 @@ pub struct SessionStore {
     session_list_hydrated: bool,
     daemon_identity: Option<HelloResult>,
     sessions: HashMap<SessionId, Arc<SessionRecord>>,
+    auxiliary_slots: HashMap<(SessionId, usize), SessionId>,
+    auxiliary_pending: HashSet<(SessionId, usize)>,
     projects: HashMap<ProjectId, Project>,
     selected_session_id: Option<SessionId>,
     sidebar_selection: HashSet<SessionId>,
@@ -317,6 +323,7 @@ pub struct SessionStore {
     directory_request_seq: u64,
     directory_listing: Option<DirectoryListing>,
     prefs: Prefs,
+    theme_preview: Option<String>,
     terminal_residency: TerminalResidency,
     app_is_active: bool,
     notification_surface_visible: bool,
@@ -351,7 +358,6 @@ pub struct SessionStore {
     /// Attention states serving out their settle window, newest arming wins.
     /// Drained by the settle task in `StoreHandle`, which is what turns one of
     /// these into a chime and a banner — see `drain_settled_attention`.
-    attention_settle: HashMap<SessionId, PendingAttention>,
     notification_feed: crate::notification_feed::NotificationFeed,
     /// Wakes the settle task when a window is armed early enough to beat the
     /// one it is currently sleeping on.
@@ -387,7 +393,10 @@ impl SessionStore {
                 crate::notification_feed::NotificationFeed::load(&parent.join("notifications.json"))
             })
             .transpose()
-            .unwrap_or_default()
+            .unwrap_or_else(|error| {
+                eprintln!("diri: notification history unavailable; alerts suppressed: {error}");
+                Some(crate::notification_feed::NotificationFeed::unavailable())
+            })
             .unwrap_or_default();
         (
             Self {
@@ -395,6 +404,8 @@ impl SessionStore {
                 session_list_hydrated: false,
                 daemon_identity: None,
                 sessions: HashMap::new(),
+                auxiliary_slots: HashMap::new(),
+                auxiliary_pending: HashSet::new(),
                 projects: HashMap::new(),
                 selected_session_id: selected_session_id.clone(),
                 sidebar_selection: HashSet::new(),
@@ -408,6 +419,7 @@ impl SessionStore {
                 directory_request_seq: 0,
                 directory_listing: None,
                 prefs,
+                theme_preview: None,
                 terminal_residency: TerminalResidency::default(),
                 app_is_active: true,
                 notification_surface_visible: true,
@@ -427,7 +439,6 @@ impl SessionStore {
                 agents: HashMap::new(),
                 agent_catalog_scans: HashMap::new(),
                 agent_catalog_errors: HashMap::new(),
-                attention_settle: HashMap::new(),
                 notification_feed,
                 attention_wake: Arc::new(Notify::new()),
                 effects,
@@ -441,13 +452,7 @@ impl SessionStore {
     }
 
     fn notification_change(&self, dismiss: Vec<String>) {
-        if let Some(parent) = self.prefs_path.as_ref().and_then(|path| path.parent())
-            && let Err(error) = self
-                .notification_feed
-                .save(&parent.join("notifications.json"))
-        {
-            eprintln!("diri: could not save notification history: {error}");
-        }
+        self.notification_feed.invalidate(&dismiss);
         if !dismiss.is_empty() {
             self.emit(StoreEffect::StatusTransition(StatusTransition {
                 dismiss,
@@ -511,11 +516,10 @@ impl SessionStore {
                 return false;
             }
         }
-        self.notification_feed
-            .entries()
-            .iter()
-            .find(|entry| entry.id == request.identifier)
-            .is_none_or(|entry| !entry.read && !entry.resolved)
+        if !request.session_event {
+            return true;
+        }
+        self.notification_feed.deliverable(&request.identifier)
     }
 
     pub fn toggle_notification_alerts(&mut self) {
@@ -796,6 +800,43 @@ impl SessionStore {
             .cloned()
     }
 
+    /// Tab bindings use the Engine's returned ID, never mutable titles or list positions.
+    pub fn auxiliary_terminal_for_slot(
+        &mut self,
+        parent: &SessionId,
+        slot: usize,
+    ) -> Option<Arc<SessionRecord>> {
+        if let Some(id) = self.auxiliary_slots.get(&(parent.clone(), slot)) {
+            return self
+                .sessions
+                .get(id)
+                .filter(|session| !session.is_archived() && !self.closing.contains(id))
+                .cloned();
+        }
+        if slot == 0 {
+            let session = self
+                .auxiliary_terminal_for(parent)
+                .filter(|session| !self.auxiliary_slots.values().any(|id| id == &session.id))?;
+            self.auxiliary_slots
+                .insert((parent.clone(), slot), session.id.clone());
+            return Some(session);
+        }
+        None
+    }
+
+    pub fn auxiliary_spawn_pending(&self, parent: &SessionId, slot: usize) -> bool {
+        self.auxiliary_pending.contains(&(parent.clone(), slot))
+    }
+
+    fn finish_auxiliary_spawn(&mut self, parent: SessionId, slot: usize, id: Option<SessionId>) {
+        if id.as_ref().is_none_or(|id| self.sessions.contains_key(id)) {
+            self.auxiliary_pending.remove(&(parent.clone(), slot));
+        }
+        if let Some(id) = id {
+            self.auxiliary_slots.insert((parent, slot), id);
+        }
+    }
+
     pub fn projects(&self) -> &HashMap<ProjectId, Project> {
         &self.projects
     }
@@ -966,6 +1007,17 @@ impl SessionStore {
         self.last_action_failure.as_ref()
     }
 
+    pub(crate) fn report_prompt_delivery_failure(&mut self, detail: String) {
+        // Never offer a blind retry: the Agent may have accepted input before
+        // the connection failed. The composer retains the reviewable draft.
+        self.last_action_failure = Some(ActionFailure {
+            title: PROMPT_DELIVERY_FAILURE_TITLE.into(),
+            detail,
+            retrying: false,
+            retry: None,
+        });
+    }
+
     pub fn dismiss_action_failure(&mut self) {
         self.last_action_failure = None;
         self.emit(StoreEffect::UiChanged);
@@ -999,6 +1051,25 @@ impl SessionStore {
     /// without waiting for the next daemon event.
     pub fn request_snapshot_publish(&mut self) {
         self.emit(StoreEffect::PublishSnapshot);
+    }
+
+    /// Effective appearance only; persisted preferences never contain a preview.
+    pub fn theme_id(&self) -> &str {
+        self.theme_preview
+            .as_deref()
+            .unwrap_or(&self.prefs.terminal_theme)
+    }
+
+    pub fn preview_theme_id(&self) -> Option<&str> {
+        self.theme_preview.as_deref()
+    }
+
+    pub fn preview_theme(&mut self, theme: Option<String>) -> bool {
+        if self.theme_preview == theme {
+            return false;
+        }
+        self.theme_preview = theme;
+        true
     }
 
     pub fn update_preferences(&mut self, update: impl FnOnce(&mut Prefs)) -> io::Result<()> {
@@ -1352,19 +1423,14 @@ impl SessionStore {
         let sessions: Vec<_> = self.sessions.values().cloned().collect();
         let mut added = false;
         for session in sessions {
-            let request = match session.attention() {
-                AttentionLevel::NeedsInput | AttentionLevel::DoneUnseen => {
-                    Some(crate::notifications::attention_request(
-                        &session,
-                        false,
-                        self.agent_descriptor(session.effective_kind()),
-                    ))
-                }
-                _ => crate::notifications::failed_request(&session),
-            };
-            if let Some(request) = request {
-                added |= self.notification_feed.record(&session, &request, false);
-            }
+            let descriptor = self.agent_descriptor(session.effective_kind()).cloned();
+            added |= self.notification_feed.observe(
+                &session,
+                descriptor.as_ref(),
+                false,
+                true,
+                Instant::now(),
+            );
         }
         let dismissed = self
             .notification_feed
@@ -1420,6 +1486,8 @@ impl SessionStore {
                                     .status_sounds
                                     .then_some(crate::notifications::NotificationSound::Done),
                                 notification: Some(crate::notifications::NotificationRequest {
+                                    session_event: true,
+                                    guard: self.notification_feed.guard(&event.id),
                                     identifier: event.id,
                                     title: event.title,
                                     body: event.body,
@@ -1508,6 +1576,8 @@ impl SessionStore {
     }
 
     pub fn upsert_session(&mut self, session: SessionRecord) {
+        self.auxiliary_pending
+            .retain(|key| self.auxiliary_slots.get(key) != Some(&session.id));
         let previous = self.sessions.get(&session.id).cloned();
         let is_new = previous.is_none();
         let id = session.id.clone();
@@ -1516,8 +1586,6 @@ impl SessionStore {
             &session,
             self.prefs.status_sounds,
         );
-        let attention = attention_signal(previous.as_deref(), &session);
-        let arriving_attention = session.attention();
         let arriving_archived = session.is_archived();
         // Closing the tab also drops the Engine record and deletes the
         // session's output log, so it may only happen where nothing is lost.
@@ -1538,33 +1606,26 @@ impl SessionStore {
             && previous
                 .as_deref()
                 .is_none_or(|record| !matches!(record.status, SessionStatus::Exited(_)));
-        let failure = (!self.closing.contains(&id)
-            && previous
-                .as_ref()
-                .is_some_and(|old| !matches!(old.status, SessionStatus::Exited(_))))
-        .then(|| crate::notifications::failed_request(&session))
-        .flatten();
         self.sessions.insert(id.clone(), Arc::new(session));
         self.reconcile_notifications();
-        if let Some(request) = failure {
-            let current = self.sessions.get(&id).expect("inserted");
-            let focused = self.notification_is_focused(&id);
-            if self.notification_feed.record(current, &request, focused) {
-                self.notification_change(Vec::new());
-                if !focused {
-                    self.emit(StoreEffect::StatusTransition(StatusTransition {
-                        dismiss: Vec::new(),
-                        sound: self
-                            .prefs
-                            .status_sounds
-                            .then_some(crate::notifications::NotificationSound::NeedsInput),
-                        notification: Some(request),
-                        in_app_banner: None,
-                    }));
-                }
-            }
+        let current = self.sessions.get(&id).expect("inserted");
+        let focused = self.notification_is_focused(&id);
+        let descriptor = self.agent_descriptor(current.effective_kind()).cloned();
+        if !self.closing.contains(&id)
+            && previous
+                .as_ref()
+                .is_none_or(|previous| previous.attention_state != current.attention_state)
+            && self.notification_feed.observe(
+                current,
+                descriptor.as_ref(),
+                focused,
+                false,
+                Instant::now(),
+            )
+        {
+            self.notification_change(Vec::new());
+            self.attention_wake.notify_one();
         }
-        self.settle_attention(&id, attention, arriving_attention, arriving_archived);
         // Spawn selects the id before the authoritative record arrives, and
         // only focus_session grants terminal residency -- without this, a
         // session created from the UI stays "Preparing terminal" forever.
@@ -1605,89 +1666,27 @@ impl SessionStore {
         self.reconcile_navigation();
     }
 
-    /// Arms, replaces, or abandons a session's settle window after an update.
-    ///
-    /// A fresh signal always re-arms: the newest reason to interrupt is the one
-    /// worth waiting on. Without a signal, a window whose state the session no
-    /// longer holds is dropped here rather than at the deadline, so a blip that
-    /// resolves immediately never even keeps the settle task awake.
-    fn settle_attention(
-        &mut self,
-        id: &SessionId,
-        signal: Option<AttentionLevel>,
-        attention: AttentionLevel,
-        archived: bool,
-    ) {
-        if let Some(level) = signal {
-            self.attention_settle.insert(
-                id.clone(),
-                PendingAttention::armed_at(level, Instant::now()),
-            );
-            self.attention_wake.notify_one();
-        } else if self
-            .attention_settle
-            .get(id)
-            .is_some_and(|pending| archived || pending.level != attention)
-        {
-            self.attention_settle.remove(id);
-        }
-    }
-
-    /// The earliest settle window still to run, for the task that sleeps on it.
-    #[must_use]
     pub fn next_attention_deadline(&self) -> Option<Instant> {
-        self.attention_settle
-            .values()
-            .map(|pending| pending.deadline)
-            .min()
+        self.notification_feed.next_deadline()
     }
 
-    /// Handle to the signal raised whenever a settle window is armed.
-    #[must_use]
     pub fn attention_wake(&self) -> Arc<Notify> {
         Arc::clone(&self.attention_wake)
     }
 
-    /// Turns every expired settle window into the chime and banner it earned,
-    /// judged against the session as it is now — not as it was when the window
-    /// was armed. States that did not survive produce nothing.
-    #[must_use]
     pub fn drain_settled_attention(&mut self, now: Instant) -> Vec<StatusTransition> {
-        let due: Vec<SessionId> = self
-            .attention_settle
-            .iter()
-            .filter(|(_, pending)| pending.deadline <= now)
-            .map(|(id, _)| id.clone())
-            .collect();
-        let mut transitions = Vec::with_capacity(due.len());
-        for id in due {
-            let Some(pending) = self.attention_settle.remove(&id) else {
-                continue;
-            };
-            let Some(session) = self.sessions.get(&id) else {
-                continue;
-            };
-            if let Some(transition) = settled_attention_transition(
-                session,
-                pending.level,
-                self.selected_session_id.as_ref(),
-                self.app_is_active && self.notification_surface_visible,
-                self.prefs.status_sounds,
-                self.agent_descriptor(session.effective_kind()),
-            ) {
-                let request = crate::notifications::attention_request(
-                    session,
-                    false,
-                    self.agent_descriptor(session.effective_kind()),
-                );
-                let focused = self.notification_is_focused(&id);
-                if self.notification_feed.record(session, &request, focused) {
-                    self.notification_change(Vec::new());
-                    transitions.push(transition);
-                }
-            }
-        }
+        let transitions = self
+            .notification_feed
+            .drain_due(now, self.prefs.status_sounds);
         transitions
+            .into_iter()
+            .filter(|effect| {
+                effect
+                    .notification
+                    .as_ref()
+                    .is_some_and(|request| self.should_deliver_notification(request))
+            })
+            .collect()
     }
 
     pub fn remove_session_record(&mut self, id: &SessionId) {
@@ -1696,7 +1695,6 @@ impl SessionStore {
         }
         self.sessions.remove(id);
         self.reconcile_notifications();
-        self.attention_settle.remove(id);
         self.closing.remove(id);
         self.sidebar_selection.remove(id);
         self.mru_order.retain(|candidate| candidate != id);
@@ -1884,6 +1882,10 @@ impl SessionStore {
 
     pub fn dismiss_overview(&mut self) {
         self.overview.dismiss();
+    }
+
+    pub fn set_overview_columns(&mut self, columns: usize) {
+        self.overview.set_columns(columns);
     }
 
     pub fn set_overview_mode(&mut self, mode: OverviewMode) {
@@ -2274,32 +2276,53 @@ impl SessionStore {
     /// pane focus is local UI state, while sidebar selection remains on the
     /// owning agent.
     pub fn spawn_auxiliary_terminal(&mut self, parent: SessionId) -> bool {
+        self.spawn_auxiliary_terminal_slot(parent, 0)
+    }
+
+    pub fn spawn_auxiliary_terminal_slot(&mut self, parent: SessionId, slot: usize) -> bool {
+        if let Some(existing) = self.auxiliary_terminal_for_slot(&parent, slot) {
+            self.auxiliary_slots
+                .insert((parent, slot), existing.id.clone());
+            return false;
+        }
         let Some(session) = self.sessions.get(&parent) else {
             return false;
         };
-        if self.auxiliary_terminal_for(&parent).is_some() {
-            return false;
+        if !self.auxiliary_pending.insert((parent.clone(), slot)) {
+            return true;
         }
         self.last_action_failure = None;
-        self.emit(StoreEffect::SpawnAuxiliary(SessionSpawnParams {
-            kind: AgentKind::SHELL,
-            cwd: session.cwd.clone(),
-            new_worktree: None,
-            worktree_branch: None,
-            worktree_base: None,
-            title: Some(AUXILIARY_TERMINAL_TITLE.to_owned()),
-            initial_prompt: None,
-            parent: Some(parent),
-            initial_cols: None,
-            initial_rows: None,
-            host: session.host.clone(),
-            account_profile_id: None,
-            same_repo_as: None,
-        }));
+        self.emit(StoreEffect::SpawnAuxiliary {
+            slot,
+            params: SessionSpawnParams {
+                kind: AgentKind::SHELL,
+                cwd: session.cwd.clone(),
+                new_worktree: None,
+                worktree_branch: None,
+                worktree_base: None,
+                title: Some(AUXILIARY_TERMINAL_TITLE.to_owned()),
+                initial_prompt: None,
+                parent: Some(parent),
+                initial_cols: None,
+                initial_rows: None,
+                host: session.host.clone(),
+                account_profile_id: None,
+                same_repo_as: None,
+            },
+        });
         true
     }
 
     pub fn spawn_kind(&mut self, kind: AgentKind, options: SpawnOptions) {
+        self.emit(StoreEffect::Spawn(self.spawn_params(kind, options)));
+    }
+
+    /// Shared launch resolution for queued actions and acknowledged composers.
+    pub(crate) fn spawn_params(
+        &self,
+        kind: AgentKind,
+        options: SpawnOptions,
+    ) -> SessionSpawnParams {
         let host = options.host;
         let cwd = if let Some(host_id) = &host {
             // Remote spawn: local directories are meaningless — use the
@@ -2321,7 +2344,7 @@ impl SessionStore {
         let (new_worktree, worktree_branch) = worktree.map_or((None, None), |worktree| {
             (Some(worktree.create), worktree.branch)
         });
-        self.emit(StoreEffect::Spawn(SessionSpawnParams {
+        SessionSpawnParams {
             kind,
             cwd,
             new_worktree,
@@ -2335,7 +2358,7 @@ impl SessionStore {
             host,
             account_profile_id: options.account_profile_id,
             same_repo_as: options.same_repo_as,
-        }));
+        }
     }
 
     pub fn reparent_worktree(&self, params: diri_proto::SessionReparentWorktreeParams) {
@@ -2402,6 +2425,13 @@ impl SessionStore {
             .unwrap_or_else(|| "/".to_owned())
     }
 
+    /// Opening the links surface is an explicit request for fresh PR metadata.
+    pub fn refresh_session_links(&self, id: SessionId) {
+        if self.sessions.contains_key(&id) {
+            self.emit(StoreEffect::MarkSeen(id));
+        }
+    }
+
     pub fn set_active(&mut self, active: bool) {
         if self.app_is_active == active {
             return;
@@ -2443,11 +2473,7 @@ impl SessionStore {
                 self.emit(StoreEffect::DetachAttachment(evicted));
             }
         }
-        if self
-            .sessions
-            .get(&id)
-            .is_some_and(|session| !session.is_archived())
-        {
+        if self.sessions.contains_key(&id) {
             // Selection is also the PR/artifact visibility signal. The
             // daemon uses mark_seen to wake a fresh foreground refresh, even
             // when there was no unseen completion to acknowledge.
@@ -3109,7 +3135,16 @@ async fn run_effects(
                 }
                 Err(error) => Err(error),
             },
-            StoreEffect::SpawnAuxiliary(params) => client.spawn(params).await.map(|_| ()),
+            StoreEffect::SpawnAuxiliary { params, slot } => {
+                let parent = params.parent.clone().expect("auxiliary parent");
+                let result = client.spawn(params).await;
+                store.write().expect("store").finish_auxiliary_spawn(
+                    parent,
+                    slot,
+                    result.as_ref().ok().cloned(),
+                );
+                result.map(|_| ())
+            }
             StoreEffect::RetryConnection => {
                 client.retry_now();
                 Ok(())
@@ -3342,7 +3377,7 @@ fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
             }),
         ),
         StoreEffect::Spawn(_) => ("Create session failed", None),
-        StoreEffect::SpawnAuxiliary(_) => ("Open terminal failed", None),
+        StoreEffect::SpawnAuxiliary { .. } => ("Open terminal failed", None),
         StoreEffect::Migrate { .. } => ("Move session failed", None),
         StoreEffect::ReparentWorktree(_) => ("Move session to worktree failed", None),
         StoreEffect::SyncPrefs { host, host_name } => (

@@ -66,10 +66,10 @@ def main() -> int:
                 "target": "licenses/NOTICE.txt",
             },
             {
-                "src": str(repository / "license-policy.json"),
+                "src": str(repository / "scripts" / "license-policy.json"),
                 "target": "licenses/license-policy.json",
             },
-            {"src": str(repository / "LICENSES"), "target": "licenses"},
+            {"src": str(repository / "docs" / "third-party"), "target": "licenses"},
         ],
         "linux": {"generateDesktopEntry": True},
         "deb": {

@@ -395,6 +395,7 @@ mod tests {
 
     fn session(id: &str, parent: Option<&str>) -> SessionRecord {
         SessionRecord {
+            attention_state: None,
             id: SessionId::new(id),
             kind: AgentKind::CODEX,
             cwd: format!("/repo/{id}"),
@@ -508,6 +509,7 @@ mod tests {
             merged: false,
             age_days: 1,
             stale_suggestion: false,
+            health: Default::default(),
         };
         let proposal = worktree_move_proposal(&source, Some(&project), &target).unwrap();
         assert_eq!(proposal.worktree_path, "/repo-feature");

@@ -127,9 +127,14 @@ fn append_matches(
         return;
     }
 
+    let case_sensitive = needle.iter().any(|ch| ch.is_uppercase());
     let mut index = 0;
     while index + needle.len() <= haystack.len() {
-        if chars_equal_ci(&haystack[index..index + needle.len()], needle) {
+        if chars_equal(
+            &haystack[index..index + needle.len()],
+            needle,
+            case_sensitive,
+        ) {
             if output.len() == MATCH_CAP {
                 output.pop_front();
             }
@@ -146,11 +151,11 @@ fn append_matches(
     }
 }
 
-fn chars_equal_ci(haystack: &[char], needle: &[char]) -> bool {
+fn chars_equal(haystack: &[char], needle: &[char], case_sensitive: bool) -> bool {
     haystack.iter().zip(needle).all(|(left, right)| {
         // Exact match first skips allocation on the overwhelmingly common
         // path, including every mismatching position the scan visits.
-        left == right || left.to_lowercase().eq(right.to_lowercase())
+        left == right || (!case_sensitive && left.to_lowercase().eq(right.to_lowercase()))
     })
 }
 
@@ -166,4 +171,32 @@ fn column_for(index: usize, columns: Option<&[usize]>) -> usize {
 
 fn column_past_end(index: usize, columns: Option<&[usize]>) -> usize {
     column_for(index, columns)
+}
+
+#[cfg(test)]
+mod qol_tests {
+    use super::*;
+    #[test]
+    fn uppercase_query_is_exact_and_lowercase_folds_unicode() {
+        let mut result = VecDeque::new();
+        append_matches(
+            "Error error ERROR",
+            None,
+            0,
+            &"Error".chars().collect::<Vec<_>>(),
+            &mut Vec::new(),
+            &mut result,
+        );
+        assert_eq!(result.len(), 1);
+        result.clear();
+        append_matches(
+            "Échec échec",
+            None,
+            0,
+            &"échec".chars().collect::<Vec<_>>(),
+            &mut Vec::new(),
+            &mut result,
+        );
+        assert_eq!(result.len(), 2);
+    }
 }

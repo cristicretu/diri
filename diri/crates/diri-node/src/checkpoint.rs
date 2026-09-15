@@ -1,6 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -28,6 +29,7 @@ const MAX_CHUNK_BYTES: u64 = 1024 * 1024;
 pub struct CheckpointStore {
     node_id: String,
     paths: NodePaths,
+    upload_lock: Mutex<()>,
 }
 
 impl CheckpointStore {
@@ -35,6 +37,7 @@ impl CheckpointStore {
         Self {
             node_id: node_id.into(),
             paths,
+            upload_lock: Mutex::new(()),
         }
     }
 
@@ -153,13 +156,26 @@ impl CheckpointStore {
     }
 
     pub fn put_blob(&self, params: BlobPutParams) -> NodeResult<bool> {
+        let _upload = self
+            .upload_lock
+            .lock()
+            .map_err(|_| NodeError::Protocol("checkpoint upload lock is poisoned".into()))?;
         validate_digest(&params.digest)?;
         let bytes = hex_decode(&params.hex)?;
         if bytes.len() > usize::try_from(MAX_CHUNK_BYTES).unwrap_or(usize::MAX) {
             return Err(NodeError::BadRequest("blob chunk is too large".into()));
         }
+        let expected_size = self.expected_blob_size(&params.digest)?;
         let final_path = self.blob_path(&params.digest);
         if final_path.is_file() {
+            if fs::metadata(&final_path)?.len() != expected_size
+                || sha256_file(&final_path)? != params.digest
+            {
+                return Err(NodeError::Conflict(format!(
+                    "blob `{}` has unexpected contents",
+                    params.digest
+                )));
+            }
             return Ok(true);
         }
         let partial = self.paths.blobs.join(format!(".{}.partial", params.digest));
@@ -168,6 +184,17 @@ impl CheckpointStore {
             return Err(NodeError::Conflict(format!(
                 "blob offset mismatch: expected {current}, got {}",
                 params.offset
+            )));
+        }
+        let received = current.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        if received > expected_size || received > MAX_FILE_BYTES {
+            return Err(NodeError::BadRequest(format!(
+                "blob exceeds its declared size of {expected_size} bytes"
+            )));
+        }
+        if params.eof && received != expected_size {
+            return Err(NodeError::BadRequest(format!(
+                "blob ended at {received} bytes; expected {expected_size}"
             )));
         }
         let mut options = OpenOptions::new();
@@ -182,6 +209,7 @@ impl CheckpointStore {
         }
         let actual = sha256_file(&partial)?;
         if actual != params.digest {
+            let _ = fs::remove_file(&partial);
             return Err(NodeError::BadRequest(format!(
                 "blob digest mismatch: expected {}, received {actual}",
                 params.digest
@@ -396,7 +424,10 @@ impl CheckpointStore {
         validate_relative_path(relative)?;
         validate_digest(&entry.digest)?;
         let source = self.blob_path(&entry.digest);
-        if !source.is_file() || sha256_file(&source)? != entry.digest {
+        if !source.is_file()
+            || fs::metadata(&source)?.len() != entry.size
+            || sha256_file(&source)? != entry.digest
+        {
             return Err(NodeError::Conflict(format!(
                 "checkpoint blob `{}` is missing or corrupt",
                 entry.digest
@@ -457,6 +488,36 @@ impl CheckpointStore {
         validate_manifest(manifest)?;
         atomic_json(&self.manifest_path(&manifest.checkpoint_id), manifest)?;
         Ok(())
+    }
+
+    fn expected_blob_size(&self, digest: &str) -> NodeResult<u64> {
+        let mut expected = None;
+        for entry in fs::read_dir(&self.paths.checkpoints)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file()
+                || entry.path().extension().and_then(|value| value.to_str()) != Some("json")
+            {
+                continue;
+            }
+            let manifest: CheckpointManifest = serde_json::from_slice(&fs::read(entry.path())?)?;
+            validate_manifest(&manifest)?;
+            for file in manifest.files.iter().chain(&manifest.provider_state) {
+                if file.digest != digest {
+                    continue;
+                }
+                if expected.is_some_and(|size| size != file.size) {
+                    return Err(NodeError::Conflict(format!(
+                        "blob `{digest}` has conflicting declared sizes"
+                    )));
+                }
+                expected = Some(file.size);
+            }
+        }
+        expected.ok_or_else(|| {
+            NodeError::BadRequest(format!(
+                "blob `{digest}` is not referenced by an accepted checkpoint manifest"
+            ))
+        })
     }
 
     fn load_manifest(&self, checkpoint_id: &str) -> NodeResult<CheckpointManifest> {
@@ -733,6 +794,57 @@ mod tests {
         assert!(validate_relative_path(Path::new("src/main.rs")).is_ok());
         assert!(validate_relative_path(Path::new("../auth.json")).is_err());
         assert!(validate_relative_path(Path::new("/etc/passwd")).is_err());
+    }
+
+    #[test]
+    fn blob_upload_must_match_an_accepted_manifest_size() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let paths = NodePaths::for_root(directory.path().join("node"));
+        paths.create_layout().expect("layout");
+        let store = CheckpointStore::new(paths.clone(), "target");
+        let digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        store
+            .put_manifest(&CheckpointManifest {
+                version: CHECKPOINT_VERSION,
+                checkpoint_id: "cp-0123456789abcdef0123456789abcdef".into(),
+                source_node_id: "source".into(),
+                session_id: "session-1".into(),
+                provider: ProviderKind::Codex,
+                profile_id: "personal".into(),
+                workspace_root: "/workspace".into(),
+                provider_session_id: None,
+                mode: TransferMode::Move,
+                created_at: 0,
+                files: vec![CheckpointFile {
+                    path: "src/main.rs".into(),
+                    digest: digest.into(),
+                    size: 3,
+                    unix_mode: None,
+                }],
+                provider_state: None,
+                excluded: Vec::new(),
+            })
+            .expect("manifest");
+
+        let oversized = store.put_blob(BlobPutParams {
+            digest: digest.into(),
+            offset: 0,
+            hex: "61626364".into(),
+            eof: true,
+        });
+        assert!(matches!(oversized, Err(NodeError::BadRequest(_))));
+        assert!(!paths.blobs.join(format!(".{digest}.partial")).exists());
+
+        assert!(
+            store
+                .put_blob(BlobPutParams {
+                    digest: digest.into(),
+                    offset: 0,
+                    hex: "616263".into(),
+                    eof: true,
+                })
+                .expect("bounded blob completes")
+        );
     }
 
     #[test]

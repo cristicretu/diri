@@ -1,5 +1,6 @@
 #[path = "usage_page.rs"]
 mod usage_page;
+mod worktree_settings;
 
 use std::cell::Cell;
 use std::collections::HashSet;
@@ -19,24 +20,23 @@ use crate::store::{Prefs, SessionStore, StoreRuntime};
 use crate::updates::{UpdateCommand, UpdateHandle, UpdatePhase};
 use crate::worktrees::WorktreesSheet;
 use account_settings::AccountsState;
-use diri_proto::{AgentKind as ProtoAgentKind, HistoryEntry, HostEntry, HostsConfig};
+use diri_proto::{AgentKind as ProtoAgentKind, HostEntry, HostsConfig};
 use diri_term::theme::{TermTheme, ThemeAppearance};
 use diri_ui::{
     AgentLogo, Fill, FloatingSurface, HairlineDivider, Ink, LoadingIndicator, Metrics, Palette,
     Radius, SemanticColors, Typo,
 };
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, Bounds, BoxShadow, ClickEvent, Context, CursorStyle,
+    Animation, AnimationExt, AnyElement, App, Bounds, ClickEvent, Context, CursorStyle,
     FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton, PathPromptOptions,
-    Pixels, Render, Rgba, ScrollHandle, ScrollStrategy, SharedString, Task, TextRun,
-    UniformListScrollHandle, Window, canvas, deferred, div, ease_out_quint, font, point,
-    prelude::*, px, rgba, uniform_list,
+    Pixels, Render, Rgba, ScrollHandle, SharedString, Task, TextRun, Window, canvas, deferred, div,
+    ease_out_quint, font, point, prelude::*, px, rgba,
 };
 use tokio::runtime::Runtime;
 
 use crate::commands::{
-    Activate, COMMANDS, CloseSurface, CommandId, MoveDown, MoveUp, OpenSettings, OpenWorktrees,
-    ShortcutCategory, ToggleHistory, UTILITY_CONTEXT,
+    COMMANDS, CloseSurface, CommandId, OpenSettings, OpenWorktrees, ShortcutCategory,
+    UTILITY_CONTEXT,
 };
 const SETTINGS_CONTENT_MAX_WIDTH: f32 = 760.0;
 const SETTINGS_TRANSITION_DURATION: Duration = Duration::from_millis(190);
@@ -51,7 +51,6 @@ const HOST_REINSTALL_SUCCESS_VISIBILITY: Duration = Duration::from_secs(3);
 enum Surface {
     #[default]
     None,
-    History,
     Worktrees,
     Settings,
     Diagnostics,
@@ -64,6 +63,18 @@ enum SettingsMenu {
     TerminalTheme,
     HibernateAfter,
     MemoryLimit,
+}
+
+#[derive(Default)]
+enum ReleaseNotesState {
+    #[default]
+    Idle,
+    Loading,
+    Loaded {
+        release: diri_updater::ReleaseNotes,
+        document: Arc<crate::markdown::MarkdownDocument>,
+    },
+    Failed(String),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -261,22 +272,13 @@ pub struct UtilitySurfaces {
     phone_setup: Option<crate::phone_access::TailscaleSetup>,
     focus: FocusHandle,
     surface: Surface,
-    history: Vec<HistoryEntry>,
-    history_query: QueryEditor,
-    history_highlight: usize,
-    history_loading: bool,
-    history_error: Option<String>,
-    history_scanner: Option<crate::history::HistoryScanner>,
-    history_search: crate::history::HistorySearch,
-    history_matches: Vec<usize>,
-    history_scroll: UniformListScrollHandle,
-    history_resuming: Option<String>,
     worktrees: WorktreesSheet,
     settings_tab: SettingsTab,
     usage: crate::usage::UsageSnapshot,
     usage_days: usize,
     usage_tokens: bool,
     usage_by_day: bool,
+    release_notes: ReleaseNotesState,
     settings_scroll: ScrollHandle,
     settings_search: QueryEditor,
     settings_search_active: bool,
@@ -332,10 +334,12 @@ impl UtilitySurfaces {
             .map(|value| value.to_ascii_lowercase());
         let settings_tab = match settings_preview.as_deref() {
             Some("terminal" | "appearance") => SettingsTab::Terminal,
+            Some("whats-new" | "what's-new") => SettingsTab::WhatsNew,
             Some("agents") => SettingsTab::Agents,
             Some("skills") => SettingsTab::Skills,
             Some("accounts") => SettingsTab::Accounts,
             Some("shortcuts") => SettingsTab::Shortcuts,
+            Some("worktrees") => SettingsTab::Worktrees,
             Some("resources") => SettingsTab::Resources,
             Some("remote") => SettingsTab::Remote,
             Some("phone") => SettingsTab::Phone,
@@ -370,7 +374,18 @@ impl UtilitySurfaces {
                 loop {
                     match changes.recv().await {
                         Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            if this.update(cx, |_, cx| cx.notify()).is_err() {
+                            if this
+                                .update(cx, |this, cx| {
+                                    let store = this.store.read().expect("store lock");
+                                    this.prefs.terminal_theme =
+                                        store.preferences().terminal_theme.clone();
+                                    this.prefs.follow_system_theme =
+                                        store.preferences().follow_system_theme;
+                                    drop(store);
+                                    cx.notify();
+                                })
+                                .is_err()
+                            {
                                 return;
                             }
                         }
@@ -406,22 +421,13 @@ impl UtilitySurfaces {
             } else {
                 Surface::None
             },
-            history: Vec::new(),
-            history_query: QueryEditor::default(),
-            history_highlight: 0,
-            history_loading: false,
-            history_error: None,
-            history_scanner: Some(crate::history::HistoryScanner::default()),
-            history_search: crate::history::HistorySearch::default(),
-            history_matches: Vec::new(),
-            history_scroll: UniformListScrollHandle::new(),
-            history_resuming: None,
             worktrees: WorktreesSheet::default(),
             settings_tab,
             usage: crate::usage::UsageSnapshot::default(),
             usage_days: 30,
             usage_tokens: false,
             usage_by_day: false,
+            release_notes: ReleaseNotesState::default(),
             settings_scroll: ScrollHandle::new(),
             settings_search: QueryEditor::default(),
             settings_search_active: false,
@@ -450,93 +456,23 @@ impl UtilitySurfaces {
     }
 
     fn colors(&self) -> SemanticColors {
-        crate::app_theme::colors(&self.prefs.terminal_theme)
+        crate::app_theme::colors(
+            self.store
+                .read()
+                .expect("session store lock poisoned")
+                .preview_theme_id()
+                .unwrap_or(&self.prefs.terminal_theme),
+        )
     }
 
     fn settings_colors(&self) -> SemanticColors {
-        crate::app_theme::sidebar_colors(&self.prefs.terminal_theme)
-    }
-
-    pub(crate) fn open_history(&mut self, cx: &mut Context<Self>) {
-        self.surface = Surface::History;
-        self.history_query.clear();
-        self.history_highlight = 0;
-        self.history_scroll = UniformListScrollHandle::new();
-        self.filter_history();
-        self.history_error = None;
-        cx.notify();
-        self.refresh_history(cx);
-    }
-
-    fn refresh_history(&mut self, cx: &mut Context<Self>) {
-        // Reopening uses the last result immediately and shares any in-flight
-        // scan. History is local data: a disconnected Engine must not delay it.
-        let Some(mut scanner) = self.history_scanner.take() else {
-            return;
-        };
-        self.history_loading = true;
-        self.history_error = None;
-        cx.notify();
-
-        let roots = crate::history::HistoryRoots::current_user();
-        let tracked = self
-            .store
-            .read()
-            .expect("session store lock poisoned")
-            .sessions()
-            .values()
-            .filter_map(|session| session.agent_session_id.clone())
-            .collect();
-        let runtime = Arc::clone(&self.runtime);
-        cx.spawn(async move |this, cx| {
-            let task = runtime.spawn(async move {
-                tokio::task::spawn_blocking(move || {
-                    let entries = scanner.scan(&roots, &tracked);
-                    (scanner, entries)
-                })
-                .await
-                .map_err(|error| error.to_string())
-            });
-            let result = task
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|r| r);
-            let _ = this.update(cx, |this, cx| {
-                this.history_loading = false;
-                match result {
-                    Ok((scanner, mut entries)) => {
-                        // A session can become tracked while the disk scan is
-                        // running. Reconcile against the current store as well.
-                        let tracked = this
-                            .store
-                            .read()
-                            .expect("session store lock poisoned")
-                            .sessions()
-                            .values()
-                            .filter_map(|session| session.agent_session_id.clone())
-                            .collect::<HashSet<_>>();
-                        entries.retain(|entry| !tracked.contains(&entry.id));
-                        let selected_id = this.highlighted_history().map(|entry| entry.id.clone());
-                        this.history_scanner = Some(scanner);
-                        this.activity = format!("{} past conversations found", entries.len());
-                        this.history = entries;
-                        this.history_search.rebuild(&this.history);
-                        this.filter_history();
-                        if let Some(index) = this.history_matches.iter().position(|index| {
-                            Some(&this.history[*index].id) == selected_id.as_ref()
-                        }) {
-                            this.history_highlight = index;
-                        }
-                    }
-                    Err(error) => {
-                        this.history_scanner = Some(crate::history::HistoryScanner::default());
-                        this.history_error = Some(error);
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        crate::app_theme::sidebar_colors(
+            self.store
+                .read()
+                .expect("session store lock poisoned")
+                .preview_theme_id()
+                .unwrap_or(&self.prefs.terminal_theme),
+        )
     }
 
     pub(crate) fn open_worktrees(&mut self, cx: &mut Context<Self>) {
@@ -547,93 +483,115 @@ impl UtilitySurfaces {
             .preferences()
             .clone();
         self.surface = Surface::Worktrees;
-        self.refresh_worktrees(cx);
+        self.load_worktrees(cx);
+    }
+
+    fn load_worktrees(&mut self, cx: &mut Context<Self>) {
+        // Tab navigation preserves checked results. A new window joins the
+        // engine's existing job/cache rather than requesting another scan.
+        if self.worktrees.scan_generation.is_none() || self.worktrees.error.is_some() {
+            self.start_worktree_scan(false, false, cx);
+        }
+        cx.notify();
     }
 
     fn refresh_worktrees(&mut self, cx: &mut Context<Self>) {
+        self.start_worktree_scan(true, false, cx);
+    }
+
+    fn start_worktree_scan(&mut self, refresh: bool, measure_disk: bool, cx: &mut Context<Self>) {
+        if self.worktrees.loading {
+            return;
+        }
         self.worktrees.begin_refresh();
+        let epoch = self.worktrees.poll_epoch;
         cx.notify();
         let client = Arc::clone(self.store_runtime.client());
         let runtime = Arc::clone(&self.runtime);
         cx.spawn(async move |this, cx| {
-            let task = runtime.spawn(async move {
-                client.wait_until_connected(Duration::from_secs(5)).await?;
-                client.worktree_overview().await
-            });
-            let result = match task.await {
-                Ok(Ok(entries)) => Ok(entries),
-                Ok(Err(error)) => Err(error.to_string()),
-                Err(error) => Err(error.to_string()),
+            let mut params = diri_proto::WorktreeScanParams {
+                refresh,
+                measure_disk,
+                ..Default::default()
             };
-            let _ = this.update(cx, |this, cx| {
-                this.worktrees.finish_refresh(result);
-                cx.notify();
-            });
+            loop {
+                let active = this
+                    .update(cx, |this, _| this.worktrees.poll_epoch == epoch)
+                    .unwrap_or(false);
+                if !active {
+                    break;
+                }
+                let client = Arc::clone(&client);
+                let request = params.clone();
+                let task = runtime.spawn(async move {
+                    client.wait_until_connected(Duration::from_secs(5)).await?;
+                    client.worktree_scan(request).await
+                });
+                let result = match task.await {
+                    Ok(Ok(result)) => Ok(result),
+                    Ok(Err(error)) => Err(error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                };
+                let mut has_more = false;
+                if let Ok(result) = &result {
+                    params.refresh = false;
+                    params.generation = Some(result.generation);
+                    params.cursor = result.cursor;
+                    has_more = result.has_more;
+                }
+                let again = this
+                    .update(cx, |this, cx| {
+                        if this.worktrees.poll_epoch != epoch {
+                            return false;
+                        }
+                        match result {
+                            Ok(result) => this.worktrees.apply_scan(result),
+                            Err(error) => this.worktrees.finish_refresh(Err(error)),
+                        }
+                        cx.notify();
+                        this.worktrees.loading
+                    })
+                    .unwrap_or(false);
+                if !again {
+                    break;
+                }
+                // Drain bounded pages promptly, including while the sidebar is
+                // closed. Stop polling once the engine job and pages finish.
+                cx.background_executor()
+                    .timer(Duration::from_millis(if has_more { 16 } else { 500 }))
+                    .await;
+            }
         })
         .detach();
     }
 
-    fn resume_history(&mut self, entry: HistoryEntry, cx: &mut Context<Self>) {
-        if self.history_resuming.is_some() {
+    fn refresh_release_notes(&mut self, cx: &mut Context<Self>) {
+        if matches!(
+            self.release_notes,
+            ReleaseNotesState::Loading | ReleaseNotesState::Loaded { .. }
+        ) {
             return;
         }
-        let existing = self
-            .store
-            .read()
-            .expect("session store lock poisoned")
-            .sessions()
-            .values()
-            .find(|session| {
-                session.agent_session_id.as_deref() == Some(&entry.id) && session.kind == entry.kind
-            })
-            .map(|session| session.id.clone());
-        if let Some(id) = existing {
-            self.store
-                .write()
-                .expect("session store lock poisoned")
-                .select(id);
-            self.surface = Surface::None;
-            cx.notify();
-            return;
-        }
-        if !entry.cwd_exists || !Path::new(&entry.cwd).is_dir() {
-            self.history_error = Some("The conversation folder is no longer available".to_owned());
-            cx.notify();
-            return;
-        }
-        self.history_resuming = Some(entry.id.clone());
-        self.history_error = None;
+        self.release_notes = ReleaseNotesState::Loading;
         cx.notify();
-        let client = Arc::clone(self.store_runtime.client());
+
         let runtime = Arc::clone(&self.runtime);
-        let conversation_id = entry.id.clone();
         cx.spawn(async move |this, cx| {
-            let task = runtime.spawn(async move {
-                client.wait_until_connected(Duration::from_secs(5)).await?;
-                crate::history::resume(&client, &entry).await
-            });
+            let task = runtime.spawn_blocking(diri_updater::fetch_latest_release_notes);
             let result = match task.await {
-                Ok(result) => result.map_err(|error| error.to_string()),
+                Ok(Ok(release)) => Ok(release),
+                Ok(Err(error)) => Err(error.to_string()),
                 Err(error) => Err(error.to_string()),
             };
             let _ = this.update(cx, |this, cx| {
-                this.history_resuming = None;
-                match result {
-                    Ok(id) => {
-                        this.history.retain(|entry| entry.id != conversation_id);
-                        this.history_search.rebuild(&this.history);
-                        this.filter_history();
-                        this.store
-                            .write()
-                            .expect("session store lock poisoned")
-                            .apply_spawn_result(id.clone());
-                        if this.surface == Surface::History {
-                            this.surface = Surface::None;
-                        }
-                        this.activity = format!("Resumed conversation in session {id}");
+                this.release_notes = match result {
+                    Ok(release) => {
+                        let document =
+                            Arc::new(crate::markdown::MarkdownDocument::parse(&release.body));
+                        ReleaseNotesState::Loaded { release, document }
                     }
-                    Err(error) => this.history_error = Some(error),
-                }
+                    Err(error) => ReleaseNotesState::Failed(error),
+                };
                 cx.notify();
             });
         })
@@ -650,16 +608,19 @@ impl UtilitySurfaces {
         cx.spawn(async move |this, cx| {
             let task = runtime.spawn(async move {
                 client.wait_until_connected(Duration::from_secs(5)).await?;
-                client.worktree_remove(params).await?;
-                client.worktree_overview().await
+                client.worktree_cleanup(params).await
             });
             let result = match task.await {
-                Ok(Ok(entries)) => Ok(entries),
+                Ok(Ok(())) => Ok(()),
                 Ok(Err(error)) => Err(error.to_string()),
                 Err(error) => Err(error.to_string()),
             };
             let _ = this.update(cx, |this, cx| {
-                this.worktrees.finish_refresh(result);
+                this.worktrees.loading = false;
+                match result {
+                    Ok(()) => this.refresh_worktrees(cx),
+                    Err(error) => this.worktrees.error = Some(error),
+                }
                 cx.notify();
             });
         })
@@ -1094,43 +1055,6 @@ impl UtilitySurfaces {
         true
     }
 
-    fn filter_history(&mut self) {
-        self.history_matches = self.history_search.rank(self.history_query.text());
-        self.history_highlight = self
-            .history_highlight
-            .min(self.history_matches.len().saturating_sub(1));
-    }
-
-    fn highlighted_history(&self) -> Option<&HistoryEntry> {
-        self.history_matches
-            .get(self.history_highlight)
-            .and_then(|index| self.history.get(*index))
-    }
-
-    fn move_history(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if self.surface != Surface::History {
-            return;
-        }
-        let count = self.history_matches.len();
-        if count == 0 {
-            return;
-        }
-        self.history_highlight =
-            (self.history_highlight as isize + delta).rem_euclid(count as isize) as usize;
-        self.history_scroll
-            .scroll_to_item(self.history_highlight, ScrollStrategy::Nearest);
-        cx.notify();
-    }
-
-    fn activate_history(&mut self, cx: &mut Context<Self>) {
-        if self.surface != Surface::History {
-            return;
-        }
-        if let Some(entry) = self.highlighted_history().cloned() {
-            self.resume_history(entry, cx);
-        }
-    }
-
     fn close_surface(&mut self, cx: &mut Context<Self>) {
         if self.worktrees.pending_cleanup.is_some() {
             self.worktrees.cancel_cleanup();
@@ -1176,6 +1100,9 @@ impl UtilitySurfaces {
         self.shortcut_editor = None;
         if self.settings_tab == SettingsTab::Skills {
             self.refresh_skills(cx);
+        }
+        if self.settings_tab == SettingsTab::WhatsNew {
+            self.refresh_release_notes(cx);
         }
         cx.notify();
     }
@@ -1249,6 +1176,12 @@ impl UtilitySurfaces {
             self.settings_scroll.set_offset(point(px(0.0), px(0.0)));
         }
         self.settings_tab = tab;
+        if tab == SettingsTab::WhatsNew {
+            self.refresh_release_notes(cx);
+        }
+        if tab == SettingsTab::Worktrees {
+            self.load_worktrees(cx);
+        }
         if tab == SettingsTab::Skills {
             self.refresh_skills(cx);
         }
@@ -1532,6 +1465,11 @@ impl UtilitySurfaces {
         cx.notify();
     }
 
+    pub(crate) fn open_whats_new(&mut self, cx: &mut Context<Self>) {
+        self.open_settings(cx);
+        self.select_settings_tab(SettingsTab::WhatsNew, cx);
+    }
+
     fn open_diagnostics(&mut self, cx: &mut Context<Self>) {
         let store = self.store.read().expect("session store lock poisoned");
         let report = build_diagnostics_report(&store);
@@ -1547,14 +1485,6 @@ impl UtilitySurfaces {
         self.settings_tab = SettingsTab::Remote;
         self.reload_hosts();
         self.begin_adding_host(window, cx);
-    }
-
-    pub(crate) fn toggle_history(&mut self, cx: &mut Context<Self>) {
-        if self.surface == Surface::History {
-            self.close_surface(cx);
-        } else {
-            self.open_history(cx);
-        }
     }
 
     pub(crate) fn key_down(
@@ -1603,239 +1533,23 @@ impl UtilitySurfaces {
             cx.notify();
         } else if key.key == "escape" {
             self.close_surface(cx);
-        } else if key.key == "up" {
-            self.move_history(-1, cx);
-        } else if key.key == "down" {
-            self.move_history(1, cx);
-        } else if key.key == "enter" {
-            self.activate_history(cx);
-        } else if self.surface == Surface::History {
-            let Some(edit) = query_editor::edit_for(key) else {
-                return;
-            };
-            let changed = match edit {
-                Edit::Local(local) => self.history_query.apply(local),
-                Edit::Clipboard(ClipboardEdit::Copy) => {
-                    query_editor::copy_selection(&self.history_query, cx);
-                    false
-                }
-                Edit::Clipboard(ClipboardEdit::Cut) => {
-                    query_editor::cut_selection(&mut self.history_query, cx)
-                }
-                Edit::Clipboard(ClipboardEdit::Paste) => cx
-                    .read_from_clipboard()
-                    .and_then(|item| item.text())
-                    .is_some_and(|text| self.history_query.insert(&text)),
-            };
-            if changed {
-                self.history_highlight = 0;
-                self.filter_history();
-                self.history_scroll.scroll_to_item(0, ScrollStrategy::Top);
-            }
-            cx.notify();
         }
-    }
-
-    fn render_history_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
-        let colors = self.settings_colors();
-        let entry = self.history[self.history_matches[index]].clone();
-        let selected = index == self.history_highlight;
-        let resumable = entry.cwd_exists;
-        let opening = self.history_resuming.as_deref() == Some(&entry.id);
-        let busy = self.history_resuming.is_some();
-        let folder = folder_name(&entry.cwd).to_owned();
-        let parent = relative_parent(&entry.cwd);
-        let title = entry
-            .title
-            .clone()
-            .unwrap_or_else(|| "Untitled conversation".to_owned());
-        let age = relative_time(entry.last_active_at.0);
-        let agent = ui_agent(&entry.kind);
-        div()
-            .h(px(56.0))
-            .px(px(8.0))
-            .py(px(2.0))
-            .child(
-                div()
-                    .id(("history-row", index))
-                    .debug_selector(move || format!("history-row-{index}"))
-                    .h_full()
-                    .px(px(10.0))
-                    .rounded(px(Radius::CARD))
-                    .flex()
-                    .items_center()
-                    .gap(px(9.0))
-                    .bg(Fill::selected(colors, selected))
-                    .when(resumable && !busy, |row| row.cursor_pointer())
-                    .when(!resumable, |row| {
-                        row.cursor(CursorStyle::OperationNotAllowed)
-                    })
-                    .hover(move |style| {
-                        style.bg(if selected {
-                            Fill::selected(colors, true)
-                        } else {
-                            Fill::hover(colors, true)
-                        })
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.history_highlight = index;
-                        this.resume_history(entry.clone(), cx);
-                    }))
-                    .child(AgentLogo::new(agent, 24.0, colors))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .gap(px(2.0))
-                            .child(
-                                div()
-                                    .text_size(px(13.0))
-                                    .font_weight(if selected {
-                                        FontWeight::MEDIUM
-                                    } else {
-                                        FontWeight::NORMAL
-                                    })
-                                    .text_color(colors.primary)
-                                    .truncate()
-                                    .child(title),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .overflow_hidden()
-                                    .gap(px(5.0))
-                                    .text_size(px(11.0))
-                                    .child(div().text_color(colors.secondary).child(folder))
-                                    .child(
-                                        div().text_color(colors.tertiary).truncate().child(parent),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(11.0))
-                            .text_color(colors.secondary)
-                            .child(if opening {
-                                "Opening…".to_owned()
-                            } else if !resumable {
-                                "Folder unavailable".to_owned()
-                            } else {
-                                age
-                            }),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn render_history(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = self.settings_colors();
-        let count = self.history_matches.len();
-        let entity = cx.entity();
-        let selected = self.highlighted_history();
-        let status = if self.history_resuming.is_some() {
-            "Opening conversation…".to_owned()
-        } else if self.history_loading {
-            "Updating history…".to_owned()
-        } else if self.history_query.is_empty() {
-            format!("{count} conversations · Recent first")
-        } else {
-            format!("{count} matches · Best match first")
-        };
-
-        FloatingSurface::new(
-            colors,
-            div()
-                .id("conversation-history")
-                .debug_selector(|| "conversation-history".into())
-                .w(px(620.0))
-                .max_w_full()
-                .flex()
-                .flex_col()
-                .child(
-                    div().px(px(18.0)).pt(px(14.0)).pb(px(10.0)).flex().items_center().justify_between()
-                        .child(div().text_size(px(13.0)).font_weight(FontWeight::SEMIBOLD).child("Past conversations"))
-                        .child(div().id("close-history").cursor_pointer().rounded(px(Radius::ROW))
-                            .px(px(7.0)).py(px(4.0)).text_size(px(11.0)).text_color(colors.secondary)
-                            .hover(move |style| style.bg(Fill::hover(colors, true)))
-                            .on_click(cx.listener(|this, _, _, cx| this.close_surface(cx)))
-                            .child("esc")),
-                )
-                .child(div().px(px(12.0)).pb(px(10.0)).child(
-                    div()
-                        .h(px(40.0))
-                        .px(px(12.0))
-                        .rounded(px(Radius::CARD))
-                        .bg(Fill::subtle(colors))
-                        .border_1().border_color(colors.primary.alpha(0.10))
-                        .flex()
-                        .items_center()
-                        .gap(px(10.0))
-                        .text_size(px(13.0))
-                        .child(sf_symbol("magnifyingglass", 13.0, colors.tertiary))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .overflow_hidden()
-                                .text_color(if self.history_query.is_empty() {
-                                    colors.tertiary
-                                } else {
-                                    colors.primary
-                                })
-                                .child(if self.history_query.is_empty() {
-                                    div().child("Search by title, project, or agent…").into_any_element()
-                                } else {
-                                    query_label(&self.history_query)
-                                }),
-                        )
-                        .when(!self.history_query.is_empty(), |view| view.child(
-                            div().id("clear-history-search").cursor_pointer().text_color(colors.secondary)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.history_query.clear(); this.history_highlight = 0;
-                                    this.filter_history(); this.history_scroll.scroll_to_item(0, ScrollStrategy::Top); cx.notify();
-                                })).child(sf_symbol("xmark.circle.fill", 13.0, colors.tertiary))
-                        )),
-                ))
-                .child(div().px(px(18.0)).pb(px(8.0)).flex().items_center().justify_between()
-                    .child(div().text_size(px(11.0)).text_color(colors.secondary).child(status))
-                    .when(!self.history_loading, |view| view.child(div().id("refresh-history").cursor_pointer()
-                        .text_size(px(11.0)).text_color(colors.secondary)
-                        .on_click(cx.listener(|this, _, _, cx| this.refresh_history(cx))).child("Refresh"))))
-                .when_some(self.history_error.clone(), |view, error| view.child(
-                    div().px(px(18.0)).py(px(8.0)).text_size(px(12.0)).text_color(Ink::DANGER).child(error)))
-                .child(div().h(px(336.0)).when(count > 0, |view| view.child(
-                    uniform_list("history-results", count, move |range, _, cx| {
-                        entity.update(cx, |this, cx| range.map(|index| this.render_history_row(index, cx)).collect())
-                    }).track_scroll(&self.history_scroll).size_full()
-                )).when(count == 0, |view| view.child(
-                    div().size_full().flex().flex_col().items_center().justify_center().gap(px(10.0))
-                        .child(sf_symbol("magnifyingglass", 24.0, colors.tertiary))
-                        .child(div().text_size(px(13.0)).text_color(colors.primary).child(
-                            if self.history_loading { "Finding your conversations…" } else if self.history_query.is_empty() { "Your next conversation starts here" } else { "No matching conversations" }))
-                        .child(div().text_size(px(12.0)).text_color(colors.secondary).child(
-                            if self.history_query.is_empty() { "Past Claude and Codex chats appear here automatically." } else { "Try a project name, agent, or a few words from the title." }))
-                )))
-                .child(HairlineDivider::horizontal(colors))
-                .child(div().px(px(18.0)).py(px(10.0)).h(px(88.0)).flex().flex_col().justify_between().gap(px(5.0))
-                    .child(div().text_size(px(12.0)).text_color(colors.primary).max_h(px(36.0)).overflow_hidden()
-                        .child(selected.and_then(|entry| entry.title.clone()).unwrap_or_else(|| "Pick up where you left off".to_owned())))
-                    .child(div().flex().items_center().justify_between().gap(px(12.0))
-                        .child(div().min_w(px(0.0)).flex_1().text_size(px(11.0)).text_color(colors.secondary).truncate()
-                            .child(selected.map(|entry| entry.cwd.clone()).unwrap_or_else(|| "Search all your local conversations".to_owned())))
-                        .child(div().flex_none().text_size(px(11.0)).text_color(colors.secondary).child("↑ ↓ navigate    ↵ open"))))
-        ).radius(Radius::FLOATING_MENU)
     }
 
     fn render_worktrees(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.colors();
         let entity = cx.entity();
+        let page_rows = worktree_settings::PAGE_ROWS;
+        let page = self
+            .worktrees
+            .page
+            .min(self.worktrees.entries.len().saturating_sub(1) / page_rows);
         let cards = self
             .worktrees
             .entries
             .iter()
+            .skip(page * page_rows)
+            .take(page_rows)
             .map(|entry| {
                 let path = entry.path.clone();
                 let drop_entry = entry.clone();
@@ -1995,6 +1709,12 @@ impl UtilitySurfaces {
                             div()
                                 .flex()
                                 .gap(px(8.0))
+                                .when(page > 0, |row| row.child(surface_button("Previous", "worktree-sheet-previous", colors, cx, move |this, cx| {
+                                    this.worktrees.page = page - 1; this.worktrees.cancel_cleanup(); cx.notify();
+                                })))
+                                .when((page + 1) * page_rows < self.worktrees.entries.len(), |row| row.child(surface_button("Next", "worktree-sheet-next", colors, cx, move |this, cx| {
+                                    this.worktrees.page = page + 1; this.worktrees.cancel_cleanup(); cx.notify();
+                                })))
                                 .child(surface_button(
                                     "Refresh",
                                     "refresh-worktrees",
@@ -2241,14 +1961,22 @@ impl UtilitySurfaces {
          * layout immediately.
          * ───────────────────────────────────────────────────────── */
         let colors = self.settings_colors();
+        let unread = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .notifications()
+            .unread_count();
         let generation = self.settings_transition_generation;
         let pane = match self.settings_tab {
             SettingsTab::General => self.general_settings(cx).into_any_element(),
+            SettingsTab::WhatsNew => self.whats_new_settings(cx).into_any_element(),
             SettingsTab::Agents => self.agents_settings(cx).into_any_element(),
             SettingsTab::Skills => self.skills.clone().into_any_element(),
             SettingsTab::Accounts => self.accounts_settings(cx).into_any_element(),
             SettingsTab::Shortcuts => self.shortcuts_settings(cx).into_any_element(),
             SettingsTab::Terminal => self.terminal_settings(cx).into_any_element(),
+            SettingsTab::Worktrees => self.worktree_settings(cx).into_any_element(),
             SettingsTab::Resources => self.resource_settings(cx).into_any_element(),
             SettingsTab::Remote => self.remote_settings(cx).into_any_element(),
             SettingsTab::Phone => self.phone_settings(cx).into_any_element(),
@@ -2267,11 +1995,16 @@ impl UtilitySurfaces {
             .child(
                 div()
                     .w_full()
-                    .max_w(px(if self.settings_tab == SettingsTab::Usage {
-                        1040.0
-                    } else {
-                        SETTINGS_CONTENT_MAX_WIDTH
-                    }))
+                    .max_w(px(
+                        if matches!(
+                            self.settings_tab,
+                            SettingsTab::Usage | SettingsTab::Worktrees
+                        ) {
+                            1040.0
+                        } else {
+                            SETTINGS_CONTENT_MAX_WIDTH
+                        },
+                    ))
                     .mx_auto()
                     .child(pane),
             );
@@ -2292,6 +2025,7 @@ impl UtilitySurfaces {
         div()
             .id("settings-shell")
             .debug_selector(|| "settings-shell".into())
+            .relative()
             .size_full()
             .pt(px(Metrics::TITLE_BAR))
             .overflow_hidden()
@@ -2310,6 +2044,7 @@ impl UtilitySurfaces {
                 }),
             )
             .child(pane)
+            .child(notification_titlebar_button(unread, colors))
     }
 
     fn phone_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2396,6 +2131,115 @@ impl UtilitySurfaces {
                     }))
             });
         settings_page("Phone access", content, colors)
+    }
+
+    fn whats_new_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        let content = match &self.release_notes {
+            ReleaseNotesState::Idle | ReleaseNotesState::Loading => div()
+                .id("release-notes-loading")
+                .p(px(16.0))
+                .flex()
+                .items_center()
+                .gap(px(9.0))
+                .text_size(px(Typo::ROW.size))
+                .text_color(colors.secondary)
+                .child(LoadingIndicator::new(
+                    "release-notes-loading-indicator",
+                    14.0,
+                    colors.tertiary,
+                ))
+                .child("Loading the latest release notes…")
+                .into_any_element(),
+            ReleaseNotesState::Failed(error) => div()
+                .id("release-notes-error")
+                .p(px(16.0))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(16.0))
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap(px(3.0))
+                        .child(
+                            div()
+                                .text_size(px(Typo::ROW_EMPHASIZED.size))
+                                .font_weight(Typo::ROW_EMPHASIZED.weight)
+                                .text_color(colors.primary)
+                                .child("Release notes couldn't be loaded"),
+                        )
+                        .child(
+                            div()
+                                .whitespace_normal()
+                                .text_size(px(Typo::META.size))
+                                .line_height(px(14.0))
+                                .text_color(colors.tertiary)
+                                .child(wrappable_setting_copy(error.clone().into())),
+                        ),
+                )
+                .child(surface_button(
+                    "Try Again",
+                    "retry-release-notes",
+                    colors,
+                    cx,
+                    |this, cx| this.refresh_release_notes(cx),
+                ))
+                .into_any_element(),
+            ReleaseNotesState::Loaded { release, document } => {
+                let version = release.tag_name.trim_start_matches('v');
+                let published = release
+                    .published_at
+                    .as_deref()
+                    .and_then(|date| date.split('T').next())
+                    .unwrap_or("Publication date unavailable");
+                div()
+                    .id("release-notes-content")
+                    .debug_selector(|| "release-notes-content".into())
+                    .p(px(16.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(14.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(12.0))
+                            .child(
+                                div()
+                                    .text_size(px(Typo::TITLE.size))
+                                    .font_weight(Typo::TITLE.weight)
+                                    .text_color(colors.primary)
+                                    .child(
+                                        release
+                                            .name
+                                            .clone()
+                                            .unwrap_or_else(|| format!("diri {version}")),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(Typo::META.size))
+                                    .text_color(colors.tertiary)
+                                    .child(format!("Released {published}")),
+                            ),
+                    )
+                    .child(HairlineDivider::horizontal(colors))
+                    .child(crate::markdown_view::render_markdown(document, colors))
+                    .into_any_element()
+            }
+        };
+
+        settings_page(
+            "What's New",
+            setting_section("LATEST RELEASE", content, colors),
+            colors,
+        )
     }
 
     fn general_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3418,24 +3262,53 @@ impl UtilitySurfaces {
                     .child("+"),
             );
 
-        let mut featured_themes = div().w_full().flex().flex_wrap().gap(px(9.0));
-        for (index, candidate) in [
-            TermTheme::DIRIJOR_DARK,
-            TermTheme::VESPER,
-            TermTheme::DIRIJOR_LIGHT,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            featured_themes = featured_themes.child(featured_theme_card(
-                index,
-                candidate,
-                candidate.id == selected.id,
-                colors,
-                cx,
-            ));
-        }
-
+        let choices = div().w_full().flex().gap(px(12.0)).children(
+            [(0, "System"), (1, "Light"), (2, "Dark")]
+                .into_iter()
+                .map(|(index, label)| {
+                    let active = if index == 0 {
+                        self.prefs.follow_system_theme
+                    } else {
+                        !self.prefs.follow_system_theme
+                            && (selected.appearance == ThemeAppearance::Light) == (index == 1)
+                    };
+                    appearance_mode_card(index, label, active, colors, cx).into_any_element()
+                }),
+        );
+        let hex = |color: gpui::Rgba| {
+            format!(
+                "#{:02X}{:02X}{:02X}",
+                (color.r * 255.0).round() as u8,
+                (color.g * 255.0).round() as u8,
+                (color.b * 255.0).round() as u8
+            )
+        };
+        let swatch = |color: gpui::Rgba| {
+            let ink = if color.r * 0.2126 + color.g * 0.7152 + color.b * 0.0722 > 0.5 {
+                rgba(0x202020ff)
+            } else {
+                rgba(0xf5f5f5ff)
+            };
+            div()
+                .h(px(30.0))
+                .w(px(148.0))
+                .px(px(10.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .rounded(px(9.0))
+                .bg(color)
+                .border_1()
+                .border_color(colors.primary.alpha(0.12))
+                .child(
+                    div()
+                        .size(px(12.0))
+                        .rounded_full()
+                        .border_1()
+                        .border_color(ink.alpha(0.3)),
+                )
+                .child(div().text_size(px(12.0)).text_color(ink).child(hex(color)))
+        };
         appearance_settings_page(
             div()
                 .flex()
@@ -3443,152 +3316,71 @@ impl UtilitySurfaces {
                 .gap(px(18.0))
                 .child(
                     div()
-                        .relative()
-                        .rounded(px(Radius::PANEL))
-                        .border_1()
-                        .border_color(colors.primary.alpha(0.085))
-                        .bg(colors.primary.alpha(0.022))
-                        .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .min_h(px(62.0))
-                                .p(px(13.0))
-                                .flex()
-                                .flex_wrap()
-                                .items_center()
-                                .justify_between()
-                                .gap(px(12.0))
-                                .child(
-                                    div()
-                                        .min_w(px(230.0))
-                                        .flex_1()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(10.0))
-                                        .child(
-                                            div()
-                                                .flex_none()
-                                                .size(px(32.0))
-                                                .rounded(px(Radius::ROW))
-                                                .bg(selected.cursor.alpha(0.13))
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .child(sf_symbol(
-                                                    "sparkles",
-                                                    13.0,
-                                                    selected.cursor,
-                                                )),
-                                        )
-                                        .child(setting_text_stack(
-                                            "Color theme".into(),
-                                            "One palette for Diri, every terminal, and all app chrome."
-                                                .into(),
-                                            colors,
-                                        )),
-                                )
-                                .child(self.terminal_theme_dropdown(cx)),
-                        )
-                        .child(setting_divider(colors))
-                        .child(
-                            div()
-                                .p(px(12.0))
-                                .flex()
-                                .flex_col()
-                                .gap(px(9.0))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .child(
-                                            div()
-                                                .text_size(px(Typo::META.size))
-                                                .font_weight(Typo::META.weight)
-                                                .text_color(colors.secondary)
-                                                .child("Quick themes"),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_size(px(Typo::META.size - 1.0))
-                                                .text_color(colors.tertiary)
-                                                .child("Select to preview instantly"),
-                                        ),
-                                )
-                                .child(featured_themes),
-                        )
-                        .child(setting_divider(colors))
-                        .child(
-                            div()
-                                .p(px(12.0))
-                                .flex()
-                                .flex_col()
-                                .gap(px(9.0))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .gap(px(12.0))
-                                        .child(
-                                            div()
-                                                .text_size(px(Typo::META.size))
-                                                .font_weight(Typo::META.weight)
-                                                .text_color(colors.secondary)
-                                                .child("Live workspace preview"),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap(px(5.0))
-                                                .child(
-                                                    div()
-                                                        .size(px(5.0))
-                                                        .rounded_full()
-                                                        .bg(Ink::FRESH),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .font_family(crate::fonts::mono_family())
-                                                        .text_size(px(10.0))
-                                                        .text_color(colors.tertiary)
-                                                        .child(format!(
-                                                            "{} · {:.0} pt",
-                                                            selected.name,
-                                                            self.prefs.terminal_font_size
-                                                        )),
-                                                ),
-                                        ),
-                                )
-                                .child(workspace_theme_preview(
-                                    selected,
-                                    self.prefs.terminal_font_size,
-                                    colors,
-                                )),
-                        ),
+                        .text_size(px(13.0))
+                        .text_color(colors.primary)
+                        .child("Theme"),
                 )
+                .child(choices)
+                .child(appearance_diff_preview(
+                    selected,
+                    self.prefs.terminal_font_size,
+                ))
                 .child(
                     div()
-                        .rounded(px(Radius::PANEL))
+                        .rounded(px(16.0))
                         .border_1()
-                        .border_color(colors.primary.alpha(0.085))
-                        .bg(colors.primary.alpha(0.022))
-                        .overflow_hidden()
+                        .border_color(colors.primary.alpha(0.08))
+                        .bg(colors.primary.alpha(0.035))
+                        .px(px(16.0))
                         .flex()
                         .flex_col()
-                        .child(setting_row(
-                            "Terminal text",
-                            "Keep code comfortable without scaling the rest of the interface.",
+                        .child(appearance_setting_row(
+                            "Color theme",
+                            self.terminal_theme_dropdown(cx),
+                            colors,
+                        ))
+                        .child(appearance_divider(colors))
+                        .child(appearance_setting_row(
+                            "Background",
+                            swatch(selected.background),
+                            colors,
+                        ))
+                        .child(appearance_divider(colors))
+                        .child(appearance_setting_row(
+                            "Foreground",
+                            swatch(selected.foreground),
+                            colors,
+                        ))
+                        .child(appearance_divider(colors))
+                        .child(appearance_setting_row(
+                            "Code font",
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(colors.secondary)
+                                .child(crate::fonts::mono_family()),
+                            colors,
+                        ))
+                        .child(appearance_divider(colors))
+                        .child(appearance_setting_row(
+                            "Code font size",
                             font_control,
                             colors,
                         ))
-                        .child(setting_divider(colors))
-                        .child(terminal_type_specimen(
-                            selected,
-                            self.prefs.terminal_font_size,
-                        )),
+                        .child(appearance_divider(colors))
+                        .child(toggle_row("Copy on selection", "Copy selected text when you release the mouse.", self.prefs.terminal_copy_on_select, "terminal_copy_on_select", colors, cx, |this,cx| {
+                            this.prefs.terminal_copy_on_select = !this.prefs.terminal_copy_on_select;
+                            this.persist_prefs(); cx.notify();
+                        }))
+                        .child(appearance_divider(colors))
+                        .child(toggle_row("Hide pointer while typing", "Show it again when you use the mouse.", self.prefs.terminal_hide_pointer, "terminal_hide_pointer", colors, cx, |this,cx| {
+                            this.prefs.terminal_hide_pointer = !this.prefs.terminal_hide_pointer;
+                            this.persist_prefs(); cx.notify();
+                        }))
+                        .child(appearance_divider(colors))
+                        .child(toggle_row("Review command pastes", "Ask before pasting multiple lines into a shell or text with control characters.", self.prefs.terminal_paste_protection, "terminal_paste_protection", colors, cx, |this,cx| {
+                            this.prefs.terminal_paste_protection = !this.prefs.terminal_paste_protection;
+                            this.persist_prefs(); cx.notify();
+                        })),
                 ),
             colors,
         )
@@ -4444,6 +4236,7 @@ impl UtilitySurfaces {
                                 .cursor_pointer()
                                 .hover(move |style| style.bg(colors.primary.alpha(0.08)))
                                 .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.prefs.follow_system_theme = false;
                                     this.prefs.terminal_theme = candidate.id.to_owned();
                                     this.settings_menu = None;
                                     this.persist_prefs();
@@ -4756,7 +4549,6 @@ impl Render for UtilitySurfaces {
         let sidebar_width = self.prefs.sidebar_width;
         let overlay = match self.surface {
             Surface::None => None,
-            Surface::History => Some(self.render_history(cx).into_any_element()),
             Surface::Worktrees => Some(self.render_worktrees(cx).into_any_element()),
             Surface::Settings => Some(self.render_settings(cx).into_any_element()),
             Surface::Diagnostics => Some(self.render_diagnostics(cx).into_any_element()),
@@ -4766,13 +4558,6 @@ impl Render for UtilitySurfaces {
             .track_focus(&self.focus)
             .key_context(UTILITY_CONTEXT)
             .on_key_down(cx.listener(Self::key_down))
-            .on_action(cx.listener(|this, _: &ToggleHistory, _, cx| {
-                if this.surface == Surface::History {
-                    this.close_surface(cx);
-                } else {
-                    this.open_history(cx);
-                }
-            }))
             .on_action(cx.listener(|this, _: &OpenWorktrees, _, cx| {
                 this.open_worktrees(cx);
             }))
@@ -4781,9 +4566,6 @@ impl Render for UtilitySurfaces {
                 cx.stop_propagation();
             }))
             .on_action(cx.listener(|this, _: &CloseSurface, _, cx| this.close_surface(cx)))
-            .on_action(cx.listener(|this, _: &MoveUp, _, cx| this.move_history(-1, cx)))
-            .on_action(cx.listener(|this, _: &MoveDown, _, cx| this.move_history(1, cx)))
-            .on_action(cx.listener(|this, _: &Activate, _, cx| this.activate_history(cx)))
             .absolute()
             // Cached entity roots are laid out independently, so insets alone
             // leave this absolute root without a definite size: its height
@@ -5136,11 +4918,7 @@ fn shortcut_row(
     let binding_label: SharedString = if editing {
         "Press keys…".into()
     } else {
-        assignment
-            .as_deref()
-            .unwrap_or("Unassigned")
-            .to_owned()
-            .into()
+        spaced_shortcut_label(assignment.as_deref().unwrap_or("Unassigned")).into()
     };
     let detail: SharedString = error.unwrap_or(metadata.description).to_owned().into();
 
@@ -5153,9 +4931,9 @@ fn shortcut_row(
             let stable_id = command.stable_id;
             move || format!("SHORTCUT_BINDING_{stable_id}")
         })
-        .h(px(27.0))
-        .min_w(px(if editing { 92.0 } else { 42.0 }))
-        .px(px(9.0))
+        .h(px(31.0))
+        .min_w(px(if editing { 96.0 } else { 48.0 }))
+        .px(px(11.0))
         .rounded(px(Radius::BADGE))
         .border_1()
         .border_color(if error.is_some() {
@@ -5174,7 +4952,7 @@ fn shortcut_row(
         .items_center()
         .justify_center()
         .font_family(crate::fonts::mono_family())
-        .text_size(px(11.0))
+        .text_size(px(Typo::ROW.size))
         .text_color(if assignment.is_none() && !editing {
             colors.tertiary
         } else {
@@ -5447,6 +5225,9 @@ fn settings_tab_matches(tab: SettingsTab, query: &str) -> bool {
         SettingsTab::General => {
             "general default startup login sessions close confirmation sounds chimes support diagnostics quick open search roots updates"
         }
+        SettingsTab::WhatsNew => {
+            "what's new whats new release notes latest version changes features improvements"
+        }
         SettingsTab::Agents => {
             "agents codex claude cursor gemini executable installed command line quick create default"
         }
@@ -5461,6 +5242,9 @@ fn settings_tab_matches(tab: SettingsTab, query: &str) -> bool {
         }
         SettingsTab::Terminal => "terminal appearance color theme font text size zoom",
         SettingsTab::Usage => "usage cost tokens spending cache savings model daily claude codex",
+        SettingsTab::Worktrees => {
+            "worktrees git branches pull requests merged old stale disk space cleanup"
+        }
         SettingsTab::Resources => {
             "resources idle sessions hibernate freeze memory limit performance"
         }
@@ -5472,6 +5256,79 @@ fn settings_tab_matches(tab: SettingsTab, query: &str) -> bool {
     query
         .split_whitespace()
         .all(|word| searchable.contains(word))
+}
+
+fn notification_titlebar_button(unread: usize, colors: SemanticColors) -> AnyElement {
+    div()
+        .id("notification-inbox-button")
+        .debug_selector(|| "notification-inbox-button".into())
+        .absolute()
+        .top(px(7.0))
+        .right(px(14.0))
+        .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(Radius::BADGE))
+        .cursor_pointer()
+        .hover(move |button| button.bg(Fill::subtle(colors)))
+        .child(sf_symbol(
+            if unread > 0 { "bell.fill" } else { "bell" },
+            14.0,
+            if unread > 0 {
+                Ink::FRESH
+            } else {
+                colors.secondary
+            },
+        ))
+        .when(unread > 0, |button| {
+            button.child(
+                div()
+                    .absolute()
+                    .top(px(2.0))
+                    .right(px(2.0))
+                    .size(px(5.0))
+                    .rounded_full()
+                    .bg(Ink::FRESH),
+            )
+        })
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(|_, window, cx| {
+            window.dispatch_action(Box::new(crate::commands::ToggleNotifications), cx);
+            cx.stop_propagation();
+        })
+        .into_any_element()
+}
+
+fn spaced_shortcut_label(label: &str) -> String {
+    if label.contains('+') {
+        return label.replace('+', "\u{2009}+\u{2009}");
+    }
+
+    let mut rest = label;
+    let mut parts = Vec::new();
+    if let Some(without_fn) = rest.strip_prefix("fn") {
+        parts.push("fn");
+        rest = without_fn;
+    }
+    while let Some(modifier) = rest
+        .chars()
+        .next()
+        .filter(|character| matches!(character, '⌃' | '⌥' | '⇧' | '⌘'))
+    {
+        parts.push(match modifier {
+            '⌃' => "⌃",
+            '⌥' => "⌥",
+            '⇧' => "⇧",
+            '⌘' => "⌘",
+            _ => unreachable!(),
+        });
+        rest = &rest[modifier.len_utf8()..];
+    }
+    if !rest.is_empty() {
+        parts.push(rest);
+    }
+    parts.join("\u{2009}")
 }
 
 fn settings_page(
@@ -5505,66 +5362,44 @@ fn appearance_settings_page(content: impl IntoElement, colors: SemanticColors) -
     div()
         .w_full()
         .px(px(24.0))
-        .pt(px(22.0))
-        .pb(px(32.0))
+        .pt(px(28.0))
+        .pb(px(36.0))
         .flex()
         .flex_col()
-        .gap(px(22.0))
+        .gap(px(36.0))
         .child(
             div()
-                .pr(px(34.0))
-                .min_h(px(44.0))
-                .flex()
-                .flex_wrap()
-                .items_end()
-                .justify_between()
-                .gap(px(12.0))
-                .child(
-                    div()
-                        .min_w(px(260.0))
-                        .flex_1()
-                        .flex()
-                        .flex_col()
-                        .gap(px(5.0))
-                        .child(
-                            div()
-                                .text_size(px(21.0))
-                                .line_height(px(24.0))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(colors.primary)
-                                .child("Appearance"),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(12.0))
-                                .line_height(px(17.0))
-                                .text_color(colors.secondary)
-                                .child("Shape a workspace that feels focused, legible, and yours."),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .h(px(26.0))
-                        .px(px(9.0))
-                        .rounded(px(Radius::CHIP))
-                        .border_1()
-                        .border_color(Ink::FRESH.alpha(0.22))
-                        .bg(Ink::FRESH.alpha(0.08))
-                        .flex()
-                        .items_center()
-                        .gap(px(6.0))
-                        .child(div().size(px(5.0)).rounded_full().bg(Ink::FRESH))
-                        .child(
-                            div()
-                                .text_size(px(10.0))
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(colors.secondary)
-                                .child("Changes apply instantly"),
-                        ),
-                ),
+                .text_size(px(24.0))
+                .font_weight(FontWeight::NORMAL)
+                .text_color(colors.primary)
+                .child("Appearance"),
         )
         .child(content)
+}
+
+fn appearance_setting_row(
+    label: &'static str,
+    control: impl IntoElement,
+    colors: SemanticColors,
+) -> impl IntoElement {
+    div()
+        .min_h(px(52.0))
+        .py(px(9.0))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(16.0))
+        .child(
+            div()
+                .text_size(px(13.0))
+                .text_color(colors.primary)
+                .child(label),
+        )
+        .child(control)
+}
+
+fn appearance_divider(colors: SemanticColors) -> impl IntoElement {
+    div().h(px(1.0)).bg(colors.primary.alpha(0.055))
 }
 
 fn setting_divider(colors: SemanticColors) -> impl IntoElement {
@@ -5669,433 +5504,268 @@ fn settings_choice_row(
         })
 }
 
-fn featured_theme_card(
+fn appearance_mode_card(
     index: usize,
-    theme: TermTheme,
+    label: &'static str,
     selected: bool,
     colors: SemanticColors,
     cx: &mut Context<UtilitySurfaces>,
 ) -> impl IntoElement {
-    let selection_tint = if theme.cursor.a > 0.0 {
-        theme.cursor
+    let light = index == 1;
+    let ink = if light {
+        rgba(0x737373ff)
     } else {
-        theme.foreground
+        rgba(0xa0a0a0ff)
     };
-
     div()
-        .id(SharedString::from(format!("featured-theme-{index}")))
+        .id(SharedString::from(format!("appearance-mode-{index}")))
         .debug_selector(move || format!("FEATURED_THEME_{index}"))
-        .relative()
-        .min_w(px(176.0))
-        .h(px(108.0))
         .flex_1()
-        .rounded(px(Radius::CARD))
-        .overflow_hidden()
-        .border_1()
-        .border_color(if selected {
-            selection_tint.alpha(0.76)
-        } else {
-            colors.primary.alpha(0.11)
-        })
-        .bg(theme.background)
-        .shadow(if selected {
-            vec![BoxShadow {
-                color: selection_tint.alpha(0.14).into(),
-                offset: point(px(0.0), px(5.0)),
-                blur_radius: px(16.0),
-                spread_radius: px(-3.0),
-                inset: false,
-            }]
-        } else {
-            Vec::new()
-        })
+        .min_w(px(0.0))
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .role(gpui::Role::Button)
+        .aria_label(format!("Use {label} appearance"))
         .cursor_pointer()
-        .hover(move |card| card.border_color(colors.primary.alpha(0.34)))
-        .active(|card| card.opacity(0.84))
-        .on_click(cx.listener(move |this, _, _, cx| {
-            this.prefs.terminal_theme = theme.id.to_owned();
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.prefs.follow_system_theme = index == 0;
+            if index == 0 {
+                this.prefs.apply_system_theme(matches!(
+                    window.appearance(),
+                    gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+                ));
+            } else if (theme(&this.prefs.terminal_theme).appearance == ThemeAppearance::Light)
+                != light
+            {
+                this.prefs.terminal_theme = if light {
+                    "dirijor-light"
+                } else {
+                    "dirijor-dark"
+                }
+                .into();
+            }
             this.settings_menu = None;
             this.persist_prefs();
             cx.notify();
         }))
-        .flex()
-        .flex_col()
         .child(
             div()
-                .h(px(30.0))
-                .px(px(9.0))
-                .flex()
-                .items_center()
-                .justify_between()
-                .bg(theme.foreground.alpha(0.045))
+                .relative()
+                .h(px(148.0))
+                .w_full()
+                .rounded(px(11.0))
+                .overflow_hidden()
+                .border_2()
+                .border_color(if selected {
+                    colors.primary
+                } else {
+                    colors.primary.alpha(0.07)
+                })
+                .bg(if light {
+                    rgba(0xedededff)
+                } else {
+                    rgba(0x555555ff)
+                })
+                .hover(move |card| {
+                    card.border_color(colors.primary.alpha(if selected { 1.0 } else { 0.4 }))
+                })
+                .when(index == 0, |card| {
+                    card.child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .top_0()
+                            .bottom_0()
+                            .w(gpui::relative(0.5))
+                            .rounded_tl(px(9.0))
+                            .rounded_bl(px(9.0))
+                            .bg(rgba(0xb3b3b3ff)),
+                    )
+                })
                 .child(
                     div()
-                        .min_w(px(0.0))
-                        .text_ellipsis()
-                        .text_size(px(10.0))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme.foreground)
-                        .child(theme.name),
-                )
-                .when(selected, |bar| {
-                    bar.child(sf_symbol("checkmark.circle.fill", 11.0, selection_tint))
-                }),
-        )
-        .child(
-            div()
-                .flex_1()
-                .px(px(10.0))
-                .py(px(8.0))
-                .flex()
-                .flex_col()
-                .gap(px(5.0))
-                .font_family(crate::fonts::mono_family())
-                .text_size(px(9.5))
-                .child(
-                    div()
-                        .flex()
-                        .child(div().text_color(theme.ansi[2]).child("❯ "))
-                        .child(div().text_color(theme.foreground).child("diri --continue"))
-                        .child(div().ml(px(2.0)).text_color(theme.cursor).child("█")),
+                        .absolute()
+                        .top(px(30.0))
+                        .left(gpui::relative(0.28))
+                        .w(gpui::relative(0.44))
+                        .h(px(7.0))
+                        .rounded_full()
+                        .bg(ink.alpha(0.6)),
                 )
                 .child(
                     div()
-                        .flex()
-                        .items_center()
-                        .gap(px(5.0))
-                        .text_color(theme.ansi[8])
-                        .child(div().size(px(4.0)).rounded_full().bg(Ink::FRESH))
-                        .child("workspace ready"),
+                        .absolute()
+                        .top(px(42.0))
+                        .left(gpui::relative(0.2))
+                        .w(gpui::relative(0.6))
+                        .h(px(4.0))
+                        .rounded_full()
+                        .bg(ink.alpha(0.3)),
                 )
                 .child(
-                    div().mt_auto().flex().gap(px(3.0)).children(
-                        [theme.ansi[1], theme.ansi[2], theme.ansi[3], theme.ansi[4]]
-                            .map(|color| div().flex_1().h(px(4.0)).rounded(px(2.0)).bg(color)),
-                    ),
+                    div()
+                        .absolute()
+                        .top(px(62.0))
+                        .left(px(11.0))
+                        .right(px(11.0))
+                        .h(px(120.0))
+                        .rounded_tl(px(11.0))
+                        .rounded_tr(px(11.0))
+                        .overflow_hidden()
+                        .bg(if index == 2 {
+                            rgba(0x262626ff)
+                        } else {
+                            rgba(0xfafafaff)
+                        })
+                        .when(index == 0, |card| {
+                            card.child(
+                                div()
+                                    .absolute()
+                                    .right_0()
+                                    .top_0()
+                                    .bottom_0()
+                                    .w(gpui::relative(0.5))
+                                    .rounded_tr(px(11.0))
+                                    .bg(rgba(0x262626ff)),
+                            )
+                        })
+                        .child(
+                            div()
+                                .relative()
+                                .p(px(11.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(12.0))
+                                .children([0.44, 0.7, 0.54].into_iter().map(|width| {
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(5.0))
+                                        .child(
+                                            div()
+                                                .w(gpui::relative(width))
+                                                .h(px(7.0))
+                                                .rounded_full()
+                                                .bg(ink.alpha(0.4)),
+                                        )
+                                        .child(div().w_full().h(px(2.0)).bg(ink.alpha(0.12)))
+                                })),
+                        ),
                 ),
         )
-}
-
-fn preview_sidebar_row(
-    label: &'static str,
-    tint: Rgba,
-    active: bool,
-    theme: TermTheme,
-) -> impl IntoElement {
-    div()
-        .h(px(25.0))
-        .px(px(8.0))
-        .rounded(px(5.0))
-        .bg(if active {
-            theme.foreground.alpha(0.085)
-        } else {
-            theme.foreground.alpha(0.0)
-        })
-        .flex()
-        .items_center()
-        .gap(px(7.0))
-        .child(div().size(px(5.0)).rounded_full().bg(tint))
         .child(
             div()
-                .min_w(px(0.0))
-                .text_ellipsis()
-                .text_size(px(9.0))
-                .font_weight(if active {
-                    FontWeight::MEDIUM
+                .w_full()
+                .text_center()
+                .text_size(px(12.0))
+                .text_color(if selected {
+                    colors.primary
                 } else {
-                    FontWeight::NORMAL
-                })
-                .text_color(if active {
-                    theme.foreground
-                } else {
-                    theme.foreground.alpha(0.58)
+                    colors.secondary
                 })
                 .child(label),
         )
 }
 
-fn preview_code_line(
-    number: &'static str,
-    content: impl IntoElement,
-    highlighted: bool,
-    theme: TermTheme,
-) -> impl IntoElement {
-    div()
-        .h(px(21.0))
-        .px(px(9.0))
-        .flex()
-        .items_center()
-        .when(highlighted, |line| {
-            line.bg(theme.ansi[4].alpha(0.11))
-                .border_l_2()
-                .border_color(theme.ansi[4].alpha(0.80))
-        })
-        .child(
-            div()
-                .flex_none()
-                .w(px(24.0))
-                .text_color(theme.ansi[8].alpha(0.76))
-                .child(number),
-        )
-        .child(content)
-}
-
-fn workspace_theme_preview(
-    theme: TermTheme,
-    font_size: f32,
-    colors: SemanticColors,
-) -> impl IntoElement {
-    let preview_font_size = (font_size - 2.0).clamp(9.0, 13.0);
-    div()
-        .debug_selector(|| "APPEARANCE_WORKSPACE_PREVIEW".into())
-        .w_full()
-        .h(px(176.0))
-        .rounded(px(Radius::CARD))
-        .overflow_hidden()
-        .border_1()
-        .border_color(colors.primary.alpha(0.13))
-        .bg(theme.background)
-        .shadow(vec![BoxShadow {
-            color: rgba(0x00000042).into(),
-            offset: point(px(0.0), px(8.0)),
-            blur_radius: px(22.0),
-            spread_radius: px(-7.0),
-            inset: false,
-        }])
-        .flex()
-        .child(
-            div()
-                .flex_none()
-                .w(px(128.0))
-                .h_full()
-                .p(px(9.0))
-                .bg(theme.foreground.alpha(0.045))
-                .flex()
-                .flex_col()
-                .gap(px(5.0))
-                .child(
+fn appearance_diff_preview(theme: TermTheme, font_size: f32) -> impl IntoElement {
+    let line_height = (font_size * 1.5).ceil();
+    let column = |added: bool| {
+        let tint = if added { theme.ansi[2] } else { theme.ansi[1] };
+        div()
+            .flex_1()
+            .min_w(px(0.0))
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .children(
+                [
+                    "const themePreview = {".to_owned(),
+                    format!(
+                        "  surface: \"{}\",",
+                        if added { "sidebar-elevated" } else { "sidebar" }
+                    ),
+                    format!(
+                        "  accent: \"{}\",",
+                        if added { "#0ea5e9" } else { "#2563eb" }
+                    ),
+                    format!("  contrast: {},", if added { 68 } else { 42 }),
+                    "};".to_owned(),
+                ]
+                .into_iter()
+                .enumerate()
+                .map(move |(index, text)| {
+                    let changed = (1..=3).contains(&index);
+                    let color = |color: gpui::Rgba| gpui::HighlightStyle {
+                        color: Some(color.into()),
+                        ..Default::default()
+                    };
+                    let highlights = match index {
+                        0 => vec![(0..5, color(theme.ansi[5].alpha(0.85)))],
+                        1..=3 => {
+                            let colon = text.find(':').expect("preview property");
+                            vec![
+                                (2..colon, color(theme.ansi[3].alpha(0.7))),
+                                (
+                                    colon + 2..text.len() - 1,
+                                    color(
+                                        if index == 3 {
+                                            theme.ansi[6]
+                                        } else {
+                                            theme.ansi[2]
+                                        }
+                                        .alpha(0.85),
+                                    ),
+                                ),
+                            ]
+                        }
+                        _ => Vec::new(),
+                    };
                     div()
-                        .h(px(20.0))
-                        .flex()
-                        .items_center()
-                        .gap(px(4.0))
-                        .children(
-                            [theme.ansi[1], theme.ansi[3], theme.ansi[2]].map(|color| {
-                                div().size(px(5.0)).rounded_full().bg(color.alpha(0.88))
-                            }),
-                        ),
-                )
-                .child(
-                    div()
-                        .mt(px(3.0))
-                        .mb(px(2.0))
-                        .text_size(px(8.0))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme.foreground.alpha(0.38))
-                        .child("WORKSPACE"),
-                )
-                .child(preview_sidebar_row(
-                    "Appearance",
-                    theme.ansi[4],
-                    true,
-                    theme,
-                ))
-                .child(preview_sidebar_row(
-                    "Refactor UI",
-                    theme.ansi[5],
-                    false,
-                    theme,
-                ))
-                .child(preview_sidebar_row(
-                    "Run tests",
-                    theme.ansi[2],
-                    false,
-                    theme,
-                ))
-                .child(
-                    div()
-                        .mt_auto()
-                        .h(px(23.0))
-                        .px(px(7.0))
-                        .rounded(px(5.0))
-                        .bg(theme.foreground.alpha(0.045))
-                        .flex()
-                        .items_center()
-                        .gap(px(6.0))
-                        .child(div().size(px(5.0)).rounded_full().bg(Ink::FRESH))
-                        .child(
-                            div()
-                                .text_size(px(8.5))
-                                .text_color(theme.foreground.alpha(0.66))
-                                .child("3 agents ready"),
-                        ),
-                ),
-        )
-        .child(div().w(px(1.0)).h_full().bg(theme.foreground.alpha(0.09)))
-        .child(
-            div()
-                .min_w(px(0.0))
-                .flex_1()
-                .h_full()
-                .flex()
-                .flex_col()
-                .child(
-                    div()
+                        .h(px(line_height))
                         .flex_none()
-                        .h(px(31.0))
-                        .px(px(10.0))
-                        .bg(theme.foreground.alpha(0.025))
                         .flex()
                         .items_center()
-                        .justify_between()
+                        .border_l_2()
+                        .border_color(if changed { tint } else { theme.background })
+                        .when(changed, |line| line.bg(tint.alpha(0.16)))
                         .child(
                             div()
-                                .font_family(crate::fonts::mono_family())
-                                .text_size(px(9.0))
-                                .text_color(theme.foreground.alpha(0.68))
-                                .child("appearance.rs"),
+                                .w(px(33.0))
+                                .flex_none()
+                                .text_right()
+                                .pr(px(10.0))
+                                .text_color(if changed {
+                                    tint.alpha(0.8)
+                                } else {
+                                    theme.foreground.alpha(0.35)
+                                })
+                                .child((index + 1).to_string()),
                         )
                         .child(
                             div()
-                                .px(px(5.0))
-                                .py(px(2.0))
-                                .rounded(px(4.0))
-                                .bg(theme.ansi[2].alpha(0.12))
-                                .text_size(px(8.0))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme.ansi[2])
-                                .child("LIVE"),
-                        ),
-                )
-                .child(div().h(px(1.0)).bg(theme.foreground.alpha(0.08)))
-                .child(
-                    div()
-                        .flex_1()
-                        .py(px(7.0))
-                        .font_family(crate::fonts::mono_family())
-                        .text_size(px(preview_font_size))
-                        .text_color(theme.foreground)
-                        .child(preview_code_line(
-                            "1",
-                            div()
-                                .flex()
-                                .child(div().text_color(theme.ansi[5]).child("const "))
-                                .child(div().text_color(theme.ansi[3]).child("appearance"))
-                                .child(div().text_color(theme.foreground).child(" = {")),
-                            false,
-                            theme,
-                        ))
-                        .child(preview_code_line(
-                            "2",
-                            div()
-                                .flex()
-                                .child(div().text_color(theme.foreground).child("  theme: "))
-                                .child(div().text_color(theme.ansi[2]).child(theme.name))
-                                .child(div().text_color(theme.foreground).child(",")),
-                            true,
-                            theme,
-                        ))
-                        .child(preview_code_line(
-                            "3",
-                            div()
-                                .flex()
-                                .child(div().text_color(theme.foreground).child("  type: "))
-                                .child(
-                                    div()
-                                        .text_color(theme.ansi[6])
-                                        .child(format!("{font_size:.0}pt")),
-                                )
-                                .child(div().text_color(theme.foreground).child(",")),
-                            false,
-                            theme,
-                        ))
-                        .child(preview_code_line(
-                            "4",
-                            div()
-                                .flex()
-                                .child(div().text_color(theme.foreground).child("  status: "))
-                                .child(div().text_color(theme.ansi[2]).child("focused"))
-                                .child(div().text_color(theme.foreground).child(",")),
-                            false,
-                            theme,
-                        ))
-                        .child(preview_code_line(
-                            "5",
-                            div().text_color(theme.foreground).child("};"),
-                            false,
-                            theme,
-                        )),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .h(px(24.0))
-                        .px(px(10.0))
-                        .bg(theme.foreground.alpha(0.04))
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .font_family(crate::fonts::mono_family())
-                        .text_size(px(8.0))
-                        .text_color(theme.foreground.alpha(0.52))
-                        .child("main  +1 −1")
-                        .child("diri · ready"),
-                ),
-        )
-}
-
-fn terminal_type_specimen(theme: TermTheme, font_size: f32) -> impl IntoElement {
-    div().p(px(12.0)).child(
-        div()
-            .w_full()
-            .min_h(px(58.0))
-            .px(px(12.0))
-            .py(px(9.0))
-            .rounded(px(Radius::ROW))
-            .border_1()
-            .border_color(theme.foreground.alpha(0.10))
-            .bg(theme.background)
-            .flex()
-            .items_center()
-            .gap(px(11.0))
-            .child(
-                div()
-                    .flex_none()
-                    .size(px(36.0))
-                    .rounded(px(Radius::BADGE))
-                    .bg(theme.ansi[4].alpha(0.15))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .font_family(crate::fonts::mono_family())
-                    .text_size(px(13.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.ansi[4])
-                    .child("Aa"),
+                                .whitespace_nowrap()
+                                .text_color(theme.foreground.alpha(0.7))
+                                .child(gpui::StyledText::new(text).with_highlights(highlights)),
+                        )
+                }),
             )
-            .child(
-                div()
-                    .min_w(px(0.0))
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .gap(px(3.0))
-                    .font_family(crate::fonts::mono_family())
-                    .child(
-                        div()
-                            .text_size(px(font_size.clamp(10.0, 17.0)))
-                            .line_height(px((font_size + 4.0).clamp(14.0, 21.0)))
-                            .text_color(theme.foreground)
-                            .child("cargo test --workspace"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(9.0))
-                            .text_color(theme.ansi[8])
-                            .child("A live specimen at your selected terminal size"),
-                    ),
-            ),
-    )
+    };
+    div()
+        .debug_selector(|| "APPEARANCE_WORKSPACE_PREVIEW".into())
+        .w_full()
+        .rounded(px(12.0))
+        .overflow_hidden()
+        .border_1()
+        .border_color(theme.foreground.alpha(0.09))
+        .bg(theme.background)
+        .font_family(crate::fonts::mono_family())
+        .font_weight(FontWeight::NORMAL)
+        .text_size(px(font_size))
+        .flex()
+        .child(column(false))
+        .child(div().w(px(1.0)).bg(theme.foreground.alpha(0.1)))
+        .child(column(true))
 }
 
 fn chip(label: String, colors: SemanticColors) -> impl IntoElement {
@@ -6135,7 +5805,7 @@ fn empty_label(label: &str, colors: SemanticColors) -> impl IntoElement {
         .child(label.to_owned())
 }
 
-fn ui_agent(kind: &ProtoAgentKind) -> diri_ui::AgentKind {
+pub(crate) fn ui_agent(kind: &ProtoAgentKind) -> diri_ui::AgentKind {
     // Brand vocabulary, not a protocol type: a manifest agent the client has
     // no hand-drawn mark for falls back to the generic terminal treatment.
     match kind.id() {
@@ -6153,22 +5823,6 @@ fn folder_name(path: &str) -> &str {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(path)
-}
-
-fn relative_parent(path: &str) -> String {
-    let Some(parent) = Path::new(path).parent() else {
-        return String::new();
-    };
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    if home.as_deref() == Some(parent) {
-        return "~".to_owned();
-    }
-    if let Some(home) = home
-        && let Ok(relative) = parent.strip_prefix(home)
-    {
-        return format!("~/{}", relative.display());
-    }
-    parent.to_string_lossy().into_owned()
 }
 
 /// Second line under the update summary: why updates are off, or when the last
@@ -6220,19 +5874,6 @@ fn expire_completed_reinstall(
     should_expire
 }
 
-fn relative_time(milliseconds: f64) -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0.0, |duration| duration.as_secs_f64() * 1000.0);
-    let seconds = ((now - milliseconds).max(0.0) / 1000.0) as u64;
-    match seconds {
-        0..=59 => "now".to_owned(),
-        60..=3_599 => format!("{}m", seconds / 60),
-        3_600..=86_399 => format!("{}h", seconds / 3_600),
-        _ => format!("{}d", seconds / 86_400),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6268,175 +5909,6 @@ mod tests {
                     .cached(StyleRefinement::default().absolute().inset_0()),
             )
         }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn seed_history(surfaces: &mut UtilitySurfaces) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs_f64()
-            * 1000.0;
-        let titles = [
-            "Make conversation search fast and useful",
-            "Polish sidebar navigation and rounded popovers",
-            "Keep remote sessions alive after reconnecting",
-            "Fix terminal rendering when switching projects",
-            "Add keyboard shortcuts for quick navigation",
-            "Explore a simpler onboarding flow",
-            "A longer conversation title about investigating search results across multiple projects and keeping useful names visible",
-        ];
-        surfaces.surface = Surface::History;
-        surfaces.history = (0..640)
-            .map(|index| HistoryEntry {
-                id: format!("conversation-{index}"),
-                kind: if index % 2 == 0 {
-                    ProtoAgentKind::CODEX
-                } else {
-                    ProtoAgentKind::CLAUDE_CODE
-                },
-                cwd: if index == 4 {
-                    "/work/old-worktree".to_owned()
-                } else {
-                    "/work/diri".to_owned()
-                },
-                title: Some(titles[index % titles.len()].to_owned()),
-                transcript_path: String::new(),
-                last_active_at: diri_proto::DateMillis(now - index as f64 * 3600000.0),
-                created_at: None,
-                cwd_exists: index != 4,
-            })
-            .collect();
-        surfaces.history_search.rebuild(&surfaces.history);
-        surfaces.filter_history();
-    }
-
-    #[cfg(target_os = "macos")]
-    #[gpui::test]
-    fn history_virtualizes_results_and_keeps_keyboard_selection_visible(cx: &mut TestAppContext) {
-        let (view, cx) = cx.add_window_view(|window, cx| {
-            let runtime = Arc::new(StoreRuntime::inert());
-            let tokio = Arc::new(
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap(),
-            );
-            let surfaces = cx.new(|cx| {
-                let mut surfaces =
-                    UtilitySurfaces::new(runtime, tokio, crate::updates::inert(), window, cx);
-                seed_history(&mut surfaces);
-                surfaces.focus.focus(window, cx);
-                surfaces
-            });
-            CachedOverlayHarness { surfaces }
-        });
-        cx.simulate_resize(size(px(800.0), px(700.0)));
-        cx.run_until_parked();
-        assert!(cx.debug_bounds("history-row-0").is_some());
-        assert!(
-            cx.debug_bounds("history-row-639").is_none(),
-            "offscreen rows must not be rendered"
-        );
-        let surfaces = view.read_with(cx, |view, _| view.surfaces.clone());
-        surfaces.update(cx, |surfaces, cx| surfaces.move_history(-1, cx));
-        cx.run_until_parked();
-        let row = cx
-            .debug_bounds("history-row-639")
-            .expect("keyboard selection scrolled into view");
-        let dialog = cx.debug_bounds("conversation-history").unwrap();
-        assert!(row.top() >= dialog.top() && row.bottom() <= dialog.bottom());
-        cx.simulate_keystrokes("s e a r c h");
-        cx.run_until_parked();
-        surfaces.read_with(cx, |surfaces, _| {
-            assert_eq!(surfaces.history_query.text(), "search");
-            assert_eq!(surfaces.history_highlight, 0);
-            assert!(surfaces.history_matches.len() < 640);
-        });
-        surfaces.update(cx, |surfaces, cx| {
-            surfaces.history_query.clear();
-            surfaces.history_query.insert("zzzzzz");
-            surfaces.filter_history();
-            cx.notify();
-        });
-        cx.run_until_parked();
-        let empty_dialog = cx.debug_bounds("conversation-history").unwrap();
-        assert_eq!(
-            empty_dialog.size.width, dialog.size.width,
-            "empty results preserve dialog width"
-        );
-        surfaces.update(cx, |surfaces, cx| {
-            surfaces.history_resuming = Some("already-opening".to_owned());
-            let entry = surfaces.history[0].clone();
-            surfaces.resume_history(entry, cx);
-            assert_eq!(
-                surfaces.history_resuming.as_deref(),
-                Some("already-opening")
-            );
-        });
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore = "renders deterministic history UI without a live daemon"]
-    fn render_history_preview_screenshot() {
-        let output =
-            PathBuf::from(std::env::var_os("DIRI_VISUAL_OUTPUT").expect("set DIRI_VISUAL_OUTPUT"));
-        let platform = gpui_platform::current_platform(true);
-        let mut cx = HeadlessAppContext::with_platform(
-            platform.text_system(),
-            Arc::new(diri_ui::IconAssets),
-            gpui_platform::current_headless_renderer,
-        );
-        cx.update(|cx| {
-            crate::fonts::init(cx);
-            cx.set_reduce_motion(true);
-        });
-        let narrow = std::env::var_os("DIRI_VISUAL_NARROW").is_some();
-        let window = cx
-            .open_window(
-                size(px(if narrow { 680.0 } else { 1000.0 }), px(720.0)),
-                move |window, cx| {
-                    let surfaces = cx.new(|cx| {
-                        let runtime = Arc::new(StoreRuntime::inert());
-                        let tokio = Arc::new(
-                            tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .build()
-                                .unwrap(),
-                        );
-                        let mut surfaces = UtilitySurfaces::new(
-                            runtime,
-                            tokio,
-                            crate::updates::inert(),
-                            window,
-                            cx,
-                        );
-                        seed_history(&mut surfaces);
-                        if std::env::var_os("DIRI_VISUAL_LIGHT").is_some() {
-                            surfaces.prefs.terminal_theme = TermTheme::DIRIJOR_LIGHT.id.to_owned();
-                        }
-                        if let Ok(query) = std::env::var("DIRI_VISUAL_QUERY") {
-                            surfaces.history_query.insert(&query);
-                            surfaces.filter_history();
-                        }
-                        if std::env::var_os("DIRI_VISUAL_OPENING").is_some() {
-                            surfaces.history_resuming = Some(surfaces.history[0].id.clone());
-                        }
-                        surfaces
-                    });
-                    cx.new(|_| CachedOverlayHarness { surfaces })
-                },
-            )
-            .unwrap();
-        cx.run_until_parked();
-        cx.update_window(window.into(), |_, window, _| window.refresh())
-            .unwrap();
-        cx.run_until_parked();
-        cx.capture_screenshot(window.into())
-            .unwrap()
-            .save(output)
-            .unwrap();
     }
 
     /// Regenerates the issue/PR screenshot without Screen Recording access or
@@ -6508,10 +5980,12 @@ mod tests {
         let tab = match std::env::var("DIRI_VISUAL_SETTINGS_TAB").as_deref() {
             Ok("shortcuts") => SettingsTab::Shortcuts,
             Ok("general") => SettingsTab::General,
+            Ok("whats-new") => SettingsTab::WhatsNew,
             Ok("agents") => SettingsTab::Agents,
             Ok("skills") => SettingsTab::Skills,
             Ok("accounts") => SettingsTab::Accounts,
             Ok("terminal") => SettingsTab::Terminal,
+            Ok("worktrees") => SettingsTab::Worktrees,
             Ok("resources") => SettingsTab::Resources,
             _ => SettingsTab::Remote,
         };
@@ -6554,6 +6028,163 @@ mod tests {
             std::fs::create_dir_all(parent).expect("create screenshot directory");
         }
         screenshot.save(output).expect("save settings screenshot");
+    }
+
+    #[gpui::test]
+    fn whats_new_is_searchable_and_renders_release_markdown(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            let release = diri_updater::ReleaseNotes {
+                tag_name: "v0.6.0".into(),
+                name: Some("diri 0.6.0".into()),
+                body: "## Highlights\n\n- Faster sessions".into(),
+                published_at: Some("2026-09-05T12:17:55Z".into()),
+            };
+            let document = Arc::new(crate::markdown::MarkdownDocument::parse(&release.body));
+            surfaces.release_notes = ReleaseNotesState::Loaded { release, document };
+            surfaces.settings_tab = SettingsTab::WhatsNew;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("release-notes-content").is_some());
+        assert!(settings_tab_matches(SettingsTab::WhatsNew, "release notes"));
+        assert!(settings_tab_matches(
+            SettingsTab::WhatsNew,
+            "latest changes"
+        ));
+    }
+
+    #[gpui::test]
+    fn worktree_checks_keep_running_after_closing_the_sidebar(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.open_settings_tab(SettingsTab::Worktrees, cx);
+            assert!(surfaces.worktrees.loading);
+            surfaces.close_surface(cx);
+        });
+        cx.run_until_parked();
+        surfaces.read_with(cx, |surfaces, _| {
+            assert!(
+                surfaces.worktrees.loading,
+                "hiding the sidebar must not stop progress updates"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn worktree_checks_survive_reopening_both_entry_points(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            let entries = worktree_settings::preview_entries();
+            surfaces
+                .worktrees
+                .apply_scan(diri_proto::WorktreeScanResult {
+                    generation: 7,
+                    cursor: entries.len(),
+                    total: entries.len(),
+                    checked: entries.len(),
+                    entries: entries.clone(),
+                    running: false,
+                    has_more: false,
+                    error: None,
+                });
+            let entries = surfaces.worktrees.entries.clone();
+            let epoch = surfaces.worktrees.poll_epoch;
+            surfaces.open_settings_tab(SettingsTab::General, cx);
+            surfaces.open_settings_tab(SettingsTab::Worktrees, cx);
+            assert!(
+                !surfaces.worktrees.loading,
+                "reopening settings must keep checked results"
+            );
+            assert_eq!(surfaces.worktrees.poll_epoch, epoch);
+            assert_eq!(surfaces.worktrees.entries, entries);
+            surfaces.close_surface(cx);
+            surfaces.open_worktrees(cx);
+            assert!(
+                !surfaces.worktrees.loading,
+                "reopening the sheet must keep checked results"
+            );
+            assert_eq!(surfaces.worktrees.poll_epoch, epoch);
+            assert_eq!(surfaces.worktrees.entries, entries);
+            surfaces.refresh_worktrees(cx);
+            assert!(
+                surfaces.worktrees.loading,
+                "explicit refresh still starts a scan"
+            );
+            assert_eq!(surfaces.worktrees.poll_epoch, epoch + 1);
+        });
+    }
+
+    #[gpui::test]
+    fn worktree_settings_bounds_rendering_for_10000_entries(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        let start = std::time::Instant::now();
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.settings_tab = SettingsTab::Worktrees;
+            let template = worktree_settings::preview_entries().remove(0);
+            surfaces.worktrees.entries = (0..10_000)
+                .map(|i| {
+                    let mut entry = template.clone();
+                    entry.path = format!("/fixture/tree-{i}");
+                    entry
+                })
+                .collect();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("worktree-row-/fixture/tree-0").is_some());
+        assert!(cx.debug_bounds("worktree-row-/fixture/tree-40").is_none());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.worktrees.page = 249;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("worktree-row-/fixture/tree-0").is_none());
+        assert!(cx.debug_bounds("worktree-row-/fixture/tree-9960").is_some());
+        eprintln!(
+            "10,000 worktrees, two rendered pages: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[gpui::test]
+    fn worktree_settings_filters_and_navigation(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.open_settings_tab(SettingsTab::Worktrees, cx);
+            surfaces
+                .worktrees
+                .finish_refresh(Ok(worktree_settings::preview_entries()));
+        });
+        cx.run_until_parked();
+        for (selector, ready, old) in [
+            ("worktrees-filter-Ready to clean", true, false),
+            ("worktrees-filter-Older than 30 days", false, true),
+            ("worktrees-filter-All", false, false),
+        ] {
+            let bounds = cx.debug_bounds(selector).expect("visible worktree filter");
+            cx.simulate_click(bounds.center(), Modifiers::default());
+            cx.run_until_parked();
+            surfaces.read_with(cx, |surfaces, _| {
+                assert_eq!(
+                    surfaces.settings_nav().unwrap().active,
+                    SettingsTab::Worktrees
+                );
+                assert_eq!(surfaces.worktrees.cleanup_only, ready);
+                assert_eq!(surfaces.worktrees.old_only, old);
+            });
+        }
+        assert!(settings_tab_matches(SettingsTab::Worktrees, "disk cleanup"));
+        assert!(settings_tab_matches(
+            SettingsTab::Worktrees,
+            "pull requests"
+        ));
     }
 
     #[gpui::test]
@@ -6851,6 +6482,34 @@ mod tests {
                 );
                 surfaces.open_settings(cx);
                 surfaces.settings_tab = tab;
+                if tab == SettingsTab::WhatsNew {
+                    let release = diri_updater::ReleaseNotes {
+                        tag_name: "v0.6.0".into(),
+                        name: Some("diri 0.6.0 — Your agent workspace".into()),
+                        body: "## Everything in one place\n\n- Open browser and shell tabs beside a session.\n- Search conversation history and resume previous work.\n\n### Polish and reliability\n\nSettings, navigation, and session recovery now feel more at home on macOS."
+                            .into(),
+                        published_at: Some("2026-09-05T12:17:55Z".into()),
+                    };
+                    let document = Arc::new(crate::markdown::MarkdownDocument::parse(&release.body));
+                    surfaces.release_notes = ReleaseNotesState::Loaded { release, document };
+                }
+                if tab == SettingsTab::Worktrees {
+                    surfaces.worktrees.entries = worktree_settings::preview_entries();
+                    if std::env::var_os("DIRI_VISUAL_WORKTREE_PROGRESS").is_some() {
+                        surfaces.worktrees.loading = true;
+                        surfaces.worktrees.checked = 2;
+                        for entry in surfaces.worktrees.entries.iter_mut().skip(2) {
+                            entry.stale_suggestion = false;
+                            entry.health.pr_state = "Checking…".into();
+                            entry.health.protection = Some("Checking…".into());
+                            entry.health.disk_bytes = None;
+                        }
+                    }
+                    if std::env::var_os("DIRI_VISUAL_WORKTREE_ERROR").is_some() {
+                        surfaces.worktrees.entries.clear();
+                        surfaces.worktrees.error = Some("Couldn't connect to the engine. Refresh to retry.".into());
+                    }
+                }
                 if tab == SettingsTab::Skills {
                     surfaces.skills.update(cx, |skills, _| {
                         skills.seed_preview(std::env::var_os("DIRI_VISUAL_SKILL_DETAIL").is_some())
@@ -7523,6 +7182,20 @@ mod tests {
         assert!(!settings_tab_matches(SettingsTab::Terminal, "ssh"));
     }
 
+    #[test]
+    fn shortcut_labels_separate_modifiers_from_each_other_and_the_key() {
+        assert_eq!(
+            spaced_shortcut_label("⌥⇧⌘C"),
+            "⌥\u{2009}⇧\u{2009}⌘\u{2009}C"
+        );
+        assert_eq!(spaced_shortcut_label("⌘Space"), "⌘\u{2009}Space");
+        assert_eq!(
+            spaced_shortcut_label("Ctrl+Shift+C"),
+            "Ctrl\u{2009}+\u{2009}Shift\u{2009}+\u{2009}C"
+        );
+        assert_eq!(spaced_shortcut_label("Unassigned"), "Unassigned");
+    }
+
     #[gpui::test]
     fn shortcut_page_searches_edits_unassigns_and_restores(cx: &mut TestAppContext) {
         let (harness, cx) = open_settings_workbench(cx);
@@ -7543,7 +7216,8 @@ mod tests {
             .debug_bounds("SHORTCUT_BINDING_open-launcher")
             .expect("filtered shortcut binding should render");
         cx.simulate_click(binding.center(), Modifiers::default());
-        cx.simulate_keystrokes("cmd-shift-y");
+        let assigned = crate::commands::test_chords("cmd-shift-y");
+        cx.simulate_keystrokes(&assigned);
         surfaces.read_with(cx, |surfaces, _| {
             assert_eq!(
                 surfaces
@@ -7551,7 +7225,7 @@ mod tests {
                     .shortcut_overrides
                     .get("open-launcher")
                     .and_then(|binding| binding.as_deref()),
-                Some("cmd-shift-y")
+                Some(assigned.as_str())
             );
             assert!(surfaces.shortcut_editor.is_none());
         });
@@ -7582,7 +7256,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn appearance_quick_themes_update_the_live_preview(cx: &mut TestAppContext) {
+    fn appearance_modes_switch_the_palette_and_persist_system_following(cx: &mut TestAppContext) {
         let (harness, cx) = cx.add_window_view(|window, cx| {
             SettingsWorkbenchHarness::open_at(SettingsTab::Terminal, window, cx)
         });
@@ -7590,23 +7264,34 @@ mod tests {
         cx.run_until_parked();
         let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
 
-        let vesper = cx
-            .debug_bounds("FEATURED_THEME_1")
-            .expect("Vesper quick theme should render");
-        cx.simulate_click(vesper.center(), Modifiers::default());
-        cx.run_until_parked();
-
-        surfaces.read_with(cx, |surfaces, _| {
-            assert_eq!(surfaces.prefs.terminal_theme, TermTheme::VESPER.id);
-        });
-        assert!(
-            cx.debug_bounds("APPEARANCE_WORKSPACE_PREVIEW").is_some(),
-            "the live preview must remain mounted after changing theme"
-        );
+        for (index, palette, selector) in [
+            (1, "dirijor-light", "FEATURED_THEME_1"),
+            (2, "dirijor-dark", "FEATURED_THEME_2"),
+            (0, "", "FEATURED_THEME_0"),
+        ] {
+            let card = cx
+                .debug_bounds(selector)
+                .expect("appearance mode should render");
+            cx.simulate_click(card.center(), Modifiers::default());
+            cx.run_until_parked();
+            surfaces.read_with(cx, |surfaces, _| {
+                assert_eq!(surfaces.prefs.follow_system_theme, index == 0);
+                if index != 0 {
+                    assert_eq!(surfaces.prefs.terminal_theme, palette);
+                }
+                let store = surfaces.store.read().unwrap();
+                assert_eq!(store.preferences().follow_system_theme, index == 0);
+                assert_eq!(
+                    store.preferences().terminal_theme,
+                    surfaces.prefs.terminal_theme
+                );
+            });
+            assert!(cx.debug_bounds("APPEARANCE_WORKSPACE_PREVIEW").is_some());
+        }
     }
 
     #[gpui::test]
-    fn appearance_theme_cards_wrap_inside_a_narrow_settings_pane(cx: &mut TestAppContext) {
+    fn appearance_theme_cards_fit_inside_a_narrow_settings_pane(cx: &mut TestAppContext) {
         let (_harness, cx) = cx.add_window_view(|window, cx| {
             SettingsWorkbenchHarness::open_at(SettingsTab::Terminal, window, cx)
         });

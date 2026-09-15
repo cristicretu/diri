@@ -63,6 +63,10 @@ fn terminal_build_log_scroll(cx: &mut BenchAppContext) {
     // is comfortably above this boundary.
     if stats.frames >= MIN_GATED_FRAMES {
         assert!(
+            stats.shape_cache_hits * 10 > (stats.shape_cache_hits + stats.shape_cache_misses) * 9,
+            "scrolling must reuse at least 90% of surviving row shapes: {stats:?}",
+        );
+        assert!(
             stats.average_frame_time() < FRAME_BUDGET,
             "terminal renderer CPU exceeded its {:?} safety budget across {} frames: {:?}",
             FRAME_BUDGET,

@@ -207,6 +207,7 @@ fn message_kinds(messages: &[RemoteMessage]) -> String {
             RemoteMessage::ScrollbackRequest(_) => "ScrollbackRequest",
             RemoteMessage::ScrollbackResponse(_) => "ScrollbackResponse",
             RemoteMessage::Error(_) => "Error",
+            RemoteMessage::ForegroundProcess(_) => "ForegroundProcess",
         })
         .collect::<Vec<_>>()
         .join(",")
@@ -376,6 +377,78 @@ fn detach_reconnect_preserves_pid_snapshot_and_input() {
         killed.process_state,
         RemoteProcessState::Exited { .. }
     ));
+}
+
+#[test]
+fn detached_foreground_job_does_not_spin_the_holder() {
+    let temporary = tempfile::tempdir().expect("temp");
+    let state_dir = temporary.path().join("state");
+    let request = LaunchRequest {
+        session_id: "foreground-detach".into(),
+        session_token: token(),
+        argv: vec![
+            "/bin/bash".into(),
+            "--norc".into(),
+            "--noprofile".into(),
+            "-i".into(),
+        ],
+        cwd: "/".into(),
+        environment: vec![diri_proto::remote_pty::EnvironmentVariable {
+            name: "PATH".into(),
+            value: "/usr/bin:/bin".into(),
+        }],
+        cols: 80,
+        rows: 24,
+        persistence: PersistenceCapability::NonPersistent,
+    };
+    let launch: LaunchResult = run_json("launch", &state_dir, Some(&request));
+    struct Cleanup<'a>(&'a std::path::Path, SessionSelector);
+    impl Drop for Cleanup<'_> {
+        fn drop(&mut self) {
+            let _: SessionInspection = run_json("kill", self.0, Some(&self.1));
+        }
+    }
+    let _cleanup = Cleanup(
+        &state_dir,
+        SessionSelector {
+            session_id: launch.session_id.clone(),
+            session_token: token(),
+            expected_incarnation: Some(launch.session_incarnation.clone()),
+        },
+    );
+    let mut attach = Attach::open(&state_dir, hello(&launch, None, "foreground-client"));
+    attach.receive_until(Duration::from_secs(2), |message| {
+        matches!(message, RemoteMessage::FullSnapshot(_))
+    });
+    attach.send(RemoteMessage::Terminal(Frame::input(
+        b"sleep 30\n".to_vec(),
+    )));
+    attach.receive_until(Duration::from_secs(3), |message| {
+        matches!(message, RemoteMessage::ForegroundProcess(foreground)
+            if foreground.pid.is_some_and(|pid| pid > 0 && pid != launch.process_pid as i32))
+    });
+    drop(attach);
+
+    // Let the one-second job probe expire after the Bridge has disconnected.
+    // A stale deadline makes poll(0) spin even though sleep produces no output.
+    std::thread::sleep(Duration::from_millis(1200));
+    let before = diri_engine::governor::cpu_time_of(&[launch.holder_pid as i32]);
+    std::thread::sleep(Duration::from_secs(1));
+    let cpu =
+        diri_engine::governor::cpu_time_of(&[launch.holder_pid as i32]).saturating_sub(before);
+    let mut reattached = Attach::open(&state_dir, hello(&launch, None, "foreground-reconnect"));
+    let messages = reattached.receive_until(Duration::from_secs(2), |message| {
+        matches!(message, RemoteMessage::FullSnapshot(_))
+    });
+    assert!(messages.iter().any(|message| matches!(message,
+        RemoteMessage::HelloAck(ack)
+            if ack.process_state == (RemoteProcessState::Running { pid: launch.process_pid })
+                && ack.foreground_pid.is_some_and(|pid| pid != launch.process_pid as i32)
+    )));
+    assert!(
+        cpu < 100_000_000,
+        "detached Holder used {cpu} ns CPU in one second"
+    );
 }
 
 #[test]

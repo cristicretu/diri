@@ -64,6 +64,7 @@ requirement.
 The current baseline:
 
 - uses SSH only as an authenticated, encrypted byte transport;
+- translates local process-control signals to the verified Helper target OS before sending the existing numeric signal frames;
 - gives Diri direct ownership of the remote Agent PTY lifecycle;
 - requires no remote `tmux`, `screen`, `zellij`, Node.js, Python, `socat`, `nc`,
   `curl`, `wget`, or preinstalled Diri service;
@@ -358,6 +359,13 @@ each configured SSH host have independent catalog state. The Engine owns the
 catalog and preferences; the Helper only reports filesystem facts from the
 remote account.
 
+Local desktop discovery and launches share a normalized PATH: captured login
+shell entries first, inherited entries next, then user package-manager and
+standard executable directories. Fallbacks include pnpm's old home-directory
+shims and pnpm 11's `bin` layout, `PNPM_HOME`, `XDG_DATA_HOME`, Bun, Cargo,
+mise, and Volta. They also apply when local shell capture fails or times out.
+These local fallbacks are never added to remote launch environments.
+
 Protocol 1.3 adds the required `executable-discovery` capability. One bounded
 `executables` request carries every bundled manifest binary and any configured
 override. The Helper captures the login environment exactly once, resolves all
@@ -486,6 +494,21 @@ attach writes. The hot path does not put an `Arc<Mutex<Terminal>>` across tasks.
 Buffers are reused where practical, and idle Holders do not poll, heartbeat, or
 run GC.
 
+The shared terminal core recomputes its 4 MiB history-cell allowance when the
+column count changes, including when the primary screen is inactive. Narrowing
+increases the row allowance before reflow; widening trims after reflow so rows
+that merge are not prematurely discarded. The allowance applies to retained
+history cells, not total process memory, allocator capacity, or visible grids.
+
+VTE 0.15.0 is pinned under `vendor/vte` with a single allocation change: its
+synchronized-update buffer grows on first use instead of reserving 2 MiB for
+every terminal at construction. It retains capacity for subsequent frames.
+The byte limit, timeout, parsing, and synchronization semantics are unchanged;
+the tradeoff is allocation during the first synchronized frame. The vendored
+source and workspace dependency configuration participate in the default
+Helper Build ID. This adds no parser implementation or runtime dependency.
+See `vendor/vte/DIRI-PATCH.md` and the 2026-09-06 measurements in `PERF.md`.
+
 ### Local Holder input compatibility
 
 The durable local Holder is outside the remote Helper wire protocol, but it
@@ -502,6 +525,19 @@ dedicated input thread uses interactive QoS so persistence does not trade a
 faster socket acknowledgement for slower end-to-grid delivery. The local
 daemon's held-output follower is raised only while the session is recently
 attached or receiving input, then returns to default QoS.
+
+Local output-stream negotiation also respects surviving Holder versions. A
+completed rejection is remembered for the attached session lifetime, and the
+Engine keeps following its durable log without probing on every wakeup.
+Transport failures and interrupted supported streams remain retryable. This
+changes no local or remote wire format and never replaces a live Holder.
+
+The local Holder's `OutputLog` writer retains no raw-output ring: no Holder
+operation reads it. Durable file output, offsets, rotation and exit markers
+remain unchanged; the separate bounded live-output queue still serves attached
+Engines. The Engine and remote Helper retain their existing history/output
+budgets. Existing Holder processes keep their original allocations until their
+sessions end naturally.
 
 ## Controller lease
 
@@ -524,6 +560,61 @@ the transport error and never queues or replays that effect.
 Stale epochs fail with a structured protocol error. Multiple read-only observers
 are a future enhancement and are not part of the completed baseline.
 
+## Terminal interaction metadata (September 2026)
+
+Terminal quality-of-life interactions remain desktop-owned: link discovery and
+activation, selection, copying, menus, paste review, export, and keyboard modes
+run in `diri-app` / `diri-term`. They do not execute SSH or change controller
+ownership. The existing local Engine RPC serves retained terminal rows.
+
+The shared terminal parser additionally retains OSC 8 targets, soft-wrap facts,
+wide-cell continuation facts, combining characters, and OSC 133 A prompt-start
+marks. These are terminal screen facts; the Holder does not infer commands,
+execute shell hooks, collect exit-code histories, or orchestrate workflows.
+Prompt marks are ignored on the alternate screen. Shell prompt navigation is a
+client interpretation of retained marks, not Agent status or hook ingestion.
+Shells must emit OSC 133; no remote shell configuration is installed.
+
+Protocol 1.6 advertises optional `terminal-annotations-v1`. Grid flag bit 2 adds
+an extension version byte (1), a big-endian u32 byte length, and bounded JSON
+row annotations after the unchanged RLE rows. Unknown versions, invalid spans,
+control characters in destinations, and oversized metadata fail decoding.
+The extension is capped at 256 KiB, targets at 2048 bytes. Exporters budget
+annotations per response; targets exceeding the available annotation budget
+remain ordinary text. Semantic wrap/prompt/wide bits are additive style bits.
+Scrollback carries optional row-aligned metadata under the same negotiated
+version. A pre-1.6 controller receives the original grid form; a new Engine
+attaching to an older live Holder sees missing annotations as unavailable,
+never as fabricated link or prompt facts. Required transport capabilities and
+all existing fail-closed bootstrap checks are unchanged.
+
+Full snapshots still contain only the visible grid and its annotations, cursor,
+modes, dimensions and sequence. History remains on demand. GridMirror, deltas,
+coalescing and slow-client full reseeds preserve annotation changes even when
+visible labels do not change. Checkpoint version 4 persists visible and history
+annotations; versions 2/3 remain readable with unavailable optional metadata.
+Oversized checkpoint annotations cause a cache-write failure, retaining the
+existing raw-log recovery path rather than persisting partial link state.
+
+VTE's OSC dispatch calls one new `mark_prompt` Handler method. The vendored
+alacritty_terminal 0.26.0 adds one cell flag and marks the cursor cell in that
+handler; its existing erase, scroll, resize and synchronized-update processing
+own marker lifetime. This small parser extension avoids a second parser or
+raw-output cursor guesses. Both vendored sources participate in the Helper
+Build ID. There is no new runtime dependency.
+
+The desktop's existing reading cache is bounded by 4 MiB of cells instead of
+512 rows, so selection can span the Engine's retained history. URI metadata is
+bounded on transport and pruned alongside cached rows. Only active edge drags
+run an autoscroll timer; hover keys use cell/content/viewport revisions without
+cloning the reading cache. No idle Holder timer or new Holder task is added.
+
+Acceptance adds metadata codec rejection and compatibility tests, annotation-
+only deltas, synchronized prompt marks, erase/scroll/resize and checkpoint
+round trips, selection and paste tests, and desktop interaction verification.
+The existing release performance, persistence, lease, and real-SSH gates remain
+mandatory.
+
 ## Wire protocol
 
 `diri-proto::remote_pty` is the versioned protocol authority. Protocol 1.3
@@ -531,7 +622,14 @@ declares terminal, session management, environment capture, directory listing,
 batched executable discovery, persistence probing, and atomic activation as
 required capabilities. Protocol 1.4 additively preserves granular mouse
 tracking/encoding bits and the raw mouse-input frame while retaining the old
-any-mouse compatibility bit.
+any-mouse compatibility bit. Protocol 1.5 additively reports the PTY foreground
+process group (`HelloAck.foregroundPid` and `ForegroundProcess`) so the Engine
+can distinguish an idle shell from a foreground job. Plain-shell sidebar
+indicators remain hidden; foreground Agent indicators follow normal attention
+rules. Older Helpers omit the field; older Engines ignore the extra JSON and
+never see the new frame. Foreground probes are armed only for an attached
+compatible controller and are cleared when it disconnects, so a detached
+Holder sleeps between PTY, lifecycle, and attach events.
 
 The protocol includes:
 
@@ -550,6 +648,7 @@ Resize
 Ping
 Pong
 ProcessExit
+ForegroundProcess
 Signal
 AcquireControl
 ControlGranted
@@ -624,6 +723,14 @@ from the Helper/UDS gates and does not claim to measure real WAN latency.
 
 ## Desktop integration
 
+While the desktop terminal is scrolled back, its renderer retains one local
+screen snapshot and preserves already fetched rows in its bounded 512-row
+history cache. This keeps Agent redraws and overlapping history replies from
+replacing text under the reader. The live grid continues receiving every
+update. Returning to live or entering the alternate screen releases the reading
+view; the next scroll fetches fresh history. This is client presentation state,
+not another terminal parser, Holder snapshot, or protocol change.
+
 The desktop app initializes a newly added SSH host immediately and displays the
 bootstrap state. The Engine returns only sanitized facts such as Build ID,
 protocol version, cwd, shell, and persistence level. It does not expose the full
@@ -644,6 +751,11 @@ hash. The app and client reject missing, old, or unknown daemon identities. A
 confirmed Rust Engine whose hash differs from the bundled executable is upgraded
 without abandoning live Holder/Agent state, ensuring subsequent remote actions
 use the current Helper catalog.
+
+An inherited `DIRIJOR_SOCKET` equal to the app's ordinary socket does not bypass
+this startup verification: Agents launched by Diri inherit that path, and an
+app started from their environment must still refresh an outdated Engine.
+Only a different, explicitly supplied socket skips app-owned supervision.
 
 ## Tailscale, iPhone Companion, and `diri-node`
 
@@ -814,6 +926,29 @@ The completed acceptance scenario is:
 5. Continue interacting with the same Agent process.
 ```
 
+## Conversation title authority
+
+The local Engine separates terminal presentation titles from native conversation
+names. `SessionRecord.titleSource` additively assigns value `5` to `TerminalTitle`;
+existing values retain their meaning and older readers decode new values as
+unknown. A terminal title is provisional and may follow later OSC updates.
+Confirmed native names take precedence; manual and Diri-assigned names remain
+authoritative. A stored first-prompt preview cannot replace a real name.
+
+Live prompt capture only fills an unnamed record (placeholder or unknown).
+After adoption or resume, the first input observed by a new Engine Session can
+be a follow-up, so it must not replace an established first-prompt title. An
+identity-bound provider read may repair that fallback to the conversation's
+actual first prompt. Subsequent live folds preserve the repaired value across
+list/inspect responses, update events and persistence.
+
+Codex activity, pending-name labels and unnamed placeholders are excluded from
+conversation names, and a matching cwd suffix and activity spinner are removed.
+The Engine repairs previously persisted transient Agent titles on load. Local
+native names still come from the exact profile and thread identity; remote
+sessions use the existing terminal output and captured-prompt path. No remote
+store reads, thread-ID discovery, Helper behavior or protocol changes are added.
+
 ## Terminal notification ingestion
 
 The local Engine optionally extracts bounded OSC 9, OSC 777 and textual OSC 99
@@ -825,6 +960,15 @@ run hooks, or interpret actions. No Helper protocol or capability changes are
 required. Replayed output must not redeliver notifications. Alerts produced
 while the Engine is disconnected are not recovered from replay; reliable
 offline notification delivery remains an independent enhancement.
+
+The local Rust Engine persists causal attention identities and native-source
+receipts in a per-session SQLite journal. Adoption retains the journal namespace;
+a newly launched process creates a new namespace. The app consumes the additive
+`SessionRecord.attentionState` snapshot and owns its own durable inbox/interruption
+receipts. No journal, hook adapter or notification policy runs in the Holder, and
+no Helper protocol or required capability changes. The corresponding release
+gates include redraw/replay deduplication, restart/adoption identity, cancellation
+and receipt survival after history pruning; see `docs/notification-architecture-review.md`.
 
 ## Deferred enhancements
 

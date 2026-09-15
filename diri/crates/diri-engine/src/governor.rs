@@ -960,6 +960,7 @@ mod tests {
     fn record(status: SessionStatus) -> diri_proto::SessionRecord {
         use diri_proto::{AgentKind, DateMillis, ProjectId, Resumability, SessionId, TitleSource};
         diri_proto::SessionRecord {
+            attention_state: None,
             id: SessionId::new("s_one"),
             kind: AgentKind::CLAUDE_CODE,
             cwd: "/tmp/project".into(),

@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use diri_client::DaemonClient;
-use diri_proto::net::is_private_bind_address;
+use diri_proto::net::is_safe_plaintext_address;
 use diri_proto::paths::{DirijorEnv, DirijorPaths};
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -44,6 +44,8 @@ const DEFAULT_PORT: u16 = 7380;
 /// How long a browser may hold an idle keep-alive connection. Phones suspend
 /// aggressively; reclaiming their sockets promptly keeps the table small.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_CONNECTIONS: usize = 64;
 
 /// SSE comment sent when nothing has happened, so that a phone NAT does not
 /// silently reap a stream the browser still believes is open.
@@ -66,7 +68,7 @@ USAGE:
     diri-web url                       print the enrolment URL and exit
 
 OPTIONS:
-    --listen ADDR:PORT   default 127.0.0.1:7380; must be loopback, LAN, or Tailscale
+    --listen ADDR:PORT   default 127.0.0.1:7380; must be loopback or Tailscale
     --socket PATH        daemon control socket (default: $DIRIJOR_SOCKET, else the
                          standard Dirijor application-support path)
     --token-file PATH    default ~/.config/dirijor/web.token, created if absent
@@ -170,11 +172,10 @@ fn parse(arguments: &[String]) -> Result<Config, String> {
     }
 
     let listen = resolve_listen(&listen)?;
-    if !is_private_bind_address(listen) {
+    if !is_safe_plaintext_address(listen) {
         return Err(format!(
-            "refusing to bind {listen}: this frontend can kill sessions and start \
-             agents, so it must sit on loopback, a private LAN, or Tailscale — \
-             never a public interface"
+            "refusing to bind {listen}: this frontend carries a bearer over \
+             plaintext HTTP, so it must sit on loopback or Tailscale"
         ));
     }
 
@@ -301,7 +302,7 @@ async fn serve_connections(listener: TcpListener, api: Arc<Api>) -> Result<(), S
     loop {
         // Dropping this owner revokes keep-alive and SSE connections too.
         let accepted = tokio::select! {
-            result = listener.accept(), if connections.len() < 64 => result,
+            result = listener.accept(), if connections.len() < MAX_CONNECTIONS => result,
             _ = connections.join_next(), if !connections.is_empty() => continue,
         };
         let (stream, peer) = match accepted {
@@ -326,11 +327,15 @@ async fn handle(stream: TcpStream, api: Arc<Api>) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
+    let mut authenticated = false;
 
     loop {
-        let request = match tokio::time::timeout(IDLE_TIMEOUT, http::read_request(&mut reader))
-            .await
-        {
+        let timeout = if authenticated {
+            IDLE_TIMEOUT
+        } else {
+            AUTH_TIMEOUT
+        };
+        let request = match tokio::time::timeout(timeout, http::read_request(&mut reader)).await {
             Err(_) => return Ok(()),
             Ok(Ok(Some(request))) => request,
             Ok(Ok(None)) => return Ok(()),
@@ -341,6 +346,7 @@ async fn handle(stream: TcpStream, api: Arc<Api>) -> std::io::Result<()> {
                 return Ok(());
             }
         };
+        authenticated |= api.auth.authorizes(&request);
 
         // The event stream owns the connection for its lifetime.
         if request.method == "GET" && request.path == "/api/events" {
@@ -352,7 +358,8 @@ async fn handle(stream: TcpStream, api: Arc<Api>) -> std::io::Result<()> {
         }
 
         let response = respond(&request, &api).await;
-        if !http::write_response(&mut write_half, Some(&request), response).await? {
+        if !http::write_response(&mut write_half, Some(&request), response).await? || !authenticated
+        {
             return Ok(());
         }
     }
@@ -533,6 +540,14 @@ mod tests {
     }
 
     #[test]
+    fn an_unencrypted_lan_listener_is_refused() {
+        for address in ["192.168.1.20:7380", "10.0.0.20:7380", "[fd12::1]:7380"] {
+            let error = parse(&arguments(&["--listen", address])).expect_err("must refuse");
+            assert!(error.contains("plaintext HTTP"), "{address}: {error}");
+        }
+    }
+
+    #[test]
     fn unknown_arguments_are_refused_rather_than_ignored() {
         let error = parse(&arguments(&["--public"])).expect_err("must refuse");
         assert!(error.contains("unrecognised"));
@@ -555,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn a_resolved_hostname_still_has_to_be_private() {
+    fn a_resolved_hostname_still_has_to_be_secure() {
         // Resolution must not become a way around the public-bind refusal.
         let error = parse(&arguments(&["--listen", "one.one.one.one:7380"]))
             .expect_err("public hostname must be refused");

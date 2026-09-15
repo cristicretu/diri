@@ -34,6 +34,8 @@ pub enum Authority {
     /// Codex: the screen drives state, notify confirms done.
     ScreenPrimary,
     /// Everything else: starting → working → exited, nothing more.
+    /// Shell is the exception: working follows the PTY foreground group, not
+    /// process liveness, so an idle login prompt is idle.
     ProcessOnly,
 }
 
@@ -44,7 +46,6 @@ pub struct ReducerTiming {
     pub recheck_interval: Duration,
     pub idle_confirm_cap: Duration,
     pub startup_grace: Duration,
-    pub hook_authority_window: Duration,
     pub blocker_clear_scans: u32,
     pub staleness_timeout: Duration,
 }
@@ -56,7 +57,6 @@ impl Default for ReducerTiming {
             recheck_interval: Duration::from_millis(100),
             idle_confirm_cap: Duration::from_millis(700),
             startup_grace: Duration::from_secs(3),
-            hook_authority_window: Duration::from_secs(7),
             blocker_clear_scans: 2,
             staleness_timeout: Duration::from_secs(60),
         }
@@ -69,6 +69,7 @@ pub enum ClaudeHook {
     SessionStart,
     UserPromptSubmit,
     PreToolUse,
+    PostToolUse,
     PermissionRequest {
         tool_name: Option<String>,
         input_summary: Option<String>,
@@ -91,6 +92,8 @@ pub enum StatusSignal {
     ClaudeHook {
         hook: ClaudeHook,
         is_subagent: bool,
+        /// Optional aggregate from the payload or the durable recovery seed.
+        pending_work: Option<bool>,
     },
     CodexTurnComplete,
     /// Cursor jsonl tail: last object is a user prompt or `tool_use`.
@@ -100,6 +103,13 @@ pub enum StatusSignal {
     Screen(ScreenObservation),
     PtyOutputActivity,
     UserKeystroke,
+    /// Input accepted by the transport that can submit or dismiss a prompt.
+    UserSubmission,
+    /// The PTY foreground process group is, or is not, the session child.
+    /// Shell sessions use this to show work only while a foreground job runs.
+    ForegroundJob {
+        running: bool,
+    },
     ProcessExit {
         code: Option<i32>,
         signal: Option<i32>,
@@ -121,6 +131,7 @@ pub struct ReducerOutcome {
     pub needs_input: Option<NeedsInputDetail>,
     /// Set when a turn just completed.
     pub turn_completed: bool,
+    pub attention_changed: bool,
 }
 
 /// The mutable belief and debounce tracking for one session.
@@ -143,7 +154,12 @@ struct InternalState {
     idle_strong: bool,
     /// Fire `turn_completed` exactly once on the next committed working→idle.
     pending_turn_completed: bool,
-    last_work_hook_at: Option<SystemTime>,
+    /// A parent work hook owns its turn until a strong completion signal.
+    /// Tool calls and thinking have no time limit; an idle-looking input box
+    /// must not expire hook authority and announce completion mid-turn.
+    hook_turn_in_flight: bool,
+    /// Retained across idle reminders, which omit background task metadata.
+    claude_pending_work: bool,
 
     // On-screen blocker tracking.
     screen_blocker_active: bool,
@@ -177,7 +193,8 @@ impl InternalState {
             idle_confirms: 0,
             idle_strong: false,
             pending_turn_completed: false,
-            last_work_hook_at: None,
+            hook_turn_in_flight: false,
+            claude_pending_work: false,
             screen_blocker_active: false,
             blocker_miss_scans: 0,
             screen_belief: None,
@@ -192,6 +209,7 @@ impl InternalState {
 }
 
 pub struct StatusReducer {
+    attention: crate::attention::AttentionLifecycle,
     status: SessionStatus,
     authority: Authority,
     timing: ReducerTiming,
@@ -204,6 +222,7 @@ pub struct StatusReducer {
 impl StatusReducer {
     pub fn new(authority: Authority, spawned_at: SystemTime) -> Self {
         Self {
+            attention: Default::default(),
             status: SessionStatus::Starting,
             authority,
             timing: ReducerTiming::default(),
@@ -257,8 +276,75 @@ impl StatusReducer {
             .unwrap_or(SystemTime::UNIX_EPOCH);
     }
 
+    pub fn with_attention_path(self, path: &std::path::Path) -> Self {
+        self.with_attention_storage(path, false)
+    }
+
+    pub(crate) fn with_attention_storage(mut self, path: &std::path::Path, fresh: bool) -> Self {
+        self.attention = crate::attention::AttentionLifecycle::open(path);
+        if fresh {
+            self.attention.start_incarnation();
+        }
+        if let Some(state) = self.attention.snapshot() {
+            if let Some(request) = state.active_requests().find(|event| event.blocking) {
+                if let Some(detail) = &request.detail {
+                    self.status = SessionStatus::NeedsInput(detail.kind);
+                    self.state.pending_needs_input = Some(detail.clone());
+                }
+            } else if state.working {
+                self.status = SessionStatus::Working;
+                self.state.turn_in_flight = true;
+                self.state.hook_turn_in_flight = self.authority == Authority::HooksPrimary;
+            } else if state.sequence > 0 {
+                self.status = SessionStatus::Idle;
+            }
+        }
+        self
+    }
+
+    pub fn attention_state(&self) -> Option<&diri_proto::attention::AttentionState> {
+        self.attention.snapshot()
+    }
+
+    pub fn reduce_identified(
+        &mut self,
+        signal: StatusSignal,
+        mut identity: crate::attention::SignalIdentity,
+        now: SystemTime,
+    ) -> ReducerOutcome {
+        if let StatusSignal::ClaudeHook {
+            hook: ClaudeHook::PermissionRequest { tool_name, .. },
+            is_subagent: false,
+            ..
+        } = &signal
+        {
+            self.attention
+                .correlate_request(&mut identity, tool_name.as_deref());
+        }
+        if self.attention.duplicate(&identity) {
+            return ReducerOutcome {
+                attention_changed: self.attention.snapshot().is_none(),
+                ..Default::default()
+            };
+        }
+        let mut evidence = crate::attention::Evidence::from(&signal);
+        let mut outcome = self.reduce_status(signal, now);
+        evidence.completion &=
+            self.state.idle_strong || outcome.turn_completed || self.status == SessionStatus::Idle;
+        let mut identity = identity;
+        if !evidence.completion && !outcome.turn_completed {
+            identity.completion = None;
+        }
+        outcome.attention_changed = self.attention.observe(&evidence, &identity, &outcome, now);
+        outcome
+    }
+
     /// Folds one signal into the session's status.
     pub fn reduce(&mut self, signal: StatusSignal, now: SystemTime) -> ReducerOutcome {
+        self.reduce_identified(signal, Default::default(), now)
+    }
+
+    fn reduce_status(&mut self, signal: StatusSignal, now: SystemTime) -> ReducerOutcome {
         let mut outcome = ReducerOutcome::default();
 
         // Exited is absorbing: once dead, nothing changes it.
@@ -291,22 +377,11 @@ impl StatusReducer {
             return outcome;
         }
 
-        // processOnly: starting → working on first output, then only exit moves it.
+        // processOnly: starting → working on first output, then only exit
+        // moves it. A shell is still process-only, but an idle login prompt
+        // is not work: Working follows the foreground process group.
         if self.authority == Authority::ProcessOnly {
-            if matches!(signal, StatusSignal::PtyOutputActivity) {
-                if self.status == SessionStatus::Starting {
-                    self.state.turn_in_flight = true;
-                    self.set_status(SessionStatus::Working, &mut outcome);
-                }
-                self.state.last_signal_at = now;
-                self.publish_evidence(
-                    StatusEvidenceSource::ProcessLiveness,
-                    None,
-                    Some(StatusFallbackReason::ProcessOnly),
-                    now,
-                    &mut outcome,
-                );
-            }
+            self.reduce_process_only(signal, now, &mut outcome);
             return outcome;
         }
 
@@ -324,26 +399,31 @@ impl StatusReducer {
             StatusSignal::Tick => None,
             StatusSignal::PtyOutputActivity
             | StatusSignal::UserKeystroke
+            | StatusSignal::UserSubmission
+            | StatusSignal::ForegroundJob { .. }
             | StatusSignal::ProcessExit { .. } => None,
         };
 
         match signal {
             StatusSignal::ProcessExit { .. } => {} // handled above
+            StatusSignal::ForegroundJob { .. } => {}
             StatusSignal::PtyOutputActivity => {
                 // Bytes alone do not establish work: late terminal repaints,
                 // title updates and status lines continue after a turn ends.
                 self.state.last_signal_at = now;
             }
-            StatusSignal::UserKeystroke => {
+            StatusSignal::UserKeystroke | StatusSignal::UserSubmission => {
                 self.state.last_signal_at = now;
                 self.state.hold_idle_against_screen = false;
                 if matches!(self.status, SessionStatus::NeedsInput(_)) {
                     self.state.responding_since = Some(now);
                 }
             }
-            StatusSignal::ClaudeHook { hook, is_subagent } => {
-                self.handle_claude_hook(hook, is_subagent, now, &mut outcome)
-            }
+            StatusSignal::ClaudeHook {
+                hook,
+                is_subagent,
+                pending_work,
+            } => self.handle_claude_hook(hook, is_subagent, pending_work, now, &mut outcome),
             StatusSignal::CodexTurnComplete => {
                 self.state.last_signal_at = now;
                 self.handle_strong_idle(now, &mut outcome);
@@ -481,6 +561,64 @@ impl StatusReducer {
         }
     }
 
+    fn reduce_process_only(
+        &mut self,
+        signal: StatusSignal,
+        now: SystemTime,
+        outcome: &mut ReducerOutcome,
+    ) {
+        match signal {
+            StatusSignal::ForegroundJob { running } if self.tracks_shell_jobs() => {
+                self.state.last_signal_at = now;
+                self.apply_shell_job(running, now, outcome);
+            }
+            StatusSignal::PtyOutputActivity => {
+                self.state.last_signal_at = now;
+                if self.tracks_shell_jobs() {
+                    // Prompt output is not a job. Drop Starting so an older
+                    // Helper that never sends ForegroundJob cannot sit on
+                    // Loading forever; a later job sample still wins.
+                    if self.status == SessionStatus::Starting {
+                        self.set_status(SessionStatus::Idle, outcome);
+                    }
+                } else if self.status == SessionStatus::Starting {
+                    self.state.turn_in_flight = true;
+                    self.set_status(SessionStatus::Working, outcome);
+                }
+                self.publish_evidence(
+                    StatusEvidenceSource::ProcessLiveness,
+                    None,
+                    Some(StatusFallbackReason::ProcessOnly),
+                    now,
+                    outcome,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn tracks_shell_jobs(&self) -> bool {
+        self.manifest_id.as_deref() == Some("shell")
+    }
+
+    fn apply_shell_job(&mut self, running: bool, now: SystemTime, outcome: &mut ReducerOutcome) {
+        let next = if running {
+            self.state.turn_in_flight = true;
+            SessionStatus::Working
+        } else {
+            self.state.turn_in_flight = false;
+            SessionStatus::Idle
+        };
+        self.set_status(next, outcome);
+        self.publish_evidence(
+            StatusEvidenceSource::ProcessLiveness,
+            None,
+            Some(StatusFallbackReason::ProcessOnly),
+            now,
+            outcome,
+        );
+    }
+
     fn set_status(&mut self, new: SessionStatus, outcome: &mut ReducerOutcome) {
         if self.status != new {
             self.status = new.clone();
@@ -513,7 +651,7 @@ impl StatusReducer {
         }
         self.state.turn_in_flight = true;
         if clear_screen_blocker {
-            self.state.last_work_hook_at = Some(now);
+            self.state.hook_turn_in_flight = true;
         }
         self.state.last_signal_at = now;
         self.set_status(SessionStatus::Working, outcome);
@@ -552,7 +690,11 @@ impl StatusReducer {
 
     /// Register one idle-confirming observation.
     fn confirm_idle(&mut self, now: SystemTime, outcome: &mut ReducerOutcome) {
-        if self.status != SessionStatus::Working {
+        if self.status != SessionStatus::Working
+            || (self.authority == Authority::HooksPrimary
+                && self.state.hook_turn_in_flight
+                && !self.state.idle_strong)
+        {
             return;
         }
         if self.state.idle_candidate_since.is_none() {
@@ -582,6 +724,7 @@ impl StatusReducer {
         let fire = self.state.pending_turn_completed;
         self.set_status(SessionStatus::Idle, outcome);
         self.state.turn_in_flight = false;
+        self.state.hook_turn_in_flight = false;
         if fire {
             outcome.turn_completed = true;
         }
@@ -595,6 +738,7 @@ impl StatusReducer {
         &mut self,
         hook: ClaudeHook,
         is_subagent: bool,
+        pending_work: Option<bool>,
         now: SystemTime,
         outcome: &mut ReducerOutcome,
     ) {
@@ -617,6 +761,9 @@ impl StatusReducer {
         if is_subagent {
             return;
         }
+        if let Some(pending) = pending_work {
+            self.state.claude_pending_work = pending;
+        }
 
         match hook {
             ClaudeHook::SessionStart => {
@@ -629,7 +776,7 @@ impl StatusReducer {
                 self.state.turn_in_flight = true;
                 self.go_working(now, true, outcome);
             }
-            ClaudeHook::PreToolUse => self.go_working(now, true, outcome),
+            ClaudeHook::PreToolUse | ClaudeHook::PostToolUse => self.go_working(now, true, outcome),
             ClaudeHook::PermissionRequest {
                 tool_name,
                 input_summary,
@@ -646,11 +793,30 @@ impl StatusReducer {
             ClaudeHook::Notification {
                 notification_type,
                 message,
-            } => self.handle_notification(notification_type, message, now, outcome),
-            ClaudeHook::Stop => self.handle_strong_idle(now, outcome),
+            } => self.handle_notification(notification_type, message, pending_work, now, outcome),
+            ClaudeHook::Stop => {
+                self.handle_claude_completion(pending_work.unwrap_or(false), now, outcome)
+            }
             // A hint only.
             ClaudeHook::SessionEnd => {}
             ClaudeHook::SubagentStart(_) | ClaudeHook::SubagentStop(_) => {}
+        }
+    }
+
+    fn handle_claude_completion(
+        &mut self,
+        pending_work: bool,
+        now: SystemTime,
+        outcome: &mut ReducerOutcome,
+    ) {
+        self.state.claude_pending_work = pending_work;
+        if pending_work {
+            // The foreground response ended, but Claude still has live work.
+            // Keep screen idle and subsequent metadata-free reminders from
+            // announcing completion until a fresh completion says it drained.
+            self.go_working(now, true, outcome);
+        } else {
+            self.handle_strong_idle(now, outcome);
         }
     }
 
@@ -658,6 +824,7 @@ impl StatusReducer {
         &mut self,
         notification_type: Option<String>,
         message: Option<String>,
+        pending_work: Option<bool>,
         now: SystemTime,
         outcome: &mut ReducerOutcome,
     ) {
@@ -684,7 +851,16 @@ impl StatusReducer {
             }
             // An idle reminder is not a question or an approval request.
             // It must not overwrite a completed turn or an actual blocker.
-            Some("idle_prompt") => {}
+            Some("idle_prompt") => {
+                if pending_work == Some(true)
+                    && !matches!(self.status, SessionStatus::NeedsInput(_))
+                {
+                    // A recovered reminder can be the first signal after a
+                    // daemon restart. Its retained work fact still outranks
+                    // the word "idle", without dismissing a live blocker.
+                    self.handle_claude_completion(true, now, outcome);
+                }
+            }
             Some("agent_needs_input") | Some("elicitation_dialog") => {
                 let text = message.unwrap_or_else(|| "Waiting for input".into());
                 let detail = NeedsInputDetail {
@@ -702,7 +878,11 @@ impl StatusReducer {
                 self.cancel_idle_candidacy();
                 self.set_status(SessionStatus::NeedsInput(NeedsInputKind::Question), outcome);
             }
-            Some("agent_completed") => self.handle_strong_idle(now, outcome),
+            Some("agent_completed") => self.handle_claude_completion(
+                pending_work.unwrap_or(self.state.claude_pending_work),
+                now,
+                outcome,
+            ),
             _ => {}
         }
     }
@@ -793,22 +973,18 @@ impl StatusReducer {
             }
             ManifestState::Idle => {
                 if self.status == SessionStatus::Working {
-                    if self.authority == Authority::HooksPrimary
-                        && !self.state.idle_strong
-                        && self.state.last_work_hook_at.is_some_and(|last| {
-                            now.duration_since(last).unwrap_or_default()
-                                < self.timing.hook_authority_window
-                        })
-                    {
-                        return;
-                    }
                     self.confirm_idle(now, outcome);
                 } else if self.status == SessionStatus::Starting {
                     self.set_status(SessionStatus::Idle, outcome);
                 } else if cleared_blocker && matches!(self.status, SessionStatus::NeedsInput(_)) {
-                    // The blocker was released and the screen now reads idle.
-                    self.cancel_idle_candidacy();
-                    self.set_status(SessionStatus::Idle, outcome);
+                    if self.authority == Authority::HooksPrimary && self.state.hook_turn_in_flight {
+                        // Dismissing a permission/question does not finish the
+                        // turn whose tool call was waiting for that answer.
+                        self.go_working(now, false, outcome);
+                    } else {
+                        self.cancel_idle_candidacy();
+                        self.set_status(SessionStatus::Idle, outcome);
+                    }
                 }
             }
             // Handled elsewhere.
@@ -856,16 +1032,6 @@ impl StatusReducer {
                 return;
             }
         }
-        if self.status == SessionStatus::Working
-            && self.authority == Authority::HooksPrimary
-            && self.state.screen_belief == Some(ManifestState::Idle)
-            && self.state.idle_candidate_since.is_none()
-            && self.state.last_work_hook_at.is_some_and(|last| {
-                now.duration_since(last).unwrap_or_default() >= self.timing.hook_authority_window
-            })
-        {
-            self.confirm_idle(now, outcome);
-        }
         // A settled screen often stops emitting new content sequences. One
         // idle observation held for the debounce cap is enough; requiring
         // more redraws leaves quiet agents stuck Working forever.
@@ -887,6 +1053,17 @@ impl StatusReducer {
             self.commit_idle(now, outcome);
         }
     }
+}
+
+/// Whether the PTY foreground group is a job other than the session child.
+/// `None` until both pids are known.
+#[must_use]
+pub fn foreground_job_running(child_pid: i32, foreground_pgid: Option<i32>) -> Option<bool> {
+    if child_pid <= 1 {
+        return None;
+    }
+    let pgid = foreground_pgid.filter(|pgid| *pgid > 0)?;
+    Some(pgid != child_pid)
 }
 
 fn needs_input_kind(state: ManifestState) -> Option<NeedsInputKind> {

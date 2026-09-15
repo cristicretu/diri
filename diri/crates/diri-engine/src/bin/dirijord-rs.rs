@@ -61,10 +61,10 @@ fn main() {
     let user_shell = login_shell();
     // SAFETY: single-threaded startup, before any spawn.
     unsafe { std::env::set_var("SHELL", &user_shell) };
-    if let Some(path) = login_path(&user_shell) {
-        // SAFETY: single-threaded startup, before any spawn.
-        unsafe { std::env::set_var("PATH", &path) };
-    }
+    let captured_path = login_path(&user_shell);
+    let path = diri_engine::local_path::search_path(captured_path.as_deref(), std::env::vars());
+    // SAFETY: single-threaded startup, before any spawn.
+    unsafe { std::env::set_var("PATH", &path) };
 
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -271,9 +271,9 @@ const fn default_shell() -> &'static str {
     "/bin/sh"
 }
 
-/// Mirrors the Swift daemon's `LoginEnvironment`: `printenv PATH` prints the
-/// real colon-separated variable regardless of shell — fish stores $PATH as a
-/// space-separated list, so `echo $PATH` produces garbage there — and `-i -l`
+/// `printenv PATH` prints the real colon-separated variable regardless of
+/// shell — fish stores $PATH as a space-separated list, so `echo $PATH`
+/// produces garbage there — and `-i -l`
 /// sources both interactive and login files, which is where agent PATHs are
 /// actually configured.
 ///
@@ -301,11 +301,6 @@ fn capture_login_path(
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    let fallback = || {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        format!("{home}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
-    };
-
     // A background process from an rc file can inherit stdout after its shell
     // exits. Capturing into an unlinked regular file means reading stops at the
     // current length instead of waiting for that descendant to close a pipe.
@@ -314,6 +309,7 @@ fn capture_login_path(
     let mut child = unsafe {
         Command::new(shell)
             .args(arguments)
+            .stdin(Stdio::null())
             .stdout(Stdio::from(child_stdout))
             .stderr(Stdio::null())
             .pre_exec(|| {
@@ -330,7 +326,8 @@ fn capture_login_path(
     let started = Instant::now();
     let timed_out = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break false,
+            Ok(Some(status)) if status.success() => break false,
+            Ok(Some(_)) => return None,
             Ok(None) if started.elapsed() < capture_timeout => {
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -346,7 +343,7 @@ fn capture_login_path(
             let _ = libc::kill(pid, libc::SIGKILL);
         }
         let _ = child.wait();
-        return Some(fallback());
+        return None;
     }
 
     capture.rewind().ok()?;
@@ -361,16 +358,7 @@ fn capture_login_path(
         .map(str::trim)
         .find(|line| line.contains('/'))
         .map(str::to_owned)?;
-    if path.is_empty() {
-        return Some(fallback());
-    }
-    // A single-entry answer smells like a broken profile: keep it, but append
-    // the standard locations so spawns still work.
-    Some(if path.contains(':') {
-        path
-    } else {
-        format!("{path}:{}", fallback())
-    })
+    Some(path)
 }
 
 #[cfg(unix)]
@@ -739,8 +727,38 @@ mod tests {
             Duration::from_millis(500),
         );
 
-        assert_ne!(path.as_deref(), Some("/too-late:/usr/bin"));
+        assert!(path.is_none());
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn failed_login_path_capture_preserves_inherited_and_pnpm_paths() {
+        for (shell, arguments) in [
+            (
+                "/does-not-exist/diri-test-shell",
+                vec!["-c", "printenv PATH"],
+            ),
+            (
+                "/bin/sh",
+                vec!["-c", "printf '/misleading/path\\n'; exit 1"],
+            ),
+            ("/bin/sh", vec!["-c", "/bin/sleep 5"]),
+        ] {
+            let captured =
+                capture_login_path(shell, &arguments, std::time::Duration::from_millis(100));
+            assert!(captured.is_none());
+            let path = diri_engine::local_path::search_path(
+                captured.as_deref(),
+                [
+                    ("PATH".into(), "/inherited/node/bin:/usr/bin".into()),
+                    ("PNPM_HOME".into(), "/custom/pnpm".into()),
+                ],
+            );
+            assert!(
+                path.starts_with("/inherited/node/bin:/usr/bin:/custom/pnpm/bin:/custom/pnpm:")
+            );
+            assert!(!path.contains("misleading"));
+        }
     }
 
     #[test]

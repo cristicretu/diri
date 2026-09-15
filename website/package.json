@@ -1,0 +1,17 @@
+{
+  "name": "diri-website",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node server.mjs",
+    "check": "node --check app.js && node --check agent-previews.js && node --check mesh.js && node --check downloads.js && node --check server.mjs && node --check scripts/build.mjs && node --check scripts/check-site.mjs",
+    "test": "node --test scripts/downloads.test.mjs",
+    "build": "node scripts/build.mjs",
+    "preview": "node server.mjs --production",
+    "verify": "npm run check && npm test && npm run build && node scripts/check-site.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

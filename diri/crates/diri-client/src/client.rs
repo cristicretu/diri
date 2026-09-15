@@ -749,8 +749,25 @@ impl DaemonClient {
         self.typed(Method::WORKTREE_LIST, &params).await
     }
 
+    pub async fn worktree_cleanup(&self, params: WorktreeCleanupParams) -> Result<(), ClientError> {
+        self.empty(Method::WORKTREE_CLEANUP, &params).await
+    }
+
     pub async fn worktree_remove(&self, params: WorktreeRemoveParams) -> Result<(), ClientError> {
         self.empty(Method::WORKTREE_REMOVE, &params).await
+    }
+
+    pub async fn worktree_scan(
+        &self,
+        params: WorktreeScanParams,
+    ) -> Result<WorktreeScanResult, ClientError> {
+        self.core
+            .request_typed(
+                Method::WORKTREE_SCAN,
+                Some(&params),
+                Some(Duration::from_secs(5)),
+            )
+            .await
     }
 
     pub async fn worktree_overview(&self) -> Result<Vec<WorktreeOverviewEntry>, ClientError> {

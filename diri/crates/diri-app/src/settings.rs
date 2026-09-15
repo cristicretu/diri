@@ -43,26 +43,30 @@ pub struct SettingsNav {
 pub enum SettingsTab {
     #[default]
     General,
+    WhatsNew,
     Agents,
     Skills,
     Accounts,
     Shortcuts,
     Terminal,
     Usage,
+    Worktrees,
     Resources,
     Remote,
     Phone,
 }
 
 impl SettingsTab {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 12] = [
         Self::General,
+        Self::WhatsNew,
         Self::Agents,
         Self::Skills,
         Self::Accounts,
         Self::Shortcuts,
         Self::Terminal,
         Self::Usage,
+        Self::Worktrees,
         Self::Resources,
         Self::Remote,
         Self::Phone,
@@ -71,12 +75,14 @@ impl SettingsTab {
     pub const fn label(self) -> &'static str {
         match self {
             Self::General => "General",
+            Self::WhatsNew => "What's New",
             Self::Agents => "Agents",
             Self::Skills => "Skills",
             Self::Accounts => "Accounts",
             Self::Shortcuts => "Shortcuts",
             Self::Terminal => "Appearance",
             Self::Usage => "Usage",
+            Self::Worktrees => "Worktrees",
             Self::Resources => "Resources",
             Self::Remote => "Remote",
             Self::Phone => "Phone access",
@@ -86,12 +92,14 @@ impl SettingsTab {
     pub const fn subtitle(self) -> &'static str {
         match self {
             Self::General => "Startup, sessions, and updates",
+            Self::WhatsNew => "Latest release notes",
             Self::Agents => "Installed CLIs and quick create",
             Self::Skills => "Browse local and project skills",
             Self::Accounts => "Profiles for work and personal accounts",
             Self::Shortcuts => "Keyboard commands and bindings",
             Self::Terminal => "Themes and terminal type",
             Self::Usage => "Costs, tokens, and cache savings",
+            Self::Worktrees => "Pull requests and disk cleanup",
             Self::Resources => "Idle sessions and memory",
             Self::Remote => "SSH execution hosts",
             Self::Phone => "Code from your iPhone",
@@ -103,25 +111,30 @@ impl SettingsTab {
     pub const fn section(self) -> SettingsSection {
         match self {
             Self::General
+            | Self::WhatsNew
             | Self::Agents
             | Self::Skills
             | Self::Accounts
             | Self::Shortcuts
             | Self::Terminal
             | Self::Usage => SettingsSection::Personal,
-            Self::Resources | Self::Remote | Self::Phone => SettingsSection::System,
+            Self::Worktrees | Self::Resources | Self::Remote | Self::Phone => {
+                SettingsSection::System
+            }
         }
     }
 
     pub const fn icon(self) -> &'static str {
         match self {
             Self::General => "gearshape",
+            Self::WhatsNew => "sparkles",
             Self::Agents => "sparkles",
             Self::Skills => "doc.text",
             Self::Accounts => "account.circle",
             Self::Shortcuts => "keyboard",
             Self::Terminal => "terminal",
             Self::Usage => "chart.bar.xaxis",
+            Self::Worktrees => "arrow.branch",
             Self::Resources => "server.rack",
             Self::Remote => "network",
             Self::Phone => "iphone",

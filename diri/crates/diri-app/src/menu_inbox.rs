@@ -11,9 +11,10 @@ use crate::switcher::display_title;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TrailingStatus {
     NeedsYou,
+    #[cfg(target_os = "macos")]
     Unread,
     Done,
-    Zzz,
+    Sleeping,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,7 +83,7 @@ fn session_row(session: &SessionRecord, depth: u16) -> InboxSessionRow {
     let hibernated = session.hibernation.is_some();
     let attention = session.attention();
     let trailing = if hibernated {
-        Some(TrailingStatus::Zzz)
+        Some(TrailingStatus::Sleeping)
     } else {
         match attention {
             AttentionLevel::NeedsInput => Some(TrailingStatus::NeedsYou),
@@ -127,6 +128,7 @@ mod tests {
         status: SessionStatus,
     ) -> Arc<SessionRecord> {
         Arc::new(SessionRecord {
+            attention_state: None,
             id: SessionId::new(id),
             kind,
             cwd: "/tmp".into(),
@@ -238,7 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn preserves_spawn_depth_and_zzz_trailing() {
+    fn preserves_spawn_depth_and_sleeping_trailing() {
         let mut asleep = session(
             "child",
             "robite",
@@ -277,7 +279,7 @@ mod tests {
             panic!("expected nested session");
         };
         assert_eq!(nested.depth, 1);
-        assert_eq!(nested.trailing, Some(TrailingStatus::Zzz));
+        assert_eq!(nested.trailing, Some(TrailingStatus::Sleeping));
         let InboxRow::Session(root) = &model.rows[1] else {
             panic!("expected root session");
         };

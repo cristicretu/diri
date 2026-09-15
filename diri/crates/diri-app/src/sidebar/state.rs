@@ -95,9 +95,8 @@ pub struct SidebarUiState {
     pub layout_menu_index: usize,
     pub renaming: Option<SessionId>,
     pub rename_draft: QueryEditor,
-    /// Session whose hover card is showing, plus the pointer's window y at
-    /// the moment the card appeared (the card anchors beside that row).
-    pub hover_card: Option<(SessionId, f32)>,
+    /// Session whose hover card is showing. Its current row bounds own the anchor.
+    pub hover_card: Option<SessionId>,
     pub drag: Option<DragItem>,
     pub drag_target: Option<String>,
     /// Project order when a header drag began. Headers reorder live under the
