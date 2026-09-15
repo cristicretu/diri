@@ -1007,9 +1007,10 @@ of the Remote Helper protocol remains deferred.
 The Rust client exposes `SessionPreview` with decoded receive-only chunks, a
 capacity-one queue, and cancellation on close/drop. Backpressure never discards
 patches: a slow server queue closes and the caller must explicitly reconnect to
-a new full seed. Session exit and remote connectivity remain facts from the
-existing control stream; a preview socket is not proof the remote process is
-currently reachable. UI consumers subscribe only while their cards are visible
+a new full seed. Session exit remains an authoritative fact from the control stream. Transient
+remote connectivity is not yet projected there, so a remote preview must be
+labeled as the last received image; a preview socket is not proof the remote
+process is currently reachable. UI consumers subscribe only while their cards are visible
 and render every grid at its existing dimensions without resizing the PTY.
 
 Private-socket tests verify pushed updates without a desktop attach, the 16-client
