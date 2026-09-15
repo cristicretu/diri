@@ -285,8 +285,17 @@ pub(crate) struct ThreeFingerGesture {
 impl ThreeFingerGesture {
     pub(crate) fn sample(
         &mut self,
+        touches: Vec<(u64, f32, f32)>,
+        cancelled: bool,
+    ) -> Option<GestureFrame> {
+        self.sample_with_reverse(touches, cancelled, false)
+    }
+
+    pub(crate) fn sample_with_reverse(
+        &mut self,
         mut touches: Vec<(u64, f32, f32)>,
         cancelled: bool,
+        revealed: bool,
     ) -> Option<GestureFrame> {
         if cancelled {
             *self = Self {
@@ -341,16 +350,16 @@ impl ThreeFingerGesture {
                 self.blocked = true;
                 return None;
             }
-            if down < -18.0 {
+            if !revealed && down < -18.0 {
                 self.blocked = true;
                 return None;
             }
-            if down < 8.0 {
+            if (if revealed { down.abs() } else { down }) < 8.0 {
                 return None;
             }
             self.recognized = true;
         }
-        self.last_distance = down.max(0.0);
+        self.last_distance = if revealed { down } else { down.max(0.0) };
         Some(GestureFrame::Tracking(self.last_distance))
     }
 }
@@ -399,6 +408,63 @@ mod tests {
             Some(GestureFrame::Cancelled)
         );
     }
+    #[test]
+    fn revealed_three_finger_swipe_can_fold_overview_and_cancel_without_changing_identity() {
+        let now = Instant::now();
+        let id = SessionId("same-work".into());
+        let mut peek = TabPeek::default();
+        peek.begin(vec![id.clone()], Some(&id));
+        peek.update(GestureFrame::Released(380.0));
+        let mut gesture = ThreeFingerGesture::default();
+        assert_eq!(
+            gesture.sample_with_reverse(touches(0.5, 0.5), false, true),
+            None
+        );
+        let frame = gesture
+            .sample_with_reverse(touches(0.5, 0.7), false, true)
+            .unwrap();
+        assert!(matches!(frame, GestureFrame::Tracking(distance) if distance < -239.0));
+        peek.update_animated(frame, now, false);
+        assert_eq!(peek.selected(), Some(id.clone()));
+        assert!((peek.distance - 140.0).abs() < 0.01);
+        let released = gesture.sample_with_reverse(vec![], false, true).unwrap();
+        peek.update_animated(released, now, false);
+        peek.advance_motion(now + Settle::DURATION);
+        assert_eq!(peek.distance, 140.0);
+        assert_eq!(peek.selected(), Some(id));
+        gesture.sample_with_reverse(touches(0.5, 0.5), false, true);
+        let reverse = gesture
+            .sample_with_reverse(touches(0.5, 0.7), false, true)
+            .unwrap();
+        peek.update_animated(reverse, now + Settle::DURATION, false);
+        let release = gesture.sample_with_reverse(vec![], false, true).unwrap();
+        peek.update_animated(release, now + Settle::DURATION, false);
+        assert!(!peek.paint_visible());
+    }
+
+    #[test]
+    fn revealed_gesture_still_rejects_horizontal_motion_and_cancels_contact_changes() {
+        let mut gesture = ThreeFingerGesture::default();
+        gesture.sample_with_reverse(touches(0.5, 0.5), false, true);
+        assert_eq!(
+            gesture.sample_with_reverse(touches(0.7, 0.5), false, true),
+            None
+        );
+        gesture.sample_with_reverse(vec![], false, true);
+        gesture.sample_with_reverse(touches(0.5, 0.5), false, true);
+        assert!(
+            gesture
+                .sample_with_reverse(touches(0.5, 0.7), false, true)
+                .is_some()
+        );
+        let mut extra = touches(0.5, 0.7);
+        extra.push((4, 0.5, 0.7));
+        assert_eq!(
+            gesture.sample_with_reverse(extra, false, true),
+            Some(GestureFrame::Cancelled)
+        );
+    }
+
     #[test]
     fn strip_cards_keep_clear_of_terminal_during_reveal_and_return() {
         let mut peek = TabPeek::default();
