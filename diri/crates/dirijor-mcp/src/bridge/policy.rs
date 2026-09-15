@@ -40,8 +40,8 @@ impl Authorization<'_> {
             return text.to_owned();
         }
         format!(
-            "[message from id:{} ({}), channel: dirijor — reply with send_prompt to that id]\n\n{text}",
-            self.caller.id.0, self.caller.title
+            "[message from id:{}, channel: dirijor — reply with send_prompt to that id]\n\n{text}",
+            self.caller.id.0
         )
     }
 }

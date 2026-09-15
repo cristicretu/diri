@@ -93,6 +93,7 @@ fn initialize(params: &Value) -> Value {
              only when the user explicitly wants a terminal or raw commands.\n\nTypical orchestration flow: spawn_agent \
              (optionally worktree:true and an initial prompt) → wait_for_agent(until:\"done\") \
              → read_output → send_prompt for follow-ups → release_agent when finished. \
+             Messages are delivered at most once. Reuse message_id on retries; never send a new copy because the agent is slow or its screen has not changed. Inspect unknown delivery outcomes. A delivery receipt does not mean the agent finished. \
              get_artifacts returns PR/Linear/preview URLs and listening ports a session has \
              produced; PR entries include live GitHub status (state, review decision, checks, \
              comment counts, +/- lines).{browser}"

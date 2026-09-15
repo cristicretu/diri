@@ -8,6 +8,7 @@ use diri_proto::{
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::control::{ControlClient, ControlFailure, default_socket_path};
 use crate::tools::{ToolDefinition, tool_definitions_for};
@@ -185,16 +186,57 @@ impl Bridge {
         .authorize(WriteAction::SendPrompt { target: &id })?;
         let relation = authorized.relation();
         let delivered = authorized.frame(&text);
-        self.request(
-            Method::SESSION_SEND_TEXT,
-            json!({"sessionID": id, "text": delivered, "submit": submit}),
-            DEFAULT_TIMEOUT,
+        let receipt = self.deliver_message(
+            arguments,
+            &id,
+            &delivered,
+            submit,
+            &json!(["send_prompt", text, submit]),
         )?;
         Ok(json!({
-            "ok": true,
+            "ok": receipt["delivery"] == "sent",
             "relation": relation.as_str(),
             "attributed": delivered != text,
+            "receipt": receipt,
         }))
+    }
+
+    fn deliver_message(
+        &self,
+        arguments: &Value,
+        target: &str,
+        text: &str,
+        submit: bool,
+        identity: &Value,
+    ) -> Result<Value, String> {
+        let message_id = match arguments.get("message_id") {
+            Some(Value::String(id))
+                if !id.is_empty() && id.len() <= 200 && !id.chars().any(char::is_control) =>
+            {
+                id.clone()
+            }
+            Some(_) => {
+                return Err("message_id must be a nonempty string of at most 200 bytes".into());
+            }
+            None => format!(
+                "auto:{}",
+                Sha256::digest(identity.to_string().as_bytes())
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            ),
+        };
+        // A dedicated method fails closed against older Engines. Never fall
+        // back to untracked session.send_text if receipts are unavailable.
+        self.request(Method::SESSION_DELIVER_MESSAGE, json!({
+            "sessionID": target,
+            "senderID": self.require_caller()?,
+            "messageID": message_id,
+            "text": text,
+            "submit": submit,
+        }), Duration::from_secs(30)).map_err(|error| format!(
+            "{error}. Message identity: {message_id}. Delivery may be unknown; retry only the same call and message_id, never send a fresh copy."
+        ))
     }
 
     fn wait_for_agent(&self, arguments: &Value) -> Result<Value, String> {
@@ -582,10 +624,7 @@ impl Bridge {
             return Err(format!("invalid report status: {status}"));
         }
         let mut lines = vec![
-            format!(
-                "[report from id:{} ({}) · status: {status}]",
-                caller, record.title
-            ),
+            format!("[report from id:{} · status: {status}]", caller),
             String::new(),
             format!("Summary: {}", required_string(arguments, "summary")?),
         ];
@@ -608,20 +647,21 @@ impl Bridge {
             }
         }
         let delivered = lines.join("\n");
-        self.request(
-            Method::SESSION_SEND_TEXT,
-            json!({
-                "sessionID": parent,
-                "text": delivered,
-                "submit": optional_bool(arguments, "submit").unwrap_or(true),
-            }),
-            DEFAULT_TIMEOUT,
+        let submit = optional_bool(arguments, "submit").unwrap_or(true);
+        // Exclude the mutable display title from the default message identity.
+        let receipt = self.deliver_message(
+            arguments,
+            &parent,
+            &delivered,
+            submit,
+            &json!(["report_to_parent", status, &lines[1..], submit]),
         )?;
         Ok(json!({
-            "ok": true,
+            "ok": receipt["delivery"] == "sent",
             "parent": parent,
             "status": status,
             "delivered": delivered,
+            "receipt": receipt,
         }))
     }
 
@@ -979,6 +1019,54 @@ mod tests {
             listening_ports: None,
             foreground_agent: None,
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn old_engines_never_trigger_untracked_delivery_fallback() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("old-engine.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let request: diri_proto::ControlMessage = serde_json::from_str(&line).unwrap();
+            let diri_proto::ControlMessage::Request { id, method, .. } = request else {
+                panic!("expected request");
+            };
+            assert_eq!(method, Method::SESSION_DELIVER_MESSAGE);
+            serde_json::to_writer(
+                &mut stream,
+                &diri_proto::ControlMessage::Response {
+                    id,
+                    result: Err(diri_proto::ControlError::new(
+                        "unknown_method",
+                        "old Engine",
+                    )),
+                },
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+            drop(stream);
+            listener
+        });
+        let bridge = Bridge::new(path, Some("s_sender".into()));
+        let error = bridge
+            .deliver_message(&json!({}), "s_target", "task", true, &json!(["task"]))
+            .unwrap_err();
+        assert!(error.contains("unknown_method"));
+        let listener = server.join().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "an old Engine must not receive an untracked fallback request"
+        );
     }
 
     #[test]

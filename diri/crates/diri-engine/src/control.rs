@@ -16,7 +16,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use diri_proto::control::MAX_CONTROL_LINE_BYTES;
 use diri_proto::{ControlError, ControlMessage, JsonValue, Method, WIRE_VERSION};
@@ -25,6 +25,7 @@ use sha2::{Digest, Sha256};
 
 use crate::registry::Registry;
 mod account_handoff;
+mod message_delivery;
 
 /// Identifies this engine in the handshake, so a client can tell which
 /// implementation it reached.
@@ -691,6 +692,7 @@ impl ControlServer {
             Method::HELLO => self.hello(params),
             Method::SESSION_SPAWN => self.session_spawn(params),
             Method::SESSION_LIST | Method::STATE_SNAPSHOT => self.session_list(),
+            Method::SESSION_DELIVER_MESSAGE => self.session_deliver_message(params),
             Method::SESSION_SEND_TEXT => self.session_send_text(params),
             Method::SESSION_RESIZE => self.session_resize(params),
             Method::SESSION_READ_SCREEN => self.session_read_screen(params),
@@ -1768,6 +1770,36 @@ impl ControlServer {
             "projects": registry.projects_raw(),
         }))
         .map_err(|error| ControlError::internal(error.to_string()))
+    }
+
+    fn session_deliver_message(
+        &self,
+        params: Option<JsonValue>,
+    ) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::DeliverMessageParams = decode(params)?;
+        // Reuse the existing input serialization. No new terminal owner, queue,
+        // or lock is introduced. Receipt writes precede all PTY effects.
+        let mut registry = self.registry.lock().map_err(poisoned)?;
+        if registry.get(&p.session_id.0).is_none() {
+            return Err(ControlError::not_found(p.session_id.0.clone()));
+        }
+        message_delivery::deliver(
+            &self
+                .socket_path
+                .with_file_name("message-receipts-v1.sqlite"),
+            &p,
+            || {
+                registry
+                    .wake_session(&p.session_id.0)
+                    .map_err(io_control_error)?;
+                self.publish_updated(&registry, &p.session_id.0);
+                registry
+                    .get(&p.session_id.0)
+                    .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?
+                    .send_text(&p.text, p.submit)
+                    .map_err(io_control_error)
+            },
+        )
     }
 
     fn session_send_text(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
@@ -3284,7 +3316,6 @@ fn prepare_agent_input(
 #[derive(Clone, Copy, Debug)]
 enum InitialPromptFailure {
     SessionEnded,
-    TimedOut,
     SubmissionUnconfirmed,
     InputFailed,
 }
@@ -3293,7 +3324,6 @@ impl std::fmt::Display for InitialPromptFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::SessionEnded => formatter.write_str("the session ended before accepting it"),
-            Self::TimedOut => formatter.write_str("the agent did not accept it before the timeout"),
             Self::InputFailed => formatter.write_str("the session could not accept input"),
             Self::SubmissionUnconfirmed => {
                 formatter.write_str("the agent never confirmed that it submitted")
@@ -3306,7 +3336,7 @@ fn initial_prompt_control_error(session_id: &str, failure: InitialPromptFailure)
     ControlError::new(
         "initial_prompt_delivery_failed",
         format!(
-            "session {session_id} was created, but initial prompt delivery was not confirmed: {failure}"
+            "session {session_id} was created, but initial prompt delivery was not confirmed: {failure}. Input may already have reached the agent; do not resend or spawn a replacement. Inspect this session first."
         ),
     )
 }
@@ -3357,33 +3387,9 @@ fn is_claude_workspace_trust_screen(screen: &str) -> bool {
         && (normalized.contains("1.") || normalized.contains("1 "))
 }
 
-/// Types an initial prompt into a freshly spawned agent.
-///
-/// The old shape of this — paste-and-Enter in one go, then call it settled
-/// the moment the screen changed at all — lost the prompt outright against
-/// Claude Code: its banner and tips repaint for seconds after bracketed-paste
-/// mode comes on, so the "screen changed" tell fired on a repaint while the
-/// composer had quietly discarded the keystrokes. The user typed a prompt,
-/// got a bare agent, and the prompt was gone.
-///
-/// So the Enter is no longer sent blind, and "it landed" is no longer
-/// inferred from the screen merely moving. Each attempt TYPES the prompt
-/// without submitting and watches for it to echo into the composer; if it
-/// does, the Enter follows a prompt we can see. If it does not — which also
-/// describes a line-mode reader that paints nothing before a newline — the
-/// Enter goes out anyway and the prompt itself must then appear on screen.
-/// Only when neither happens is the attempt treated as swallowed, and only
-/// then is anything retyped.
-///
-/// And it keeps trying. A first-run agent can sit on a trust dialog or a
-/// login for a minute before it has a composer at all (Codex asks whether it
-/// trusts the directory), which the old three-quick-tries shape treated as
-/// "prompt lost". The prompt is held rather than fired: a dialog does not
-/// echo what it is handed, so those attempts simply fail their check and come
-/// back a moment later, and the first attempt after the dialog closes is the
-/// one that lands. Nothing here consults the session's status — Codex reads
-/// as `Working` even at an idle composer, so the echo is the only tell worth
-/// trusting.
+/// Types and submits an initial prompt at most once. Screen observations can
+/// confirm acceptance, but an absent echo cannot prove that input was lost.
+/// Never clear/retype or send another Enter after an ambiguous outcome.
 fn inject_initial_prompt(
     registry: &Arc<Mutex<Registry>>,
     session_id: &str,
@@ -3392,94 +3398,41 @@ fn inject_initial_prompt(
     if !wait_until_ready(registry, session_id) {
         return Err(InitialPromptFailure::SessionEnded);
     }
-    let give_up_at = Instant::now() + PROMPT_INJECTION_WINDOW;
-    loop {
-        let Some(before) = screen_text(registry, session_id) else {
-            return Err(InitialPromptFailure::SessionEnded);
-        };
-        // A word already on screen (a path in the banner, a word from the
-        // tips panel) proves nothing, so the probe is chosen against the
-        // pre-typing screen.
-        let probe = verification_probe(prompt, &before);
-        with_session(registry, session_id, |session| session.paste_text(prompt))
-            .ok_or(InitialPromptFailure::SessionEnded)?
-            .map_err(|_| InitialPromptFailure::InputFailed)?;
-        match wait_for_echo(registry, session_id, probe.as_deref(), &before, ECHO_WINDOW) {
-            EchoOutcome::Gone => return Err(InitialPromptFailure::SessionEnded),
-            // The composer is holding our text: the Enter is safe.
-            EchoOutcome::Visible => {
-                return submit_typed_prompt(registry, session_id, probe.as_deref());
-            }
-            EchoOutcome::Missing => {}
+    let before = screen_text(registry, session_id).ok_or(InitialPromptFailure::SessionEnded)?;
+    let probe = verification_probe(prompt, &before);
+    with_session(registry, session_id, |session| session.paste_text(prompt))
+        .ok_or(InitialPromptFailure::SessionEnded)?
+        .map_err(|_| InitialPromptFailure::InputFailed)?;
+    match wait_for_echo(registry, session_id, probe.as_deref(), &before, ECHO_WINDOW) {
+        EchoOutcome::Gone => return Err(InitialPromptFailure::SessionEnded),
+        EchoOutcome::Visible => {
+            return submit_typed_prompt(registry, session_id, probe.as_deref());
         }
-
-        // Nothing came back. Either the keystrokes were discarded, or this is
-        // a reader that paints nothing until it sees a newline (a line-mode
-        // shell with echo off). Submitting tells the two apart: the prompt
-        // shows up when it landed, and nothing shows up when it did not.
-        //
-        // This Enter is a keypress into something we cannot see, and some of
-        // those things are questions — Codex's "do you trust this directory?"
-        // reads Enter as yes. Nothing here can tell a line-mode reader from a
-        // dialog: both swallow a paste without repainting, and the difference
-        // is canonical vs raw mode, which lives in the holder's pty and not
-        // here. The old code sent this same blind Enter on every attempt, so
-        // the exposure is unchanged; narrowing it would need the holder to
-        // report termios.
-        with_session(registry, session_id, |session| session.submit_input())
-            .ok_or(InitialPromptFailure::SessionEnded)?
-            .map_err(|_| InitialPromptFailure::InputFailed)?;
-        match wait_for_echo(
-            registry,
-            session_id,
-            probe.as_deref(),
-            &before,
-            LANDED_WINDOW,
-        ) {
-            EchoOutcome::Gone => return Err(InitialPromptFailure::SessionEnded),
-            EchoOutcome::Visible => return Ok(()),
-            EchoOutcome::Missing => {}
-        }
-
-        // Truly swallowed. Empty the composer before retyping so a late echo
-        // cannot concatenate with the retry.
-        if with_session(registry, session_id, |session| session.clear_input_line()).is_none() {
-            return Err(InitialPromptFailure::SessionEnded);
-        }
-        if !sleep_until(give_up_at, PROMPT_RETRY_DELAY) {
-            break;
-        }
+        EchoOutcome::Missing => {}
     }
-    eprintln!(
-        "dirijord: {session_id} never accepted its initial prompt within \
-         {}s — left untyped rather than submitted blind",
-        PROMPT_INJECTION_WINDOW.as_secs()
-    );
-    Err(InitialPromptFailure::TimedOut)
-}
-
-/// How long a prompt waits for a composer that will take it. Long enough to
-/// outlast a trust dialog or a first-run login, short enough that a session
-/// abandoned at a wall does not hold a thread forever.
-const PROMPT_INJECTION_WINDOW: Duration = Duration::from_secs(180);
-
-/// Quiet time between delivery attempts.
-const PROMPT_RETRY_DELAY: Duration = Duration::from_secs(2);
-
-/// Sleeps for `delay`, or reports false when that would pass `deadline`.
-fn sleep_until(deadline: Instant, delay: Duration) -> bool {
-    if Instant::now() + delay >= deadline {
-        return false;
+    // A line-mode reader may not display anything until Enter. Send it once;
+    // a missing response leaves an unknown outcome, never permission to retry.
+    with_session(registry, session_id, |session| session.submit_input())
+        .ok_or(InitialPromptFailure::SessionEnded)?
+        .map_err(|_| InitialPromptFailure::InputFailed)?;
+    match wait_for_echo(
+        registry,
+        session_id,
+        probe.as_deref(),
+        &before,
+        LANDED_WINDOW,
+    ) {
+        EchoOutcome::Gone => Err(InitialPromptFailure::SessionEnded),
+        EchoOutcome::Visible => Ok(()),
+        EchoOutcome::Missing => Err(InitialPromptFailure::SubmissionUnconfirmed),
     }
-    std::thread::sleep(delay);
-    true
 }
 
 /// What the screen said about a prompt we just typed.
 enum EchoOutcome {
     /// The prompt is visibly sitting in the composer: safe to submit.
     Visible,
-    /// Nothing arrived; the composer can be cleared and the prompt retyped.
+    /// No echo was observed; acceptance is unknown.
     Missing,
     /// The session exited or vanished — stop touching it.
     Gone,
@@ -3522,58 +3475,55 @@ fn wait_for_echo(
 }
 
 /// Presses Enter on a prompt already verified to be in the composer, and
-/// confirms the composer let go of it. A prompt still sitting there after the
-/// first Enter gets exactly one more — never a retype, which is what would
-/// double-send.
+/// observes whether the composer let go of it. A delayed repaint must never
+/// cause an extra Enter: it could submit a queued turn or answer a dialog.
 fn submit_typed_prompt(
     registry: &Arc<Mutex<Registry>>,
     session_id: &str,
     probe: Option<&str>,
 ) -> Result<(), InitialPromptFailure> {
     let submitted_at = diri_proto::DateMillis::from(std::time::SystemTime::now());
-    for _ in 0..2 {
-        let (before, process_only) = with_session(registry, session_id, |session| {
-            let view = session.view();
-            (
-                session.screen_lines().join("\n"),
-                view.status_evidence.is_some_and(|evidence| {
-                    evidence.fallback_reason == Some(diri_proto::StatusFallbackReason::ProcessOnly)
-                }),
-            )
-        })
-        .ok_or(InitialPromptFailure::SessionEnded)?;
-        let composer_had_prompt = probe.is_some_and(|probe| {
-            composer_text(&before).is_some_and(|composer| composer.contains(probe))
-        });
-        with_session(registry, session_id, |session| session.submit_input())
-            .ok_or(InitialPromptFailure::SessionEnded)?
-            .map_err(|_| InitialPromptFailure::InputFailed)?;
-        // The prompt may remain in the transcript after submission. In that
-        // case require a fresh, authoritative Agent signal; startup output or
-        // a status that predates Enter cannot acknowledge these bytes.
-        for _ in 0..20 {
-            std::thread::sleep(Duration::from_millis(100));
-            match screen_text(registry, session_id) {
-                None => return Err(InitialPromptFailure::SessionEnded),
-                Some(now)
-                    if probe.is_some_and(|probe| !now.contains(probe))
-                        // Codex keeps the submitted text in the transcript.
-                        // Require a composer that held our probe before Enter
-                        // and is still identifiable but no longer holds it.
-                        // An absent composer during a repaint proves nothing.
-                        || (composer_had_prompt && probe.is_some_and(|probe| {
-                            composer_text(&now).is_some_and(|composer| !composer.contains(probe))
-                        }))
-                        // Plain CLI tools have no Agent status signals. A new
-                        // response after Enter is their available confirmation;
-                        // the pasted echo alone must never count as one.
-                        || ((process_only || probe.is_none()) && now != before)
-                        || agent_started_working(registry, session_id, submitted_at) =>
-                {
-                    return Ok(());
-                }
-                Some(_) => {}
+    let (before, process_only) = with_session(registry, session_id, |session| {
+        let view = session.view();
+        (
+            session.screen_lines().join("\n"),
+            view.status_evidence.is_some_and(|evidence| {
+                evidence.fallback_reason == Some(diri_proto::StatusFallbackReason::ProcessOnly)
+            }),
+        )
+    })
+    .ok_or(InitialPromptFailure::SessionEnded)?;
+    let composer_had_prompt = probe.is_some_and(|probe| {
+        composer_text(&before).is_some_and(|composer| composer.contains(probe))
+    });
+    with_session(registry, session_id, |session| session.submit_input())
+        .ok_or(InitialPromptFailure::SessionEnded)?
+        .map_err(|_| InitialPromptFailure::InputFailed)?;
+    // The prompt may remain in the transcript after submission. In that
+    // case require a fresh, authoritative Agent signal; startup output or
+    // a status that predates Enter cannot acknowledge these bytes.
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(100));
+        match screen_text(registry, session_id) {
+            None => return Err(InitialPromptFailure::SessionEnded),
+            Some(now)
+                if probe.is_some_and(|probe| !now.contains(probe))
+                    // Codex keeps the submitted text in the transcript.
+                    // Require a composer that held our probe before Enter
+                    // and is still identifiable but no longer holds it.
+                    // An absent composer during a repaint proves nothing.
+                    || (composer_had_prompt && probe.is_some_and(|probe| {
+                        composer_text(&now).is_some_and(|composer| !composer.contains(probe))
+                    }))
+                    // Plain CLI tools have no Agent status signals. A new
+                    // response after Enter is their available confirmation;
+                    // the pasted echo alone must never count as one.
+                    || ((process_only || probe.is_none()) && now != before)
+                    || agent_started_working(registry, session_id, submitted_at) =>
+            {
+                return Ok(());
             }
+            Some(_) => {}
         }
     }
     Err(InitialPromptFailure::SubmissionUnconfirmed)
@@ -4924,7 +4874,7 @@ mod tests {
         peer.set_read_timeout(Some(Duration::from_millis(250)))
             .unwrap();
         let worker = std::thread::spawn(move || server.serve(stream));
-        let start = Instant::now();
+        let start = std::time::Instant::now();
         peer.write_all(
             b"{\"id\":1,\"method\":\"worktree.overview\"}\n{\"id\":2,\"method\":\"hello\"}\n",
         )

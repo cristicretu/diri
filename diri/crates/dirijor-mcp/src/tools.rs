@@ -60,12 +60,13 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
         ),
         ToolDefinition::new(
             "send_prompt",
-            "Type into an authorized session and optionally press Enter. Delegated agents may message their parent or direct children; root agents may coordinate their project. Cross-lineage messages are attributed to their sender.",
+            "Type into an authorized session and optionally press Enter. Delegated agents may message their parent or direct children; root agents may coordinate their project. Cross-lineage messages are attributed to their sender. Identical messages from the same sender to the same target are delivered at most once, including across retries and restarts. Reuse message_id on retries; use a new message_id only to intentionally repeat identical text. A receipt acknowledges input delivery, not agent completion. Inspect an unknown outcome; never resend it under a new identity.",
             json!({
                 "type": "object",
                 "properties": {
                     "session_id": {"type": "string"},
                     "text": {"type": "string"},
+                    "message_id": message_id_schema(),
                     "submit": {"type": "boolean", "description": "Press Enter after typing; defaults to true."}
                 },
                 "required": ["session_id", "text"]
@@ -201,11 +202,12 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
         ),
         ToolDefinition::new(
             "report_to_parent",
-            "Deliver a structured update, result, blocker, or question to the session that delegated this work.",
+            "Deliver a structured update, result, blocker, or question to the session that delegated this work at most once. Identical reports are deduplicated. Reuse message_id on retries; choose a new one only for an intentional repeat. Inspect unknown outcomes without resending.",
             json!({
                 "type": "object",
                 "properties": {
                     "summary": {"type": "string"},
+                    "message_id": message_id_schema(),
                     "status": {"type": "string", "enum": ["update", "done", "blocked", "failed"]},
                     "details": {"type": "string"},
                     "blockers": string_array(),
@@ -264,6 +266,11 @@ fn browser_schema() -> Value {
         },
         "required": ["action"]
     })
+}
+
+fn message_id_schema() -> Value {
+    json!({"type":"string", "minLength":1, "maxLength":200,
+        "description":"Stable identity for this logical message. Reuse on retries. If omitted, identical content is deduplicated for this sender/target. Use a new value only for an intentional repeat."})
 }
 
 #[cfg(test)]

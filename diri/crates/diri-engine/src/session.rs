@@ -1512,7 +1512,7 @@ impl Session {
     ///
     /// Titling happens here rather than at submit, so a prompt the injector
     /// types names its session the same way one the user types does. It is
-    /// idempotent, which matters because the injector may retype.
+    /// idempotent; delivery itself must never be replayed based on screen echo.
     pub fn paste_text(&self, text: &str) -> std::io::Result<()> {
         self.capture_prompt_title(text);
         let framed = if self.bracketed_paste() {
@@ -1526,13 +1526,6 @@ impl Session {
     /// The Enter that submits whatever is in the composer.
     pub fn submit_input(&self) -> std::io::Result<()> {
         self.write_input(b"\r")
-    }
-
-    /// Kill-line (⌃U): what every one of these TUIs uses to empty its
-    /// composer. Sent before a retyped prompt so a half-landed first attempt
-    /// cannot concatenate with the second.
-    pub fn clear_input_line(&self) -> std::io::Result<()> {
-        self.write_input(b"\x15")
     }
 
     /// Sends bytes to the child, as if typed.

@@ -606,6 +606,51 @@ round trips, selection and paste tests, and desktop interaction verification.
 The existing release performance, persistence, lease, and real-SSH gates remain
 mandatory.
 
+## Engine-owned orchestration message delivery (September 2026)
+
+Initial prompts are pasted and submitted at most once. Screen echo, composer
+changes, and fresh Agent signals may confirm acceptance; their absence cannot
+prove that input was discarded. The Engine never clears/retypes a prompt or
+sends another Enter because a confirmation timed out. An uncertain initial
+delivery identifies the existing session and instructs the caller to inspect
+it rather than resend or spawn a replacement. This deliberately replaces the
+old screen-based retry policy, including retries intended to recover swallowed
+startup input. Startup readiness still gates the first attempt; PTY input alone
+cannot guarantee exactly-once application consumption.
+
+MCP `send_prompt` and `report_to_parent` use the additive local Engine method
+`session.deliver_message`. It reserves a receipt durably before writing input.
+Sender session, target session, and message ID define one logical message.
+The MCP bridge derives a stable ID from normalized content when omitted; an
+explicit `message_id` allows an intentional repeat. Returned IDs can be passed
+back unchanged. Repeating the same identity returns its receipt; changed text
+or submit mode with that identity fails with `message_id_conflict`. Attribution
+uses stable session IDs so renaming a sender cannot change a retried payload.
+
+Receipts survive MCP and Engine restarts in owner-only
+`message-receipts-v1.sqlite` beside the Engine socket. The versioned table stores
+only identity/content hashes and `sent`/`unknown` outcomes, never prompt bodies.
+A reservation interrupted by a crash, partial input, or lost acknowledgement
+remains unknown and is never replayed. `sent` confirms input transport, not Agent
+execution or completion. Receipts do not expire; at 100,000 entries new messages
+fail closed instead of forgetting old identities. Existing identities remain
+queryable. Missing Engine support, corrupt storage, and unsafe paths fail
+closed; the MCP bridge never falls back to untracked text input.
+
+This is local Engine orchestration over the existing local and remote input
+paths, not remote MCP forwarding. Raw interactive `session.send_text`, Helper
+protocols, controller leases, and Holder ownership are unchanged. SQLite and
+SHA-256 reuse workspace dependencies; the MCP bridge adds the existing `sha2`
+dependency for stable content identity. There is no Holder cache, timer, or lock.
+The receipt work uses the existing Engine input serialization. A 100-message
+debug measurement on macOS recorded median 5.0 ms / p95 9.7 ms receipt overhead
+and a 36 KiB database; the existing 30 ms paste/Enter settle is separate.
+
+Acceptance covers accepted input with no visible echo, delayed composer
+repaint without extra Enter, repeated and concurrent MCP calls, intentional
+repeats, conflicting identities, durable reopen/crash reservations, and
+corrupt/symlinked storage. Existing remote at-most-once transport gates remain.
+
 ## Wire protocol
 
 `diri-proto::remote_pty` is the versioned protocol authority. Protocol 1.3

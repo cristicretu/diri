@@ -24,6 +24,7 @@ impl Method {
     pub const SESSION_RENAME: &'static str = "session.rename";
     pub const SESSION_RESUME: &'static str = "session.resume";
     pub const SESSION_FORK: &'static str = "session.fork";
+    pub const SESSION_DELIVER_MESSAGE: &'static str = "session.deliver_message";
     pub const SESSION_SEND_TEXT: &'static str = "session.send_text";
     pub const SESSION_RESIZE: &'static str = "session.resize";
     pub const SESSION_READ_SCREEN: &'static str = "session.read_screen";
@@ -520,6 +521,21 @@ pub type SessionRenameResult = EmptyResult;
 pub struct SendTextParams {
     #[serde(rename = "sessionID")]
     pub session_id: SessionId,
+    pub text: String,
+    pub submit: bool,
+}
+
+/// Idempotent orchestration input. The identity is scoped to sender and target
+/// session and retained across Engine restarts. Raw interactive input uses SendText.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliverMessageParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    #[serde(rename = "senderID")]
+    pub sender_id: String,
+    #[serde(rename = "messageID")]
+    pub message_id: String,
     pub text: String,
     pub submit: bool,
 }

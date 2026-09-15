@@ -325,3 +325,200 @@ fn spawn_agent_waits_for_a_large_multiline_prompt_in_a_new_worktree() {
     );
     assert!(acted, "the spawned agent must act on the submitted prompt");
 }
+
+#[test]
+fn repeated_mcp_sends_deliver_one_copy() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let capture = temp.path().join("received");
+    let fixture = temp.path().join("prompt-fixture");
+    std::fs::write(
+        &fixture,
+        format!(
+            "#!/bin/sh\nstty raw -echo\nprintf '\\033[?2004hREADY'\nexec cat > '{}'\n",
+            capture.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let server = start_server(temp.path(), &fixture, &repo);
+    let bridge = Bridge::new(server.socket_path().into(), Some("s_parent".into()));
+    let spawned = bridge
+        .call("spawn_agent", &json!({"kind":"prompt-fixture", "cwd":repo}))
+        .unwrap();
+    let id = spawned["id"].as_str().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let screen = bridge
+            .call("read_output", &json!({"session_id":id}))
+            .unwrap();
+        if screen["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("READY")
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "fixture did not become ready");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Retry with both omitted identity and the exact identity in the receipt.
+    let first = bridge
+        .call(
+            "send_prompt",
+            &json!({"session_id":id, "text":"run this task once"}),
+        )
+        .unwrap();
+    let receipt_id = first["receipt"]["message_id"].as_str().unwrap();
+    for _ in 0..10 {
+        let retry = Bridge::new(server.socket_path().into(), Some("s_parent".into()))
+            .call(
+                "send_prompt",
+                &json!({"session_id":id, "text":"run this task once"}),
+            )
+            .unwrap();
+        assert_eq!(retry["receipt"]["duplicate"], true);
+    }
+    let retry = bridge
+        .call(
+            "send_prompt",
+            &json!({"session_id":id, "text":"run this task once", "message_id":receipt_id}),
+        )
+        .unwrap();
+    assert_eq!(retry["receipt"]["duplicate"], true);
+    // Simultaneous calls on separate control connections have one owner too.
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            let bridge = &bridge;
+            scope.spawn(move || {
+                let result = bridge
+                    .call(
+                        "send_prompt",
+                        &json!({"session_id":id, "text":"run this task once"}),
+                    )
+                    .unwrap();
+                assert_eq!(result["receipt"]["duplicate"], true);
+            });
+        }
+    });
+    // Intentional repeats require a distinct logical message identity.
+    for _ in 0..2 {
+        bridge.call("send_prompt", &json!({"session_id":id, "text":"run this task once", "message_id":"intentional-repeat"})).unwrap();
+    }
+    // Lose the reply after dispatch. The retry may race the first connection;
+    // the durable identity still permits only one PTY write.
+    let mut disconnected = std::os::unix::net::UnixStream::connect(server.socket_path()).unwrap();
+    serde_json::to_writer(&mut disconnected, &diri_proto::ControlMessage::Request {
+        id: 900, method: Method::SESSION_DELIVER_MESSAGE.into(),
+        params: Some(json!({"sessionID":id, "senderID":"s_parent", "messageID":"lost-reply", "text":"lost reply task", "submit":true})),
+    }).unwrap();
+    disconnected.write_all(b"\n").unwrap();
+    drop(disconnected);
+    for _ in 0..3 {
+        bridge
+            .call(
+                "send_prompt",
+                &json!({"session_id":id, "text":"lost reply task", "message_id":"lost-reply"}),
+            )
+            .unwrap();
+    }
+    // Raw interactive input deliberately has no content deduplication.
+    for _ in 0..2 {
+        bridge
+            .request(
+                Method::SESSION_SEND_TEXT,
+                json!({"sessionID":id, "text":"raw", "submit":false}),
+                Duration::from_secs(3),
+            )
+            .unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    bridge
+        .call("release_agent", &json!({"session_id":id}))
+        .unwrap();
+    assert_eq!(
+        std::fs::read(capture).unwrap(),
+        [
+            b"\x1b[200~run this task once\x1b[201~\r".repeat(2),
+            b"\x1b[200~lost reply task\x1b[201~\rrawraw".to_vec()
+        ]
+        .concat(),
+        "repeated MCP calls must not repeat the prompt in the PTY"
+    );
+}
+
+#[test]
+fn parent_reports_are_deduplicated_across_sender_renames() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(repo.join("child")).unwrap();
+    let fixture = temp.path().join("prompt-fixture");
+    std::fs::write(
+        &fixture,
+        "#!/bin/sh\nstty raw -echo\nprintf '\\033[?2004hREADY'\nexec cat > received\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let server = start_server(temp.path(), &fixture, &repo);
+    let root = Bridge::new(server.socket_path().into(), Some("s_parent".into()));
+    let parent = root
+        .call("spawn_agent", &json!({"kind":"prompt-fixture", "cwd":repo}))
+        .unwrap();
+    let parent_id = parent["id"].as_str().unwrap();
+    let parent_bridge = Bridge::new(server.socket_path().into(), Some(parent_id.into()));
+    let child = parent_bridge
+        .call(
+            "spawn_agent",
+            &json!({"kind":"prompt-fixture", "cwd":repo.join("child")}),
+        )
+        .unwrap();
+    let child_id = child["id"].as_str().unwrap();
+    let child_bridge = Bridge::new(server.socket_path().into(), Some(child_id.into()));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let screen = parent_bridge
+            .call("read_output", &json!({"session_id":parent_id}))
+            .unwrap();
+        if screen["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("READY")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "parent fixture did not become ready"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let args = json!({"summary":"task complete", "status":"done", "proof":["checks passed"]});
+    let first = child_bridge.call("report_to_parent", &args).unwrap();
+    root.request(
+        Method::SESSION_RENAME,
+        json!({"sessionID":child_id, "title":"renamed worker"}),
+        Duration::from_secs(3),
+    )
+    .unwrap();
+    for _ in 0..10 {
+        let result = Bridge::new(server.socket_path().into(), Some(child_id.into()))
+            .call("report_to_parent", &args)
+            .unwrap();
+        assert_eq!(result["receipt"]["duplicate"], true);
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    parent_bridge
+        .call("release_agent", &json!({"session_id":child_id}))
+        .unwrap();
+    root.call("release_agent", &json!({"session_id":parent_id}))
+        .unwrap();
+    assert_eq!(
+        std::fs::read(repo.join("received")).unwrap(),
+        format!(
+            "\x1b[200~{}\x1b[201~\r",
+            first["delivered"].as_str().unwrap()
+        )
+        .as_bytes()
+    );
+}

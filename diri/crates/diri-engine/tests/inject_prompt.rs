@@ -1,6 +1,6 @@
 //! Verified initial-prompt injection, end to end over the control socket:
 //! the prompt must wait for the composer to come alive, land exactly once,
-//! and be retried when a not-yet-ready TUI silently swallows it.
+//! with uncertain outcomes reported without replaying text or Enter.
 
 #![cfg(unix)]
 
@@ -103,7 +103,7 @@ fn codex_prompt_retained_in_transcript_is_acknowledged_once() {
 }
 
 #[test]
-fn codex_banner_repaint_does_not_acknowledge_a_swallowed_enter() {
+fn codex_banner_repaint_neither_acknowledges_nor_retries_a_swallowed_enter() {
     assert_codex_delivery(true);
 }
 
@@ -162,11 +162,16 @@ exec cat"#,
         Err(error) => error.message.split_whitespace().nth(1).unwrap().to_owned(),
     };
     control.request("session.kill", json!({ "sessionID": id }));
-    assert!(
-        accepted.exists(),
-        "fixture must receive the submitted prompt"
-    );
-    assert!(result.is_ok(), "sent prompt reported as failed: {result:?}");
+    if swallow_first_enter {
+        assert!(!accepted.exists(), "a second Enter must not be sent");
+        assert!(result.is_err(), "a swallowed Enter cannot be confirmed");
+    } else {
+        assert!(
+            accepted.exists(),
+            "fixture must receive the submitted prompt"
+        );
+        assert!(result.is_ok(), "sent prompt reported as failed: {result:?}");
+    }
     assert!(
         !extra_enter.exists(),
         "accepted prompt received another Enter"
@@ -297,96 +302,6 @@ fn the_prompt_waits_for_the_composer_and_lands_once() {
     control.request("session.kill", json!({ "sessionID": id }));
 }
 
-/// A TUI that paints a banner but then SILENTLY eats input for a while (no
-/// echo, no screen change) — the swallowed first attempt must be detected
-/// and retried until the real reader is up, without duplication.
-#[test]
-fn a_silently_swallowed_prompt_is_retried_until_it_lands() {
-    let temp = tempfile::tempdir().expect("temp");
-    let server = start_server(temp.path());
-    let mut control = Control::connect(&server);
-
-    // FROZEN paints immediately (so readiness fires on screen stability),
-    // then every line typed for ~3s is discarded with echo off — the screen
-    // stays byte-identical, which is the ONLY state that permits a retry.
-    // Echo stays off after the swallow too, so a delivered prompt paints
-    // exactly once (cat's copy) and the count below is exact.
-    let id = spawn(
-        &mut control,
-        r#"printf FROZEN; stty -echo; end=$((SECONDS+3)); while [ $SECONDS -lt $end ]; do read -t 1 junk; done; exec cat"#,
-        "/bin/bash",
-        "the retried prompt",
-    );
-
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let mut text = String::new();
-    while Instant::now() < deadline {
-        text = screen(&mut control, &id);
-        if text.contains("the retried prompt") {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    assert!(
-        text.contains("the retried prompt"),
-        "the swallowed prompt was never retried: {text:?}"
-    );
-    std::thread::sleep(Duration::from_millis(2500));
-    let text = screen(&mut control, &id);
-    assert_eq!(
-        occurrences(&text, "the retried prompt"),
-        1,
-        "retries must stop the moment one attempt lands: {text:?}"
-    );
-
-    control.request("session.kill", json!({ "sessionID": id }));
-}
-
-/// The Claude Code shape, and the one that used to lose prompts outright:
-/// bracketed paste comes on EARLY, while the banner is still repainting, and
-/// input typed into that window is discarded. A busy screen must not be
-/// mistaken for "the prompt arrived" — the prompt itself has to show up.
-#[test]
-fn a_prompt_swallowed_behind_a_repainting_banner_still_lands() {
-    let temp = tempfile::tempdir().expect("temp");
-    let server = start_server(temp.path());
-    let mut control = Control::connect(&server);
-
-    // Paste mode on immediately (the readiness tell), then ~7s of repainting
-    // while every line typed is discarded, then a real reader. The screen
-    // changes constantly throughout, so any "did the screen move?" check
-    // reports success on the very first attempt and the prompt is lost.
-    let id = spawn(
-        &mut control,
-        r#"printf '\033[?2004h'; stty -echo; end=$((SECONDS+7)); while [ $SECONDS -lt $end ]; do printf '.'; read -t 1 junk; done; exec cat"#,
-        "/bin/bash",
-        "prompt behind the banner",
-    );
-
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut text = String::new();
-    while Instant::now() < deadline {
-        text = screen(&mut control, &id);
-        if text.contains("prompt behind the banner") {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    assert!(
-        text.contains("prompt behind the banner"),
-        "a repainting banner was mistaken for a delivered prompt: {text:?}"
-    );
-    std::thread::sleep(Duration::from_millis(2500));
-    let text = screen(&mut control, &id);
-    assert_eq!(
-        occurrences(&text, "prompt behind the banner"),
-        1,
-        "retries must stop the moment one attempt lands: {text:?}"
-    );
-
-    control.request("session.kill", json!({ "sessionID": id }));
-}
-
 /// Codex collapses long pasted prompts in its composer. The visible summary
 /// keeps the first line but can omit a probe chosen from the middle of the
 /// prompt. Once Enter submits that accepted paste, losing the middle probe
@@ -437,31 +352,89 @@ while :; do sleep 1; done"#
     control.request("session.kill", json!({ "sessionID": id }));
 }
 
-/// An echoed paste is not a submitted prompt. Some startup composers swallow
-/// the first Enter while finishing initialization.
+/// The first Enter may be accepted while the old composer remains visible.
+/// Sending a second Enter can submit another turn or answer a new dialog.
 #[test]
-fn an_echoed_prompt_waits_for_an_accepted_enter() {
-    for prompt in ["verify swallowed enter", "hi"] {
+fn a_visible_prompt_with_delayed_acceptance_gets_only_one_enter() {
+    for prompt in ["verify delayed acceptance", "hi"] {
         let temp = tempfile::tempdir().expect("temp");
         let server = start_server(temp.path());
         let mut control = Control::connect(&server);
+        let capture = temp.path().join("received");
         let framed_len = prompt.len() + 12;
         let script = format!(
-            r#"stty -echo -icanon min 1 time 0
+            r#"stty raw -echo
 printf '\033[?2004hREADY'
-dd if=/dev/stdin of=/dev/null bs=1 count={framed_len} 2>/dev/null
+dd bs=1 count={framed_len} of='{}' 2>/dev/null
 printf '\r\033[2K{prompt}'
-dd if=/dev/stdin of=/dev/null bs=1 count=1 2>/dev/null
-dd if=/dev/stdin of=/dev/null bs=1 count=1 2>/dev/null
-printf '\r\033[2KSUBMITTED'
-exec cat"#
+dd bs=1 count=1 >>'{}' 2>/dev/null
+# Accept without repainting; capture any erroneous extra Enter.
+exec cat >>'{}'"#,
+            capture.display(),
+            capture.display(),
+            capture.display(),
         );
-        let id = spawn(&mut control, &script, "/bin/sh", prompt);
-        let text = screen(&mut control, &id);
-        control.request("session.kill", json!({ "sessionID": id }));
-        assert!(
-            text.contains("SUBMITTED"),
-            "spawn acknowledged an unsubmitted paste: {text:?}"
+        let error = control
+            .try_request(
+                "session.spawn",
+                json!({
+                    "kind": {"shell":{}}, "cwd":"/tmp",
+                    "argv":["/bin/sh", "-c", script], "initialPrompt":prompt,
+                }),
+            )
+            .expect_err("acceptance is unknown");
+        let id = error.message.split_whitespace().nth(1).unwrap();
+        control.request("session.kill", json!({"sessionID":id}));
+        assert_eq!(
+            std::fs::read(capture).unwrap(),
+            format!("\x1b[200~{prompt}\x1b[201~\r").as_bytes(),
+            "an unchanged composer must not cause extra Enter presses"
         );
     }
+}
+
+/// Accepting input does not require displaying it. A remote TUI can keep
+/// painting the same viewport while it processes a submitted task.
+#[test]
+fn an_accepted_prompt_without_a_visible_echo_is_never_replayed() {
+    let temp = tempfile::tempdir().expect("temp");
+    let server = start_server(temp.path());
+    let mut control = Control::connect(&server);
+    let prompt = "hidden task";
+    let capture = temp.path().join("received");
+    let bytes = prompt.len() + 13; // bracketed paste plus Enter
+    let script = format!(
+        r#"stty raw -echo
+printf '\033[?2004hREADY'
+dd bs=1 count={bytes} of='{}' 2>/dev/null
+# The agent has accepted the task; its viewport has not changed.
+dd bs=1 count={} >>'{}' 2>/dev/null
+printf '{prompt}'
+exec cat"#,
+        capture.display(),
+        bytes + 1,
+        capture.display(),
+    );
+    let result = control.try_request(
+        "session.spawn",
+        json!({
+            "kind": { "shell": {} }, "cwd": "/tmp",
+            "argv": ["/bin/sh", "-c", script], "initialPrompt": prompt,
+        }),
+    );
+    let id = match &result {
+        Ok(value) => value["id"].as_str().unwrap().to_owned(),
+        Err(error) => error.message.split_whitespace().nth(1).unwrap().to_owned(),
+    };
+    control.request("session.kill", json!({ "sessionID": id }));
+    let received = std::fs::read(capture).expect("captured input");
+    assert_eq!(
+        received,
+        format!("\x1b[200~{prompt}\x1b[201~\r").as_bytes(),
+        "missing screen echo must not replay a submitted task"
+    );
+    assert!(
+        result.is_err(),
+        "an unobservable outcome must be reported honestly"
+    );
 }
