@@ -121,6 +121,97 @@ pub struct SessionAttachment {
     pub chunks: AttachmentChunks,
 }
 
+/// Receive-only observation of an Engine-owned grid. Opening or dropping this
+/// channel never attaches to the remote Holder or changes terminal authority.
+/// A slow consumer backpressures the bounded socket queue; reconnect is explicit.
+pub struct SessionPreview {
+    session_id: SessionId,
+    // Keep the connection's command receiver alive, but expose no writer.
+    _commands: mpsc::UnboundedSender<Command>,
+    task: Option<JoinHandle<()>>,
+    pub chunks: AttachmentChunks,
+}
+
+impl SessionPreview {
+    pub async fn connect(
+        socket_path: impl AsRef<Path>,
+        session_id: SessionId,
+    ) -> Result<Self, AttachmentError> {
+        let stream = UnixStream::connect(socket_path).await?;
+        Self::adopt(stream, session_id).await
+    }
+
+    async fn adopt(mut stream: UnixStream, session_id: SessionId) -> Result<Self, AttachmentError> {
+        use diri_proto::preview::{PREVIEW_VERSION, PreviewReady, PreviewRequest};
+        let request = PreviewRequest {
+            preview: session_id.clone(),
+            version: PREVIEW_VERSION,
+        };
+        let mut line = serde_json::to_vec(&request)?;
+        line.push(b'\n');
+        // Bounded acknowledgement makes old engines, unknown sessions and the
+        // admission limit fail closed before a preview is exposed to the UI.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            stream.write_all(&line).await?;
+            let mut response = Vec::new();
+            loop {
+                let byte = stream.read_u8().await?;
+                if byte == b'\n' {
+                    break;
+                }
+                if response.len() >= 512 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "oversized preview acknowledgement",
+                    ));
+                }
+                response.push(byte);
+            }
+            let ready: PreviewReady = serde_json::from_slice(&response)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            if ready.version != PREVIEW_VERSION || ready.preview != session_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "preview identity/version mismatch",
+                ));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "preview handshake timed out"))??;
+        let (commands, command_rx) = mpsc::unbounded_channel();
+        let (chunk_tx, receiver) = mpsc::channel(1);
+        let task = tokio::spawn(run_connection(stream, command_rx, chunk_tx));
+        Ok(Self {
+            session_id,
+            _commands: commands,
+            task: Some(task),
+            chunks: AttachmentChunks { receiver },
+        })
+    }
+
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    /// Cancellation remains prompt even if the UI stopped draining a full queue.
+    pub async fn close(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        self.chunks.receiver.close();
+    }
+}
+
+impl Drop for SessionPreview {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
 /// Cloneable write half for a live, resident attachment.
 ///
 /// The app keeps this handle beside its resident terminal model while the
