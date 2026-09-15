@@ -985,6 +985,14 @@ impl SessionStore {
         self.repo_targets.insert(key, target);
     }
 
+    pub fn remember_split_layouts(&mut self, layouts: crate::split_layout::SplitLayouts) {
+        self.prefs.split_layouts = layouts;
+        self.invalidate_projection();
+        if let Err(error) = self.persist_preferences() {
+            eprintln!("diri: could not remember terminal panes: {error}");
+        }
+    }
+
     pub fn preferences(&self) -> &Prefs {
         &self.prefs
     }
@@ -2545,6 +2553,14 @@ impl SessionStore {
     /// and the sidebar shows no selection at all while the workbench shows a
     /// session — which reads as the app losing track of itself.
     fn reveal(&mut self, id: &SessionId) -> bool {
+        let owner = self.prefs.split_layouts.containing(id).and_then(|tree| {
+            tree.ids().into_iter().find(|id| {
+                self.sessions.get(id).is_some_and(|session| {
+                    !session.is_archived() && !is_auxiliary_terminal(session)
+                })
+            })
+        });
+        let id = owner.as_ref().unwrap_or(id);
         let Some(session) = self.sessions.get(id).cloned() else {
             return false;
         };

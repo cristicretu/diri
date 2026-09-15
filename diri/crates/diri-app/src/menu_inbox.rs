@@ -166,6 +166,7 @@ mod tests {
 
     fn row(session: Arc<SessionRecord>, depth: u16) -> SidebarRow {
         SidebarRow {
+            split_members: Vec::new(),
             session,
             depth,
             has_children: false,
@@ -200,6 +201,8 @@ mod tests {
     #[test]
     fn projects_with_no_active_sessions_are_dropped_entirely() {
         let projection = SidebarProjection {
+            split_groups: Default::default(),
+            split_owners: Default::default(),
             projects: vec![group("robite-landing", "robite", Vec::new(), Vec::new())],
             ordered_sessions: Vec::new(),
             display_order: Vec::new(),
@@ -218,6 +221,8 @@ mod tests {
             SessionStatus::Idle,
         );
         let projection = SidebarProjection {
+            split_groups: Default::default(),
+            split_owners: Default::default(),
             projects: vec![group(
                 "robite-landing",
                 "robite",
@@ -265,6 +270,8 @@ mod tests {
             SessionStatus::Working,
         );
         let projection = SidebarProjection {
+            split_groups: Default::default(),
+            split_owners: Default::default(),
             projects: vec![group(
                 "robite-landing",
                 "robite",
@@ -296,6 +303,8 @@ mod tests {
             SessionStatus::Working,
         );
         let projection = SidebarProjection {
+            split_groups: Default::default(),
+            split_owners: Default::default(),
             projects: vec![group(
                 "alex",
                 "alex",
@@ -336,6 +345,8 @@ mod tests {
             });
         }
         let projection = SidebarProjection {
+            split_groups: Default::default(),
+            split_owners: Default::default(),
             projects: vec![group(
                 "robite-landing",
                 "robite",
