@@ -218,11 +218,17 @@ struct ElementSharedState {
     stats: Mutex<RendererStats>,
     viewport: Mutex<ScrollbackViewport>,
     selection: Mutex<TerminalSelection>,
-    find_spans: Mutex<Vec<FindSpan>>,
+    find_highlights: Mutex<FindHighlights>,
     modes: Mutex<TerminalModes>,
     scroll_router: Mutex<ScrollRouter>,
     history_lines: Mutex<HistoryLineCache>,
     metrics: Mutex<Option<(Font, u32, CellMetrics)>>,
+}
+
+#[derive(Default)]
+struct FindHighlights {
+    spans: Vec<FindSpan>,
+    current_bounds: Option<Bounds<Pixels>>,
 }
 
 /// Shaped lines for history rows, keyed by absolute row and content-addressed
@@ -386,7 +392,7 @@ impl TerminalElement {
                 stats: Mutex::new(RendererStats::default()),
                 viewport: Mutex::new(ScrollbackViewport::default()),
                 selection: Mutex::new(TerminalSelection::default()),
-                find_spans: Mutex::new(Vec::new()),
+                find_highlights: Mutex::new(FindHighlights::default()),
                 modes: Mutex::new(TerminalModes::default()),
                 scroll_router: Mutex::new(ScrollRouter::default()),
                 history_lines: Mutex::new(HistoryLineCache::default()),
@@ -797,7 +803,18 @@ impl TerminalElement {
     }
 
     pub fn set_find_highlights(&self, spans: Vec<FindSpan>) {
-        *mutex_lock(&self.shared.find_spans) = spans;
+        *mutex_lock(&self.shared.find_highlights) = FindHighlights {
+            spans,
+            current_bounds: None,
+        };
+    }
+
+    /// Window-space bounds of the active highlight from this element's latest
+    /// prepaint. Overlay siblings must read this after the terminal prepaints,
+    /// so font, clipping, and viewport changes use the same geometry as paint.
+    #[must_use]
+    pub fn current_find_match_bounds(&self) -> Option<Bounds<Pixels>> {
+        mutex_lock(&self.shared.find_highlights).current_bounds
     }
 
     /// Captures the small live grid and packages it with daemon history for a
@@ -1018,6 +1035,7 @@ impl Element for TerminalElement {
         _cx: &mut App,
     ) -> Self::PrepaintState {
         if self.suspended {
+            mutex_lock(&self.shared.find_highlights).current_bounds = None;
             mutex_lock(&self.shared.row_cache).clear();
             mutex_lock(&self.shared.render_generations).clear();
             *mutex_lock(&self.shared.render_context) = None;
@@ -1042,6 +1060,7 @@ impl Element for TerminalElement {
         let focused = self.is_focused(window);
 
         if grid_is_empty {
+            mutex_lock(&self.shared.find_highlights).current_bounds = None;
             return TerminalPrepaintState {
                 started_at: None,
                 background_quads: Vec::new(),
@@ -1246,7 +1265,27 @@ impl Element for TerminalElement {
                 ));
             }
         }
-        for span in mutex_lock(&self.shared.find_spans).iter().copied() {
+        let mut highlights = mutex_lock(&self.shared.find_highlights);
+        highlights.current_bounds = highlights.spans.iter().find_map(|span| {
+            if !span.is_current || span.row >= visible_rows {
+                return None;
+            }
+            let start = span.start_col.min(visible_cols);
+            let end = span.end_col_exclusive.min(visible_cols);
+            (end > start).then(|| {
+                Bounds::new(
+                    point(
+                        bounds.left() + metrics.cell_width * start as f32,
+                        bounds.top() + metrics.line_height * span.row as f32,
+                    ),
+                    size(
+                        metrics.cell_width * (end - start) as f32,
+                        metrics.line_height,
+                    ),
+                )
+            })
+        });
+        for span in highlights.spans.iter().copied() {
             append_overlay_quad(
                 span.row,
                 span.start_col,
@@ -1261,6 +1300,8 @@ impl Element for TerminalElement {
                 &mut overlay_quads,
             );
         }
+
+        drop(highlights);
 
         let cursor_visible = cursor_should_render(focused, cursor.visible);
         let cursor = if cursor_visible
