@@ -279,6 +279,8 @@ fn append_management_actions(
                     | PaletteCommand::Action(
                         CommandId::OpenWorktrees
                             | CommandId::ToggleSidebar
+                            | CommandId::HorizontalTabs
+                            | CommandId::VerticalTabs
                             | CommandId::OpenSettings
                             | CommandId::ToggleHistory
                             | CommandId::ToggleNotifications
@@ -449,6 +451,8 @@ pub fn actions_for_default_host(
     result.extend([
         registered_action(CommandId::OpenWorktrees),
         registered_action(CommandId::ToggleSidebar),
+        registered_action(CommandId::HorizontalTabs),
+        registered_action(CommandId::VerticalTabs),
         registered_action(CommandId::OpenSettings),
         registered_action(CommandId::ToggleHistory),
         registered_action(CommandId::ToggleNotifications),
@@ -979,6 +983,8 @@ mod tests {
                 "new-default-in-/work/diri",
                 "worktrees",
                 "toggle-sidebar",
+                "horizontal-tabs",
+                "vertical-tabs",
                 "settings",
                 "history",
                 "toggle-notifications",

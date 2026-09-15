@@ -1,6 +1,7 @@
 //! Window-sidebar state, deterministic preview data, and GPUI rendering.
 
 mod disclosure;
+mod filter;
 mod fixture;
 mod state;
 mod view;
