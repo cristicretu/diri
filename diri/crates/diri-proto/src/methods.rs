@@ -28,6 +28,7 @@ impl Method {
     pub const SESSION_KILL: &'static str = "session.kill";
     pub const SESSION_REMOVE: &'static str = "session.remove";
     pub const SESSION_RENAME: &'static str = "session.rename";
+    pub const SESSION_RECONNECT: &'static str = "session.reconnect";
     pub const SESSION_RESUME: &'static str = "session.resume";
     pub const SESSION_FORK: &'static str = "session.fork";
     pub const SESSION_DELIVER_MESSAGE: &'static str = "session.deliver_message";
@@ -433,6 +434,7 @@ pub use SessionIdParams as SessionIDParams;
 pub type SessionKillParams = SessionIdParams;
 pub type SessionRemoveParams = SessionIdParams;
 pub type SessionResumeParams = SessionIdParams;
+pub type SessionReconnectParams = SessionIdParams;
 pub type SessionReadScreenParams = SessionIdParams;
 pub type SessionReadScrollbackParams = SessionIdParams;
 pub type SessionMarkSeenParams = SessionIdParams;
@@ -444,6 +446,15 @@ pub type SessionRefParams = SessionIdParams;
 
 pub type SessionKillResult = EmptyResult;
 pub type SessionRemoveResult = EmptyResult;
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionReconnectResult {
+    pub session: SessionRecord,
+    pub started: bool,
+    /// Previous uncertain input was discarded, never confirmed or replayed.
+    pub uncertain_input_discarded: bool,
+}
+
 pub type SessionResumeResult = SessionRecord;
 pub type SessionMarkSeenResult = EmptyResult;
 pub type SessionHibernateResult = EmptyResult;

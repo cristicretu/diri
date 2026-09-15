@@ -7,6 +7,7 @@ mod controller;
 use controller::{AttachmentControl, ControllerLease};
 mod find_overlay;
 mod qol;
+mod reconnect;
 use qol::QolState;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -556,6 +557,7 @@ pub struct TerminalViewport {
 
 pub struct TerminalPane {
     qol: QolState,
+    reconnect: reconnect::ReconnectUi,
     runtime: Arc<StoreRuntime>,
     _tokio_owner: Arc<tokio::runtime::Runtime>,
     tokio: Handle,
@@ -721,6 +723,7 @@ impl TerminalPane {
             glyphs: HashMap::new(),
             session_links: SessionLinks::new(cx),
             qol: QolState::default(),
+            reconnect: Default::default(),
             pending_resizes: HashMap::new(),
             resize_flush: None,
             resize_flush_armed: false,
@@ -974,6 +977,7 @@ impl TerminalPane {
             *resident.element.buffer().write().unwrap() = grid;
             resident.attachment_state = AttachmentState::Live;
             resident.controller.seed_live_for_test();
+            self.seed_reconnect_fixture(&id);
         }
     }
 
@@ -2856,6 +2860,9 @@ impl TerminalPane {
         }
         if exited {
             body = body.child(self.render_exit_pill(session, colors, cx));
+        }
+        if let Some(status) = self.render_remote_connection(session, colors, cx) {
+            body = body.child(status);
         }
         body.child(self.render_qol(colors, cx)).into_any_element()
     }

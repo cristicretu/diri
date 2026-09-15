@@ -566,6 +566,7 @@ impl ControlServer {
                         | Method::SESSION_REMOVE
                         | Method::SESSION_ARCHIVE
                         | Method::SESSION_RESUME
+                        | Method::SESSION_RECONNECT
                         | Method::SESSION_FORK
                         | Method::SESSION_MIGRATE
                         | Method::WORKTREE_OVERVIEW
@@ -800,6 +801,7 @@ impl ControlServer {
             Method::HOST_LOCATE_REPO => self.host_locate_repo(params),
             Method::HOOK_REPORT => self.hook_report(params),
             Method::SESSION_RESUME => self.session_resume(params),
+            Method::SESSION_RECONNECT => self.session_reconnect(params),
             Method::SESSION_FORK => self.session_fork(params),
             Method::SESSION_RESUME_FROM_HISTORY => self.session_resume_from_history(params),
             Method::SESSION_REOPEN_LAST => self.session_reopen_last(),
@@ -2213,6 +2215,65 @@ impl ControlServer {
     }
 
     /// Revives an exited session's conversation under the SAME record id.
+    fn session_reconnect(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::SessionReconnectParams = decode(params)?;
+        let owner = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            let record = registry
+                .record(&p.session_id.0)
+                .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+            if record.host.is_none() {
+                return Err(ControlError::bad_request(
+                    "Reconnect requires a remote session",
+                ));
+            }
+            if !matches!(record.status, diri_proto::SessionStatus::Exited(_))
+                && registry.get(&p.session_id.0).is_none()
+            {
+                return Err(ControlError::new(
+                    "remote_owner_unavailable",
+                    "The remote session has no live Engine binding to reconnect",
+                ));
+            }
+            if !record.remote_connection.is_some_and(|connection| {
+                connection.state == diri_proto::RemoteConnectionState::Failed
+            }) {
+                return encode(&diri_proto::SessionReconnectResult {
+                    session: record,
+                    started: false,
+                    uncertain_input_discarded: false,
+                });
+            }
+            registry
+                .get(&p.session_id.0)
+                .and_then(|session| session.remote_reconnect_handle())
+                .ok_or_else(|| {
+                    ControlError::new(
+                        "remote_owner_unavailable",
+                        "The remote session has no live Engine binding to reconnect",
+                    )
+                })?
+        };
+        // Inspect can wait on SSH. The lifecycle reservation pins this identity,
+        // while Registry remains available to unrelated sessions and UI reads.
+        let inspection = owner
+            .inspect()
+            .map_err(|error| ControlError::new("remote_reconnect_failed", error.to_string()))?;
+        let mut registry = self.registry.lock().map_err(poisoned)?;
+        let (started, uncertain_input_discarded) = registry
+            .reconnect_remote(&p.session_id.0, &owner, inspection.process_state)
+            .map_err(io_control_error)?;
+        self.publish_updated(&registry, &p.session_id.0);
+        let session = registry
+            .record(&p.session_id.0)
+            .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+        encode(&diri_proto::SessionReconnectResult {
+            session,
+            started,
+            uncertain_input_discarded,
+        })
+    }
+
     fn session_resume(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::SessionIdParams = decode(params)?;
         let record = {
@@ -3958,6 +4019,8 @@ const MAX_PROBE_CHARS: usize = 20;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod reconnect_tests;
 
     #[test]
     fn explicit_launch_argv_is_literal_and_never_silently_repaired() {

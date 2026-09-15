@@ -5408,7 +5408,14 @@ mod tests {
             cx.set_reduce_motion(std::env::var_os("DIRI_WORKSPACE_PEEK").is_none());
         });
         let services = test_services();
-        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let mut fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        if std::env::var_os("DIRI_WORKSPACE_REMOTE_FAILURE").is_some() {
+            fixture.list.sessions[0].host = Some("dev-box".into());
+            fixture.list.sessions[0].remote_connection = Some(diri_proto::RemoteConnection {
+                state: diri_proto::RemoteConnectionState::Failed,
+                since: diri_proto::DateMillis(0.0),
+            });
+        }
         let workspace = WorkspaceId::new("release-workspace");
         let tab = TabId::new("release-tab");
         let first = PaneId::new("coding");
