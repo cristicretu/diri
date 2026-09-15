@@ -93,6 +93,54 @@ pub struct TerminalElement {
     hovered_reference: Option<ReferenceHit>,
 }
 
+/// Selection and reading state only: deliberately does not retain an input
+/// callback, focus handle or IME composition when a session registers a view.
+#[derive(Clone)]
+pub struct TerminalDamageObserver {
+    buffer: SharedGridBuffer,
+    shared: Arc<ElementSharedState>,
+}
+
+impl TerminalDamageObserver {
+    pub fn prepare(&self, update: &GridUpdate) {
+        // Absolute rows keep a selection attached while the viewport moves,
+        // but not when the daemon replaces cells at those rows. Damage is
+        // row-granular, so unrelated live output and history remain selected.
+        let mut viewport = mutex_lock(&self.shared.viewport);
+        let live_start_row = viewport.live_start_row();
+        let buffer = read_lock(&self.buffer);
+        viewport.hold_reading_view(&buffer);
+        let reading_held = viewport.is_reading();
+        drop(viewport);
+        let replaces_grid =
+            update.is_full_snapshot || buffer.cols != update.cols || buffer.rows != update.rows;
+        let damaged_cols = usize::from(if replaces_grid {
+            buffer.cols.max(update.cols)
+        } else {
+            update.cols
+        });
+        let mut selection = mutex_lock(&self.shared.selection);
+        let selection_overlaps_damage = if reading_held || selection.range().is_none() {
+            false
+        } else if replaces_grid {
+            (0..buffer.rows.max(update.rows)).any(|row| {
+                selection.overlaps_row(live_start_row.saturating_add(i64::from(row)), damaged_cols)
+            })
+        } else {
+            update.changed_rows.iter().any(|changed| {
+                changed.y < update.rows
+                    && selection.overlaps_row(
+                        live_start_row.saturating_add(i64::from(changed.y)),
+                        damaged_cols,
+                    )
+            })
+        };
+        if selection_overlaps_damage {
+            selection.clear();
+        }
+    }
+}
+
 #[derive(Default)]
 struct TerminalImeState {
     marked_text: String,
@@ -513,43 +561,18 @@ impl TerminalElement {
     /// Terminal hosts use this to keep the authoritative buffer current while
     /// coalescing bursts and suppressing paints for offscreen residents.
     pub fn apply_damage(&self, update: GridUpdate) -> ApplySummary {
-        // Absolute rows keep a selection attached while the viewport moves,
-        // but not when the daemon replaces cells at those rows. Damage is
-        // row-granular, so unrelated live output and history remain selected.
-        let mut viewport = mutex_lock(&self.shared.viewport);
-        let live_start_row = viewport.live_start_row();
-        let mut buffer = write_lock(&self.buffer);
-        viewport.hold_reading_view(&buffer);
-        let reading_held = viewport.is_reading();
-        drop(viewport);
-        let replaces_grid =
-            update.is_full_snapshot || buffer.cols != update.cols || buffer.rows != update.rows;
-        let damaged_cols = usize::from(if replaces_grid {
-            buffer.cols.max(update.cols)
-        } else {
-            update.cols
-        });
-        let mut selection = mutex_lock(&self.shared.selection);
-        let selection_overlaps_damage = if reading_held || selection.range().is_none() {
-            false
-        } else if replaces_grid {
-            (0..buffer.rows.max(update.rows)).any(|row| {
-                selection.overlaps_row(live_start_row.saturating_add(i64::from(row)), damaged_cols)
-            })
-        } else {
-            update.changed_rows.iter().any(|changed| {
-                changed.y < update.rows
-                    && selection.overlaps_row(
-                        live_start_row.saturating_add(i64::from(changed.y)),
-                        damaged_cols,
-                    )
-            })
-        };
-        let summary = buffer.apply(update);
-        if selection_overlaps_damage {
-            selection.clear();
+        self.damage_observer().prepare(&update);
+        write_lock(&self.buffer).apply(update)
+    }
+
+    /// View-local damage bookkeeping for a session-owned live buffer. Hosts
+    /// prepare every mounted view before applying the frame once to that buffer.
+    #[must_use]
+    pub fn damage_observer(&self) -> TerminalDamageObserver {
+        TerminalDamageObserver {
+            buffer: self.buffer.clone(),
+            shared: self.shared.clone(),
         }
-        summary
     }
 
     #[must_use]
