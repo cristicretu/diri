@@ -872,6 +872,82 @@ impl Sidebar {
                     );
                 }
             }
+            if let Some(snapshot) = catalog.snapshot()
+                && let Some(index) = snapshot
+                    .workspaces
+                    .iter()
+                    .position(|workspace| Some(&workspace.id) == self.workspace_nav.active.as_ref())
+            {
+                let workspace = &snapshot.workspaces[index];
+                let mut actions = div().flex().items_center().gap(px(4.0)).pt(px(5.0));
+                for (label, icon, mutation, enabled) in [
+                    (
+                        "Move workspace up",
+                        "arrow.up",
+                        WorkspaceMutation::MoveWorkspace {
+                            workspace_id: workspace.id.clone(),
+                            index: index.saturating_sub(1),
+                        },
+                        index > 0,
+                    ),
+                    (
+                        "Move workspace down",
+                        "arrow.down",
+                        WorkspaceMutation::MoveWorkspace {
+                            workspace_id: workspace.id.clone(),
+                            index: index + 1,
+                        },
+                        index + 1 < snapshot.workspaces.len(),
+                    ),
+                    (
+                        "Remove workspace",
+                        "trash",
+                        WorkspaceMutation::RemoveWorkspace {
+                            workspace_id: workspace.id.clone(),
+                        },
+                        true,
+                    ),
+                ] {
+                    actions = actions.child(
+                        div()
+                            .id(SharedString::from(label))
+                            .role(Role::Button)
+                            .aria_label(label)
+                            .h(px(28.0))
+                            .px(px(8.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(5.0))
+                            .rounded(px(5.0))
+                            .opacity(if enabled { 1.0 } else { 0.35 })
+                            .when(enabled, |button| {
+                                button
+                                    .cursor_pointer()
+                                    .hover(move |button| button.bg(colors.primary.alpha(0.07)))
+                            })
+                            .child(sf_symbol(icon, 11.0, colors.secondary))
+                            .when(label == "Remove workspace", |button| {
+                                button.child(div().text_size(px(11.0)).child("Remove"))
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if enabled {
+                                    this.store
+                                        .write()
+                                        .expect("store")
+                                        .edit_workspace(mutation.clone());
+                                    cx.notify();
+                                }
+                            })),
+                    );
+                }
+                panel = panel.child(actions).child(
+                    div()
+                        .px(px(5.0))
+                        .text_size(px(10.0))
+                        .text_color(colors.tertiary)
+                        .child("Removing a workspace keeps its sessions running."),
+                );
+            }
             panel = panel.child(
                 div()
                     .id("new-workspace")

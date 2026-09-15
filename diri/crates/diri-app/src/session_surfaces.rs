@@ -23,12 +23,32 @@ use gpui::{
 
 #[path = "tab_peek_surface.rs"]
 mod tab_peek_surface;
+#[path = "workspace_peek_surface.rs"]
+mod workspace_peek_surface;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PeekItem {
+    Session(SessionId),
+    Tab(diri_proto::workspace::TabId),
+}
+impl PeekItem {
+    fn session(&self) -> Option<&SessionId> {
+        match self {
+            Self::Session(id) => Some(id),
+            Self::Tab(_) => None,
+        }
+    }
+}
 
 pub(crate) struct TabPeekActivated;
 impl gpui::EventEmitter<TabPeekActivated> for SessionSurfaces {}
 
 pub struct SessionSurfaces {
-    peek: crate::tab_peek::TabPeek,
+    peek: crate::tab_peek::TabPeek<PeekItem>,
+    peek_workspace: Option<diri_proto::workspace::WorkspaceId>,
+    peek_settled_bounds: crate::workspace_geometry::Rect,
+    workspace_previews: crate::workspace_preview_source::WorkspacePreviews,
+    workspace_preview_views: HashMap<diri_proto::workspace::PaneId, TerminalElement>,
     peek_left: f32,
     peek_top: f32,
     peek_width: f32,
@@ -108,7 +128,7 @@ impl SessionSurfaces {
             .iter()
             .filter_map(|id| {
                 self.live_previews
-                    .get(id)
+                    .get(id.session()?)
                     .map(|preview| preview.state.clone())
             })
             .collect()
@@ -141,6 +161,10 @@ impl SessionSurfaces {
             peek_previous_focus: None,
             peek_frame_pending: false,
             closing_previews: HashMap::new(),
+            peek_workspace: None,
+            peek_settled_bounds: Default::default(),
+            workspace_previews: Default::default(),
+            workspace_preview_views: HashMap::new(),
             live_previews: Default::default(),
             store: Arc::clone(&runtime.store),
             focus_handle: cx.focus_handle(),
@@ -221,7 +245,9 @@ impl Render for SessionSurfaces {
         self.sync_tab_peek_focus(window, cx);
         if !self.peek.paint_visible() {
             self.live_previews.clear();
+            self.workspace_previews.clear();
             self.closing_previews.clear();
+            self.workspace_preview_views.clear();
         }
         if self.peek.is_settling() && !self.peek_frame_pending {
             self.peek_frame_pending = true;

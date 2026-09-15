@@ -58,10 +58,13 @@ pub mod transcript;
 pub mod updates;
 pub mod usage;
 mod workbench;
+#[cfg(all(test, target_os = "macos"))]
+mod workspace_fixture;
 #[cfg_attr(not(test), allow(dead_code))]
 mod workspace_geometry;
 #[cfg_attr(not(test), allow(dead_code))]
 mod workspace_preview;
+mod workspace_preview_source;
 mod workspace_workbench;
 pub mod worktrees;
 

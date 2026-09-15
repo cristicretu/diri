@@ -99,6 +99,7 @@ struct MountedPane {
     terminal: Entity<TerminalPane>,
     _focus: Subscription,
     _events: Subscription,
+    _output: Subscription,
 }
 
 pub(crate) struct WorkspaceWorkbench {
@@ -106,6 +107,7 @@ pub(crate) struct WorkspaceWorkbench {
     tokio: Arc<tokio::runtime::Runtime>,
     tab: Option<WorkspaceTab>,
     enabled: bool,
+    external_owner: Option<SessionId>,
     mounted: HashMap<PaneId, MountedPane>,
     recent: VecDeque<PaneId>,
     catalog_revision: Option<u64>,
@@ -165,6 +167,7 @@ impl WorkspaceWorkbench {
             tokio,
             tab: None,
             enabled: false,
+            external_owner: None,
             mounted: HashMap::new(),
             recent: VecDeque::new(),
             catalog_revision: None,
@@ -334,6 +337,7 @@ impl WorkspaceWorkbench {
             let events = cx.subscribe(&terminal, |_, _, event: &TerminalPaneEvent, cx| {
                 cx.emit(WorkspaceWorkbenchEvent::Terminal(event.clone()));
             });
+            let output = cx.observe(&terminal, |_, _, cx| cx.notify());
             self.mounted.insert(
                 identity.pane,
                 MountedPane {
@@ -341,11 +345,19 @@ impl WorkspaceWorkbench {
                     terminal,
                     _focus: focus,
                     _events: events,
+                    _output: output,
                 },
             );
         }
     }
 
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn send_owned_fixture_input(&self, cx: &gpui::App) -> Vec<(SessionId, u16, u16)> {
+        self.mounted
+            .values()
+            .filter_map(|pane| pane.terminal.read(cx).send_owned_fixture_input())
+            .collect()
+    }
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn seed_panes_for_test(&self, cx: &mut Context<Self>) {
         let mut seeded = HashSet::new();
@@ -384,7 +396,39 @@ impl WorkspaceWorkbench {
             .filter(|id| self.mounted.contains_key(*id))
             .or_else(|| self.tab.as_ref().map(|tab| &tab.focused_pane))
     }
+    pub(crate) fn resident_preview_buffers(
+        &self,
+        cx: &gpui::App,
+    ) -> HashMap<SessionId, diri_term::element::SharedGridBuffer> {
+        self.mounted
+            .values()
+            .flat_map(|pane| pane.terminal.read(cx).resident_preview_buffers())
+            .collect()
+    }
+    pub(crate) fn set_external_owner(&mut self, session: Option<SessionId>) {
+        self.external_owner = session;
+    }
+    pub(crate) fn visible_session(&self, session: &SessionId) -> bool {
+        self.enabled
+            && self.geometry().is_some_and(|geometry| {
+                geometry
+                    .panes
+                    .iter()
+                    .any(|pane| &pane.identity.session == session)
+            })
+    }
+    pub(crate) fn focused_session_id(&self) -> Option<SessionId> {
+        if !self.enabled {
+            return None;
+        }
+        self.focused_id()
+            .and_then(|id| self.mounted.get(id))
+            .map(|pane| pane.session.clone())
+    }
     pub(crate) fn focused_terminal(&self) -> Option<Entity<TerminalPane>> {
+        if !self.enabled {
+            return None;
+        }
         self.focused_id()
             .and_then(|id| self.mounted.get(id))
             .map(|pane| pane.terminal.clone())
@@ -592,6 +636,7 @@ impl WorkspaceWorkbench {
         let owners = visible_owners(&identities, &geometry.focused.pane);
         for (id, mounted) in &self.mounted {
             let owns = self.enabled
+                && self.external_owner.as_ref() != Some(&mounted.session)
                 && window.is_window_active()
                 && owners.get(&mounted.session) == Some(id);
             mounted.terminal.update(cx, |terminal, _| {
@@ -1027,6 +1072,15 @@ mod tests {
                 workbench.pending_focus = Some(PaneId::new("b"));
                 workbench.assign_visible_owners(window, cx);
                 assert_eq!(owners(workbench, cx), [PaneId::new("b")]);
+                workbench.set_external_owner(Some(SessionId::new("preview-claude")));
+                workbench.assign_visible_owners(window, cx);
+                assert!(
+                    owners(workbench, cx).is_empty(),
+                    "focused inspector duplicate owns its geometry"
+                );
+                workbench.set_external_owner(None);
+                workbench.assign_visible_owners(window, cx);
+                assert_eq!(owners(workbench, cx), [PaneId::new("b")]);
                 let a = workbench.mounted[&PaneId::new("a")]
                     .terminal
                     .read(cx)
@@ -1055,6 +1109,10 @@ mod tests {
             .update(cx, |workbench, window, cx| {
                 workbench.assign_visible_owners(window, cx);
                 assert_eq!(owners(workbench, cx), [PaneId::new("a")]);
+                workbench.deactivate(cx);
+                assert!(workbench.focused_terminal().is_none());
+                assert!(workbench.focused_session_id().is_none());
+                assert!(owners(workbench, cx).is_empty());
                 window.remove_window();
             })
             .unwrap();

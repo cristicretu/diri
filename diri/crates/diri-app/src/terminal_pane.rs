@@ -932,6 +932,16 @@ impl TerminalPane {
         }
     }
 
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn send_owned_fixture_input(&self) -> Option<(SessionId, u16, u16)> {
+        let id = self.selected_id()?;
+        let resident = self.residents.get(&id)?;
+        if !resident.attachment.is_controller() || resident.last_size == (0, 0) {
+            return None;
+        }
+        resident.attachment.input(b"show\n".to_vec());
+        Some((id, resident.last_size.0, resident.last_size.1))
+    }
     #[cfg(test)]
     pub(crate) fn layout_owner_for_test(&self) -> bool {
         self.selected_id()

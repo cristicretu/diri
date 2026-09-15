@@ -1,6 +1,6 @@
 //! Paint-only split thumbnails. All buffers are borrowed client grids.
 use crate::workspace_geometry::{Rect, WorkspaceGeometry};
-use diri_proto::SessionId;
+use diri_proto::{SessionId, workspace::PaneId};
 use diri_term::{element::TerminalElement, theme::TermTheme};
 use diri_ui::SemanticColors;
 use gpui::{AnyElement, SharedString, div, prelude::*, px};
@@ -11,6 +11,7 @@ pub(crate) fn render_workspace_preview(
     width: f32,
     height: f32,
     buffers: &HashMap<SessionId, TerminalElement>,
+    views: &mut HashMap<PaneId, TerminalElement>,
     theme: TermTheme,
     colors: SemanticColors,
 ) -> AnyElement {
@@ -54,11 +55,20 @@ pub(crate) fn render_workspace_preview(
             .overflow_hidden()
             .p(px(2.0));
         if let Some(buffer) = buffers.get(&pane.identity.session) {
+            // A Session shares its canonical grid, while each visible PaneId
+            // owns independent glyph metrics/paint caches at its own size.
+            let source = buffer.buffer();
+            let element = views
+                .entry(pane.identity.pane.clone())
+                .or_insert_with(|| TerminalElement::new(source.clone()));
+            if !std::sync::Arc::ptr_eq(&element.buffer(), &source) {
+                *element = TerminalElement::new(source);
+            }
             let font_size = ((bounds.width - 4.0) / (f32::from(buffer.grid_cols().max(1)) * 0.65))
                 .min((bounds.height - 4.0) / (f32::from(buffer.grid_rows().max(1)) * 1.5))
                 .max(0.1);
             view = view.child(
-                buffer
+                element
                     .clone()
                     .focused(false)
                     .font(gpui::font(crate::fonts::mono_family()))
@@ -86,6 +96,7 @@ mod tests {
     struct PreviewHarness {
         geometry: WorkspaceGeometry,
         buffers: HashMap<SessionId, TerminalElement>,
+        views: HashMap<PaneId, TerminalElement>,
         selected: Option<PaneIdentity>,
     }
     impl Render for PreviewHarness {
@@ -102,6 +113,7 @@ mod tests {
                         400.0,
                         240.0,
                         &self.buffers,
+                        &mut self.views,
                         crate::app_theme::terminal_theme("dirijor-dark"),
                         colors,
                     ))
@@ -168,9 +180,36 @@ mod tests {
         PreviewHarness {
             geometry,
             buffers,
+            views: HashMap::new(),
             selected: None,
         }
     }
+    #[gpui::test]
+    fn duplicate_session_panes_share_grid_but_keep_distinct_paint_caches(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut fixture = fixture();
+            fixture.geometry.panes[2].identity.session =
+                fixture.geometry.panes[0].identity.session.clone();
+            fixture
+        });
+        cx.simulate_resize(size(px(460.0), px(300.0)));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let left = &view.views[&PaneId::new("left")];
+            let bottom = &view.views[&PaneId::new("right-bottom")];
+            assert!(std::sync::Arc::ptr_eq(&left.buffer(), &bottom.buffer()));
+            assert!(left.stats().frames > 0 && bottom.stats().frames > 0);
+            left.reset_stats();
+            assert_eq!(left.stats().frames, 0);
+            assert!(
+                bottom.stats().frames > 0,
+                "unequal pane sizes must not share render metrics/cache state"
+            );
+        });
+    }
+
     #[gpui::test]
     fn split_card_selects_the_saved_pane_and_session_without_resizing_buffers(
         cx: &mut gpui::TestAppContext,
