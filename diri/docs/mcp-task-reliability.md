@@ -87,8 +87,9 @@ scripts/mcp-remote-soak.sh
 ```
 
 Run from `diri/`. The remote account must have `/bin/sh`, `stty`, and a compatible
-platform. Set `DIRI_REMOTE_HELPER_PATH` to a Helper built for that remote
-platform when the local/native artifact differs. Optional overrides are
+platform matching the test runner’s OS/architecture: this harness probes its
+Helper locally before installing it remotely. `DIRI_REMOTE_HELPER_PATH` can
+select another compatible native Helper build. Optional overrides are
 `DIRI_REMOTE_SSH_EXECUTABLE` and `DIRI_REMOTE_CWD` (default `~`). Rounds are bounded
 1–100. Use a disposable account: the normal authenticated bootstrap installs
 its versioned Helper cache. Only this test's session is killed during cleanup;
