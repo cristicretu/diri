@@ -36,6 +36,7 @@ pub struct FindSpan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FindSnapshot {
     pub lines: Vec<String>,
+    pub text_cells: std::collections::BTreeMap<usize, Vec<[u16; 2]>>,
     pub first_row: i64,
     pub visible_start_row: i64,
     pub cols: i64,
@@ -48,6 +49,7 @@ impl From<ReadScrollbackResult> for FindSnapshot {
     fn from(result: ReadScrollbackResult) -> Self {
         Self {
             lines: result.lines,
+            text_cells: result.text_cells,
             first_row: result.first_row,
             visible_start_row: result.visible_start_row,
             cols: result.cols,
@@ -315,6 +317,7 @@ mod tests {
 
     fn snapshot(lines: Vec<String>, alt: bool) -> FindSnapshot {
         FindSnapshot {
+            text_cells: Default::default(),
             lines,
             first_row: 0,
             visible_start_row: 10,

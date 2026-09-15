@@ -3828,6 +3828,7 @@ mod tests {
 
     fn find_snapshot(content_seq: u64) -> FindSnapshot {
         FindSnapshot {
+            text_cells: Default::default(),
             lines: Vec::new(),
             first_row: 0,
             visible_start_row: 0,
@@ -5092,6 +5093,7 @@ mod tests {
             .take_due_search(Duration::from_millis(200))
             .expect("find request");
         let snapshot = FindSnapshot {
+            text_cells: Default::default(),
             lines: Vec::new(),
             first_row: 0,
             visible_start_row: 0,
