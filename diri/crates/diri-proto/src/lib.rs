@@ -16,6 +16,7 @@ pub mod recovery;
 pub mod remote_pty;
 pub mod tasks;
 pub mod terminal;
+pub mod workspace;
 
 pub use control::{ControlError, ControlMessage, JsonValue, WIRE_VERSION};
 pub use hosts::{HostEntry, HostNodeConfig, HostsConfig};
