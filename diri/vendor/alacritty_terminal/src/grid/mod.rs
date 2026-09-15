@@ -10,6 +10,8 @@ use crate::index::{Column, Line, Point};
 use crate::term::cell::{Flags, ResetDiscriminant};
 use crate::vte::ansi::{CharsetIndex, StandardCharset};
 
+#[cfg(feature = "compact-history")]
+pub mod compact;
 pub mod resize;
 mod row;
 mod storage;
@@ -135,6 +137,28 @@ pub struct Grid<T> {
 
     /// Maximum number of lines in history.
     max_scroll_limit: usize,
+}
+
+#[cfg(feature = "compact-history")]
+impl Grid<crate::term::cell::Cell> {
+    /// Keep completed history rows in lossless process-local blocks.
+    pub fn enable_compact_history(&mut self) {
+        self.raw.enable_compact(compact::cell_codec());
+    }
+
+    /// Reclaim decoded history only after callers have released their borrows.
+    pub fn release_history_read_cache(&mut self) {
+        self.raw.release_read_cache();
+    }
+
+    pub fn bound_history_storage(&mut self, budget: usize) {
+        self.raw.bound_history_bytes(budget);
+        self.display_offset = self.display_offset.min(self.history_size());
+    }
+
+    pub fn history_storage_bytes(&self) -> usize {
+        self.raw.history_storage_bytes()
+    }
 }
 
 impl<T: GridCell + Default + PartialEq> Grid<T> {

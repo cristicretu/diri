@@ -157,6 +157,7 @@ version = "0.26.0"
 dependencies = [
  "base64 0.22.1",
  "bitflags 2.13.1",
+ "flate2",
  "home",
  "libc",
  "log",
@@ -167,6 +168,8 @@ dependencies = [
  "regex-automata",
  "rustix 1.1.4",
  "rustix-openpty",
+ "serde",
+ "serde_json",
  "signal-hook",
  "unicode-width",
  "vte",
@@ -661,6 +664,9 @@ name = "bitflags"
 version = "2.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
+dependencies = [
+ "serde_core",
+]
 
 [[package]]
 name = "bitstream-io"
@@ -6659,6 +6665,7 @@ dependencies = [
  "cursor-icon",
  "log",
  "memchr",
+ "serde",
 ]
 
 [[package]]

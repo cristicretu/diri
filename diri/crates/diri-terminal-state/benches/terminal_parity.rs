@@ -21,6 +21,7 @@ struct Sample {
     fresh_bytes: usize,
     fed_bytes: usize,
     published_bytes: usize,
+    read_released_bytes: usize,
     peak_bytes: usize,
     allocations: usize,
     history_rows: i64,
@@ -82,9 +83,27 @@ fn sample(count: usize, lines: usize) -> Sample {
     // Inspect the actual retained range only after resource/timing samples.
     // A zero-row read reports history metadata without cloning the history.
     let history_rows = screens[0].scrollback_cells(0, 0).live_start_row;
-    for screen in &screens {
+    for screen in &mut screens {
         assert_eq!(screen.scrollback_cells(0, 0).live_start_row, history_rows);
     }
+    if std::env::args().any(|arg| arg == "--full-history-read-gate") && lines == 10_000 {
+        for screen in &mut screens {
+            let history = screen.scrollback();
+            assert_eq!(history.lines.len(), 10_001);
+            for (index, row) in history.lines[..10_000].iter().enumerate() {
+                assert!(
+                    row.starts_with(&format!("{index:06} ")),
+                    "lost or reordered history row {index}"
+                );
+            }
+            assert!(history.lines.last().unwrap().is_empty());
+            drop(history);
+            let history = screen.history_snapshot();
+            assert_eq!(history.len(), 10_000 + 1 - ROWS);
+            assert_eq!(screen.history_metadata().len(), history.len());
+        }
+    }
+    let read_released_bytes = LIVE.load(Relaxed) - baseline;
     drop(screens);
     assert_eq!(
         LIVE.load(Relaxed),
@@ -95,6 +114,7 @@ fn sample(count: usize, lines: usize) -> Sample {
         fresh_bytes,
         fed_bytes,
         published_bytes,
+        read_released_bytes,
         peak_bytes,
         allocations,
         history_rows,
@@ -122,6 +142,32 @@ fn main() {
         std::env::consts::OS
     );
     black_box(sample(1, 1));
+    if std::env::args().any(|arg| arg == "--full-history-gate" || arg == "--full-history-read-gate")
+    {
+        let measured = sample(1, 10_000);
+        println!(
+            "full prose workload: {} retained history rows, {} requested heap bytes",
+            measured.history_rows, measured.published_bytes
+        );
+        assert_eq!(
+            measured.history_rows,
+            10_000 + 1 - ROWS as i64,
+            "the full input history must remain readable"
+        );
+        assert!(
+            measured.published_bytes <= 407 * 1024,
+            "full prose workload exceeds the 407 KiB requested-heap engineering target"
+        );
+        println!(
+            "after history reads: {} requested heap bytes",
+            measured.read_released_bytes
+        );
+        assert!(
+            measured.read_released_bytes <= 407 * 1024,
+            "history reads retained decoded cold rows"
+        );
+        return;
+    }
     if std::env::args().any(|arg| arg == "--short-history-gate") {
         for lines in [23, 24, 25] {
             let measured = sample(1, lines);

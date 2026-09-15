@@ -666,6 +666,31 @@ remain separate from this reserve target. Smaller batches trade more occasional
 growth operations for lower memory; the resource and throughput harnesses verify
 that tradeoff. Parser source participates in the Helper Build ID as above.
 
+### Disabled compact-history storage experiment
+
+The `diri-terminal-state/compact-history` feature is an internal experiment and
+is not enabled by the Engine or Helper. It tests process-local compressed row
+blocks in the existing parser, with editable recent rows and exclusively owned
+history read caches. The experiment retains up to 10,000 physical rows under a
+4 MiB stored-history allowance (compressed payload, block/row allocation indexes,
+and editable history cell storage). Visible cells, cell-extra heap allocations,
+temporary codec/read/reflow work and caller-owned response buffers are separate
+from that allowance. The default build retains the history-cell policy above.
+
+This is not a parking/checkpoint format and does not change a wire codec. The
+candidate uses typed Cell style palettes, UTF-8 scalars and style runs followed
+by DEFLATE, preserving row occupancy, flags, colors, links and combining marks.
+`flate2`, already present in the lockfile, supplies compression instead of a new
+compressor implementation; serde/serde_json supply the typed internal layout.
+These are optional dependencies until the experiment passes acceptance.
+
+Activation requires actual-parser differential coverage for scrolling, partial
+regions, editing, primary/alternate screens, reset and resize/reflow; bounded
+history reads that release decoded blocks; checkpoint/adoption and Helper Scroll
+verification; adversarial stored-budget tests; and measured CPU, latency and
+requested-heap comparisons. The existing Helper/UDS gates remain unchanged.
+No transport, controller lease, on-disk state or protocol migration is implied.
+
 ### Local Holder input compatibility
 
 The durable local Holder is outside the remote Helper wire protocol, but it
