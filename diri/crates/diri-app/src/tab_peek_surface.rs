@@ -581,6 +581,7 @@ mod tests {
         let (_, cx) = cx.add_window_view(move |_, cx| {
             CaptionHarness(cx.new(|cx| {
                 let mut surface = SessionSurfaces::new(runtime, None, cx);
+                surface.tab_gesture(GestureFrame::Tracking(140.0), cx);
                 surface.tab_gesture(GestureFrame::Released(140.0), cx);
                 surface
             }))
