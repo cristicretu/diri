@@ -64,6 +64,7 @@ requirement.
 The current baseline:
 
 - uses SSH only as an authenticated, encrypted byte transport;
+- translates local process-control signals to the verified Helper target OS before sending the existing numeric signal frames;
 - gives Diri direct ownership of the remote Agent PTY lifecycle;
 - requires no remote `tmux`, `screen`, `zellij`, Node.js, Python, `socat`, `nc`,
   `curl`, `wget`, or preinstalled Diri service;

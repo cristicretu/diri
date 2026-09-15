@@ -320,6 +320,7 @@ impl RemoteManager {
             return Ok(None);
         }
         let helper = InstalledHelper {
+            target: artifact.target,
             build_id: artifact.build_id.clone(),
             protocol: probe.protocol,
             transport: cached.helper.transport,
@@ -372,6 +373,7 @@ impl RemoteManager {
                     ));
                 }
                 let helper = InstalledHelper {
+                    target: artifact.target,
                     build_id: artifact.build_id.clone(),
                     protocol: probe.protocol,
                     transport,
@@ -453,6 +455,7 @@ impl RemoteManager {
         }
         let probe = install?;
         let helper = InstalledHelper {
+            target: artifact.target,
             build_id: artifact.build_id.clone(),
             protocol: probe.protocol,
             transport,
@@ -577,6 +580,7 @@ impl RemoteManager {
             ));
         }
         Ok(InstalledHelper {
+            target: RemoteTarget::from_artifact_name(&probe.target).map_err(io::Error::other)?,
             build_id: build_id.to_string(),
             protocol: probe.protocol,
             transport,
@@ -845,6 +849,7 @@ fn effective_uid() -> u32 {
 
 #[derive(Clone, Debug)]
 pub struct InstalledHelper {
+    pub target: RemoteTarget,
     pub build_id: String,
     pub protocol: ProtocolVersion,
     pub transport: SshTransport,
@@ -1110,10 +1115,16 @@ mod tests {
                 .all(|helper| helper.build_id == first.build_id)
         );
         assert_eq!(first.build_id, "test-build");
+        assert!(installed.iter().all(|helper| helper.target == target));
         let final_path = remote_home.join(".cache/diri/bin/protocol-1/test-build/diri-remote");
         assert!(final_path.is_file());
         let second = manager.ensure_helper(&host).expect("idempotent bootstrap");
         assert_eq!(second.build_id, first.build_id);
+        assert_eq!(second.target, target);
+        let adopted = manager
+            .existing_helper(&host, &first.build_id, first.protocol)
+            .expect("adopt existing helper");
+        assert_eq!(adopted.target, target);
         let uploads_before_reinstall = fs::read_to_string(&upload_log)
             .expect("upload log")
             .lines()
@@ -1122,6 +1133,7 @@ mod tests {
             .reinstall_helper(&host)
             .expect("forced verified reinstall");
         assert_eq!(reinstalled.build_id, first.build_id);
+        assert_eq!(reinstalled.target, target);
         let uploads_after_reinstall = fs::read_to_string(&upload_log)
             .expect("upload log")
             .lines()
