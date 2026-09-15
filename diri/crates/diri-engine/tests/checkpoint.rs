@@ -87,6 +87,7 @@ fn record(id: &str) -> diri_proto::SessionRecord {
         archived_at: None,
         host: None,
         remote_persistence: None,
+        remote_connection: None,
         hibernation: None,
         memory_bytes: None,
         artifacts: None,
