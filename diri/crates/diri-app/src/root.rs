@@ -4591,6 +4591,8 @@ mod tests {
         let (root, cx) = cx.add_window_view(move |window, cx| {
             RootView::new(services, false, PreviewScenario::Empty, window, cx)
         });
+        root.update_in(cx, |_, window, _| window.activate_window());
+        cx.run_until_parked();
         let windowed = size(px(1000.0), px(700.0));
         cx.simulate_resize(windowed);
         cx.run_until_parked();
@@ -4661,6 +4663,8 @@ mod tests {
         let (root, cx) = cx.add_window_view(move |window, cx| {
             RootView::new(services, false, PreviewScenario::Empty, window, cx)
         });
+        root.update_in(cx, |_, window, _| window.activate_window());
+        cx.run_until_parked();
         let mut input = root.update(cx, |root, cx| {
             root.terminal
                 .as_ref()

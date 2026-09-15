@@ -236,7 +236,40 @@ pub struct SessionAttachmentHandle {
     budget: Arc<Semaphore>,
 }
 
+/// One reserved resize frame in the existing ordered writer queue. The caller
+/// decides the latest still-authorized geometry only after capacity is ready.
+/// Dropping a reservation releases both budgets without enqueueing a frame.
+pub struct ResizeReservation {
+    queue: mpsc::OwnedPermit<Command>,
+    bytes: OwnedSemaphorePermit,
+}
+
+impl ResizeReservation {
+    pub fn send(self, cols: u16, rows: u16) {
+        self.queue
+            .send(Command::Frame(Frame::resize(cols, rows), self.bytes));
+    }
+}
+
 impl SessionAttachmentHandle {
+    /// Wait for capacity without repeatedly rejecting a coalescible resize.
+    /// Holding this reservation never takes a terminal or app-state lock.
+    pub async fn reserve_resize(&self) -> Result<ResizeReservation, AttachmentClosed> {
+        let queue = self
+            .commands
+            .clone()
+            .reserve_owned()
+            .await
+            .map_err(|_| AttachmentClosed::Closed)?;
+        let bytes = self
+            .budget
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .map_err(|_| AttachmentClosed::Closed)?;
+        Ok(ResizeReservation { queue, bytes })
+    }
+
     pub fn send_input(&self, bytes: impl Into<Vec<u8>>) -> Result<(), AttachmentClosed> {
         self.send(Frame::input(bytes))
     }
@@ -656,6 +689,41 @@ mod tests {
             "successful close remains idempotent"
         );
         assert_eq!(peer.await.unwrap(), [b"first".to_vec(), b"second".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn cancelled_resize_reservation_releases_capacity_and_sends_only_on_commit() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(super::COMMAND_QUEUE_CAPACITY);
+        let handle = super::SessionAttachmentHandle {
+            commands: tx,
+            budget: std::sync::Arc::new(tokio::sync::Semaphore::new(super::COMMAND_QUEUE_BYTES)),
+        };
+        handle
+            .send_input(vec![b'x'; super::COMMAND_QUEUE_BYTES])
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), handle.reserve_resize())
+                .await
+                .is_err()
+        );
+        drop(rx.try_recv().unwrap());
+        assert!(
+            rx.try_recv().is_err(),
+            "cancelled reservation emitted no geometry"
+        );
+        let reservation = handle.reserve_resize().await.unwrap();
+        reservation.send(90, 30);
+        let super::Command::Frame(frame, _bytes) = rx.try_recv().unwrap() else {
+            panic!("resize frame");
+        };
+        assert_eq!(frame.resize_payload(), Some((90, 30)));
+        for _ in 0..super::COMMAND_QUEUE_CAPACITY {
+            handle.send_input(b"x".to_vec()).unwrap();
+        }
+        assert_eq!(
+            handle.send_input(b"full".to_vec()),
+            Err(super::AttachmentClosed::Backpressure)
+        );
     }
 
     #[test]
