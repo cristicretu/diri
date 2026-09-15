@@ -707,6 +707,17 @@ activation, selection, copying, menus, paste review, export, and keyboard modes
 run in `diri-app` / `diri-term`. They do not execute SSH or change controller
 ownership. The existing local Engine RPC serves retained terminal rows.
 
+The local `session.read_scrollback` response includes optional sparse `textCells`
+row mappings from Unicode scalar indices to half-open terminal cell ranges.
+Text omits wide-glyph filler cells and retains combining marks; the mappings
+keep find highlights aligned with the original cells. Ordinary one-cell text
+omits this field. Clients accept an absent field using the older cell-aligned
+text contract. This is an additive local control response, with no Helper
+protocol, controller, snapshot, or history-budget change. Live-grid search uses
+the existing annotations and the same `unicode-width` 0.2.2 width rules as the
+shared parser; making that existing transitive dependency direct in `diri-term`
+avoids a separate, inconsistent width table.
+
 The shared terminal parser additionally retains OSC 8 targets, soft-wrap facts,
 wide-cell continuation facts, combining characters, and OSC 133 A prompt-start
 marks. These are terminal screen facts; the Holder does not infer commands,
@@ -961,6 +972,32 @@ same remote Agent after the pause. This checks Engine contention separately
 from the Helper/UDS gates and does not claim to measure real WAN latency.
 
 ## Desktop integration
+
+The Engine's local binary attachment hub encodes each publication once and
+shares it among bounded per-client output queues. Its existing one pump per
+Session owns nonblocking writes; the existing connection thread handles input
+with a readiness wait and preserves partial frame headers/bodies. No writer
+worker, remote attachment, or Helper protocol change is added. PTY draining
+remains independent of every local client.
+
+Ordinary queued frames retain at most 1 MiB and 64 frame references per sink.
+One larger valid frame (up to the existing 16 MiB protocol payload limit) may be
+queued with 64 bytes of mode/control overhead. Already-written prefixes still
+count toward retained allocation until their complete frame is released. The
+pump services each sink for at most 256 KiB or 1 ms per turn; it retries at 1 ms
+only while data remains pending. Empty queues use the existing GridWake sleep.
+A sink that exceeds its bound or makes no write progress for two seconds closes;
+the client reconnects and receives a FullSnapshot. Partial frames are never
+spliced with a replacement. Queueing seeds moves all socket I/O outside the
+Registry lock; pongs use the same ordered writer.
+
+The deterministic local regression stalls one client with a 1 KiB socket send
+buffer while another receives 40 interactive redraws. It requires active-reader
+p90 below 150 ms, validates fragmented input, and reconnects to a FullSnapshot
+with the same process identity. Queue tests verify exact partial-frame bytes,
+retained-byte bounds, overflow closure and the no-progress timeout. These are
+Engine-local tests, separate from the Helper/UDS and real SSH release gates.
+
 
 While the desktop terminal is scrolled back, its renderer retains one local
 screen snapshot and preserves already fetched rows in its bounded 512-row

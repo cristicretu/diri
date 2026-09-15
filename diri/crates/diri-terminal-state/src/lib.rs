@@ -947,17 +947,50 @@ impl HeadlessScreen {
         let cols = self.geometry.cols;
         let total = history + rows;
         let mut lines = Vec::with_capacity(total);
+        let mut text_cells = std::collections::BTreeMap::new();
+        let mut ranges = Vec::with_capacity(cols);
         for index in 0..total {
             let line = Line(index as i32 - history as i32);
             let mut text = String::with_capacity(cols);
+            ranges.clear();
             for x in 0..cols {
-                let c = grid[line][Column(x)].c;
+                let cell = &grid[line][Column(x)];
+                if cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                let c = cell.c;
+                let width = if cell.flags.contains(Flags::WIDE_CHAR) {
+                    2
+                } else {
+                    1
+                };
+                let range = [x as u16, (x + width).min(cols) as u16];
                 text.push(if c < ' ' && c != '\t' { ' ' } else { c });
+                ranges.push(range);
+                if let Some(combining) = cell.zerowidth() {
+                    for &ch in combining {
+                        text.push(ch);
+                        ranges.push(range);
+                    }
+                }
             }
-            lines.push(text.trim_end().to_string());
+            text.truncate(text.trim_end().len());
+            ranges.truncate(text.chars().count());
+            if ranges
+                .iter()
+                .enumerate()
+                .any(|(i, range)| usize::from(range[0]) != i || usize::from(range[1]) != i + 1)
+            {
+                text_cells.insert(index, ranges.clone());
+            }
+            lines.push(text);
         }
         diri_proto::ReadScrollbackResult {
             lines,
+            text_cells,
             first_row: 0,
             visible_start_row: history as i64,
             cols: cols as i64,
@@ -1962,6 +1995,31 @@ mod qol_tests {
         let mut screen = HeadlessScreen::new(8, 2);
         screen.feed("界X\rA".as_bytes());
         assert_eq!(screen.lines(), vec!["A X"]);
+    }
+
+    #[test]
+    fn history_text_maps_unicode_scalars_to_their_original_cells() {
+        let mut screen = HeadlessScreen::new(12, 2);
+        screen.feed("<界> e\u{301}\r\nA🙂B\r\nplain\r\nend".as_bytes());
+        let history = screen.scrollback();
+        assert_eq!(
+            &history.lines[..4],
+            &["<界> e\u{301}", "A🙂B", "plain", "end"]
+        );
+        assert_eq!(history.visible_start_row, 2);
+        assert_eq!(
+            history.text_cells[&0],
+            vec![[0, 1], [1, 3], [3, 4], [4, 5], [5, 6], [5, 6]]
+        );
+        assert_eq!(history.text_cells[&1], vec![[0, 1], [1, 3], [3, 4]]);
+        assert!(!history.text_cells.contains_key(&2));
+        assert!(!history.text_cells.contains_key(&3));
+        screen.feed(b"\x1b[?1049h\x1b[H");
+        screen.feed("e\u{301}".as_bytes());
+        let alternate = screen.scrollback();
+        assert!(alternate.is_alt_screen);
+        assert_eq!(alternate.lines[0], "e\u{301}");
+        assert_eq!(alternate.text_cells[&0], vec![[0, 1], [0, 1]]);
     }
 
     #[test]
