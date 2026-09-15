@@ -128,6 +128,7 @@ impl std::error::Error for AttachmentClosed {}
 pub struct SessionAttachment {
     commands: mpsc::Sender<Command>,
     budget: Arc<Semaphore>,
+    writer_drained: Option<bool>,
     task: Option<JoinHandle<bool>>,
     pub chunks: AttachmentChunks,
 }
@@ -317,6 +318,7 @@ impl SessionAttachment {
         Ok(Self {
             commands: command_tx,
             budget: Arc::new(Semaphore::new(COMMAND_QUEUE_BYTES)),
+            writer_drained: None,
             task: Some(task),
             chunks: AttachmentChunks { receiver: chunk_rx },
         })
@@ -368,7 +370,9 @@ impl SessionAttachment {
 
     /// Reports whether the ordered socket writer reached the queued close.
     /// Success confirms neither Engine receipt nor delivery to the PTY. EOF,
-    /// write failure or task failure leaves recent input uncertain.
+    /// write failure or task failure leaves recent input uncertain. Repeated
+    /// calls preserve that terminal outcome; closing again cannot turn an
+    /// interrupted writer into a successful drain.
     pub async fn close_checked(&mut self) -> Result<(), AttachmentClosed> {
         let close = self.commands.send(Command::Close);
         tokio::pin!(close);
@@ -386,9 +390,10 @@ impl SessionAttachment {
                 }
             }
         } else {
-            true
+            self.writer_drained.unwrap_or(false)
         };
         self.task.take();
+        self.writer_drained = Some(drained);
         if drained {
             Ok(())
         } else {
@@ -554,6 +559,12 @@ mod tests {
             attachment.close_checked().await,
             Err(super::AttachmentClosed::Closed)
         );
+        attachment.close().await;
+        assert_eq!(
+            attachment.close_checked().await,
+            Err(super::AttachmentClosed::Closed),
+            "repeat close cannot invent successful completion"
+        );
     }
 
     #[tokio::test]
@@ -565,6 +576,7 @@ mod tests {
         let mut attachment = SessionAttachment {
             commands,
             budget: std::sync::Arc::new(tokio::sync::Semaphore::new(super::COMMAND_QUEUE_BYTES)),
+            writer_drained: None,
             task: Some(task),
             chunks: super::AttachmentChunks {
                 receiver: chunks_rx,
@@ -637,6 +649,12 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        attachment.close().await;
+        assert_eq!(
+            attachment.close_checked().await,
+            Ok(()),
+            "successful close remains idempotent"
+        );
         assert_eq!(peer.await.unwrap(), [b"first".to_vec(), b"second".to_vec()]);
     }
 
