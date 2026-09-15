@@ -862,6 +862,7 @@ impl TerminalPane {
 
         self.reconcile_residency(cx);
         if selection_changed {
+            self.qol.clear_feedback();
             self.session_links.close();
             for resident in self.residents.values_mut() {
                 resident.pointer_owner = None;
@@ -5097,6 +5098,54 @@ mod tests {
         assert!(cx.debug_bounds("terminal-context-menu").is_some());
         cx.simulate_mouse_down(outside, MouseButton::Left, Modifiers::default());
         pane.read_with(cx, |pane, _| assert!(pane.qol.menu.is_none()));
+    }
+
+    #[gpui::test]
+    fn changing_sessions_clears_feedback_and_rearms_identical_later_errors(
+        cx: &mut TestAppContext,
+    ) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let first = fixture_session();
+        let mut second = first.clone();
+        second.id = SessionId::new("feedback-next");
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(first.clone());
+            store.upsert_session(second.clone());
+            store.select(first.id);
+        }
+        let runtime_for_view = runtime.clone();
+        let (pane, cx) = cx.add_window_view(move |window, cx| {
+            TerminalPane::new(runtime_for_view, tokio, window, cx)
+        });
+        pane.update_in(cx, |pane, window, cx| {
+            pane.show_terminal_feedback("Input rejected", window, cx)
+        });
+        runtime.store.write().unwrap().select(second.id);
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            assert!(
+                pane.qol.feedback.is_none(),
+                "previous session's feedback must not linger"
+            );
+            pane.show_terminal_feedback("Input rejected", window, cx);
+            assert_eq!(pane.qol.feedback.as_deref(), Some("Input rejected"));
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(3));
+        cx.run_until_parked();
+        pane.read_with(cx, |pane, _| {
+            assert!(
+                pane.qol.feedback.is_none(),
+                "identical later error has its own expiry"
+            )
+        });
     }
 
     #[gpui::test]
