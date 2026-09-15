@@ -56,3 +56,16 @@ cargo bench -p diri-terminal-state --no-default-features --bench terminal_throug
 Raw per-run outputs are in `paired-results.jsonl`, `full-history.txt` and
 `resize.txt`. Parser storage is process-local; this change does not implement
 full-parser parking or alter a checkpoint/protocol format.
+
+## Full stack validation
+
+The exact implementation tree passed formatting, strict workspace/all-target
+Clippy, **1,739 workspace tests / 39 ignored**, and a workspace release build.
+The standalone vendored parser passed **143 tests plus 1 doctest** with compact
+history enabled. No real SSH host is needed for these tests.
+
+The additional seven-sample `resources.jsonl` matrix covers 1, 10 and 100 cores,
+empty and with 10,000 prose lines. At 100 full cores it retained 9,977 history rows
+per core with 27,825,100 requested heap bytes after publication. Fresh 100 cores
+used 5,413,100 bytes. This matrix ran alongside other builds: use its allocation
+counts, not its timings, for comparisons. The paired timings above were isolated.
