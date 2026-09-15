@@ -136,6 +136,36 @@ pub(crate) fn card_rect(
     }
 }
 
+/// Intersect the same interpolated geometry used by the painter. Offscreen
+/// terminal streams are closed even while cards continue to exist in the tree.
+pub(crate) fn visible_card_indices(
+    peek: &TabPeek,
+    width: f32,
+    height: f32,
+    scroll_y: f32,
+    reduced_motion: bool,
+) -> Vec<usize> {
+    if !peek.visible() || width <= 0.0 || height <= 0.0 {
+        return Vec::new();
+    }
+    (0..peek.sessions.len())
+        .filter(|index| {
+            let rect = card_rect(
+                *index,
+                peek.sessions.len(),
+                width,
+                height,
+                peek,
+                reduced_motion,
+            );
+            rect.x < width
+                && rect.x + rect.width > 0.0
+                && rect.y + scroll_y < height
+                && rect.y + rect.height + scroll_y > 0.0
+        })
+        .collect()
+}
+
 /// Recognizes only a stable set of three contacts. Coordinates are normalized
 /// trackpad coordinates with Y up; changing finger count cancels until lifted.
 #[cfg(any(target_os = "macos", test))]
@@ -329,5 +359,35 @@ mod tests {
         assert!((first.width - second.width).abs() < 2.0);
         assert_eq!(terminal_offset(&peek, true), 0.0);
         assert_eq!(terminal_offset(&peek, false), PEEK_CONTENT_OFFSET);
+    }
+}
+
+#[cfg(test)]
+mod visibility_tests {
+    use super::*;
+    #[test]
+    fn only_cards_intersecting_the_actual_strip_or_scrolled_overview_are_live() {
+        let mut peek = TabPeek::default();
+        peek.begin(
+            (0..100).map(|i| SessionId::new(i.to_string())).collect(),
+            None,
+        );
+        peek.update(GestureFrame::Released(140.0));
+        assert_eq!(
+            visible_card_indices(&peek, 800.0, 600.0, 0.0, false),
+            vec![0, 1, 2, 3, 4]
+        );
+        peek.advance(20);
+        let moved = visible_card_indices(&peek, 800.0, 600.0, 0.0, false);
+        assert!(moved.contains(&20));
+        assert!(!moved.contains(&0));
+        peek.update(GestureFrame::Released(380.0));
+        let top = visible_card_indices(&peek, 800.0, 600.0, 0.0, false);
+        let scrolled = visible_card_indices(&peek, 800.0, 600.0, -1000.0, false);
+        assert!(top.contains(&0));
+        assert!(!scrolled.contains(&0));
+        assert!(scrolled.iter().all(|index| *index > 3));
+        peek.dismiss();
+        assert!(visible_card_indices(&peek, 800.0, 600.0, 0.0, false).is_empty());
     }
 }
