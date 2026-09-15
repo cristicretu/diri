@@ -875,3 +875,129 @@ fn cursor_regression_checkpoint_survives_restart_and_replay() {
     assert_eq!(next.next_page, 1);
     assert_eq!(next.start_ms, newest.timestamp_ms - 300_000);
 }
+
+#[test]
+fn remote_history_replaces_sources_retains_offline_totals_and_dedupes_aliases() {
+    use super::{RemoteUsageSnapshot, RemoteUsageStatus, UsageSnapshot};
+    use diri_proto::remote_pty::{TranscriptUsageBucket, TranscriptUsageResult};
+    use std::sync::Arc;
+    let now = timestamp("2026-07-22T12:00:00Z");
+    let mut result = TranscriptUsageResult {
+        source_id: "a".repeat(32),
+        collected_at: now,
+        buckets: vec![TranscriptUsageBucket {
+            provider: "codex".into(),
+            model: "gpt-5.4".into(),
+            day: now / 86_400,
+            input: 60,
+            cache_read: 40,
+            output: 20,
+            ..Default::default()
+        }],
+    };
+    let mut snapshot = UsageSnapshot::<()>::default();
+    snapshot.remote.push(RemoteUsageSnapshot {
+        host: "forge".into(),
+        name: "Forge".into(),
+        status: RemoteUsageStatus::Ready,
+        data: Some(Arc::new(result.clone())),
+    });
+    assert_eq!(
+        snapshot
+            .history_for_source(None)
+            .report(now, 7)
+            .total
+            .totals()
+            .total_tokens(),
+        120
+    );
+    assert_eq!(
+        snapshot
+            .history_for_source(Some(""))
+            .report(now, 7)
+            .total
+            .totals()
+            .total_tokens(),
+        0
+    );
+    result.buckets[0].input = 160;
+    snapshot.remote[0].data = Some(Arc::new(result));
+    snapshot.remote[0].status = RemoteUsageStatus::Unavailable;
+    assert_eq!(
+        snapshot
+            .history_for_source(None)
+            .report(now, 7)
+            .total
+            .totals()
+            .total_tokens(),
+        220
+    );
+    let mut alias = snapshot.remote[0].clone();
+    alias.host = "alias".into();
+    snapshot.remote.push(alias);
+    assert_eq!(
+        snapshot
+            .history_for_source(None)
+            .report(now, 7)
+            .total
+            .totals()
+            .total_tokens(),
+        220
+    );
+    assert_eq!(
+        snapshot
+            .history_for_source(Some("alias"))
+            .report(now, 7)
+            .total
+            .totals()
+            .total_tokens(),
+        220
+    );
+    snapshot.remote.clear();
+    assert_eq!(
+        snapshot
+            .history_for_source(None)
+            .report(now, 7)
+            .total
+            .totals()
+            .total_tokens(),
+        0
+    );
+}
+
+#[test]
+fn remote_scan_is_incremental_and_rejects_oversized_or_linked_history() {
+    let fixture = Fixture::new();
+    write_lines(
+        &fixture.codex.join("rollout.jsonl"),
+        &[
+            json!({"type":"turn_context","payload":{"model":"gpt-5.4"}}),
+            json!({"timestamp":"2026-07-22T11:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":100}}}}),
+        ],
+    );
+    let mut store = fixture.store(
+        "2026-07-22T12:00:00Z",
+        "2026-07-22T00:00:00Z",
+        "2026-07-01T00:00:00Z",
+    );
+    let first = store.refresh_remote().unwrap();
+    assert!(store.last_stats().bytes_parsed > 0);
+    assert_eq!(store.refresh_remote().unwrap(), first);
+    assert_eq!(store.last_stats().bytes_parsed, 0);
+    let huge = fixture.codex.join("large.jsonl");
+    fs::File::create(&huge)
+        .unwrap()
+        .set_len(257 * 1024 * 1024)
+        .unwrap();
+    assert!(store.refresh_remote().is_err());
+    fs::remove_file(huge).unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(
+            fixture.codex.join("rollout.jsonl"),
+            fixture.codex.join("link.jsonl"),
+        )
+        .unwrap();
+        assert!(store.refresh_remote().is_err());
+    }
+}

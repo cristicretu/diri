@@ -8,6 +8,7 @@ build = "build.rs"
 
 [dependencies]
 diri-proto.workspace = true
+diri-usage.workspace = true
 diri-pty.workspace = true
 diri-terminal-state.workspace = true
 getrandom.workspace = true

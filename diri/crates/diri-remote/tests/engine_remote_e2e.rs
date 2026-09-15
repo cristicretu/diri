@@ -289,6 +289,79 @@ fn remote_scrollback_does_not_block_input_or_screen_reads() {
 }
 
 #[test]
+fn engine_collects_remote_usage_without_a_node_or_holder() {
+    use diri_proto::remote_pty::{TranscriptUsageDirectory, TranscriptUsageRequest};
+    let temporary = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temporary.path()).unwrap();
+    let home = root.join("remote-home");
+    let state = root.join("remote-state");
+    let argv = root.join("argv.log");
+    let project = home.join("account with 'quotes' $(no-shell)/projects/project");
+    fs::create_dir_all(&project).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let date = diri_usage::transcripts::dashboard::date_label(now / 86_400);
+    let event = serde_json::json!({"type":"assistant","timestamp":format!("{date}T00:00:00Z"),
+        "requestId":"r1","message":{"id":"m1","model":"claude-sonnet","content":"PROMPT_MUST_STAY_REMOTE",
+        "usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":40,"cache_creation_input_tokens":10}}});
+    fs::write(project.join("one.jsonl"), format!("{event}\n{event}\n")).unwrap();
+    let ssh = write_fake_ssh_with_argv_log(&root, &home, &state, &argv);
+    let script = fs::read_to_string(&ssh).unwrap().replace(
+        "#!/bin/sh\n",
+        "#!/bin/sh\nunset CODEX_HOME CLAUDE_CONFIG_DIR ZDOTDIR\n",
+    );
+    fs::write(&ssh, script).unwrap();
+    let manager = RemoteManager::new(
+        ProcessExecutor::new(ssh),
+        ArtifactCatalog::from_native_helper(Path::new(helper())).unwrap(),
+        root.join("control"),
+    )
+    .unwrap();
+    let host = HostEntry {
+        id: "usage".into(),
+        name: None,
+        ssh: "fixture-host".into(),
+        default_cwd: None,
+        node: None,
+    };
+    let request = TranscriptUsageRequest {
+        profiles: vec![TranscriptUsageDirectory {
+            provider: "claude".into(),
+            config_home: "~/account with 'quotes' $(no-shell)".into(),
+        }],
+    };
+    let first = manager.transcript_usage(&host, &request).unwrap();
+    let second = manager.transcript_usage(&host, &request).unwrap();
+    assert_eq!(first.buckets, second.buckets);
+    assert_eq!(first.source_id, second.source_id);
+    assert_eq!(first.buckets.len(), 1);
+    assert_eq!(first.buckets[0].input, 100);
+    assert_eq!(first.buckets[0].cache_read, 40);
+    assert!(
+        !serde_json::to_string(&first)
+            .unwrap()
+            .contains("PROMPT_MUST_STAY_REMOTE")
+    );
+    assert_eq!(fs::read_dir(state.join("sessions")).unwrap().count(), 0);
+    let calls = fs::read_to_string(&argv).unwrap();
+    assert!(calls.lines().all(|line| line.contains("<BatchMode=yes>")));
+    assert!(
+        calls
+            .lines()
+            .filter(|line| line.contains(" usage"))
+            .all(|line| line.contains("<-T>"))
+    );
+    fs::write(&argv, "").unwrap();
+    manager.ensure_helper(&host).unwrap();
+    assert!(
+        !fs::read_to_string(&argv).unwrap().contains("BatchMode=yes"),
+        "background mode must not affect interactive connections"
+    );
+}
+
+#[test]
 fn engine_lists_remote_directories_through_the_verified_helper() {
     let temporary = tempfile::tempdir().expect("temp");
     let remote_home = temporary.path().join("remote-home");

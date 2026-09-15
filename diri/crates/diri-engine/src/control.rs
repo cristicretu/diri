@@ -516,6 +516,7 @@ impl ControlServer {
                         | Method::SESSION_SPAWN_TRACKED
                         | Method::SESSION_CONTINUE_ACCOUNT
                         | Method::HOST_INITIALIZE
+                        | Method::HOST_USAGE
                         | Method::HOST_LIST_DIRECTORIES
                         | Method::SESSION_READ_DIFF
                         | Method::SESSION_READ_SCROLLBACK_CELLS
@@ -742,6 +743,7 @@ impl ControlServer {
             Method::EVENTS_WAIT => self.events_wait(params),
             Method::HOST_SYNC_PREFS => self.host_sync_prefs(params),
             Method::HOST_INITIALIZE => self.host_initialize(params),
+            Method::HOST_USAGE => self.host_usage(params),
             Method::HOST_LIST_DIRECTORIES => self.host_list_directories(params),
             Method::HOST_LIST => Ok(
                 json!({"hosts": diri_proto::HostsConfig::load(self.hosts_file())
@@ -1706,6 +1708,40 @@ impl ControlServer {
             cwd: captured.cwd,
             shell: captured.shell,
         })
+    }
+
+    fn host_usage(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::HostUsageParams = decode(params)?;
+        let manager = self
+            .remote
+            .as_ref()
+            .ok_or_else(crate::remote::transport_unavailable)?;
+        let host = self.resolve_host(&p.host)?;
+        let profiles = self
+            .accounts
+            .lock()
+            .map_err(poisoned)?
+            .catalog()?
+            .profiles
+            .into_iter()
+            .filter(|profile| profile.host.as_deref() == Some(host.id.as_str()))
+            .filter_map(|profile| {
+                Some(diri_proto::remote_pty::TranscriptUsageDirectory {
+                    provider: match profile.agent.as_str() {
+                        "claude-code" => "claude",
+                        "codex" => "codex",
+                        _ => return None,
+                    }
+                    .into(),
+                    config_home: profile.config_home,
+                })
+            })
+            .collect();
+        let request = diri_proto::remote_pty::TranscriptUsageRequest { profiles };
+        let result = manager
+            .transcript_usage(&host, &request)
+            .map_err(io_control_error)?;
+        encode(&result)
     }
 
     /// `host.list_directories`: one shallow, bounded filesystem read on the
@@ -5333,6 +5369,18 @@ mod tests {
             Some(json!({ "host": "forge" })),
         ));
 
+        assert_eq!(error.code, crate::remote::TRANSPORT_UNAVAILABLE_CODE);
+    }
+
+    #[test]
+    fn remote_usage_fails_closed_without_transport() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = server(temp.path());
+        let error = err_of(call(
+            &server,
+            Method::HOST_USAGE,
+            Some(json!({"host":"forge"})),
+        ));
         assert_eq!(error.code, crate::remote::TRANSPORT_UNAVAILABLE_CODE);
     }
 

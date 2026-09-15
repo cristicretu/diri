@@ -1,7 +1,9 @@
 use std::{
     collections::BTreeMap,
     fs, io,
+    io::Write,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use serde::{Deserialize, Serialize};
@@ -53,7 +55,7 @@ pub(crate) struct UsageCacheFile {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
-pub(crate) struct CursorFetchWindow {
+pub struct CursorFetchWindow {
     pub start_ms: i64,
     pub end_ms: i64,
     pub next_page: u32,
@@ -106,14 +108,32 @@ pub(crate) fn save(path: &Path, cache: &UsageCacheFile) -> io::Result<()> {
     }
     let data = serde_json::to_vec(cache).map_err(io::Error::other)?;
     let temporary = temporary_path(path);
-    fs::write(&temporary, data)?;
-    fs::rename(temporary, path)
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(&temporary)?;
+    let result = file
+        .write_all(&data)
+        .and_then(|()| fs::rename(&temporary, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn temporary_path(path: &Path) -> PathBuf {
     let mut name = path
         .file_name()
         .map_or_else(|| "usage-cache.json".into(), |name| name.to_os_string());
-    name.push(".tmp");
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    name.push(format!(
+        ".{}-{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
     path.with_file_name(name)
 }

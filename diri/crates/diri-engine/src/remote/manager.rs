@@ -165,6 +165,7 @@ pub struct RemoteManager {
     executor: ProcessExecutor,
     artifacts: ArtifactCatalog,
     control_dir: PathBuf,
+    batch_mode: bool,
     persistence: Arc<Mutex<HashMap<String, PersistenceCapability>>>,
     /// Process-local target discovery cache. Every new remote action still
     /// probes the exact packaged Build ID before use; this cache only removes
@@ -195,6 +196,7 @@ impl RemoteManager {
             executor,
             artifacts,
             control_dir,
+            batch_mode: false,
             persistence: Arc::new(Mutex::new(HashMap::new())),
             current_helpers: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -285,9 +287,10 @@ impl RemoteManager {
             .expect("current Helper cache")
             .get(&host.ssh)
             .cloned();
-        let Some(cached) = cached else {
+        let Some(mut cached) = cached else {
             return Ok(None);
         };
+        cached.helper.transport = self.transport(host);
         let artifact = self.artifacts.artifact(cached.target)?;
         artifact.verify().map_err(io::Error::other)?;
         if artifact.build_id != cached.helper.build_id {
@@ -500,6 +503,26 @@ impl RemoteManager {
                 self.rpc(&helper, HelperCommand::Executables, request, RPC_TIMEOUT)
             }
         }
+    }
+
+    pub fn transcript_usage(
+        &self,
+        host: &HostEntry,
+        request: &diri_proto::remote_pty::TranscriptUsageRequest,
+    ) -> io::Result<diri_proto::remote_pty::TranscriptUsageResult> {
+        request.validate().map_err(io::Error::other)?;
+        // Automatic accounting must never prompt for credentials or host keys.
+        let mut background = self.clone();
+        background.batch_mode = true;
+        let helper = background.ensure_helper(host)?;
+        let result: diri_proto::remote_pty::TranscriptUsageResult = background.rpc(
+            &helper,
+            HelperCommand::Usage,
+            request,
+            Duration::from_secs(45),
+        )?;
+        result.validate().map_err(io::Error::other)?;
+        Ok(result)
     }
 
     /// Executes an Engine-owned fixed POSIX script over the host's multiplexed
@@ -805,6 +828,7 @@ impl RemoteManager {
             .collect::<String>();
         SshTransport::new(host, self.control_dir.join(name))
             .with_executable(self.executor.ssh_executable().to_os_string())
+            .with_batch_mode(self.batch_mode)
     }
 }
 
@@ -1183,7 +1207,7 @@ mod tests {
         let target = RemoteTarget::MacosAarch64;
         let artifact_path = temporary.path().join("diri-remote-fixture");
         let artifact_script = format!(
-            "#!/bin/sh\ncase \"$1\" in\nprobe) printf '%s\\n' '{{\"protocol\":{{\"major\":1,\"minor\":3}},\"buildId\":\"test-build\",\"artifactSha256\":\"'$TEST_ARTIFACT_SHA'\",\"target\":\"{}\",\"os\":\"test\",\"arch\":\"test\",\"supported\":true,\"holderAvailable\":true,\"capabilities\":[\"full-snapshot\",\"incremental-grid\",\"process-exit\",\"signal\",\"controller-lease\",\"scrollback\",\"session-management\",\"environment-capture\",\"directory-list\",\"executable-discovery\",\"persistence-probe\",\"atomic-activation\"]}}';;\nactivate) final=$(dirname \"$0\")/diri-remote; ln \"$0\" \"$final\" 2>/dev/null || true; rm -f \"$0\"; exec \"$final\" probe --format=json;;\n*) exit 64;;\nesac\n",
+            "#!/bin/sh\ncase \"$1\" in\nprobe) printf '%s\\n' '{{\"protocol\":{{\"major\":1,\"minor\":3}},\"buildId\":\"test-build\",\"artifactSha256\":\"'$TEST_ARTIFACT_SHA'\",\"target\":\"{}\",\"os\":\"test\",\"arch\":\"test\",\"supported\":true,\"holderAvailable\":true,\"capabilities\":[\"full-snapshot\",\"incremental-grid\",\"process-exit\",\"signal\",\"controller-lease\",\"scrollback\",\"session-management\",\"environment-capture\",\"directory-list\",\"executable-discovery\",\"transcript-usage\",\"persistence-probe\",\"atomic-activation\"]}}';;\nactivate) final=$(dirname \"$0\")/diri-remote; ln \"$0\" \"$final\" 2>/dev/null || true; rm -f \"$0\"; exec \"$final\" probe --format=json;;\n*) exit 64;;\nesac\n",
             target.artifact_name()
         );
         fs::write(&artifact_path, artifact_script).expect("artifact");

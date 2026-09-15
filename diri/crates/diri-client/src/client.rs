@@ -555,6 +555,17 @@ impl DaemonClient {
             .await
     }
 
+    /// Collect a remote transcript summary through the local Engine.
+    pub async fn host_usage(&self, host: String) -> Result<HostUsageResult, ClientError> {
+        self.core
+            .request_typed(
+                Method::HOST_USAGE,
+                Some(&HostUsageParams { host }),
+                Some(Duration::from_secs(600)),
+            )
+            .await
+    }
+
     /// Lists exactly one directory level on the Engine-selected machine.
     /// Remote requests stay behind the Engine's authenticated SSH transport.
     pub async fn list_directories(

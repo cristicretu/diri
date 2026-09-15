@@ -278,6 +278,16 @@ fn main() {
             .await;
         });
     }
+    if !preview && std::env::var_os("DIRI_SETTINGS_PREVIEW").is_none() {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/nonexistent"));
+        tokio.spawn(usage::watch_remote_usage(
+            Arc::clone(&client),
+            home,
+            usage_tx.clone(),
+        ));
+    }
     let (usage_limits_refresh, mut limits_requests) = tokio::sync::mpsc::channel(1);
     if !preview && std::env::var_os("DIRI_SETTINGS_PREVIEW").is_none() {
         let usage_tx = usage_tx.clone();
@@ -555,11 +565,13 @@ async fn publish_usage_refresh(
     })
     .await
     .ok()?;
-    let snapshot = merge_fleet_usage(snapshot, home).await;
+    let snapshot = merge_fleet_usage(snapshot.with_limits(Vec::new()), home).await;
     usage_tx.send_modify(|current| {
         let limits = std::mem::take(&mut current.limits);
+        let remote = std::mem::take(&mut current.remote);
         *current = snapshot;
         current.limits = limits;
+        current.remote = remote;
     });
     Some(store)
 }

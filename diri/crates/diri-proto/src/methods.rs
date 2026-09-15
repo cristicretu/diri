@@ -46,6 +46,7 @@ impl Method {
     pub const HOST_SYNC_PREFS: &'static str = "host.sync_prefs";
     pub const HOST_LOCATE_REPO: &'static str = "host.locate_repo";
     pub const HOST_INITIALIZE: &'static str = "host.initialize";
+    pub const HOST_USAGE: &'static str = "host.usage";
     pub const HOST_LIST_DIRECTORIES: &'static str = "host.list_directories";
     pub const HOST_LIST: &'static str = "host.list";
     pub const SESSION_HISTORY: &'static str = "session.history";
@@ -1089,3 +1090,10 @@ pub struct SessionNotificationEvent {
     pub title: String,
     pub body: String,
 }
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostUsageParams {
+    pub host: String,
+}
+pub type HostUsageResult = crate::remote_pty::TranscriptUsageResult;

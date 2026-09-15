@@ -138,6 +138,26 @@ impl<C: Clock> UsageStore<C> {
         snapshot
     }
 
+    /// Bound remote collection before entering the shared incremental ledger.
+    /// Missing provider roots are normal; unreadable or oversized history is
+    /// an explicit failure so callers retain their last complete snapshot.
+    pub fn refresh_remote(&mut self) -> std::io::Result<UsageSnapshot> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut remaining_entries = 100_000_usize;
+        let mut changed_bytes = 0_u64;
+        for (root, _) in &self.paths.roots {
+            check_remote_tree(
+                root,
+                0,
+                deadline,
+                &mut remaining_entries,
+                &mut changed_bytes,
+                &self.ledger.cache,
+            )?;
+        }
+        Ok(self.refresh())
+    }
+
     /// Refresh only transcript paths reported by the filesystem watcher. The
     /// initial `refresh` remains a full reconciliation; normal app activity
     /// never needs to walk every historical transcript directory again.
@@ -154,7 +174,7 @@ impl<C: Clock> UsageStore<C> {
         self.last_stats
     }
 
-    pub(crate) fn watch_roots(&self) -> Vec<PathBuf> {
+    pub fn watch_roots(&self) -> Vec<PathBuf> {
         self.paths
             .roots
             .iter()
@@ -162,7 +182,7 @@ impl<C: Clock> UsageStore<C> {
             .collect()
     }
 
-    pub(crate) fn cursor_fetch_window(&self) -> CursorFetchWindow {
+    pub fn cursor_fetch_window(&self) -> CursorFetchWindow {
         if let Some(pending) = self.ledger.cache.cursor.pending {
             return pending;
         }
@@ -182,7 +202,7 @@ impl<C: Clock> UsageStore<C> {
         }
     }
 
-    pub(crate) fn ingest_cursor_batch(&mut self, batch: CursorBatch) -> ProviderUsage {
+    pub fn ingest_cursor_batch(&mut self, batch: CursorBatch) -> ProviderUsage {
         let reading = self.clock.read();
         let cutoff_hour = reading.unix_seconds / 3_600 - RETENTION_DAYS * 24;
         let changed = ingest_cursor(&mut self.ledger.cache, &batch.events, cutoff_hour);
@@ -205,7 +225,7 @@ impl<C: Clock> UsageStore<C> {
         provider_from_hours(&self.ledger.cache.cursor.hours, reading)
     }
 
-    pub(crate) fn cursor_history(&self) -> dashboard::ModelHours {
+    pub fn cursor_history(&self) -> dashboard::ModelHours {
         self.ledger.cache.cursor.details.clone()
     }
 }
@@ -799,4 +819,55 @@ fn civil_from_days(days: i64) -> (i32, i32, i32) {
         i32::try_from(month).expect("month is in range"),
         i32::try_from(day).expect("day is in range"),
     )
+}
+
+fn check_remote_tree(
+    path: &Path,
+    depth: usize,
+    deadline: std::time::Instant,
+    remaining: &mut usize,
+    bytes: &mut u64,
+    cache: &UsageCacheFile,
+) -> std::io::Result<()> {
+    use std::io;
+    if depth > 48 || *remaining == 0 || std::time::Instant::now() > deadline {
+        return Err(io::Error::other("remote usage scan limit exceeded"));
+    }
+    *remaining -= 1;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(io::Error::other("remote usage history is unreadable")),
+    };
+    if metadata.is_symlink() {
+        return Err(io::Error::other("remote usage history contains a symlink"));
+    }
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            check_remote_tree(&entry.path(), depth + 1, deadline, remaining, bytes, cache)?;
+        }
+    } else if metadata.is_file() && path.extension().is_some_and(|ext| ext == "jsonl") {
+        let revision = FileRevision::from_metadata(&metadata);
+        let old = cache.files.get(path.to_string_lossy().as_ref());
+        if old.is_some_and(|old| revision.is_unchanged(old)) {
+            return Ok(());
+        }
+        let offset = old
+            .filter(|old| revision.is_append_compatible(old, path))
+            .map_or(0, |old| old.offset);
+        let delta = metadata.len().saturating_sub(offset);
+        *bytes = bytes.saturating_add(delta);
+        if delta > 256 * 1024 * 1024 || *bytes > 1024 * 1024 * 1024 {
+            return Err(io::Error::other(
+                "remote usage transcript size limit exceeded",
+            ));
+        }
+        std::fs::File::open(path)
+            .map_err(|_| io::Error::other("remote usage transcript is unreadable"))?;
+    }
+    Ok(())
 }

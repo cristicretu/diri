@@ -9,6 +9,7 @@ mod output_log;
 mod paths;
 mod persistence;
 mod state;
+mod usage;
 
 use std::collections::HashSet;
 use std::fs;
@@ -49,6 +50,7 @@ kill                   Stop an authenticated Holder and its process tree\n  \
 gc                     Remove dead, unreferenced session state\n  \
 environment            Capture the remote login/cwd environment\n  \
 directories            List one bounded directory level\n  \
+usage                  Report bounded transcript token summaries\n  \
 executables            Resolve a bounded Agent executable batch\n  \
 persistence            Run a persistence capability probe step\n  \
 activate               Atomically activate this uploaded Helper build\n";
@@ -86,6 +88,7 @@ enum Invocation {
     Environment,
     Directories,
     Executables,
+    Usage,
     Persistence,
     Activate,
     HiddenHolder,
@@ -170,6 +173,21 @@ pub fn execute<W: Write + Send>(
         >(stdin, diri_proto::remote_pty::MAX_LAUNCH_BYTES)
         .and_then(|request| executables::discover(&request, executable))
         .and_then(|result| write_json(stdout, &result)),
+        Invocation::Usage => holder::read_limited_json::<
+            _,
+            diri_proto::remote_pty::TranscriptUsageRequest,
+        >(stdin, 512 * 1024)
+        .and_then(|request| usage::collect(executable, &request))
+        .and_then(|result| {
+            let bytes = serde_json::to_vec(&result).map_err(io::Error::other)?;
+            if bytes.len() + 1 > diri_proto::remote_pty::MAX_USAGE_RESPONSE_BYTES {
+                return Err(io::Error::other(
+                    "remote usage response size limit exceeded",
+                ));
+            }
+            stdout.write_all(&bytes)?;
+            stdout.write_all(b"\n")
+        }),
         Invocation::Persistence => holder::read_limited_json::<
             _,
             diri_proto::remote_pty::PersistenceProbeRequest,
@@ -237,6 +255,7 @@ fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, Stri
         "environment" => no_more(arguments, Invocation::Environment),
         "directories" => no_more(arguments, Invocation::Directories),
         "executables" => no_more(arguments, Invocation::Executables),
+        "usage" => no_more(arguments, Invocation::Usage),
         "persistence" => no_more(arguments, Invocation::Persistence),
         "activate" => no_more(arguments, Invocation::Activate),
         "__holder" => no_more(arguments, Invocation::HiddenHolder),

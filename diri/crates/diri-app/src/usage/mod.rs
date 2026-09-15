@@ -1,31 +1,26 @@
-//! Incremental usage accounting for Claude Code, Codex, and Cursor.
+//! Incremental, daemon-free usage accounting for Claude Code and Codex transcripts.
 //!
-//! Claude and Codex costs come from local transcripts. Cursor usage is fetched
-//! from Cursor's dashboard API using the signed-in IDE/CLI session. The
-//! separate limits reader queries provider-reported subscription windows
-//! without deriving quota percentages from these estimates.
+//! The shared Rust parser estimates usage from local and remote transcripts.
+//! Only aggregates cross SSH. The separate limits reader queries provider-reported subscription
+//! windows without deriving quota percentages from these estimates.
 
-mod cache;
-mod cursor;
-pub mod dashboard;
+pub use diri_usage::PRICING_ENTRY_COUNT;
+pub use diri_usage::transcripts::{
+    Clock, ClockReading, ProviderUsage, RefreshStats, ScanPaths, SystemClock, UsageFormat,
+    UsageHourAgg, UsageProvider, UsageStore, UsageTotals, dashboard,
+};
 mod fleet;
 pub(crate) mod limits;
-mod model;
-mod parser;
-mod pricing;
-mod store;
-mod timestamp;
 mod watcher;
-
-pub(crate) use cursor::{CursorBatch, CursorRefresh};
 pub(crate) use fleet::merge_fleet_usage;
-pub use model::{ProviderUsage, UsageHourAgg, UsageSnapshot, UsageTotals};
-pub use pricing::PRICING_ENTRY_COUNT;
-pub use store::{
-    Clock, ClockReading, RefreshStats, ScanPaths, SystemClock, UsageFormat, UsageProvider,
-    UsageStore,
-};
 pub(crate) use watcher::{TranscriptInvalidation, TranscriptWatcher};
+pub type UsageSnapshot = diri_usage::transcripts::UsageSnapshot<limits::AccountLimits>;
 
-#[cfg(test)]
-mod tests;
+mod remote;
+pub use diri_usage::transcripts::{RemoteUsageSnapshot, RemoteUsageStatus};
+pub(crate) use remote::watch_remote_usage;
+
+pub(crate) use diri_usage::transcripts::timestamp;
+
+mod cursor;
+pub(crate) use cursor::{CursorBatch, CursorRefresh};

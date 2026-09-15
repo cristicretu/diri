@@ -103,6 +103,58 @@ directory preparation, and profile resolution belong to the local Engine;
 the Holder receives only the resulting argv/environment/cwd. This enhancement
 adds no remote service, credential store, or transport dependency.
 
+## Remote transcript usage enhancement
+
+The Usage page collects available Claude Code and Codex transcript usage from
+configured SSH hosts, including conversations started outside Diri. The local
+Engine owns host selection and collection requests. A short-lived `usage`
+Helper command scans provider transcript directories with the same Rust parser
+used locally and returns bounded daily/model token aggregates. It never sends
+prompts, transcript text, credentials, or full environments to the app. The shared
+Rust usage crate applies the same bundled estimate rates locally and remotely;
+the app owns aggregation and display. No usage work runs inside a Holder.
+
+Protocol 1.7 adds the management capability (`transcript-usage`), independent of
+live session protocol handshakes. Each request uses the exact verified packaged
+Helper through `ssh -T`; older live Holders retain their Build ID and continue
+running. Collection adds no daemon, watcher, service, package, or node requirement.
+
+Requests and output are bounded. Local and remote snapshots are replaced per
+host rather than repeatedly added. Failed refreshes retain the last successful
+host snapshot and expose its stale status; never-collected hosts are shown as
+unavailable. Removed hosts stop contributing. Local collection does not wait
+for SSH. Remote collection is paced independently of local transcript writes:
+two hosts at a time, every five minutes, with a 45-second scan RPC timeout after bounded
+bootstrap. Background SSH requires `BatchMode=yes` and strict host-key checking;
+users authenticate through existing Remote settings. The Helper reuses the
+shared incremental ledger in an owner-only `usage-v1` directory under its state
+root. A stable random usage-store identity deduplicates SSH aliases. The app
+persists the latest aggregate per configured destination for offline display.
+
+A scan permits at most 100,000 filesystem entries, depth 48, 256 MiB of changed
+bytes per file and 1 GiB of changed bytes in total; preflight is bounded to 20
+seconds. Responses contain at most 4,096 daily/model buckets and 2 MiB. Exceeding
+a bound fails the refresh, preserving the prior visible summary. The parser reads
+provider JSONL transcripts locally on the remote host and exports only usage
+aggregates; credential files are not read.
+
+`diri-usage` now owns the existing local transcript parser, incremental ledger,
+and projections. Reusing the existing serde, serde_json, libc and diri-proto
+dependencies avoids a second accounting implementation. Unchanged-file tests
+require zero parsed transcript bytes on a warm refresh.
+
+The initial scope is the remote login account's standard provider directories
+and login environment overrides, plus saved Diri account profiles for that host.
+Profile directories travel as validated JSON data over stdin. Arbitrary directories
+and accounts belonging to other operating-system users are not searched. Token counts reflect available
+transcripts; estimated API cost is not a subscription bill. Subscription quota
+windows remain a separate local-account feature.
+
+Acceptance covers fixture transcripts for both providers, incremental refresh
+and repeat-request deduplication, bounded and malformed responses, unavailable
+hosts with retained history, and the Engine-only SSH route. Remote usage does
+not change PTY ownership, session identity, input, output, or Holder lifecycle.
+
 ## Why the old transport was replaced
 
 `tmux` provided a practical PTY, process survival, and reconnection mechanism,
@@ -164,6 +216,7 @@ diri-remote list
 diri-remote kill
 diri-remote environment
 diri-remote directories
+diri-remote usage
 diri-remote persistence
 diri-remote gc
 ```
@@ -1138,7 +1191,7 @@ refactor work:
 - offline structured Agent-event buffering;
 - remote conversation/thread identifiers;
 - MCP forwarding;
-- artifact, port, usage, and resource discovery;
+- artifact, port, and resource discovery;
 - cross-host handoff and checkpoint migration;
 - cross-host or post-reboot process recovery;
 - multiple read-only observers;
