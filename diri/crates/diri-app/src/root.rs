@@ -2720,10 +2720,9 @@ impl RootView {
         }
 
         if tabs_height > 0.0 {
-            card = card.child(
-                self.sidebar
-                    .update(cx, |sidebar, cx| sidebar.render_horizontal_tabs(cx)),
-            );
+            card = card.child(self.sidebar.update(cx, |sidebar, cx| {
+                sidebar.render_horizontal_tabs(card_width, cx)
+            }));
         }
         // Translation changes only paint placement. The stationary tab strip
         // and settled PTY viewport never participate in the gesture layout.
@@ -4208,6 +4207,40 @@ mod tests {
                     .unwrap(),
             ),
         })
+    }
+
+    #[gpui::test]
+    fn horizontal_tabs_reveal_selection_after_first_layout_and_resize(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let services = test_services();
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let selected = fixture.selected_session_id.clone().unwrap();
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.select(selected.clone());
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        root.update_in(cx, |root, window, cx| {
+            root.run_command(CommandId::HorizontalTabs, window, cx)
+        });
+        for width in [1000.0, 640.0] {
+            cx.simulate_resize(size(px(width), px(700.0)));
+            cx.run_until_parked();
+            let tab = cx.debug_bounds("horizontal-tab-preview-codex").unwrap();
+            let project = cx.debug_bounds("horizontal-tab-project").unwrap();
+            assert!(
+                tab.left() >= project.right(),
+                "selected tab hidden to the left"
+            );
+            assert!(
+                tab.right() <= px(width - 40.0),
+                "selected tab hidden to the right at {width}: {tab:?}"
+            );
+        }
     }
 
     #[gpui::test]

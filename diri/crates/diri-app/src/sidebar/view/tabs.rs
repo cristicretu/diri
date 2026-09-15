@@ -2,6 +2,9 @@ use super::*;
 use crate::store::TabOrientation;
 use crate::tab_navigation::{TAB_STRIP_HEIGHT, selected_project_tabs};
 
+const TAB_WIDTH: f32 = 164.0;
+const TAB_GAP: f32 = 4.0;
+
 impl Sidebar {
     pub(super) fn navigation_sessions(&self, store: &mut SessionStore) -> Vec<Arc<SessionRecord>> {
         if store.preferences().tab_orientation == TabOrientation::Horizontal {
@@ -56,7 +59,11 @@ impl Sidebar {
         Ok(())
     }
 
-    pub fn render_horizontal_tabs(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    pub fn render_horizontal_tabs(
+        &mut self,
+        available_width: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let colors = self.colors();
         let (tabs, selected) = {
             let mut store = self.store.write().expect("store");
@@ -70,21 +77,25 @@ impl Sidebar {
             )))
             .flex()
             .items_center()
-            .gap(px(4.0))
+            .gap(px(TAB_GAP))
             .flex_1()
             .min_w(px(0.0))
             .h_full()
             .overflow_x_scroll()
             .track_scroll(&self.tab_scroll);
-        if self.last_tab_selection != selected {
+        if self.last_tab_selection != selected || self.last_tab_available_width != available_width {
             if let Some(index) = tabs
                 .sessions
                 .iter()
                 .position(|session| Some(&session.id) == selected.as_ref())
             {
-                self.tab_scroll.scroll_to_item(index);
+                // Fixed-width tabs have a known content position before the
+                // first layout. GPUI clamps this offset to the final viewport.
+                self.tab_scroll
+                    .set_offset(point(px(-(index as f32) * (TAB_WIDTH + TAB_GAP)), px(0.0)));
             }
             self.last_tab_selection = selected.clone();
+            self.last_tab_available_width = available_width;
         }
         for session in tabs.sessions {
             let id = session.id.clone();
@@ -100,7 +111,7 @@ impl Sidebar {
                     .aria_label(title.clone())
                     .aria_selected(active)
                     .flex_none()
-                    .w(px(164.0))
+                    .w(px(TAB_WIDTH))
                     .h(px(30.0))
                     .px(px(10.0))
                     .rounded(px(SIDEBAR_ROW_RADIUS))
