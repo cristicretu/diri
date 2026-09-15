@@ -5,7 +5,7 @@
 use diri_engine::remote::{
     binding::RemoteBindingStore,
     executor::ProcessExecutor,
-    manager::{ArtifactCatalog, InstalledHelper, RemoteManager},
+    manager::{ArtifactCatalog, RemoteManager},
 };
 use diri_engine::{ManifestEngine, control::ControlServer, registry::Registry};
 use diri_proto::remote_pty::{RemoteProcessState, SessionSelector};
@@ -160,12 +160,31 @@ fn lose_reply(
 
 struct Cleanup {
     manager: Arc<RemoteManager>,
-    helper: InstalledHelper,
-    selector: SessionSelector,
+    host: HostEntry,
+    bindings: RemoteBindingStore,
 }
 impl Drop for Cleanup {
     fn drop(&mut self) {
-        let _ = self.manager.kill(&self.helper, &self.selector);
+        // The store is unique to this test. Arm cleanup before the first RPC
+        // so assertion/transport failures cannot orphan a fixture Holder.
+        if let Ok(bindings) = self.bindings.load_all() {
+            for binding in bindings {
+                if let Ok(helper) = self.manager.existing_helper(
+                    &self.host,
+                    &binding.helper_build_id,
+                    binding.protocol,
+                ) {
+                    let _ = self.manager.kill(
+                        &helper,
+                        &SessionSelector {
+                            session_id: binding.session_id,
+                            session_token: binding.session_token,
+                            expected_incarnation: Some(binding.session_incarnation),
+                        },
+                    );
+                }
+            }
+        }
     }
 }
 fn screen(bridge: &Bridge, id: &str, needle: &str) -> String {
@@ -224,6 +243,11 @@ fn run(real: bool) {
         serde_json::to_vec(&json!({"hosts":[host]})).unwrap(),
     )
     .unwrap();
+    let cleanup = Cleanup {
+        manager: manager.clone(),
+        host: host.clone(),
+        bindings: RemoteBindingStore::new(root.join("remote-bindings")).unwrap(),
+    };
     let mut engine = Some(Engine::start(root, manager.clone()));
     let bridge = Bridge::new(root.join("daemon.sock"), Some("parent".into()));
     let args = json!({"kind":"mcp-fixture","host":"soak","cwd":if real{std::env::var("DIRI_REMOTE_CWD").unwrap_or_else(|_|"~".into())}else{home.to_string_lossy().into_owned()},"operation_id":"spawn-one"});
@@ -247,11 +271,6 @@ fn run(real: bool) {
         session_id: id.into(),
         session_token: binding.session_token.clone(),
         expected_incarnation: Some(binding.session_incarnation.clone()),
-    };
-    let cleanup = Cleanup {
-        manager: manager.clone(),
-        helper: helper.clone(),
-        selector: selector.clone(),
     };
     let before = manager.inspect(&helper, &selector).unwrap();
     assert!(matches!(

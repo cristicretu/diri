@@ -28,7 +28,7 @@ impl Bridge {
     pub(super) fn get_task(&self, args: &Value) -> Result<Value, String> {
         self.request(
             Method::TASK_GET,
-            json!({"caller_id":self.require_caller()?,"task_id":required_string(args,"task_id")?}),
+            json!({"caller_id":self.require_caller()?,"task_id":args.get("task_id"),"request_id":args.get("request_id")}),
             DEFAULT_TIMEOUT,
         )
     }

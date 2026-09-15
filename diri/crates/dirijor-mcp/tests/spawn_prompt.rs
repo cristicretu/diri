@@ -584,6 +584,10 @@ fn task_completion_is_explicit_and_specific_to_the_submitted_task() {
     let args = json!({"session_id":id, "text":"do this specific task", "request_id":"task-one"});
     let first = parent.call("submit_task", &args).unwrap();
     let task_id = first["task"]["task_id"].as_str().unwrap();
+    let recovered = parent
+        .call("get_task", &json!({"request_id":"task-one"}))
+        .unwrap();
+    assert_eq!(recovered["task_id"], task_id);
     let second = parent.call("submit_task", &args).unwrap();
     assert_eq!(second["duplicate"], true);
     assert_eq!(second["task"]["task_id"], task_id);

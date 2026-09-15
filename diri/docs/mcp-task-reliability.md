@@ -10,7 +10,9 @@ for the same caller. An intentional second Agent needs a new `operation_id`.
 The ordinary user CLI and app retain their existing untracked spawn interface.
 
 The Engine commits a reservation and session ID before worktree creation,
-remote bootstrap, or launch. It records `completed` after the original spawn
+remote bootstrap, or launch. Generated worktree branches derive from that ID
+and are included in the receipt. The session record is saved before a Holder
+can launch so crash recovery can match its binding. It records `completed` after the original spawn
 contract finishes. Repeated calls return the original ID and receipt, including
 when the reply was lost. Concurrent retries cannot start another launch.
 A conflicting payload is rejected. Records are never evicted to make room for
@@ -38,7 +40,8 @@ For work whose completion matters:
 Submission adds a short task-ID/reporting instruction to the delivered text.
 Use the same `request_id` when a reply is lost; a new ID means new work. Without
 an ID, identical target/text from the same caller derive one identity.
-Sending, explicit Agent acknowledgement, and an explicit result are separate
+`get_task(request_id: "original-id")` recovers the receipt without sending input,
+even after the target disappears. Sending, explicit Agent acknowledgement, and an explicit result are separate
 facts. Terminal idle, unrelated output, process exit, and disappearance cannot
 complete a task. Terminal results are immutable; identical reports are safe to
 repeat. A different task cannot inherit another task's completion.

@@ -39,7 +39,8 @@ pub struct TaskSubmitParams {
 #[serde(deny_unknown_fields)]
 pub struct TaskGetParams {
     pub caller_id: String,
-    pub task_id: String,
+    pub task_id: Option<String>,
+    pub request_id: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -103,7 +103,22 @@ fn reserve(path: &Path, p: &TaskSubmitParams) -> Result<(TaskRecord, bool), Cont
     Ok((record, true))
 }
 fn get(path: &Path, p: &TaskGetParams) -> Result<TaskRecord, ControlError> {
-    let record = load(&database(path)?, &p.task_id)?;
+    let id = match (&p.task_id, &p.request_id) {
+        (Some(id), None) => {
+            identity(id)?;
+            id.clone()
+        }
+        (None, Some(request)) => {
+            identity(request)?;
+            format!("task_{}", digest(&json!([p.caller_id, request])))
+        }
+        _ => {
+            return Err(ControlError::bad_request(
+                "provide exactly one of task_id or request_id",
+            ));
+        }
+    };
+    let record = load(&database(path)?, &id)?;
     if p.caller_id != record.sender_id && p.caller_id != record.session_id {
         return Err(ControlError::new(
             "forbidden",
@@ -275,7 +290,8 @@ mod tests {
                 &path,
                 &TaskGetParams {
                     caller_id: "stranger".into(),
-                    task_id: task.task_id
+                    task_id: Some(task.task_id),
+                    request_id: None,
                 }
             )
             .is_err()

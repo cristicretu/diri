@@ -122,7 +122,7 @@ impl super::ControlServer {
             operation_id: String,
             spawn: Value,
         }
-        let p: Request = super::decode(params)?;
+        let mut p: Request = super::decode(params)?;
         let typed: diri_proto::SessionSpawnParams = super::decode(Some(p.spawn.clone()))?;
         if typed.parent.as_ref().map(|id| id.0.as_str()) != Some(p.sender_id.as_str()) {
             return Err(ControlError::bad_request(
@@ -131,6 +131,14 @@ impl super::ControlServer {
         }
         let path = self.socket_path.with_file_name("operations-v1.sqlite");
         let mut reservation = reserve(&path, &p.sender_id, &p.operation_id, &p.spawn)?;
+        let worktree_branch = typed.new_worktree.unwrap_or(false).then(|| {
+            typed
+                .worktree_branch
+                .unwrap_or_else(|| format!("diri/mcp-{}", reservation.resource))
+        });
+        if let Some(branch) = &worktree_branch {
+            p.spawn["worktreeBranch"] = json!(branch);
+        }
         let mut error_code = None;
         let record = if reservation.fresh {
             match self.session_spawn_identified(Some(p.spawn), Some(reservation.resource.clone())) {
@@ -166,7 +174,7 @@ impl super::ControlServer {
         result["spawn_receipt"] = json!({
             "operation_id":p.operation_id, "session_id":reservation.resource,
             "outcome":reservation.outcome, "duplicate":!reservation.fresh, "session_present":session_present,
-            "error_code":error_code,
+            "error_code":error_code, "worktree_branch":worktree_branch,
             "note":"This operation never launches twice. Reuse operation_id on retries. Unknown or failed may have left a session or worktree; inspect session_id before recovery."
         });
         Ok(result)

@@ -37,8 +37,8 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
         ),
         ToolDefinition::new(
             "get_task",
-            "Read the durable receipt for one task you assigned or received. Delivery, Agent acknowledgement, and task result are separate facts. Status survives Engine restarts; terminal idle is not task completion.",
-            json!({"type":"object","properties":{"task_id":message_id_schema()},"required":["task_id"]}),
+            "Read the durable receipt for one task you assigned or received. Provide exactly one of task_id or your original request_id; request_id recovers a lost submission reply even after the target disappears. Delivery, Agent acknowledgement, and task result are separate facts. Status survives Engine restarts; terminal idle is not task completion.",
+            json!({"type":"object","properties":{"task_id":message_id_schema(),"request_id":message_id_schema()}}),
         ),
         ToolDefinition::new(
             "wait_for_task",

@@ -868,6 +868,7 @@ impl ControlServer {
         }
         let authority = descriptor.authority();
 
+        let tracked = reserved_id.is_some();
         let id = reserved_id.unwrap_or_else(next_session_id);
         // Build the complete agent argv before `spawn_spec`: agents declaring
         // `returnToLoginShell` need every manifest and injection argument
@@ -1016,10 +1017,20 @@ impl ControlServer {
             remote: None,
             defer_launch: true,
         };
+        if tracked {
+            // Persist the launch intent before a Holder can exist. A crash
+            // immediately after launch must leave a record for binding adoption.
+            registry.insert_record(record.clone());
+            registry.persist_for_shutdown().map_err(io_control_error)?;
+        }
         registry
             .spawn(spec, record)
             .map_err(|error| ControlError::internal(error.to_string()))?;
-        let _ = registry.persist();
+        if tracked {
+            registry.persist_for_shutdown().map_err(io_control_error)?;
+        } else {
+            let _ = registry.persist();
+        }
         self.publish_updated(&registry, &id);
 
         // An initial prompt is typed once the TUI can actually receive input,
@@ -1149,6 +1160,7 @@ impl ControlServer {
             .map(|variable| (variable.name, variable.value))
             .collect::<Vec<_>>();
 
+        let tracked = reserved_id.is_some();
         let id = reserved_id.unwrap_or_else(next_session_id);
         let mut agent_session_id = None;
         let mut launch_args = caller_argv.clone();
@@ -1272,10 +1284,20 @@ impl ControlServer {
         };
         let mut registry = self.registry.lock().map_err(poisoned)?;
         registry.ensure_session_project(&captured.cwd, Some(&host.id));
+        if tracked {
+            // Persist the launch intent before a Holder can exist. A crash
+            // immediately after launch must leave a record for binding adoption.
+            registry.insert_record(record.clone());
+            registry.persist_for_shutdown().map_err(io_control_error)?;
+        }
         registry
             .spawn(spec, record)
             .map_err(|error| ControlError::internal(error.to_string()))?;
-        let _ = registry.persist();
+        if tracked {
+            registry.persist_for_shutdown().map_err(io_control_error)?;
+        } else {
+            let _ = registry.persist();
+        }
         self.publish_updated(&registry, &id);
 
         let prompt = p.initial_prompt.filter(|prompt| !prompt.is_empty());
