@@ -79,11 +79,15 @@ impl SessionSurfaces {
     }
     fn commit_tab_peek(&mut self, id: SessionId, cx: &mut Context<Self>) {
         let mut store = self.store.write().unwrap();
-        if store.sessions().get(&id).is_some() {
+        let activate = store.sessions().get(&id).is_some();
+        if activate {
             store.select(id);
         }
         drop(store);
         self.dismiss_tab_peek();
+        if activate {
+            cx.emit(TabPeekActivated);
+        }
         cx.notify();
     }
     pub(super) fn handle_tab_peek_key(
