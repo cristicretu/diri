@@ -73,6 +73,23 @@ The current baseline:
   capability-compatible Helper is available;
 - retains orchestration and user-facing state in the local Rust Engine.
 
+## Terminal input-mode projection
+
+Protocol minor 9 adds optional `terminal-input-modes-v1`. A capable Holder
+publishes a bounded `InputModes` record immediately before the snapshot/delta
+with the same sequence, admitting both frames as one queue transaction. The
+Engine commits modes only after validating that grid; a new Hello clears the
+pending projection. Mode-only changes use the same publication path. Older
+controllers receive neither the capability nor new messages, and old Holders
+remain usable with unknown input-mode state. Mode-dependent typed input fails
+explicitly when that state is unavailable.
+
+Local app/client `Modes` frames retain their existing first byte and gain an
+optional versioned tail. GUI and CLI share one pure key encoder; there is no new
+Holder attachment or terminal owner. Local restart checkpoints carry optional
+versioned keyboard state. Missing state and truncated replay are unknown, not
+an observed default. See [terminal key input](docs/terminal-key-input.md).
+
 ## Account-profile enhancement
 
 The local Engine owns the account-profile catalog and durable per-session

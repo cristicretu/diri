@@ -586,6 +586,29 @@ impl HeadlessScreen {
         (self.geometry.cols, self.geometry.rows)
     }
 
+    /// Keyboard modes from the same parser that owns the visible terminal.
+    pub fn keyboard_state(&self) -> diri_proto::terminal_input::KeyboardState {
+        let mode = self.term.mode();
+        diri_proto::terminal_input::KeyboardState {
+            application_cursor_keys: mode.contains(TermMode::APP_CURSOR),
+            application_keypad: mode.contains(TermMode::APP_KEYPAD),
+        }
+    }
+
+    /// Restore checkpointed modes through the existing parser after grid restore.
+    pub fn restore_keyboard_state(&mut self, state: diri_proto::terminal_input::KeyboardState) {
+        self.feed(if state.application_cursor_keys {
+            b"\x1b[?1h"
+        } else {
+            b"\x1b[?1l"
+        });
+        self.feed(if state.application_keypad {
+            b"\x1b="
+        } else {
+            b"\x1b>"
+        });
+    }
+
     /// The independent tracking and encoding modes requested by the child.
     pub fn mouse_modes(&self) -> MouseModes {
         let mode = self.term.mode();
@@ -1459,6 +1482,29 @@ fn emulator_color(color: TermColor) -> Color {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn keyboard_mode_only_changes_leave_cells_unchanged_and_reset_independently() {
+        let mut screen = super::HeadlessScreen::new(20, 3);
+        screen.feed(b"unchanged");
+        let cells = screen.lines();
+        assert_eq!(
+            screen.keyboard_state(),
+            diri_proto::terminal_input::KeyboardState::default()
+        );
+        screen.feed(b"\x1b[?1h\x1b=");
+        assert_eq!(screen.lines(), cells);
+        assert!(screen.keyboard_state().application_cursor_keys);
+        assert!(screen.keyboard_state().application_keypad);
+        screen.feed(b"\x1b[?1l");
+        assert!(!screen.keyboard_state().application_cursor_keys);
+        assert!(screen.keyboard_state().application_keypad);
+        screen.feed(b"\x1b>");
+        assert_eq!(
+            screen.keyboard_state(),
+            diri_proto::terminal_input::KeyboardState::default()
+        );
+    }
+
     use super::*;
 
     fn screen_with(input: &[u8]) -> HeadlessScreen {

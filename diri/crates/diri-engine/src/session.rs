@@ -260,6 +260,7 @@ impl PromptInputState {
 
 /// The state the pump thread and the outside world share.
 struct Shared {
+    keyboard_known: AtomicBool,
     id: String,
     status: Mutex<SessionStatus>,
     needs_input: Mutex<Option<NeedsInputDetail>>,
@@ -302,10 +303,44 @@ struct Shared {
 }
 
 struct RemoteGridState {
+    keyboard: RemoteKeyboardProjection,
     connection: diri_proto::RemoteConnection,
     mirror: GridMirror,
     revision: u64,
     pending: Option<diri_proto::grid::GridUpdate>,
+}
+
+/// One bounded staged input-state record, committed with its matching grid.
+#[derive(Default)]
+struct RemoteKeyboardProjection {
+    required: bool,
+    staged: Option<diri_proto::remote_pty::InputModes>,
+    committed: Option<diri_proto::terminal_input::KeyboardState>,
+}
+
+impl RemoteKeyboardProjection {
+    fn state_for(
+        &self,
+        sequence: u64,
+    ) -> std::io::Result<Option<diri_proto::terminal_input::KeyboardState>> {
+        if !self.required {
+            return Ok(None);
+        }
+        self.staged
+            .filter(|state| state.sequence == sequence)
+            .map(|state| Some(state.keyboard))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "grid publication has no matching keyboard state",
+                )
+            })
+    }
+
+    fn commit(&mut self, state: Option<diri_proto::terminal_input::KeyboardState>) {
+        self.committed = state;
+        self.staged = None;
+    }
 }
 
 impl Shared {
@@ -356,6 +391,7 @@ fn unix_secs() -> u64 {
 /// observable changed. Default is "never seen anything".
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct GridSignature {
+    pub keyboard: Option<diri_proto::terminal_input::KeyboardState>,
     pub content_seq: u64,
     pub size: (usize, usize),
     pub cursor: (u16, u16, bool),
@@ -446,6 +482,12 @@ fn grid_wake_event(state: &GridWakeState, observed: u64) -> GridWakeEvent {
         generation: state.generation,
         interactive: state.interactive_budget > 0 && state.generation != observed,
     }
+}
+
+pub(crate) struct TerminalPublication {
+    pub grid: Option<diri_proto::grid::GridUpdate>,
+    pub modes: (bool, bool, MouseModes),
+    pub keyboard: Option<diri_proto::terminal_input::KeyboardState>,
 }
 
 pub(crate) struct AttachmentSeed {
@@ -809,7 +851,9 @@ impl Session {
         )?);
         let log = OutputLog::writer(&spec.logs_dir, &spec.id)?;
         let shared = new_shared(&spec, log, &engine, true);
+        shared.keyboard_known.store(false, Ordering::SeqCst);
         *shared.remote_grid.lock().expect("remote grid") = Some(RemoteGridState {
+            keyboard: RemoteKeyboardProjection::default(),
             connection: diri_proto::RemoteConnection {
                 state: diri_proto::RemoteConnectionState::Connecting,
                 since: diri_proto::DateMillis::from(SystemTime::now()),
@@ -947,7 +991,9 @@ impl Session {
         shared
             .remote_output_offset
             .store(remote.output_offset, Ordering::SeqCst);
+        shared.keyboard_known.store(false, Ordering::SeqCst);
         *shared.remote_grid.lock().expect("remote grid") = Some(RemoteGridState {
+            keyboard: RemoteKeyboardProjection::default(),
             connection: diri_proto::RemoteConnection {
                 state: diri_proto::RemoteConnectionState::Connecting,
                 since: diri_proto::DateMillis::from(SystemTime::now()),
@@ -1408,6 +1454,7 @@ impl Session {
                         grid,
                         (alt_screen, bracketed_paste, mouse),
                         GridSignature {
+                            keyboard: remote.keyboard.committed,
                             content_seq: remote.revision,
                             size: (usize::from(cols), usize::from(rows)),
                             cursor: (cursor_col, cursor_row, cursor_visible),
@@ -1427,6 +1474,11 @@ impl Session {
                         screen.mouse_modes(),
                     ),
                     GridSignature {
+                        keyboard: self
+                            .shared
+                            .keyboard_known
+                            .load(Ordering::SeqCst)
+                            .then(|| screen.keyboard_state()),
                         content_seq: screen.content_seq(),
                         size: screen.size(),
                         cursor: screen.cursor(),
@@ -1453,6 +1505,14 @@ impl Session {
         &self,
         signature: &mut GridSignature,
     ) -> Option<diri_proto::grid::GridUpdate> {
+        self.terminal_publication(signature).grid
+    }
+
+    /// Capture grid and input modes under the same terminal/mirror lock.
+    pub(crate) fn terminal_publication(
+        &self,
+        signature: &mut GridSignature,
+    ) -> TerminalPublication {
         if let Some(remote) = self
             .shared
             .remote_grid
@@ -1462,37 +1522,59 @@ impl Session {
             && remote.mirror.sequence().is_some()
         {
             let (cols, rows) = remote.mirror.size();
-            let (cursor_col, cursor_row, cursor_visible) = remote.mirror.cursor();
-            let (alt_screen, _, mouse) = remote.mirror.modes();
+            let modes = remote.mirror.modes();
             let current = GridSignature {
+                keyboard: remote.keyboard.committed,
                 content_seq: remote.revision,
                 size: (usize::from(cols), usize::from(rows)),
-                cursor: (cursor_col, cursor_row, cursor_visible),
-                alt_screen,
-                mouse,
+                cursor: remote.mirror.cursor(),
+                alt_screen: modes.0,
+                mouse: modes.2,
             };
-            if current == *signature {
-                return None;
-            }
-            *signature = current;
-            return remote
-                .pending
-                .take()
-                .or_else(|| remote.mirror.full_update());
+            let grid = if current == *signature {
+                None
+            } else {
+                *signature = current;
+                remote
+                    .pending
+                    .take()
+                    .or_else(|| remote.mirror.full_update())
+            };
+            return TerminalPublication {
+                grid,
+                modes,
+                keyboard: current.keyboard,
+            };
         }
         let mut screen = self.shared.screen.lock().expect("screen");
+        let modes = (
+            screen.is_alt_screen(),
+            screen.bracketed_paste(),
+            screen.mouse_modes(),
+        );
         let current = GridSignature {
+            keyboard: self
+                .shared
+                .keyboard_known
+                .load(Ordering::SeqCst)
+                .then(|| screen.keyboard_state()),
             content_seq: screen.content_seq(),
             size: screen.size(),
             cursor: screen.cursor(),
-            alt_screen: screen.is_alt_screen(),
-            mouse: screen.mouse_modes(),
+            alt_screen: modes.0,
+            mouse: modes.2,
         };
-        if current == *signature {
-            return None;
+        let grid = if current == *signature {
+            None
+        } else {
+            *signature = current;
+            Some(screen.grid_update(false))
+        };
+        TerminalPublication {
+            grid,
+            modes,
+            keyboard: current.keyboard,
         }
-        *signature = current;
-        Some(screen.grid_update(false))
     }
 
     pub(crate) fn grid_wake(&self) -> GridWake {
@@ -1513,6 +1595,23 @@ impl Session {
             return remote.mirror.modes().1;
         }
         self.shared.screen.lock().expect("screen").bracketed_paste()
+    }
+
+    /// Unknown for old remote Holders until a negotiated, matching publication.
+    pub fn keyboard_state(&self) -> Option<diri_proto::terminal_input::KeyboardState> {
+        if let Some(remote) = self
+            .shared
+            .remote_grid
+            .lock()
+            .expect("remote grid")
+            .as_ref()
+        {
+            return remote.keyboard.committed;
+        }
+        self.shared
+            .keyboard_known
+            .load(Ordering::SeqCst)
+            .then(|| self.shared.screen.lock().expect("screen").keyboard_state())
     }
 
     /// Current alternate-screen, bracketed-paste, and granular mouse modes.
@@ -2036,6 +2135,7 @@ fn new_shared(
         })
         .map(|event| event.occurred_at);
     Arc::new(Shared {
+        keyboard_known: AtomicBool::new(true),
         id: spec.id.clone(),
         status: Mutex::new(initial_status),
         needs_input: Mutex::new(initial_detail),
@@ -2473,6 +2573,16 @@ fn handle_remote_message(
                     acknowledgement.foreground_pid,
                 );
             }
+            if let Some(remote) = shared.remote_grid.lock().expect("remote grid").as_mut() {
+                remote.keyboard = RemoteKeyboardProjection {
+                    required: acknowledgement.protocol.minor
+                        >= diri_proto::remote_pty::INPUT_MODES_PROTOCOL_MINOR
+                        && acknowledgement
+                            .capabilities
+                            .contains(&diri_proto::remote_pty::RemoteCapability::InputModes),
+                    ..RemoteKeyboardProjection::default()
+                };
+            }
             *hello_accepted = true;
             RemoteConnectionDisposition::Continue
         }
@@ -2551,6 +2661,22 @@ fn handle_remote_message(
         }
         RemoteMessage::Error(error) if error.fatal => RemoteConnectionDisposition::Fatal,
         RemoteMessage::Error(_) => RemoteConnectionDisposition::Continue,
+        RemoteMessage::InputModes(modes) => {
+            let mut remote = shared.remote_grid.lock().expect("remote grid");
+            let Some(remote) = remote.as_mut() else {
+                return RemoteConnectionDisposition::Fatal;
+            };
+            if !remote.keyboard.required
+                || remote
+                    .keyboard
+                    .staged
+                    .is_some_and(|old| old.sequence >= modes.sequence)
+            {
+                return RemoteConnectionDisposition::Fatal;
+            }
+            remote.keyboard.staged = Some(modes);
+            RemoteConnectionDisposition::Continue
+        }
         RemoteMessage::ForegroundProcess(foreground) => {
             apply_foreground_sample(
                 shared,
@@ -2627,6 +2753,7 @@ fn apply_remote_snapshot(
         let remote = remote
             .as_mut()
             .ok_or_else(|| std::io::Error::other("remote grid state is unavailable"))?;
+        let keyboard = remote.keyboard.state_for(snapshot.sequence)?;
         remote
             .mirror
             .apply_snapshot(
@@ -2637,6 +2764,7 @@ fn apply_remote_snapshot(
                 snapshot.mouse,
             )
             .map_err(std::io::Error::other)?;
+        remote.keyboard.commit(keyboard);
         remote.revision = remote.revision.saturating_add(1);
         remote.pending = Some(snapshot.grid.clone());
     }
@@ -2680,6 +2808,7 @@ fn apply_remote_delta(shared: &Shared, delta: GridDelta) -> std::io::Result<()> 
         let remote = remote
             .as_mut()
             .ok_or_else(|| std::io::Error::other("remote grid state is unavailable"))?;
+        let keyboard = remote.keyboard.state_for(delta.sequence)?;
         remote
             .mirror
             .apply_delta(
@@ -2690,6 +2819,7 @@ fn apply_remote_delta(shared: &Shared, delta: GridDelta) -> std::io::Result<()> 
                 delta.mouse,
             )
             .map_err(std::io::Error::other)?;
+        remote.keyboard.commit(keyboard);
         remote.revision = remote.revision.saturating_add(1);
         remote.pending = if remote.pending.is_some() {
             remote.mirror.full_update()
@@ -2704,22 +2834,33 @@ fn apply_remote_delta(shared: &Shared, delta: GridDelta) -> std::io::Result<()> 
 fn set_remote_connection(shared: &Shared, state: diri_proto::RemoteConnectionState) {
     // Reuse the existing mirror lock only at lifecycle transitions. Silent
     // sessions create no timer, new SSH operation, or repeated status event.
-    let changed = {
+    let (changed, keyboard_changed) = {
         let mut remote = shared.remote_grid.lock().expect("remote grid");
         if let Some(remote) = remote.as_mut()
             && remote.connection.state != state
         {
+            let keyboard_changed = state != diri_proto::RemoteConnectionState::Connected
+                && remote.keyboard.committed.is_some();
+            if state != diri_proto::RemoteConnectionState::Connected {
+                // Retain the last image, but never encode new input from modes
+                // observed before transport loss. A new validated seed restores them.
+                remote.keyboard.committed = None;
+                remote.keyboard.staged = None;
+            }
             remote.connection = diri_proto::RemoteConnection {
                 state,
                 since: diri_proto::DateMillis::from(SystemTime::now()),
             };
-            true
+            (true, keyboard_changed)
         } else {
-            false
+            (false, false)
         }
     };
     if changed {
         shared.bump_state_version();
+    }
+    if keyboard_changed {
+        shared.grid_wake.notify();
     }
 }
 
@@ -3087,6 +3228,12 @@ fn pump_held(
                     checkpoint.mouse,
                 );
                 if restored {
+                    shared
+                        .keyboard_known
+                        .store(checkpoint.keyboard.is_some(), Ordering::SeqCst);
+                    if let Some(keyboard) = checkpoint.keyboard {
+                        screen.restore_keyboard_state(keyboard);
+                    }
                     screen.restore_history_metadata(&checkpoint.history_metadata);
                 }
                 restored
@@ -3098,12 +3245,11 @@ fn pump_held(
                 watcher,
                 checkpoint.marker_buffer,
             ),
-            None => (
-                checkpoint_path,
-                log.preferred_replay_start(replay_budget),
-                watcher,
-                Vec::new(),
-            ),
+            None => {
+                let start = log.preferred_replay_start(replay_budget);
+                shared.keyboard_known.store(start == 0, Ordering::SeqCst);
+                (checkpoint_path, start, watcher, Vec::new())
+            }
         }
     };
     // Adoption can restore a checkpoint concurrently with a freshly attached
@@ -3563,6 +3709,7 @@ fn mark_launch_failed(shared: &Shared) {
 /// byte-identical checkpoint that need not be rewritten.
 #[derive(Clone, Copy, PartialEq)]
 struct CheckpointKey {
+    keyboard: Option<diri_proto::terminal_input::KeyboardState>,
     offset: u64,
     content_seq: u64,
     marker_bytes: usize,
@@ -3580,7 +3727,16 @@ fn persist_checkpoint(
     marker_buffer: &[u8],
     last_key: &mut Option<CheckpointKey>,
 ) {
-    let (history, history_metadata, grid, alt_screen, bracketed_paste, mouse, content_seq) = {
+    let (
+        history,
+        history_metadata,
+        grid,
+        alt_screen,
+        bracketed_paste,
+        mouse,
+        content_seq,
+        keyboard,
+    ) = {
         let screen = shared.screen.lock().expect("screen");
         (
             screen.history_snapshot(),
@@ -3590,9 +3746,14 @@ fn persist_checkpoint(
             screen.bracketed_paste(),
             screen.mouse_modes(),
             screen.content_seq(),
+            shared
+                .keyboard_known
+                .load(Ordering::SeqCst)
+                .then(|| screen.keyboard_state()),
         )
     };
     let key = CheckpointKey {
+        keyboard,
         offset,
         content_seq,
         marker_bytes: marker_buffer.len(),
@@ -3604,6 +3765,7 @@ fn persist_checkpoint(
         return;
     }
     let checkpoint = crate::checkpoint::ScreenCheckpoint {
+        keyboard,
         log_offset: offset,
         history,
         history_metadata,
@@ -3885,6 +4047,48 @@ mod prompt_title_tests {
 
 #[cfg(test)]
 mod grid_wake_tests {
+    #[test]
+    fn remote_keyboard_state_is_unknown_until_matching_grid_commit() {
+        use super::RemoteKeyboardProjection;
+        use diri_proto::remote_pty::InputModes;
+        use diri_proto::terminal_input::KeyboardState;
+        let state = KeyboardState {
+            application_cursor_keys: true,
+            application_keypad: false,
+        };
+        let mut projection = RemoteKeyboardProjection {
+            required: true,
+            ..Default::default()
+        };
+        assert!(projection.state_for(8).is_err());
+        projection.staged = Some(InputModes {
+            sequence: 8,
+            keyboard: state,
+        });
+        assert_eq!(projection.committed, None);
+        assert!(projection.state_for(7).is_err());
+        let matched = projection.state_for(8).unwrap();
+        assert_eq!(
+            projection.committed, None,
+            "validation alone must not publish"
+        );
+        projection.commit(matched);
+        assert_eq!(projection.committed, Some(state));
+        assert!(projection.staged.is_none());
+        projection = RemoteKeyboardProjection {
+            required: true,
+            ..Default::default()
+        };
+        assert!(
+            projection.state_for(8).is_err(),
+            "reconnect does not reuse old state"
+        );
+        assert_eq!(
+            RemoteKeyboardProjection::default().state_for(8).unwrap(),
+            None
+        );
+    }
+
     use std::time::Duration;
 
     use super::GridWake;
@@ -4070,7 +4274,7 @@ mod remote_connection_tests {
                 protocol: diri_proto::remote_pty::ProtocolVersion::CURRENT,
                 holder_build_id: "fixture".into(),
                 session_incarnation: "same-incarnation".into(),
-                capabilities: diri_proto::remote_pty::PHASE_ONE_HOLDER_CAPABILITIES.to_vec(),
+                capabilities: diri_proto::remote_pty::ANNOTATED_HOLDER_CAPABILITIES.to_vec(),
                 controller_epoch: 1,
                 process_state: RemoteProcessState::Running { pid },
                 output_offset: 0,
@@ -4089,6 +4293,16 @@ mod remote_connection_tests {
             for (name, message) in [
                 ("hello.bin", hello),
                 ("snapshot.bin", snapshot),
+                (
+                    "modes.bin",
+                    RemoteMessage::InputModes(diri_proto::remote_pty::InputModes {
+                        sequence: 1,
+                        keyboard: diri_proto::terminal_input::KeyboardState {
+                            application_cursor_keys: true,
+                            application_keypad: true,
+                        },
+                    }),
+                ),
                 (
                     "fatal.bin",
                     RemoteMessage::Terminal(diri_proto::frames::Frame::input(
@@ -4116,13 +4330,13 @@ mod remote_connection_tests {
 cd "$(dirname "$0")" || exit 1
 printf x >> attaches
 if mkdir first 2>/dev/null; then
-  cat hello.bin
+  cat hello.bin modes.bin
   while [ ! -f seed ]; do sleep 0.01; done
   cat snapshot.bin
   while [ ! -f disconnect ]; do sleep 0.01; done
 else
   while [ ! -f reconnect ]; do sleep 0.01; done
-  cat hello.bin snapshot.bin
+  cat hello.bin modes.bin snapshot.bin
   while [ ! -f finish ]; do sleep 0.01; done
   if [ -f fatal ]; then cat fatal.bin; else cat exit.bin; fi
 fi
@@ -4194,10 +4408,32 @@ fi
                     .sequence()
                     .is_none()
             );
+            wait_for("staged input modes", || {
+                session
+                    .shared
+                    .remote_grid
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .keyboard
+                    .staged
+                    .is_some()
+            });
+            assert_eq!(
+                session.keyboard_state(),
+                None,
+                "modes wait for their validated grid"
+            );
             std::fs::write(temp.path().join("seed"), "").unwrap();
             wait_for("validated snapshot", || {
                 session.view().remote_connection.unwrap().state == State::Connected
             });
+            let keyboard = Some(diri_proto::terminal_input::KeyboardState {
+                application_cursor_keys: true,
+                application_keypad: true,
+            });
+            assert_eq!(session.keyboard_state(), keyboard);
             let seed = session.preview_seed().grid;
             let connected = session.view().remote_connection.unwrap();
             let version = session.state_version();
@@ -4212,6 +4448,11 @@ fi
             wait_for("bridge EOF", || {
                 session.view().remote_connection.unwrap().state == State::Reconnecting
             });
+            assert_eq!(
+                session.keyboard_state(),
+                None,
+                "EOF clears stale input modes immediately"
+            );
             assert_eq!(session.child_pid(), pid as i32);
             assert!(process.0.try_wait().unwrap().is_none());
             assert_eq!(session.preview_seed().grid, seed);
@@ -4222,12 +4463,14 @@ fi
             });
             assert_eq!(session.child_pid(), pid as i32);
             assert_eq!(session.preview_seed().grid, seed);
+            assert_eq!(session.keyboard_state(), keyboard);
             if fatal {
                 std::fs::write(temp.path().join("fatal"), "").unwrap();
                 std::fs::write(temp.path().join("finish"), "").unwrap();
                 wait_for("fatal transport", || {
                     session.view().remote_connection.unwrap().state == State::Failed
                 });
+                assert_eq!(session.keyboard_state(), None);
                 assert_eq!(session.view().status, SessionStatus::Unknown);
                 assert!(!session.view().exited);
                 assert!(!crate::events::satisfies_wait_target(
@@ -4247,6 +4490,9 @@ fi
             assert_eq!(process.0.wait().unwrap().code(), Some(126));
             std::fs::write(temp.path().join("finish"), "").unwrap();
             wait_for("real exit126 fact", || session.view().exited);
+            wait_for("exit clears keyboard modes", || {
+                session.keyboard_state().is_none()
+            });
             assert_eq!(
                 session.view().remote_connection.unwrap().state,
                 State::Exited

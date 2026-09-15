@@ -83,7 +83,7 @@ fn run(arguments: &[String]) -> Result<(), CliError> {
 fn print_help() {
     println!(
         "dirijor — Diri automation CLI\n\n\
-         Usage:\n  dirijor status [--json]\n  dirijor activity [--limit N] [--json]\n  dirijor session <list|get|read|send|wait|spawn|fork|reconnect|release|archive> ...\n  \
+         Usage:\n  dirijor status [--json]\n  dirijor activity [--limit N] [--json]\n  dirijor session <list|get|read|send|key|wait|spawn|fork|reconnect|release|archive> ...\n  \
          dirijor worktree <list|create|remove> ...\n  dirijor artifacts <session> [--json]\n  \
          dirijor events <subscribe|wait> ...\n  dirijor ports [--json]\n  dirijor doctor\n  \
          dirijor hook <event>\n  dirijor notify <json>\n  dirijor notify --title TEXT --body TEXT\n  dirijor mcp-tools\n  \
@@ -357,6 +357,7 @@ fn session(arguments: &[String]) -> Result<(), CliError> {
         "get" => session_get(rest),
         "read" => session_read(rest),
         "send" => session_send(rest),
+        "key" => session_key(rest),
         "wait" => session_wait(rest),
         "spawn" => session_spawn(rest),
         "fork" => session_fork(rest),
@@ -538,6 +539,105 @@ fn session_read(arguments: &[String]) -> Result<(), CliError> {
         for line in lines {
             println!("{line}");
         }
+    }
+    Ok(())
+}
+
+fn session_key(arguments: &[String]) -> Result<(), CliError> {
+    use diri_proto::terminal_input::{Key, KeyAction, KeypadKey, Modifiers, NamedKey};
+    if arguments.len() < 2 || arguments[0].starts_with("--") {
+        return Err(CliError::failure(
+            "session key requires ID KEY [--ctrl] [--alt] [--shift] [--cmd] [--repeat|--release] [--json]",
+        ));
+    }
+    let mut modifiers = Modifiers::default();
+    let mut action = KeyAction::Press;
+    let mut json_output = false;
+    let mut seen = std::collections::HashSet::new();
+    for option in &arguments[2..] {
+        if !seen.insert(option.as_str()) {
+            return Err(CliError::failure(format!("duplicate key option: {option}")));
+        }
+        match option.as_str() {
+            "--ctrl" => modifiers.ctrl = true,
+            "--alt" => modifiers.alt = true,
+            "--shift" => modifiers.shift = true,
+            "--cmd" => modifiers.cmd = true,
+            "--json" => json_output = true,
+            "--repeat" | "--release" if action == KeyAction::Press => {
+                action = if option == "--repeat" {
+                    KeyAction::Repeat
+                } else {
+                    KeyAction::Release
+                };
+            }
+            _ => {
+                return Err(CliError::failure(format!(
+                    "unsupported key option: {option}"
+                )));
+            }
+        }
+    }
+    let raw = arguments[1].as_str();
+    let key = if let Some(name) = raw.strip_prefix("keypad:") {
+        let name = match name {
+            "0" => "zero",
+            "1" => "one",
+            "2" => "two",
+            "3" => "three",
+            "4" => "four",
+            "5" => "five",
+            "6" => "six",
+            "7" => "seven",
+            "8" => "eight",
+            "9" => "nine",
+            other => other,
+        };
+        Key::Keypad(
+            serde_json::from_value::<KeypadKey>(json!(name))
+                .map_err(|_| CliError::failure("unknown keypad key"))?,
+        )
+    } else {
+        let name = match raw {
+            "up" => "arrow-up",
+            "down" => "arrow-down",
+            "left" => "arrow-left",
+            "right" => "arrow-right",
+            "pageup" => "page-up",
+            "pagedown" => "page-down",
+            "esc" => "escape",
+            "return" => "enter",
+            other => other,
+        };
+        match serde_json::from_value::<NamedKey>(json!(name)) {
+            Ok(key) => Key::Named(key),
+            Err(_) => Key::Character(raw.to_owned()),
+        }
+    };
+    let params = diri_proto::SendKeyParams {
+        session_id: diri_proto::SessionId(arguments[0].clone()),
+        key,
+        modifiers,
+        action,
+    };
+    params.event().map_err(CliError::failure)?;
+    if action == KeyAction::Release {
+        return Err(CliError::failure(
+            "key release is unsupported by the current keyboard protocol",
+        ));
+    }
+    let result = request(
+        Method::SESSION_SEND_KEY,
+        serde_json::to_value(&params).map_err(|error| CliError::failure(error.to_string()))?,
+        Duration::from_secs(10),
+    )?;
+    if json_output {
+        print_json(&result);
+    } else {
+        println!(
+            "accepted {} input bytes for {}",
+            result["bytesAccepted"], params.session_id.0
+        );
     }
     Ok(())
 }

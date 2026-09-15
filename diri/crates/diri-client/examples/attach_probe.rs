@@ -122,12 +122,13 @@ async fn main() {
                 }
             }
             TerminalChunk::Modes {
+                keyboard,
                 alt_screen,
                 bracketed_paste,
                 mouse,
             } => {
                 eprintln!(
-                    "[{:>7.1?}] modes alt={alt_screen} bp={bracketed_paste} mouse={mouse:?}",
+                    "[{:>7.1?}] modes alt={alt_screen} bp={bracketed_paste} mouse={mouse:?} keyboard={keyboard:?}",
                     start.elapsed()
                 );
             }

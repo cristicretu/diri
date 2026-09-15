@@ -18,7 +18,8 @@ use crate::grid::{GridCodecError, GridUpdate};
 use crate::terminal::MouseModes;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 7;
+pub const PROTOCOL_MINOR: u16 = 9;
+pub const INPUT_MODES_PROTOCOL_MINOR: u16 = 9;
 pub const TERMINAL_ANNOTATIONS_PROTOCOL_MINOR: u16 = 6;
 pub const MOUSE_INPUT_PROTOCOL_MINOR: u16 = 4;
 pub const FOREGROUND_PROCESS_PROTOCOL_MINOR: u16 = 5;
@@ -51,6 +52,7 @@ const KIND_GRID_DELTA: u8 = 42;
 const KIND_SCROLLBACK_REQUEST: u8 = 43;
 const KIND_SCROLLBACK_RESPONSE: u8 = 44;
 const KIND_FOREGROUND_PROCESS: u8 = 45;
+const KIND_INPUT_MODES: u8 = 46;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -78,6 +80,8 @@ pub enum RemoteCapability {
     FullSnapshot,
     #[serde(rename = "terminal-annotations-v1")]
     TerminalAnnotations,
+    #[serde(rename = "terminal-input-modes-v1")]
+    InputModes,
     IncrementalGrid,
     ProcessExit,
     Signal,
@@ -115,6 +119,7 @@ impl RemoteCapability {
     pub const fn wire_name(self) -> &'static str {
         match self {
             Self::TerminalAnnotations => "terminal-annotations-v1",
+            Self::InputModes => "terminal-input-modes-v1",
             Self::FullSnapshot => "full-snapshot",
             Self::IncrementalGrid => "incremental-grid",
             Self::ProcessExit => "process-exit",
@@ -177,6 +182,7 @@ pub const ANNOTATED_HOLDER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::ControllerLease,
     RemoteCapability::Scrollback,
     RemoteCapability::TerminalAnnotations,
+    RemoteCapability::InputModes,
 ];
 pub const ANNOTATED_HELPER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::FullSnapshot,
@@ -193,6 +199,7 @@ pub const ANNOTATED_HELPER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::PersistenceProbe,
     RemoteCapability::AtomicActivation,
     RemoteCapability::TerminalAnnotations,
+    RemoteCapability::InputModes,
 ];
 
 /// Authentication bearer shared only by the local Engine and one Holder.
@@ -299,6 +306,15 @@ impl HelloAck {
         validate_identifier("holder build id", &self.holder_build_id)?;
         validate_identifier("session incarnation", &self.session_incarnation)
     }
+}
+
+/// Input state staged before the grid publication with the exact same sequence.
+/// A receiver commits this state only after accepting that snapshot or delta.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InputModes {
+    pub sequence: u64,
+    pub keyboard: crate::terminal_input::KeyboardState,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -793,6 +809,7 @@ pub enum RemoteMessage {
     ScrollbackResponse(ScrollbackResponse),
     Error(RemoteError),
     ForegroundProcess(ForegroundProcess),
+    InputModes(InputModes),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -978,6 +995,7 @@ impl RemoteCodec {
                 append_json(KIND_SCROLLBACK_RESPONSE, value, output, start)
             }
             RemoteMessage::Error(value) => append_json(KIND_ERROR, value, output, start),
+            RemoteMessage::InputModes(value) => append_json(KIND_INPUT_MODES, value, output, start),
             RemoteMessage::ForegroundProcess(value) => {
                 append_json(KIND_FOREGROUND_PROCESS, value, output, start)
             }
@@ -1180,6 +1198,7 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
             kind, payload,
         )?)),
         KIND_ERROR => Ok(RemoteMessage::Error(decode_json(kind, payload)?)),
+        KIND_INPUT_MODES => Ok(RemoteMessage::InputModes(decode_json(kind, payload)?)),
         KIND_FOREGROUND_PROCESS => Ok(RemoteMessage::ForegroundProcess(decode_json(
             kind, payload,
         )?)),
@@ -1189,7 +1208,7 @@ fn decode_message(kind: u8, payload: &[u8]) -> Result<RemoteMessage, RemoteCodec
 
 fn validate_kind(kind: u8) -> Result<(), RemoteCodecError> {
     if (1..=FrameType::Mouse as u8).contains(&kind)
-        || (KIND_HELLO..=KIND_FOREGROUND_PROCESS).contains(&kind)
+        || (KIND_HELLO..=KIND_INPUT_MODES).contains(&kind)
     {
         Ok(())
     } else {
