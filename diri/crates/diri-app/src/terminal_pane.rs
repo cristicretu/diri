@@ -914,6 +914,14 @@ impl TerminalPane {
         cx.notify();
     }
 
+    /// Paint-only previews must not reconcile residency or acquire a controller.
+    pub fn resident_preview_buffers(&self) -> HashMap<SessionId, SharedGridBuffer> {
+        self.residents
+            .iter()
+            .map(|(id, resident)| (id.clone(), resident.element.buffer()))
+            .collect()
+    }
+
     pub fn resident_buffers(&mut self) -> HashMap<SessionId, SharedGridBuffer> {
         self.reconcile_residency();
         self.residents
@@ -941,6 +949,17 @@ impl TerminalPane {
         }
         self.viewport = Some(viewport);
         cx.notify();
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn seed_preview_grid_for_test(&mut self, grid: GridBuffer) {
+        self.reconcile_residency();
+        if let Some(id) = self.selected_id()
+            && let Some(resident) = self.residents.get_mut(&id)
+        {
+            *resident.element.buffer().write().unwrap() = grid;
+            resident.attachment_state = AttachmentState::Live;
+        }
     }
 
     #[cfg(test)]
