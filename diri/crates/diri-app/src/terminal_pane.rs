@@ -951,7 +951,7 @@ impl TerminalPane {
         cx.notify();
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn seed_preview_grid_for_test(&mut self, grid: GridBuffer) {
         self.reconcile_residency();
         if let Some(id) = self.selected_id()
