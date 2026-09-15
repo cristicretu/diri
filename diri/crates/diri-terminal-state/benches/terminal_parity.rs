@@ -122,6 +122,21 @@ fn main() {
         std::env::consts::OS
     );
     black_box(sample(1, 1));
+    if std::env::args().any(|arg| arg == "--short-history-gate") {
+        for lines in [23, 24, 25] {
+            let measured = sample(1, lines);
+            println!(
+                "{lines}-line core: {} bytes after publication, {} history rows",
+                measured.published_bytes, measured.history_rows
+            );
+            assert_eq!(measured.history_rows, (lines + 1 - ROWS) as i64);
+            assert!(
+                measured.published_bytes <= 192 * 1024,
+                "short terminal history exceeds 192 KiB requested-heap budget"
+            );
+        }
+        return;
+    }
     if std::env::args().any(|arg| arg == "--empty-gate") {
         let measured = sample(1, 0);
         println!("empty core requested heap: {} bytes", measured.fresh_bytes);

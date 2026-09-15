@@ -25,3 +25,17 @@ already participates in the Remote Helper Build ID; live Holders keep their bina
 The resource gate and actual-parser screen-switch/resize/reset regressions live
 in `diri-terminal-state`; run `cargo bench -p diri-terminal-state --bench
 terminal_parity -- --empty-gate` from the workspace for the allocation gate.
+
+## Spare history-row allocation
+
+Storage still grows in batches and reuses cleared rows. Its batch and shrink
+cache limit now scales with row byte size: at most 1,000 rows and about 64 KiB
+of newly allocated rows, with a minimum of one row. A request for more live rows
+is always satisfied. The reserve includes cell and row-descriptor sizes; existing
+Vec capacity and rows retained through reflow are not a total-memory guarantee.
+
+Previously, the first history row eagerly allocated 1,000 rows, even at wide
+terminal dimensions. The change preserves ring indexing, row identity, history
+limits, resize/reflow and serialized formats. It trades smaller growth batches
+for lower retained heap. The short-history resource gate covers both sides of
+the first-scroll boundary; upstream storage tests cover indexing and rotation.
