@@ -656,3 +656,13 @@ complete verified packaged catalog instead of executing a native test Helper.
 test executables on another machine. The SSH soak installs a versioned Helper
 beside existing builds, creates a nonce-named shell session, and kills only that
 session on completion/failure. Installed Helper builds remain available for GC.
+
+Final verification after merging current `main` repeated the same gates with
+format 3: Forge append max **0.813 ms** (median **53.6 µs**), impaired TCP
+median/p90/max **144 / 165 / 493 ms**, history **141 ms**, and **9 packet drops**.
+The real SSH rerun measured median/p90/max **138 / 191 / 275 ms** and history
+**197 ms**. These differing WAN/loss samples are repeatability checks, not a
+controlled before/after network-speed comparison. Workspace validation passed
+**1,612 tests** (34 intentionally ignored), formatting, clippy, and release build;
+Linux-specific remote clippy, local Holder latency/load/slow-attach gates, and
+the signed three-platform app bundle/catalog verification also passed.
