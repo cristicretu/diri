@@ -13,6 +13,7 @@ pub(crate) enum GestureFrame {
     Cancelled,
     #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
     Tracking(f32),
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
     Released(f32),
 }
 
