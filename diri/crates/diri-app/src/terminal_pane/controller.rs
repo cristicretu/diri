@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use diri_client::attachment::{AttachmentClosed, SessionAttachmentHandle};
 use diri_term::element::TerminalDamageObserver;
 use gpui::{App, Global};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{Notify, oneshot, watch};
 
 use super::*;
 
@@ -51,8 +51,11 @@ struct SessionController {
 
 struct ControlState {
     owner: u64,
+    ownership_revision: u64,
     writer: Option<SessionAttachmentHandle>,
     last_resize: Option<(u16, u16)>,
+    pending_resize: Option<(u16, u16)>,
+    resize_wake: Arc<Notify>,
 }
 
 /// Accepted means queued locally. There is no PTY delivery acknowledgement.
@@ -88,12 +91,35 @@ impl AttachmentControl {
         let mut state = self.state.lock().unwrap();
         if state.owner != self.view {
             state.owner = self.view;
+            state.ownership_revision = state.ownership_revision.wrapping_add(1);
             state.last_resize = None;
+            state.pending_resize = None;
+            state.resize_wake.notify_one();
         }
     }
 
+    pub(super) fn release(&self) {
+        let mut state = self.state.lock().unwrap();
+        if state.owner == self.view {
+            state.owner = 0;
+            state.ownership_revision = state.ownership_revision.wrapping_add(1);
+            state.last_resize = None;
+            state.pending_resize = None;
+            state.resize_wake.notify_one();
+        }
+    }
+
+    pub(super) fn ownership_revision(&self) -> u64 {
+        self.state.lock().unwrap().ownership_revision
+    }
+
+    pub(super) fn resize_if_current(&self, size: (u16, u16), revision: u64) {
+        let _ = self.submit_at(AttachmentCommand::Resize(size.0, size.1), Some(revision));
+    }
+
     pub(super) fn needs_resize(&self, size: (u16, u16)) -> bool {
-        self.state.lock().unwrap().last_resize != Some(size)
+        let state = self.state.lock().unwrap();
+        state.pending_resize.or(state.last_resize) != Some(size)
     }
 
     pub(super) fn is_controller(&self) -> bool {
@@ -101,25 +127,45 @@ impl AttachmentControl {
     }
 
     fn submit(&self, command: AttachmentCommand) -> Result<(), InputRejection> {
+        self.submit_at(command, None)
+    }
+
+    fn submit_at(
+        &self,
+        command: AttachmentCommand,
+        revision: Option<u64>,
+    ) -> Result<(), InputRejection> {
         let mut state = self.state.lock().unwrap();
-        if state.owner != self.view {
+        if state.owner != self.view
+            || revision.is_some_and(|revision| revision != state.ownership_revision)
+        {
             return Err(InputRejection::PassiveView);
         }
-        let resize = if let AttachmentCommand::Resize(cols, rows) = command {
-            // Desired geometry survives connection setup, unlike keystrokes.
-            if state.writer.is_none() {
-                state.last_resize = Some((cols, rows));
-                return Ok(());
+        if let AttachmentCommand::Resize(cols, rows) = command {
+            let size = (cols, rows);
+            let result = match &state.writer {
+                Some(writer) => writer.resize(cols, rows),
+                None => Ok(()), // Desired geometry survives connection setup.
+            };
+            match result {
+                Ok(()) => {
+                    state.last_resize = Some(size);
+                    state.pending_resize = None;
+                }
+                Err(_) => {
+                    state.pending_resize = Some(size);
+                    state.resize_wake.notify_one();
+                }
             }
-            Some((cols, rows))
-        } else {
-            None
-        };
+            // Geometry is a coalesced request, not rejected user typing. The
+            // worker reserves capacity and admits only the latest owned size.
+            return Ok(());
+        }
         let writer = state.writer.as_ref().ok_or(InputRejection::Disconnected)?;
         let result = match command {
             AttachmentCommand::Input(bytes) => writer.send_input(bytes),
             AttachmentCommand::Mouse(bytes) => writer.send_mouse(bytes),
-            AttachmentCommand::Resize(cols, rows) => writer.resize(cols, rows),
+            AttachmentCommand::Resize(_, _) => unreachable!("resize handled above"),
             AttachmentCommand::Scroll {
                 direction,
                 lines,
@@ -127,11 +173,6 @@ impl AttachmentControl {
                 row,
             } => writer.scroll(direction, lines, col, row),
         };
-        if result.is_ok()
-            && let Some(size) = resize
-        {
-            state.last_resize = Some(size);
-        }
         result.map_err(|error| match error {
             AttachmentClosed::Backpressure => InputRejection::Overloaded,
             AttachmentClosed::Closed => InputRejection::Disconnected,
@@ -162,9 +203,7 @@ impl AttachmentControl {
 
     pub(super) fn resize(&self, cols: u16, rows: u16) {
         // A delayed resize from a view that lost focus is simply obsolete.
-        if self.is_controller() {
-            self.report(self.submit(AttachmentCommand::Resize(cols, rows)));
-        }
+        let _ = self.submit(AttachmentCommand::Resize(cols, rows));
     }
 
     pub(super) fn mouse(&self, bytes: Vec<u8>) {
@@ -212,8 +251,11 @@ impl ControllerLease {
             let (shutdown, shutdown_rx) = oneshot::channel();
             let control = Arc::new(Mutex::new(ControlState {
                 owner: 0,
+                ownership_revision: 0,
                 writer: None,
                 last_resize: None,
+                pending_resize: None,
+                resize_wake: Arc::new(Notify::new()),
             }));
             let session = Rc::new(RefCell::new(SessionController {
                 id: id.clone(),
@@ -271,12 +313,8 @@ impl ControllerLease {
         });
         let view = NEXT_VIEW.fetch_add(1, Ordering::Relaxed);
         let mut core = session.borrow_mut();
-        {
-            let mut control = core.control.lock().unwrap();
-            if control.owner == 0 {
-                control.owner = view;
-            }
-        }
+        // Hydration may mount a session first in an inactive window. Only an
+        // explicit active-window/pane claim grants input and resize authority.
         let attachment = AttachmentControl {
             state: core.control.clone(),
             view,
@@ -355,6 +393,10 @@ impl Drop for ControllerLease {
         if control.owner == self.view {
             // No hidden passive view gets authority without an explicit focus.
             control.owner = 0;
+            control.ownership_revision = control.ownership_revision.wrapping_add(1);
+            control.last_resize = None;
+            control.pending_resize = None;
+            control.resize_wake.notify_one();
         }
     }
 }
@@ -482,15 +524,47 @@ fn spawn_transport(
                 result = tokio::time::timeout(Duration::from_secs(2), connect) => result,
             };
             if let Ok(Ok(mut attachment)) = connected {
-                {
+                let writer = attachment.handle();
+                let resize_wake = {
                     let mut state = control.lock().unwrap();
-                    let writer = attachment.handle();
-                    if let Some((cols, rows)) = state.last_resize { let _ = writer.resize(cols, rows); }
-                    state.writer = Some(writer);
-                }
+                    if let Some(size) = state.pending_resize.take().or(state.last_resize) {
+                        let _ = writer.resize(size.0, size.1);
+                        state.last_resize = Some(size);
+                    }
+                    state.writer = Some(writer.clone());
+                    state.resize_wake.clone()
+                };
                 let _ = events.send(PaneEvent::AttachmentState(id.clone(), 0, AttachmentState::Live));
+                let mut resize_wait = None;
                 let stopping = loop {
+                    let pending_resize = {
+                        let state = control.lock().unwrap();
+                        state.owner != 0 && state.pending_resize.is_some()
+                    };
+                    if pending_resize && resize_wait.is_none() {
+                        let writer = writer.clone();
+                        resize_wait = Some(Box::pin(async move { writer.reserve_resize().await }));
+                    } else if !pending_resize { resize_wait = None; }
                     tokio::select! {
+                        _ = resize_wake.notified() => {},
+                        reservation = async {
+                            match &mut resize_wait {
+                                Some(wait) => wait.await,
+                                None => std::future::pending().await,
+                            }
+                        } => {
+                            resize_wait = None;
+                            match reservation {
+                                Ok(reservation) => {
+                                    let mut state = control.lock().unwrap();
+                                    if state.owner != 0 && let Some(size) = state.pending_resize.take() {
+                                        reservation.send(size.0, size.1);
+                                        state.last_resize = Some(size);
+                                    }
+                                }
+                                Err(_) => break false,
+                            }
+                        }
                         _ = &mut shutdown => break true,
                         chunk = attachment.chunks.recv() => match chunk {
                             Some(chunk) => { let _ = events.send(PaneEvent::Chunk(id.clone(), 0, chunk)); }
@@ -498,6 +572,7 @@ fn spawn_transport(
                         }
                     }
                 };
+                drop(resize_wait);
                 // Linearize closed admission before draining. The existing
                 // single queue keeps all commands accepted before this point.
                 control.lock().unwrap().writer = None;
@@ -649,8 +724,11 @@ mod tests {
         let state = || {
             Arc::new(Mutex::new(ControlState {
                 owner: 1,
+                ownership_revision: 0,
                 writer: None,
                 last_resize: None,
+                pending_resize: None,
+                resize_wake: Arc::new(Notify::new()),
             }))
         };
         let (prior_done, prior) = watch::channel(false);
@@ -704,8 +782,11 @@ mod tests {
         let control = AttachmentControl {
             state: Arc::new(Mutex::new(ControlState {
                 owner: 1,
+                ownership_revision: 0,
                 writer: None,
                 last_resize: None,
+                pending_resize: None,
+                resize_wake: Arc::new(Notify::new()),
             })),
             view: 1,
             events,
@@ -730,13 +811,15 @@ mod tests {
     }
 
     #[gpui::test]
-    fn rejected_resize_remains_pending_until_queue_capacity_returns(cx: &mut TestAppContext) {
+    fn stalled_writer_coalesces_resizes_without_feedback_or_stale_owner_geometry(
+        cx: &mut TestAppContext,
+    ) {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        let engine = FakeEngine::start(&runtime);
-        let (events, _rx) = pane_event_channel();
+        let mut engine = FakeEngine::start(&runtime);
+        let (events, rx) = pane_event_channel();
         let (lease, control, _) = cx.update(|cx| {
             ControllerLease::mount(
                 engine.path.clone(),
@@ -752,24 +835,115 @@ mod tests {
             control.state.lock().unwrap().writer.is_some()
                 && engine.connects.load(Ordering::SeqCst) == 1
         });
-        // The single-thread runtime is parked: this occupies the complete byte
-        // budget before the writer can retire any command.
+        assert!(!control.is_controller(), "first mount starts passive");
+        control.claim();
+        // Park the socket writer with its entire byte budget occupied while
+        // GPUI keeps processing layout. Geometry must create no feedback loop.
         control
             .submit(AttachmentCommand::Input(vec![b'x'; 1024 * 1024]))
             .unwrap();
+        for cols in 40..140 {
+            control.resize(cols, 30);
+            cx.run_until_parked();
+        }
         assert_eq!(
-            control.submit(AttachmentCommand::Resize(90, 30)),
-            Err(InputRejection::Overloaded)
+            control.state.lock().unwrap().pending_resize,
+            Some((139, 30))
         );
         assert!(
-            control.needs_resize((90, 30)),
-            "rejected geometry cannot be marked sent"
+            !control.needs_resize((139, 30)),
+            "pending geometry does not request another render retry"
+        );
+        assert!(
+            !rx.state
+                .lock()
+                .unwrap()
+                .events
+                .iter()
+                .any(|event| matches!(event, PaneEvent::InputFeedback(..)))
+        );
+        control.input(b"rejected typing".to_vec());
+        assert_eq!(
+            rx.state
+                .lock()
+                .unwrap()
+                .events
+                .iter()
+                .filter(|event| matches!(event, PaneEvent::InputFeedback(..)))
+                .count(),
+            1,
+            "actual rejected input remains visible"
         );
         wait_for(cx, &runtime, || {
-            control.submit(AttachmentCommand::Resize(90, 30)).is_ok()
+            control.state.lock().unwrap().pending_resize.is_none()
         });
-        assert!(!control.needs_resize((90, 30)));
+        let next_resize = |engine: &mut FakeEngine| {
+            runtime.block_on(async {
+                loop {
+                    let frame = tokio::time::timeout(Duration::from_secs(2), engine.frames.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    if let Some(size) = frame.resize_payload() {
+                        break size;
+                    }
+                }
+            })
+        };
+        assert_eq!(
+            next_resize(&mut engine),
+            (139, 30),
+            "latest geometry drains without any new layout or feedback event"
+        );
+
+        control
+            .submit(AttachmentCommand::Input(vec![b'y'; 1024 * 1024]))
+            .unwrap();
+        control.resize(200, 40);
+        let (next_events, _next_rx) = pane_event_channel();
+        let (next_lease, next, _) = cx.update(|cx| {
+            ControllerLease::mount(
+                engine.path.clone(),
+                SessionId("shared-session".into()),
+                runtime.handle(),
+                next_events,
+                2,
+                None,
+                cx,
+            )
+        });
+        next.claim();
+        assert!(
+            next.state.lock().unwrap().pending_resize.is_none(),
+            "transfer cancels unadmitted old geometry"
+        );
+        next.resize(77, 22);
+        control.resize(250, 50); // stale view cannot replace the new request
+        wait_for(cx, &runtime, || {
+            next.state.lock().unwrap().pending_resize.is_none()
+        });
+        assert_eq!(next_resize(&mut engine), (77, 22));
+        let old_revision = next.ownership_revision();
+        control.claim();
+        next.claim();
+        next.resize_if_current((250, 50), old_revision);
+        assert_eq!(
+            next.state.lock().unwrap().last_resize,
+            None,
+            "an old cadence tick stays obsolete after same-view reacquisition"
+        );
+        next.resize_if_current((80, 24), next.ownership_revision());
+        assert_eq!(next_resize(&mut engine), (80, 24));
+        next.release();
+        assert!(!next.is_controller());
+        assert_eq!(
+            next.state.lock().unwrap().last_resize,
+            None,
+            "released geometry cannot seed a reconnect"
+        );
+        assert_eq!(engine.connects.load(Ordering::SeqCst), 1);
         drop(lease);
+        drop(next_lease);
     }
 
     #[gpui::test]
@@ -820,6 +994,8 @@ mod tests {
             b.submit(AttachmentCommand::Input(b"no".to_vec())),
             Err(InputRejection::PassiveView)
         );
+        assert!(!a.is_controller(), "mount order does not confer ownership");
+        a.claim();
         a.submit(AttachmentCommand::Input(b"before".to_vec()))
             .unwrap();
         b.claim();
@@ -959,6 +1135,7 @@ mod tests {
             control.state.lock().unwrap().writer.is_some()
                 && engine.connects.load(Ordering::SeqCst) == 1
         });
+        control.claim();
         control
             .submit(AttachmentCommand::Input(b"queued before close".to_vec()))
             .unwrap();

@@ -576,7 +576,7 @@ pub struct TerminalPane {
     /// Paced PTY resizes: window and sidebar drags relayout every frame, but
     /// sustained grid frames leave the daemon at up to 120 Hz, so intermediate
     /// sizes coalesce onto that cadence (see [`RESIZE_CADENCE`]).
-    pending_resizes: HashMap<SessionId, (u16, u16)>,
+    pending_resizes: HashMap<SessionId, ((u16, u16), u64)>,
     resize_flush: Option<Task<()>>,
     /// A cadence tick is already armed; further changes fold into it instead of
     /// rescheduling (which is what used to starve the flush during a drag).
@@ -600,6 +600,7 @@ pub struct TerminalPane {
     utility_surfaces: Option<Entity<UtilitySurfaces>>,
     local_clipboard_images: Vec<StagedClipboardImage>,
     _focus_owner: gpui::Subscription,
+    _window_owner: gpui::Subscription,
     _pane_events: Task<()>,
     _store_changes: Task<()>,
 }
@@ -649,9 +650,17 @@ impl TerminalPane {
         if matches!(session_source, SessionSource::FollowSelection) {
             window.focus(&focus, cx);
         }
-        let focus_owner = cx.on_focus(&focus, window, |this, _, cx| {
-            this.claim_selected_control();
+        let focus_owner = cx.on_focus(&focus, window, |this, window, cx| {
+            if window.is_window_active() {
+                this.claim_selected_control();
+            }
             cx.notify();
+        });
+        let window_owner = cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() && this.focus.is_focused(window) {
+                this.claim_selected_control();
+                cx.notify();
+            }
         });
         let (pane_tx, mut pane_rx) = pane_event_channel();
         let pane_events = cx.spawn_in(window, async move |this, cx| {
@@ -729,6 +738,7 @@ impl TerminalPane {
             utility_surfaces: None,
             local_clipboard_images: Vec::new(),
             _focus_owner: focus_owner,
+            _window_owner: window_owner,
             _pane_events: pane_events,
             _store_changes: store_changes,
         };
@@ -840,6 +850,14 @@ impl TerminalPane {
             })
             .flatten();
         let selection_changed = selected_id != self.observed_selected_id;
+        if selection_changed {
+            if let Some(previous) = &self.observed_selected_id
+                && let Some(resident) = self.residents.get(previous)
+            {
+                resident.attachment.release();
+            }
+            self.pending_resizes.clear();
+        }
         self.observed_selected_id = selected_id.clone();
 
         self.reconcile_residency(cx);
@@ -891,7 +909,9 @@ impl TerminalPane {
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
-        self.claim_selected_control();
+        if window.is_window_active() {
+            self.claim_selected_control();
+        }
         window.focus(&self.focus, cx);
     }
 
@@ -2385,12 +2405,18 @@ impl TerminalPane {
                 // continuous drag keeps the PTY reflowing at ~20Hz instead of
                 // waiting for the mouse to stop.
                 ResizePlan::Fold => {
-                    self.pending_resizes.insert(session.id.clone(), size);
+                    self.pending_resizes.insert(
+                        session.id.clone(),
+                        (size, resident.attachment.ownership_revision()),
+                    );
                     return;
                 }
                 ResizePlan::Arm(delay) => delay,
             };
-            self.pending_resizes.insert(session.id.clone(), size);
+            self.pending_resizes.insert(
+                session.id.clone(),
+                (size, resident.attachment.ownership_revision()),
+            );
             self.resize_flush_armed = true;
             let timer = cx.background_executor().timer(delay);
             self.resize_flush = Some(cx.spawn(async move |this, cx| {
@@ -2399,9 +2425,9 @@ impl TerminalPane {
                     this.resize_flush_armed = false;
                     this.last_resize_sent = Some(Instant::now());
                     let pending = std::mem::take(&mut this.pending_resizes);
-                    for (id, size) in pending {
+                    for (id, (size, revision)) in pending {
                         if let Some(resident) = this.residents.get(&id) {
-                            resident.attachment.resize(size.0, size.1);
+                            resident.attachment.resize_if_current(size, revision);
                         }
                     }
                 });
@@ -4634,6 +4660,27 @@ mod tests {
         let second = cx.add_window(|window, cx| {
             TerminalPane::new_fixed(runtime.clone(), tokio.clone(), id.clone(), window, cx)
         });
+        // Both windows hydrate before either is active. In particular the
+        // first session reference must not acquire control just by mounting.
+        first
+            .update(cx, |pane, window, cx| {
+                assert!(!pane.residents[&id].attachment.is_controller());
+                pane.focus(window, cx);
+                pane.set_viewport(
+                    TerminalViewport {
+                        width: 400.0,
+                        height: 300.0,
+                        ..Default::default()
+                    },
+                    cx,
+                );
+                pane.update_selected_geometry(window, cx);
+                assert_eq!(pane.residents[&id].last_size, (0, 0));
+                assert!(!pane.residents[&id].attachment.is_controller());
+                window.activate_window();
+            })
+            .unwrap();
+        cx.run_until_parked();
         let first_grid = first
             .update(cx, |pane, window, cx| {
                 pane.focus(window, cx);
@@ -4671,6 +4718,22 @@ mod tests {
                     "passive layout cannot resize"
                 );
                 pane.focus(window, cx);
+                assert!(
+                    !pane.residents[&id].attachment.is_controller(),
+                    "inactive hydration/focus cannot steal control"
+                );
+            })
+            .unwrap();
+        second
+            .update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+        cx.run_until_parked();
+        second
+            .update(cx, |pane, window, cx| {
+                assert!(
+                    pane.residents[&id].attachment.is_controller(),
+                    "activation claims the already-focused pane without another click"
+                );
                 pane.update_selected_geometry(window, cx);
                 assert_ne!(pane.residents[&id].last_size, (0, 0));
                 pane.handle_pane_event(
@@ -4679,11 +4742,29 @@ mod tests {
                     cx,
                 );
                 assert_eq!(pane.qol.feedback.as_deref(), Some("Input rejected"));
+                let generation = pane.qol.feedback_generation;
+                for _ in 0..100 {
+                    pane.handle_pane_event(
+                        PaneEvent::InputFeedback(id.clone(), "Input rejected".into()),
+                        window,
+                        cx,
+                    );
+                }
+                assert_eq!(
+                    pane.qol.feedback_generation, generation,
+                    "identical rejection does not create another timer or repaint"
+                );
             })
             .unwrap();
         first
             .update(cx, |pane, window, cx| {
                 assert!(!pane.residents[&id].attachment.is_controller());
+                pane.observed_selected_id = None;
+                pane.reconcile_store_change(window, cx);
+                assert!(
+                    !pane.residents[&id].attachment.is_controller(),
+                    "inactive selection hydration cannot take ownership"
+                );
                 let size = pane.residents[&id].last_size;
                 pane.set_viewport(
                     TerminalViewport {
