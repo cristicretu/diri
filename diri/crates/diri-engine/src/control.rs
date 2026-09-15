@@ -28,6 +28,7 @@ mod account_handoff;
 mod message_delivery;
 mod operations;
 mod tasks;
+mod workspaces;
 
 /// Identifies this engine in the handshake, so a client can tell which
 /// implementation it reached.
@@ -64,6 +65,7 @@ pub struct ControlServer {
     active_connections: Arc<AtomicUsize>,
     background_requests: Arc<AtomicUsize>,
     worktree_scan: crate::worktree_scan::ScanStore,
+    workspaces: crate::workspace::WorkspaceStore,
     agent_catalog: Arc<Mutex<crate::agent_catalog::AgentCatalogStore>>,
     accounts: Mutex<crate::accounts::AccountStore>,
     session_operations: Mutex<std::collections::HashSet<String>>,
@@ -116,6 +118,8 @@ impl ControlServer {
         // updater can replace the bundle path underneath the live daemon.
         let _ = process_executable_hash();
         let socket_path = socket_path.into();
+        let workspaces =
+            crate::workspace::WorkspaceStore::new(registry.lock().expect("registry").state_file());
         let logs_dir = socket_path
             .parent()
             .map(|parent| parent.join("logs"))
@@ -159,6 +163,7 @@ impl ControlServer {
             active_connections: Arc::new(AtomicUsize::new(0)),
             background_requests: Arc::new(AtomicUsize::new(0)),
             worktree_scan: Default::default(),
+            workspaces,
             agent_catalog: Arc::new(Mutex::new(agent_catalog)),
             accounts,
             session_operations: Mutex::new(std::collections::HashSet::new()),
@@ -711,6 +716,8 @@ impl ControlServer {
                 let params: diri_proto::AgentAccountId = decode(params)?;
                 encode(&self.accounts.lock().map_err(poisoned)?.remove(&params.id)?)
             }
+            Method::WORKSPACE_SNAPSHOT => encode(&self.workspaces.snapshot()?),
+            Method::WORKSPACE_MUTATE => self.workspace_mutate(params),
             Method::HELLO => self.hello(params),
             Method::SESSION_SPAWN => self.session_spawn(params),
             Method::SESSION_SPAWN_TRACKED => self.session_spawn_tracked(params),

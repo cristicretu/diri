@@ -16,6 +16,8 @@ pub const RUST_ENGINE_KIND: &str = "diri-rust-engine";
 pub struct Method;
 
 impl Method {
+    pub const WORKSPACE_SNAPSHOT: &'static str = "workspace.snapshot";
+    pub const WORKSPACE_MUTATE: &'static str = "workspace.mutate";
     pub const HELLO: &'static str = "hello";
     pub const SESSION_SPAWN_TRACKED: &'static str = "session.spawn_tracked";
     pub const TASK_SUBMIT: &'static str = "task.submit";
@@ -81,6 +83,7 @@ impl Method {
 pub struct EventName;
 
 impl EventName {
+    pub const WORKSPACE_UPDATED: &'static str = "workspace.updated";
     pub const SESSION_NOTIFICATION: &'static str = "session.notification";
     pub const SESSION_UPDATED: &'static str = "session.updated";
     pub const SESSION_RESOURCES: &'static str = "session.resources";
