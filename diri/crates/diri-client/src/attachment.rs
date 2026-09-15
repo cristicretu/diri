@@ -181,7 +181,7 @@ impl SessionPreview {
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "preview handshake timed out"))??;
         let (commands, command_rx) = mpsc::unbounded_channel();
         let (chunk_tx, receiver) = mpsc::channel(1);
-        let task = tokio::spawn(run_connection(stream, command_rx, chunk_tx));
+        let task = tokio::spawn(run_connection(stream, command_rx, chunk_tx, false));
         Ok(Self {
             session_id,
             _commands: commands,
@@ -286,7 +286,7 @@ impl SessionAttachment {
         // backpressure only the attach writer instead of growing client memory
         // without limit.
         let (chunk_tx, chunk_rx) = mpsc::channel(CHUNK_QUEUE_CAPACITY);
-        let task = tokio::spawn(run_connection(stream, command_rx, chunk_tx));
+        let task = tokio::spawn(run_connection(stream, command_rx, chunk_tx, true));
 
         Ok(Self {
             commands: command_tx,
@@ -356,13 +356,19 @@ async fn run_connection(
     mut stream: UnixStream,
     mut commands: mpsc::UnboundedReceiver<Command>,
     chunks: mpsc::Sender<TerminalChunk>,
+    keepalive_enabled: bool,
 ) {
     let mut codec = FrameCodec::new();
     let mut read_buffer = vec![0_u8; READ_BUFFER_BYTES];
     let mut last_received = Instant::now();
-    let start = Instant::now() + KEEPALIVE_CHECK_EVERY;
-    let mut keepalive = tokio::time::interval_at(start, KEEPALIVE_CHECK_EVERY);
-    keepalive.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // Local receive-only previews need no idle timer: Unix socket EOF reports
+    // peer closure, and remote freshness is an Engine control fact.
+    let mut keepalive = keepalive_enabled.then(|| {
+        let start = Instant::now() + KEEPALIVE_CHECK_EVERY;
+        let mut timer = tokio::time::interval_at(start, KEEPALIVE_CHECK_EVERY);
+        timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        timer
+    });
 
     loop {
         tokio::select! {
@@ -389,7 +395,12 @@ async fn run_connection(
                     Some(Command::Close) | None => return,
                 }
             }
-            _ = keepalive.tick() => {
+            _ = async {
+                match &mut keepalive {
+                    Some(timer) => { timer.tick().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
                 let idle = Instant::now().duration_since(last_received);
                 if idle >= DEAD_AFTER {
                     return;
@@ -550,6 +561,36 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_silent_preview_has_no_idle_ping_or_deadline() {
+        use super::SessionPreview;
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let peer = tokio::spawn(async move {
+            let mut reader = BufReader::new(server);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            reader.get_mut().write_all(line.as_bytes()).await.unwrap();
+            reader.into_inner()
+        });
+        let mut preview = SessionPreview::adopt(client, SessionId("silent".into()))
+            .await
+            .unwrap();
+        server = peer.await.unwrap();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(120)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !preview.task.as_ref().unwrap().is_finished(),
+            "silent preview stays open"
+        );
+        assert_eq!(
+            server.try_read(&mut [0]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "preview emits no idle ping"
+        );
+        preview.close().await;
     }
 
     #[tokio::test]
