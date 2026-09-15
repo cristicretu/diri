@@ -557,7 +557,10 @@ fn retrying_a_spawn_returns_the_same_session() {
     let args = json!({"kind":"prompt-fixture", "cwd":temp.path()});
     let first = bridge.call("spawn_agent", &args).unwrap();
     let second = Bridge::new(server.socket_path().into(), Some("s_parent".into()))
-        .call("spawn_agent", &args)
+        .call(
+            "spawn_agent",
+            &json!({"cwd":temp.path(), "kind":"prompt-fixture"}),
+        )
         .unwrap();
     for id in [first["id"].clone(), second["id"].clone()] {
         let _ = bridge.call("release_agent", &json!({"session_id":id}));

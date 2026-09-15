@@ -31,7 +31,9 @@ pub(super) fn reserve(
     identity(sender)?;
     identity(id)?;
     let key = digest(&json!([sender, id]));
-    let fingerprint = digest(payload);
+    let mut canonical_payload = payload.clone();
+    canonical_payload.sort_all_objects();
+    let fingerprint = digest(&canonical_payload);
     let mut db = open(path)?;
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS spawn_operations_v1 (
@@ -206,6 +208,27 @@ mod tests {
             "completed"
         );
         assert!(!String::from_utf8_lossy(&std::fs::read(path).unwrap()).contains("private"));
+    }
+    #[test]
+    fn object_key_order_does_not_change_the_operation_fingerprint() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("ops.sqlite");
+        let first = reserve(
+            &path,
+            "parent",
+            "op",
+            &json!({"a":1,"nested":{"b":2,"c":3}}),
+        )
+        .unwrap();
+        let second = reserve(
+            &path,
+            "parent",
+            "op",
+            &json!({"nested":{"c":3,"b":2},"a":1}),
+        )
+        .unwrap();
+        assert!(!second.fresh);
+        assert_eq!(first.resource, second.resource);
     }
     #[test]
     fn concurrent_reservations_choose_one_session() {

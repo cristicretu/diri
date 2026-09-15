@@ -213,6 +213,7 @@ impl Bridge {
         }
         let mut identity = arguments.clone();
         identity.as_object_mut().unwrap().remove("operation_id");
+        identity.sort_all_objects();
         let operation_id = optional_string(arguments, "operation_id").unwrap_or_else(|| {
             format!(
                 "auto:{}",
