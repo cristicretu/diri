@@ -1005,7 +1005,8 @@ channel or changes its controller lease. The deferred multiple-observer feature
 of the Remote Helper protocol remains deferred.
 
 The Rust client exposes `SessionPreview` with decoded receive-only chunks, a
-capacity-one queue, and cancellation on close/drop. Backpressure never discards
+capacity-one queue, and cancellation on close/drop. Previews create no idle
+keepalive timer or deadline; local socket EOF reports peer closure. Backpressure never discards
 patches: a slow server queue closes and the caller must explicitly reconnect to
 a new full seed. Session exit remains an authoritative fact from the control stream. Transient
 remote connectivity is not yet projected there, so a remote preview must be
