@@ -608,3 +608,51 @@ Helper environment-capture fixtures require debug assertions; run the complete
 remote suite through `cargo test -p diri-remote`, not an unfiltered release run.
 New Holder scheduling applies to new sessions. Existing remote Helpers retain
 their original Build IDs; the Engine-side fixes apply after the Engine updates.
+
+
+## Remote disk and network follow-up — 2026-09-15
+
+`diri-remote::output_log::tests::append_latency_gate` appends 128 MiB in 2,048
+64-KiB chunks through the actual Holder log, including multiple capacity wraps.
+It fails if an append takes 16 ms or longer. On this Mac the original copy/sync
+rotation reached 20.88 ms (median 6.75 µs). Rename-based prototypes still paused
+20–60 ms on Forge's disk; reducing segment sizes did not remove those stalls.
+The final circular format avoids file creation/deletion during append. Two
+Forge disk runs measured maxima **0.732 ms / 0.174 ms**, p99 **91.6 / 71.8 µs**,
+and medians **53.8 / 52.9 µs**. Checksumming increases ordinary append CPU work;
+there is no extra logging worker, queue, or retained-payload copy. These are
+observed host timings, not a guarantee against arbitrary storage/scheduler stalls.
+Use `TMPDIR` on the filesystem being evaluated: Forge's `/tmp` is RAM-backed.
+
+Reproduce from `diri/`:
+
+```sh
+cargo test -p diri-remote --release --lib append_latency_gate -- --ignored --nocapture
+scripts/remote-netem-gate.sh
+DIRI_REMOTE_SSH_TARGET=disposable-host DIRI_REMOTE_SOAK_SECONDS=5 scripts/remote-ssh-soak.sh
+```
+
+The Linux-only netem test creates its own user/network namespace and verifies
+both differ from the caller's before touching its sole loopback interface.
+It requires `unshare`, permitted unprivileged namespaces, and kernel netem;
+it installs no packages or services and never changes host networking.
+The Rust fixture forwards the real Helper protocol across TCP with 70 ms delay
+per direction, 15 ms jitter, and 2% loss. Kernel counters must confirm actual
+dropped packets. It verifies exact replay, input acknowledgements, on-demand
+history, and reconnect with unchanged Agent identity, then reaps its fixture.
+The default test suite never runs this test or contacts a real SSH host.
+
+Measured fixture results: baseline median/p90 **0.195 / 0.344 ms**; impaired
+median/p90/max **140 / 570 / 721 ms**, history **322 ms**, **19 packet drops**.
+This TCP fixture isolates loss/retransmission behavior; the separate real SSH
+soak exercises OpenSSH, bootstrap, Engine mirroring, and detach persistence.
+Over the actual Mac-to-Forge connection, 32 input-to-grid samples measured
+median/p90/max **187 / 304 / 357 ms**, and history retrieval **220 ms**. The
+sampler polls every 20 ms and does not measure display/input-to-photon latency.
+
+For a cross-platform real SSH run, `DIRI_REMOTE_ARTIFACT_MANIFEST` selects the
+complete verified packaged catalog instead of executing a native test Helper.
+`DIRI_REMOTE_HELPER_PATH` can select a native Helper when running copied Holder
+test executables on another machine. The SSH soak installs a versioned Helper
+beside existing builds, creates a nonce-named shell session, and kills only that
+session on completion/failure. Installed Helper builds remain available for GC.

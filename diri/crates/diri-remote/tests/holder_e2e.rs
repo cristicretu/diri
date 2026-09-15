@@ -2,7 +2,7 @@
 
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -15,8 +15,37 @@ use diri_proto::remote_pty::{
     SessionInspection, SessionSelector, SessionToken,
 };
 
-fn helper() -> &'static str {
-    env!("CARGO_BIN_EXE_diri-remote")
+fn helper() -> std::path::PathBuf {
+    std::env::var_os("DIRI_REMOTE_HELPER_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_diri-remote").into())
+}
+
+fn log_tail(path: &std::path::Path) -> u64 {
+    use std::os::unix::fs::FileExt;
+    let Ok(file) = std::fs::File::open(path) else {
+        return 0;
+    };
+    let mut tail = 0;
+    // Observe committed offsets independently of the asynchronous session
+    // checkpoint. Detailed checksum/torn-write recovery is tested in OutputLog.
+    for slot in 0..512 {
+        for commit in 0..2 {
+            let mut header = [0_u8; 64];
+            if file
+                .read_exact_at(&mut header, 16 + slot * (65536 + 128) + commit * 64)
+                .is_err()
+            {
+                continue;
+            }
+            let base = u64::from_be_bytes(header[..8].try_into().unwrap());
+            let len = u32::from_be_bytes(header[8..12].try_into().unwrap());
+            if header[12..16] == 0x4452_434d_u32.to_be_bytes() && len <= 65536 {
+                tail = tail.max(base + u64::from(len));
+            }
+        }
+    }
+    tail
 }
 
 fn token() -> SessionToken {
@@ -65,9 +94,12 @@ struct TestGcResult {
     retained_helper_builds: usize,
 }
 
+type TestWriter = Box<dyn Write + Send>;
+type TestReader = Box<dyn Read + Send>;
+
 struct Attach {
     child: Child,
-    input: ChildStdin,
+    input: Box<dyn Write + Send>,
     messages: Receiver<Result<RemoteMessage, String>>,
     diagnostics: std::path::PathBuf,
     stderr: Arc<Mutex<Vec<u8>>>,
@@ -75,6 +107,10 @@ struct Attach {
 
 impl Attach {
     fn open(state_dir: &std::path::Path, hello: Hello) -> Self {
+        Self::open_impl(state_dir, hello, false)
+    }
+
+    fn open_impl(state_dir: &std::path::Path, hello: Hello, tcp: bool) -> Self {
         let session_id = hello.session_id.clone();
         let mut child = Command::new(helper())
             .arg("attach")
@@ -84,8 +120,13 @@ impl Attach {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn attach");
-        let mut input = child.stdin.take().expect("attach stdin");
-        let mut output = child.stdout.take().expect("attach stdout");
+        let input = child.stdin.take().expect("attach stdin");
+        let output = child.stdout.take().expect("attach stdout");
+        let (mut input, mut output): (TestWriter, TestReader) = if tcp {
+            tcp_bridge(input, output)
+        } else {
+            (Box::new(input), Box::new(output))
+        };
         let mut stderr = child.stderr.take().expect("attach stderr");
         let captured_stderr = Arc::new(Mutex::new(Vec::new()));
         let stderr_sink = Arc::clone(&captured_stderr);
@@ -1273,6 +1314,12 @@ fn slow_attach_never_blocks_pty_and_reconnects_from_full_snapshot() {
     let _ = slow.kill();
     let _ = slow.wait();
     let _: SessionInspection = run_json("kill", &state_dir, Some(&selector));
+    let gc: TestGcResult = run_json::<(), _>("gc", &state_dir, None);
+    assert_eq!(
+        gc.removed_sessions, 1,
+        "GC must remove the circular output log"
+    );
+    assert_eq!(gc.retained_sessions, 0);
 }
 
 fn assert_percentile(name: &str, samples: &mut [Duration], percentile: usize, max_ms: u128) {
@@ -1411,11 +1458,7 @@ fn stopping_during_output_checkpoints_leaves_no_temporary_state() {
         );
         let session_root = state_dir.join("sessions").join(&launch.session_id);
         let deadline = Instant::now() + Duration::from_secs(10);
-        while std::fs::metadata(session_root.join("output.log"))
-            .unwrap()
-            .len()
-            < (1 << 20) + 16
-        {
+        while log_tail(&session_root.join("output.log")) < 1 << 20 {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -1428,10 +1471,7 @@ fn stopping_during_output_checkpoints_leaves_no_temporary_state() {
                 expected_incarnation: Some(launch.session_incarnation),
             }),
         );
-        let log_bytes = std::fs::metadata(session_root.join("output.log"))
-            .unwrap()
-            .len()
-            - 16;
+        let log_bytes = log_tail(&session_root.join("output.log"));
         assert_eq!(
             inspection.output_offset, log_bytes,
             "management exit must include the final log offset"
@@ -1442,5 +1482,177 @@ fn stopping_during_output_checkpoints_leaves_no_temporary_state() {
             "interrupted checkpoint left temporary state on iteration {iteration}"
         );
         assert_eq!(gc.retained_sessions, 0);
+    }
+}
+
+// Keep fixture forwarding in userspace. Linux splice can hold a pipe lock
+// while waiting for TCP input, deadlocking the Helper's reader of that pipe.
+fn copy_test_stream(reader: &mut impl Read, writer: &mut impl Write) -> std::io::Result<()> {
+    let mut bytes = [0_u8; 8192];
+    loop {
+        let count = reader.read(&mut bytes)?;
+        if count == 0 {
+            return Ok(());
+        }
+        writer.write_all(&bytes[..count])?;
+    }
+}
+
+// The test bridge is a reliable byte stream. netem drops actual TCP packets;
+// it never discards application bytes or changes the Helper transport.
+fn tcp_bridge(
+    mut input: impl Write + Send + 'static,
+    mut output: impl Read + Send + 'static,
+) -> (TestWriter, TestReader) {
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client =
+        TcpStream::connect_timeout(&listener.local_addr().unwrap(), Duration::from_secs(10))
+            .unwrap();
+    let (mut server, _) = listener.accept().unwrap();
+    client.set_nodelay(true).unwrap();
+    server.set_nodelay(true).unwrap();
+    client
+        .set_write_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    let mut server_read = server.try_clone().unwrap();
+    std::thread::spawn(move || {
+        let _ = copy_test_stream(&mut server_read, &mut input);
+    });
+    std::thread::spawn(move || {
+        let _ = copy_test_stream(&mut output, &mut server);
+        let _ = server.shutdown(Shutdown::Write);
+    });
+    (Box::new(client.try_clone().unwrap()), Box::new(client))
+}
+
+#[cfg(target_os = "linux")]
+#[path = "support/netem.rs"]
+mod netem;
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires Linux unprivileged user/network namespaces; no host network changes"]
+fn impaired_tcp_preserves_input_history_and_reconnect() {
+    if !netem::enter_fixture() {
+        return;
+    }
+    for (delay, jitter, loss) in [(0, 0, 0), (70, 15, 2)] {
+        netem::configure(delay, jitter, loss);
+        let temporary = tempfile::tempdir().unwrap();
+        let state_dir = temporary.path().join("state");
+        let launch: LaunchResult = run_json("launch", &state_dir, Some(&LaunchRequest {
+            session_id: "netem-fixture".into(), session_token: token(),
+            argv: vec!["/bin/sh".into(), "-c".into(),
+                "i=0; while [ $i -lt 8192 ]; do printf '%080d\\n' $i; i=$((i+1)); done; printf 'ready>'; while IFS= read -r line; do printf 'ack:%s\\n' \"$line\"; done".into()],
+            cwd: "/".into(), environment: vec![], cols: 100, rows: 24,
+            persistence: PersistenceCapability::NonPersistent,
+        }));
+        // Always reap the fixture's Agent tree even if a protocol assertion fails.
+        struct Cleanup(std::path::PathBuf, SessionSelector);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _: SessionInspection = run_json("kill", &self.0, Some(&self.1));
+            }
+        }
+        let cleanup = Cleanup(
+            state_dir.clone(),
+            SessionSelector {
+                session_id: launch.session_id.clone(),
+                session_token: token(),
+                expected_incarnation: Some(launch.session_incarnation.clone()),
+            },
+        );
+        let mut attach =
+            Attach::open_impl(&state_dir, hello(&launch, Some(0), "netem-first"), true);
+        let mut raw = Vec::new();
+        attach.receive_until(Duration::from_secs(30), |message| {
+            if let RemoteMessage::Terminal(frame) = message
+                && let Some((_, bytes)) = frame.output_payload()
+            {
+                raw.extend_from_slice(bytes);
+            }
+            raw.ends_with(b"ready>")
+        });
+        let mut expected: Vec<u8> = Vec::new();
+        for index in 0..8192 {
+            expected.extend(format!("{index:080}\r\n").as_bytes());
+        }
+        expected.extend(b"ready>");
+        assert!(
+            raw == expected,
+            "loss must never corrupt or duplicate replay bytes"
+        );
+        let mut timings = Vec::new();
+        for index in 0..32 {
+            let ack = format!("ack:{index:03}");
+            let start = Instant::now();
+            attach.send(RemoteMessage::Terminal(Frame::input(
+                format!("{index:03}\n").into_bytes(),
+            )));
+            let mut output: Vec<u8> = Vec::new();
+            attach.receive_until(Duration::from_secs(10), |message| {
+                if let RemoteMessage::Terminal(frame) = message
+                    && let Some((_, bytes)) = frame.output_payload()
+                {
+                    output.extend(bytes);
+                }
+                output.windows(ack.len()).any(|part| part == ack.as_bytes())
+            });
+            timings.push(start.elapsed());
+        }
+        timings.sort_unstable();
+        eprintln!(
+            "TCP delay={delay}ms jitter={jitter}ms loss={loss}%: input/output median={:?} p90={:?} max={:?}",
+            timings[16], timings[28], timings[31]
+        );
+        assert!(
+            timings[28] < Duration::from_secs(2),
+            "interactive latency exceeds impaired-link budget"
+        );
+        let scroll = Instant::now();
+        attach.send(RemoteMessage::ScrollbackRequest(
+            diri_proto::remote_pty::ScrollbackRequest {
+                request_id: 1,
+                first_row: 0,
+                max_rows: 100,
+            },
+        ));
+        let history = attach.receive_until(Duration::from_secs(10), |message| {
+            matches!(message, RemoteMessage::ScrollbackResponse(response) if response.request_id == 1)
+        });
+        assert!(history.iter().any(|message| matches!(message,
+            RemoteMessage::ScrollbackResponse(response) if response.result.row_count == 100 && !response.result.payload.is_empty())));
+        eprintln!("on-demand history: {:?}", scroll.elapsed());
+        drop(attach);
+        let inspection: SessionInspection = run_json("inspect", &state_dir, Some(&cleanup.1));
+        assert_eq!(
+            inspection.process_state,
+            RemoteProcessState::Running {
+                pid: launch.process_pid
+            }
+        );
+        let mut attach =
+            Attach::open_impl(&state_dir, hello(&launch, None, "netem-reconnect"), true);
+        attach.receive_until(Duration::from_secs(10), |message| {
+            matches!(message, RemoteMessage::FullSnapshot(_))
+        });
+        attach.send(RemoteMessage::Terminal(Frame::input(
+            b"reconnected\n".to_vec(),
+        )));
+        attach.receive_until(Duration::from_secs(10), |message| match message {
+            RemoteMessage::GridDelta(delta) => grid_text(&delta.grid).contains("ack:reconnected"),
+            RemoteMessage::FullSnapshot(snapshot) => {
+                grid_text(&snapshot.grid).contains("ack:reconnected")
+            }
+            _ => false,
+        });
+        let drops = netem::drops();
+        eprintln!("actual kernel packet drops: {drops}");
+        if loss > 0 {
+            assert!(drops > 0, "fixture did not exercise packet loss");
+        }
+        drop(attach);
+        drop(cleanup);
     }
 }

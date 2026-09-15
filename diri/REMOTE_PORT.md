@@ -547,12 +547,39 @@ only after the old Holder has released its ownership lock, then revalidates
 the incarnation under that lock. An
 old Running checkpoint cannot overwrite the final management exit.
 
-These scheduling changes add no protocol or on-disk schema. Durable output-log
-writes and rotation retain their existing policy. Engine improvements apply
+These scheduling changes add no protocol schema. Engine improvements apply
 to surviving remote sessions after an Engine update; Holder scheduling changes
 apply to newly launched Helper processes. Live Helpers retain their original
 Build IDs and are never overwritten or restarted to apply an optimization.
 See the 2026-09-15 regression measurements in [PERF.md](PERF.md).
+
+### Bounded output log (format 3)
+
+New Holders use one fixed-layout circular `output.log`: 512 pages of 64 KiB
+payload, each with two 64-byte commit headers, plus a 16-byte format header.
+The payload remains bounded to 32 MiB; format overhead is 65,552 bytes. Pages
+are reused in place. Append never creates, renames, truncates, deletes, or syncs
+a file. There is no additional worker, queue, or copy of retained payload.
+Measurements rejected rename-based segments: even deleting smaller files
+occasionally blocked the measured VPS owner loop for tens of milliseconds.
+
+Each page records its absolute offset, committed length, and SHA-256 of the
+offset plus payload prefix. Append writes new payload then alternates between
+two commit headers. The incremental hash is updated once per byte. Only after
+the complete header write succeeds may output reach the parser or controller.
+A killed append can recover the previous complete prefix; an interrupted page
+reuse may evict the oldest page, but never invents replacement output. Open
+validates both candidate commits, chooses the newest valid one per slot, and
+rejects gaps or corrupt interior pages. Replay crosses page boundaries and
+clamps evicted offsets to the retained floor.
+
+The initial file/header is synced before launch succeeds; final exit syncs the
+file after draining all PTY output. As with ordinary appends before this change,
+host power loss can lose unflushed output. Rotation no longer introduces an
+incidental mid-session sync. Existing format-1 logs remain readable without
+conversion; format 2 was an unshipped segmented prototype and is rejected by
+this build. New Holders write format 3. Live Holders retain their exact original
+binaries and formats. Reset and GC still remove the single known regular file.
 
 The shared terminal core recomputes its 4 MiB history-cell allowance when the
 column count changes, including when the primary screen is inactive. Narrowing
