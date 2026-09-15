@@ -1717,8 +1717,6 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    #[cfg(target_os = "macos")]
-    use diri_proto::Project;
     use diri_proto::{
         AgentKind as ProtoAgentKind, DateMillis, ProjectId, Resumability, SessionListResult,
         SessionStatus, TitleSource,
