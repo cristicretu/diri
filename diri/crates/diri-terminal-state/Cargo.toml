@@ -16,3 +16,7 @@ harness = false
 [[bench]]
 name = "terminal_fleet"
 harness = false
+
+[[bench]]
+name = "terminal_parity"
+harness = false
