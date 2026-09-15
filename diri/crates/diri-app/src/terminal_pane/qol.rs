@@ -25,6 +25,12 @@ pub(super) struct QolState {
 }
 
 impl QolState {
+    pub(super) fn clear_feedback(&mut self) {
+        self.feedback = None;
+        self.feedback_timer = None;
+        self.feedback_generation += 1;
+    }
+
     pub fn hover_key_clear(&mut self) {
         self.hover_key = None;
     }
