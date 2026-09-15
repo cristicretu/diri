@@ -21,13 +21,6 @@ pub(crate) struct EffectWriteError {
 }
 
 impl EffectWriteError {
-    pub(crate) fn not_applied(source: io::Error) -> Self {
-        Self {
-            outcome: EffectOutcome::NotApplied,
-            source,
-        }
-    }
-
     pub(crate) fn outcome(&self) -> EffectOutcome {
         self.outcome
     }
@@ -56,36 +49,44 @@ impl std::error::Error for EffectWriteError {
 
 impl From<EffectWriteError> for io::Error {
     fn from(error: EffectWriteError) -> Self {
-        io::Error::other(error)
+        let kind = match error.outcome() {
+            EffectOutcome::NotApplied => error.source.kind(),
+            EffectOutcome::Unknown => io::ErrorKind::Other,
+        };
+        io::Error::new(kind, error)
     }
 }
 
+/// Advance an unbuffered nonblocking transport by at most `budget` bytes.
+/// WouldBlock preserves the exact prefix; the next call resumes that frame.
 pub(crate) fn write_at_most_once(
     writer: &mut impl Write,
     bytes: &[u8],
+    written: &mut usize,
+    budget: &mut usize,
 ) -> Result<(), EffectWriteError> {
-    let mut written = 0;
-    while written < bytes.len() {
-        match writer.write(&bytes[written..]) {
+    while *written < bytes.len() && *budget > 0 {
+        let end = bytes.len().min(*written + *budget);
+        match writer.write(&bytes[*written..end]) {
             Ok(0) => {
                 return Err(classify(
-                    written,
+                    *written,
                     io::Error::new(
                         io::ErrorKind::WriteZero,
                         "remote effect write returned zero",
                     ),
                 ));
             }
-            Ok(count) => written += count,
+            Ok(count) => {
+                *written += count;
+                *budget -= count;
+            }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(classify(written, error)),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(classify(*written, error)),
         }
     }
-    writer.flush().map_err(|error| EffectWriteError {
-        // All bytes entered the transport, so the Holder may have applied them.
-        outcome: EffectOutcome::Unknown,
-        source: error,
-    })
+    Ok(())
 }
 
 fn classify(written: usize, source: io::Error) -> EffectWriteError {
@@ -137,6 +138,8 @@ mod tests {
                 fail_flush: false,
             },
             b"effect",
+            &mut 0,
+            &mut 100,
         )
         .expect_err("write fails");
         assert_eq!(error.outcome(), EffectOutcome::NotApplied);
@@ -151,22 +154,31 @@ mod tests {
                 fail_flush: false,
             },
             b"effect",
+            &mut 0,
+            &mut 100,
         )
         .expect_err("write fails");
         assert_eq!(error.outcome(), EffectOutcome::Unknown);
     }
 
     #[test]
-    fn a_lost_flush_receipt_has_an_unknown_outcome() {
-        let error = write_at_most_once(
-            &mut FailingWriter {
-                accept: usize::MAX,
-                accepted: 0,
-                fail_flush: true,
-            },
-            b"effect",
-        )
-        .expect_err("flush fails");
-        assert_eq!(error.outcome(), EffectOutcome::Unknown);
+    fn budget_and_backpressure_resume_without_repeating_a_prefix() {
+        let mut output = Vec::new();
+        let mut written = 0;
+        write_at_most_once(&mut output, b"effect", &mut written, &mut 2).unwrap();
+        assert_eq!(output, b"ef");
+        struct Blocked;
+        impl Write for Blocked {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::WouldBlock.into())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                unreachable!()
+            }
+        }
+        write_at_most_once(&mut Blocked, b"effect", &mut written, &mut 100).unwrap();
+        assert_eq!(written, 2);
+        write_at_most_once(&mut output, b"effect", &mut written, &mut 100).unwrap();
+        assert_eq!(output, b"effect");
     }
 }

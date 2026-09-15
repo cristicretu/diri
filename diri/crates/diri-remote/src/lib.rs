@@ -370,6 +370,7 @@ fn list() -> io::Result<Vec<SessionInspection>> {
 fn kill(selector: &SessionSelector) -> io::Result<SessionInspection> {
     let roots = paths::StatePaths::resolve()?;
     let paths = roots.session(&selector.session_id)?;
+    let _launch_lock = state::acquire_launch_lock_wait(&paths.launch_lock)?;
     if !state::authenticate(&paths, &selector.session_token)? {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -399,7 +400,6 @@ fn kill(selector: &SessionSelector) -> io::Result<SessionInspection> {
             signal: Some(libc::SIGTERM),
         };
     }
-    state::write_state(&paths.state, &session)?;
     signal_pid(session.holder_pid, libc::SIGTERM);
     if session.persistence == diri_proto::remote_pty::PersistenceCapability::UserSupervisor {
         persistence::cleanup_holder(&session.session_id);
@@ -421,6 +421,21 @@ fn kill(selector: &SessionSelector) -> io::Result<SessionInspection> {
             ));
         }
     }
+    // Fence the dead Holder's asynchronous checkpoints before publishing the
+    // management exit. Also retain the Holder lock through this final write.
+    let _lock = state::acquire_lock(&paths.lock)?;
+    let latest = state::read_state(&paths.state)?;
+    validate_incarnation(selector, &latest)?;
+    if latest.session_incarnation != session.session_incarnation {
+        return Err(io::Error::other("session changed while stopping Holder"));
+    }
+    let fallback_exit = session.process_state;
+    session = latest;
+    if matches!(session.process_state, RemoteProcessState::Running { .. }) {
+        session.process_state = fallback_exit;
+    }
+    session.output_offset = output_log::OutputLog::open(&paths.output)?.tail_offset();
+    state::write_state(&paths.state, &session)?;
     Ok(session.inspection())
 }
 

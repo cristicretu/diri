@@ -1081,7 +1081,8 @@ mod tests {
                 "signal-test-incarnation".into(),
                 RemoteBindingStore::new(temporary.path().join("bindings")).expect("bindings"),
                 0,
-            );
+            )
+            .expect("remote client");
             let (generation, mut output) = client.connect(0, None).expect("connect");
             let (sender, receiver) = mpsc::channel();
             let reader = std::thread::spawn(move || {
@@ -1108,8 +1109,27 @@ mod tests {
                 client.signal(libc::SIGCONT).unwrap_err().kind(),
                 io::ErrorKind::NotConnected
             );
+            client.write(b"before-hello;").expect("queued input");
             client.accept_hello(generation, 42).expect("hello");
+            client
+                .write(b"after-hello;")
+                .expect("input during handshake");
             client.grant_control(generation, 42).expect("control");
+            let RemoteMessage::Terminal(frame) = receive() else {
+                panic!("expected queued input");
+            };
+            assert_eq!(
+                frame.payload, b"before-hello;after-hello;",
+                "new input overtook reconnect input"
+            );
+            assert_eq!(
+                client
+                    .write(&vec![0; diri_proto::frames::MAX_FRAME_BYTES + 1])
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+            // An encoding rejection accepts nothing and leaves the channel usable.
             for (native, expected) in [
                 (libc::SIGCONT, resume),
                 (libc::SIGSTOP, stop),

@@ -1,7 +1,9 @@
 //! One Engine-side controller for one remote Holder.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::unix::net::UnixStream;
 use std::process::{Child, ChildStdin, ChildStdout};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -16,7 +18,7 @@ use diri_proto::remote_pty::{
 
 use super::binding::RemoteBindingStore;
 use super::bootstrap::RemoteTarget;
-use super::effect::{EffectOutcome, EffectWriteError, write_at_most_once};
+
 use super::manager::{InstalledHelper, RemoteManager};
 
 const MAX_QUEUED_INPUT: usize = 1024 * 1024;
@@ -24,13 +26,28 @@ const OFFSET_PERSIST_INTERVAL: u64 = 1024 * 1024;
 const REQUIRED_CAPABILITIES: &[diri_proto::remote_pty::RemoteCapability] =
     PHASE_ONE_HOLDER_CAPABILITIES;
 
+struct PendingFrame {
+    bytes: Vec<u8>,
+    written: usize,
+    replay_input: Option<Vec<u8>>,
+    resize: Option<(u16, u16)>,
+    effect: bool,
+}
+
+#[derive(Default)]
 struct WriterState {
     child: Option<Child>,
     input: Option<ChildStdin>,
     generation: u64,
     controller_epoch: Option<u64>,
+    control_granted: bool,
     queued_input: Vec<u8>,
     queued_resize: Option<(u16, u16)>,
+    pending: VecDeque<PendingFrame>,
+    pending_bytes: usize,
+    uncertain_effect: bool,
+    wake: Option<UnixStream>,
+    wake_reader: Option<UnixStream>,
 }
 
 /// The pump owns SSH stdout. Interactive callers share this small writer
@@ -41,16 +58,15 @@ pub struct RemoteSessionClient {
     session_id: String,
     token: SessionToken,
     incarnation: String,
-    binding_store: RemoteBindingStore,
+    checkpoint: diri_pty::checkpoint::CheckpointWriter<u64>,
     writer: Mutex<WriterState>,
     observed_output_offset: AtomicU64,
-    persisted_output_offset: AtomicU64,
+    scheduled_output_offset: AtomicU64,
     next_request_id: AtomicU64,
     scrollback_requests: Mutex<HashMap<u64, mpsc::Sender<diri_proto::ReadScrollbackCellsResult>>>,
 }
 
 impl RemoteSessionClient {
-    #[must_use]
     pub fn new(
         manager: Arc<RemoteManager>,
         helper: InstalledHelper,
@@ -59,27 +75,35 @@ impl RemoteSessionClient {
         incarnation: String,
         binding_store: RemoteBindingStore,
         initial_output_offset: u64,
-    ) -> Self {
-        Self {
+    ) -> io::Result<Self> {
+        let binding_id = session_id.clone();
+        let binding_incarnation = incarnation.clone();
+        let checkpoint =
+            diri_pty::checkpoint::CheckpointWriter::new("remote-binding", move |offset| {
+                // Recovery offsets are best effort. Keep the worker alive so
+                // a transient filesystem failure is retried at the next
+                // scheduled offset (or the final close), without IO retries
+                // on the terminal-processing thread.
+                let _ = binding_store.update_output_offset_for_incarnation(
+                    &binding_id,
+                    &binding_incarnation,
+                    offset,
+                );
+                Ok(())
+            })?;
+        Ok(Self {
             manager,
             helper,
             session_id,
             token,
             incarnation,
-            binding_store,
-            writer: Mutex::new(WriterState {
-                child: None,
-                input: None,
-                generation: 0,
-                controller_epoch: None,
-                queued_input: Vec::new(),
-                queued_resize: None,
-            }),
+            checkpoint,
+            writer: Mutex::new(WriterState::default()),
             observed_output_offset: AtomicU64::new(initial_output_offset),
-            persisted_output_offset: AtomicU64::new(initial_output_offset),
+            scheduled_output_offset: AtomicU64::new(initial_output_offset),
             next_request_id: AtomicU64::new(1),
             scrollback_requests: Mutex::new(HashMap::new()),
-        }
+        })
     }
 
     pub fn connect(
@@ -88,24 +112,48 @@ impl RemoteSessionClient {
         grid_sequence: Option<u64>,
     ) -> io::Result<(u64, ChildStdout)> {
         let mut channel = self.manager.attach(&self.helper)?;
-        let hello = RemoteMessage::Hello(Hello {
-            protocol: ProtocolVersion::CURRENT,
-            local_build_id: format!("engine-{}", env!("CARGO_PKG_VERSION")),
-            session_id: self.session_id.clone(),
-            session_token: self.token.clone(),
-            expected_incarnation: Some(self.incarnation.clone()),
-            requested_role: RemoteRole::Controller,
-            client_nonce: random_identifier()?,
-            required_capabilities: REQUIRED_CAPABILITIES.to_vec(),
-            last_acknowledged_output_offset: Some(output_offset),
-            last_acknowledged_grid_sequence: grid_sequence,
-        });
-        let encoded = RemoteCodec::encode(&hello).map_err(io::Error::other)?;
-        channel.input.write_all(&encoded)?;
-        channel.input.flush()?;
+        let setup = (|| {
+            let hello = RemoteMessage::Hello(Hello {
+                protocol: ProtocolVersion::CURRENT,
+                local_build_id: format!("engine-{}", env!("CARGO_PKG_VERSION")),
+                session_id: self.session_id.clone(),
+                session_token: self.token.clone(),
+                expected_incarnation: Some(self.incarnation.clone()),
+                requested_role: RemoteRole::Controller,
+                client_nonce: random_identifier()?,
+                required_capabilities: REQUIRED_CAPABILITIES.to_vec(),
+                last_acknowledged_output_offset: Some(output_offset),
+                last_acknowledged_grid_sequence: grid_sequence,
+            });
+            let encoded = RemoteCodec::encode(&hello).map_err(io::Error::other)?;
+            channel.input.write_all(&encoded)?;
+            channel.input.flush()?;
 
+            // Only this Engine writes this pipe. Never let SSH backpressure block
+            // an interactive caller or the Registry that called it.
+            let fd = channel.input.as_raw_fd();
+            // SAFETY: fd is the live owned SSH stdin descriptor; preserve its flags.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let (wake, wake_reader) = UnixStream::pair()?;
+            wake.set_nonblocking(true)?;
+            wake_reader.set_nonblocking(true)?;
+            Ok((wake, wake_reader))
+        })();
+        let (wake, wake_reader) = match setup {
+            Ok(pair) => pair,
+            Err(error) => {
+                super::executor::terminate_process_group(&mut channel.child);
+                return Err(error);
+            }
+        };
         let mut writer = self.writer.lock().expect("remote writer");
         terminate_current(&mut writer);
+        writer.wake = Some(wake);
+        writer.wake_reader = Some(wake_reader);
         writer.generation = writer.generation.saturating_add(1);
         writer.controller_epoch = None;
         writer.child = Some(channel.child);
@@ -113,10 +161,55 @@ impl RemoteSessionClient {
         Ok((writer.generation, channel.output))
     }
 
+    pub(crate) fn take_write_wakeup(&self, generation: u64) -> io::Result<UnixStream> {
+        let mut writer = self.writer.lock().expect("remote writer");
+        require_generation(&writer, generation)?;
+        writer
+            .wake_reader
+            .take()
+            .ok_or_else(|| io::Error::other("SSH writer wakeup already taken"))
+    }
+
+    pub(crate) fn pending_write_fd(&self, generation: u64) -> io::Result<Option<OwnedFd>> {
+        let writer = self.writer.lock().expect("remote writer");
+        require_generation(&writer, generation)?;
+        if writer.pending.is_empty() {
+            return Ok(None);
+        }
+        writer
+            .input
+            .as_ref()
+            .map(|input| input.as_fd().try_clone_to_owned())
+            .transpose()
+    }
+
+    pub(crate) fn flush_pending(&self, generation: u64) -> io::Result<()> {
+        let mut writer = self.writer.lock().expect("remote writer");
+        require_generation(&writer, generation)?;
+        flush_pending(&mut writer)?;
+        if let Some((cols, rows)) = writer.queued_resize.take()
+            && let Err(error) = write_message(
+                &mut writer,
+                &RemoteMessage::Terminal(Frame::resize(cols, rows)),
+            )
+        {
+            writer.queued_resize = Some((cols, rows));
+            if error.kind() != io::ErrorKind::WouldBlock {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn uncertain_effect(&self) -> bool {
+        self.writer.lock().expect("remote writer").uncertain_effect
+    }
+
     pub fn accept_hello(&self, generation: u64, epoch: u64) -> io::Result<()> {
         let mut writer = self.writer.lock().expect("remote writer");
         require_generation(&writer, generation)?;
         writer.controller_epoch = Some(epoch);
+        writer.control_granted = false;
         Ok(())
     }
 
@@ -160,16 +253,20 @@ impl RemoteSessionClient {
         }
         if !writer.queued_input.is_empty() {
             let bytes = std::mem::take(&mut writer.queued_input);
-            if let Err(error) = write_effect_message(
+            // Reconnect input was accepted before this lease. If the queue
+            // cannot accept it, retain it without duplicating a sent prefix.
+            if let Err(error) = write_message(
                 &mut writer,
                 &RemoteMessage::Terminal(Frame::input(bytes.clone())),
             ) {
-                if error.outcome() == EffectOutcome::NotApplied {
+                if error.kind() == io::ErrorKind::WouldBlock {
                     writer.queued_input = bytes;
                 }
-                return Err(error.into());
+                return Err(error);
             }
         }
+        // The same writer lock keeps new input behind the reconnect batch.
+        writer.control_granted = true;
         Ok(())
     }
 
@@ -189,17 +286,18 @@ impl RemoteSessionClient {
             return Ok(());
         }
         let mut writer = self.writer.lock().expect("remote writer");
-        if writer.controller_epoch.is_none() || writer.input.is_none() {
+        if !writer.control_granted || writer.input.is_none() {
             // Wheel/motion is ephemeral. Replaying it after a reconnect would
             // target a screen that may already have changed.
             return Ok(());
         }
-        if write_message(
+        if let Err(error) = write_message(
             &mut writer,
             &RemoteMessage::Terminal(Frame::scroll(direction, lines, col, row)),
-        )
-        .is_err()
-        {
+        ) {
+            if error.kind() == io::ErrorKind::WouldBlock {
+                return Ok(());
+            }
             terminate_current(&mut writer);
             writer.controller_epoch = None;
         }
@@ -211,21 +309,25 @@ impl RemoteSessionClient {
             return Ok(());
         }
         let mut writer = self.writer.lock().expect("remote writer");
-        if writer.controller_epoch.is_none() || writer.input.is_none() {
+        if !writer.control_granted || writer.input.is_none() {
             return queue_input(&mut writer, bytes);
         }
+        if writer.uncertain_effect {
+            return Err(io::Error::other("remote input delivery is uncertain"));
+        }
         let frame = terminal_input_frame(self.helper.protocol, bytes, mouse);
-        if let Err(error) = write_effect_message(&mut writer, &RemoteMessage::Terminal(frame)) {
-            let outcome = error.outcome();
-            let queue_result =
-                (outcome == EffectOutcome::NotApplied).then(|| queue_input(&mut writer, bytes));
+        if let Err(error) = write_message(&mut writer, &RemoteMessage::Terminal(frame)) {
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::InvalidInput
+            ) {
+                return Err(error);
+            }
             terminate_current(&mut writer);
             writer.controller_epoch = None;
-            return if outcome == EffectOutcome::NotApplied {
-                queue_result.expect("not-applied writes retain input")
-            } else {
-                Err(error.into())
-            };
+            if writer.uncertain_effect {
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -234,7 +336,7 @@ impl RemoteSessionClient {
         validate_terminal_dimensions(cols, rows)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         let mut writer = self.writer.lock().expect("remote writer");
-        if writer.controller_epoch.is_none() || writer.input.is_none() {
+        if !writer.control_granted || writer.input.is_none() {
             writer.queued_resize = Some((cols, rows));
             return Ok(());
         }
@@ -243,6 +345,9 @@ impl RemoteSessionClient {
             &RemoteMessage::Terminal(Frame::resize(cols, rows)),
         ) {
             writer.queued_resize = Some((cols, rows));
+            if error.kind() == io::ErrorKind::WouldBlock {
+                return Ok(());
+            }
             terminate_current(&mut writer);
             writer.controller_epoch = None;
             let _ = error;
@@ -253,20 +358,22 @@ impl RemoteSessionClient {
 
     pub fn signal(&self, signal: i32) -> io::Result<()> {
         let mut writer = self.writer.lock().expect("remote writer");
-        let epoch = writer.controller_epoch.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotConnected,
-                "remote controller is reconnecting",
-            )
-        })?;
-        write_effect_message(
+        let epoch = writer
+            .controller_epoch
+            .filter(|_| writer.control_granted)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "remote controller is reconnecting",
+                )
+            })?;
+        write_message(
             &mut writer,
             &RemoteMessage::Signal(Signal {
                 controller_epoch: epoch,
                 signal: remote_signal(self.helper.target, signal)?,
             }),
         )
-        .map_err(Into::into)
     }
 
     pub fn kill(&self) -> io::Result<()> {
@@ -310,7 +417,7 @@ impl RemoteSessionClient {
         });
         let sent = {
             let mut writer = self.writer.lock().expect("remote writer");
-            if writer.controller_epoch.is_none() {
+            if !writer.control_granted {
                 Err(io::Error::new(
                     io::ErrorKind::NotConnected,
                     "remote controller is reconnecting",
@@ -357,33 +464,20 @@ impl RemoteSessionClient {
             .observed_output_offset
             .fetch_max(offset, Ordering::AcqRel);
         let offset = offset.max(previous);
-        let persisted = self.persisted_output_offset.load(Ordering::Acquire);
+        let persisted = self.scheduled_output_offset.load(Ordering::Acquire);
         if offset.saturating_sub(persisted) < OFFSET_PERSIST_INTERVAL {
             return;
         }
-        if self
-            .binding_store
-            .update_output_offset(&self.session_id, offset)
-            .is_ok()
-        {
-            self.persisted_output_offset
+        if self.checkpoint.submit(offset).is_ok() {
+            self.scheduled_output_offset
                 .store(offset, Ordering::Release);
         }
     }
 
     fn persist_observed_output_offset(&self) {
         let offset = self.observed_output_offset.load(Ordering::Acquire);
-        if offset <= self.persisted_output_offset.load(Ordering::Acquire) {
-            return;
-        }
-        if self
-            .binding_store
-            .update_output_offset(&self.session_id, offset)
-            .is_ok()
-        {
-            self.persisted_output_offset
-                .store(offset, Ordering::Release);
-        }
+        let _ = self.checkpoint.submit(offset);
+        let _ = self.checkpoint.finish();
     }
 
     pub fn disconnect(&self, generation: u64) {
@@ -398,6 +492,7 @@ impl RemoteSessionClient {
         let mut writer = self.writer.lock().expect("remote writer");
         terminate_current(&mut writer);
         writer.controller_epoch = None;
+        drop(writer);
         self.scrollback_requests
             .lock()
             .expect("scrollback requests")
@@ -412,28 +507,77 @@ impl RemoteSessionClient {
 }
 
 fn write_message(writer: &mut WriterState, message: &RemoteMessage) -> io::Result<()> {
-    let encoded = RemoteCodec::encode(message).map_err(io::Error::other)?;
+    if writer.input.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "SSH channel is closed",
+        ));
+    }
+    let bytes = RemoteCodec::encode(message)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    if writer
+        .pending_bytes
+        .saturating_add(writer.queued_input.len())
+        .saturating_add(bytes.len())
+        > MAX_QUEUED_INPUT + 4096
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "remote input queue is full",
+        ));
+    }
+    let (replay_input, resize, effect) = match message {
+        RemoteMessage::Terminal(frame)
+            if frame.frame_type == diri_proto::frames::FrameType::Input =>
+        {
+            (Some(frame.payload.clone()), None, true)
+        }
+        RemoteMessage::Terminal(frame)
+            if frame.frame_type == diri_proto::frames::FrameType::Resize =>
+        {
+            (None, frame.resize_payload(), false)
+        }
+        RemoteMessage::Signal(_) => (None, None, true),
+        _ => (None, None, false),
+    };
+    writer.pending_bytes += bytes.len();
+    writer.pending.push_back(PendingFrame {
+        bytes,
+        written: 0,
+        replay_input,
+        resize,
+        effect,
+    });
+    let result = flush_pending(writer);
+    if !writer.pending.is_empty()
+        && let Some(wake) = &mut writer.wake
+    {
+        // A full wake pipe already means the pump will observe this queue.
+        let _ = wake.write(&[1]);
+    }
+    result
+}
+
+fn flush_pending(writer: &mut WriterState) -> io::Result<()> {
     let input = writer
         .input
         .as_mut()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "SSH channel is closed"))?;
-    input.write_all(&encoded)?;
-    input.flush()
-}
-
-fn write_effect_message(
-    writer: &mut WriterState,
-    message: &RemoteMessage,
-) -> Result<(), EffectWriteError> {
-    let encoded = RemoteCodec::encode(message)
-        .map_err(|error| EffectWriteError::not_applied(io::Error::other(error)))?;
-    let input = writer.input.as_mut().ok_or_else(|| {
-        EffectWriteError::not_applied(io::Error::new(
-            io::ErrorKind::NotConnected,
-            "SSH channel is closed",
-        ))
-    })?;
-    write_at_most_once(input, &encoded)
+    let mut budget = 64 << 10;
+    while budget > 0
+        && let Some(frame) = writer.pending.front_mut()
+    {
+        let end = frame.bytes.len().min(frame.written + budget);
+        let before = frame.written;
+        super::effect::write_at_most_once(input, &frame.bytes, &mut frame.written, &mut budget)?;
+        if frame.written == frame.bytes.len() {
+            writer.pending_bytes -= frame.bytes.len();
+            writer.pending.pop_front();
+        } else if frame.written == before || frame.written < end {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn terminal_input_frame(protocol: ProtocolVersion, bytes: &[u8], mouse: bool) -> Frame {
@@ -449,6 +593,9 @@ fn terminal_input_frame(protocol: ProtocolVersion, bytes: &[u8], mouse: bool) ->
 }
 
 fn queue_input(writer: &mut WriterState, bytes: &[u8]) -> io::Result<()> {
+    if writer.uncertain_effect {
+        return Err(io::Error::other("remote input delivery is uncertain"));
+    }
     if writer.queued_input.len().saturating_add(bytes.len()) > MAX_QUEUED_INPUT {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
@@ -494,6 +641,26 @@ fn remote_signal(target: RemoteTarget, signal: i32) -> io::Result<i32> {
 }
 
 fn terminate_current(writer: &mut WriterState) {
+    writer.control_granted = false;
+    let latest_resize = writer.queued_resize.take();
+    for frame in writer.pending.drain(..) {
+        if frame.effect && frame.written > 0 {
+            writer.uncertain_effect = true;
+        } else if let Some(bytes) = frame.replay_input {
+            writer.queued_input.extend_from_slice(&bytes);
+        } else if frame.effect {
+            // Signals are never replayed, even if the local queue had not
+            // written them. Surface the lost operation rather than hide it.
+            writer.uncertain_effect = true;
+        }
+        if let Some(size) = frame.resize {
+            writer.queued_resize = Some(size);
+        }
+    }
+    writer.queued_resize = latest_resize.or(writer.queued_resize);
+    writer.pending_bytes = 0;
+    writer.wake.take();
+    writer.wake_reader.take();
     writer.input.take();
     if let Some(mut child) = writer.child.take() {
         super::executor::terminate_process_group(&mut child);
@@ -574,5 +741,112 @@ mod tests {
             terminal_input_frame(ProtocolVersion::CURRENT, b"key", false).frame_type,
             FrameType::Input
         );
+    }
+    fn pipe_writer() -> (WriterState, UnixStream) {
+        let (input, output) = UnixStream::pair().unwrap();
+        input.set_nonblocking(true).unwrap();
+        output.set_nonblocking(true).unwrap();
+        let size: libc::c_int = 4096;
+        // SAFETY: input owns a live socket and size points to a valid integer.
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    input.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&size as *const libc::c_int).cast(),
+                    std::mem::size_of_val(&size) as _,
+                )
+            },
+            0
+        );
+        (
+            WriterState {
+                input: Some(ChildStdin::from(OwnedFd::from(input))),
+                generation: 7,
+                controller_epoch: Some(3),
+                control_granted: true,
+                ..WriterState::default()
+            },
+            output,
+        )
+    }
+
+    #[test]
+    fn nonblocking_frames_resume_in_order_and_reject_overflow_atomically() {
+        use std::io::Read;
+        let (mut writer, mut output) = pipe_writer();
+        let messages = [
+            RemoteMessage::Terminal(Frame::input(vec![b'x'; 128 * 1024])),
+            RemoteMessage::Terminal(Frame::input(b"tail".to_vec())),
+        ];
+        for message in &messages {
+            write_message(&mut writer, message).unwrap();
+        }
+        assert!(!writer.pending.is_empty());
+        let before = writer.pending_bytes;
+        let full = RemoteMessage::Terminal(Frame::input(vec![b'y'; MAX_QUEUED_INPUT]));
+        assert_eq!(
+            write_message(&mut writer, &full).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(writer.pending_bytes, before);
+        assert!(require_generation(&writer, 6).is_err());
+        let mut bytes = Vec::new();
+        loop {
+            let mut chunk = [0; 64 * 1024];
+            while let Ok(count) = output.read(&mut chunk) {
+                if count == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            if writer.pending.is_empty() {
+                break;
+            }
+            flush_pending(&mut writer).unwrap();
+        }
+        assert_eq!(RemoteCodec::new().feed(&bytes).unwrap(), messages);
+        assert_eq!(writer.pending_bytes, 0);
+    }
+
+    #[test]
+    fn disconnect_never_replays_a_partially_written_effect() {
+        let (mut writer, _output) = pipe_writer();
+        write_message(
+            &mut writer,
+            &RemoteMessage::Terminal(Frame::input(vec![b'x'; 128 * 1024])),
+        )
+        .unwrap();
+        assert!(writer.pending.front().unwrap().written > 0);
+        write_message(
+            &mut writer,
+            &RemoteMessage::Terminal(Frame::input(b"later".to_vec())),
+        )
+        .unwrap();
+        terminate_current(&mut writer);
+        assert!(writer.uncertain_effect);
+        assert_eq!(writer.queued_input, b"later");
+        assert!(queue_input(&mut writer, b"retry").is_err());
+    }
+
+    #[test]
+    fn disconnect_retains_only_wholly_unwritten_input() {
+        let (mut writer, _output) = pipe_writer();
+        // A large ephemeral mouse report occupies the transport first.
+        write_message(
+            &mut writer,
+            &RemoteMessage::Terminal(Frame::mouse(vec![b'm'; 128 * 1024])),
+        )
+        .unwrap();
+        write_message(
+            &mut writer,
+            &RemoteMessage::Terminal(Frame::input(b"safe".to_vec())),
+        )
+        .unwrap();
+        assert_eq!(writer.pending.back().unwrap().written, 0);
+        terminate_current(&mut writer);
+        assert!(!writer.uncertain_effect);
+        assert_eq!(writer.queued_input, b"safe");
     }
 }

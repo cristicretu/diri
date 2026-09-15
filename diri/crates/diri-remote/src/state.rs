@@ -85,6 +85,23 @@ pub fn acquire_lock(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// Serialize metadata checkpoints with launch, kill, and GC. This is the
+/// existing per-session launch lock; waiting occurs only on a metadata worker
+/// or management command, never on the Holder's interactive owner loop.
+pub fn acquire_launch_lock_wait(path: &Path) -> io::Result<File> {
+    let file = open_private_file(path)?;
+    loop {
+        // SAFETY: file owns the valid descriptor throughout flock.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(file);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
 pub fn holder_lock_held(path: &Path) -> io::Result<bool> {
     let file = open_private_file(path)?;
     // SAFETY: `flock` operates only on the descriptor owned by `file`.

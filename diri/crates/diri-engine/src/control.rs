@@ -272,21 +272,14 @@ impl ControlServer {
             return Vec::new();
         };
         let hosts = diri_proto::HostsConfig::load(self.hosts_file());
-        // Snapshot under the lock, then let it go. Every step below is an SSH
+        // Clone the engine under the lock, then let it go. Every step below is an SSH
         // round trip, and a delegated fleet is dozens of bindings on one host:
         // holding the Registry across all of them blocked attaches, hook
         // reports, and readiness probes for minutes after boot, which the app
         // showed as a blank pane for every session, local ones included.
-        let (records, engine) = {
-            let Ok(registry) = self.registry.lock() else {
-                return Vec::new();
-            };
-            let records = registry
-                .records()
-                .into_iter()
-                .map(|record| (record.id.0.clone(), record))
-                .collect::<std::collections::HashMap<_, _>>();
-            (records, registry.engine())
+        let engine = match self.registry.lock() {
+            Ok(registry) => registry.engine(),
+            Err(_) => return Vec::new(),
         };
         // One Helper probe per host and build rather than one per session.
         let mut helpers = std::collections::HashMap::<
@@ -295,8 +288,26 @@ impl ControlServer {
         >::new();
         let mut adopted = Vec::new();
         for binding in bindings {
-            let Some(record) = records.get(&binding.session_id) else {
+            // Startup restore and user lifecycle operations must reserve the
+            // same identity while SSH runs. Re-read the record under that
+            // reservation: a prior stop/resume may have replaced the snapshot
+            // captured when the bindings directory was enumerated.
+            let Ok(_operation) =
+                account_handoff::SessionOperation::for_session(self, &binding.session_id)
+            else {
                 continue;
+            };
+            let record = {
+                let Ok(registry) = self.registry.lock() else {
+                    break;
+                };
+                if registry.get(&binding.session_id).is_some() {
+                    continue;
+                }
+                let Some(record) = registry.record(&binding.session_id) else {
+                    continue;
+                };
+                record
             };
             if record.host.as_deref() != Some(&binding.host_id) {
                 continue;
@@ -508,6 +519,12 @@ impl ControlServer {
                         | Method::HOST_LIST_DIRECTORIES
                         | Method::SESSION_READ_DIFF
                         | Method::SESSION_READ_SCROLLBACK_CELLS
+                        | Method::SESSION_KILL
+                        | Method::SESSION_REMOVE
+                        | Method::SESSION_ARCHIVE
+                        | Method::SESSION_RESUME
+                        | Method::SESSION_FORK
+                        | Method::SESSION_MIGRATE
                         | Method::WORKTREE_OVERVIEW
                         | Method::WORKTREE_CLEANUP
                 ) || ((method == Method::AGENT_READINESS
@@ -1282,17 +1299,9 @@ impl ControlServer {
             }),
             defer_launch: false,
         };
+        self.spawn_session_with_intent(spec, Some(record), tracked)?;
         let mut registry = self.registry.lock().map_err(poisoned)?;
         registry.ensure_session_project(&captured.cwd, Some(&host.id));
-        if tracked {
-            // Persist the launch intent before a Holder can exist. A crash
-            // immediately after launch must leave a record for binding adoption.
-            registry.insert_record(record.clone());
-            registry.persist_for_shutdown().map_err(io_control_error)?;
-        }
-        registry
-            .spawn(spec, record)
-            .map_err(|error| ControlError::internal(error.to_string()))?;
         if tracked {
             registry.persist_for_shutdown().map_err(io_control_error)?;
         } else {
@@ -1509,10 +1518,7 @@ impl ControlServer {
 
         // Point of no return: stop the source agent.
         let mut warnings: Vec<String> = Vec::new();
-        {
-            let mut registry = self.registry.lock().map_err(poisoned)?;
-            let _ = registry.terminate(&id, std::time::Duration::from_secs(3));
-        }
+        self.terminate_session_unlocked(&id, Duration::from_secs(3))?;
         // Phase 2: transcript shuttle (source stopped ⇒ the jsonl is final).
         let shuttle = crate::migrate::shuttle_transcript(
             &record.cwd,
@@ -1915,12 +1921,98 @@ impl ControlServer {
         encode(&reader.read(p.first_row, p.max_rows))
     }
 
+    fn spawn_session_unlocked(
+        &self,
+        spec: crate::session::SessionSpec,
+        record: Option<diri_proto::SessionRecord>,
+    ) -> Result<(), ControlError> {
+        self.spawn_session_with_intent(spec, record, false)
+    }
+
+    fn spawn_session_with_intent(
+        &self,
+        spec: crate::session::SessionSpec,
+        record: Option<diri_proto::SessionRecord>,
+        persist_intent: bool,
+    ) -> Result<(), ControlError> {
+        let id = spec.id.clone();
+        let engine = {
+            let mut registry = self.registry.lock().map_err(poisoned)?;
+            registry
+                .reserve_launch(&id, record.is_some())
+                .map_err(io_control_error)?;
+            if persist_intent && let Some(record) = &record {
+                registry.insert_record(record.clone());
+                if let Err(error) = registry.persist_for_shutdown() {
+                    registry.release_launch(&id);
+                    return Err(io_control_error(error));
+                }
+            }
+            registry.engine()
+        };
+        let spawned = crate::session::Session::spawn(spec, engine);
+        let mut registry = self.registry.lock().map_err(poisoned)?;
+        registry.release_launch(&id);
+        let mut session = spawned.map_err(io_control_error)?;
+        let installed = registry.install_session(session, record);
+        drop(registry);
+        if let Err(rejected) = installed {
+            session = *rejected;
+            let _ = session.terminate(Duration::ZERO);
+            return Err(ControlError::bad_request(
+                "Session changed while its remote launch was pending",
+            ));
+        }
+        Ok(())
+    }
+
+    fn terminate_session_unlocked(
+        &self,
+        id: &str,
+        grace: Duration,
+    ) -> Result<Option<crate::pty::Exit>, ControlError> {
+        let stop = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            registry
+                .get(id)
+                .and_then(crate::session::Session::remote_stop)
+        };
+        if let Some(stop) = stop {
+            let exit = stop.stop(grace).map_err(io_control_error)?;
+            let session = self
+                .registry
+                .lock()
+                .map_err(poisoned)?
+                .finish_remote_stop(id, &stop, exit);
+            drop(session);
+            Ok(Some(exit))
+        } else {
+            self.registry
+                .lock()
+                .map_err(poisoned)?
+                .terminate(id, grace)
+                .map_err(io_control_error)
+        }
+    }
+
+    fn stop_remote_before_lifecycle(&self, id: &str) -> Result<(), ControlError> {
+        let remote = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            registry.preflight_lifecycle(id).map_err(io_control_error)?;
+            registry
+                .get(id)
+                .is_some_and(|session| session.remote_stop().is_some())
+        };
+        if remote {
+            self.terminate_session_unlocked(id, Duration::from_millis(500))?;
+        }
+        Ok(())
+    }
+
     fn session_kill(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::SessionIdParams = decode(params)?;
+        let exit = self.terminate_session_unlocked(&p.session_id.0, Duration::from_secs(3))?;
         let mut registry = self.registry.lock().map_err(poisoned)?;
-        let exit = registry
-            .terminate(&p.session_id.0, std::time::Duration::from_secs(3))
-            .map_err(|error| ControlError::internal(error.to_string()))?;
         if exit.is_none() {
             return Err(ControlError::not_found(p.session_id.0.clone()));
         }
@@ -1934,6 +2026,7 @@ impl ControlServer {
 
     fn session_remove(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::SessionIdParams = decode(params)?;
+        self.stop_remote_before_lifecycle(&p.session_id.0)?;
         let mut registry = self.registry.lock().map_err(poisoned)?;
         let removed = registry
             .record(&p.session_id.0)
@@ -1992,9 +2085,16 @@ impl ControlServer {
 
     fn session_archive(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::SessionIdParams = decode(params)?;
+        let original = self
+            .registry
+            .lock()
+            .map_err(poisoned)?
+            .record(&p.session_id.0)
+            .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+        self.stop_remote_before_lifecycle(&p.session_id.0)?;
         let mut registry = self.registry.lock().map_err(poisoned)?;
         registry
-            .archive(&p.session_id.0)
+            .archive_record(original)
             .map_err(io_control_error)?;
         self.publish_updated(&registry, &p.session_id.0);
         Ok(json!({}))
@@ -2087,6 +2187,15 @@ impl ControlServer {
             crate::accounts::bind_pty(&mut profile, &mut spec.pty)?;
         }
         let remote_persistence = spec.remote.as_ref().map(|remote| remote.launch.persistence);
+        if remote_persistence.is_some() {
+            self.terminate_session_unlocked(&p.session_id.0, Duration::from_millis(500))?;
+            self.spawn_session_unlocked(spec, None)?;
+            let mut registry = self.registry.lock().map_err(poisoned)?;
+            registry.update_record(&p.session_id.0, |record| {
+                record.remote_persistence = remote_persistence
+            });
+            return self.restored_resume_result(&mut registry, &p.session_id.0);
+        }
         let mut registry = self.registry.lock().map_err(poisoned)?;
         let record = registry
             .records()
@@ -2184,11 +2293,17 @@ impl ControlServer {
         record.title = format!("Fork of {}", source.title);
         record.title_source = diri_proto::TitleSource::DirijorAssigned;
 
+        if spec.remote.is_some() {
+            self.spawn_session_unlocked(spec, Some(record))?;
+        } else {
+            self.registry
+                .lock()
+                .map_err(poisoned)?
+                .spawn(spec, record)
+                .map_err(io_control_error)?;
+        }
         let mut registry = self.registry.lock().map_err(poisoned)?;
         registry.ensure_session_project(&source.cwd, source.host.as_deref());
-        registry
-            .spawn(spec, record)
-            .map_err(|error| ControlError::internal(error.to_string()))?;
         let _ = registry.persist();
         self.publish_updated(&registry, &id);
         let record = registry

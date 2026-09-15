@@ -181,7 +181,7 @@ The completed ownership boundaries are:
 - `diri-engine`: local session authority, host orchestration, bootstrap, SSH,
   reconnect, and status reduction;
 - `diri-proto::remote_pty`: versioned Helper protocol and wire codec;
-- `diri-pty`: shared low-level PTY primitives;
+- `diri-pty`: shared low-level PTY primitives and bounded metadata checkpoint scheduling;
 - `diri-terminal-state`: shared headless parser, grid, snapshot, and diff model;
 - `diri-remote`: minimal remote Helper executable;
 - `diri-client`: app-to-Engine client only;
@@ -493,6 +493,66 @@ One owner/event loop handles PTY drain, terminal parsing, diff construction, and
 attach writes. The hot path does not put an `Arc<Mutex<Terminal>>` across tasks.
 Buffers are reused where practical, and idle Holders do not poll, heartbeat, or
 run GC.
+
+### Remote responsiveness under contention
+
+Remote lifecycle RPCs run in the existing bounded control-worker pool. The
+Registry reserves a launch identity, releases its lock for SSH and Session
+construction, and installs the completed Session under the lock. Stop pins the
+original Session, performs SSH and pump cleanup outside the Registry, and
+removes only that same owner. Existing per-session operation guards serialize
+resume, fork, archive, removal, migration, account continuation, and startup
+restore. Restore rechecks the current record under that reservation. Unrelated
+input, screen reads, and Hello requests remain available during these operations.
+
+Interactive SSH stdin is nonblocking. The existing remote pump polls pending
+writes alongside stdout, using a wake socket when an interactive caller queues
+work. Each flush writes at most 64 KiB. The queue bounds encoded frames to 1 MiB
+plus 4 KiB of framing allowance, with a bounded copy of wholly unwritten input
+for reconnect. Queue overflow rejects the new operation before accepting bytes;
+the binary attach closes on input errors rather than silently swallowing them.
+Pending frames retain their exact written prefix. Input received during the
+Hello handshake stays behind the reconnect batch until control is granted.
+Wholly unwritten input may
+be replayed after reconnect; a partially written effect is never replayed and
+an uncertain asynchronous delivery fails the session transport explicitly.
+Wheel intent is ephemeral; resize retains the latest pending size. This needs
+no new writer thread or wire version and supports existing Helper builds.
+
+A Holder drains at most 64 KiB per owner-loop turn and yields when two
+milliseconds have elapsed between reads. Input, attach writes, and due grid
+publication are serviced between turns even if PTY output stays readable.
+On Agent exit, the Holder reaps its guarded process group but retains the PTY
+reader until its remaining output is consumed. The final output and grid
+precede the exit event.
+
+Routine offset, dimensions, and controller-epoch checkpoints now use a shared
+bounded persistence primitive in `diri-pty`. Each remote Engine client and
+Holder has one sleeping worker with a 128 KiB stack, one immutable snapshot in
+flight, and at most one latest snapshot pending. No PTY, parser, grid, or
+connection moves to that worker. It does not hold the submission lock during
+filesystem operations and has no idle timer or periodic wakeup. Holder write
+failures wake the owner through a pollable socket and fail closed. Engine
+binding write failures retain the existing best-effort recovery-offset policy.
+
+Initial Holder identity is durable before launch succeeds. Routine on-disk
+inspection metadata may lag the authoritative in-memory state while disk I/O
+is in flight. Final exit waits for the ordered checkpoint fence; Engine close
+fences its binding writer before removal or replacement. A stale client cannot
+submit after that fence, and binding updates validate the incarnation. The
+metadata worker shares the existing launch lock with launch, kill, and GC.
+Management kill acquires that lock before signaling the Holder, so it cannot
+interrupt a checkpoint and leave a nonce file behind. It publishes final state
+only after the old Holder has released its ownership lock, then revalidates
+the incarnation under that lock. An
+old Running checkpoint cannot overwrite the final management exit.
+
+These scheduling changes add no protocol or on-disk schema. Durable output-log
+writes and rotation retain their existing policy. Engine improvements apply
+to surviving remote sessions after an Engine update; Holder scheduling changes
+apply to newly launched Helper processes. Live Helpers retain their original
+Build IDs and are never overwritten or restarted to apply an optimization.
+See the 2026-09-15 regression measurements in [PERF.md](PERF.md).
 
 The shared terminal core recomputes its 4 MiB history-cell allowance when the
 column count changes, including when the primary screen is inactive. Narrowing

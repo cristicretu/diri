@@ -34,6 +34,14 @@ impl<'a> SessionOperation<'a> {
         let id = guarded
             .then(|| params?.get("sessionID")?.as_str().map(str::to_owned))
             .flatten();
+        Self::reserve(server, id)
+    }
+
+    pub(super) fn for_session(server: &'a ControlServer, id: &str) -> Result<Self, ControlError> {
+        Self::reserve(server, Some(id.to_owned()))
+    }
+
+    fn reserve(server: &'a ControlServer, id: Option<String>) -> Result<Self, ControlError> {
         if let Some(id) = &id
             && !server
                 .session_operations
@@ -183,9 +191,9 @@ impl ControlServer {
             }
             registry.persist_now().map_err(io_control_error)?;
             // Termination waits for the old process tree; no two Claude writers share this session.
-            registry
-                .terminate(&source.id.0, Duration::from_secs(3))
-                .map_err(io_control_error)?;
+            drop(registry);
+            self.terminate_session_unlocked(&source.id.0, Duration::from_secs(3))?;
+            let mut registry = self.registry.lock().map_err(poisoned)?;
             registry.persist_now().map_err(io_control_error)?;
             self.publish_updated(&registry, &source.id.0);
         }
@@ -216,7 +224,14 @@ impl ControlServer {
             }
             // The new binding is durable before launch. A launch failure retries this account,
             // never the limited account, and recovery capsules use the same binding.
-            let result = registry.respawn(spec).map_err(io_control_error);
+            let result = if spec.remote.is_some() {
+                drop(registry);
+                let result = self.spawn_session_unlocked(spec, None);
+                registry = self.registry.lock().map_err(poisoned)?;
+                result
+            } else {
+                registry.respawn(spec).map_err(io_control_error)
+            };
             self.publish_updated(&registry, &source.id.0);
             result?;
             registry.persist_now().map_err(io_control_error)?;

@@ -1290,3 +1290,157 @@ fn assert_percentile(name: &str, samples: &mut [Duration], percentile: usize, ma
         max_ms * 1_000
     );
 }
+
+#[test]
+fn bounded_drain_preserves_output_and_grid_before_process_exit() {
+    let temporary = tempfile::tempdir_in("/tmp").unwrap();
+    let state_dir = temporary.path().join("state");
+    let launch: LaunchResult = run_json("launch", &state_dir, Some(&LaunchRequest {
+        session_id: "exit-tail".into(), session_token: token(),
+        argv: vec!["/bin/sh".into(), "-c".into(), "stty -echo; printf 'ready\\n'; read start; head -c 2097152 /dev/zero | tr '\\000' x; printf 'tail-complete'".into()],
+        cwd: "/".into(), environment: vec![], cols: 80, rows: 24,
+        persistence: PersistenceCapability::NonPersistent,
+    }));
+    let mut attach = Attach::open(&state_dir, hello(&launch, Some(0), "exit-tail-client"));
+    attach.receive_until(Duration::from_secs(5), |message| {
+        matches!(message, RemoteMessage::ControlGranted(_))
+    });
+    attach.send(RemoteMessage::Terminal(Frame::input(b"start\n".to_vec())));
+    let started = Instant::now();
+    let messages = attach.receive_until(Duration::from_secs(15), |message| {
+        matches!(message, RemoteMessage::ProcessExit(_))
+    });
+    let elapsed = started.elapsed();
+    let tail_in_grid = messages.iter().any(|message| match message {
+        RemoteMessage::FullSnapshot(snapshot) => {
+            grid_text(&snapshot.grid).contains("tail-complete")
+        }
+        RemoteMessage::GridDelta(delta) => grid_text(&delta.grid).contains("tail-complete"),
+        _ => false,
+    });
+    let inspection: SessionInspection = run_json(
+        "inspect",
+        &state_dir,
+        Some(&SessionSelector {
+            session_id: launch.session_id.clone(),
+            session_token: token(),
+            expected_incarnation: Some(launch.session_incarnation.clone()),
+        }),
+    );
+    let _: SessionInspection = run_json(
+        "kill",
+        &state_dir,
+        Some(&SessionSelector {
+            session_id: launch.session_id.clone(),
+            session_token: token(),
+            expected_incarnation: Some(launch.session_incarnation),
+        }),
+    );
+    assert!(tail_in_grid, "final grid must arrive before ProcessExit");
+    assert_eq!(
+        inspection.output_offset,
+        b"ready\r\n".len() as u64 + 2097152 + b"tail-complete".len() as u64
+    );
+    eprintln!("2 MiB output and final grid drained in {elapsed:?}");
+}
+
+#[test]
+#[ignore = "release-only responsiveness under continuous PTY output"]
+fn continuous_output_keeps_controller_responsive() {
+    let temporary = tempfile::tempdir_in("/tmp").unwrap();
+    let state_dir = temporary.path().join("state");
+    let launch: LaunchResult = run_json("launch", &state_dir, Some(&LaunchRequest {
+        session_id: "loaded-input".into(), session_token: token(),
+        argv: vec!["/bin/sh".into(), "-c".into(), "stty -echo; printf 'ready\\n'; read start; yes noisy-output & producer=$!; read line; kill $producer; wait $producer 2>/dev/null; printf 'ack:%s\\n' \"$line\"; read end".into()],
+        cwd: "/".into(), environment: vec![], cols: 80, rows: 24,
+        persistence: PersistenceCapability::NonPersistent,
+    }));
+    let mut attach = Attach::open(&state_dir, hello(&launch, Some(0), "loaded-client"));
+    attach.receive_until(Duration::from_secs(5), |message| {
+        matches!(message, RemoteMessage::ControlGranted(_))
+    });
+    attach.send(RemoteMessage::Terminal(Frame::input(b"start\n".to_vec())));
+    attach.receive_until(Duration::from_secs(5), |message| matches!(message, RemoteMessage::Terminal(frame) if frame.output_payload().is_some_and(|(_, bytes)| bytes.windows(12).any(|part| part == b"noisy-output"))));
+    let started = Instant::now();
+    attach.send(RemoteMessage::Terminal(Frame::input(
+        b"interactive\n".to_vec(),
+    )));
+    attach.receive_until(Duration::from_secs(5), |message| match message {
+        RemoteMessage::GridDelta(delta) => grid_text(&delta.grid).contains("ack:interactive"),
+        RemoteMessage::FullSnapshot(snapshot) => {
+            grid_text(&snapshot.grid).contains("ack:interactive")
+        }
+        _ => false,
+    });
+    let elapsed = started.elapsed();
+    let _: SessionInspection = run_json(
+        "kill",
+        &state_dir,
+        Some(&SessionSelector {
+            session_id: launch.session_id,
+            session_token: token(),
+            expected_incarnation: Some(launch.session_incarnation),
+        }),
+    );
+    eprintln!("loaded input-to-grid: {elapsed:?}");
+    assert!(elapsed < Duration::from_millis(150));
+}
+
+#[test]
+fn stopping_during_output_checkpoints_leaves_no_temporary_state() {
+    let temporary = tempfile::tempdir_in("/tmp").unwrap();
+    let state_dir = temporary.path().join("state");
+    for iteration in 0..4 {
+        let launch: LaunchResult = run_json(
+            "launch",
+            &state_dir,
+            Some(&LaunchRequest {
+                session_id: format!("checkpoint-stop-{iteration}"),
+                session_token: token(),
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "exec yes checkpoint-output".into(),
+                ],
+                cwd: "/".into(),
+                environment: vec![],
+                cols: 80,
+                rows: 24,
+                persistence: PersistenceCapability::NonPersistent,
+            }),
+        );
+        let session_root = state_dir.join("sessions").join(&launch.session_id);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while std::fs::metadata(session_root.join("output.log"))
+            .unwrap()
+            .len()
+            < (1 << 20) + 16
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let inspection: SessionInspection = run_json(
+            "kill",
+            &state_dir,
+            Some(&SessionSelector {
+                session_id: launch.session_id,
+                session_token: token(),
+                expected_incarnation: Some(launch.session_incarnation),
+            }),
+        );
+        let log_bytes = std::fs::metadata(session_root.join("output.log"))
+            .unwrap()
+            .len()
+            - 16;
+        assert_eq!(
+            inspection.output_offset, log_bytes,
+            "management exit must include the final log offset"
+        );
+        let gc: TestGcResult = run_json::<(), _>("gc", &state_dir, None);
+        assert_eq!(
+            gc.removed_sessions, 1,
+            "interrupted checkpoint left temporary state on iteration {iteration}"
+        );
+        assert_eq!(gc.retained_sessions, 0);
+    }
+}

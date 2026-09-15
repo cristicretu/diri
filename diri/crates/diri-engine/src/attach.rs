@@ -143,10 +143,14 @@ impl AttachHub {
         };
         match frame.frame_type {
             FrameType::Input => {
-                let _ = session.write_input(&frame.payload);
+                if session.write_input(&frame.payload).is_err() {
+                    return false;
+                }
             }
             FrameType::Mouse => {
-                let _ = session.write_mouse(&frame.payload);
+                if session.write_mouse(&frame.payload).is_err() {
+                    return false;
+                }
             }
             FrameType::Resize => {
                 if let Some((cols, rows)) = frame.resize_payload() {

@@ -108,7 +108,12 @@ impl RemoteBindingStore {
         Ok(binding)
     }
 
-    pub fn update_output_offset(&self, session_id: &str, offset: u64) -> io::Result<()> {
+    pub fn update_output_offset_for_incarnation(
+        &self,
+        session_id: &str,
+        incarnation: &str,
+        offset: u64,
+    ) -> io::Result<()> {
         validate_identifier(session_id)?;
         let path = self.path(session_id);
         reject_symlink(&path)?;
@@ -124,7 +129,7 @@ impl RemoteBindingStore {
         }
         let mut binding: RemoteBinding = serde_json::from_slice(&fs::read(path)?)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        if binding.session_id != session_id {
+        if binding.session_id != session_id || binding.session_incarnation != incarnation {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "remote binding identity does not match its filename",
@@ -248,7 +253,15 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
-        store.update_output_offset("session-1", 42).expect("offset");
+        store
+            .update_output_offset_for_incarnation("session-1", &binding.session_incarnation, 42)
+            .expect("offset");
+        assert_eq!(store.load_all().expect("reload")[0].last_output_offset, 42);
+        assert!(
+            store
+                .update_output_offset_for_incarnation("session-1", "stale-incarnation", 1000)
+                .is_err()
+        );
         assert_eq!(store.load_all().expect("reload")[0].last_output_offset, 42);
     }
 }

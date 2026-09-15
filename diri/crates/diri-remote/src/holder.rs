@@ -59,7 +59,7 @@ pub fn launch(request: LaunchRequest, executable: &std::path::Path) -> io::Resul
     let roots = StatePaths::resolve()?;
     let paths = roots.session(&request.session_id)?;
     paths.ensure()?;
-    let _launch_lock = acquire_lock(&paths.launch_lock)?;
+    let _launch_lock = crate::state::acquire_launch_lock_wait(&paths.launch_lock)?;
 
     if let Ok(state) = read_state(&paths.state)
         && crate::state::holder_lock_held(&paths.lock)?
@@ -78,6 +78,12 @@ pub fn launch(request: LaunchRequest, executable: &std::path::Path) -> io::Resul
                 "the requested session already exists and has exited",
             ));
         };
+        if !crate::state::process_alive(pid) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "the requested Agent has exited",
+            ));
+        }
         return Ok(LaunchResult {
             session_id: state.session_id,
             session_incarnation: state.session_incarnation,
@@ -396,16 +402,18 @@ impl Drop for ProcessGuard {
 }
 
 struct Holder {
+    // Cleanup the Agent before joining metadata persistence, and retain the
+    // session lock until both are finished, including on unwinding.
+    process_guard: ProcessGuard,
+    checkpoint: diri_pty::checkpoint::CheckpointWriter<SessionState>,
     _lock: File,
     paths: SessionPaths,
     listener: UnixListener,
-    // Declared before the PTY so ordinary unwinding closes the guard's pipe
-    // and reaps the Agent group before the PTY handle itself is dropped.
-    process_guard: ProcessGuard,
     pty: Pty,
     pty_reader: Option<PtyStream>,
     pty_writer: PtyStream,
     exit_watcher: Option<ExitWatcher>,
+    pending_exit: Option<Exit>,
     screen: HeadlessScreen,
     log: OutputLog,
     state: SessionState,
@@ -475,8 +483,16 @@ impl Holder {
         let mut state = SessionState::new(&start.request, start.incarnation, process_pid);
         state.output_offset = log.tail_offset();
         write_state(&paths.state, &state)?;
+        let state_path = paths.state.clone();
+        let metadata_lock = paths.launch_lock.clone();
+        let checkpoint =
+            diri_pty::checkpoint::CheckpointWriter::new("holder-checkpoint", move |state| {
+                let _lock = crate::state::acquire_launch_lock_wait(&metadata_lock)?;
+                write_state(&state_path, &state)
+            })?;
 
         Ok(Self {
+            checkpoint,
             _lock: lock,
             paths,
             listener,
@@ -485,6 +501,7 @@ impl Holder {
             pty_reader: Some(pty_reader),
             pty_writer,
             exit_watcher: Some(exit_watcher),
+            pending_exit: None,
             screen,
             log,
             state,
@@ -565,6 +582,12 @@ impl Holder {
                 });
                 index
             });
+            let checkpoint_index = descriptors.len();
+            descriptors.push(libc::pollfd {
+                fd: self.checkpoint.failure_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
             let timeout = self.poll_timeout_ms();
             // SAFETY: `descriptors` owns initialized pollfd entries for the
             // duration of the call. A negative timeout sleeps indefinitely.
@@ -583,6 +606,9 @@ impl Holder {
                 return Err(error);
             }
 
+            if descriptors[checkpoint_index].revents != 0 {
+                self.checkpoint.check_error()?;
+            }
             if descriptors[0].revents & libc::POLLIN != 0 {
                 self.accept_connection()?;
             }
@@ -631,6 +657,11 @@ impl Holder {
                 self.flush_output()?;
                 self.emit_grid_delta()?;
             }
+            if self.pty_reader.is_none()
+                && let Some(exit) = self.pending_exit.take()
+            {
+                self.finish_exit(exit)?;
+            }
             self.emit_foreground_process()?;
         }
     }
@@ -668,64 +699,53 @@ impl Holder {
     }
 
     fn drain_pty(&mut self) -> io::Result<()> {
-        let Some(_) = self.pty_reader.as_mut() else {
+        let Some(mut reader) = self.pty_reader.take() else {
             return Ok(());
         };
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let read = self
-                .pty_reader
-                .as_mut()
-                .expect("reader checked")
-                .read(&mut buffer);
-            match read {
-                Ok(0) => {
-                    self.pty_reader = None;
-                    return Ok(());
-                }
-                Ok(count) => {
-                    let bytes = &buffer[..count];
-                    let offset = self.log.append(bytes)?;
-                    self.state.output_offset = self.log.tail_offset();
-                    self.screen.feed(bytes);
-                    if self.dirty_since.is_none() {
-                        self.dirty_since = Some(Instant::now());
-                    }
-                    if self
-                        .connection
-                        .as_ref()
-                        .is_some_and(|connection| connection.epoch.is_some())
-                    {
-                        // Held rather than framed here. A PTY hands over about
-                        // a kilobyte per read, and a frame each meant ten
-                        // thousand of them for eleven megabytes — a header, a
-                        // queue entry and a share of a write syscall apiece, on
-                        // both ends. The loop flushes these on the same
-                        // interval it already paces grid diffs by, so nothing
-                        // waits longer than a frame.
-                        if self.pending_output.is_empty() {
-                            self.pending_output_offset = offset;
-                        }
-                        self.pending_output.extend_from_slice(bytes);
-                        if self.pending_output.len() >= OUTPUT_FRAME_BYTES {
-                            self.flush_output()?;
-                        }
-                    }
-                    if self
-                        .state
-                        .output_offset
-                        .saturating_sub(self.last_persisted_offset)
-                        >= PERSIST_OFFSET_INTERVAL
-                    {
-                        write_state(&self.paths.state, &self.state)?;
-                        self.last_persisted_offset = self.state.output_offset;
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error),
+        let eof = drain_ready(&mut reader, |bytes| self.consume_output(bytes))?;
+        if !eof {
+            self.pty_reader = Some(reader);
+        }
+        Ok(())
+    }
+
+    fn consume_output(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let offset = self.log.append(bytes)?;
+        self.state.output_offset = self.log.tail_offset();
+        self.screen.feed(bytes);
+        if self.dirty_since.is_none() {
+            self.dirty_since = Some(Instant::now());
+        }
+        if self
+            .connection
+            .as_ref()
+            .is_some_and(|connection| connection.epoch.is_some())
+        {
+            // Held rather than framed here. A PTY hands over about
+            // a kilobyte per read, and a frame each meant ten
+            // thousand of them for eleven megabytes — a header, a
+            // queue entry and a share of a write syscall apiece, on
+            // both ends. The loop flushes these on the same
+            // interval it already paces grid diffs by, so nothing
+            // waits longer than a frame.
+            if self.pending_output.is_empty() {
+                self.pending_output_offset = offset;
+            }
+            self.pending_output.extend_from_slice(bytes);
+            if self.pending_output.len() >= OUTPUT_FRAME_BYTES {
+                self.flush_output()?;
             }
         }
+        if self
+            .state
+            .output_offset
+            .saturating_sub(self.last_persisted_offset)
+            >= PERSIST_OFFSET_INTERVAL
+        {
+            self.checkpoint.submit(self.state.clone())?;
+            self.last_persisted_offset = self.state.output_offset;
+        }
+        Ok(())
     }
 
     fn read_connection(&mut self) -> io::Result<()> {
@@ -852,7 +872,7 @@ impl Holder {
                     self.state.cols = cols;
                     self.state.rows = rows;
                     self.state.snapshot_sequence = self.state.snapshot_sequence.saturating_add(1);
-                    write_state(&self.paths.state, &self.state)?;
+                    self.checkpoint.submit(self.state.clone())?;
                     self.queue_snapshot(connection)
                 }
                 FrameType::Ping => connection.queue(RemoteMessage::Terminal(Frame::pong())),
@@ -976,7 +996,7 @@ impl Holder {
         connection.queue(RemoteMessage::ControlGranted(ControlGranted {
             controller_epoch: epoch,
         }))?;
-        write_state(&self.paths.state, &self.state)
+        self.checkpoint.submit(self.state.clone())
     }
 
     fn queue_replay(
@@ -1187,7 +1207,16 @@ impl Holder {
         self.process_guard.finish()?;
         let exit = self.pty.wait()?;
         self.exit_watcher = None;
-        self.pty_reader = None;
+        self.pending_exit = Some(exit);
+        Ok(())
+    }
+
+    fn finish_exit(&mut self, exit: Exit) -> io::Result<()> {
+        // The leader is reaped, but every PTY tail byte must precede ProcessExit.
+        self.flush_output()?;
+        if self.dirty_since.is_some() {
+            self.emit_grid_delta()?;
+        }
         let (state, message) = match exit {
             Exit::Code(code) => (
                 RemoteProcessState::Exited {
@@ -1213,8 +1242,70 @@ impl Holder {
         self.state.process_state = state;
         self.state.output_offset = self.log.tail_offset();
         self.log.flush()?;
-        write_state(&self.paths.state, &self.state)?;
+        self.checkpoint.submit(self.state.clone())?;
+        self.checkpoint.flush()?;
         self.queue(RemoteMessage::ProcessExit(message))
+    }
+}
+
+/// Return true only at EOF; a yield retains the reader for the next poll turn.
+fn drain_ready(
+    reader: &mut impl Read,
+    mut consume: impl FnMut(&[u8]) -> io::Result<()>,
+) -> io::Result<bool> {
+    let mut buffer = [0_u8; 64 * 1024];
+    let started = Instant::now();
+    let mut remaining = 64 * 1024;
+    while remaining > 0 && started.elapsed() < Duration::from_millis(2) {
+        let capacity = buffer.len().min(remaining);
+        match reader.read(&mut buffer[..capacity]) {
+            Ok(0) => return Ok(true),
+            Ok(count) => {
+                remaining -= count;
+                consume(&buffer[..count])?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+mod fairness_tests {
+    use super::*;
+    #[test]
+    fn continuously_readable_output_yields_to_input() {
+        // A PTY producer that never reaches WouldBlock: the old owner loop
+        // spends the entire burst here before servicing controller input.
+        let mut source = io::repeat(b'x').take(64 * 1024 * 128);
+        let mut consumed = 0;
+        let started = Instant::now();
+        let eof = drain_ready(&mut source, |bytes| {
+            consumed += bytes.len();
+            std::thread::sleep(Duration::from_millis(1));
+            Ok(())
+        })
+        .unwrap();
+        eprintln!(
+            "continuous output owner turn: {:?}, {consumed} bytes",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(40),
+            "output starved controller service"
+        );
+        assert!(!eof);
+        assert!(consumed > 0);
+        // A yield must retain every remaining byte for subsequent turns.
+        while !drain_ready(&mut source, |bytes| {
+            consumed += bytes.len();
+            Ok(())
+        })
+        .unwrap()
+        {}
+        assert_eq!(consumed, 64 * 1024 * 128);
     }
 }
 

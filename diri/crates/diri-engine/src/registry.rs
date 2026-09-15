@@ -45,6 +45,7 @@ impl PersistedState {
 pub struct Registry {
     engine: Arc<ManifestEngine>,
     sessions: HashMap<String, Session>,
+    pending_launches: std::collections::HashSet<String>,
     /// Records for sessions that are no longer live but still listed.
     records: HashMap<String, SessionRecord>,
     /// Project records are kept as additive JSON so fields outside the
@@ -141,6 +142,7 @@ impl Registry {
         Self {
             engine,
             sessions: HashMap::new(),
+            pending_launches: std::collections::HashSet::new(),
             records: HashMap::new(),
             projects: Vec::new(),
             recently_closed: Vec::new(),
@@ -341,6 +343,91 @@ impl Registry {
         Ok(id)
     }
 
+    pub(crate) fn reserve_launch(&mut self, id: &str, new_record: bool) -> std::io::Result<()> {
+        if self.sessions.contains_key(id)
+            || self.pending_launches.contains(id)
+            || (new_record == self.records.contains_key(id))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "session cannot be launched in its current state",
+            ));
+        }
+        self.pending_launches.insert(id.to_owned());
+        Ok(())
+    }
+
+    pub(crate) fn release_launch(&mut self, id: &str) {
+        self.pending_launches.remove(id);
+    }
+
+    /// Installs a session constructed outside the Registry. The control server's
+    /// per-session operation guard owns resume/fork/stop serialization.
+    pub(crate) fn install_session(
+        &mut self,
+        session: Session,
+        record: Option<SessionRecord>,
+    ) -> Result<(), Box<Session>> {
+        let id = session.id().to_owned();
+        if self.sessions.contains_key(&id) || (record.is_none() && !self.records.contains_key(&id))
+        {
+            return Err(Box::new(session));
+        }
+        if let Some(record) = record {
+            self.records.insert(id.clone(), record);
+        } else if let Some(record) = self.records.get_mut(&id) {
+            record.status = SessionStatus::Starting;
+            record.needs_input = None;
+            record.updated_at = DateMillis::from(std::time::SystemTime::now());
+        }
+        self.sessions.insert(id, session);
+        Ok(())
+    }
+
+    pub(crate) fn preflight_lifecycle(&self, id: &str) -> std::io::Result<()> {
+        self.records.get(id).ok_or_else(|| not_found(id))?;
+        self.state_file.verify_editable()
+    }
+
+    /// Detaches only the incarnation that actually completed its stop. The
+    /// caller drops the returned Session outside the Registry (pump join).
+    pub(crate) fn finish_remote_stop(
+        &mut self,
+        id: &str,
+        stop: &crate::session::RemoteStop,
+        exit: crate::pty::Exit,
+    ) -> Option<Session> {
+        if !self
+            .sessions
+            .get(id)
+            .is_some_and(|session| stop.matches(session))
+        {
+            return None;
+        }
+        let session = self.sessions.remove(id);
+        self.record_exit(id, exit);
+        session
+    }
+
+    fn record_exit(&mut self, id: &str, exit: crate::pty::Exit) {
+        if let Some(record) = self.records.get_mut(id) {
+            record.status = SessionStatus::Exited(diri_proto::ExitInfo {
+                reason: match exit {
+                    crate::pty::Exit::Signal(_) => diri_proto::ExitReason::Signaled,
+                    crate::pty::Exit::Code(_) => diri_proto::ExitReason::Exited,
+                },
+                code: match exit {
+                    crate::pty::Exit::Code(code) => Some(code),
+                    _ => None,
+                },
+                signal: match exit {
+                    crate::pty::Exit::Signal(signal) => Some(signal),
+                    _ => None,
+                },
+            });
+        }
+    }
+
     pub fn adopt_remote(
         &mut self,
         spec: SessionSpec,
@@ -349,6 +436,12 @@ impl Registry {
         let id = spec.id.clone();
         if !self.records.contains_key(&id) {
             return Err(not_found(&id));
+        }
+        if self.sessions.contains_key(&id) || self.pending_launches.contains(&id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "session already has an owner or pending launch",
+            ));
         }
         let initial_status = self
             .records
@@ -811,22 +904,7 @@ impl Registry {
                 return Err(error);
             }
         };
-        if let Some(record) = self.records.get_mut(id) {
-            record.status = SessionStatus::Exited(diri_proto::ExitInfo {
-                reason: match exit {
-                    crate::pty::Exit::Signal(_) => diri_proto::ExitReason::Signaled,
-                    crate::pty::Exit::Code(_) => diri_proto::ExitReason::Exited,
-                },
-                code: match exit {
-                    crate::pty::Exit::Code(code) => Some(code),
-                    crate::pty::Exit::Signal(_) => None,
-                },
-                signal: match exit {
-                    crate::pty::Exit::Signal(signal) => Some(signal),
-                    crate::pty::Exit::Code(_) => None,
-                },
-            });
-        }
+        self.record_exit(id, exit);
         Ok(Some(exit))
     }
 
@@ -1305,6 +1383,12 @@ impl Registry {
     /// keep-record, stamp `archivedAt`.
     pub fn archive(&mut self, id: &str) -> std::io::Result<()> {
         let original = self.records.get(id).cloned().ok_or_else(|| not_found(id))?;
+        self.archive_record(original)
+    }
+
+    pub(crate) fn archive_record(&mut self, original: SessionRecord) -> std::io::Result<()> {
+        let id = original.id.0.clone();
+        let id = id.as_str();
         let plan = LifecyclePlan::for_record(
             &original,
             LifecycleAction::Archive,
@@ -1994,6 +2078,22 @@ mod tests {
             .expect("manifests");
         let (engine, _) = ManifestEngine::load_dir(&dir).expect("load");
         Arc::new(engine)
+    }
+
+    #[test]
+    fn launch_reservation_rejects_overlapping_owners_and_wrong_record_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+        assert!(registry.reserve_launch("s_1", false).is_err());
+        registry.reserve_launch("s_1", true).unwrap();
+        assert!(registry.reserve_launch("s_1", true).is_err());
+        registry.release_launch("s_1");
+        registry.records.insert("s_1".into(), record("s_1"));
+        assert!(registry.reserve_launch("s_1", true).is_err());
+        registry.reserve_launch("s_1", false).unwrap();
+        assert!(registry.reserve_launch("s_1", false).is_err());
+        registry.release_launch("s_1");
+        registry.reserve_launch("s_1", false).unwrap();
     }
 
     #[test]
