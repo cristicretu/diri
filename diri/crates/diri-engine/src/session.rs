@@ -400,7 +400,7 @@ impl GridWake {
         }
     }
 
-    fn notify(&self) {
+    pub(crate) fn notify(&self) {
         let mut state = self.inner.state.lock().expect("grid wake");
         state.generation = state.generation.saturating_add(1);
         self.inner.changed.notify_all();
