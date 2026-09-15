@@ -30,6 +30,7 @@ mod notification_feed;
 pub mod notifications;
 pub mod palette;
 mod palette_chrome;
+mod peek_settle;
 mod phone_access;
 mod platform;
 pub mod query_editor;

@@ -1,11 +1,34 @@
 use super::*;
-use crate::tab_peek::{GestureFrame, card_rect, terminal_offset, visible_card_indices};
+use crate::tab_peek::{
+    GestureFrame, card_rect, preview_reveal_offset, terminal_offset, visible_card_indices,
+};
 use gpui::App;
 
 impl SessionSurfaces {
-    pub(super) fn dismiss_tab_peek(&mut self) {
+    pub(super) fn dismiss_tab_peek(&mut self, cx: &mut Context<Self>) {
+        if self.peek.is_closing() {
+            return;
+        }
+        self.closing_previews = self
+            .peek
+            .sessions
+            .iter()
+            .filter_map(|id| {
+                self.live_previews
+                    .get(id)
+                    .map(|preview| (id.clone(), preview.element.clone()))
+            })
+            .collect();
+        self.live_previews.clear();
+        self.peek
+            .animate_to(0.0, cx.background_executor().now(), cx.reduce_motion());
+    }
+
+    pub(crate) fn cancel_tab_peek_immediately(&mut self, cx: &mut Context<Self>) {
         self.peek.dismiss();
         self.live_previews.clear();
+        self.closing_previews.clear();
+        cx.notify();
     }
 
     pub(crate) fn sync_tab_peek_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -45,7 +68,7 @@ impl SessionSurfaces {
     }
     pub(crate) fn tab_gesture(&mut self, frame: GestureFrame, cx: &mut Context<Self>) {
         if matches!(frame, GestureFrame::Cancelled) {
-            self.dismiss_tab_peek();
+            self.dismiss_tab_peek(cx);
             cx.notify();
             return;
         }
@@ -63,7 +86,11 @@ impl SessionSurfaces {
             self.peek.begin(sessions, selected.as_ref());
             self.peek_scroll.set_offset(point(px(0.0), px(0.0)));
         }
-        self.peek.update(frame);
+        if matches!(frame, GestureFrame::Tracking(_)) {
+            self.closing_previews.clear();
+        }
+        self.peek
+            .update_animated(frame, cx.background_executor().now(), cx.reduce_motion());
         if !self.peek.visible() {
             self.live_previews.clear();
         }
@@ -71,20 +98,26 @@ impl SessionSurfaces {
     }
     pub(crate) fn toggle_tab_peek(&mut self, cx: &mut Context<Self>) {
         if self.peek.visible() {
-            self.dismiss_tab_peek();
+            self.dismiss_tab_peek(cx);
             cx.notify();
         } else {
-            self.tab_gesture(GestureFrame::Released(140.0), cx);
+            self.tab_gesture(GestureFrame::Tracking(0.0), cx);
+            self.peek
+                .animate_to(140.0, cx.background_executor().now(), cx.reduce_motion());
+            cx.notify();
         }
     }
     fn commit_tab_peek(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        if !self.peek.visible() {
+            return;
+        }
         let mut store = self.store.write().unwrap();
         let activate = store.sessions().get(&id).is_some();
         if activate {
             store.select(id);
         }
         drop(store);
-        self.dismiss_tab_peek();
+        self.dismiss_tab_peek(cx);
         if activate {
             cx.emit(TabPeekActivated);
         }
@@ -103,14 +136,14 @@ impl SessionSurfaces {
             crate::commands::CommandId::ToggleTabPeek,
             &event.keystroke,
         ) {
-            self.dismiss_tab_peek();
+            self.dismiss_tab_peek(cx);
             self.sync_tab_peek_focus(window, cx);
             cx.notify();
             cx.stop_propagation();
             return true;
         }
         match event.keystroke.key.as_str() {
-            "escape" => self.dismiss_tab_peek(),
+            "escape" => self.dismiss_tab_peek(cx),
             "left" => self.peek.advance(-1),
             "right" | "tab" => self.peek.advance(if event.keystroke.modifiers.shift {
                 -1
@@ -210,7 +243,8 @@ impl SessionSurfaces {
             .iter()
             .filter_map(|index| sessions.get(*index))
             .filter(|session| {
-                !self.resident_previews.contains_key(&session.id)
+                self.peek.visible()
+                    && !self.resident_previews.contains_key(&session.id)
                     && !matches!(session.status, diri_proto::SessionStatus::Exited(_))
             })
             .map(|session| session.id.clone())
@@ -236,10 +270,12 @@ impl SessionSurfaces {
             let live = self.live_previews.get(&id);
             let state = live.map(|preview| *preview.state.borrow());
             let resident = self.resident_previews.get(&id);
-            let grid = resident.or_else(|| {
-                live.filter(|preview| preview.element.grid_cols() > 0)
-                    .map(|preview| &preview.element)
-            });
+            let grid = resident
+                .or_else(|| self.closing_previews.get(&id))
+                .or_else(|| {
+                    live.filter(|preview| preview.element.grid_cols() > 0)
+                        .map(|preview| &preview.element)
+                });
             let preview = if let Some(preview) = grid {
                 let font_size = ((bounds.width - 12.0)
                     / (f32::from(preview.grid_cols().max(1)) * 0.65))
@@ -347,14 +383,23 @@ impl SessionSurfaces {
                                 )
                             }),
                     )
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .when(self.peek.visible(), |element| {
+                        element.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.commit_tab_peek(id.clone(), cx);
-                        cx.stop_propagation();
+                        if this.peek.visible() {
+                            this.commit_tab_peek(id.clone(), cx);
+                            cx.stop_propagation();
+                        }
                     })),
             );
         }
-        body = body.h(px(content_height));
+        body = body
+            .h(px(content_height))
+            .when(self.peek.is_closing(), |body| {
+                // Preserve the last scrolled pose after scroll interaction is disabled.
+                body.top(self.peek_scroll.offset().y)
+            });
         div()
             .id("tab-peek")
             .debug_selector(|| "TAB_PEEK".into())
@@ -363,35 +408,41 @@ impl SessionSurfaces {
             .top(px(self.peek_top))
             .w(px(width))
             .h(px(height))
-            .occlude()
+            .when(self.peek.visible(), |surface| surface.occlude())
+            .opacity(self.peek.reveal())
             .overflow_hidden()
             .bg(colors
                 .background
                 .alpha(if reduced { 1.0 } else { blend * 0.98 }))
-            .on_scroll_wheel(cx.listener(|_, _, _, cx| {
-                cx.notify();
-                cx.stop_propagation();
+            .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                if this.peek.visible() {
+                    cx.notify();
+                    cx.stop_propagation();
+                }
             }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    this.dismiss_tab_peek();
-                    cx.notify();
-                    cx.stop_propagation();
+                    if this.peek.visible() {
+                        this.dismiss_tab_peek(cx);
+                        cx.notify();
+                        cx.stop_propagation();
+                    }
                 }),
             )
             .child(
                 div()
                     .id("tab-peek-scroll")
                     .size_full()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.peek_scroll)
+                    .when(self.peek.visible(), |element| {
+                        element.overflow_y_scroll().track_scroll(&self.peek_scroll)
+                    })
                     .child(body),
             )
             .child(
                 div()
                     .absolute()
-                    .top(px(12.0))
+                    .top(px(12.0 + preview_reveal_offset(&self.peek, reduced)))
                     .right(px(16.0))
                     .h(px(28.0))
                     .flex()
@@ -409,13 +460,20 @@ impl SessionSurfaces {
                             .id("tab-peek-expand")
                             .cursor_pointer()
                             .child(if blend > 0.5 { "Collapse" } else { "Show all" })
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .when(self.peek.visible(), |element| {
+                                element.on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation()
+                                })
+                            })
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.peek.update(GestureFrame::Released(if blend > 0.5 {
-                                    140.0
-                                } else {
-                                    380.0
-                                }));
+                                if !this.peek.visible() {
+                                    return;
+                                }
+                                this.peek.animate_to(
+                                    if blend > 0.5 { 140.0 } else { 380.0 },
+                                    cx.background_executor().now(),
+                                    cx.reduce_motion(),
+                                );
                                 cx.notify();
                                 cx.stop_propagation();
                             })),
@@ -425,11 +483,17 @@ impl SessionSurfaces {
                             .id("tab-peek-close")
                             .cursor_pointer()
                             .child("Esc  ×")
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .when(self.peek.visible(), |element| {
+                                element.on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation()
+                                })
+                            })
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.dismiss_tab_peek();
-                                cx.notify();
-                                cx.stop_propagation();
+                                if this.peek.visible() {
+                                    this.dismiss_tab_peek(cx);
+                                    cx.notify();
+                                    cx.stop_propagation();
+                                }
                             })),
                     ),
             )

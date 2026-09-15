@@ -1,3 +1,7 @@
+#[cfg(all(test, target_os = "macos"))]
+#[path = "root/peek_profile.rs"]
+mod peek_profile;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -714,9 +718,7 @@ impl RootView {
                     bridge.cancel();
                 }
                 if let Some(surfaces) = &this.session_surfaces {
-                    surfaces.update(cx, |s, cx| {
-                        s.tab_gesture(crate::tab_peek::GestureFrame::Cancelled, cx)
-                    });
+                    surfaces.update(cx, |s, cx| s.cancel_tab_peek_immediately(cx));
                 }
             }
             activation_services
@@ -4541,12 +4543,22 @@ mod tests {
         }
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
+        assert_eq!(cx.debug_bounds("horizontal-tabs").unwrap(), heading);
+        assert!(cx.debug_bounds("terminal-card-body").unwrap().top() > body.top());
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(250));
+        root.update_in(cx, |_, window, cx| window.simulate_next_frame(cx));
+        cx.run_until_parked();
         assert_eq!(cx.debug_bounds("terminal-card-body").unwrap(), body);
         let trigger = cx.debug_bounds("horizontal-peek-tabs").unwrap();
         cx.simulate_click(trigger.center(), Modifiers::default());
         cx.run_until_parked();
         assert!(cx.debug_bounds("TAB_PEEK").is_some());
         cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(250));
+        root.update_in(cx, |_, window, cx| window.simulate_next_frame(cx));
         cx.run_until_parked();
         assert!(cx.debug_bounds("TAB_PEEK").is_none());
         assert_eq!(
@@ -5061,6 +5073,9 @@ mod tests {
                 .unwrap();
             source.settle(states);
             cx.run_until_parked();
+        }
+        if let Some(profile) = std::env::var_os("DIRI_PEEK_PROFILE") {
+            super::peek_profile::run(&mut cx, window, std::path::Path::new(&profile));
         }
         cx.capture_screenshot(window.into())
             .unwrap()
