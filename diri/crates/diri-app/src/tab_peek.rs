@@ -1,5 +1,7 @@
 //! Presentation-only tab peek state. It never owns a terminal or issues effects.
+use crate::peek_settle::Settle;
 use diri_proto::SessionId;
+use std::time::Instant;
 
 pub(crate) const PEEK_DISTANCE: f32 = 140.0;
 const OVERVIEW_DISTANCE: f32 = 380.0;
@@ -11,6 +13,7 @@ pub(crate) enum GestureFrame {
     Cancelled,
     #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
     Tracking(f32),
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
     Released(f32),
 }
 
@@ -19,12 +22,99 @@ pub(crate) struct TabPeek {
     pub(crate) sessions: Vec<SessionId>,
     pub(crate) focused: usize,
     distance: f32,
+    settle: Option<Settle>,
+    gesture_origin: f32,
+    closing: bool,
     pub(crate) tracking: bool,
 }
 
 impl TabPeek {
     pub(crate) fn visible(&self) -> bool {
-        !self.sessions.is_empty() && self.distance > 0.0
+        !self.closing && self.paint_visible()
+    }
+    pub(crate) fn paint_visible(&self) -> bool {
+        !self.sessions.is_empty() && (self.distance > 0.0 || self.settle.is_some())
+    }
+    pub(crate) fn is_closing(&self) -> bool {
+        self.closing
+    }
+    pub(crate) fn is_settling(&self) -> bool {
+        self.settle.is_some()
+    }
+    pub(crate) fn advance_motion(&mut self, now: Instant) {
+        if let Some(settle) = self.settle {
+            let (distance, done) = settle.sample(now);
+            self.distance = distance;
+            if done {
+                self.settle = None;
+                if settle.to == 0.0 {
+                    self.dismiss();
+                }
+            }
+        }
+    }
+    pub(crate) fn animate_to(&mut self, target: f32, now: Instant, reduced_motion: bool) {
+        self.advance_motion(now);
+        self.tracking = false;
+        self.closing = target == 0.0;
+        if reduced_motion {
+            self.settle = None;
+            self.distance = target;
+            if target == 0.0 {
+                self.dismiss();
+            }
+        } else {
+            self.settle = Settle::new(self.distance, target, now);
+            if self.settle.is_none() && target == 0.0 {
+                self.dismiss();
+            }
+        }
+    }
+    pub(crate) fn update_animated(
+        &mut self,
+        frame: GestureFrame,
+        now: Instant,
+        reduced_motion: bool,
+    ) {
+        if reduced_motion {
+            self.update(frame);
+            return;
+        }
+        self.advance_motion(now);
+        match frame {
+            GestureFrame::Tracking(distance) if distance.is_finite() => {
+                if !self.tracking {
+                    self.gesture_origin = self.distance;
+                }
+                self.distance = (self.gesture_origin + distance).clamp(0.0, OVERVIEW_DISTANCE);
+                self.tracking = true;
+                self.closing = false;
+                self.settle = None;
+            }
+            GestureFrame::Released(distance) if distance.is_finite() => {
+                let final_distance = if self.tracking {
+                    self.gesture_origin + distance
+                } else {
+                    self.distance + distance
+                };
+                if self.tracking {
+                    self.distance = final_distance.clamp(0.0, OVERVIEW_DISTANCE);
+                }
+                let target = if final_distance < 45.0 {
+                    0.0
+                } else if final_distance < 260.0 {
+                    PEEK_DISTANCE
+                } else {
+                    OVERVIEW_DISTANCE
+                };
+                self.animate_to(target, now, false);
+            }
+            _ => {
+                if !self.closing {
+                    self.animate_to(0.0, now, false);
+                }
+            }
+        }
     }
     pub(crate) fn begin(&mut self, sessions: Vec<SessionId>, selected: Option<&SessionId>) {
         self.focused = selected
@@ -33,6 +123,8 @@ impl TabPeek {
         self.sessions = sessions;
     }
     pub(crate) fn update(&mut self, frame: GestureFrame) {
+        self.settle = None;
+        self.closing = false;
         match frame {
             GestureFrame::Cancelled => self.dismiss(),
             GestureFrame::Tracking(distance) => {
@@ -59,6 +151,9 @@ impl TabPeek {
     }
     pub(crate) fn dismiss(&mut self) {
         self.sessions.clear();
+        self.settle = None;
+        self.closing = false;
+        self.gesture_origin = 0.0;
         self.distance = 0.0;
         self.tracking = false;
     }
@@ -86,6 +181,16 @@ pub(crate) fn terminal_offset(peek: &TabPeek, reduced_motion: bool) -> f32 {
         0.0
     } else {
         PEEK_CONTENT_OFFSET * peek.reveal()
+    }
+}
+
+/// Keep the preview strip above the translated terminal during reveal/return.
+/// Clipping at the overlay top removes cards as they leave the viewport.
+pub(crate) fn preview_reveal_offset(peek: &TabPeek, reduced_motion: bool) -> f32 {
+    if reduced_motion {
+        0.0
+    } else {
+        -PEEK_CONTENT_OFFSET * (1.0 - peek.reveal())
     }
 }
 
@@ -130,7 +235,7 @@ pub(crate) fn card_rect(
     let mix = |a, b| a + (b - a) * t;
     CardRect {
         x: mix(strip_x, target_x),
-        y: mix(48.0, target_y),
+        y: mix(48.0, target_y) + preview_reveal_offset(peek, reduced_motion),
         width: mix(strip_width, target_width),
         height: mix(114.0, target_height),
     }
@@ -145,7 +250,7 @@ pub(crate) fn visible_card_indices(
     scroll_y: f32,
     reduced_motion: bool,
 ) -> Vec<usize> {
-    if !peek.visible() || width <= 0.0 || height <= 0.0 {
+    if !peek.paint_visible() || width <= 0.0 || height <= 0.0 {
         return Vec::new();
     }
     (0..peek.sessions.len())
@@ -295,6 +400,17 @@ mod tests {
         );
     }
     #[test]
+    fn strip_cards_keep_clear_of_terminal_during_reveal_and_return() {
+        let mut peek = TabPeek::default();
+        peek.begin(vec![SessionId("same-work".into())], None);
+        for distance in [1.0, 20.0, 70.0, 140.0] {
+            peek.update(GestureFrame::Tracking(distance));
+            let card = card_rect(0, 1, 1000.0, 700.0, &peek, false);
+            assert!((terminal_offset(&peek, false) - (card.y + card.height) - 14.0).abs() < 0.001);
+        }
+    }
+
+    #[test]
     fn release_and_cancel_never_select_or_change_work_identity() {
         let ids = vec![
             SessionId::new("one"),
@@ -389,5 +505,59 @@ mod visibility_tests {
         assert!(scrolled.iter().all(|index| *index > 3));
         peek.dismiss();
         assert!(visible_card_indices(&peek, 800.0, 600.0, 0.0, false).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod settling_tests {
+    use super::*;
+    use std::time::Duration;
+    fn peek() -> TabPeek {
+        let mut peek = TabPeek::default();
+        peek.begin(vec![SessionId::new("same-work")], None);
+        peek
+    }
+    #[test]
+    fn release_has_no_pose_jump_and_a_new_gesture_interrupts_at_the_current_pose() {
+        let now = Instant::now();
+        let mut peek = peek();
+        peek.update_animated(GestureFrame::Tracking(285.0), now, false);
+        peek.update_animated(GestureFrame::Released(285.0), now, false);
+        assert_eq!(peek.distance, 285.0);
+        assert!(peek.is_settling());
+        let halfway = now + Duration::from_millis(100);
+        peek.advance_motion(halfway);
+        let pose = peek.distance;
+        assert!(pose > 285.0 && pose < 380.0);
+        peek.update_animated(GestureFrame::Tracking(0.0), halfway, false);
+        assert_eq!(peek.distance, pose);
+        assert!(!peek.is_settling());
+        peek.update_animated(GestureFrame::Tracking(-25.0), halfway, false);
+        assert_eq!(peek.distance, pose - 25.0);
+        assert_eq!(peek.selected(), Some(SessionId::new("same-work")));
+    }
+    #[test]
+    fn cancel_keeps_a_finite_paint_return_but_releases_interaction_immediately() {
+        let now = Instant::now();
+        let mut peek = peek();
+        peek.update_animated(GestureFrame::Tracking(140.0), now, false);
+        peek.update_animated(GestureFrame::Cancelled, now, false);
+        assert_eq!(peek.distance, 140.0);
+        assert!(!peek.visible());
+        assert!(peek.paint_visible());
+        peek.advance_motion(now + Settle::DURATION);
+        assert!(!peek.paint_visible());
+        assert!(!peek.is_settling());
+        assert!(peek.sessions.is_empty());
+    }
+    #[test]
+    fn reduced_motion_and_coalesced_release_finish_without_animation() {
+        let now = Instant::now();
+        let mut peek = peek();
+        peek.update_animated(GestureFrame::Released(300.0), now, true);
+        assert_eq!(peek.distance, 380.0);
+        assert!(!peek.is_settling());
+        peek.update_animated(GestureFrame::Cancelled, now, true);
+        assert!(!peek.paint_visible());
     }
 }

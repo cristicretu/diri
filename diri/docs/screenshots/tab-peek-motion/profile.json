@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "kind": "simulated-input-headless-metal",
+  "build": "release",
+  "concurrentLoad": "Other worktree checks may be active; timing is provisional",
+  "physicalTrackpadVerified": false,
+  "displayVsyncMeasured": false,
+  "scriptCadenceHz": 120.0,
+  "warmupFrames": 150,
+  "sampleFrames": 300,
+  "workload": "Six single-pane cards; one resident 100x36 grid, receive-only 80x24 grids opened only while visible",
+  "previewOutput": "One synthetic full snapshot per connection, idle afterward; output-heavy performance is a separate workload",
+  "subscribedPreviewRange": [
+    0,
+    5
+  ],
+  "livePreviewRange": [
+    0,
+    5
+  ],
+  "windowDrawMs": {
+    "median": 2.6995,
+    "p90": 3.029542,
+    "p95": 3.098125,
+    "max": 3.413125
+  },
+  "drawnFrames": 300,
+  "cpuUpdateMs": {
+    "median": 2.7273750000000003,
+    "p90": 3.0689580000000003,
+    "p95": 3.164209,
+    "max": 5.455583
+  },
+  "metalRenderAndReadbackMs": {
+    "median": 5.242084,
+    "p90": 6.745834,
+    "p95": 7.255583000000001,
+    "max": 11.371875
+  },
+  "combinedProcessingMs": {
+    "median": 7.926042,
+    "p90": 9.528666999999999,
+    "p95": 10.206042,
+    "max": 14.197125
+  },
+  "processingOver120HzBudget": 94,
+  "processingOver60HzBudget": 0,
+  "terminalIdentityAndGeometryPreserved": true,
+  "note": "Scripted 120Hz clock, no physical input or display-link pacing. Metal readback is included separately; deadline counts are processing comparisons, not measured dropped display frames."
+}
