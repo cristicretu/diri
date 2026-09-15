@@ -122,6 +122,15 @@ fn main() {
         std::env::consts::OS
     );
     black_box(sample(1, 1));
+    if std::env::args().any(|arg| arg == "--empty-gate") {
+        let measured = sample(1, 0);
+        println!("empty core requested heap: {} bytes", measured.fresh_bytes);
+        assert!(
+            measured.fresh_bytes <= 68 * 1024,
+            "empty core exceeds 68 KiB requested-heap budget"
+        );
+        return;
+    }
     for count in [1, 10, 100] {
         for lines in [0, 10_000] {
             let mut samples = [Sample::default(); SAMPLES];
