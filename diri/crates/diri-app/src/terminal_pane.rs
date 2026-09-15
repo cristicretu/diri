@@ -4679,8 +4679,27 @@ mod tests {
                         }
                         grid.changed_rows.push(row);
                     }
+                    let unicode_find = if scene == "find-unicode" {
+                        let mut screen = diri_engine::HeadlessScreen::new(80, 28);
+                        screen.feed("$ printf 'Unicode terminal output'\r\n\r\n1  <界> cafe\u{301}\r\n2  A🙂B  cafe\u{301}\r\n\r\nSearch keeps wide glyphs and combining marks aligned with their cells.".as_bytes());
+                        grid = screen.full_snapshot();
+                        Some(FindSnapshot::from(screen.scrollback()))
+                    } else {
+                        None
+                    };
                     let resident = pane.residents.get_mut(&id).unwrap();
                     resident.element.apply_damage(grid);
+                    if let Some(snapshot) = unicode_find {
+                        let query = std::env::var("DIRI_QOL_QUERY").unwrap_or_else(|_| "e\u{301}".into());
+                        let mut find = TerminalFindModel::default();
+                        let request = due_find_request(&mut find, &query, Duration::ZERO);
+                        let result = resident.element.prepare_find_search(&find, &request, snapshot).unwrap().run();
+                        resident.element.apply_find_result(&mut find, result);
+                        assert!(!find.matches().is_empty());
+                        resident.find_query.insert(&query);
+                        resident.element.sync_find_highlights(&find);
+                        resident.find = Some(find);
+                    }
                     resident.last_size = (80, 28);
                     resident.attachment_state = AttachmentState::Live;
                     pane.focus(window, cx);
