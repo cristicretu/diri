@@ -916,6 +916,29 @@ impl TerminalPane {
         window.focus(&self.focus, cx);
     }
 
+    /// A split workbench explicitly assigns one visible owner per SessionId.
+    /// Unfocused sessions still need geometry; duplicate passive views do not.
+    pub(crate) fn claim_layout_control(&self, window: &Window) {
+        if window.is_window_active() {
+            self.claim_selected_control();
+        }
+    }
+
+    pub(crate) fn release_layout_control(&self) {
+        if let Some(id) = self.selected_id()
+            && let Some(resident) = self.residents.get(&id)
+        {
+            resident.attachment.release();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn layout_owner_for_test(&self) -> bool {
+        self.selected_id()
+            .and_then(|id| self.residents.get(&id))
+            .is_some_and(|resident| resident.attachment.is_controller())
+    }
+
     fn claim_selected_control(&self) {
         if let Some(id) = self.selected_id()
             && let Some(resident) = self.residents.get(&id)
@@ -2027,7 +2050,8 @@ impl TerminalPane {
                     .read()
                     .expect("session store lock poisoned");
                 store
-                    .selected_session()
+                    .sessions()
+                    .get(&id)
                     .and_then(|session| session.host.as_deref())
                     .and_then(|host_id| store.host(host_id))
                     .map(|host| host.ssh.clone())
@@ -2485,6 +2509,9 @@ impl TerminalPane {
         let sidebar_reveal = show_sidebar.then(|| self.render_sidebar_reveal_control(colors, cx));
         let inspector_open = self.inspector_open;
         let header_trailing_inset = self.header_trailing_inset;
+        let header_width = self
+            .viewport
+            .map_or(f32::INFINITY, |viewport| viewport.width);
         let unread = self
             .runtime
             .store
@@ -2514,8 +2541,7 @@ impl TerminalPane {
                         div()
                             .min_w(px(0.0))
                             .flex_1()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
+                            .text_ellipsis()
                             .text_size(px(Typo::TITLE.size))
                             .font_weight(Typo::TITLE.weight)
                             .text_color(colors.primary)
@@ -2526,7 +2552,11 @@ impl TerminalPane {
             .child(
                 div()
                     .flex_none()
-                    .pl(px(Metrics::TOOLBAR_EDGE_INSET))
+                    .pl(px(if header_width < 420.0 {
+                        4.0
+                    } else {
+                        Metrics::TOOLBAR_EDGE_INSET
+                    }))
                     .flex()
                     .items_center()
                     .gap(px(Metrics::TOOLBAR_ITEM_GAP))
@@ -2536,13 +2566,18 @@ impl TerminalPane {
                             .flex()
                             .items_center()
                             .gap(px(Metrics::TOOLBAR_COMPACT_GAP))
-                            .when_some(glyph, |identity, glyph| identity.child(glyph))
-                            .child(
-                                div()
-                                    .text_size(px(Typo::META.size))
-                                    .text_color(colors.tertiary)
-                                    .child(kind.label()),
-                            ),
+                            .when_some(
+                                glyph.filter(|_| header_width >= 280.0),
+                                |identity, glyph| identity.child(glyph),
+                            )
+                            .when(header_width >= 420.0, |identity| {
+                                identity.child(
+                                    div()
+                                        .text_size(px(Typo::META.size))
+                                        .text_color(colors.tertiary)
+                                        .child(kind.label()),
+                                )
+                            }),
                     )
                     .when(shell_controls, |trailing| {
                         trailing.child(

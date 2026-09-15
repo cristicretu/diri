@@ -62,6 +62,7 @@ mod workbench;
 mod workspace_geometry;
 #[cfg_attr(not(test), allow(dead_code))]
 mod workspace_preview;
+mod workspace_workbench;
 pub mod worktrees;
 
 #[cfg(target_os = "macos")]

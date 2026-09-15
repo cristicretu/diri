@@ -28,6 +28,7 @@ pub(crate) fn render_workspace_preview(
         return root.into_any_element();
     };
     for divider in geometry.dividers {
+        let divider = divider.bounds;
         root = root.child(
             div()
                 .absolute()

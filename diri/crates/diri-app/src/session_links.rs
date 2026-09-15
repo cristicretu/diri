@@ -434,6 +434,7 @@ impl TerminalPane {
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let compact = self.viewport.is_some_and(|viewport| viewport.width < 360.0);
         let count = link_count(session);
         let attention = active_check_attention(session);
         let help = attention.as_ref().map_or_else(
@@ -455,7 +456,7 @@ impl TerminalPane {
             .id("session-links-trigger")
             .debug_selector(|| "session-links-trigger".into())
             .h(px(Metrics::TOOLBAR_CONTROL_SIZE))
-            .px(px(8.0))
+            .px(px(if compact { 2.0 } else { 8.0 }))
             .flex_none()
             .flex()
             .items_center()
@@ -469,8 +470,8 @@ impl TerminalPane {
             .when_some(attention, |el, (tone, _)| {
                 el.child(div().size(px(5.0)).flex_none().rounded_full().bg(tone))
             })
-            .child("Links")
-            .when(count > 0, |el| {
+            .when(!compact, |el| el.child("Links"))
+            .when(count > 0 && !compact, |el| {
                 el.child(
                     div()
                         .text_size(px(Typo::META.size))
@@ -478,7 +479,15 @@ impl TerminalPane {
                         .child(count.to_string()),
                 )
             })
-            .child(Icon::new(IconName::ChevronDown, 14.0, colors.tertiary))
+            .child(Icon::new(
+                if compact {
+                    IconName::ExternalLink
+                } else {
+                    IconName::ChevronDown
+                },
+                14.0,
+                colors.tertiary,
+            ))
             .tooltip(move |_, cx| cx.new(|_| PaletteTooltip(help.clone(), colors)).into())
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|this, _, window, cx| {

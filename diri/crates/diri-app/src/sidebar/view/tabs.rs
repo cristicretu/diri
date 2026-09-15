@@ -65,6 +65,10 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = self.colors();
+        if self.workspace_nav.active.is_some() {
+            self.workspace_nav.available_width = available_width;
+            return self.workspace_strip(colors, cx);
+        }
         let (tabs, selected) = {
             let mut store = self.store.write().expect("store");
             let selected = store.selected_session_id().cloned();
@@ -198,6 +202,12 @@ impl Sidebar {
             .border_color(colors.primary.alpha(0.07))
             .bg(colors.sidebar_surface())
             .text_color(colors.primary)
+            .child(
+                div()
+                    .w(px(120.0))
+                    .flex_none()
+                    .child(self.workspace_control(colors, cx)),
+            )
             .child(
                 div()
                     .id("horizontal-tab-project")

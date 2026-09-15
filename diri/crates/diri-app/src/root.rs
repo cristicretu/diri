@@ -200,6 +200,8 @@ fn advance_seam(slide: &mut Option<SeamSlide>, settled: f32, now: Instant, windo
 }
 
 pub struct RootView {
+    active_workspace: Option<diri_proto::workspace::WorkspaceId>,
+    workspace_workbench: Option<Entity<crate::workspace_workbench::WorkspaceWorkbench>>,
     sidebar: Entity<Sidebar>,
     terminal: Option<Entity<TerminalPane>>,
     navigation: Option<Entity<NavigationOverlay>>,
@@ -383,6 +385,15 @@ impl RootView {
             .detach();
         }
         cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
+            if let SidebarEvent::WorkspaceActivated(id) = event {
+                this.activate_saved_workspace(id.clone(), window, cx);
+            }
+            if matches!(event, SidebarEvent::WorkspaceTabActivated) {
+                if let Some(workbench) = &this.workspace_workbench {
+                    workbench.update(cx, |workbench, cx| workbench.focus(window, cx));
+                }
+                cx.notify();
+            }
             if matches!(event, SidebarEvent::RefreshUsageLimits) {
                 let _ = this.services.usage_limits_refresh.try_send(());
             }
@@ -432,6 +443,11 @@ impl RootView {
                 });
             }
             if matches!(event, SidebarEvent::SessionActivated) {
+                if this.active_workspace.is_some() {
+                    this.sidebar
+                        .update(cx, |sidebar, cx| sidebar.activate_workspace(None, cx));
+                    this.activate_saved_workspace(None, window, cx);
+                }
                 if this.launcher.read(cx).is_open() {
                     this.launcher
                         .update(cx, |launcher, cx| launcher.dismiss(cx));
@@ -442,7 +458,7 @@ impl RootView {
                 }
             }
             if matches!(event, SidebarEvent::FocusTerminal) {
-                if let Some(terminal) = &this.terminal {
+                if let Some(terminal) = this.active_terminal(cx) {
                     terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
                     this.sync_auxiliary_terminal(window, cx);
                 } else {
@@ -1063,6 +1079,8 @@ impl RootView {
             (None, None)
         };
         let mut root = Self {
+            active_workspace: None,
+            workspace_workbench: None,
             sidebar,
             terminal,
             navigation,
@@ -1141,6 +1159,18 @@ impl RootView {
             _browser_state_sync: browser_state_sync,
         };
         root.sync_auxiliary_terminal(window, cx);
+        let saved_workspace = root
+            .services
+            .store
+            .store
+            .read()
+            .expect("store")
+            .preferences()
+            .active_workspace
+            .clone();
+        if saved_workspace.is_some() && !preview {
+            root.activate_saved_workspace(saved_workspace, window, cx);
+        }
         if !preview {
             // Do not rely on AppKit emitting a move/resize after the observer
             // is installed: even an untouched first launch should become the
@@ -1182,6 +1212,84 @@ impl RootView {
         }));
     }
 
+    fn activate_saved_workspace(
+        &mut self,
+        id: Option<diri_proto::workspace::WorkspaceId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_workspace = id;
+        if let Some(workbench) = &self.workspace_workbench {
+            workbench.update(cx, |workbench, cx| workbench.deactivate(cx));
+        }
+        if self.active_workspace.is_some() {
+            if let Some(auxiliary) = &self.auxiliary_terminal {
+                auxiliary.update(cx, |terminal, _| terminal.release_layout_control());
+            }
+            if let Some(terminal) = &self.terminal {
+                terminal.update(cx, |terminal, _| terminal.release_layout_control());
+            }
+            if self.workspace_workbench.is_none() {
+                let runtime = self.services.store.clone();
+                let tokio = self.services.tokio.clone();
+                let workbench = cx.new(|cx| {
+                    crate::workspace_workbench::WorkspaceWorkbench::new(runtime, tokio, window, cx)
+                });
+                cx.subscribe_in(
+                    &workbench,
+                    window,
+                    |this, _, event, window, cx| match event {
+                        crate::workspace_workbench::WorkspaceWorkbenchEvent::Notice(message) => {
+                            this.show_quote_feedback("Workspace", message.clone(), cx)
+                        }
+                        crate::workspace_workbench::WorkspaceWorkbenchEvent::RequestSplit {
+                            tab,
+                            pane,
+                        } => this.sidebar.update(cx, |sidebar, cx| {
+                            sidebar.choose_split_session(tab.clone(), pane.clone(), window, cx)
+                        }),
+                        crate::workspace_workbench::WorkspaceWorkbenchEvent::Terminal(
+                            TerminalPaneEvent::OpenFileReference { reference, cwd, .. },
+                        ) => {
+                            this.reveal_inspector(cx);
+                            if let Some(inspector) = &this.inspector {
+                                inspector.update(cx, |inspector, cx| {
+                                    inspector.open_file_reference(
+                                        cwd.clone(),
+                                        reference.clone(),
+                                        cx,
+                                    )
+                                });
+                            }
+                        }
+                        crate::workspace_workbench::WorkspaceWorkbenchEvent::Terminal(
+                            TerminalPaneEvent::ExternalDropFeedback { message },
+                        ) => this.show_quote_feedback("Dropped files", message.clone(), cx),
+                        crate::workspace_workbench::WorkspaceWorkbenchEvent::Terminal(
+                            TerminalPaneEvent::ContinueAccount(id),
+                        ) => {
+                            if let Some(surfaces) = &this.utility_surfaces {
+                                surfaces.update(cx, |surfaces, cx| {
+                                    surfaces.open_account_continuation(id.clone(), window, cx)
+                                });
+                            }
+                        }
+                    },
+                )
+                .detach();
+                self.workspace_workbench = Some(workbench);
+            }
+        } else {
+            if let Some(workbench) = &self.workspace_workbench {
+                workbench.update(cx, |workbench, cx| workbench.deactivate(cx));
+            }
+            if let Some(terminal) = &self.terminal {
+                terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+            }
+        }
+        cx.notify();
+    }
+
     fn colors(&self) -> SemanticColors {
         let store = self
             .services
@@ -1217,6 +1325,16 @@ impl RootView {
         .detach();
     }
 
+    fn active_terminal(&self, cx: &App) -> Option<Entity<TerminalPane>> {
+        if self.active_workspace.is_some() {
+            self.workspace_workbench
+                .as_ref()
+                .and_then(|workbench| workbench.read(cx).focused_terminal())
+        } else {
+            self.terminal.clone()
+        }
+    }
+
     fn focused_quote_surface(&self, window: &Window, cx: &App) -> Option<QuoteSurface> {
         if let Some(auxiliary) = &self.auxiliary_terminal
             && auxiliary.read(cx).is_focused(window)
@@ -1228,7 +1346,7 @@ impl RootView {
         {
             return Some(QuoteSurface::Inspector);
         }
-        if let Some(terminal) = &self.terminal
+        if let Some(terminal) = self.active_terminal(cx)
             && terminal.read(cx).is_focused(window)
         {
             return Some(QuoteSurface::PrimaryTerminal);
@@ -1239,7 +1357,7 @@ impl RootView {
     fn quote_from_surface(&self, surface: QuoteSurface, cx: &App) -> Option<Quote> {
         match surface {
             QuoteSurface::PrimaryTerminal => self
-                .terminal
+                .active_terminal(cx)
                 .as_ref()
                 .and_then(|terminal| terminal.read(cx).quote_selection()),
             QuoteSurface::AuxiliaryTerminal => self
@@ -1267,7 +1385,7 @@ impl RootView {
     ) {
         let handle = match surface {
             QuoteSurface::PrimaryTerminal => self
-                .terminal
+                .active_terminal(cx)
                 .as_ref()
                 .map(|terminal| terminal.read(cx).quote_focus_handle()),
             QuoteSurface::AuxiliaryTerminal => self
@@ -1292,7 +1410,7 @@ impl RootView {
         // source surface rather than making Quote Selection palette-only fail.
         self.quote_from_surface(self.last_quote_surface, cx)
             .or_else(|| {
-                self.terminal
+                self.active_terminal(cx)
                     .as_ref()
                     .and_then(|terminal| terminal.read(cx).quote_selection())
             })
@@ -1947,6 +2065,12 @@ impl RootView {
     /// The relationship survives app restarts because it lives in the session
     /// record; the GPUI entity remains disposable rendering state.
     fn sync_auxiliary_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_workspace.is_some() {
+            if let Some(auxiliary) = &self.auxiliary_terminal {
+                auxiliary.update(cx, |terminal, _| terminal.release_layout_control());
+            }
+            return;
+        }
         if self.preview {
             return;
         }
@@ -2757,7 +2881,53 @@ impl RootView {
             .h(px(card_height))
             .min_h(px(0.0))
             .bg(terminal.background);
-        if self.preview && self.preview_scenario != PreviewScenario::Empty {
+        if self.active_workspace.is_some() {
+            let tab = {
+                let store = self.services.store.store.read().expect("store");
+                store
+                    .workspace_catalog()
+                    .snapshot()
+                    .and_then(|snapshot| {
+                        snapshot
+                            .workspaces
+                            .iter()
+                            .find(|workspace| Some(&workspace.id) == self.active_workspace.as_ref())
+                    })
+                    .and_then(|workspace| {
+                        workspace
+                            .tabs
+                            .iter()
+                            .find(|tab| Some(&tab.id) == workspace.selected_tab.as_ref())
+                    })
+                    .cloned()
+            };
+            if let (Some(tab), Some(workbench)) = (tab, &self.workspace_workbench) {
+                workbench.update(cx, |workbench, cx| {
+                    workbench.set_tab(
+                        tab,
+                        TerminalViewport {
+                            x: sidebar_width,
+                            y: tabs_height,
+                            width: card_width,
+                            height: card_height,
+                        },
+                        window,
+                        cx,
+                    )
+                });
+                body = body.child(workbench.clone());
+            } else {
+                if let Some(workbench) = &self.workspace_workbench {
+                    workbench.update(cx, |workbench, cx| workbench.deactivate(cx));
+                }
+                body = body.child(
+                    div()
+                        .p(px(28.0))
+                        .text_color(terminal.secondary)
+                        .child("Add a session to this workspace"),
+                );
+            }
+        } else if self.preview && self.preview_scenario != PreviewScenario::Empty {
             body = body.child(self.preview_workbench(terminal));
         } else if split_open {
             let available_height = (card_height - 1.0).max(0.0);
@@ -4980,6 +5150,147 @@ mod tests {
         root.update(cx, |_, cx| cx.notify());
         cx.run_until_parked();
         assert!(cx.debug_bounds("copy-recovery-details").is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes synthetic saved workspace UI to DIRI_WORKSPACE_SCREENSHOT"]
+    fn render_workspace_workbench_screenshot() {
+        use diri_proto::workspace::*;
+        use gpui::HeadlessAppContext;
+        let output = std::env::var("DIRI_WORKSPACE_SCREENSHOT").unwrap();
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let services = test_services();
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let workspace = WorkspaceId::new("release-workspace");
+        let tab = TabId::new("release-tab");
+        let first = PaneId::new("coding");
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store
+                .update_preferences(|prefs| {
+                    prefs.terminal_theme = if std::env::var_os("DIRI_VISUAL_LIGHT").is_some() {
+                        "dirijor-light"
+                    } else {
+                        "dirijor-dark"
+                    }
+                    .into();
+                })
+                .unwrap();
+            store.seed_workspace_snapshot_for_test(WorkspaceSnapshot {
+                revision: 7,
+                workspaces: vec![WorkspaceRecord {
+                    id: workspace.clone(),
+                    name: "Release room".into(),
+                    selected_tab: Some(tab.clone()),
+                    tabs: vec![
+                        WorkspaceTab {
+                            id: tab,
+                            title: Some("Implement and verify".into()),
+                            focused_pane: first.clone(),
+                            zoomed_pane: None,
+                            layout: LayoutNode::Split {
+                                id: SplitId::new("split-main"),
+                                axis: LayoutAxis::Horizontal,
+                                fraction: 0.58,
+                                first: Box::new(LayoutNode::Pane {
+                                    id: first,
+                                    session_id: SessionId::new("preview-claude"),
+                                }),
+                                second: Box::new(LayoutNode::Pane {
+                                    id: PaneId::new("verification"),
+                                    session_id: SessionId::new("preview-codex"),
+                                }),
+                            },
+                        },
+                        WorkspaceTab {
+                            id: TabId::new("notes-tab"),
+                            title: Some("Review notes".into()),
+                            focused_pane: PaneId::new("notes"),
+                            zoomed_pane: None,
+                            layout: LayoutNode::Pane {
+                                id: PaneId::new("notes"),
+                                session_id: SessionId::new("preview-claude"),
+                            },
+                        },
+                    ],
+                }],
+                ..Default::default()
+            });
+        }
+        {
+            let mut store = services.store.store.write().unwrap();
+            let mut snapshot = store.workspace_catalog().snapshot().unwrap().clone();
+            let tab = &mut snapshot.workspaces[0].tabs[0];
+            if std::env::var_os("DIRI_WORKSPACE_NESTED").is_some()
+                && let LayoutNode::Split { second, .. } = &mut tab.layout
+            {
+                **second = LayoutNode::Split {
+                    id: SplitId::new("split-detail"),
+                    axis: LayoutAxis::Vertical,
+                    fraction: 0.6,
+                    first: second.clone(),
+                    second: Box::new(LayoutNode::Pane {
+                        id: PaneId::new("notes-duplicate"),
+                        session_id: SessionId::new("preview-claude"),
+                    }),
+                };
+            }
+            if std::env::var_os("DIRI_WORKSPACE_ZOOM").is_some() {
+                tab.focused_pane = PaneId::new("verification");
+                tab.zoomed_pane = Some(tab.focused_pane.clone());
+            }
+            store.seed_workspace_snapshot_for_test(snapshot);
+        }
+        let width = if std::env::var_os("DIRI_WORKSPACE_NARROW").is_some() {
+            720.0
+        } else {
+            1200.0
+        };
+        let window = cx
+            .open_window(size(px(width), px(800.0)), |window, cx| {
+                cx.new(|cx| {
+                    let root = RootView::new(services, false, PreviewScenario::Empty, window, cx);
+                    root.sidebar.update(cx, |sidebar, cx| {
+                        sidebar
+                            .set_tab_orientation(
+                                if std::env::var_os("DIRI_WORKSPACE_HORIZONTAL").is_some() {
+                                    crate::store::TabOrientation::Horizontal
+                                } else {
+                                    crate::store::TabOrientation::Vertical
+                                },
+                                cx,
+                            )
+                            .unwrap();
+                        sidebar.activate_workspace(Some(workspace), cx);
+                    });
+                    root
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window.into(), |root, _, cx| {
+            let root = root.downcast::<RootView>().unwrap();
+            let workbench = root.read(cx).workspace_workbench.clone().unwrap();
+            workbench.update(cx, |workbench, cx| workbench.seed_panes_for_test(cx));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let image = cx.capture_screenshot(window.into()).unwrap();
+        image.save(&output).unwrap();
+        cx.update_window(window.into(), |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
     }
 
     #[cfg(target_os = "macos")]

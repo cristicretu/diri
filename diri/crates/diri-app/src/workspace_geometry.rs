@@ -2,7 +2,8 @@
 use diri_proto::{
     SessionId,
     workspace::{
-        LayoutAxis, LayoutNode, MAX_LAYOUT_DEPTH, MAX_TAB_PANES, PaneId, TabId, WorkspaceTab,
+        LayoutAxis, LayoutNode, MAX_LAYOUT_DEPTH, MAX_TAB_PANES, PaneId, SplitId, TabId,
+        WorkspaceTab,
     },
 };
 use std::collections::HashSet;
@@ -47,11 +48,19 @@ pub(crate) struct PanePlacement {
     pub bounds: Rect,
 }
 #[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DividerPlacement {
+    pub id: SplitId,
+    pub axis: LayoutAxis,
+    pub fraction: f32,
+    pub bounds: Rect,
+    pub parent: Rect,
+}
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct WorkspaceGeometry {
     pub tab: TabId,
     pub focused: PaneIdentity,
     pub panes: Vec<PanePlacement>,
-    pub dividers: Vec<Rect>,
+    pub dividers: Vec<DividerPlacement>,
     pub bounds: Rect,
 }
 
@@ -126,7 +135,15 @@ impl WorkspaceGeometry {
                     bounds: transform(pane.bounds),
                 })
                 .collect(),
-            dividers: self.dividers.iter().copied().map(transform).collect(),
+            dividers: self
+                .dividers
+                .iter()
+                .map(|divider| DividerPlacement {
+                    bounds: transform(divider.bounds),
+                    parent: transform(divider.parent),
+                    ..divider.clone()
+                })
+                .collect(),
         })
     }
 
@@ -187,7 +204,7 @@ fn place(
     bounds: Rect,
     depth: usize,
     panes: &mut Vec<PanePlacement>,
-    dividers: &mut Vec<Rect>,
+    dividers: &mut Vec<DividerPlacement>,
     identities: &mut HashSet<PaneId>,
 ) -> Option<()> {
     if depth > MAX_LAYOUT_DEPTH {
@@ -207,6 +224,7 @@ fn place(
             });
         }
         LayoutNode::Split {
+            id,
             axis,
             fraction,
             first,
@@ -258,7 +276,13 @@ fn place(
                     },
                 )
             };
-            dividers.push(divider);
+            dividers.push(DividerPlacement {
+                id: id.clone(),
+                axis: *axis,
+                fraction: *fraction,
+                bounds: divider,
+                parent: bounds,
+            });
             place(first, left, depth + 1, panes, dividers, identities)?;
             place(second, right, depth + 1, panes, dividers, identities)?;
         }
@@ -269,7 +293,6 @@ fn place(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use diri_proto::workspace::SplitId;
     fn pane(id: &str) -> LayoutNode {
         LayoutNode::Pane {
             id: PaneId::new(id),
@@ -331,7 +354,7 @@ mod tests {
         );
         assert_eq!(preview.tab, tab.id);
         assert_eq!(tab, before);
-        assert_eq!(preview.dividers[0].width, 1.0);
+        assert_eq!(preview.dividers[0].bounds.width, 1.0);
     }
     #[test]
     fn zoomed_pane_changes_only_projection_and_demand() {

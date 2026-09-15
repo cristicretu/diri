@@ -23,6 +23,8 @@ pub struct WorkspaceCatalog {
     editing: bool,
     announced_revision: u64,
     pub error: Option<String>,
+    pub created_workspace: Option<diri_proto::workspace::WorkspaceId>,
+    creating: bool,
 }
 
 impl Default for WorkspaceCatalog {
@@ -38,6 +40,8 @@ impl Default for WorkspaceCatalog {
             editing: false,
             announced_revision: 0,
             error: None,
+            created_workspace: None,
+            creating: false,
         }
     }
 }
@@ -58,6 +62,15 @@ impl WorkspaceCatalog {
 }
 
 impl SessionStore {
+    #[cfg(test)]
+    pub(crate) fn seed_workspace_snapshot_for_test(&mut self, snapshot: WorkspaceSnapshot) {
+        self.daemon_state = DaemonState::Connected;
+        self.workspaces.snapshot = Some(Arc::new(snapshot));
+        self.workspaces.status = WorkspaceCatalogStatus::Ready;
+        self.workspaces.connected = true;
+        self.workspaces.hydrated = true;
+    }
+
     pub fn workspace_catalog(&self) -> &WorkspaceCatalog {
         &self.workspaces
     }
@@ -74,6 +87,8 @@ impl SessionStore {
         catalog.refreshing = false;
         catalog.refresh_again = false;
         catalog.editing = false;
+        catalog.creating = false;
+        catalog.created_workspace = None;
         catalog.announced_revision = 0;
         catalog.status = if connected {
             WorkspaceCatalogStatus::Loading
@@ -130,6 +145,8 @@ impl SessionStore {
             mutation,
         };
         catalog.editing = true;
+        catalog.creating = matches!(&params.mutation, WorkspaceMutation::CreateWorkspace { .. });
+        catalog.created_workspace = None;
         catalog.error = None;
         let generation = catalog.generation;
         self.emit(StoreEffect::MutateWorkspace { generation, params });
@@ -160,6 +177,12 @@ impl SessionStore {
                 catalog.refresh_again = false;
             }
             Ok(snapshot) => {
+                if mutation && catalog.creating {
+                    catalog.created_workspace = snapshot
+                        .workspaces
+                        .last()
+                        .map(|workspace| workspace.id.clone());
+                }
                 // Within one connection a delayed response cannot roll back
                 // newer event/mutation state. Reconnect hydration is allowed
                 // to replace the read-only cache from a prior Engine.
