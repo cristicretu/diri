@@ -6,11 +6,12 @@ use objc2::{ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_cl
 use objc2_app_kit::{NSEvent, NSResponder, NSTouchPhase, NSTouchTypeMask, NSView};
 use objc2_foundation::NSObjectProtocol;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 struct GestureIvars {
     view: Retained<NSView>,
     gesture: RefCell<ThreeFingerGesture>,
+    revealed: Cell<bool>,
     frames: tokio::sync::watch::Sender<GestureFrame>,
 }
 define_class!(
@@ -62,12 +63,11 @@ impl GestureResponder {
                 )
             })
             .collect();
-        if let Some(frame) = self
-            .ivars()
-            .gesture
-            .borrow_mut()
-            .sample(contacts, cancelled)
-        {
+        if let Some(frame) = self.ivars().gesture.borrow_mut().sample_with_reverse(
+            contacts,
+            cancelled,
+            self.ivars().revealed.get(),
+        ) {
             self.ivars().frames.send_replace(frame);
         }
     }
@@ -82,6 +82,11 @@ pub(crate) struct TabGestureBridge {
     previous_touch_types: NSTouchTypeMask,
 }
 impl TabGestureBridge {
+    /// Presentation state only; no polling or extra event interception.
+    pub(crate) fn set_revealed(&self, revealed: bool) {
+        self.responder.ivars().revealed.set(revealed);
+    }
+
     pub(crate) fn cancel(&self) {
         self.responder
             .ivars()
@@ -111,6 +116,7 @@ impl TabGestureBridge {
         let responder = marker.alloc().set_ivars(GestureIvars {
             view: view.clone(),
             gesture: Default::default(),
+            revealed: Cell::new(false),
             frames,
         });
         let responder: Retained<GestureResponder> = unsafe { msg_send![super(responder), init] };

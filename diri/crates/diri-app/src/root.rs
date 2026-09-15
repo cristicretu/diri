@@ -983,6 +983,10 @@ impl RootView {
             cx.observe(surfaces, move |_this, surfaces, cx| {
                 let visible = surfaces.read(cx).tab_peek_visible();
                 let offset = surfaces.read(cx).tab_peek_offset(cx);
+                #[cfg(target_os = "macos")]
+                if let Some(bridge) = &_this._tab_gesture {
+                    bridge.set_revealed(visible);
+                }
                 if was_visible && !visible {
                     #[cfg(target_os = "macos")]
                     if let Some(bridge) = &_this._tab_gesture {
