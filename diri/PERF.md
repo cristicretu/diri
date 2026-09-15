@@ -753,3 +753,50 @@ controlled before/after network-speed comparison. Workspace validation passed
 **1,612 tests** (34 intentionally ignored), formatting, clippy, and release build;
 Linux-specific remote clippy, local Holder latency/load/slow-attach gates, and
 the signed three-platform app bundle/catalog verification also passed.
+
+
+## Multiplexed local preview capacity — 2026-09-16
+
+The same `previewbench` release binary compares separate preview sockets with a
+single receive-only connection for the active preview set. This experiment
+compiled the admission constant at 64 in a disposable build; production remains
+at 16. Each run lasts three seconds after a one-second unattached idle sample,
+uses alternating 80×24 and 160×50 grids, and retains one deliberately stalled
+single-session preview plus one normal interactive attachment in both modes.
+The shared queue's overflow/partial-frame and reseed behavior has separate tests.
+
+| Previews / Hz | CPU cores separate → mux | RSS MiB separate → mux | Input p95 ms separate → mux |
+|---|---:|---:|---:|
+| 48 / idle | 0.010 → 0.005 | 43.6 → 35.6 | — |
+| 48 / 10 | 0.720 → 0.671 | 77.8 → 65.6 | 7.866 → 6.326 |
+| 48 / 60 | 2.241 → 1.671 | 122.7 → 116.3 | 3.456 → 1.000 |
+| 64 / idle | 0.013 → 0.006 | 54.6 → 44.2 | — |
+| 64 / 10 | 0.938 → 0.840 | 96.1 → 83.6 | 9.106 → 6.615 |
+| 64 / 60 | 3.299 → 2.194 | 167.3 → 148.2 | 2.256 → 1.224 |
+
+All continuously drained readers survived all twelve runs; the stalled legacy
+preview disconnected and reseeded without changing its process identity. At
+64/60, small/large grids delivered 54.4/53.1 distinct producer images per second
+with multiplexing, versus 53.2/52.0 separately. Producers completed 159–170 frames
+in the multiplexed interval, so this is not evidence of sustained 60fps output.
+At 64/10, multiplexed output p90 was 20.2/19.9 ms versus 16.8/17.3 ms separately;
+lower aggregate cost does not imply lower latency for every workload.
+
+The boundary includes Engine and blocking benchmark decoder threads, not GUI,
+SSH, or producer CPU. With 64 previews, unconnected baseline was 67 threads;
+separate connections reached 260, multiplexing 137. Of the 123-thread reduction,
+62 are benchmark decoder threads (the production client already uses Tokio),
+and 61 are Engine connection threads. Existing per-session publishers remain.
+Idle decoder deadline checks also contribute to the reported CPU, so idle values
+are not Engine-only wakeup measurements. Runs were paired while other builds
+were held on Mac16,5 / 36 GiB / macOS 27.0 / Rust 1.97.1.
+
+Full per-dimension timing, producer progress, reader survival, and allocation
+samples are in `docs/perf/preview-multiplex-2026-09-16.json`. Reproduce the checked-in
+16-subscription configuration from `diri/`:
+
+```sh
+cargo build --release -p diri-engine --example previewbench
+./target/release/examples/previewbench 16 60 3 diagnose
+./target/release/examples/previewbench 16 60 3 diagnose mux
+```

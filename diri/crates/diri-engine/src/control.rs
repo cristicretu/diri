@@ -449,6 +449,23 @@ impl ControlServer {
             }
             if first {
                 first = false;
+                if serde_json::from_slice::<serde_json::Value>(&line)
+                    .is_ok_and(|value| value.get("preview_set").is_some())
+                {
+                    if let Ok(request) =
+                        serde_json::from_slice::<diri_proto::preview_set::PreviewSetRequest>(&line)
+                        && request.preview_set
+                        && request.version == diri_proto::preview_set::PREVIEW_SET_VERSION
+                    {
+                        let buffered = reader.buffer().to_vec();
+                        return self.attach.serve_preview_set(
+                            &self.registry,
+                            reader.into_inner(),
+                            buffered,
+                        );
+                    }
+                    return Ok(());
+                }
                 // Route by the distinct key before normal attach decoding. Mixed
                 // or unsupported requests fail closed without visibility effects.
                 if serde_json::from_slice::<serde_json::Value>(&line)
