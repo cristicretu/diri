@@ -2,6 +2,40 @@ use super::*;
 use crate::tab_peek::{GestureFrame, card_rect, terminal_offset, visible_card_indices};
 use gpui::App;
 
+/// A local preview connection is not proof that the remote Holder is reachable.
+fn preview_caption(
+    session: &SessionRecord,
+    source: Option<crate::tab_preview::PreviewState>,
+) -> Option<&'static str> {
+    use crate::tab_preview::PreviewState;
+    use diri_proto::{RemoteConnectionState, SessionStatus};
+    let remote = session
+        .host
+        .as_ref()
+        .and(session.remote_connection.as_ref())
+        .map(|connection| connection.state);
+    if matches!(session.status, SessionStatus::Exited(_))
+        || remote == Some(RemoteConnectionState::Exited)
+    {
+        return Some("Exited");
+    }
+    if session.hibernation.is_some() {
+        return Some("Paused");
+    }
+    if source == Some(PreviewState::Disconnected) {
+        return Some("Disconnected");
+    }
+    session.host.as_ref()?;
+    Some(match remote {
+        Some(RemoteConnectionState::Connecting) => "Connecting",
+        Some(RemoteConnectionState::Connected) => "Connected",
+        Some(RemoteConnectionState::Reconnecting) => "Reconnecting",
+        Some(RemoteConnectionState::Failed) => "Connection failed",
+        Some(RemoteConnectionState::Exited) => "Exited",
+        Some(RemoteConnectionState::Unknown) | None => "Last received",
+    })
+}
+
 impl SessionSurfaces {
     pub(super) fn dismiss_tab_peek(&mut self) {
         self.peek.dismiss();
@@ -280,19 +314,7 @@ impl SessionSurfaces {
                     .into_any_element()
             };
             let title = display_title(session);
-            let status = if matches!(session.status, diri_proto::SessionStatus::Exited(_)) {
-                Some("Exited")
-            } else if session.hibernation.is_some() {
-                Some("Paused")
-            } else if state == Some(crate::tab_preview::PreviewState::Disconnected) {
-                Some("Disconnected")
-            } else if session.host.is_some() {
-                // The Engine's remote mirror can outlive its SSH channel. A
-                // preview socket confirms local delivery, not host reachability.
-                Some("Last received")
-            } else {
-                None
-            };
+            let status = preview_caption(session, state);
             body = body.child(
                 div()
                     .id(SharedString::from(format!("tab-peek-{}", id.0)))
@@ -336,10 +358,12 @@ impl SessionSurfaces {
                             .text_color(colors.primary)
                             .overflow_hidden()
                             .whitespace_nowrap()
-                            .child(title)
+                            .child(div().flex_1().min_w(px(0.0)).truncate().child(title))
                             .when_some(status, |row, status| {
-                                row.child(div().flex_1()).child(
+                                row.child(
                                     div()
+                                        .flex_shrink_0()
+                                        .debug_selector(move || format!("TAB_PEEK_STATUS_{index}"))
                                         .ml(px(6.0))
                                         .text_size(px(9.0))
                                         .text_color(colors.secondary)
@@ -434,5 +458,140 @@ impl SessionSurfaces {
                     ),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        sidebar::{PreviewScenario, SidebarPreviewFixture},
+        tab_preview::PreviewState,
+    };
+    use diri_proto::{
+        DateMillis, ExitInfo, ExitReason, HibernationInfo, HibernationReason, RemoteConnection,
+        RemoteConnectionState, SessionStatus,
+    };
+
+    fn remote_session() -> SessionRecord {
+        let mut session = SidebarPreviewFixture::make(PreviewScenario::Typical)
+            .list
+            .sessions
+            .remove(0);
+        session.host = Some("fixture-host".into());
+        session.status = SessionStatus::Working;
+        session.hibernation = None;
+        session.remote_connection = None;
+        session
+    }
+
+    #[test]
+    fn local_preview_delivery_never_invents_remote_connectivity() {
+        let mut session = remote_session();
+        assert_eq!(
+            preview_caption(&session, Some(PreviewState::Live)),
+            Some("Last received")
+        );
+        for (state, expected) in [
+            (RemoteConnectionState::Unknown, "Last received"),
+            (RemoteConnectionState::Connecting, "Connecting"),
+            (RemoteConnectionState::Connected, "Connected"),
+            (RemoteConnectionState::Reconnecting, "Reconnecting"),
+            (RemoteConnectionState::Failed, "Connection failed"),
+            (RemoteConnectionState::Exited, "Exited"),
+        ] {
+            session.remote_connection = Some(RemoteConnection {
+                state,
+                since: DateMillis(1.0),
+            });
+            assert_eq!(
+                preview_caption(&session, Some(PreviewState::Live)),
+                Some(expected)
+            );
+            // Transition time is not terminal output age and does not change the label.
+            session.remote_connection.as_mut().unwrap().since = DateMillis(9_999_999.0);
+            assert_eq!(
+                preview_caption(&session, Some(PreviewState::Live)),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn authoritative_exit_pause_and_local_delivery_loss_have_explicit_precedence() {
+        let mut session = remote_session();
+        session.remote_connection = Some(RemoteConnection {
+            state: RemoteConnectionState::Connected,
+            since: DateMillis(1.0),
+        });
+        assert_eq!(
+            preview_caption(&session, Some(PreviewState::Disconnected)),
+            Some("Disconnected")
+        );
+        session.hibernation = Some(HibernationInfo {
+            since: DateMillis(2.0),
+            reason: HibernationReason::Manual,
+            tree_pids: vec![],
+            tree_start_times: None,
+        });
+        assert_eq!(
+            preview_caption(&session, Some(PreviewState::Disconnected)),
+            Some("Paused")
+        );
+        session.status = SessionStatus::Exited(ExitInfo {
+            reason: ExitReason::Exited,
+            code: Some(0),
+            signal: None,
+        });
+        assert_eq!(
+            preview_caption(&session, Some(PreviewState::Disconnected)),
+            Some("Exited")
+        );
+        session.status = SessionStatus::Working;
+        session.hibernation = None;
+        session.host = None;
+        assert_eq!(preview_caption(&session, Some(PreviewState::Live)), None);
+    }
+    struct CaptionHarness(Entity<SessionSurfaces>);
+    impl Render for CaptionHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().relative().child(self.0.clone())
+        }
+    }
+
+    #[gpui::test]
+    fn remote_caption_stays_inside_a_narrow_card_with_a_long_title(cx: &mut gpui::TestAppContext) {
+        let mut session = remote_session();
+        session.title = "A long task title that must leave the transport caption readable".into();
+        session.remote_connection = Some(RemoteConnection {
+            state: RemoteConnectionState::Failed,
+            since: DateMillis(1.0),
+        });
+        let id = session.id.clone();
+        let runtime = Arc::new(StoreRuntime::inert());
+        runtime
+            .store
+            .write()
+            .unwrap()
+            .hydrate(diri_proto::SessionListResult {
+                sessions: vec![session],
+                projects: vec![],
+            });
+        runtime.store.write().unwrap().select(id);
+        let (_, cx) = cx.add_window_view(move |_, cx| {
+            CaptionHarness(cx.new(|cx| {
+                let mut surface = SessionSurfaces::new(runtime, None, cx);
+                surface.tab_gesture(GestureFrame::Tracking(140.0), cx);
+                surface.tab_gesture(GestureFrame::Released(140.0), cx);
+                surface
+            }))
+        });
+        cx.simulate_resize(gpui::size(px(250.0), px(700.0)));
+        let card = cx.debug_bounds("TAB_PEEK_CARD_0").unwrap();
+        let status = cx.debug_bounds("TAB_PEEK_STATUS_0").unwrap();
+        assert!(status.left() >= card.left());
+        assert!(status.right() <= card.right());
+        assert!(status.bottom() <= card.bottom());
+        assert!(status.size.width > px(40.0));
     }
 }

@@ -4994,6 +4994,24 @@ mod tests {
             .project_id
             .clone();
         fixture.list.sessions.retain(|s| s.project_id == project);
+        if std::env::var_os("DIRI_PEEK_REMOTE_STATES").is_some() {
+            use diri_proto::{DateMillis, RemoteConnection, RemoteConnectionState};
+            let states = [
+                RemoteConnectionState::Connected,
+                RemoteConnectionState::Connecting,
+                RemoteConnectionState::Reconnecting,
+                RemoteConnectionState::Failed,
+                RemoteConnectionState::Unknown,
+                RemoteConnectionState::Exited,
+            ];
+            for (index, session) in fixture.list.sessions.iter_mut().enumerate() {
+                session.host = Some("fixture-host".into());
+                session.remote_connection = Some(RemoteConnection {
+                    state: states[index % states.len()],
+                    since: DateMillis(1.0),
+                });
+            }
+        }
         {
             let mut store = services.store.store.write().unwrap();
             store.hydrate(fixture.list);
