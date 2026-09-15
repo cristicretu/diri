@@ -126,3 +126,13 @@ individual keystrokes and a status change before Enter, then inspect the
 Registry projection used by the sidebar. The startup regression failed before
 the change and passed afterward. Previously missed input is not reconstructed;
 existing sessions can still recover through their native completion metadata.
+
+## Prompt stability across title publishers
+
+The regression `codex_prompt_titles_stay_stable_across_native_refresh_and_live_views`
+covers both fresh and resumed PTY sessions. Fresh input can seed an unnamed
+record; native metadata can then recover the original conversation prompt once.
+For a resumed session, the saved first prompt survives the attachment's input
+from the start. Repeated metadata refreshes, individual/list reads, and forced
+status-watcher publications must agree on the title and avoid redundant native
+title events. This extends the reconnect coverage for the fix in PR #286.

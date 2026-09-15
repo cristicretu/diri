@@ -3128,6 +3128,84 @@ mod tests {
     }
 
     #[test]
+    fn codex_prompt_titles_stay_stable_across_native_refresh_and_live_views() {
+        for resumed in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut registry = Registry::new(engine(), temp.path().join("state.json"));
+            let mut record = record("stable-prompt");
+            record.kind = AgentKind::CODEX;
+            record.agent_session_id = Some("thread-9".into());
+            if resumed {
+                record.title = "Original conversation prompt".into();
+                record.title_source = TitleSource::FirstPrompt;
+            }
+            registry
+                .spawn(
+                    SessionSpec {
+                        id: "stable-prompt".into(),
+                        pty: crate::PtySpec::new(
+                            vec!["/bin/sh".into(), "-c".into(), "cat >/dev/null".into()],
+                            "/tmp",
+                        ),
+                        manifest_id: "codex".into(),
+                        authority: crate::Authority::ProcessOnly,
+                        logs_dir: temp.path().join("logs"),
+                        holder: None,
+                        remote: None,
+                        defer_launch: false,
+                    },
+                    record,
+                )
+                .unwrap();
+            registry.sessions["stable-prompt"]
+                .send_text("Current terminal prompt", true)
+                .unwrap();
+            let expected = if resumed {
+                "Original conversation prompt"
+            } else {
+                "Current terminal prompt"
+            };
+            let mut published = HashMap::new();
+            registry.changed_since(&mut published);
+            assert_eq!(registry.record("stable-prompt").unwrap().title, expected);
+
+            for pass in 0..4 {
+                let updates =
+                    registry.apply_native_title_refreshes(vec![NativeTitleRefreshResult {
+                        request: NativeTitleRefreshRequest {
+                            account_profile: None,
+                            id: "stable-prompt".into(),
+                            kind: AgentKind::CODEX,
+                            cwd: "/tmp".into(),
+                            agent_session_id: "thread-9".into(),
+                            transcript_path: None,
+                        },
+                        title: Some(crate::history::ProviderTitle {
+                            title: "Original conversation prompt".into(),
+                            source: TitleSource::FirstPrompt,
+                        }),
+                    }]);
+                let expected = "Original conversation prompt";
+                if resumed || pass > 0 {
+                    assert!(updates.is_empty(), "unchanged metadata republished a title");
+                } else {
+                    assert_eq!(updates.len(), 1);
+                    assert_eq!(updates[0].1.title, expected);
+                }
+                assert_eq!(registry.record("stable-prompt").unwrap().title, expected);
+                assert_eq!(registry.records()[0].title, expected);
+                // Force a watcher publication, including the live view fold.
+                published.clear();
+                let updates = registry.changed_since(&mut published);
+                assert_eq!(updates[0].1.title, expected);
+            }
+            registry
+                .terminate("stable-prompt", std::time::Duration::from_secs(1))
+                .unwrap();
+        }
+    }
+
+    #[test]
     fn native_title_updates_follow_the_provider_but_respect_diri_renames() {
         let mut session = record("codex");
         session.kind = AgentKind::CODEX;
