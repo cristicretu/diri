@@ -1520,6 +1520,34 @@ impl RootView {
                     surfaces.update(cx, |surfaces, cx| surfaces.toggle_settings(cx));
                 }
             }
+            CommandId::ToggleTabOrientation
+            | CommandId::HorizontalTabs
+            | CommandId::VerticalTabs => {
+                let orientation = match command {
+                    CommandId::HorizontalTabs => crate::store::TabOrientation::Horizontal,
+                    CommandId::VerticalTabs => crate::store::TabOrientation::Vertical,
+                    _ => self.sidebar.read(cx).tab_orientation().toggled(),
+                };
+                let navigation_focused = self.sidebar.read(cx).is_focused(window);
+                if let Err(error) = self.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.set_tab_orientation(orientation, cx)
+                }) {
+                    self.show_quote_feedback(
+                        "Tab orientation",
+                        format!("Could not save tab orientation: {error}"),
+                        cx,
+                    );
+                    return;
+                }
+                if orientation == crate::store::TabOrientation::Horizontal
+                    && navigation_focused
+                    && !self.sidebar.read(cx).is_visible()
+                    && let Some(terminal) = &self.terminal
+                {
+                    terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+                }
+                cx.notify();
+            }
             CommandId::ToggleSidebar => {
                 self.sidebar.update(cx, |sidebar, cx| sidebar.toggle(cx));
             }
@@ -2459,7 +2487,14 @@ impl RootView {
         };
         let card_width =
             (f32::from(viewport_size.width) - sidebar_width - inspector_width).max(0.0);
-        let card_height = f32::from(viewport_size.height).max(0.0);
+        let tabs_height = if self.sidebar.read(cx).tab_orientation()
+            == crate::store::TabOrientation::Horizontal
+        {
+            crate::tab_navigation::TAB_STRIP_HEIGHT
+        } else {
+            0.0
+        };
+        let card_height = (f32::from(viewport_size.height) - tabs_height).max(0.0);
         let selected = self
             .services
             .store
@@ -2521,13 +2556,19 @@ impl RootView {
                         x: sidebar_width + card_width,
                         y: Metrics::TITLE_BAR,
                         width: inspector_width,
-                        height: card_height.max(0.0),
+                        height: f32::from(viewport_size.height).max(0.0),
                     },
                     cx,
                 );
             });
         }
 
+        if tabs_height > 0.0 {
+            card = card.child(
+                self.sidebar
+                    .update(cx, |sidebar, cx| sidebar.render_horizontal_tabs(cx)),
+            );
+        }
         if self.preview && self.preview_scenario != PreviewScenario::Empty {
             card = card.child(self.preview_workbench(terminal));
         } else if split_open {
@@ -2540,7 +2581,7 @@ impl RootView {
                     terminal.set_viewport(
                         TerminalViewport {
                             x: sidebar_width,
-                            y: 0.0,
+                            y: tabs_height,
                             width: card_width,
                             height: heights.primary,
                         },
@@ -2572,7 +2613,7 @@ impl RootView {
                     terminal.set_viewport(
                         TerminalViewport {
                             x: sidebar_width,
-                            y: heights.primary + 1.0,
+                            y: tabs_height + heights.primary + 1.0,
                             width: card_width,
                             height: heights.auxiliary,
                         },
@@ -2633,7 +2674,7 @@ impl RootView {
                 terminal.set_viewport(
                     TerminalViewport {
                         x: sidebar_width,
-                        y: 0.0,
+                        y: tabs_height,
                         width: card_width,
                         height: card_height,
                     },
@@ -3564,6 +3605,19 @@ impl Render for RootView {
             .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| {
                 this.run_command(CommandId::ToggleSidebar, window, cx);
             }))
+            .on_action(
+                cx.listener(|this, _: &commands::ToggleTabOrientation, window, cx| {
+                    this.run_command(CommandId::ToggleTabOrientation, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &commands::HorizontalTabs, window, cx| {
+                    this.run_command(CommandId::HorizontalTabs, window, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &commands::VerticalTabs, window, cx| {
+                this.run_command(CommandId::VerticalTabs, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &FocusSidebar, window, cx| {
                 this.run_command(CommandId::FocusSidebar, window, cx);
             }))
@@ -3981,6 +4035,106 @@ mod tests {
                     .unwrap(),
             ),
         })
+    }
+
+    #[gpui::test]
+    fn tab_orientation_preserves_terminal_identity_selection_and_restores_geometry(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            cx.set_reduce_motion(true);
+            commands::bind_keys(cx, &Default::default());
+        });
+        let services = test_services();
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let selected = fixture.selected_session_id.unwrap();
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.select(selected.clone());
+        }
+        let store = services.store.clone();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        root.update_in(cx, |root, window, cx| {
+            root.run_command(CommandId::VerticalTabs, window, cx)
+        });
+        cx.run_until_parked();
+        let (entity, before, records) = root.read_with(cx, |root, cx| {
+            let terminal = root.terminal.as_ref().unwrap();
+            (
+                terminal.clone(),
+                terminal.read(cx).geometry_for_test().0.unwrap(),
+                store.store.read().unwrap().sessions().clone(),
+            )
+        });
+        cx.simulate_keystrokes(&commands::test_chords("cmd-k"));
+        cx.run_until_parked();
+        assert!(
+            root.read_with(cx, |root, cx| root
+                .navigation
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .is_open()),
+            "palette opens from terminal"
+        );
+        cx.simulate_keystrokes("h o r i z o n t a l");
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("palette-row-0").is_some(),
+            "orientation is searchable"
+        );
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(
+            store.store.read().unwrap().preferences().tab_orientation,
+            crate::store::TabOrientation::Horizontal
+        );
+        assert!(cx.debug_bounds("horizontal-tabs").is_some());
+        let horizontal = root.read_with(cx, |root, cx| {
+            assert_eq!(root.terminal.as_ref(), Some(&entity));
+            entity.read(cx).geometry_for_test().0.unwrap()
+        });
+        assert_eq!(
+            horizontal.height,
+            before.height - crate::tab_navigation::TAB_STRIP_HEIGHT
+        );
+        assert!(horizontal.width > before.width);
+        assert_eq!(horizontal.y, crate::tab_navigation::TAB_STRIP_HEIGHT);
+        let picker = cx.debug_bounds("horizontal-tab-project").unwrap();
+        cx.simulate_click(picker.center(), Modifiers::default());
+        cx.executor().advance_clock(Duration::from_millis(300));
+        cx.run_until_parked();
+        root.read_with(cx, |root, cx| {
+            assert!(
+                root.sidebar.read(cx).is_peeking(),
+                "keyboard project picker remains open"
+            );
+            assert_eq!(
+                entity.read(cx).geometry_for_test().0.unwrap(),
+                horizontal,
+                "project picker overlays work without resizing"
+            );
+        });
+        cx.simulate_keystrokes("escape");
+        cx.executor().advance_clock(Duration::from_millis(300));
+        cx.run_until_parked();
+        cx.simulate_keystrokes(&commands::test_chords("cmd-shift-s"));
+        cx.run_until_parked();
+        root.read_with(cx, |root, cx| {
+            assert_eq!(root.terminal.as_ref(), Some(&entity));
+            assert_eq!(entity.read(cx).geometry_for_test().0.unwrap(), before);
+        });
+        let store = store.store.read().unwrap();
+        assert_eq!(store.selected_session_id(), Some(&selected));
+        assert_eq!(
+            store.sessions(),
+            &records,
+            "presentation must not mutate workload records"
+        );
     }
 
     #[gpui::test]
@@ -4433,6 +4587,91 @@ mod tests {
         cx.update_window(window.into(), |_, window, _| window.remove_window())
             .unwrap();
         cx.run_until_parked();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes deterministic tab orientation screenshots to DIRI_TABS_SCREENSHOTS"]
+    fn render_tab_orientation_screenshots() {
+        use gpui::{AppContext as _, HeadlessAppContext};
+        let output = std::env::var("DIRI_TABS_SCREENSHOTS").expect("DIRI_TABS_SCREENSHOTS");
+        std::fs::create_dir_all(&output).unwrap();
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        for (name, orientation, light, width) in [
+            (
+                "horizontal-dark",
+                crate::store::TabOrientation::Horizontal,
+                false,
+                1000.0,
+            ),
+            (
+                "horizontal-light",
+                crate::store::TabOrientation::Horizontal,
+                true,
+                1000.0,
+            ),
+            (
+                "horizontal-narrow",
+                crate::store::TabOrientation::Horizontal,
+                false,
+                640.0,
+            ),
+            (
+                "vertical-light",
+                crate::store::TabOrientation::Vertical,
+                true,
+                1000.0,
+            ),
+        ] {
+            let services = test_services();
+            let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+            {
+                let mut store = services.store.store.write().unwrap();
+                store.hydrate(fixture.list);
+                store.select(fixture.selected_session_id.unwrap());
+                store
+                    .update_preferences(|prefs| {
+                        prefs.terminal_theme = if light {
+                            "dirijor-light"
+                        } else {
+                            "dirijor-dark"
+                        }
+                        .into()
+                    })
+                    .unwrap();
+            }
+            let window = cx
+                .open_window(size(px(width), px(700.0)), |window, cx| {
+                    cx.new(|cx| {
+                        let root =
+                            RootView::new(services, false, PreviewScenario::Empty, window, cx);
+                        root.sidebar
+                            .update(cx, |sidebar, cx| {
+                                sidebar.set_tab_orientation(orientation, cx)
+                            })
+                            .unwrap();
+                        root
+                    })
+                })
+                .unwrap();
+            cx.run_until_parked();
+            cx.capture_screenshot(window.into())
+                .unwrap()
+                .save(std::path::Path::new(&output).join(format!("{name}.png")))
+                .unwrap();
+            cx.update_window(window.into(), |_, window, _| window.remove_window())
+                .unwrap();
+            cx.run_until_parked();
+        }
     }
 
     #[cfg(target_os = "macos")]

@@ -41,6 +41,9 @@ actions!(
         // OpenSettings retains the Cmd+, toggle behavior.
         ShowSettings,
         ToggleSidebar,
+        ToggleTabOrientation,
+        HorizontalTabs,
+        VerticalTabs,
         FocusSidebar,
         ToggleInspector,
         ToggleAuxiliaryTerminal,
@@ -110,6 +113,9 @@ pub enum CommandId {
     OpenWorktrees,
     OpenSettings,
     ToggleSidebar,
+    ToggleTabOrientation,
+    HorizontalTabs,
+    VerticalTabs,
     FocusSidebar,
     ToggleInspector,
     ToggleAuxiliaryTerminal,
@@ -360,6 +366,36 @@ pub const COMMANDS: &[CommandSpec] = &[
         "Toggle Sidebar",
         "sidebar.left",
         "hide show panel"
+    ),
+    spec!(
+        ToggleTabOrientation,
+        "toggle-tab-orientation",
+        Some("cmd-shift-s"),
+        Some("⇧⌘S"),
+        Some(APP_CONTEXT),
+        "Switch Tab Orientation",
+        "rectangle.split.2x1",
+        "horizontal vertical tabs sidebar layout"
+    ),
+    spec!(
+        HorizontalTabs,
+        "horizontal-tabs",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "Switch to Horizontal Tabs",
+        "rectangle.topthird.inset.filled",
+        "tab placement orientation top"
+    ),
+    spec!(
+        VerticalTabs,
+        "vertical-tabs",
+        None,
+        None,
+        Some(APP_CONTEXT),
+        "Switch to Vertical Tabs",
+        "sidebar.left",
+        "tab placement orientation side"
     ),
     spec!(
         FocusSidebar,
@@ -787,6 +823,9 @@ impl CommandSpec {
             CommandId::OpenWorktrees => KeyBinding::new(key, OpenWorktrees, context),
             CommandId::OpenSettings => KeyBinding::new(key, OpenSettings, context),
             CommandId::ToggleSidebar => KeyBinding::new(key, ToggleSidebar, context),
+            CommandId::ToggleTabOrientation => KeyBinding::new(key, ToggleTabOrientation, context),
+            CommandId::HorizontalTabs => KeyBinding::new(key, HorizontalTabs, context),
+            CommandId::VerticalTabs => KeyBinding::new(key, VerticalTabs, context),
             CommandId::FocusSidebar => KeyBinding::new(key, FocusSidebar, context),
             CommandId::ToggleInspector => KeyBinding::new(key, ToggleInspector, context),
             CommandId::ToggleAuxiliaryTerminal => {
@@ -1146,6 +1185,13 @@ impl CommandId {
             Self::SelectLastSession => {
                 session_slot_metadata("Select last session", "Select the last session")
             }
+            Self::ToggleTabOrientation | Self::HorizontalTabs | Self::VerticalTabs => {
+                ShortcutMetadata {
+                    title: "Tab orientation",
+                    description: "Place session tabs across the top or in the sidebar",
+                    category: Workspace,
+                }
+            }
             Self::ToggleSidebar => ShortcutMetadata {
                 title: "Toggle sidebar",
                 description: "Show or hide the sessions sidebar",
@@ -1288,6 +1334,9 @@ impl CommandId {
             Self::OpenWorktrees => Box::new(OpenWorktrees),
             Self::OpenSettings => Box::new(OpenSettings),
             Self::ToggleSidebar => Box::new(ToggleSidebar),
+            Self::ToggleTabOrientation => Box::new(ToggleTabOrientation),
+            Self::HorizontalTabs => Box::new(HorizontalTabs),
+            Self::VerticalTabs => Box::new(VerticalTabs),
             Self::FocusSidebar => Box::new(FocusSidebar),
             Self::ToggleInspector => Box::new(ToggleInspector),
             Self::ToggleAuxiliaryTerminal => Box::new(ToggleAuxiliaryTerminal),
