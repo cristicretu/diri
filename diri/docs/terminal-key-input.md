@@ -32,12 +32,12 @@ Local held-session checkpoints have an optional versioned `keyboardState` field.
 
 ## Desktop boundary
 
-The desktop consumes the observed modes and reports unavailable mode-dependent input inline. This corrects the previous unconditional default-mode encoding. The pinned GPUI macOS adapter collapses physical numeric-keypad identity into ordinary text/Enter; retaining that physical identity is a follow-up platform input change. Explicit CLI keypad identity is supported here.
+The desktop consumes the observed modes and reports unavailable mode-dependent input inline. This corrects the previous unconditional default-mode encoding. The patched GPUI macOS adapter provides callback-scoped hardware identity without changing logical text or shortcuts. The terminal uses it to distinguish physical numeric-keypad keys from the top row and Return, then invokes the same encoder as the CLI. Saved or synthetic GPUI events outside native dispatch do not inherit hardware identity.
 
 ## Validation
 
 Deterministic tests cover raw PTY bytes, Enter versus bracketed paste, modified navigation/function keys, unsupported actions, missing/closed sessions, historical local mode frames, checkpoint adoption, transactional mode/grid encoding, and mode transitions across real Helper detach/adoption using fake SSH. Default tests do not contact a developer's SSH host.
 
-Final local validation: 1,674 tests passed, 36 ignored; workspace formatting, strict Clippy and release build passed. An initial full run stalled in a macOS test-child exit; its diagnostic trace was retained locally, the exact test passed on rerun, and the subsequent complete workspace run passed.
+Final local validation: 1,676 workspace tests passed, 36 ignored; all 15 vendored platform tests passed. Workspace formatting, strict Clippy and release build passed. Native fixtures cover synthetic AppKit key events, duplicate logical keys with different hardware codes, nested/unwind/thread cleanup, exact encoder bytes and ordinary query-field insertion.
 
-![Rendered synthetic CLI and test evidence](screenshots/terminal-key-input-tests.png)
+![Rendered native keypad test evidence](screenshots/native-keypad-tests.png)

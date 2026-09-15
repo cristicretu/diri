@@ -9,6 +9,10 @@ mod display;
 mod display_link;
 mod events;
 mod keyboard;
+mod native_key;
+pub use native_key::current_native_key_code;
+#[cfg(any(test, feature = "test-support"))]
+pub use native_key::with_native_key_for_test;
 mod pasteboard;
 mod system_notifications;
 
