@@ -21,7 +21,7 @@ use crate::commands::{
     SelectPreviousSession, SelectSession1, SelectSession2, SelectSession3, SelectSession4,
     SelectSession5, SelectSession6, SelectSession7, SelectSession8, ToggleAuxiliaryTerminal,
     ToggleCommandPalette, ToggleHistory, ToggleInspector, ToggleOverview, ToggleQuickOpen,
-    ToggleSidebar,
+    ToggleSidebar, ToggleTabPeek,
 };
 use crate::external_drop::ExternalDropAction;
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
@@ -200,6 +200,10 @@ pub struct RootView {
     terminal: Option<Entity<TerminalPane>>,
     navigation: Option<Entity<NavigationOverlay>>,
     session_surfaces: Option<Entity<SessionSurfaces>>,
+    #[cfg(target_os = "macos")]
+    _tab_gesture: Option<crate::macos::tab_gesture::TabGestureBridge>,
+    #[cfg(target_os = "macos")]
+    _tab_gesture_task: Option<Task<()>>,
     utility_surfaces: Option<Entity<UtilitySurfaces>>,
     launcher: Entity<LauncherOverlay>,
     inspector: Option<Entity<WorkbenchInspector>>,
@@ -703,7 +707,18 @@ impl RootView {
         });
 
         let activation_services = Arc::clone(&services);
-        let activation = cx.observe_window_activation(window, move |_this, window, _cx| {
+        let activation = cx.observe_window_activation(window, move |this, window, cx| {
+            if !window.is_window_active() {
+                #[cfg(target_os = "macos")]
+                if let Some(bridge) = &this._tab_gesture {
+                    bridge.cancel();
+                }
+                if let Some(surfaces) = &this.session_surfaces {
+                    surfaces.update(cx, |s, cx| {
+                        s.tab_gesture(crate::tab_peek::GestureFrame::Cancelled, cx)
+                    });
+                }
+            }
             activation_services
                 .store
                 .store
@@ -947,11 +962,96 @@ impl RootView {
                 }
             }
         });
+        let peek_observer = session_surfaces.as_ref().map(|surfaces| {
+            let mut was_visible = false;
+            let mut previous_offset = 0.0;
+            cx.observe(surfaces, move |_this, surfaces, cx| {
+                let visible = surfaces.read(cx).tab_peek_visible();
+                let offset = surfaces.read(cx).tab_peek_offset(cx);
+                if was_visible && !visible {
+                    #[cfg(target_os = "macos")]
+                    if let Some(bridge) = &_this._tab_gesture {
+                        bridge.cancel();
+                    }
+                }
+                // Output only repaints the preview entity. Root layout needs
+                // invalidation solely when terminal placement changes.
+                if was_visible != visible || previous_offset != offset {
+                    cx.notify();
+                }
+                was_visible = visible;
+                previous_offset = offset;
+            })
+        });
+        let peek_output =
+            terminal
+                .as_ref()
+                .zip(session_surfaces.as_ref())
+                .map(|(terminal, surfaces)| {
+                    let surfaces = surfaces.clone();
+                    cx.observe(terminal, move |_, terminal, cx| {
+                        if surfaces.read(cx).tab_peek_visible() {
+                            let buffers = terminal.read(cx).resident_preview_buffers();
+                            surfaces.update(cx, |surface, cx| {
+                                surface.sync_resident_buffers(buffers);
+                                cx.notify();
+                            });
+                        }
+                    })
+                });
+        #[cfg(target_os = "macos")]
+        let (tab_gesture, tab_gesture_task) = if !preview
+            && let Some((bridge, mut frames)) =
+                crate::macos::tab_gesture::TabGestureBridge::install(window)
+        {
+            let task = cx.spawn_in(window, async move |this, cx| {
+                while frames.changed().await.is_ok() {
+                    let frame = *frames.borrow_and_update();
+                    if this
+                        .update_in(cx, |this, window, cx| {
+                            if window.is_window_active()
+                                && !this.launcher.read(cx).is_open()
+                                && !this
+                                    .navigation
+                                    .as_ref()
+                                    .is_some_and(|v| v.read(cx).is_open())
+                                && !this
+                                    .utility_surfaces
+                                    .as_ref()
+                                    .is_some_and(|v| v.read(cx).is_open())
+                                && !this.notification_panel_open
+                                && this.sidebar.read(cx).pending_close_copy().is_none()
+                                && this.quote_target_picker.is_none()
+                                && this.resize_origin.is_none()
+                                && this.terminal_resize_origin.is_none()
+                                && this.inspector_resize_origin.is_none()
+                                && let Some(surfaces) = &this.session_surfaces
+                            {
+                                surfaces.update(cx, |surfaces, cx| {
+                                    surfaces.tab_gesture(frame, cx);
+                                    surfaces.sync_tab_peek_focus(window, cx);
+                                });
+                            }
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            (Some(bridge), Some(task))
+        } else {
+            (None, None)
+        };
         let mut root = Self {
             sidebar,
             terminal,
             navigation,
             session_surfaces,
+            #[cfg(target_os = "macos")]
+            _tab_gesture: tab_gesture,
+            #[cfg(target_os = "macos")]
+            _tab_gesture_task: tab_gesture_task,
             utility_surfaces,
             launcher,
             inspector,
@@ -1012,6 +1112,8 @@ impl RootView {
             _subscriptions: std::iter::once(activation)
                 .chain(bounds_observer)
                 .chain(appearance_observer)
+                .chain(peek_observer)
+                .chain(peek_output)
                 .collect(),
             _service_events: service_events,
             _surface_sync: surface_sync,
@@ -1318,7 +1420,43 @@ impl RootView {
         self.open_quote_draft(target, picker.quote, window, cx);
     }
 
+    pub(crate) fn toggle_tab_peek(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.launcher.read(cx).is_open()
+            || self
+                .utility_surfaces
+                .as_ref()
+                .is_some_and(|view| view.read(cx).is_open())
+            || self.notification_panel_open
+            || self.sidebar.read(cx).pending_close_copy().is_some()
+            || self.quote_target_picker.is_some()
+        {
+            return;
+        }
+        if let Some(surfaces) = &self.session_surfaces {
+            let buffers = self
+                .terminal
+                .as_ref()
+                .map(|terminal| terminal.read(cx).resident_preview_buffers());
+            surfaces.update(cx, |surfaces, cx| {
+                if let Some(buffers) = buffers {
+                    surfaces.sync_resident_buffers(buffers);
+                }
+                surfaces.toggle_tab_peek(cx);
+                surfaces.sync_tab_peek_focus(window, cx);
+            });
+        }
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(surfaces) = &self.session_surfaces
+            && surfaces.read(cx).tab_peek_visible()
+        {
+            surfaces.update(cx, |surfaces, cx| {
+                surfaces.handle_key_down(event, window, cx)
+            });
+            cx.stop_propagation();
+            return;
+        }
         // The close dialog overlays the focused surface without taking its
         // focus. Handle its keys first so they cannot reach the terminal or
         // sidebar beneath it, and focus is preserved when closing is canceled.
@@ -1499,6 +1637,7 @@ impl RootView {
                     });
                 }
             }
+            CommandId::ToggleTabPeek => self.toggle_tab_peek(window, cx),
             CommandId::ToggleOverview => {
                 if let Some(surfaces) = &self.session_surfaces {
                     surfaces.update(cx, |surfaces, cx| surfaces.toggle_overview(cx));
@@ -1975,6 +2114,14 @@ impl RootView {
     }
 
     fn on_key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .session_surfaces
+            .as_ref()
+            .is_some_and(|s| s.read(cx).tab_peek_visible())
+        {
+            cx.stop_propagation();
+            return;
+        }
         if let Some(surfaces) = &self.session_surfaces {
             surfaces.update(cx, |surfaces, cx| {
                 surfaces.handle_key_up(event, window, cx);
@@ -2517,8 +2664,18 @@ impl RootView {
                 || selected
                     .as_ref()
                     .is_some_and(|id| self.auxiliary_spawn_parent.as_ref() == Some(id)));
+        let peek_offset = self
+            .session_surfaces
+            .as_ref()
+            .map_or(0.0, |surfaces| surfaces.read(cx).tab_peek_offset(cx));
+        if let Some(surfaces) = &self.session_surfaces {
+            surfaces.update(cx, |surfaces, cx| {
+                surfaces.set_tab_peek_region(sidebar_width, card_width, cx)
+            });
+        }
         let mut card = div()
             .relative()
+            .top(px(peek_offset))
             .flex_1()
             .flex()
             .flex_col()
@@ -3584,6 +3741,9 @@ impl Render for RootView {
             .on_action(cx.listener(|this, _: &ToggleHistory, window, cx| {
                 this.run_command(CommandId::ToggleHistory, window, cx);
             }))
+            .on_action(cx.listener(|this, _: &ToggleTabPeek, window, cx| {
+                this.toggle_tab_peek(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &ToggleOverview, window, cx| {
                 this.run_command(CommandId::ToggleOverview, window, cx);
             }))
@@ -4138,6 +4298,72 @@ mod tests {
     }
 
     #[gpui::test]
+    fn tab_peek_translation_does_not_resize_the_terminal(cx: &mut gpui::TestAppContext) {
+        use crate::tab_peek::GestureFrame;
+        let services = test_services();
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.select(fixture.selected_session_id.unwrap());
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        cx.run_until_parked();
+        let original = root.read_with(cx, |root, cx| {
+            root.terminal.as_ref().unwrap().read(cx).geometry_for_test()
+        });
+        let selected = root.read_with(cx, |root, _| {
+            root.services
+                .store
+                .store
+                .read()
+                .unwrap()
+                .selected_session_id()
+                .cloned()
+        });
+        for distance in [10.0, 50.0, 140.0, 240.0, 380.0, 180.0, 40.0] {
+            root.update(cx, |root, cx| {
+                root.session_surfaces.as_ref().unwrap().update(cx, |s, cx| {
+                    s.tab_gesture(GestureFrame::Tracking(distance), cx)
+                })
+            });
+            cx.run_until_parked();
+            let current = root.read_with(cx, |root, cx| {
+                root.terminal.as_ref().unwrap().read(cx).geometry_for_test()
+            });
+            assert_eq!(
+                current, original,
+                "peek at {distance} changed terminal geometry"
+            );
+            assert_eq!(
+                root.read_with(cx, |root, _| root
+                    .services
+                    .store
+                    .store
+                    .read()
+                    .unwrap()
+                    .selected_session_id()
+                    .cloned()),
+                selected
+            );
+        }
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert_eq!(
+            root.read_with(cx, |root, cx| root
+                .terminal
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .geometry_for_test()),
+            original
+        );
+    }
+
+    #[gpui::test]
     fn fullscreen_terminal_tracks_drawable_size_with_windowed_restore_bounds(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -4537,6 +4763,72 @@ mod tests {
         root.update(cx, |_, cx| cx.notify());
         cx.run_until_parked();
         assert!(cx.debug_bounds("copy-recovery-details").is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes the complete tab peek workbench to DIRI_PEEK_ROOT_SCREENSHOT"]
+    fn render_tab_peek_workbench_screenshot() {
+        use diri_term::buffer::GridBuffer;
+        use gpui::HeadlessAppContext;
+        let output = std::env::var("DIRI_PEEK_ROOT_SCREENSHOT").expect("output path");
+        let distance = std::env::var("DIRI_PEEK_DISTANCE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(140.0);
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| crate::fonts::init(cx));
+        let services = test_services();
+        let mut fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let selected = fixture.selected_session_id.clone().unwrap();
+        let project = fixture
+            .list
+            .sessions
+            .iter()
+            .find(|s| s.id == selected)
+            .unwrap()
+            .project_id
+            .clone();
+        fixture.list.sessions.retain(|s| s.project_id == project);
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.select(selected.clone());
+            store
+                .update_preferences(|p| {
+                    p.terminal_theme = if std::env::var_os("DIRI_VISUAL_LIGHT").is_some() {
+                        "dirijor-light"
+                    } else {
+                        "dirijor-dark"
+                    }
+                    .into()
+                })
+                .unwrap();
+        }
+        let window=cx.open_window(size(px(1200.0),px(800.0)),|window,cx|cx.new(|cx| {
+            let root=RootView::new(services,false,PreviewScenario::Empty,window,cx);
+            let mut grid=GridBuffer::new(100,36);
+            let sample="$ pwd\n/Users/you/work/diri\n\n$ cargo test --workspace\n\nrunning 4 tests\ntest session_identity_survives ... ok\ntest preview_does_not_resize ... ok\ntest controller_stays_attached ... ok\ntest input_returns_to_terminal ... ok\n\ntest result: ok. 4 passed; 0 failed\n\n$ git status --short\n M crates/diri-app/src/tab_peek.rs\n M crates/diri-app/src/root.rs\n\n$ ";
+            for (y,line) in sample.lines().enumerate(){for (x,ch) in line.chars().enumerate(){grid.cells[y*100+x].scalar=ch as u32;}}
+            let terminal=root.terminal.as_ref().unwrap();
+            terminal.update(cx,|terminal,cx|{terminal.seed_preview_grid_for_test(grid);cx.notify();});
+            let buffers=terminal.read(cx).resident_preview_buffers();
+            root.session_surfaces.as_ref().unwrap().update(cx,|surface,cx|{surface.sync_resident_buffers(buffers);surface.tab_gesture(crate::tab_peek::GestureFrame::Tracking(distance),cx);});
+            root
+        })).unwrap();
+        cx.run_until_parked();
+        cx.capture_screenshot(window.into())
+            .unwrap()
+            .save(output)
+            .unwrap();
+        cx.update_window(window.into(), |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
     }
 
     #[cfg(target_os = "macos")]
