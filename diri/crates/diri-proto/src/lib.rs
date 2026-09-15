@@ -14,6 +14,7 @@ pub mod node;
 pub mod paths;
 pub mod recovery;
 pub mod remote_pty;
+pub mod tasks;
 pub mod terminal;
 
 pub use control::{ControlError, ControlMessage, JsonValue, WIRE_VERSION};

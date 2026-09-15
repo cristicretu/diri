@@ -88,7 +88,7 @@ fn initialize(params: &Value) -> Value {
              it is available. Never use `shell` to launch an agent CLI such as `claude`, \
              `codex`, `cursor`, or `gemini`. A child `shell` is an interactive terminal shown \
              in the parent's Cmd+J pane, and its prompt is executed as shell commands; use it \
-             only when the user explicitly wants a terminal or raw commands.\n\nTypical orchestration flow: spawn_agent \
+             only when the user explicitly wants a terminal or raw commands.\n\nFor delegated work needing reliable completion, spawn_agent without an initial prompt, then submit_task, wait_for_task, and inspect its result. When receiving a Diri task, call report_task acknowledged before starting and report_task completed or failed for that exact task_id after verification. These are explicit Agent reports, not automated proof that the work is correct.\n\nFor untracked interaction: spawn_agent \
              (optionally worktree:true and an initial prompt) → wait_for_agent(until:\"done\") \
              → read_output → send_prompt for follow-ups → release_agent when finished. \
              Messages are delivered at most once. Reuse message_id on retries; never send a new copy because the agent is slow or its screen has not changed. Inspect unknown delivery outcomes. A delivery receipt does not mean the agent finished. Waits observe current status and may return immediately; verify output for the submitted task before treating it as completed. \

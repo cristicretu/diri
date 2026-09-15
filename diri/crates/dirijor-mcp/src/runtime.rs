@@ -83,6 +83,8 @@ fn read_only(message: &Value) -> bool {
             message["params"]["name"].as_str(),
             Some(
                 "list_agents"
+                    | "get_task"
+                    | "wait_for_task"
                     | "get_status"
                     | "wait_for_agent"
                     | "read_output"

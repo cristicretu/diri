@@ -88,12 +88,21 @@ fn spec(id: &str, script: &str, logs: &Path, holder: HolderConfig) -> SessionSpe
 /// blocked on a read until their own timeout fires — or forever.
 #[test]
 fn a_cursor_position_query_gets_a_reply() {
+    assert_cursor_position_reply(false);
+}
+
+#[test]
+fn a_query_written_before_the_engine_pump_starts_is_live() {
+    assert_cursor_position_reply(true);
+}
+
+fn assert_cursor_position_reply(prelaunch: bool) {
     let _exclusive = exclusive();
     // Asked immediately, before the pump has drained anything. A shell setting
     // up its prompt does exactly this, and a reply suppressed as "replayed
     // history" until the first empty read leaves it waiting on its own
     // timeout — which is how this read on Linux and not on macOS.
-    let root = work_dir("dsr");
+    let root = work_dir(if prelaunch { "dsr-before-pump" } else { "dsr" });
     let logs = root.join("logs");
     let holder = HolderConfig {
         holders_dir: root.join("holders"),
@@ -109,7 +118,43 @@ fn a_cursor_position_query_gets_a_reply() {
          got=b'' if not select.select([fd],[],[],20.0)[0] else os.read(fd,32); \
          termios.tcsetattr(fd,termios.TCSADRAIN,old); \
          print('ANSWER[%s]' % got.decode('latin1').lstrip('\\033'))\"";
-    let session = Session::spawn(spec("s_dsr", script, &logs, holder), engine()).expect("spawn");
+    let spec = spec("s_dsr", script, &logs, holder.clone());
+    if prelaunch {
+        use diri_engine::holder::{
+            launcher::HolderLauncher, paths::HolderPaths, protocol::HolderLaunchSpec,
+        };
+        let paths = HolderPaths::new(&holder.holders_dir, "s_dsr");
+        HolderLauncher::launch(
+            &holder.executable,
+            &paths,
+            &HolderLaunchSpec {
+                session_id: "s_dsr".into(),
+                socket_path: paths.socket().to_string_lossy().into_owned(),
+                pid_file_path: paths.pid_file().to_string_lossy().into_owned(),
+                log_file_path: logs.join("s_dsr.bin").to_string_lossy().into_owned(),
+                argv: spec.pty.argv.clone(),
+                cwd: spec.pty.cwd.to_string_lossy().into_owned(),
+                environment: spec.pty.env.iter().cloned().collect(),
+                cols: spec.pty.cols,
+                rows: spec.pty.rows,
+                disk_capacity: diri_engine::holder::protocol::DEFAULT_DISK_CAPACITY,
+            },
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let bytes = std::fs::read(logs.join("s_dsr.bin")).unwrap_or_default();
+            if bytes.windows(4).any(|bytes| bytes == b"\x1b[6n") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fixture did not send its startup query"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    let session = Session::spawn(spec, engine()).expect("spawn");
 
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut seen = String::new();

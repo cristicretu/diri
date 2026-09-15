@@ -26,6 +26,8 @@ use sha2::{Digest, Sha256};
 use crate::registry::Registry;
 mod account_handoff;
 mod message_delivery;
+mod operations;
+mod tasks;
 
 /// Identifies this engine in the handshake, so a client can tell which
 /// implementation it reached.
@@ -500,6 +502,7 @@ impl ControlServer {
                 if matches!(
                     method.as_str(),
                     Method::SESSION_SPAWN
+                        | Method::SESSION_SPAWN_TRACKED
                         | Method::SESSION_CONTINUE_ACCOUNT
                         | Method::HOST_INITIALIZE
                         | Method::HOST_LIST_DIRECTORIES
@@ -692,6 +695,10 @@ impl ControlServer {
             }
             Method::HELLO => self.hello(params),
             Method::SESSION_SPAWN => self.session_spawn(params),
+            Method::SESSION_SPAWN_TRACKED => self.session_spawn_tracked(params),
+            Method::TASK_SUBMIT => self.task_submit(params),
+            Method::TASK_GET => self.task_get(params),
+            Method::TASK_REPORT => self.task_report(params),
             Method::SESSION_LIST | Method::STATE_SNAPSHOT => self.session_list(),
             Method::SESSION_DELIVER_MESSAGE => self.session_deliver_message(params),
             Method::SESSION_SEND_TEXT => self.session_send_text(params),
@@ -779,6 +786,14 @@ impl ControlServer {
     /// `generic` need an explicit `argv`, since their manifests declare no
     /// binary.
     fn session_spawn(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        self.session_spawn_identified(params, None)
+    }
+
+    fn session_spawn_identified(
+        &self,
+        params: Option<JsonValue>,
+        reserved_id: Option<String>,
+    ) -> Result<JsonValue, ControlError> {
         let raw = params.ok_or_else(|| ControlError::bad_request("params are required"))?;
         // Tests and scripts may pass a raw argv; the app never does. Read it
         // before the typed decode consumes the value.
@@ -800,7 +815,7 @@ impl ControlServer {
             p.host.as_deref(),
         )?;
         if p.host.is_some() {
-            return self.session_spawn_remote(p, argv, account_profile);
+            return self.session_spawn_remote(p, argv, account_profile, reserved_id);
         }
         let kind = p.kind.id().to_string();
         // A generic kind carries the user's command line inside itself.
@@ -853,7 +868,7 @@ impl ControlServer {
         }
         let authority = descriptor.authority();
 
-        let id = next_session_id();
+        let id = reserved_id.unwrap_or_else(next_session_id);
         // Build the complete agent argv before `spawn_spec`: agents declaring
         // `returnToLoginShell` need every manifest and injection argument
         // quoted inside the shell's `-c` command.
@@ -1046,6 +1061,7 @@ impl ControlServer {
         p: diri_proto::SessionSpawnParams,
         caller_argv: Vec<String>,
         mut account_profile: Option<diri_proto::AgentAccountProfile>,
+        reserved_id: Option<String>,
     ) -> Result<JsonValue, ControlError> {
         let manager = self
             .remote
@@ -1133,7 +1149,7 @@ impl ControlServer {
             .map(|variable| (variable.name, variable.value))
             .collect::<Vec<_>>();
 
-        let id = next_session_id();
+        let id = reserved_id.unwrap_or_else(next_session_id);
         let mut agent_session_id = None;
         let mut launch_args = caller_argv.clone();
         if descriptor.binary.is_some() {

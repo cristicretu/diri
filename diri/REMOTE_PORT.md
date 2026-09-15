@@ -692,6 +692,28 @@ identity rejection, and deadline enforcement. A 50-ping debug sample while a too
 was blocked measured approximately 37 microseconds median / 77 microseconds p95.
 See [the MCP reliability audit](docs/mcp-reliability-audit.md) for scope and limits.
 
+### Durable spawn and explicit task completion
+
+The local Engine now owns additive tracked-spawn and task receipts, as specified
+in [MCP task reliability](docs/mcp-task-reliability.md). It reserves a session ID
+before a tracked spawn has effects; retries return that identity and never
+repeat a launch whose outcome is uncertain. Worktree/bootstrap interruption is
+reported as failed/unknown and requires inspection, not automatic recreation.
+
+Task assignment, delivery, explicit Agent acknowledgement, and explicit task
+results are distinct. Only the assigned Agent can report that task's outcome;
+terminal status never substitutes for a task result. These journals, MCP tools,
+and task events belong to the local Engine. This is a separate orchestration
+enhancement, not a Holder task queue, remote hook service, or MCP forwarding.
+Existing Helper protocol/artifacts and controller ownership remain unchanged.
+
+The continuous remote gate adds dropped-reply retries, cancelled waits, and
+Engine-instance/SSH teardown and adoption through a disposable real OpenSSH
+endpoint. Deterministic Agent fixtures exercise exact task IDs and preserve the
+same remote process/incarnation across restart; no native provider completion
+is inferred. Native provider behavior and physical WAN outages remain distinct
+manual acceptance checks.
+
 ## Wire protocol
 
 `diri-proto::remote_pty` is the versioned protocol authority. Protocol 1.3

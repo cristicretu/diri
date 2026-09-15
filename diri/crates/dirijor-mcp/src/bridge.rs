@@ -16,6 +16,7 @@ use crate::tools::{ToolDefinition, tool_definitions_for};
 #[cfg(test)]
 mod audit_tests;
 mod policy;
+mod tasks;
 
 use policy::{McpPolicy, WRITE_POLICY, WriteAction};
 
@@ -97,6 +98,10 @@ impl Bridge {
         crate::tools::validate_arguments(tool, arguments)?;
         match tool {
             "spawn_agent" => self.spawn_agent(arguments),
+            "submit_task" => self.submit_task(arguments),
+            "get_task" => self.get_task(arguments),
+            "report_task" => self.report_task(arguments),
+            "wait_for_task" => self.wait_for_task(arguments),
             "list_agents" => self.list_agents(),
             "get_status" => self.get_status(arguments),
             "send_prompt" => self.send_prompt(arguments),
@@ -186,6 +191,7 @@ impl Bridge {
             self.request_typed(Method::AGENT_READINESS, json!({}), DEFAULT_TIMEOUT)?;
         let kind = resolve_agent_kind(&readiness, &requested);
 
+        let tracked = parent.is_some();
         let params = SessionSpawnParams {
             kind,
             cwd: required_string(arguments, "cwd")?,
@@ -202,7 +208,23 @@ impl Bridge {
             same_repo_as: None,
         };
         let params = serde_json::to_value(params).map_err(|error| error.to_string())?;
-        self.request(Method::SESSION_SPAWN, params, SPAWN_TIMEOUT)
+        if !tracked {
+            return self.request(Method::SESSION_SPAWN, params, SPAWN_TIMEOUT);
+        }
+        let mut identity = arguments.clone();
+        identity.as_object_mut().unwrap().remove("operation_id");
+        let operation_id = optional_string(arguments, "operation_id").unwrap_or_else(|| {
+            format!(
+                "auto:{}",
+                Sha256::digest(identity.to_string().as_bytes())
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            )
+        });
+        self.request(Method::SESSION_SPAWN_TRACKED, json!({
+            "senderID":self.require_caller()?, "operationID":operation_id, "spawn":params,
+        }), SPAWN_TIMEOUT).map_err(|error| format!("{error}. Spawn identity: {operation_id}. Retry only the same arguments and operation_id; never launch a fresh copy after a lost response."))
     }
 
     fn list_agents(&self) -> Result<Value, String> {
