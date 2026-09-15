@@ -20,6 +20,7 @@ pub mod remote_pty;
 pub use remote_connection::{RemoteConnection, RemoteConnectionState};
 pub mod tasks;
 pub mod terminal;
+pub mod terminal_input;
 
 pub use control::{ControlError, ControlMessage, JsonValue, WIRE_VERSION};
 pub use hosts::{HostEntry, HostNodeConfig, HostsConfig};

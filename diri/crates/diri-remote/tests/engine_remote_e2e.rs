@@ -499,7 +499,7 @@ fn engine_bootstraps_detaches_and_adopts_the_same_remote_process() {
         argv: vec![
             "/bin/sh".into(),
             "-c".into(),
-            "printf 'ready>'; IFS= read -r first; printf 'first:%s\\nnext>' \"$first\"; IFS= read -r second; printf 'second:%s\\n' \"$second\"".into(),
+            "printf '\\033[?1h\\033=ready>'; IFS= read -r first; printf '\\033[?1lfirst:%s\\nnext>' \"$first\"; IFS= read -r second; printf 'second:%s\\n' \"$second\"".into(),
         ],
         cwd: "/".into(),
         environment: vec![
@@ -539,8 +539,22 @@ fn engine_bootstraps_detaches_and_adopts_the_same_remote_process() {
     )
     .expect("spawn remote Session");
     wait_for_grid(&session, "ready>");
+    assert_eq!(
+        session.keyboard_state(),
+        Some(diri_proto::terminal_input::KeyboardState {
+            application_cursor_keys: true,
+            application_keypad: true
+        })
+    );
     session.write_input(b"alpha\n").expect("first input");
     wait_for_grid(&session, "next>");
+    assert_eq!(
+        session.keyboard_state(),
+        Some(diri_proto::terminal_input::KeyboardState {
+            application_cursor_keys: false,
+            application_keypad: true
+        })
+    );
 
     let binding = bindings
         .load_all()
@@ -604,6 +618,13 @@ fn engine_bootstraps_detaches_and_adopts_the_same_remote_process() {
         "reattaching an existing remote Agent must not look like a new launch"
     );
     wait_for_grid(&session, "next>");
+    assert_eq!(
+        session.keyboard_state(),
+        Some(diri_proto::terminal_input::KeyboardState {
+            application_cursor_keys: false,
+            application_keypad: true
+        })
+    );
     let after = manager
         .inspect(
             &installed,
@@ -618,7 +639,24 @@ fn engine_bootstraps_detaches_and_adopts_the_same_remote_process() {
         after.process_state,
         diri_proto::remote_pty::RemoteProcessState::Running { pid } if pid == process_pid
     ));
-    session.write_input(b"omega\n").expect("second input");
+    for key in "omega"
+        .chars()
+        .map(|ch| diri_proto::terminal_input::KeyEvent::character(ch.to_string()))
+        .chain([diri_proto::terminal_input::KeyEvent::named(
+            diri_proto::terminal_input::NamedKey::Enter,
+        )])
+    {
+        let bytes = diri_proto::terminal_input::encode_action(
+            &key,
+            Default::default(),
+            session.keyboard_state(),
+            diri_proto::terminal_input::KeyAction::Press,
+        )
+        .unwrap();
+        session
+            .write_input(&bytes)
+            .expect("mode-aware input after reconnect");
+    }
     wait_until("remote exit", Duration::from_secs(5), || {
         session.view().exited
     });

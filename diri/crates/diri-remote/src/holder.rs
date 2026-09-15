@@ -1167,6 +1167,7 @@ impl Holder {
         let Some(mut connection) = self.connection.take() else {
             return Ok(());
         };
+        connection.keyboard = self.screen.keyboard_state();
         connection.queue(message)?;
         if connection.outbound.len() > MAX_OUTBOUND_BYTES {
             if connection.sent != 0 {
@@ -1191,6 +1192,7 @@ impl Holder {
     }
 
     fn queue_snapshot(&self, connection: &mut Connection) -> io::Result<()> {
+        connection.keyboard = self.screen.keyboard_state();
         connection.queue(RemoteMessage::FullSnapshot(FullSnapshot {
             sequence: self.state.snapshot_sequence,
             alt_screen: self.screen.is_alt_screen(),
@@ -1344,6 +1346,7 @@ fn resolve_remote_executable(
 
 struct Connection {
     protocol_minor: u16,
+    keyboard: diri_proto::terminal_input::KeyboardState,
     stream: UnixStream,
     codec: RemoteCodec,
     epoch: Option<u64>,
@@ -1355,6 +1358,7 @@ impl Connection {
     fn new(stream: UnixStream) -> Self {
         Self {
             protocol_minor: 0,
+            keyboard: Default::default(),
             stream,
             codec: RemoteCodec::new(),
             epoch: None,
@@ -1383,7 +1387,39 @@ impl Connection {
                 _ => {}
             }
         }
-        RemoteCodec::encode_into(&message, &mut self.outbound).map_err(io::Error::other)
+        if self.protocol_minor < diri_proto::remote_pty::INPUT_MODES_PROTOCOL_MINOR
+            && let RemoteMessage::HelloAck(value) = &mut message
+        {
+            value.capabilities.retain(|capability| {
+                *capability != diri_proto::remote_pty::RemoteCapability::InputModes
+            });
+        }
+        // Mode state and its grid are admitted as one publication. The Holder's
+        // overflow/reseed decision must never run between these two frames.
+        let start = self.outbound.len();
+        let result = (|| {
+            if self.protocol_minor >= diri_proto::remote_pty::INPUT_MODES_PROTOCOL_MINOR {
+                let sequence = match &message {
+                    RemoteMessage::FullSnapshot(value) => Some(value.sequence),
+                    RemoteMessage::GridDelta(value) => Some(value.sequence),
+                    _ => None,
+                };
+                if let Some(sequence) = sequence {
+                    RemoteCodec::encode_into(
+                        &RemoteMessage::InputModes(diri_proto::remote_pty::InputModes {
+                            sequence,
+                            keyboard: self.keyboard,
+                        }),
+                        &mut self.outbound,
+                    )?;
+                }
+            }
+            RemoteCodec::encode_into(&message, &mut self.outbound)
+        })();
+        if result.is_err() {
+            self.outbound.truncate(start);
+        }
+        result.map_err(io::Error::other)
     }
 
     fn queue_error(&mut self, code: &str, message: &str, fatal: bool) -> io::Result<()> {
@@ -1520,6 +1556,59 @@ fn terminate_process_group(pid: u32) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn input_modes_and_grid_are_one_negotiated_publication() {
+        use diri_proto::terminal_input::KeyboardState;
+        for minor in [8, 9] {
+            let (stream, _peer) = UnixStream::pair().unwrap();
+            let mut connection = Connection::new(stream);
+            connection.protocol_minor = minor;
+            connection.keyboard = KeyboardState {
+                application_cursor_keys: true,
+                application_keypad: true,
+            };
+            let screen = diri_terminal_state::HeadlessScreen::new(4, 2);
+            let snapshot = FullSnapshot {
+                sequence: 42,
+                alt_screen: false,
+                bracketed_paste: false,
+                mouse: Default::default(),
+                grid: screen.full_snapshot(),
+            };
+            connection
+                .queue(RemoteMessage::FullSnapshot(snapshot))
+                .unwrap();
+            let frames = RemoteCodec::new().feed(&connection.outbound).unwrap();
+            assert_eq!(frames.len(), if minor == 9 { 2 } else { 1 });
+            if minor == 9 {
+                assert!(
+                    matches!(&frames[0], RemoteMessage::InputModes(state) if state.sequence == 42 && state.keyboard == connection.keyboard)
+                );
+            }
+            assert!(
+                matches!(frames.last(), Some(RemoteMessage::FullSnapshot(state)) if state.sequence == 42)
+            );
+            let before = connection.outbound.clone();
+            let mut invalid = screen.full_snapshot();
+            invalid.cols = 0;
+            assert!(
+                connection
+                    .queue(RemoteMessage::FullSnapshot(FullSnapshot {
+                        sequence: 43,
+                        alt_screen: false,
+                        bracketed_paste: false,
+                        mouse: Default::default(),
+                        grid: invalid
+                    }))
+                    .is_err()
+            );
+            assert_eq!(
+                connection.outbound, before,
+                "failed grid must roll back its mode prefix"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

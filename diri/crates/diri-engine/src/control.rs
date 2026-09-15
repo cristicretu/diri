@@ -757,6 +757,7 @@ impl ControlServer {
             Method::TASK_REPORT => self.task_report(params),
             Method::SESSION_LIST | Method::STATE_SNAPSHOT => self.session_list(),
             Method::SESSION_DELIVER_MESSAGE => self.session_deliver_message(params),
+            Method::SESSION_SEND_KEY => self.session_send_key(params),
             Method::SESSION_SEND_TEXT => self.session_send_text(params),
             Method::SESSION_RESIZE => self.session_resize(params),
             Method::SESSION_READ_SCREEN => self.session_read_screen(params),
@@ -1920,6 +1921,37 @@ impl ControlServer {
                     .map_err(io_control_error)
             },
         )
+    }
+
+    fn session_send_key(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        use diri_proto::terminal_input::{KeyEncodingError, encode_action};
+        let p: diri_proto::SendKeyParams = decode(params)?;
+        let event = p.event().map_err(ControlError::bad_request)?;
+        let mut registry = self.registry.lock().map_err(poisoned)?;
+        let session = registry
+            .get(&p.session_id.0)
+            .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+        let bytes = encode_action(&event, p.modifiers, session.keyboard_state(), p.action)
+            .map_err(|error| {
+                ControlError::new(
+                    match error {
+                        KeyEncodingError::UnknownModes => "input_modes_unavailable",
+                        _ => "unsupported_key_action",
+                    },
+                    error.to_string(),
+                )
+            })?;
+        registry
+            .wake_session(&p.session_id.0)
+            .map_err(io_control_error)?;
+        let session = registry
+            .get(&p.session_id.0)
+            .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+        session.write_input(&bytes).map_err(io_control_error)?;
+        self.publish_updated(&registry, &p.session_id.0);
+        encode(&diri_proto::SendKeyResult {
+            bytes_accepted: bytes.len(),
+        })
     }
 
     fn session_send_text(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
@@ -3999,6 +4031,7 @@ mod tests {
     use super::*;
 
     mod reconnect_tests;
+    mod send_key_tests;
 
     #[test]
     fn failed_remote_state_times_out_exit_wait_and_returns_a_structured_resume_error() {

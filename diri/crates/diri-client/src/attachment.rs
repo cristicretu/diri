@@ -34,6 +34,7 @@ const CHUNK_QUEUE_CAPACITY: usize = 256;
 pub enum TerminalChunk {
     Grid(GridUpdate),
     Modes {
+        keyboard: Option<diri_proto::terminal_input::KeyboardState>,
         alt_screen: bool,
         bracketed_paste: bool,
         mouse: MouseModes,
@@ -430,6 +431,7 @@ async fn process_incoming(
             let (alt_screen, bracketed_paste, mouse) = frame.terminal_modes_payload().ok_or(())?;
             chunks
                 .send(TerminalChunk::Modes {
+                    keyboard: frame.keyboard_state_payload().map_err(|_| ())?,
                     alt_screen,
                     bracketed_paste,
                     mouse,
@@ -494,6 +496,7 @@ mod tests {
         assert_eq!(
             rx.recv().await,
             Some(TerminalChunk::Modes {
+                keyboard: None,
                 alt_screen: true,
                 bracketed_paste: true,
                 mouse,

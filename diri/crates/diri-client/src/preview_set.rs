@@ -260,6 +260,7 @@ async fn read_previews(
                                 .terminal_modes_payload()
                                 .ok_or_else(|| invalid("invalid preview modes"))?;
                             TerminalChunk::Modes {
+                                keyboard: frame.keyboard_state_payload().map_err(invalid)?,
                                 alt_screen,
                                 bracketed_paste,
                                 mouse,

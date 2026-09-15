@@ -234,10 +234,11 @@ impl AttachHub {
         else {
             return Admission::Unavailable;
         };
-        let Ok(modes) = encoded(&Frame::modes_with_bracketed_paste(
+        let Ok(modes) = encoded(&Frame::modes_with_keyboard(
             seed.modes.0,
             seed.modes.1,
             seed.modes.2,
+            seed.signature.keyboard,
         )) else {
             return Admission::Unavailable;
         };
@@ -375,10 +376,11 @@ impl AttachHub {
                 grid
             };
             output.enqueue(Arc::from(grid));
-            let Ok(modes) = encoded(&Frame::modes_with_bracketed_paste(
+            let Ok(modes) = encoded(&Frame::modes_with_keyboard(
                 seed.modes.0,
                 seed.modes.1,
                 seed.modes.2,
+                seed.signature.keyboard,
             )) else {
                 return;
             };
@@ -640,7 +642,7 @@ impl AttachHub {
     /// one bounded wait after the last sink.
     fn pump(&self, registry: &Arc<Mutex<Registry>>, session_id: &str, seed: AttachmentSeed) {
         let mut signature = seed.signature;
-        let mut last_modes = Some(seed.modes);
+        let mut last_modes = Some((seed.modes, seed.signature.keyboard));
         let mut wake = seed.wake;
         let mut wake_generation = seed.wake_generation;
         let mut last_emission = Instant::now()
@@ -700,8 +702,7 @@ impl AttachHub {
                 let Ok(guard) = registry.lock() else { break };
                 guard.get(session_id).map(|session| {
                     (
-                        session.grid_update_if_changed(&mut signature),
-                        session.modes(),
+                        session.terminal_publication(&mut signature),
                         self.sink_outputs(session_id),
                     )
                 })
@@ -711,19 +712,20 @@ impl AttachHub {
 
             let mut frames: Vec<Frame> = Vec::with_capacity(2);
             let mut eligible_sinks = Vec::new();
-            if let Some((grid, modes, sinks)) = observed {
+            if let Some((publication, sinks)) = observed {
                 eligible_sinks = sinks;
-                if let Some(update) = grid
+                let modes = (publication.modes, publication.keyboard);
+                if let Some(update) = publication.grid
                     && let Ok(frame) = Frame::grid(&update)
                 {
                     frames.push(frame);
                 }
                 // Fresh sinks get their initial modes at seed time; the pump
                 // only broadcasts changes.
-                if let Some(previous) = last_modes
-                    && previous != modes
-                {
-                    frames.push(Frame::modes_with_bracketed_paste(modes.0, modes.1, modes.2));
+                if last_modes != Some(modes) {
+                    frames.push(Frame::modes_with_keyboard(
+                        modes.0.0, modes.0.1, modes.0.2, modes.1,
+                    ));
                 }
                 last_modes = Some(modes);
             }

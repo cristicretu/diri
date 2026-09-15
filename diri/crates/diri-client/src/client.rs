@@ -609,6 +609,13 @@ impl DaemonClient {
             .await
     }
 
+    pub async fn send_key(
+        &self,
+        params: &diri_proto::SendKeyParams,
+    ) -> Result<diri_proto::SendKeyResult, ClientError> {
+        self.typed(Method::SESSION_SEND_KEY, params).await
+    }
+
     pub async fn send_text(
         &self,
         session_id: &SessionId,
