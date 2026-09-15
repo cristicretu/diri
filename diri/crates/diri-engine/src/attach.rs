@@ -494,6 +494,42 @@ impl AttachHub {
         pending
     }
 
+    /// Wait only on queued output, so a reader freeing socket capacity wakes
+    /// the owner immediately. Retaining the outputs keeps every polled fd live;
+    /// no Registry, session, or output lock is held across the bounded wait.
+    fn wait_for_writable(&self, session_id: &str, timeout: Duration) {
+        let outputs = self.sink_outputs(session_id);
+        let mut descriptors: Vec<_> = outputs
+            .iter()
+            .filter_map(|(_, output)| {
+                let output = output.lock().ok()?;
+                (!output.closed && !output.frames.is_empty()).then(|| libc::pollfd {
+                    fd: output.stream.as_raw_fd(),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                })
+            })
+            .collect();
+        if descriptors.is_empty() {
+            return;
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let millis = remaining.as_micros().div_ceil(1000).min(i32::MAX as u128) as i32;
+            // SAFETY: retained output Arcs keep all sockets live, and the poll
+            // array is exclusively owned for its exact initialized length.
+            let result =
+                unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, millis) };
+            if result >= 0
+                || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+                || Instant::now() >= deadline
+            {
+                return;
+            }
+        }
+    }
+
     /// The per-session broadcast loop. Grid writers wake it after a complete
     /// PTY output batch. The leading edge and interactive responses publish
     /// immediately; continuous background output coalesces to 8 ms. A quiet
@@ -509,20 +545,22 @@ impl AttachHub {
             .unwrap_or_else(Instant::now);
         let stop = AtomicBool::new(false);
         let mut last_owner_check = Instant::now();
+        let mut publication_pending = false;
         loop {
             let pending = self.flush_sinks(session_id);
-            let observed_generation = wake_generation;
-            // Retry only outstanding data. Once every queue is empty, retain
-            // the existing quiet GridWake wait rather than polling sockets.
-            let event = wake.wait_for_change(
-                wake_generation,
-                if pending {
-                    WRITE_RETRY
-                } else {
-                    Duration::from_secs(1)
-                },
-            );
-            let mut changed = event.generation != wake_generation;
+            // A publication deadline must not suspend partially sent frames.
+            // Remember dirty state while the loop services bounded write retries.
+            let mut timeout = if publication_pending {
+                GRID_FLUSH_INTERVAL.saturating_sub(last_emission.elapsed())
+            } else {
+                Duration::from_secs(1)
+            };
+            if pending {
+                self.wait_for_writable(session_id, timeout.min(WRITE_RETRY));
+                timeout = Duration::ZERO;
+            }
+            let event = wake.wait_for_change(wake_generation, timeout);
+            let mut changed = publication_pending || event.generation != wake_generation;
             let mut interactive = event.interactive;
             wake_generation = event.generation;
 
@@ -548,16 +586,11 @@ impl AttachHub {
                 interactive = true;
             }
 
-            if changed && !interactive {
-                let elapsed = last_emission.elapsed();
-                if elapsed < GRID_FLUSH_INTERVAL {
-                    let event = wake.wait_for_priority_or_timeout(
-                        observed_generation,
-                        GRID_FLUSH_INTERVAL - elapsed,
-                    );
-                    wake_generation = event.generation;
-                }
+            if changed && !interactive && last_emission.elapsed() < GRID_FLUSH_INTERVAL {
+                publication_pending = true;
+                continue;
             }
+            publication_pending = false;
             // The session may be briefly absent mid-restart adoption: keep
             // the sinks, send nothing until it is back.
             let observed = if changed {
