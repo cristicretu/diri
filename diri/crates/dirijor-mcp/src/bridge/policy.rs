@@ -1,9 +1,10 @@
 //! Authorization for MCP writes initiated by an agent session.
 //!
 //! Reads intentionally remain fleet-wide. Writes are narrower: a root agent
-//! may coordinate its project, while a delegated agent may only write to its
-//! parent or direct children. Every write is re-evaluated from the Engine's
-//! latest session snapshot, so a stale or unhosted MCP process fails closed.
+//! may coordinate its project and message direct children on any host, while a
+//! delegated agent may only write to its parent or direct children. Every write
+//! is re-evaluated from the Engine's latest session snapshot, so a stale or
+//! unhosted MCP process fails closed.
 
 use std::path::Path;
 
@@ -11,7 +12,7 @@ use diri_proto::{Project, SessionRecord, SessionStatus};
 
 use super::{Lineage, Relation};
 
-pub(super) const WRITE_POLICY: &str = "Reads are open across all sessions. Root agents may write within their project; delegated agents may write only to their parent and direct children. Every write requires a live Diri session identity. Cross-lineage messages are attributed. Agents cannot target themselves, and only roots may release non-child sessions in their project.";
+pub(super) const WRITE_POLICY: &str = "Reads are open across all sessions. Root agents may write within their project and message direct children on any host; delegated agents may write only to their parent and direct children. Every write requires a live Diri session identity. Cross-lineage messages are attributed. Agents cannot target themselves. Root agents may release only sessions in their project; delegated agents may release only direct children.";
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum WriteAction<'a> {
@@ -176,7 +177,7 @@ impl<'a> McpPolicy<'a> {
 
     fn can_message(&self, target: &SessionRecord, relation: Relation) -> bool {
         if self.is_root() {
-            self.same_project(target)
+            relation == Relation::Child || self.same_project(target)
         } else {
             matches!(relation, Relation::Parent | Relation::Child)
         }
@@ -296,6 +297,75 @@ mod tests {
         assert!(
             policy
                 .authorize(WriteAction::SendPrompt { target: "foreign" })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn roots_can_coordinate_direct_children_across_hosts_but_not_foreign_sessions() {
+        let mut child = record("child", "remote-project", Some("root"));
+        child.host = Some("forge".into());
+        let records = vec![
+            record("root", "local-project", None),
+            child,
+            record("grandchild", "remote-project", Some("child")),
+            record("foreign", "remote-project", None),
+        ];
+        let projects = vec![project("local-project"), project("remote-project")];
+        let policy = McpPolicy::new(&records, &projects, Some("root")).expect("policy");
+        let message = policy
+            .authorize(WriteAction::SendPrompt { target: "child" })
+            .expect("direct child is writable across projects");
+        assert_eq!(message.frame("follow up"), "follow up");
+        assert!(
+            policy
+                .authorize(WriteAction::Release { target: "child" })
+                .is_err()
+        );
+        for target in ["root", "foreign", "grandchild"] {
+            assert!(
+                policy
+                    .authorize(WriteAction::SendPrompt { target })
+                    .is_err(),
+                "{target}"
+            );
+            assert!(
+                policy.authorize(WriteAction::Release { target }).is_err(),
+                "{target}"
+            );
+        }
+        let child_policy =
+            McpPolicy::new(&records, &projects, Some("child")).expect("child policy");
+        assert!(
+            child_policy
+                .authorize(WriteAction::SendPrompt { target: "root" })
+                .is_ok()
+        );
+        assert!(
+            child_policy
+                .authorize(WriteAction::ReportToParent { target: "root" })
+                .is_ok()
+        );
+        assert!(
+            child_policy
+                .authorize(WriteAction::Release { target: "root" })
+                .is_err()
+        );
+        assert!(
+            child_policy
+                .authorize(WriteAction::SendPrompt { target: "foreign" })
+                .is_err()
+        );
+        let grandchild_policy =
+            McpPolicy::new(&records, &projects, Some("grandchild")).expect("grandchild policy");
+        assert!(
+            grandchild_policy
+                .authorize(WriteAction::SendPrompt { target: "root" })
+                .is_err()
+        );
+        assert!(
+            grandchild_policy
+                .authorize(WriteAction::Release { target: "root" })
                 .is_err()
         );
     }

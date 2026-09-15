@@ -320,6 +320,7 @@ impl RemoteManager {
             return Ok(None);
         }
         let helper = InstalledHelper {
+            target: artifact.target,
             build_id: artifact.build_id.clone(),
             protocol: probe.protocol,
             transport: cached.helper.transport,
@@ -372,6 +373,7 @@ impl RemoteManager {
                     ));
                 }
                 let helper = InstalledHelper {
+                    target: artifact.target,
                     build_id: artifact.build_id.clone(),
                     protocol: probe.protocol,
                     transport,
@@ -453,6 +455,7 @@ impl RemoteManager {
         }
         let probe = install?;
         let helper = InstalledHelper {
+            target: artifact.target,
             build_id: artifact.build_id.clone(),
             protocol: probe.protocol,
             transport,
@@ -577,6 +580,7 @@ impl RemoteManager {
             ));
         }
         Ok(InstalledHelper {
+            target: RemoteTarget::from_artifact_name(&probe.target).map_err(io::Error::other)?,
             build_id: build_id.to_string(),
             protocol: probe.protocol,
             transport,
@@ -845,6 +849,7 @@ fn effective_uid() -> u32 {
 
 #[derive(Clone, Debug)]
 pub struct InstalledHelper {
+    pub target: RemoteTarget,
     pub build_id: String,
     pub protocol: ProtocolVersion,
     pub transport: SshTransport,
@@ -1027,6 +1032,128 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn remote_client_sends_receiver_signals_on_the_ssh_channel() {
+        use std::io::Read as _;
+        use std::sync::mpsc;
+
+        use diri_proto::remote_pty::{RemoteCodec, RemoteMessage, SessionToken};
+
+        use crate::remote::binding::RemoteBindingStore;
+        use crate::remote::client::RemoteSessionClient;
+
+        let temporary = tempfile::tempdir_in("/tmp").expect("temp");
+        let fake_ssh = temporary.path().join("ssh");
+        fs::write(&fake_ssh, "#!/bin/sh\nexec cat\n").expect("fake ssh");
+        fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o700)).expect("mode");
+        let manager = Arc::new(
+            RemoteManager::new(
+                ProcessExecutor::new(&fake_ssh),
+                ArtifactCatalog {
+                    artifacts: HashMap::new(),
+                },
+                temporary.path().join("control"),
+            )
+            .expect("manager"),
+        );
+        let host = HostEntry {
+            id: "fixture".into(),
+            name: None,
+            ssh: "fake-host".into(),
+            default_cwd: None,
+            node: None,
+        };
+        for (target, stop, resume) in [
+            (RemoteTarget::LinuxX86_64, 19, 18),
+            (RemoteTarget::LinuxAarch64, 19, 18),
+            (RemoteTarget::MacosAarch64, 17, 19),
+        ] {
+            let client = RemoteSessionClient::new(
+                Arc::clone(&manager),
+                InstalledHelper {
+                    target,
+                    build_id: "test-build".into(),
+                    // Live Holders must work without an upgrade.
+                    protocol: ProtocolVersion { major: 1, minor: 3 },
+                    transport: manager.transport(&host),
+                },
+                "signal-test".into(),
+                SessionToken::new("signal-test-token").expect("token"),
+                "signal-test-incarnation".into(),
+                RemoteBindingStore::new(temporary.path().join("bindings")).expect("bindings"),
+                0,
+            );
+            let (generation, mut output) = client.connect(0, None).expect("connect");
+            let (sender, receiver) = mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                let mut codec = RemoteCodec::new();
+                let mut buffer = [0_u8; 4096];
+                while let Ok(count) = output.read(&mut buffer) {
+                    if count == 0 {
+                        break;
+                    }
+                    for message in codec.feed(&buffer[..count]).expect("decode") {
+                        if sender.send(message).is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+            let receive = || {
+                receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("wire frame")
+            };
+            assert!(matches!(receive(), RemoteMessage::Hello(_)));
+            assert_eq!(
+                client.signal(libc::SIGCONT).unwrap_err().kind(),
+                io::ErrorKind::NotConnected
+            );
+            client.accept_hello(generation, 42).expect("hello");
+            client.grant_control(generation, 42).expect("control");
+            for (native, expected) in [
+                (libc::SIGCONT, resume),
+                (libc::SIGSTOP, stop),
+                (libc::SIGINT, 2),
+                (libc::SIGTERM, 15),
+                (libc::SIGKILL, 9),
+                (libc::SIGHUP, 1),
+                (libc::SIGQUIT, 3),
+            ] {
+                client.signal(native).expect("signal");
+                let RemoteMessage::Signal(signal) = receive() else {
+                    panic!("expected signal frame");
+                };
+                assert_eq!(signal.controller_epoch, 42);
+                assert_eq!(
+                    signal.signal, expected,
+                    "native signal {native} for {target:?}"
+                );
+            }
+            for signal in [0, -1, libc::SIGUSR1, libc::SIGUSR2, libc::SIGCHLD] {
+                assert_eq!(
+                    client.signal(signal).unwrap_err().kind(),
+                    io::ErrorKind::InvalidInput
+                );
+            }
+            // A valid frame after the rejections proves no rejected write was buffered.
+            client
+                .signal(libc::SIGCONT)
+                .expect("resume after rejection");
+            let RemoteMessage::Signal(signal) = receive() else {
+                panic!("expected resume frame");
+            };
+            assert_eq!(signal.signal, resume);
+            drop(client);
+            reader.join().expect("reader");
+            assert!(
+                receiver.try_recv().is_err(),
+                "rejected signals must not reach SSH"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn fake_ssh_bootstrap_uploads_activates_and_then_reuses_exact_build() {
         let temporary = tempfile::tempdir().expect("temp");
         let remote_home = temporary.path().join("remote-home");
@@ -1110,10 +1237,16 @@ mod tests {
                 .all(|helper| helper.build_id == first.build_id)
         );
         assert_eq!(first.build_id, "test-build");
+        assert!(installed.iter().all(|helper| helper.target == target));
         let final_path = remote_home.join(".cache/diri/bin/protocol-1/test-build/diri-remote");
         assert!(final_path.is_file());
         let second = manager.ensure_helper(&host).expect("idempotent bootstrap");
         assert_eq!(second.build_id, first.build_id);
+        assert_eq!(second.target, target);
+        let adopted = manager
+            .existing_helper(&host, &first.build_id, first.protocol)
+            .expect("adopt existing helper");
+        assert_eq!(adopted.target, target);
         let uploads_before_reinstall = fs::read_to_string(&upload_log)
             .expect("upload log")
             .lines()
@@ -1122,6 +1255,7 @@ mod tests {
             .reinstall_helper(&host)
             .expect("forced verified reinstall");
         assert_eq!(reinstalled.build_id, first.build_id);
+        assert_eq!(reinstalled.target, target);
         let uploads_after_reinstall = fs::read_to_string(&upload_log)
             .expect("upload log")
             .lines()
