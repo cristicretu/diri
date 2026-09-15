@@ -1718,8 +1718,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use diri_proto::{
-        AgentKind as ProtoAgentKind, DateMillis, Project, ProjectId, Resumability,
-        SessionListResult, SessionStatus, TitleSource,
+        AgentKind as ProtoAgentKind, DateMillis, ProjectId, Resumability, SessionListResult,
+        SessionStatus, TitleSource,
     };
     use gpui::{ScrollDelta, ScrollWheelEvent, StyleRefinement, TestAppContext, size};
 
@@ -1908,7 +1908,7 @@ mod tests {
             sessions[1].status = SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Permission);
             {
                 let mut store = runtime.store.write().unwrap();
-                store.hydrate(SessionListResult { sessions, projects: vec![Project { id: ProjectId::new("overview"), root: "/work".into(), name: "Workspace".into(), pinned_order: None, host: None }] });
+                store.hydrate(SessionListResult { sessions, projects: vec![diri_proto::Project { id: ProjectId::new("overview"), root: "/work".into(), name: "Workspace".into(), pinned_order: None, host: None }] });
                 store.update_preferences(|p| p.terminal_theme = if light { "dirijor-light" } else { "dirijor-dark" }.into()).unwrap();
                 store.toggle_overview();
                 match std::env::var("DIRI_VISUAL_STATE").as_deref() {

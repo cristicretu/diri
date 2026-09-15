@@ -25,3 +25,4 @@ sha2.workspace = true
 [dev-dependencies]
 diri-engine = { path = "../diri-engine" }
 tempfile.workspace = true
+dirijor-mcp = { path = "../dirijor-mcp" }

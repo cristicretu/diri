@@ -102,7 +102,7 @@ fn receipt(message: &DeliverMessageParams, outcome: &str, duplicate: bool) -> Va
     })
 }
 
-fn digest(value: &Value) -> String {
+pub(super) fn digest(value: &Value) -> String {
     Sha256::digest(value.to_string().as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -116,7 +116,7 @@ fn storage_error(_: rusqlite::Error) -> ControlError {
     )
 }
 
-fn open(path: &Path) -> Result<Connection, ControlError> {
+pub(super) fn open(path: &Path) -> Result<Connection, ControlError> {
     let unavailable = || {
         ControlError::new(
             "message_receipts_unavailable",

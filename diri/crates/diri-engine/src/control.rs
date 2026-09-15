@@ -26,6 +26,8 @@ use sha2::{Digest, Sha256};
 use crate::registry::Registry;
 mod account_handoff;
 mod message_delivery;
+mod operations;
+mod tasks;
 
 /// Identifies this engine in the handshake, so a client can tell which
 /// implementation it reached.
@@ -511,6 +513,7 @@ impl ControlServer {
                 if matches!(
                     method.as_str(),
                     Method::SESSION_SPAWN
+                        | Method::SESSION_SPAWN_TRACKED
                         | Method::SESSION_CONTINUE_ACCOUNT
                         | Method::HOST_INITIALIZE
                         | Method::HOST_USAGE
@@ -710,6 +713,10 @@ impl ControlServer {
             }
             Method::HELLO => self.hello(params),
             Method::SESSION_SPAWN => self.session_spawn(params),
+            Method::SESSION_SPAWN_TRACKED => self.session_spawn_tracked(params),
+            Method::TASK_SUBMIT => self.task_submit(params),
+            Method::TASK_GET => self.task_get(params),
+            Method::TASK_REPORT => self.task_report(params),
             Method::SESSION_LIST | Method::STATE_SNAPSHOT => self.session_list(),
             Method::SESSION_DELIVER_MESSAGE => self.session_deliver_message(params),
             Method::SESSION_SEND_TEXT => self.session_send_text(params),
@@ -798,6 +805,14 @@ impl ControlServer {
     /// `generic` need an explicit `argv`, since their manifests declare no
     /// binary.
     fn session_spawn(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        self.session_spawn_identified(params, None)
+    }
+
+    fn session_spawn_identified(
+        &self,
+        params: Option<JsonValue>,
+        reserved_id: Option<String>,
+    ) -> Result<JsonValue, ControlError> {
         let raw = params.ok_or_else(|| ControlError::bad_request("params are required"))?;
         // Tests and scripts may pass a raw argv; the app never does. Read it
         // before the typed decode consumes the value.
@@ -819,7 +834,7 @@ impl ControlServer {
             p.host.as_deref(),
         )?;
         if p.host.is_some() {
-            return self.session_spawn_remote(p, argv, account_profile);
+            return self.session_spawn_remote(p, argv, account_profile, reserved_id);
         }
         let kind = p.kind.id().to_string();
         // A generic kind carries the user's command line inside itself.
@@ -872,7 +887,8 @@ impl ControlServer {
         }
         let authority = descriptor.authority();
 
-        let id = next_session_id();
+        let tracked = reserved_id.is_some();
+        let id = reserved_id.unwrap_or_else(next_session_id);
         // Build the complete agent argv before `spawn_spec`: agents declaring
         // `returnToLoginShell` need every manifest and injection argument
         // quoted inside the shell's `-c` command.
@@ -1020,10 +1036,20 @@ impl ControlServer {
             remote: None,
             defer_launch: true,
         };
+        if tracked {
+            // Persist the launch intent before a Holder can exist. A crash
+            // immediately after launch must leave a record for binding adoption.
+            registry.insert_record(record.clone());
+            registry.persist_for_shutdown().map_err(io_control_error)?;
+        }
         registry
             .spawn(spec, record)
             .map_err(|error| ControlError::internal(error.to_string()))?;
-        let _ = registry.persist();
+        if tracked {
+            registry.persist_for_shutdown().map_err(io_control_error)?;
+        } else {
+            let _ = registry.persist();
+        }
         self.publish_updated(&registry, &id);
 
         // An initial prompt is typed once the TUI can actually receive input,
@@ -1065,6 +1091,7 @@ impl ControlServer {
         p: diri_proto::SessionSpawnParams,
         caller_argv: Vec<String>,
         mut account_profile: Option<diri_proto::AgentAccountProfile>,
+        reserved_id: Option<String>,
     ) -> Result<JsonValue, ControlError> {
         let manager = self
             .remote
@@ -1152,7 +1179,8 @@ impl ControlServer {
             .map(|variable| (variable.name, variable.value))
             .collect::<Vec<_>>();
 
-        let id = next_session_id();
+        let tracked = reserved_id.is_some();
+        let id = reserved_id.unwrap_or_else(next_session_id);
         let mut agent_session_id = None;
         let mut launch_args = caller_argv.clone();
         if descriptor.binary.is_some() {
@@ -1273,10 +1301,14 @@ impl ControlServer {
             }),
             defer_launch: false,
         };
-        self.spawn_session_unlocked(spec, Some(record))?;
+        self.spawn_session_with_intent(spec, Some(record), tracked)?;
         let mut registry = self.registry.lock().map_err(poisoned)?;
         registry.ensure_session_project(&captured.cwd, Some(&host.id));
-        let _ = registry.persist();
+        if tracked {
+            registry.persist_for_shutdown().map_err(io_control_error)?;
+        } else {
+            let _ = registry.persist();
+        }
         self.publish_updated(&registry, &id);
 
         let prompt = p.initial_prompt.filter(|prompt| !prompt.is_empty());
@@ -1930,12 +1962,28 @@ impl ControlServer {
         spec: crate::session::SessionSpec,
         record: Option<diri_proto::SessionRecord>,
     ) -> Result<(), ControlError> {
+        self.spawn_session_with_intent(spec, record, false)
+    }
+
+    fn spawn_session_with_intent(
+        &self,
+        spec: crate::session::SessionSpec,
+        record: Option<diri_proto::SessionRecord>,
+        persist_intent: bool,
+    ) -> Result<(), ControlError> {
         let id = spec.id.clone();
         let engine = {
             let mut registry = self.registry.lock().map_err(poisoned)?;
             registry
                 .reserve_launch(&id, record.is_some())
                 .map_err(io_control_error)?;
+            if persist_intent && let Some(record) = &record {
+                registry.insert_record(record.clone());
+                if let Err(error) = registry.persist_for_shutdown() {
+                    registry.release_launch(&id);
+                    return Err(io_control_error(error));
+                }
+            }
             registry.engine()
         };
         let spawned = crate::session::Session::spawn(spec, engine);

@@ -1535,7 +1535,7 @@ dependencies = [
 
 [[package]]
 name = "diri-app"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "base64 0.23.1",
  "block2 0.6.2",
@@ -1649,6 +1649,7 @@ dependencies = [
  "diri-pty",
  "diri-terminal-state",
  "diri-usage",
+ "dirijor-mcp",
  "getrandom 0.4.3",
  "libc",
  "serde",

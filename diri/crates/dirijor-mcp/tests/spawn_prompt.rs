@@ -545,3 +545,106 @@ fn parent_reports_are_deduplicated_across_sender_renames() {
         .as_bytes()
     );
 }
+
+#[test]
+fn retrying_a_spawn_returns_the_same_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = temp.path().join("prompt-fixture");
+    std::fs::write(&fixture, "#!/bin/sh\nexec cat\n").unwrap();
+    std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let server = start_server(temp.path(), &fixture, temp.path());
+    let bridge = Bridge::new(server.socket_path().into(), Some("s_parent".into()));
+    let args = json!({"kind":"prompt-fixture", "cwd":temp.path()});
+    let first = bridge.call("spawn_agent", &args).unwrap();
+    let second = Bridge::new(server.socket_path().into(), Some("s_parent".into()))
+        .call(
+            "spawn_agent",
+            &json!({"cwd":temp.path(), "kind":"prompt-fixture"}),
+        )
+        .unwrap();
+    for id in [first["id"].clone(), second["id"].clone()] {
+        let _ = bridge.call("release_agent", &json!({"session_id":id}));
+    }
+    assert_eq!(first["id"], second["id"], "retry created a second Agent");
+}
+
+#[test]
+fn task_completion_is_explicit_and_specific_to_the_submitted_task() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = temp.path().join("prompt-fixture");
+    std::fs::write(&fixture, "#!/bin/sh\nstty raw -echo\nexec cat > received\n").unwrap();
+    std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let server = start_server(temp.path(), &fixture, temp.path());
+    let parent = Bridge::new(server.socket_path().into(), Some("s_parent".into()));
+    let child = parent
+        .call(
+            "spawn_agent",
+            &json!({"kind":"prompt-fixture", "cwd":temp.path()}),
+        )
+        .unwrap();
+    let id = child["id"].as_str().unwrap();
+    let child_bridge = Bridge::new(server.socket_path().into(), Some(id.into()));
+    let args = json!({"session_id":id, "text":"do this specific task", "request_id":"task-one"});
+    let first = parent.call("submit_task", &args).unwrap();
+    let task_id = first["task"]["task_id"].as_str().unwrap();
+    let recovered = parent
+        .call("get_task", &json!({"request_id":"task-one"}))
+        .unwrap();
+    assert_eq!(recovered["task_id"], task_id);
+    let second = parent.call("submit_task", &args).unwrap();
+    assert_eq!(second["duplicate"], true);
+    assert_eq!(second["task"]["task_id"], task_id);
+    let waiting = parent
+        .call("wait_for_task", &json!({"task_id":task_id,"timeout_s":0}))
+        .unwrap();
+    assert_eq!(waiting["completed"], false);
+    assert_eq!(waiting["timed_out"], true);
+    assert!(
+        child_bridge
+            .call(
+                "report_task",
+                &json!({"task_id":task_id,"status":"completed"})
+            )
+            .is_err()
+    );
+    assert!(
+        parent
+            .call(
+                "report_task",
+                &json!({"task_id":task_id,"status":"acknowledged"})
+            )
+            .is_err()
+    );
+    child_bridge
+        .call(
+            "report_task",
+            &json!({"task_id":task_id,"status":"acknowledged"}),
+        )
+        .unwrap();
+    let wait_parent = parent.clone();
+    let wait_id = task_id.to_owned();
+    let waiter = std::thread::spawn(move || {
+        wait_parent
+            .call("wait_for_task", &json!({"task_id":wait_id,"timeout_s":3}))
+            .unwrap()
+    });
+    child_bridge
+        .call(
+            "report_task",
+            &json!({"task_id":task_id,"status":"completed", "result":"verified outcome"}),
+        )
+        .unwrap();
+    let finished = waiter.join().unwrap();
+    assert_eq!(finished["completed"], true);
+    assert_eq!(finished["task"]["result"], "verified outcome");
+    let another = parent
+        .call(
+            "submit_task",
+            &json!({"session_id":id,"text":"a separate task", "request_id":"task-two"}),
+        )
+        .unwrap();
+    assert_eq!(another["task"]["status"], "awaiting_acknowledgement");
+    parent
+        .call("release_agent", &json!({"session_id":id}))
+        .unwrap();
+}

@@ -225,6 +225,12 @@ jobs:
           DIRI_REMOTE_SSH_TARGET: diri-ci-soak
           DIRI_REMOTE_SOAK_SECONDS: "5"
         run: scripts/remote-ssh-soak.sh
+      - name: Run MCP lost-reply and restart soak over real SSH
+        env:
+          DIRI_REMOTE_SSH_TARGET: diri-ci-soak
+          DIRI_REMOTE_SOAK_SECONDS: "2"
+          DIRI_MCP_SOAK_ROUNDS: "5"
+        run: scripts/mcp-remote-soak.sh
       - name: Start PAM/logind logout-policy endpoint
         run: |
           sudo useradd --create-home --shell /bin/bash diri-pam

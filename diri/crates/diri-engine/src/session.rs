@@ -1065,7 +1065,7 @@ impl Session {
                             .expect("screen")
                             .resize(cols.max(2) as usize, rows.max(2) as usize);
                     }
-                    pump_held(shared, engine, client, floor, manifest_id)
+                    pump_held(shared, engine, client, floor, manifest_id, true)
                 })?
         };
 
@@ -1149,7 +1149,16 @@ impl Session {
             let manifest_id = spec.manifest_id.clone();
             std::thread::Builder::new()
                 .name(format!("diri-session-{}", spec.id))
-                .spawn(move || pump_held(shared, engine, client, exit_marker_floor, manifest_id))?
+                .spawn(move || {
+                    pump_held(
+                        shared,
+                        engine,
+                        client,
+                        exit_marker_floor,
+                        manifest_id,
+                        fresh,
+                    )
+                })?
         };
 
         Ok(Self {
@@ -2983,6 +2992,7 @@ fn pump_held(
     client: HolderClient,
     exit_marker_floor: u64,
     manifest_id: String,
+    fresh: bool,
 ) {
     let replay_budget = replay_budget();
     let (checkpoint_path, mut offset, mut watcher, mut marker_buffer) = {
@@ -3055,7 +3065,11 @@ fn pump_held(
     // was asked before we were here and has either been answered or outlived
     // its asker; a query above it came from the running child and is owed an
     // answer, even if the pump has not finished draining the tail yet.
-    let replay_until = {
+    let replay_until = if fresh {
+        // Output from this newly launched child is live even if it reached
+        // disk before the Engine pump started. Startup queries need answers.
+        exit_marker_floor
+    } else {
         let mut log = shared.log.lock().expect("log");
         // Refreshed first: the handle may predate output the holder has
         // already written, and a stale tail here would answer queries that

@@ -40,7 +40,7 @@ fn real_ssh_detach_soak_reconnects_the_same_process() {
     let manager = Arc::new(
         RemoteManager::new(
             ProcessExecutor::new(ssh),
-            ArtifactCatalog::from_native_helper(&helper_path).expect("native Helper catalog"),
+            test_catalog(&helper_path),
             temporary.path().join("ssh-control"),
         )
         .expect("remote manager"),
@@ -81,7 +81,7 @@ fn real_ssh_detach_soak_reconnects_the_same_process() {
         argv: vec![
             "/bin/sh".into(),
             "-c".into(),
-            "printf 'soak-ready>'; IFS= read -r first; printf 'first:%s\\nsoak-next>' \"$first\"; IFS= read -r second; printf 'second:%s\\n' \"$second\"".into(),
+            "printf 'soak-ready>'; while IFS= read -r first; do [ \"$first\" = before-drop ] && break; printf 'ack:%s\\n' \"$first\"; done; printf 'first:%s\\nsoak-next>' \"$first\"; IFS= read -r second; printf 'second:%s\\n' \"$second\"".into(),
         ],
         cwd: captured.cwd.clone(),
         environment: captured.environment,
@@ -120,6 +120,29 @@ fn real_ssh_detach_soak_reconnects_the_same_process() {
     };
 
     wait_for_grid(&session, "soak-ready>");
+    let mut timings = Vec::new();
+    for index in 0..32 {
+        let input = format!("latency-{index:03}");
+        let ack = format!("ack:{input}");
+        let start = Instant::now();
+        session
+            .write_input(format!("{input}\n").as_bytes())
+            .expect("latency input");
+        wait_for_grid(&session, &ack);
+        timings.push(start.elapsed());
+    }
+    timings.sort_unstable();
+    eprintln!(
+        "real SSH input-to-grid (32 samples, 20 ms polling): median={:?} p90={:?} max={:?}",
+        timings[16], timings[28], timings[31]
+    );
+    let scroll_started = Instant::now();
+    let history = session.read_scrollback_cells(0, 100);
+    assert!(
+        history.total_rows > 0,
+        "remote history must be available on demand"
+    );
+    eprintln!("real SSH on-demand history: {:?}", scroll_started.elapsed());
     session.write_input(b"before-drop\n").expect("first input");
     wait_for_grid(&session, "soak-next>");
     let process_pid = running_pid(
@@ -195,7 +218,7 @@ fn real_ssh_pam_logout_is_classified_non_persistent() {
     let temporary = tempfile::tempdir().expect("local acceptance state");
     let manager = RemoteManager::new(
         ProcessExecutor::new(ssh),
-        ArtifactCatalog::from_native_helper(&helper_path).expect("native Helper catalog"),
+        test_catalog(&helper_path),
         temporary.path().join("ssh-control"),
     )
     .expect("remote manager");
@@ -218,6 +241,15 @@ fn real_ssh_pam_logout_is_classified_non_persistent() {
     manager
         .close_control_masters()
         .expect("close PAM probe ControlMaster");
+}
+
+fn test_catalog(helper: &Path) -> ArtifactCatalog {
+    match env::var_os("DIRI_REMOTE_ARTIFACT_MANIFEST") {
+        Some(path) => {
+            ArtifactCatalog::from_manifest(Path::new(&path)).expect("verified packaged catalog")
+        }
+        None => ArtifactCatalog::from_native_helper(helper).expect("native Helper catalog"),
+    }
 }
 
 fn session_spec(id: &str, local_root: &Path, remote: Option<RemoteSessionSpec>) -> SessionSpec {

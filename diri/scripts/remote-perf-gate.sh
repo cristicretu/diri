@@ -11,3 +11,6 @@ cargo test --locked --release --package diri-remote --test holder_e2e \
 
 cargo test --locked --release --package diri-remote --test holder_e2e \
     continuous_output_keeps_controller_responsive -- --ignored --exact --nocapture
+
+cargo test --locked --release --package diri-remote --lib \
+    output_log::tests::append_latency_gate -- --ignored --exact --nocapture

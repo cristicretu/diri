@@ -234,8 +234,15 @@ impl ControlClient {
         loop {
             // Recompute for every socket read, including partial JSON frames.
             // A drip of bytes/events must not keep resetting the request timeout.
-            self.stream
-                .set_read_timeout(Some(self.remaining(deadline)?))?;
+            let remaining = self.remaining(deadline)?;
+            if let Err(error) = self.stream.set_read_timeout(Some(remaining)) {
+                // Darwin rejects SO_RCVTIMEO after a peer closes, even when its
+                // complete reply is queued. Only bypass that error after poll
+                // proves hangup: draining queued bytes/EOF cannot block.
+                if error.raw_os_error() != Some(libc::EINVAL) || !self.peer_hung_up() {
+                    return Err(self.io_failure(error));
+                }
+            }
             let buffered = match self.reader.fill_buf() {
                 Ok(bytes) if !bytes.is_empty() => bytes,
                 Ok(_) => {
@@ -260,6 +267,18 @@ impl ControlClient {
                     .map_err(|_| ControlFailure::Protocol("invalid daemon response".into()));
             }
         }
+    }
+
+    fn peer_hung_up(&self) -> bool {
+        use std::os::fd::AsRawFd;
+        let mut descriptor = libc::pollfd {
+            fd: self.stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd referring to a stream owned by this client.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, 0) > 0 };
+        ready && descriptor.revents & libc::POLLHUP != 0
     }
 }
 
@@ -335,6 +354,27 @@ mod tests {
                 "incoming bytes extended the absolute deadline: {result:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_reply_buffered_before_peer_close_is_readable() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("engine.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let mut client = ControlClient::connect(&path, Duration::from_secs(1)).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        let reply = ControlMessage::Response {
+            id: 42,
+            result: Ok(serde_json::json!({"accepted":true})),
+        };
+        serde_json::to_writer(&mut peer, &reply).unwrap();
+        peer.write_all(b"\n").unwrap();
+        drop(peer);
+        let result = client.read_message_until(Instant::now() + Duration::from_secs(1));
+        assert!(
+            matches!(result, Ok(ControlMessage::Response { id: 42, .. })),
+            "{result:?}"
+        );
     }
 
     #[test]

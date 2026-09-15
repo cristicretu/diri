@@ -17,6 +17,10 @@ pub struct Method;
 
 impl Method {
     pub const HELLO: &'static str = "hello";
+    pub const SESSION_SPAWN_TRACKED: &'static str = "session.spawn_tracked";
+    pub const TASK_SUBMIT: &'static str = "task.submit";
+    pub const TASK_GET: &'static str = "task.get";
+    pub const TASK_REPORT: &'static str = "task.report";
     pub const SESSION_SPAWN: &'static str = "session.spawn";
     pub const SESSION_LIST: &'static str = "session.list";
     pub const SESSION_KILL: &'static str = "session.kill";

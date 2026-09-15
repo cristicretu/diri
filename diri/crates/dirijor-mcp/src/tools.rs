@@ -31,8 +31,28 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
     let kind_enum: Vec<Value> = kinds.iter().map(|kind| json!(kind)).collect();
     let mut tools = vec![
         ToolDefinition::new(
+            "submit_task",
+            "Assign a tracked task to an authorized Agent. Returns a durable task_id and delivery receipt, and tells the Agent to acknowledge and report that exact task. Reuse request_id on retries. Identical target/text defaults to one task; use a new request_id only for intentional additional work. Unknown delivery never permits a fresh copy. Use wait_for_task to await its explicit result.",
+            json!({"type":"object","properties":{"session_id":{"type":"string"},"text":{"type":"string","minLength":1,"maxLength":1048576},"request_id":message_id_schema()},"required":["session_id","text"]}),
+        ),
+        ToolDefinition::new(
+            "get_task",
+            "Read the durable receipt for one task you assigned or received. Provide exactly one of task_id or your original request_id; request_id recovers a lost submission reply even after the target disappears. Delivery, Agent acknowledgement, and task result are separate facts. Status survives Engine restarts; terminal idle is not task completion.",
+            json!({"type":"object","properties":{"task_id":message_id_schema(),"request_id":message_id_schema()}}),
+        ),
+        ToolDefinition::new(
+            "wait_for_task",
+            "Wait for the explicit completed or failed result of this exact task. Already terminal tasks return immediately. timed_out means no terminal result was observed; completed is true only for a reported successful result. Agent idle/exit/removal cannot fabricate completion.",
+            json!({"type":"object","properties":{"task_id":message_id_schema(),"timeout_s":{"type":"number","minimum":0,"maximum":600,"default":600}},"required":["task_id"]}),
+        ),
+        ToolDefinition::new(
+            "report_task",
+            "Acknowledge or report the exact Diri task assigned to you. Call acknowledged before starting; report completed only after verifying the requested outcome and include result evidence. Use blocked for a blocker and failed for terminal failure. Only the assigned Agent can report; terminal results are immutable and identical retries are safe.",
+            json!({"type":"object","properties":{"task_id":message_id_schema(),"status":{"type":"string","enum":["acknowledged","blocked","completed","failed"]},"result":{"type":"string","maxLength":16384}},"required":["task_id","status"]}),
+        ),
+        ToolDefinition::new(
             "spawn_agent",
-            "Open a new Diri session running an agent or shell, locally or on a configured remote host. Use this whenever the user asks to spawn another agent, session, or terminal.",
+            "Open a new Diri session running an agent or shell, locally or on a configured remote host. Use this whenever the user asks to spawn another agent, session, or terminal. Identical arguments are deduplicated for this caller; reuse operation_id on retries and supply a new operation_id only for an intentional additional session. Inspect spawn_receipt: unknown/failed must never be retried under a new identity blindly.",
             json!({
                 "type": "object",
                 "properties": {
@@ -43,7 +63,8 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
                     "branch": {"type": "string"},
                     "base": {"type": "string", "description": "Starting ref for a new worktree, e.g. main. Omitted preserves HEAD behavior."},
                     "prompt": {"type": "string"},
-                    "name": {"type": "string"}
+                    "name": {"type": "string"},
+                    "operation_id": message_id_schema()
                 },
                 "required": ["kind", "cwd"]
             }),
