@@ -3487,7 +3487,7 @@ fn persist_checkpoint(
     last_key: &mut Option<CheckpointKey>,
 ) {
     let (history, history_metadata, grid, alt_screen, bracketed_paste, mouse, content_seq) = {
-        let screen = shared.screen.lock().expect("screen");
+        let mut screen = shared.screen.lock().expect("screen");
         (
             screen.history_snapshot(),
             screen.history_metadata(),

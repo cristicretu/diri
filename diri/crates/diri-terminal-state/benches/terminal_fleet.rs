@@ -90,7 +90,14 @@ fn main() {
             black_box(screen.grid_update(false));
         }
     }
-    println!("resize churn: {} us/op", start.elapsed().as_micros() / 600);
+    let resize_us = start.elapsed().as_micros() / 600;
+    println!("resize churn: {resize_us} us/op");
+    if std::env::args().any(|arg| arg == "--resize-gate") {
+        assert!(
+            resize_us <= 1000,
+            "unaffected hard-line history makes interactive resize too expensive"
+        );
+    }
     assert!(
         heap("after resize churn", baseline) < 140 << 20,
         "resize churn retained excessive heap"

@@ -1,0 +1,3 @@
+{"type":"metadata","schema":1,"cols":80,"rows":24,"samples":7,"metric":"requested_rust_heap","profile":"optimized","arch":"aarch64","os":"macos","input_columns":72,"includes":"terminal cores and fleet container","excludes":"RSS, allocator overhead, processes, PTYs, logs, renderer, GPU"}
+full prose workload: 9977 retained history rows, 278251 requested heap bytes
+after history reads: 278251 requested heap bytes
