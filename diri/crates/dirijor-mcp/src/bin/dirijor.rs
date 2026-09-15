@@ -1,3 +1,6 @@
+#[path = "dirijor/organization.rs"]
+mod organization;
+
 use std::collections::BTreeMap;
 #[cfg(not(unix))]
 use std::io::Read;
@@ -69,6 +72,9 @@ fn run(arguments: &[String]) -> Result<(), CliError> {
         "activity" => activity(arguments.get(1..).unwrap_or_default()),
         "session" => session(arguments.get(1..).unwrap_or_default()),
         "worktree" => worktree(arguments.get(1..).unwrap_or_default()),
+        "workspace" | "tab" | "pane" => {
+            organization::run(command, arguments.get(1..).unwrap_or_default())
+        }
         "artifacts" => artifacts(arguments.get(1..).unwrap_or_default()),
         "events" => events(arguments.get(1..).unwrap_or_default()),
         "ports" => ports(arguments.get(1..).unwrap_or_default()),
@@ -88,6 +94,13 @@ fn print_help() {
          dirijor events <subscribe|wait> ...\n  dirijor ports [--json]\n  dirijor doctor\n  \
          dirijor hook <event>\n  dirijor notify <json>\n  dirijor notify --title TEXT --body TEXT\n  dirijor mcp-tools\n  \
          dirijor mcp-call --tool <name> < input.json\n\n\
+         dirijor workspace list | create NAME | rename ID NAME | remove ID | move ID INDEX\n  \
+         dirijor workspace apply < mutation.json\n  \
+         dirijor tab create WORKSPACE SESSION | rename TAB TITLE | remove TAB | move TAB WORKSPACE INDEX | select WORKSPACE TAB\n  \
+         dirijor pane split TAB PANE SESSION EDGE | remove TAB PANE | move SOURCE_TAB PANE DEST_TAB TARGET_PANE EDGE\n  \
+         dirijor pane move-group SOURCE_TAB SPLIT DEST_TAB TARGET_PANE EDGE | swap TAB PANE TAB PANE\n  \
+         dirijor pane resize TAB SPLIT FRACTION | focus TAB PANE | zoom TAB PANE_OR_none\n  \
+         Organization edits accept --revision N and return the shared snapshot as JSON.\n\n\
          Deferred on Linux: companion forwarding (dirijor forward)."
     );
 }
@@ -487,7 +500,8 @@ fn session_read(arguments: &[String]) -> Result<(), CliError> {
             .map(str::to_owned)
             .collect()
     };
-    if let Some(count) = option_value(arguments, "--lines").and_then(|raw| raw.parse().ok())
+    if let Some(count) =
+        option_value(arguments, "--lines").and_then(|raw| raw.parse::<usize>().ok())
         && count > 0
         && lines.len() > count
     {
