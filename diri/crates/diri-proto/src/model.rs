@@ -335,6 +335,7 @@ string_enum! {
         ScreenRule => "screenRule",
         ProcessLiveness => "processLiveness",
         Staleness => "staleness",
+        Transport => "transport",
     }
 }
 
@@ -345,6 +346,7 @@ string_enum! {
         ProcessOnly => "processOnly",
         StaleSignals => "staleSignals",
         ProcessExited => "processExited",
+        TransportUnavailable => "transportUnavailable",
     }
 }
 
@@ -800,6 +802,9 @@ pub struct SessionRecord {
     /// from platform alone; `non-persistent` is surfaced to callers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_persistence: Option<crate::remote_pty::PersistenceCapability>,
+    /// Last Engine-observed transport transition; absent means unknown/local.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_connection: Option<crate::RemoteConnection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hibernation: Option<HibernationInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]

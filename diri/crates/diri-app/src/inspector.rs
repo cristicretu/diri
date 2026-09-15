@@ -4571,6 +4571,9 @@ fn status_evidence_explanation(source: diri_proto::StatusEvidenceSource) -> &'st
         diri_proto::StatusEvidenceSource::Staleness => {
             "Authoritative signals stopped arriving, so Diri fell back to unknown instead of guessing."
         }
+        diri_proto::StatusEvidenceSource::Transport => {
+            "The remote transport failed; the agent process exit has not been confirmed."
+        }
         diri_proto::StatusEvidenceSource::Unknown => {
             "This daemon reported an evidence source this app does not recognize yet."
         }
