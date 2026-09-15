@@ -114,6 +114,8 @@ pub enum StatusSignal {
         code: Option<i32>,
         signal: Option<i32>,
     },
+    /// Transport failed without evidence that the Agent process exited.
+    TransportUnavailable,
     /// Periodic tick driving the debounce timers.
     Tick,
 }
@@ -137,6 +139,7 @@ pub struct ReducerOutcome {
 /// The mutable belief and debounce tracking for one session.
 #[derive(Clone, Debug)]
 struct InternalState {
+    transport_unavailable: bool,
     spawned_at: SystemTime,
     /// When the most recent meaningful signal arrived; drives staleness.
     last_signal_at: SystemTime,
@@ -185,6 +188,7 @@ struct InternalState {
 impl InternalState {
     fn new(spawned_at: SystemTime) -> Self {
         Self {
+            transport_unavailable: false,
             spawned_at,
             last_signal_at: spawned_at,
             turn_in_flight: false,
@@ -377,6 +381,23 @@ impl StatusReducer {
             return outcome;
         }
 
+        if matches!(signal, StatusSignal::TransportUnavailable) {
+            self.state.transport_unavailable = true;
+            self.cancel_idle_candidacy();
+            self.set_status(SessionStatus::Unknown, &mut outcome);
+            self.publish_evidence(
+                StatusEvidenceSource::Transport,
+                None,
+                Some(StatusFallbackReason::TransportUnavailable),
+                now,
+                &mut outcome,
+            );
+            return outcome;
+        }
+        if self.state.transport_unavailable {
+            return outcome;
+        }
+
         // processOnly: starting → working on first output, then only exit
         // moves it. A shell is still process-only, but an idle login prompt
         // is not work: Working follows the foreground process group.
@@ -401,11 +422,12 @@ impl StatusReducer {
             | StatusSignal::UserKeystroke
             | StatusSignal::UserSubmission
             | StatusSignal::ForegroundJob { .. }
-            | StatusSignal::ProcessExit { .. } => None,
+            | StatusSignal::ProcessExit { .. }
+            | StatusSignal::TransportUnavailable => None,
         };
 
         match signal {
-            StatusSignal::ProcessExit { .. } => {} // handled above
+            StatusSignal::ProcessExit { .. } | StatusSignal::TransportUnavailable => {} // handled above
             StatusSignal::ForegroundJob { .. } => {}
             StatusSignal::PtyOutputActivity => {
                 // Bytes alone do not establish work: late terminal repaints,

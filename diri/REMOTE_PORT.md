@@ -1008,16 +1008,47 @@ The Rust client exposes `SessionPreview` with decoded receive-only chunks, a
 capacity-one queue, and cancellation on close/drop. Previews create no idle
 keepalive timer or deadline; local socket EOF reports peer closure. Backpressure never discards
 patches: a slow server queue closes and the caller must explicitly reconnect to
-a new full seed. Session exit remains an authoritative fact from the control stream. Transient
-remote connectivity is not yet projected there, so a remote preview must be
-labeled as the last received image; a preview socket is not proof the remote
-process is currently reachable. UI consumers subscribe only while their cards are visible
+a new full seed. Session exit and Engine-observed remote connection state are projected through
+the control stream. A preview socket itself is not proof the remote process is
+currently reachable; absent or unknown connection state means last received. UI consumers subscribe only while their cards are visible
 and render every grid at its existing dimensions without resizing the PTY.
 
 Private-socket tests verify pushed updates without a desktop attach, the 16-client
 limit, rejected mutation and mixed handshakes, unchanged stopped process identity,
 geometry/hibernation/last-seen state, and prompt client cancellation with a full
 queue. These local observation checks do not replace real SSH release gates.
+
+
+### Remote connection facts and fatal transport failures
+
+`SessionRecord.remoteConnection` is an optional Engine observation with a state
+and `since` transition timestamp. It moves from Connecting to Connected only
+after a validated FullSnapshot; an open SSH pipe or HelloAck is insufficient.
+Bridge EOF/recoverable errors publish Reconnecting immediately and retain the
+last grid, PID and incarnation. A new validated snapshot restores Connected.
+Silent sessions remain connected without an added heartbeat or output timer.
+Unknown future values decode as Unknown; absence is never treated as Connected.
+Engine restart clears persisted connection observations before Holder adoption.
+The existing session state-version/event path publishes transitions only; the
+timestamp describes when the transition was observed, not last-output age.
+
+A fatal protocol failure or uncertain write permanently closes that Engine
+client, clears queued input/resize, and publishes Failed plus Unknown Agent
+status. It preserves the last grid and identity but does not invent an exit code
+or complete `wait --until exited`. Subsequent writes return structured
+`remote_transport_failed`; ordinary status signals cannot revive that failed
+reducer. Only an actual ProcessExit can establish Agent exit, including code126.
+Explicit kill still uses the existing management RPC; automatic replay or a
+second Holder controller is never introduced. A failed resident `session.resume`
+returns the structured error instead of falsely succeeding as a live no-op.
+Explicit Engine re-adoption remains the recovery boundary; a session-scoped
+reconnect command is a separate follow-up.
+
+Deterministic fake-SSH fixtures preserve one live child across bridge loss and
+validated reconnect, reject a fatal protocol frame without declaring that child
+dead, and distinguish its genuine exit126. Separate tests cover permanent write
+rejection/queue clearing, status reduction, restart clearing, and forward-compatible
+state decoding. These fixtures do not replace actual-host SSH release gates.
 
 
 While the desktop terminal is scrolled back, its renderer retains one local
