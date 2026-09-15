@@ -3,6 +3,9 @@
 //! The child receives an exact argv/environment/cwd tuple. The parent process
 //! environment is never inherited implicitly.
 
+#[cfg(unix)]
+pub mod checkpoint;
+
 use std::path::PathBuf;
 
 /// What to launch on a PTY.

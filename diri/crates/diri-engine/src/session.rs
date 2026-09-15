@@ -519,6 +519,45 @@ impl ScrollbackReader {
     }
 }
 
+/// A remote stop pins the original incarnation while the Registry stays usable.
+pub(crate) struct RemoteStop {
+    shared: Arc<Shared>,
+    client: Arc<RemoteSessionClient>,
+}
+
+impl RemoteStop {
+    pub(crate) fn stop(&self, grace: Duration) -> std::io::Result<Exit> {
+        if !self.shared.exited.load(Ordering::SeqCst) {
+            let _ = self.client.signal(libc::SIGTERM);
+            let deadline = Instant::now() + grace;
+            while Instant::now() < deadline && !self.shared.exited.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        // Preserve terminate's treatment of an already-ended session (its
+        // Holder may also be gone). A failed stop of a live session must keep
+        // the original tracked owner so another Agent cannot replace it.
+        if let Err(error) = self.client.kill()
+            && !self.shared.exited.load(Ordering::SeqCst)
+        {
+            return Err(error);
+        }
+        let exit = self
+            .shared
+            .exit
+            .lock()
+            .expect("exit")
+            .unwrap_or(Exit::Signal(libc::SIGKILL));
+        self.shared.stop.store(true, Ordering::SeqCst);
+        self.client.close();
+        Ok(exit)
+    }
+
+    pub(crate) fn matches(&self, session: &Session) -> bool {
+        Arc::ptr_eq(&self.shared, &session.shared)
+    }
+}
+
 /// Deferred-launch state: the agent is not exec'd until the attaching client
 /// reports its real terminal size, so a TUI's one-shot banner renders at the
 /// exact width (no post-spawn reflow). Ported from the Swift daemon's
@@ -766,7 +805,7 @@ impl Session {
             launched.session_incarnation,
             remote.binding_store,
             0,
-        ));
+        )?);
         let log = OutputLog::writer(&spec.logs_dir, &spec.id)?;
         let shared = new_shared(&spec, log, &engine, true);
         *shared.remote_grid.lock().expect("remote grid") = Some(RemoteGridState {
@@ -824,7 +863,7 @@ impl Session {
             remote.incarnation,
             remote.binding_store,
             remote.output_offset,
-        ));
+        )?);
         let log = OutputLog::writer(&spec.logs_dir, &spec.id)?;
         let shared = new_shared(&spec, log, &engine, false);
         shared
@@ -1120,6 +1159,16 @@ impl Session {
             manifest_id: spec.manifest_id,
             deferred: None,
         })
+    }
+
+    pub(crate) fn remote_stop(&self) -> Option<RemoteStop> {
+        match &self.transport {
+            Transport::Remote(client) => Some(RemoteStop {
+                shared: Arc::clone(&self.shared),
+                client: Arc::clone(client),
+            }),
+            _ => None,
+        }
     }
 
     pub fn id(&self) -> &str {
@@ -2091,6 +2140,13 @@ fn pump_remote(
             &manifest_id,
         );
         client.disconnect(generation);
+        if client.uncertain_effect()
+            && !shared.stop.load(Ordering::SeqCst)
+            && !shared.exited.load(Ordering::SeqCst)
+        {
+            mark_remote_transport_failed(&shared);
+            break;
+        }
         match disposition {
             RemoteConnectionDisposition::Continue => continue,
             RemoteConnectionDisposition::Reconnect => {
@@ -2148,6 +2204,9 @@ fn pump_remote_connection(
     let mut last_scan_at = None;
     let mut last_scan_seq = 0_u64;
     let fd = output.as_raw_fd();
+    let Ok(mut write_wakeup) = client.take_write_wakeup(generation) else {
+        return RemoteConnectionDisposition::Reconnect;
+    };
 
     loop {
         if shared.stop.load(Ordering::SeqCst) {
@@ -2158,14 +2217,46 @@ fn pump_remote_connection(
         }
         scan_artifacts_if_due(shared, &mut last_scan_at, &mut last_scan_seq);
 
-        let mut poll_fd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
+        if last_tick.elapsed().unwrap_or_default() >= TICK_INTERVAL {
+            last_tick = SystemTime::now();
+            let outcome = shared
+                .reducer
+                .lock()
+                .expect("reducer")
+                .reduce(StatusSignal::Tick, last_tick);
+            apply(shared, &outcome);
+        }
+
+        let pending_fd = match client.pending_write_fd(generation) {
+            Ok(fd) => fd,
+            Err(_) => return RemoteConnectionDisposition::Reconnect,
         };
-        // SAFETY: `poll_fd` points to one initialized pollfd and remains valid
-        // for the duration of this call.
-        let ready = unsafe { libc::poll(&mut poll_fd, 1, TICK_INTERVAL.as_millis() as i32) };
+        let mut descriptors = [
+            libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: write_wakeup.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: pending_fd.as_ref().map_or(-1, AsRawFd::as_raw_fd),
+                events: libc::POLLOUT,
+                revents: 0,
+            },
+        ];
+        // SAFETY: the owned output, wakeup and cloned pending descriptors stay
+        // alive throughout poll; generation checks precede every write.
+        let ready = unsafe {
+            libc::poll(
+                descriptors.as_mut_ptr(),
+                descriptors.len() as _,
+                TICK_INTERVAL.as_millis() as i32,
+            )
+        };
         if ready < 0 {
             if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                 continue;
@@ -2182,6 +2273,22 @@ fn pump_remote_connection(
                 .reduce(StatusSignal::Tick, now);
             apply(shared, &outcome);
             last_tick = now;
+            continue;
+        }
+
+        if descriptors[1].revents != 0 {
+            let mut wake_bytes = [0; 256];
+            while write_wakeup
+                .read(&mut wake_bytes)
+                .is_ok_and(|count| count > 0)
+            {}
+        }
+        if (descriptors[1].revents != 0 || descriptors[2].revents != 0)
+            && client.flush_pending(generation).is_err()
+        {
+            return RemoteConnectionDisposition::Reconnect;
+        }
+        if descriptors[0].revents == 0 {
             continue;
         }
 
@@ -2211,16 +2318,6 @@ fn pump_remote_connection(
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => return RemoteConnectionDisposition::Reconnect,
-        }
-
-        if last_tick.elapsed().unwrap_or_default() >= TICK_INTERVAL {
-            last_tick = SystemTime::now();
-            let outcome = shared
-                .reducer
-                .lock()
-                .expect("reducer")
-                .reduce(StatusSignal::Tick, last_tick);
-            apply(shared, &outcome);
         }
     }
 }

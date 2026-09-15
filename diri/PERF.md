@@ -549,3 +549,62 @@ harness on both revisions. `DIRIJOR_SIDEBAR_PREVIEW=fleet` also opens the
 30-session fixture interactively without an Engine connection. Use
 `DIRI_VISUAL_SCENARIO=stress` and `DIRI_VISUAL_LIGHT=1` for layout checks of
 loading, sleeping, nested, and long-title rows.
+
+## 2026-09-15 — Remote responsiveness under contention
+
+The remote responsiveness regressions use local disposable Helpers, fake SSH,
+Unix sockets, and PTYs. They isolate Engine/Holder scheduling from WAN latency.
+Baseline is `436a6a0` (the remote scrollback fix with main merged).
+
+| Trigger | Before | After |
+| --- | ---: | ---: |
+| SSH launch delayed 800 ms; input to another session | 923 ms | 42 ms |
+| SSH kill delayed 800 ms; input to another session | 935 ms | 32 ms |
+| Paused SSH bridge; accept a 256 KiB paste | 802 ms | 5–10 ms |
+| Continuously readable 8 MiB source; one owner turn with 1 ms consumption per read | 215 ms | 1.6 ms |
+| Checkpoint submission with an injected 200 ms persistence callback | 202 ms synchronous | < 1 µs queued |
+
+The first three rows exercise the real control/SSH paths. The last two are
+controlled scheduling harnesses at the production drain and persistence seams;
+their injected delays are not measurements of a particular VPS or disk. The
+paste test verifies all 262,144 accepted bytes arrive after SSH resumes without
+requiring another keystroke to wake the writer. Archive and remove keep peer
+input below 40 ms under the same delayed management command. A failed live
+stop retains the tracked session.
+
+On the local release Helper fixture, input during continuous output reached
+the grid in 11.4 ms. A 2 MiB output burst, including its final grid before exit,
+drained in 342 ms during a parallel test run. These are regression observations,
+not a controlled throughput comparison or WAN performance promise.
+
+The existing release latency gate passed with 12 snapshot and 32 interaction
+samples: snapshot p90 1 µs, input-to-PTY p95 3.65 ms, output-to-diff p90 13 µs,
+loopback median 74 µs / p90 471 µs. Timing varies with host load; the assertions
+retain the existing release budgets.
+
+The deferred SSH queue uses the existing pump rather than another thread. Each
+Engine remote client and Holder adds one metadata worker with a 128 KiB stack,
+one active immutable checkpoint and one pending latest checkpoint. Workers
+sleep on condition variables and generate no idle timer wakeups. The tradeoff
+is bounded thread/stack and snapshot storage to remove filesystem sync from
+interactive processing. Disk errors, ordered final writes, coalescing, stale
+incarnations, partial input writes, reconnect ordering across Hello/control
+grant, overflow, and exact exit-tail preservation
+have regression coverage. Management stop fences checkpoint writes using the
+existing launch lock; a repeated output/kill/GC test checks that interrupted
+metadata cannot leave nonce files or a stale final output offset.
+
+Commands (run from `diri/`):
+
+```sh
+cargo test --locked --release -p diri-remote --test responsiveness -- --nocapture
+cargo test --locked --release -p diri-remote --lib continuously_readable_output -- --nocapture
+cargo test --locked --release -p diri-pty checkpoint -- --nocapture
+scripts/remote-perf-gate.sh
+cargo test --locked --release -p diri-remote --test holder_e2e slow_attach_never_blocks_pty_and_reconnects_from_full_snapshot -- --ignored --exact --nocapture
+```
+
+Helper environment-capture fixtures require debug assertions; run the complete
+remote suite through `cargo test -p diri-remote`, not an unfiltered release run.
+New Holder scheduling applies to new sessions. Existing remote Helpers retain
+their original Build IDs; the Engine-side fixes apply after the Engine updates.
