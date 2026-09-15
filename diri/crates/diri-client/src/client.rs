@@ -471,6 +471,14 @@ impl DaemonClient {
         .await
     }
 
+    pub async fn reconnect(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<diri_proto::SessionReconnectResult, ClientError> {
+        self.typed(Method::SESSION_RECONNECT, &session_params(session_id))
+            .await
+    }
+
     pub async fn resume(&self, session_id: &SessionId) -> Result<SessionId, ClientError> {
         let record: SessionResumeResult = self
             .typed(Method::SESSION_RESUME, &session_params(session_id))

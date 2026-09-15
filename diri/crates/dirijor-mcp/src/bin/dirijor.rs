@@ -83,7 +83,7 @@ fn run(arguments: &[String]) -> Result<(), CliError> {
 fn print_help() {
     println!(
         "dirijor — Diri automation CLI\n\n\
-         Usage:\n  dirijor status [--json]\n  dirijor activity [--limit N] [--json]\n  dirijor session <list|get|read|send|wait|spawn|fork|release|archive> ...\n  \
+         Usage:\n  dirijor status [--json]\n  dirijor activity [--limit N] [--json]\n  dirijor session <list|get|read|send|wait|spawn|fork|reconnect|release|archive> ...\n  \
          dirijor worktree <list|create|remove> ...\n  dirijor artifacts <session> [--json]\n  \
          dirijor events <subscribe|wait> ...\n  dirijor ports [--json]\n  dirijor doctor\n  \
          dirijor hook <event>\n  dirijor notify <json>\n  dirijor notify --title TEXT --body TEXT\n  dirijor mcp-tools\n  \
@@ -360,12 +360,46 @@ fn session(arguments: &[String]) -> Result<(), CliError> {
         "wait" => session_wait(rest),
         "spawn" => session_spawn(rest),
         "fork" => session_fork(rest),
+        "reconnect" => session_reconnect(rest),
         "release" => session_release(rest),
         "archive" => session_archive(rest),
         other => Err(CliError::failure(format!(
             "unknown session action: {other}"
         ))),
     }
+}
+
+fn session_reconnect(arguments: &[String]) -> Result<(), CliError> {
+    let Some(id) = arguments.first().filter(|id| !id.starts_with('-')) else {
+        return Err(CliError::failure("session reconnect requires a session ID"));
+    };
+    if arguments[1..].iter().any(|arg| arg != "--json") {
+        return Err(CliError::failure("usage: session reconnect ID [--json]"));
+    }
+    let result = request(
+        Method::SESSION_RECONNECT,
+        json!({"sessionID": id}),
+        Duration::from_secs(30),
+    )?;
+    if has_flag(arguments, "--json") {
+        print_json(&result);
+    } else {
+        let parsed: diri_proto::SessionReconnectResult =
+            serde_json::from_value(result).map_err(|error| CliError::failure(error.to_string()))?;
+        println!(
+            "{}: {}",
+            parsed.session.id.0,
+            if parsed.started {
+                "reconnecting"
+            } else {
+                "connection state unchanged"
+            }
+        );
+        if parsed.uncertain_input_discarded {
+            println!("Previous input delivery is uncertain; it was not replayed.");
+        }
+    }
+    Ok(())
 }
 
 fn session_list(arguments: &[String], include_archived_by_default: bool) -> Result<(), CliError> {
