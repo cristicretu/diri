@@ -456,6 +456,14 @@ button or motion reports, while wheel intent remains encoded by that Holder's
 authoritative parser. Scrollback is bounded to 4 MiB and served on demand
 through `Scroll`. Raw output is bounded to 32 MiB.
 
+On-demand history reads use the Engine's bounded background-request pool. The
+Engine pins a read handle to the original Session and releases the Registry
+before sending or waiting for the remote request. A slow history reply must
+not hold up the control connection, terminal input, or grid publication for
+any session. Removing or replacing a Session does not retarget an in-flight
+read to the replacement. This is an Engine scheduling rule; live Helpers need
+no protocol or binary update.
+
 The PTY reader must never block on a client. The Holder uses bounded queues. It
 coalesces background output for no more than 8 ms, while up to two grid
 publications after interactive input bypass that wait (one trailing publication
@@ -606,6 +614,13 @@ loopback interaction p90 99 us
 
 Measured values are printed in CI so regressions are visible rather than hidden
 behind pass/fail status.
+
+The Engine integration regression also pauses a disposable remote Holder for
+800 ms during a history read. Local Hello, input forwarding (including the
+desktop binary attach channel), and screen reads must complete within 400 ms,
+before the history response arrives. The test verifies the input reaches the
+same remote Agent after the pause. This checks Engine contention separately
+from the Helper/UDS gates and does not claim to measure real WAN latency.
 
 ## Desktop integration
 

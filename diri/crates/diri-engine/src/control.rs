@@ -560,6 +560,7 @@ impl ControlServer {
                         | Method::HOST_INITIALIZE
                         | Method::HOST_LIST_DIRECTORIES
                         | Method::SESSION_READ_DIFF
+                        | Method::SESSION_READ_SCROLLBACK_CELLS
                 ) || ((method == Method::AGENT_READINESS
                     || method == Method::AGENT_CONFIGURE)
                     && params
@@ -1939,11 +1940,17 @@ impl ControlServer {
         params: Option<JsonValue>,
     ) -> Result<JsonValue, ControlError> {
         let p: diri_proto::ReadScrollbackCellsParams = decode(params)?;
-        let registry = self.registry.lock().map_err(poisoned)?;
-        let session = registry
-            .get(&p.session_id.0)
-            .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
-        encode(&session.read_scrollback_cells(p.first_row, p.max_rows))
+        let reader = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            registry
+                .get(&p.session_id.0)
+                .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?
+                .scrollback_reader()
+        };
+        // A remote history page takes a network round trip (up to the request
+        // timeout). Attach input and grid publication also need the Registry;
+        // neither may wait for this reply.
+        encode(&reader.read(p.first_row, p.max_rows))
     }
 
     fn session_kill(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {

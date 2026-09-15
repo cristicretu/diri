@@ -488,6 +488,34 @@ pub struct Session {
     deferred: Option<Arc<DeferredLaunch>>,
 }
 
+/// A history read pinned to this Session's state and remote incarnation.
+/// Acquire it under the Registry lock, then release that lock before waiting
+/// for SSH. Keeping these handles alive does not keep a removed Session's
+/// pump running or retarget a request to its replacement.
+pub(crate) struct ScrollbackReader {
+    shared: Arc<Shared>,
+    remote: Option<Arc<RemoteSessionClient>>,
+}
+
+impl ScrollbackReader {
+    pub(crate) fn read(
+        self,
+        first_row: i64,
+        max_rows: i64,
+    ) -> diri_proto::ReadScrollbackCellsResult {
+        if let Some(client) = self.remote
+            && let Ok(result) = client.read_scrollback_cells(first_row, max_rows)
+        {
+            return result;
+        }
+        self.shared
+            .screen
+            .lock()
+            .expect("screen")
+            .scrollback_cells(first_row, max_rows)
+    }
+}
+
 /// Deferred-launch state: the agent is not exec'd until the attaching client
 /// reports its real terminal size, so a TUI's one-shot banner renders at the
 /// exact width (no post-spawn reflow). Ported from the Swift daemon's
@@ -1367,16 +1395,17 @@ impl Session {
         first_row: i64,
         max_rows: i64,
     ) -> diri_proto::ReadScrollbackCellsResult {
-        if let Transport::Remote(client) = &self.transport
-            && let Ok(result) = client.read_scrollback_cells(first_row, max_rows)
-        {
-            return result;
+        self.scrollback_reader().read(first_row, max_rows)
+    }
+
+    pub(crate) fn scrollback_reader(&self) -> ScrollbackReader {
+        ScrollbackReader {
+            shared: Arc::clone(&self.shared),
+            remote: match &self.transport {
+                Transport::Remote(client) => Some(Arc::clone(client)),
+                _ => None,
+            },
         }
-        self.shared
-            .screen
-            .lock()
-            .expect("screen")
-            .scrollback_cells(first_row, max_rows)
     }
 
     /// Marks the session hibernated (input queues) or awake. On wake, the

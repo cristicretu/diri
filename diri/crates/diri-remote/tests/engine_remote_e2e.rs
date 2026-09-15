@@ -23,6 +23,271 @@ fn helper() -> &'static str {
     env!("CARGO_BIN_EXE_diri-remote")
 }
 
+/// A slow WAN history reply must not stall the control connection or the
+/// Registry used by attach input and grid publication. Pause only our fixture
+/// Holder to make the remote reply deterministically slower than local work.
+#[test]
+fn remote_scrollback_does_not_block_input_or_screen_reads() {
+    use diri_engine::control::ControlServer;
+    use diri_engine::registry::Registry;
+    use diri_proto::frames::{Frame, FrameCodec};
+    use diri_proto::{ControlMessage, Method, WIRE_VERSION};
+    use serde_json::json;
+    use std::io::{BufRead, BufReader, Read};
+    use std::os::unix::net::UnixStream;
+    use std::sync::Mutex;
+
+    let temporary = tempfile::tempdir().expect("temp");
+    let home = temporary.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let manager = Arc::new(
+        RemoteManager::new(
+            ProcessExecutor::new(write_fake_ssh(
+                temporary.path(),
+                &home,
+                &temporary.path().join("remote-state"),
+            )),
+            ArtifactCatalog::from_native_helper(Path::new(helper())).unwrap(),
+            temporary.path().join("control"),
+        )
+        .unwrap(),
+    );
+    let host = HostEntry {
+        id: "latency".into(),
+        name: None,
+        ssh: "fixture".into(),
+        default_cwd: None,
+        node: None,
+    };
+    let installed = manager.ensure_helper(&host).unwrap();
+    let token = token_for_retry();
+    let id = "scroll-latency";
+    let request = LaunchRequest {
+        session_id: id.into(),
+        session_token: token.clone(),
+        argv: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "i=0; while [ \"$i\" -lt 80 ]; do printf 'history:%s\\n' \"$i\"; i=$((i + 1)); done; printf 'ready>'; IFS= read -r line; printf 'received:%s\\n' \"$line\""
+                .into(),
+        ],
+        cwd: "/".into(),
+        environment: vec![],
+        cols: 80,
+        rows: 24,
+        persistence: PersistenceCapability::NativeDetach,
+    };
+    let registry = Arc::new(Mutex::new(Registry::new(
+        Arc::new(ManifestEngine::new(Vec::new())),
+        temporary.path().join("state.json"),
+    )));
+    let record = serde_json::from_value(json!({
+        "id":id, "kind":{"shell":{}}, "cwd":"/", "projectID":"p",
+        "title":"latency", "titleSource":0, "status":{"starting":{}},
+        "resumability":"notResumable", "createdAt":0, "updatedAt":0, "pinned":false,
+        "host":host.id,
+    }))
+    .unwrap();
+    registry
+        .lock()
+        .unwrap()
+        .spawn(
+            SessionSpec {
+                id: id.into(),
+                pty: PtySpec::new(request.argv.clone(), "/").size(80, 24),
+                manifest_id: "shell".into(),
+                authority: Authority::ProcessOnly,
+                logs_dir: temporary.path().join("logs"),
+                holder: None,
+                defer_launch: false,
+                remote: Some(RemoteSessionSpec {
+                    manager: Arc::clone(&manager),
+                    helper: installed.clone(),
+                    launch: request,
+                    host_id: host.id.clone(),
+                    binding_store: RemoteBindingStore::new(temporary.path().join("bindings"))
+                        .unwrap(),
+                }),
+            },
+            record,
+        )
+        .unwrap();
+    wait_for_grid(registry.lock().unwrap().get(id).unwrap(), "ready>");
+    let selector = SessionSelector {
+        session_id: id.into(),
+        session_token: token,
+        expected_incarnation: None,
+    };
+    let inspection = manager.inspect(&installed, &selector).unwrap();
+    // Always resume/clean up the fixture, including assertion failures.
+    struct Cleanup {
+        manager: Arc<RemoteManager>,
+        helper: diri_engine::remote::manager::InstalledHelper,
+        selector: SessionSelector,
+        pid: libc::pid_t,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            // SAFETY: this is the live Holder created by this test.
+            unsafe {
+                libc::kill(self.pid, libc::SIGCONT);
+            }
+            let _ = self.manager.kill(&self.helper, &self.selector);
+        }
+    }
+    let cleanup = Cleanup {
+        manager,
+        helper: installed,
+        selector,
+        pid: inspection.holder_pid as libc::pid_t,
+    };
+    let socket = temporary.path().join("daemon.sock");
+    let server = Arc::new(ControlServer::new(Arc::clone(&registry), &socket));
+    let (mut attach, attach_server) = UnixStream::pair().unwrap();
+    attach
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let attach_worker = {
+        let server = Arc::clone(&server);
+        std::thread::spawn(move || server.serve(attach_server).unwrap())
+    };
+    attach
+        .write_all(b"{\"attach\":\"scroll-latency\"}\n")
+        .unwrap();
+    let mut codec = FrameCodec::new();
+    let mut frames = std::collections::VecDeque::new();
+    let mut wait_for_pong = |stream: &mut UnixStream| {
+        loop {
+            while let Some(frame) = frames.pop_front() {
+                if frame == Frame::pong() {
+                    return;
+                }
+            }
+            let mut bytes = [0; 65536];
+            let count = stream.read(&mut bytes).unwrap();
+            assert_ne!(count, 0, "attach disconnected before Pong");
+            frames.extend(codec.feed(&bytes[..count]).unwrap());
+        }
+    };
+    attach
+        .write_all(&FrameCodec::encode(&Frame::ping()).unwrap())
+        .unwrap();
+    wait_for_pong(&mut attach);
+    let listener = server.bind().unwrap();
+    let worker = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        server.serve(stream).unwrap();
+    });
+    let mut stream = UnixStream::connect(socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    // SAFETY: stop only the disposable Holder, never a developer's session.
+    assert_eq!(unsafe { libc::kill(cleanup.pid, libc::SIGSTOP) }, 0);
+    let started = Instant::now();
+    let pid = cleanup.pid;
+    let resume = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(800));
+        // SAFETY: Cleanup keeps this fixture process alive until join.
+        unsafe {
+            libc::kill(pid, libc::SIGCONT);
+        }
+    });
+    let mut attach_input_elapsed = Duration::ZERO;
+    for (id, method, params) in [
+        (
+            1,
+            Method::SESSION_READ_SCROLLBACK_CELLS,
+            json!({"sessionID":"scroll-latency", "firstRow":0, "maxRows":24}),
+        ),
+        (
+            2,
+            Method::HELLO,
+            json!({"proto":WIRE_VERSION, "build":"test"}),
+        ),
+        (
+            3,
+            Method::SESSION_SEND_TEXT,
+            json!({"sessionID":"scroll-latency", "text":"geons", "submit":true}),
+        ),
+        (
+            4,
+            Method::SESSION_READ_SCREEN,
+            json!({"sessionID":"scroll-latency"}),
+        ),
+    ] {
+        let mut bytes = serde_json::to_vec(&ControlMessage::Request {
+            id,
+            method: method.into(),
+            params: Some(params),
+        })
+        .unwrap();
+        bytes.push(b'\n');
+        stream.write_all(&bytes).unwrap();
+        if id == 1 {
+            // Give the history worker time to send its request to the stopped
+            // Holder before testing contention from a second connection.
+            std::thread::sleep(Duration::from_millis(50));
+            let input_started = Instant::now();
+            attach
+                .write_all(&FrameCodec::encode(&Frame::input(b"pi".to_vec())).unwrap())
+                .unwrap();
+            attach
+                .write_all(&FrameCodec::encode(&Frame::ping()).unwrap())
+                .unwrap();
+            wait_for_pong(&mut attach);
+            attach_input_elapsed = input_started.elapsed();
+        }
+    }
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut timings = std::collections::HashMap::new();
+    for _ in 0..4 {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let ControlMessage::Response { id, result } = serde_json::from_str(&line).unwrap() else {
+            panic!("unexpected response")
+        };
+        assert!(result.is_ok(), "request {id}: {result:?}");
+        if id == 1 {
+            let history: diri_proto::ReadScrollbackCellsResult =
+                serde_json::from_value(result.unwrap()).unwrap();
+            assert_eq!(history.row_count, 24);
+            assert!(
+                history.live_start_row >= 24,
+                "fixture must have real scrollback"
+            );
+        }
+        timings.insert(id, started.elapsed());
+    }
+    resume.join().unwrap();
+    wait_for_grid(
+        registry.lock().unwrap().get("scroll-latency").unwrap(),
+        "received:pigeons",
+    );
+    drop(reader);
+    drop(stream);
+    worker.join().unwrap();
+    drop(attach);
+    attach_worker.join().unwrap();
+    eprintln!("attach input: {attach_input_elapsed:?}");
+    assert!(
+        attach_input_elapsed < Duration::from_millis(400),
+        "terminal input waited behind history: {attach_input_elapsed:?}"
+    );
+    assert!(timings[&1] >= Duration::from_millis(750));
+    eprintln!(
+        "delayed scrollback: {:?}; hello: {:?}; input: {:?}; screen: {:?}",
+        timings[&1], timings[&2], timings[&3], timings[&4]
+    );
+    for id in [2, 3, 4] {
+        assert!(
+            timings[&id] < Duration::from_millis(400),
+            "request {id} waited behind remote scrollback: {:?}",
+            timings[&id]
+        );
+    }
+}
+
 #[test]
 fn engine_lists_remote_directories_through_the_verified_helper() {
     let temporary = tempfile::tempdir().expect("temp");

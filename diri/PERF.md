@@ -29,6 +29,31 @@ cargo build -p diri-app --release
 The shared target is measurement/build cache only. It must never be packaged or
 shipped.
 
+## Remote history contention (2026-09-15)
+
+A release-mode Engine regression at `main` (`0f5905f`) pauses a disposable
+remote Holder for 800 ms while the desktop requests history. Before the fix,
+the request blocked the control connection and held the Registry lock used by
+terminal input and screen publication. Moving just the request to a background
+worker freed Hello but left input blocked on that lock.
+
+The fixed Engine uses its existing bounded background pool and pins the
+history reader to the original session before releasing the Registry. In the
+same fixture, binary attach input followed by a local Pong took **748 ms on
+main and 34 µs with the fix**. The Pong measures forwarding through the Engine,
+not remote PTY echo; the test separately checks that the complete input reaches
+the same Agent after the Holder resumes. The history response still takes
+about 805 ms. No real VPS/network latency is included in these measurements.
+
+```sh
+cargo test --locked --release -p diri-remote --test engine_remote_e2e \
+  remote_scrollback_does_not_block_input_or_screen_reads -- --exact --nocapture
+```
+
+This local fixture creates and cleans up its own Helper, Agent, sockets, and
+fake SSH home. It requires no configured SSH host. Live Helper versions and
+the remote protocol are unchanged.
+
 ## Terminal interaction hot path (2026-08-13)
 
 Release-mode measurements below compare untouched `main` at `39af365` with the
