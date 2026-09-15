@@ -157,7 +157,12 @@ struct SessionSinks {
 pub struct AttachHub {
     sessions: Arc<Mutex<HashMap<String, SessionSinks>>>,
     next_sink: Arc<AtomicU64>,
+    #[cfg(test)]
+    registration_hook: Arc<Mutex<Option<RegistrationHook>>>,
 }
+
+#[cfg(test)]
+type RegistrationHook = Arc<dyn Fn() + Send + Sync>;
 
 impl AttachHub {
     pub fn new() -> Self {
@@ -185,26 +190,33 @@ impl AttachHub {
             };
             let _ = guard.wake_session(session_id);
         }
-        // Seed before registering: the full snapshot must be the sink's first
-        // frame, ahead of any diff the pump broadcasts.
-        let seed = {
-            let Ok(guard) = registry.lock() else { return };
-            let Some(session) = guard.get(session_id) else {
-                return; // unknown session: close, as the Swift daemon does
-            };
-            session.attachment_seed()
-        };
-
-        let output = {
+        let mut output = {
             let Ok(writer) = writer.lock() else {
                 return;
             };
             let Ok(stream) = writer.try_clone() else {
                 return;
             };
-            let Ok(mut output) = SinkOutput::new(stream) else {
+            let Ok(output) = SinkOutput::new(stream) else {
                 return;
             };
+            output
+        };
+        // Snapshot, seed queueing and registration share the publisher's
+        // Registry sequencing boundary. No update can slip between a new
+        // sink's snapshot and admission, and no socket write holds this lock.
+        let (sink_id, output, wake) = {
+            let Ok(guard) = registry.lock() else {
+                return;
+            };
+            let Some(session) = guard.get(session_id) else {
+                return;
+            };
+            let seed = session.attachment_seed();
+            #[cfg(test)]
+            if let Some(hook) = self.registration_hook.lock().unwrap().clone() {
+                hook();
+            }
             let Some(grid) = Frame::grid(&seed.grid)
                 .ok()
                 .and_then(|frame| FrameCodec::encode(&frame).ok())
@@ -220,11 +232,12 @@ impl AttachHub {
                 return;
             };
             output.enqueue(modes);
-            Arc::new(Mutex::new(output))
+            let output = Arc::new(Mutex::new(output));
+            let sink_id = self.next_sink.fetch_add(1, Ordering::SeqCst);
+            let wake = seed.wake.clone();
+            self.register(registry, session_id, sink_id, Arc::clone(&output), seed);
+            (sink_id, output, wake)
         };
-        let sink_id = self.next_sink.fetch_add(1, Ordering::SeqCst);
-        let wake = seed.wake.clone();
-        self.register(registry, session_id, sink_id, Arc::clone(&output), seed);
         wake.notify();
 
         // The read loop is this connection's thread. A feed error means a
@@ -379,6 +392,24 @@ impl AttachHub {
             .unwrap_or_default()
     }
 
+    /// Recipients were captured with the grid under Registry. Looking them
+    /// up after encoding could send an older diff behind a newer client's seed.
+    fn enqueue_publication(
+        &self,
+        session_id: &str,
+        sinks: Vec<(u64, Arc<Mutex<SinkOutput>>)>,
+        frames: &[Arc<[u8]>],
+    ) {
+        for (sink_id, output) in sinks {
+            let accepted = output.lock().is_ok_and(|mut output| {
+                frames.iter().all(|frame| output.enqueue(Arc::clone(frame)))
+            });
+            if !accepted {
+                self.deregister(session_id, sink_id);
+            }
+        }
+    }
+
     fn flush_sinks(&self, session_id: &str) -> bool {
         let mut pending = false;
         for (id, output) in self.sink_outputs(session_id) {
@@ -466,6 +497,7 @@ impl AttachHub {
                     (
                         session.grid_update_if_changed(&mut signature),
                         session.modes(),
+                        self.sink_outputs(session_id),
                     )
                 })
             } else {
@@ -473,7 +505,9 @@ impl AttachHub {
             };
 
             let mut frames: Vec<Frame> = Vec::with_capacity(2);
-            if let Some((grid, modes)) = observed {
+            let mut eligible_sinks = Vec::new();
+            if let Some((grid, modes, sinks)) = observed {
+                eligible_sinks = sinks;
                 if let Some(update) = grid
                     && let Ok(frame) = Frame::grid(&update)
                 {
@@ -514,17 +548,7 @@ impl AttachHub {
                     }
                     return;
                 };
-                let sinks = self.sink_outputs(session_id);
-                for (sink_id, output) in sinks {
-                    let accepted = output.lock().is_ok_and(|mut output| {
-                        encoded_frames
-                            .iter()
-                            .all(|frame| output.enqueue(Arc::clone(frame)))
-                    });
-                    if !accepted {
-                        self.deregister(session_id, sink_id);
-                    }
-                }
+                self.enqueue_publication(session_id, eligible_sinks, &encoded_frames);
             }
 
             {
@@ -586,6 +610,197 @@ mod tests {
         );
         reader.set_nonblocking(true).unwrap();
         (SinkOutput::new(writer).unwrap(), reader)
+    }
+
+    #[test]
+    fn late_registration_cannot_receive_a_pre_seed_publication() {
+        let hub = AttachHub::new();
+        let (old, _old_reader) = constrained_output();
+        let old = Arc::new(Mutex::new(old));
+        hub.sessions.lock().unwrap().insert(
+            "s".into(),
+            SessionSinks {
+                sinks: vec![Sink {
+                    id: 1,
+                    output: Arc::clone(&old),
+                }],
+                pump_running: true,
+            },
+        );
+        // A publisher captures its recipients along with an older grid. Delay
+        // its encoding/queueing until after a newer sink has registered.
+        let recipients = hub.sink_outputs("s");
+        let (mut new, _new_reader) = constrained_output();
+        let new_seed = encoded(&Frame::input(b"new seed".to_vec())).unwrap();
+        assert!(new.enqueue(Arc::clone(&new_seed)));
+        let new = Arc::new(Mutex::new(new));
+        hub.sessions
+            .lock()
+            .unwrap()
+            .get_mut("s")
+            .unwrap()
+            .sinks
+            .push(Sink {
+                id: 2,
+                output: Arc::clone(&new),
+            });
+        hub.enqueue_publication(
+            "s",
+            recipients,
+            &[encoded(&Frame::input(b"old diff".to_vec())).unwrap()],
+        );
+        let output = new.lock().unwrap();
+        assert_eq!(
+            output.frames.len(),
+            1,
+            "older publication must not follow a newer seed"
+        );
+        assert_eq!(&**output.frames.front().unwrap(), &*new_seed);
+        drop(output);
+        hub.enqueue_publication(
+            "s",
+            hub.sink_outputs("s"),
+            &[encoded(&Frame::input(b"subsequent diff".to_vec())).unwrap()],
+        );
+        assert_eq!(new.lock().unwrap().frames.len(), 2);
+        assert_eq!(old.lock().unwrap().frames.len(), 2);
+    }
+
+    #[test]
+    fn output_between_seed_and_registration_is_not_lost() {
+        let temp = tempfile::tempdir().unwrap();
+        let (engine, _) =
+            crate::detect::ManifestEngine::load_dir(&crate::detect::bundled_manifest_dir())
+                .unwrap();
+        let engine = Arc::new(engine);
+        let record: diri_proto::SessionRecord = serde_json::from_value(serde_json::json!({
+            "id":"s", "kind":diri_proto::AgentKind::new("generic"), "cwd":temp.path(),
+            "projectID":"p", "title":"fixture", "titleSource":diri_proto::TitleSource::Placeholder,
+            "status":diri_proto::SessionStatus::Idle, "resumability":diri_proto::Resumability::Live,
+            "createdAt":0.0,"updatedAt":0.0,"pinned":false
+        }))
+        .unwrap();
+        let mut registry = Registry::new(Arc::clone(&engine), temp.path().join("state.json"));
+        registry
+            .spawn(
+                crate::session::SessionSpec {
+                    id: "s".into(),
+                    pty: crate::pty::PtySpec::new(
+                        vec!["/bin/sh".into(), "-c".into(),
+                "while [ ! -f ready ]; do sleep 0.01; done; printf 'new-output'; read line".into()],
+                        temp.path(),
+                    )
+                    .size(80, 24),
+                    manifest_id: "generic".into(),
+                    authority: crate::session::authority_for("generic", &engine),
+                    logs_dir: temp.path().join("logs"),
+                    holder: None,
+                    remote: None,
+                    defer_launch: false,
+                },
+                record,
+            )
+            .unwrap();
+        let registry = Arc::new(Mutex::new(registry));
+        let hub = AttachHub::new();
+        let open = || {
+            let (writer, reader) = UnixStream::pair().unwrap();
+            reader
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let hub = hub.clone();
+            let registry = Arc::clone(&registry);
+            let worker = std::thread::spawn(move || {
+                hub.serve(
+                    &registry,
+                    "s",
+                    writer.try_clone().unwrap(),
+                    Vec::new(),
+                    Arc::new(Mutex::new(writer)),
+                );
+            });
+            (reader, worker)
+        };
+        let receive = |reader: &mut UnixStream, kind: FrameType| {
+            let mut codec = FrameCodec::new();
+            let mut bytes = [0; 65536];
+            loop {
+                let count = reader.read(&mut bytes).unwrap();
+                assert!(count > 0);
+                if let Some(frame) = codec
+                    .feed(&bytes[..count])
+                    .unwrap()
+                    .into_iter()
+                    .find(|frame| frame.frame_type == kind)
+                {
+                    break frame;
+                }
+            }
+        };
+        let (mut existing, first_worker) = open();
+        receive(&mut existing, FrameType::Modes);
+        existing
+            .write_all(&FrameCodec::encode(&Frame::ping()).unwrap())
+            .unwrap();
+        receive(&mut existing, FrameType::Pong);
+        let wake = registry.lock().unwrap().get("s").unwrap().grid_wake();
+        let before = wake.generation();
+        let (seeded_tx, seeded_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let resume_rx = Mutex::new(resume_rx);
+        *hub.registration_hook.lock().unwrap() = Some(Arc::new(move || {
+            seeded_tx.send(()).unwrap();
+            resume_rx.lock().unwrap().recv().unwrap();
+        }));
+        let (mut late, late_worker) = open();
+        seeded_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        std::fs::write(temp.path().join("ready"), b"").unwrap();
+        let event = wake.wait_for_change(before, Duration::from_secs(2));
+        assert!(
+            event.generation > before,
+            "PTY output must land while registration is paused"
+        );
+        assert!(
+            registry.try_lock().is_err(),
+            "seed and admission must exclude a publication between them"
+        );
+        resume_tx.send(()).unwrap();
+        let mut codec = FrameCodec::new();
+        let mut bytes = [0; 65536];
+        let mut saw_seed = false;
+        loop {
+            let count = late.read(&mut bytes).unwrap();
+            assert!(count > 0);
+            let mut saw_output = false;
+            for frame in codec.feed(&bytes[..count]).unwrap() {
+                if let Some(grid) = frame.grid_payload().unwrap() {
+                    if !saw_seed {
+                        assert!(grid.is_full_snapshot);
+                        saw_seed = true;
+                    }
+                    saw_output |= grid.changed_rows.iter().any(|row| {
+                        row.cells
+                            .iter()
+                            .map(|cell| char::from_u32(cell.scalar).unwrap_or(' '))
+                            .collect::<String>()
+                            .contains("new-output")
+                    });
+                }
+            }
+            if saw_output {
+                break;
+            }
+        }
+        assert!(saw_seed);
+        let _ = existing.shutdown(std::net::Shutdown::Both);
+        let _ = late.shutdown(std::net::Shutdown::Both);
+        first_worker.join().unwrap();
+        late_worker.join().unwrap();
+        registry
+            .lock()
+            .unwrap()
+            .remove("s", &temp.path().join("logs"))
+            .unwrap();
     }
 
     #[test]

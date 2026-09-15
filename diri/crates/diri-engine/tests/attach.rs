@@ -328,7 +328,7 @@ fn a_slow_reader_does_not_delay_an_active_reader() {
     serde_json::to_writer(&mut control, &ControlMessage::Request {
         id: 1, method: "session.spawn".into(), params: Some(json!({
             "kind": {"generic": {}}, "cwd": temp.path(), "initialCols":80,"initialRows":24,
-            "argv":["/bin/sh", "-c", "stty -echo; while IFS= read -r line; do printf '\\033[H'; i=0; while [ \"$i\" -lt 24 ]; do printf '%s--ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz\\n' \"$line\"; i=$((i+1)); done; done"]
+            "argv":["/bin/sh", "-c", "stty -echo; printf '\\033[?2004h'; while IFS= read -r line; do printf '\\033[H'; i=0; while [ \"$i\" -lt 24 ]; do printf '%s--ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz\\n' \"$line\"; i=$((i+1)); done; done"]
         }))
     }).unwrap();
     control.write_all(b"\n").unwrap();
@@ -343,6 +343,14 @@ fn a_slow_reader_does_not_delay_an_active_reader() {
         } => value["id"].as_str().unwrap().to_owned(),
         other => panic!("{other:?}"),
     };
+    let ready_deadline = Instant::now() + Duration::from_secs(2);
+    while !registry.lock().unwrap().get(&id).unwrap().bracketed_paste() {
+        assert!(
+            Instant::now() < ready_deadline,
+            "fixture did not disable PTY echo"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
     let attach = || {
         let mut stream = UnixStream::connect(server.socket_path()).unwrap();
         stream
