@@ -753,6 +753,19 @@ impl RemoteManager {
         self.rpc(helper, HelperCommand::Inspect, selector, RPC_TIMEOUT)
     }
 
+    pub(crate) fn inspect_for_reconnect(
+        &self,
+        helper: &InstalledHelper,
+        selector: &SessionSelector,
+    ) -> io::Result<SessionInspection> {
+        self.rpc(
+            helper,
+            HelperCommand::Inspect,
+            selector,
+            Duration::from_secs(15),
+        )
+    }
+
     pub fn list(&self, helper: &InstalledHelper) -> io::Result<Vec<SessionInspection>> {
         self.rpc_empty(helper, HelperCommand::List, RPC_TIMEOUT)
     }

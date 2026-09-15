@@ -23,6 +23,7 @@ impl<'a> SessionOperation<'a> {
             method,
             Method::SESSION_CONTINUE_ACCOUNT
                 | Method::SESSION_RESUME
+                | Method::SESSION_RECONNECT
                 | Method::SESSION_FORK
                 | Method::SESSION_KILL
                 | Method::SESSION_REMOVE

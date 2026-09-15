@@ -505,6 +505,21 @@ impl ScrollbackReader {
     }
 }
 
+/// Pins the failed remote owner while inspection runs outside Registry.
+pub(crate) struct RemoteReconnect {
+    shared: Arc<Shared>,
+    client: Arc<RemoteSessionClient>,
+}
+impl RemoteReconnect {
+    pub(crate) fn inspect(&self) -> std::io::Result<diri_proto::remote_pty::SessionInspection> {
+        self.client
+            .inspect_for_reconnect(self.shared.child_pid.load(Ordering::SeqCst))
+    }
+    pub(crate) fn matches(&self, session: &Session) -> bool {
+        Arc::ptr_eq(&self.shared, &session.shared)
+    }
+}
+
 /// A remote stop pins the original incarnation while the Registry stays usable.
 pub(crate) struct RemoteStop {
     shared: Arc<Shared>,
@@ -833,6 +848,79 @@ impl Session {
         engine: Arc<ManifestEngine>,
     ) -> std::io::Result<Self> {
         Self::adopt_remote_with_status(spec, remote, engine, None)
+    }
+
+    pub(crate) fn remote_reconnect_handle(&self) -> Option<RemoteReconnect> {
+        let Transport::Remote(client) = &self.transport else {
+            return None;
+        };
+        Some(RemoteReconnect {
+            shared: Arc::clone(&self.shared),
+            client: Arc::clone(client),
+        })
+    }
+
+    pub(crate) fn restart_failed_remote(
+        &mut self,
+        engine: Arc<ManifestEngine>,
+        inspected: diri_proto::remote_pty::RemoteProcessState,
+    ) -> std::io::Result<(bool, bool)> {
+        let Transport::Remote(client) = &self.transport else {
+            return Err(std::io::Error::other("session has no remote transport"));
+        };
+        if self.shared.exited.load(Ordering::SeqCst) {
+            return Ok((false, false));
+        }
+        if let RemoteProcessState::Exited { code, signal } = inspected {
+            record_remote_exit(&self.shared, ProcessExit { code, signal });
+            return Ok((false, false));
+        }
+        if self
+            .view()
+            .remote_connection
+            .is_none_or(|connection| connection.state != diri_proto::RemoteConnectionState::Failed)
+        {
+            return Ok((false, false));
+        }
+        let RemoteProcessState::Running { pid } = inspected else {
+            unreachable!()
+        };
+        let uncertain = client.uncertain_effect();
+        let previous = self.pump.take();
+        let shared = Arc::clone(&self.shared);
+        let client = Arc::clone(client);
+        let manifest_id = self.manifest_id.clone();
+        set_remote_connection(
+            &self.shared,
+            diri_proto::RemoteConnectionState::Reconnecting,
+        );
+        let worker = std::thread::Builder::new()
+            .name(format!("diri-remote-session-{}", self.shared.id))
+            .spawn(move || {
+                // Joining the old failed pump happens outside Registry; a log
+                // flush cannot block other sessions or overlap another owner.
+                if let Some(previous) = previous {
+                    let _ = previous.join();
+                }
+                if shared.stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                if client.restart_failed(pid).is_err() {
+                    mark_remote_transport_failed(&shared);
+                    return;
+                }
+                pump_remote(shared, engine, client, manifest_id);
+            });
+        match worker {
+            Ok(worker) => {
+                self.pump = Some(worker);
+                Ok((true, uncertain))
+            }
+            Err(error) => {
+                mark_remote_transport_failed(&self.shared);
+                Err(error)
+            }
+        }
     }
 
     /// Reattaches a remote Holder while retaining the last canonical status.
@@ -1623,6 +1711,12 @@ impl Session {
 
     /// Sends bytes to the child, as if typed.
     pub fn write_input(&self, bytes: &[u8]) -> std::io::Result<()> {
+        if self.shared.exited.load(Ordering::SeqCst) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "session has exited",
+            ));
+        }
         // Input means someone is interacting: keep the pump on its fast tick
         // so the echo renders promptly.
         self.shared.note_hot();
