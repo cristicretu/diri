@@ -176,6 +176,11 @@ pub(crate) struct AppServices {
 
 fn main() {
     #[cfg(all(target_os = "macos", debug_assertions))]
+    if std::env::var_os("DIRI_NATIVE_MENU_SMOKE").is_some() {
+        macos::menu_bar::smoke_test();
+        return;
+    }
+    #[cfg(all(target_os = "macos", debug_assertions))]
     if std::env::var_os("DIRI_NATIVE_BROWSER_SMOKE").is_some() {
         macos::browser::smoke_test();
         return;
