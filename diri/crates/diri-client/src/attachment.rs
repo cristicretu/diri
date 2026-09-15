@@ -490,6 +490,95 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn preview_decodes_ordered_chunks_and_cancels_with_a_full_queue() {
+        use super::SessionPreview;
+        use diri_proto::grid::{ChangedRow, GridUpdate};
+        use tokio::io::AsyncReadExt;
+        let (client, server) = UnixStream::pair().unwrap();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let mut server = BufReader::new(server);
+            let mut line = String::new();
+            server.read_line(&mut line).await.unwrap();
+            let request: diri_proto::preview::PreviewRequest = serde_json::from_str(&line).unwrap();
+            assert_eq!(request.preview.0, "fixture");
+            server.get_mut().write_all(line.as_bytes()).await.unwrap();
+            for index in 0..4 {
+                let update = GridUpdate {
+                    cols: 1,
+                    rows: 1,
+                    cursor_col: 0,
+                    cursor_row: 0,
+                    cursor_visible: true,
+                    is_full_snapshot: index == 0,
+                    changed_rows: vec![ChangedRow::new(
+                        0,
+                        vec![GridCell {
+                            scalar: u32::from(b'A' + index),
+                            ..GridCell::BLANK
+                        }],
+                    )],
+                };
+                super::write_frame(server.get_mut(), &Frame::grid(&update).unwrap())
+                    .await
+                    .unwrap();
+            }
+            ready_tx.send(()).unwrap();
+            assert_eq!(
+                server.read(&mut [0]).await.unwrap(),
+                0,
+                "close releases socket"
+            );
+        });
+        let mut preview = SessionPreview::adopt(client, SessionId("fixture".into()))
+            .await
+            .unwrap();
+        ready_rx.await.unwrap();
+        for scalar in *b"AB" {
+            let Some(TerminalChunk::Grid(grid)) = preview.chunks.recv().await else {
+                panic!("grid");
+            };
+            assert_eq!(grid.changed_rows[0].cells[0].scalar, u32::from(scalar));
+        }
+        // Leave the remaining patches unread. Closing must not await a sender
+        // blocked on the capacity-one queue, nor splice/drop patches to continue.
+        timeout(Duration::from_secs(1), preview.close())
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), peer)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn preview_rejects_wrong_identity_and_legacy_control_reply() {
+        use super::SessionPreview;
+        for response in [
+            r#"{"preview":"other","version":1}"#,
+            r#"{"id":0,"error":"unknown request"}"#,
+        ] {
+            let (client, server) = UnixStream::pair().unwrap();
+            let peer = tokio::spawn(async move {
+                let mut server = BufReader::new(server);
+                let mut line = String::new();
+                server.read_line(&mut line).await.unwrap();
+                server
+                    .get_mut()
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            });
+            assert!(
+                SessionPreview::adopt(client, SessionId("fixture".into()))
+                    .await
+                    .is_err()
+            );
+            peer.await.unwrap();
+        }
+    }
+
     struct TestControl {
         reader: BufReader<OwnedReadHalf>,
         writer: OwnedWriteHalf,

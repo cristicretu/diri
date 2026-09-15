@@ -988,6 +988,36 @@ retained-byte bounds, overflow closure and the no-progress timeout. These are
 Engine-local tests, separate from the Helper/UDS and real SSH release gates.
 
 
+### Receive-only desktop previews
+
+A separate Engine-local first-line handshake, `{"preview":"SESSION","version":1}`,
+observes the Engine's existing terminal mirror. The strict request rejects mixed
+attach/preview fields and unsupported versions before normal attach dispatch.
+A matching versioned acknowledgement precedes the existing binary full grid,
+modes, and pushed diff frames. There is no fallback to a normal attachment.
+
+At most 16 preview connections are admitted per Engine. They share the bounded
+publisher above and do not count as governor visibility. Opening a preview does
+not wake, mark seen, persist, trigger the PR monitor, or refresh activity clocks.
+Input, mouse, resize, and scroll frames close the preview before session lookup;
+only Ping/Pong is accepted. Observing a remote mirror never opens another Helper
+channel or changes its controller lease. The deferred multiple-observer feature
+of the Remote Helper protocol remains deferred.
+
+The Rust client exposes `SessionPreview` with decoded receive-only chunks, a
+capacity-one queue, and cancellation on close/drop. Backpressure never discards
+patches: a slow server queue closes and the caller must explicitly reconnect to
+a new full seed. Session exit and remote connectivity remain facts from the
+existing control stream; a preview socket is not proof the remote process is
+currently reachable. UI consumers subscribe only while their cards are visible
+and render every grid at its existing dimensions without resizing the PTY.
+
+Private-socket tests verify pushed updates without a desktop attach, the 16-client
+limit, rejected mutation and mixed handshakes, unchanged stopped process identity,
+geometry/hibernation/last-seen state, and prompt client cancellation with a full
+queue. These local observation checks do not replace real SSH release gates.
+
+
 While the desktop terminal is scrolled back, its renderer retains one local
 screen snapshot and preserves already fetched rows in its bounded 512-row
 history cache. This keeps Agent redraws and overlapping history replies from

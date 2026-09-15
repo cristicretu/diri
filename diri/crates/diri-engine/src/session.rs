@@ -1300,6 +1300,11 @@ impl Session {
     /// where output lands between the seed and pump registration.
     pub(crate) fn attachment_seed(&self) -> AttachmentSeed {
         self.shared.note_hot();
+        self.preview_seed()
+    }
+
+    /// Observe the current mirror without changing activity or process state.
+    pub(crate) fn preview_seed(&self) -> AttachmentSeed {
         let wake = self.shared.grid_wake.clone();
         loop {
             let wake_generation = wake.generation();

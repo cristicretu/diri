@@ -34,6 +34,7 @@ const GRID_FLUSH_INTERVAL: Duration = Duration::from_millis(8);
 /// One attached client's write half.
 struct Sink {
     id: u64,
+    preview: bool,
     output: Arc<Mutex<SinkOutput>>,
 }
 
@@ -177,14 +178,37 @@ impl AttachHub {
         &self,
         registry: &Arc<Mutex<Registry>>,
         session_id: &str,
+        reader: UnixStream,
+        buffered: Vec<u8>,
+        writer: Arc<Mutex<UnixStream>>,
+    ) {
+        self.serve_kind(registry, session_id, reader, buffered, writer, false);
+    }
+
+    pub fn serve_preview(
+        &self,
+        registry: &Arc<Mutex<Registry>>,
+        session_id: &str,
+        reader: UnixStream,
+        buffered: Vec<u8>,
+        writer: Arc<Mutex<UnixStream>>,
+    ) {
+        self.serve_kind(registry, session_id, reader, buffered, writer, true);
+    }
+
+    fn serve_kind(
+        &self,
+        registry: &Arc<Mutex<Registry>>,
+        session_id: &str,
         mut reader: UnixStream,
         buffered: Vec<u8>,
         writer: Arc<Mutex<UnixStream>>,
+        preview: bool,
     ) {
         // Selecting a hibernated session revives it: the seed below paints
         // instantly from the emulator, and the live program resumes
         // underneath — the Swift attach() behavior.
-        {
+        if !preview {
             let Ok(mut guard) = registry.lock() else {
                 return;
             };
@@ -212,7 +236,24 @@ impl AttachHub {
             let Some(session) = guard.get(session_id) else {
                 return;
             };
-            let seed = session.attachment_seed();
+            if preview
+                && self
+                    .sessions
+                    .lock()
+                    .expect("attach hub")
+                    .values()
+                    .flat_map(|entry| &entry.sinks)
+                    .filter(|sink| sink.preview)
+                    .count()
+                    >= diri_proto::preview::MAX_PREVIEWS
+            {
+                return;
+            }
+            let seed = if preview {
+                session.preview_seed()
+            } else {
+                session.attachment_seed()
+            };
             #[cfg(test)]
             if let Some(hook) = self.registration_hook.lock().unwrap().clone() {
                 hook();
@@ -222,6 +263,20 @@ impl AttachHub {
                 .and_then(|frame| FrameCodec::encode(&frame).ok())
             else {
                 return;
+            };
+            let grid = if preview {
+                let ready = diri_proto::preview::PreviewReady {
+                    preview: diri_proto::SessionId(session_id.to_owned()),
+                    version: diri_proto::preview::PREVIEW_VERSION,
+                };
+                let Ok(mut bytes) = serde_json::to_vec(&ready) else {
+                    return;
+                };
+                bytes.push(b'\n');
+                bytes.extend_from_slice(&grid);
+                bytes
+            } else {
+                grid
             };
             output.enqueue(Arc::from(grid));
             let Ok(modes) = encoded(&Frame::modes_with_bracketed_paste(
@@ -235,7 +290,14 @@ impl AttachHub {
             let output = Arc::new(Mutex::new(output));
             let sink_id = self.next_sink.fetch_add(1, Ordering::SeqCst);
             let wake = seed.wake.clone();
-            self.register(registry, session_id, sink_id, Arc::clone(&output), seed);
+            self.register(
+                registry,
+                session_id,
+                sink_id,
+                Arc::clone(&output),
+                seed,
+                preview,
+            );
             (sink_id, output, wake)
         };
         wake.notify();
@@ -249,6 +311,9 @@ impl AttachHub {
         'serve: while let Ok(frames) = codec.feed(&pending) {
             pending.clear();
             for frame in frames {
+                if preview && !matches!(frame.frame_type, FrameType::Ping | FrameType::Pong) {
+                    break 'serve;
+                }
                 if !self.handle_frame(registry, session_id, &output, &wake, &frame) {
                     break 'serve;
                 }
@@ -279,6 +344,17 @@ impl AttachHub {
         wake: &crate::session::GridWake,
         frame: &Frame,
     ) -> bool {
+        if frame.frame_type == FrameType::Ping {
+            let Ok(pong) = encoded(&Frame::pong()) else {
+                return false;
+            };
+            let queued = output.lock().is_ok_and(|mut output| output.enqueue(pong));
+            wake.notify();
+            return queued;
+        }
+        if frame.frame_type == FrameType::Pong {
+            return true;
+        }
         let Ok(mut guard) = registry.lock() else {
             return false;
         };
@@ -312,15 +388,6 @@ impl AttachHub {
                         session.scroll(direction == 0, lines as usize, col as usize, row as usize);
                 }
             }
-            FrameType::Ping => {
-                drop(guard);
-                let Ok(pong) = encoded(&Frame::pong()) else {
-                    return false;
-                };
-                let queued = output.lock().is_ok_and(|mut output| output.enqueue(pong));
-                wake.notify();
-                return queued;
-            }
             _ => {}
         }
         true
@@ -333,11 +400,13 @@ impl AttachHub {
         sink_id: u64,
         output: Arc<Mutex<SinkOutput>>,
         seed: AttachmentSeed,
+        preview: bool,
     ) {
         let mut sessions = self.sessions.lock().expect("attach hub");
         let entry = sessions.entry(session_id.to_string()).or_default();
         entry.sinks.push(Sink {
             id: sink_id,
+            preview,
             output,
         });
         if !entry.pump_running {
@@ -358,7 +427,7 @@ impl AttachHub {
             .lock()
             .expect("attach hub")
             .get(session_id)
-            .is_some_and(|entry| !entry.sinks.is_empty())
+            .is_some_and(|entry| entry.sinks.iter().any(|sink| !sink.preview))
     }
 
     fn deregister(&self, session_id: &str, sink_id: u64) {
@@ -622,6 +691,7 @@ mod tests {
             SessionSinks {
                 sinks: vec![Sink {
                     id: 1,
+                    preview: false,
                     output: Arc::clone(&old),
                 }],
                 pump_running: true,
@@ -642,6 +712,7 @@ mod tests {
             .sinks
             .push(Sink {
                 id: 2,
+                preview: false,
                 output: Arc::clone(&new),
             });
         hub.enqueue_publication(
