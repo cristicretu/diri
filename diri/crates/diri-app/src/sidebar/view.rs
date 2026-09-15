@@ -245,6 +245,7 @@ pub struct Sidebar {
     list_scroll: ScrollHandle,
     tab_scroll: ScrollHandle,
     last_tab_selection: Option<SessionId>,
+    last_tab_available_width: f32,
     filter_query: crate::query_editor::QueryEditor,
     filter_open: bool,
     filter_focus: FocusHandle,
@@ -385,6 +386,7 @@ impl Sidebar {
             list_scroll: ScrollHandle::new(),
             tab_scroll: ScrollHandle::new(),
             last_tab_selection: None,
+            last_tab_available_width: 0.0,
             filter_query: Default::default(),
             filter_open: false,
             filter_focus: cx.focus_handle(),
@@ -1027,6 +1029,11 @@ impl Sidebar {
 
     fn focus_rows_snapshot(&self) -> (Vec<FocusRow>, Option<SessionId>) {
         let mut store = self.store.write().expect("session store lock poisoned");
+        let selected = store.selected_session_id().cloned();
+        (self.focus_rows_for_store(&mut store), selected)
+    }
+
+    fn focus_rows_for_store(&self, store: &mut SessionStore) -> Vec<FocusRow> {
         let mut expanded_archives = store.preferences().sidebar_expanded_archives.clone();
         let grouping = store.preferences().sidebar_grouping;
         let ordering = store.preferences().sidebar_ordering;
@@ -1038,7 +1045,6 @@ impl Sidebar {
             .iter()
             .cloned()
             .collect();
-        let selected = store.selected_session_id().cloned();
         let projection =
             super::filter::filter_projection(store.sidebar_projection(), self.filter_query.text());
         if !self.filter_query.text().trim().is_empty() {
@@ -1049,7 +1055,7 @@ impl Sidebar {
                 .collect();
         }
         let today = local_day_ordinal(wall_clock_millis()).unwrap_or(0);
-        let rows = match grouping {
+        match grouping {
             SidebarGrouping::Project => focus_rows(&projection, &expanded_archives),
             SidebarGrouping::Recency => recency_focus_rows(
                 &projection,
@@ -1058,8 +1064,7 @@ impl Sidebar {
                 &pinned,
                 today,
             ),
-        };
-        (rows, selected)
+        }
     }
 
     fn move_focus_cursor(
@@ -9293,6 +9298,11 @@ mod tests {
                 let sidebar = cx.new(|cx| {
                     let mut sidebar = Sidebar::new(None, true, scenario, cx);
                     sidebar.ui.width = width;
+                    if let Ok(query) = std::env::var("DIRI_VISUAL_FILTER") {
+                        sidebar.filter_open = true;
+                        sidebar.filter_query.insert(&query);
+                    }
+
                     if std::env::var_os("DIRI_VISUAL_HOVER").is_some() {
                         sidebar.ui.hovered_session = Some(SessionId::new("preview-codex"));
                     }
@@ -9490,6 +9500,39 @@ mod tests {
             "project actions must open below their trigger"
         );
         assert_eq!(popover.size.width, px(184.0));
+    }
+
+    #[gpui::test]
+    fn filtered_shortcuts_follow_visible_rows_including_archives(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.filter_query.insert("i");
+            for grouping in [SidebarGrouping::Project, SidebarGrouping::Recency] {
+                let expected = {
+                    let mut store = sidebar.store.write().unwrap();
+                    store
+                        .update_preferences(|prefs| prefs.sidebar_grouping = grouping)
+                        .unwrap();
+                    let rows = sidebar.focus_rows_for_store(&mut store);
+                    assert!(
+                        rows.iter()
+                            .any(|row| store.sessions()[&row.id].archived_at.is_some())
+                    );
+                    rows.into_iter().map(|row| row.id).collect::<Vec<_>>()
+                };
+                for (index, id) in expected.iter().enumerate() {
+                    assert!(sidebar.select_shortcut(index, cx));
+                    assert_eq!(
+                        sidebar.store.read().unwrap().selected_session_id(),
+                        Some(id)
+                    );
+                }
+            }
+        });
     }
 
     #[gpui::test]
