@@ -1548,6 +1548,7 @@ dependencies = [
  "diri-usage",
  "diri-web",
  "gpui",
+ "gpui_macos",
  "gpui_platform",
  "image",
  "libc",
