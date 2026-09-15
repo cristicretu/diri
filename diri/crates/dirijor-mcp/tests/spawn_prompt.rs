@@ -116,6 +116,7 @@ fn start_server(temp: &Path, fixture: &Path, parent_cwd: &Path) -> Arc<ControlSe
         archived_at: None,
         host: None,
         remote_persistence: None,
+        remote_connection: None,
         hibernation: None,
         memory_bytes: None,
         artifacts: None,
