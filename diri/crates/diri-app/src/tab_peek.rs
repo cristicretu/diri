@@ -17,9 +17,8 @@ pub(crate) enum GestureFrame {
     Released(f32),
 }
 
-#[derive(Default)]
-pub(crate) struct TabPeek {
-    pub(crate) sessions: Vec<SessionId>,
+pub(crate) struct TabPeek<T = SessionId> {
+    pub(crate) sessions: Vec<T>,
     pub(crate) focused: usize,
     distance: f32,
     settle: Option<Settle>,
@@ -28,7 +27,21 @@ pub(crate) struct TabPeek {
     pub(crate) tracking: bool,
 }
 
-impl TabPeek {
+impl<T> Default for TabPeek<T> {
+    fn default() -> Self {
+        Self {
+            sessions: Vec::new(),
+            focused: 0,
+            distance: 0.0,
+            settle: None,
+            gesture_origin: 0.0,
+            closing: false,
+            tracking: false,
+        }
+    }
+}
+
+impl<T: Clone + PartialEq> TabPeek<T> {
     pub(crate) fn visible(&self) -> bool {
         !self.closing && self.paint_visible()
     }
@@ -116,7 +129,7 @@ impl TabPeek {
             }
         }
     }
-    pub(crate) fn begin(&mut self, sessions: Vec<SessionId>, selected: Option<&SessionId>) {
+    pub(crate) fn begin(&mut self, sessions: Vec<T>, selected: Option<&T>) {
         self.focused = selected
             .and_then(|id| sessions.iter().position(|item| item == id))
             .unwrap_or(0);
@@ -169,14 +182,17 @@ impl TabPeek {
                 (self.focused as isize + by).rem_euclid(self.sessions.len() as isize) as usize;
         }
     }
-    pub(crate) fn selected(&self) -> Option<SessionId> {
+    pub(crate) fn selected(&self) -> Option<T> {
         self.sessions.get(self.focused).cloned()
     }
 }
 
 /// A fixed source viewport with a changing paint origin. The terminal keeps
 /// receiving the original width/height; only this presentation offset changes.
-pub(crate) fn terminal_offset(peek: &TabPeek, reduced_motion: bool) -> f32 {
+pub(crate) fn terminal_offset<T: Clone + PartialEq>(
+    peek: &TabPeek<T>,
+    reduced_motion: bool,
+) -> f32 {
     if reduced_motion {
         0.0
     } else {
@@ -186,7 +202,10 @@ pub(crate) fn terminal_offset(peek: &TabPeek, reduced_motion: bool) -> f32 {
 
 /// Keep the preview strip above the translated terminal during reveal/return.
 /// Clipping at the overlay top removes cards as they leave the viewport.
-pub(crate) fn preview_reveal_offset(peek: &TabPeek, reduced_motion: bool) -> f32 {
+pub(crate) fn preview_reveal_offset<T: Clone + PartialEq>(
+    peek: &TabPeek<T>,
+    reduced_motion: bool,
+) -> f32 {
     if reduced_motion {
         0.0
     } else {
@@ -202,12 +221,12 @@ pub(crate) struct CardRect {
     pub height: f32,
 }
 
-pub(crate) fn card_rect(
+pub(crate) fn card_rect<T: Clone + PartialEq>(
     index: usize,
     count: usize,
     width: f32,
     height: f32,
-    peek: &TabPeek,
+    peek: &TabPeek<T>,
     reduced_motion: bool,
 ) -> CardRect {
     let width = width.max(1.0);
@@ -243,8 +262,8 @@ pub(crate) fn card_rect(
 
 /// Intersect the same interpolated geometry used by the painter. Offscreen
 /// terminal streams are closed even while cards continue to exist in the tree.
-pub(crate) fn visible_card_indices(
-    peek: &TabPeek,
+pub(crate) fn visible_card_indices<T: Clone + PartialEq>(
+    peek: &TabPeek<T>,
     width: f32,
     height: f32,
     scroll_y: f32,
