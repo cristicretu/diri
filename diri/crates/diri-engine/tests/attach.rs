@@ -177,6 +177,24 @@ fn an_attach_is_seeded_then_streams_diffs_and_answers_input() {
         "live mode changes propagate independently of grid damage"
     );
 
+    // Exercise WouldBlock with both a fragmented frame header and body. The
+    // decoder must preserve each prefix and deliver the input exactly once.
+    let fragmented = FrameCodec::encode(&Frame::input(b"fragmented-input\n".to_vec())).unwrap();
+    for part in [&fragmented[..2], &fragmented[2..7], &fragmented[7..]] {
+        data.write_all(part).unwrap();
+        std::thread::sleep(Duration::from_millis(3));
+    }
+    frames.until("fragmented input", |frame| {
+        frame
+            .grid_payload()
+            .ok()
+            .flatten()
+            .is_some_and(|grid| grid_text(&grid).contains("fragmented-input"))
+    });
+    data.write_all(&FrameCodec::encode(&Frame::ping()).unwrap())
+        .unwrap();
+    frames.until("queued pong", |frame| frame.frame_type == FrameType::Pong);
+
     // Let the per-session pump establish its shared diff baseline. Its first
     // sample is allowed to be a FullSnapshot: if input beats that first tick,
     // the snapshot legitimately includes the new text. A second turn is the
@@ -267,4 +285,161 @@ fn an_attach_is_seeded_then_streams_diffs_and_answers_input() {
         method: "session.kill".into(),
         params: Some(json!({ "sessionID": id })),
     });
+}
+
+#[test]
+fn a_slow_reader_does_not_delay_an_active_reader() {
+    use std::io::BufRead;
+    use std::os::fd::AsRawFd;
+    let temp = tempfile::tempdir().unwrap();
+    let registry = Arc::new(Mutex::new(Registry::new(
+        engine(),
+        temp.path().join("state.json"),
+    )));
+    let server = Arc::new(ControlServer::new(
+        Arc::clone(&registry),
+        temp.path().join("daemon.sock"),
+    ));
+    let listener = server.bind().unwrap();
+    let serving = Arc::clone(&server);
+    std::thread::spawn(move || {
+        while let Ok((stream, _)) = listener.accept() {
+            let small_buffer: libc::c_int = 1024;
+            // SAFETY: a live socket and correctly sized initialized option.
+            assert_eq!(
+                unsafe {
+                    libc::setsockopt(
+                        stream.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_SNDBUF,
+                        (&small_buffer as *const libc::c_int).cast(),
+                        std::mem::size_of_val(&small_buffer) as libc::socklen_t,
+                    )
+                },
+                0
+            );
+            let server = Arc::clone(&serving);
+            std::thread::spawn(move || {
+                let _ = server.serve(stream);
+            });
+        }
+    });
+    let mut control = UnixStream::connect(server.socket_path()).unwrap();
+    serde_json::to_writer(&mut control, &ControlMessage::Request {
+        id: 1, method: "session.spawn".into(), params: Some(json!({
+            "kind": {"generic": {}}, "cwd": temp.path(), "initialCols":80,"initialRows":24,
+            "argv":["/bin/sh", "-c", "stty -echo; while IFS= read -r line; do printf '\\033[H'; i=0; while [ \"$i\" -lt 24 ]; do printf '%s--ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz\\n' \"$line\"; i=$((i+1)); done; done"]
+        }))
+    }).unwrap();
+    control.write_all(b"\n").unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(control.try_clone().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let reply: ControlMessage = serde_json::from_str(&line).unwrap();
+    let id = match reply {
+        ControlMessage::Response {
+            result: Ok(value), ..
+        } => value["id"].as_str().unwrap().to_owned(),
+        other => panic!("{other:?}"),
+    };
+    let attach = || {
+        let mut stream = UnixStream::connect(server.socket_path()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(750)))
+            .unwrap();
+        serde_json::to_writer(&mut stream, &json!({"attach": id})).unwrap();
+        stream.write_all(b"\n").unwrap();
+        stream
+    };
+    let slow = attach();
+    // Read only the initial seed, then leave this first sink completely stalled.
+    let mut initial = FrameReader::new(slow.try_clone().unwrap());
+    initial.until("slow seed", |frame| frame.frame_type == FrameType::Modes);
+    let active = attach();
+    let mut active = FrameReader::new(active);
+    active.until("active seed", |frame| frame.frame_type == FrameType::Modes);
+    let original_pid = registry.lock().unwrap().get(&id).unwrap().child_pid();
+    let mut samples = Vec::new();
+    let mut failure = None;
+    for step in 0..40 {
+        let marker = format!("sample{step:03}");
+        let start = Instant::now();
+        registry
+            .lock()
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .write_input(format!("{marker}\n").as_bytes())
+            .unwrap();
+        let mut bytes = [0; 65536];
+        let mut found = false;
+        while start.elapsed() < Duration::from_millis(750) {
+            while let Some(frame) = active.queue.pop_front() {
+                if frame
+                    .grid_payload()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|grid| grid_text(&grid).contains(&marker))
+                {
+                    found = true;
+                    break;
+                }
+            }
+            if found {
+                break;
+            }
+            match active.stream.read(&mut bytes) {
+                Ok(0) => break,
+                Ok(count) => active
+                    .queue
+                    .extend(active.codec.feed(&bytes[..count]).unwrap()),
+                Err(_) => break,
+            }
+        }
+        if !found {
+            failure = Some(marker);
+            break;
+        }
+        samples.push(start.elapsed());
+    }
+    // Release the baseline's blocked write before reporting an assertion.
+    let _ = slow.shutdown(std::net::Shutdown::Both);
+    if failure.is_none() {
+        let mut reconnected = FrameReader::new(attach());
+        let seed = reconnected.until("reconnected full snapshot", |frame| {
+            frame.frame_type == FrameType::Grid
+        });
+        let grid = seed.grid_payload().unwrap().unwrap();
+        assert!(grid.is_full_snapshot);
+        assert!(grid_text(&grid).contains("sample039"));
+        assert_eq!(
+            registry.lock().unwrap().get(&id).unwrap().child_pid(),
+            original_pid
+        );
+        let _ = reconnected.stream.shutdown(std::net::Shutdown::Both);
+    }
+    let _ = active.stream.shutdown(std::net::Shutdown::Both);
+    registry
+        .lock()
+        .unwrap()
+        .remove(&id, &temp.path().join("logs"))
+        .unwrap();
+    assert!(
+        failure.is_none(),
+        "slow reader blocked active output at {failure:?}"
+    );
+    eprintln!(
+        "active reader samples_us: {:?}",
+        samples.iter().map(Duration::as_micros).collect::<Vec<_>>()
+    );
+    samples.sort();
+    eprintln!(
+        "active reader with stalled peer: {} samples, p50={:?}, p90={:?}, max={:?}",
+        samples.len(),
+        samples[samples.len() / 2],
+        samples[samples.len() * 9 / 10],
+        samples.last().unwrap()
+    );
+    assert!(samples[samples.len() * 9 / 10] < Duration::from_millis(150));
 }
