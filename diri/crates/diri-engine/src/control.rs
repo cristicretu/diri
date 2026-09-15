@@ -444,6 +444,26 @@ impl ControlServer {
             }
             if first {
                 first = false;
+                // Route by the distinct key before normal attach decoding. Mixed
+                // or unsupported requests fail closed without visibility effects.
+                if serde_json::from_slice::<serde_json::Value>(&line)
+                    .is_ok_and(|value| value.get("preview").is_some())
+                {
+                    if let Ok(request) =
+                        serde_json::from_slice::<diri_proto::preview::PreviewRequest>(&line)
+                        && request.version == diri_proto::preview::PREVIEW_VERSION
+                    {
+                        let buffered = reader.buffer().to_vec();
+                        self.attach.serve_preview(
+                            &self.registry,
+                            &request.preview.0,
+                            reader.into_inner(),
+                            buffered,
+                            writer,
+                        );
+                    }
+                    return Ok(());
+                }
                 if let Ok(attach) = serde_json::from_slice::<diri_proto::AttachRequest>(&line) {
                     // Attaching means this session is visible. Reconcile the
                     // actual process first: an adopted holder can be stopped
