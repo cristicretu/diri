@@ -1030,7 +1030,14 @@ mod tests {
             commands::command(CommandId::NewDefaultSession).shortcut_label()
         );
         assert_eq!(result[1].title, "New Claude Code Session");
-        assert_eq!(result[7].title, "New Codex in diri");
+        assert_eq!(
+            result
+                .iter()
+                .find(|action| action.id == "new-default-in-/work/diri")
+                .unwrap()
+                .title,
+            "New Codex in diri"
+        );
     }
 
     #[test]

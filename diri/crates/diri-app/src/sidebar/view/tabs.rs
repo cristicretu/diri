@@ -6,6 +6,13 @@ impl Sidebar {
     pub(super) fn navigation_sessions(&self, store: &mut SessionStore) -> Vec<Arc<SessionRecord>> {
         if store.preferences().tab_orientation == TabOrientation::Horizontal {
             selected_project_tabs(store).sessions
+        } else if !self.filter_query.text().trim().is_empty() {
+            // Numeric shortcuts follow the displayed filtered rows, including
+            // disclosed archives and the current project/recency grouping.
+            self.focus_rows_for_store(store)
+                .iter()
+                .filter_map(|row| store.sessions().get(&row.id).cloned())
+                .collect()
         } else {
             super::super::filter::filter_projection(
                 store.sidebar_projection(),
@@ -212,6 +219,26 @@ impl Sidebar {
                     })),
             )
             .child(rows)
+            .child(
+                div()
+                    .id("horizontal-peek-tabs")
+                    .debug_selector(|| "horizontal-peek-tabs".into())
+                    .role(Role::Button)
+                    .aria_label("Peek tabs")
+                    .size(px(28.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(7.0))
+                    .cursor_pointer()
+                    .hover(move |button| button.bg(colors.primary.alpha(0.06)))
+                    .child(sf_symbol("square.grid.2x2", 12.0, colors.secondary))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(crate::commands::ToggleTabPeek), cx)
+                    }),
+            )
             .child(
                 div()
                     .id("horizontal-new-tab")

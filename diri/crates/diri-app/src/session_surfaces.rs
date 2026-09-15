@@ -27,6 +27,7 @@ mod tab_peek_surface;
 pub struct SessionSurfaces {
     peek: crate::tab_peek::TabPeek,
     peek_left: f32,
+    peek_top: f32,
     peek_width: f32,
     peek_scroll: ScrollHandle,
     peek_previous_focus: Option<FocusHandle>,
@@ -104,6 +105,7 @@ impl SessionSurfaces {
         Self {
             peek: Default::default(),
             peek_left: 0.0,
+            peek_top: 0.0,
             peek_width: 0.0,
             peek_scroll: ScrollHandle::new(),
             peek_previous_focus: None,

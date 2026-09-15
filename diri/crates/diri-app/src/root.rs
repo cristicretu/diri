@@ -2670,12 +2670,11 @@ impl RootView {
             .map_or(0.0, |surfaces| surfaces.read(cx).tab_peek_offset(cx));
         if let Some(surfaces) = &self.session_surfaces {
             surfaces.update(cx, |surfaces, cx| {
-                surfaces.set_tab_peek_region(sidebar_width, card_width, cx)
+                surfaces.set_tab_peek_region(sidebar_width, tabs_height, card_width, cx)
             });
         }
         let mut card = div()
             .relative()
-            .top(px(peek_offset))
             .flex_1()
             .flex()
             .flex_col()
@@ -2726,8 +2725,22 @@ impl RootView {
                     .update(cx, |sidebar, cx| sidebar.render_horizontal_tabs(cx)),
             );
         }
+        // Translation changes only paint placement. The stationary tab strip
+        // and settled PTY viewport never participate in the gesture layout.
+        let mut body = div()
+            .id("terminal-card-body")
+            .debug_selector(|| "terminal-card-body".into())
+            .relative()
+            .top(px(peek_offset))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .w_full()
+            .h(px(card_height))
+            .min_h(px(0.0))
+            .bg(terminal.background);
         if self.preview && self.preview_scenario != PreviewScenario::Empty {
-            card = card.child(self.preview_workbench(terminal));
+            body = body.child(self.preview_workbench(terminal));
         } else if split_open {
             let available_height = (card_height - 1.0).max(0.0);
             self.terminal_available_height = available_height;
@@ -2745,7 +2758,7 @@ impl RootView {
                         cx,
                     );
                 });
-                card = card.child(
+                body = body.child(
                     div()
                         .flex_none()
                         .w_full()
@@ -2755,7 +2768,7 @@ impl RootView {
                         .child(primary.clone()),
                 );
             }
-            card = card.child(self.terminal_resize_handle(cx));
+            body = body.child(self.terminal_resize_handle(cx));
 
             let mut auxiliary = div()
                 .relative()
@@ -2823,7 +2836,7 @@ impl RootView {
                         }),
                 );
             }
-            card = card.child(auxiliary);
+            body = body.child(auxiliary);
         } else if let Some(primary) = &self.terminal {
             self.terminal_available_height = card_height;
             primary.update(cx, |terminal, cx| {
@@ -2838,10 +2851,10 @@ impl RootView {
                     cx,
                 );
             });
-            card = card.child(primary.clone());
+            body = body.child(primary.clone());
         }
 
-        card.child(card_outline).into_any_element()
+        card.child(body).child(card_outline).into_any_element()
     }
 
     fn preview_workbench(&self, colors: SemanticColors) -> AnyElement {
@@ -4364,6 +4377,92 @@ mod tests {
     }
 
     #[gpui::test]
+    fn horizontal_peek_keeps_tabs_stationary_and_terminal_identity(cx: &mut gpui::TestAppContext) {
+        use crate::tab_peek::GestureFrame;
+        let services = test_services();
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.select(fixture.selected_session_id.unwrap());
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        cx.simulate_resize(size(px(1000.0), px(700.0)));
+        root.update_in(cx, |root, window, cx| {
+            root.run_command(CommandId::HorizontalTabs, window, cx)
+        });
+        cx.run_until_parked();
+        let heading = cx.debug_bounds("horizontal-tabs").unwrap();
+        let body = cx.debug_bounds("terminal-card-body").unwrap();
+        let entity = root.read_with(cx, |root, _| root.terminal.clone().unwrap());
+        let original = root.read_with(cx, |root, cx| {
+            root.terminal.as_ref().unwrap().read(cx).geometry_for_test()
+        });
+        let selected = root.read_with(cx, |root, _| {
+            root.services
+                .store
+                .store
+                .read()
+                .unwrap()
+                .selected_session_id()
+                .cloned()
+        });
+        for distance in [10.0, 50.0, 140.0, 240.0, 380.0, 180.0, 40.0] {
+            root.update(cx, |root, cx| {
+                root.session_surfaces.as_ref().unwrap().update(cx, |s, cx| {
+                    s.tab_gesture(GestureFrame::Tracking(distance), cx)
+                })
+            });
+            cx.run_until_parked();
+            assert_eq!(cx.debug_bounds("horizontal-tabs").unwrap(), heading);
+            let moved = cx.debug_bounds("terminal-card-body").unwrap();
+            assert_eq!(moved.size, body.size);
+            let overlay = cx.debug_bounds("TAB_PEEK").unwrap();
+            assert_eq!(overlay.top(), heading.bottom());
+            let current = root.read_with(cx, |root, cx| {
+                assert_eq!(root.terminal.as_ref(), Some(&entity));
+                root.terminal.as_ref().unwrap().read(cx).geometry_for_test()
+            });
+            assert_eq!(
+                current, original,
+                "peek at {distance} changed terminal geometry"
+            );
+            assert_eq!(
+                root.read_with(cx, |root, _| root
+                    .services
+                    .store
+                    .store
+                    .read()
+                    .unwrap()
+                    .selected_session_id()
+                    .cloned()),
+                selected
+            );
+        }
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert_eq!(cx.debug_bounds("terminal-card-body").unwrap(), body);
+        let trigger = cx.debug_bounds("horizontal-peek-tabs").unwrap();
+        cx.simulate_click(trigger.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("TAB_PEEK").is_some());
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("TAB_PEEK").is_none());
+        assert_eq!(
+            root.read_with(cx, |root, cx| root
+                .terminal
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .geometry_for_test()),
+            original
+        );
+    }
+
+    #[gpui::test]
     fn fullscreen_terminal_tracks_drawable_size_with_windowed_restore_bounds(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -4810,8 +4909,16 @@ mod tests {
                 })
                 .unwrap();
         }
-        let window=cx.open_window(size(px(1200.0),px(800.0)),|window,cx|cx.new(|cx| {
+        let width = if std::env::var_os("DIRI_PEEK_NARROW").is_some() {
+            640.0
+        } else {
+            1200.0
+        };
+        let window=cx.open_window(size(px(width),px(800.0)),|window,cx|cx.new(|cx| {
             let root=RootView::new(services,false,PreviewScenario::Empty,window,cx);
+            if std::env::var_os("DIRI_PEEK_HORIZONTAL").is_some() {
+                root.sidebar.update(cx, |sidebar, cx| sidebar.set_tab_orientation(crate::store::TabOrientation::Horizontal, cx)).unwrap();
+            }
             let mut grid=GridBuffer::new(100,36);
             let sample="$ pwd\n/Users/you/work/diri\n\n$ cargo test --workspace\n\nrunning 4 tests\ntest session_identity_survives ... ok\ntest preview_does_not_resize ... ok\ntest controller_stays_attached ... ok\ntest input_returns_to_terminal ... ok\n\ntest result: ok. 4 passed; 0 failed\n\n$ git status --short\n M crates/diri-app/src/tab_peek.rs\n M crates/diri-app/src/root.rs\n\n$ ";
             for (y,line) in sample.lines().enumerate(){for (x,ch) in line.chars().enumerate(){grid.cells[y*100+x].scalar=ch as u32;}}
