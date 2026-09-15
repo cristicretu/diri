@@ -1,5 +1,60 @@
 # diri performance record
 
+## Large preview frames keep draining (2026-09-16)
+
+A 160×50 receive-only preview could disconnect despite continuously reading.
+The default macOS Unix socket send buffer is 8 KiB; the output loop waited a
+fixed millisecond between partial writes and could also suspend draining during
+its 8 ms publication coalescing window. The resulting backlog overflowed even
+though the producer and terminal parser kept up. A real-PTY release regression
+received only 18 of 120 images before EOF, while the producer and Engine reached
+the final frame. The same 80×24 workload stayed connected.
+
+Queued output now waits for `POLLOUT` readiness, bounded to one millisecond, and
+resumes immediately when the reader frees capacity. The publisher remembers a
+pending grid change while servicing partial writes. Existing frame offsets,
+recipient ordering, queue limits, fairness budgets, and the single writer owner
+remain intact. Empty queues retain the existing GridWake sleep. No new remote
+Holder attachment or preview visibility/activity side effect is introduced.
+
+### Verification
+
+`cargo test -p diri-engine --release --test preview_progress` exercises both
+sizes with an 8 KiB send buffer. Each fixture produces 120 dense colored redraws;
+the preview must stay connected, show progress, and receive the final frame.
+The full Engine suite passed 526 tests with 6 ignored; strict all-target Engine
+Clippy, formatting, and the release build passed. Existing slow-reader,
+partial-frame, registration-order, and interactive-input tests also passed.
+
+A quiet reference-machine run used 16 previews (one deliberately stalled), plus
+one normal active attachment. All 15 drained previews survived each complete
+three-second sample; the stalled preview disconnected and reconnect seeded the
+same child PID. The production cap remains 16.
+
+| Requested rate | 80×24 updates/s | 160×50 updates/s | Output p90, small / large | Input p95 | Combined CPU cores | Loaded RSS |
+| --- | ---: | ---: | --- | ---: | ---: | ---: |
+| Idle | 0 | 0 | — | — | 0.0036 | 20.5 MiB |
+| 10 Hz | 10.01 | 10.01 | 4.91 / 6.21 ms | 0.917 ms | 0.241 | 33.9 MiB |
+| 60 Hz | 58.95 | 58.10 | 4.47 / 5.83 ms | 1.745 ms | 1.082 | 58.5 MiB |
+
+Updates/s counts distinct producer timestamps reaching decoded client grids,
+not monitor presentation. At the 60 Hz target, producers completed 173–180 frames
+in the sample; the large-grid maximum observed latency was 19.74 ms. These are
+local Engine/socket results, excluding GUI, SSH, and producer CPU. The benchmark
+combines Engine and blocking decoder threads: 19 threads before attachment,
+68 after. The 49-thread increase includes one benchmark reader per drained
+preview; actual desktop preview clients use Tokio tasks. Idle CPU includes the
+benchmark readers’ 100 ms deadline checks, so it is not an Engine-only idle cost.
+
+[Raw samples and commands](docs/perf/preview-progress-2026-09-16.json) include
+per-size connection lifetimes, producer/PTY counters, memory, and input samples.
+Run `cargo run -p diri-engine --release --example previewbench -- 16 60 3 diagnose`
+to reproduce using disposable local PTYs. The optional `diagnose` argument
+records synthetic child write progress; all fixture processes and files are
+cleaned up. The harness fails on any unexpected drained-reader EOF. Earlier
+48/64-preview loaded samples ended connections early and cannot justify a cap
+increase; larger demand requires a fresh measurement of the corrected path.
+
 ## A stalled desktop client cannot block another client (2026-09-15)
 
 The Engine-local AttachHub wrote each client's socket synchronously. A client
