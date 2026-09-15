@@ -50,8 +50,8 @@ pub struct ProviderUsage {
 }
 
 /// The UI-facing usage projection. Dates are Unix seconds.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct UsageSnapshot {
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsageSnapshot<L = ()> {
     pub claude: ProviderUsage,
     pub codex: ProviderUsage,
     pub cursor: ProviderUsage,
@@ -61,12 +61,29 @@ pub struct UsageSnapshot {
     pub session_remaining_seconds: Option<i64>,
     pub updated_at: i64,
     /// Default local account quotas; never inferred from transcript costs.
-    pub limits: Vec<super::limits::AccountLimits>,
+    pub limits: Vec<L>,
+    pub remote: Vec<RemoteUsageSnapshot>,
     /// Local transcript history; fleet summaries do not provide this detail.
     pub history: std::sync::Arc<super::dashboard::UsageHistory>,
 }
 
-impl UsageSnapshot {
+impl<L> UsageSnapshot<L> {
+    pub fn with_limits<T>(self, limits: Vec<T>) -> UsageSnapshot<T> {
+        UsageSnapshot {
+            claude: self.claude,
+            codex: self.codex,
+            cursor: self.cursor,
+            session_cost: self.session_cost,
+            session_started_at: self.session_started_at,
+            session_ends_at: self.session_ends_at,
+            session_remaining_seconds: self.session_remaining_seconds,
+            updated_at: self.updated_at,
+            history: self.history,
+            limits,
+            remote: self.remote,
+        }
+    }
+
     #[must_use]
     pub fn today(&self) -> UsageTotals {
         let mut totals = self.claude.today;
@@ -101,5 +118,64 @@ impl UsageHourAgg {
         self.cr += other.cr;
         self.cw += other.cw;
         self.c += other.c;
+    }
+}
+
+impl<L> Default for UsageSnapshot<L> {
+    fn default() -> Self {
+        Self {
+            claude: ProviderUsage::default(),
+            codex: ProviderUsage::default(),
+            cursor: ProviderUsage::default(),
+            session_cost: None,
+            session_started_at: None,
+            session_ends_at: None,
+            session_remaining_seconds: None,
+            updated_at: 0,
+            limits: Vec::new(),
+            history: Default::default(),
+            remote: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RemoteUsageStatus {
+    Loading,
+    Ready,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RemoteUsageSnapshot {
+    pub host: String,
+    pub name: String,
+    pub status: RemoteUsageStatus,
+    pub data: Option<std::sync::Arc<diri_proto::remote_pty::TranscriptUsageResult>>,
+}
+
+impl<L> UsageSnapshot<L> {
+    /// None selects all machines; an empty string selects only this machine.
+    pub fn history_for_source(&self, host: Option<&str>) -> super::dashboard::UsageHistory {
+        let mut history = if host.is_none_or(str::is_empty) {
+            (*self.history).clone()
+        } else {
+            super::dashboard::UsageHistory::default()
+        };
+        let mut sources = std::collections::BTreeMap::new();
+        for remote in &self.remote {
+            if host.is_none_or(|id| id == remote.host)
+                && let Some(data) = &remote.data
+            {
+                let saved = sources.entry(&data.source_id).or_insert(data);
+                if data.collected_at >= saved.collected_at {
+                    *saved = data;
+                }
+            }
+        }
+        for data in sources.values() {
+            let _ = history.merge_remote(data);
+        }
+        history
     }
 }

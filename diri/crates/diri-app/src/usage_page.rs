@@ -15,6 +15,13 @@ fn provider_color(provider: usize, colors: SemanticColors) -> Rgba {
 
 impl UtilitySurfaces {
     pub(crate) fn set_usage(&mut self, usage: UsageSnapshot, cx: &mut Context<Self>) {
+        if self
+            .usage_host
+            .as_deref()
+            .is_some_and(|id| !id.is_empty() && !usage.remote.iter().any(|host| host.host == id))
+        {
+            self.usage_host = None;
+        }
         self.usage = usage;
         if self.surface == Surface::Settings && self.settings_tab == SettingsTab::Usage {
             cx.notify();
@@ -28,17 +35,33 @@ impl UtilitySurfaces {
                 .child(label("Reading local usage…", 14.0, colors.primary))
                 .child(label("Preparing costs and token history from local Claude Code and Codex transcripts, plus billed Cursor usage when signed in.", 12.0, colors.secondary)), colors).into_any_element();
         }
+        let now = self
+            .usage
+            .remote
+            .iter()
+            .filter_map(|host| host.data.as_ref().map(|data| data.collected_at))
+            .fold(self.usage.updated_at, i64::max);
         let report = self
             .usage
-            .history
-            .report(self.usage.updated_at, self.usage_days);
+            .history_for_source(self.usage_host.as_deref())
+            .report(now, self.usage_days);
         let total = report.total.totals();
         let loaded = self.usage.updated_at > 0;
         let subtitle = if loaded {
             format!(
-                "{} — {} · UTC · Local transcripts",
+                "{} — {} · UTC · {}",
                 date_label(report.days[0].day),
-                date_label(report.days.last().unwrap().day)
+                date_label(report.days.last().unwrap().day),
+                match self.usage_host.as_deref() {
+                    None if !self.usage.remote.is_empty() => "All machines",
+                    Some(id) if !id.is_empty() => self
+                        .usage
+                        .remote
+                        .iter()
+                        .find(|host| host.host == id)
+                        .map_or("Remote", |host| host.name.as_str()),
+                    _ => "This Mac",
+                }
             )
         } else {
             "Reading local usage…".to_owned()
@@ -197,10 +220,89 @@ impl UtilitySurfaces {
                 .child(label(subtitle, 11.0, colors.secondary))
                 .child(ranges),
         );
+        if !self.usage.remote.is_empty() {
+            let mut sources = div()
+                .flex()
+                .flex_wrap()
+                .gap(px(4.0))
+                .child(
+                    usage_control(
+                        "usage-source-all",
+                        "All machines",
+                        self.usage_host.is_none(),
+                        colors,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.usage_host = None;
+                        cx.notify();
+                    })),
+                )
+                .child(
+                    usage_control(
+                        "usage-source-local",
+                        "This Mac",
+                        self.usage_host.as_deref() == Some(""),
+                        colors,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.usage_host = Some(String::new());
+                        cx.notify();
+                    })),
+                );
+            let mut status = div().flex().flex_col().gap(px(4.0));
+            for host in &self.usage.remote {
+                let id = host.host.clone();
+                sources = sources.child(
+                    usage_control(
+                        format!("usage-source-{id}"),
+                        host.name.clone(),
+                        self.usage_host.as_deref() == Some(id.as_str()),
+                        colors,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.usage_host = Some(id.clone());
+                        cx.notify();
+                    })),
+                );
+                if self.usage_host.as_deref().is_none_or(|id| id == host.host) {
+                    use crate::usage::RemoteUsageStatus;
+                    let last = host.data.as_ref().map(|data| {
+                        let time = data.collected_at;
+                        format!(
+                            "{} {:02}:{:02} UTC",
+                            date_label(time.div_euclid(86_400)),
+                            time.rem_euclid(86_400) / 3_600,
+                            time.rem_euclid(3_600) / 60
+                        )
+                    });
+                    let message = match (host.status, last) {
+                        (RemoteUsageStatus::Loading, Some(last)) => format!("Updating · cached through {last}"),
+                        (RemoteUsageStatus::Loading, None) => "Reading remote usage…".to_owned(),
+                        (RemoteUsageStatus::Unavailable, Some(last)) => format!("Unavailable · showing usage saved at {last}"),
+                        (RemoteUsageStatus::Unavailable, None) => "Usage unavailable · retries every 5 minutes; check the connection in Remote settings".to_owned(),
+                        (RemoteUsageStatus::Ready, Some(last)) => format!("Updated {last}"),
+                        (RemoteUsageStatus::Ready, None) => "No transcript history".to_owned(),
+                    };
+                    status = status.child(label(
+                        format!("{} · {message}", host.name),
+                        11.0,
+                        colors.secondary,
+                    ));
+                }
+            }
+            content = content.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(sources)
+                    .child(status),
+            );
+        }
         if loaded && total.total_tokens() == 0 {
             content = content.child(div().p(px(20.0)).rounded(px(8.0)).bg(colors.primary.alpha(0.035)).flex().flex_col().gap(px(6.0))
                 .child(label("Your usage starts with a conversation", 14.0, colors.primary))
-                .child(label("Use Claude Code, Codex, or Cursor on this Mac. Transcript history and signed-in Cursor usage appear here automatically.", 12.0, colors.secondary))
+                .child(label("Available Claude Code and Codex transcripts appear automatically, alongside signed-in Cursor usage on this Mac.", 12.0, colors.secondary))
                 .child(label("Try a longer date range to see earlier activity.", 12.0, colors.secondary)));
         }
         content = content.child(hero).child(metrics).child(self.usage_breakdown(&report, colors, cx))
@@ -208,7 +310,7 @@ impl UtilitySurfaces {
                 .child(label("About these estimates", 12.0, colors.primary).font_weight(FontWeight::MEDIUM))
                 .child(label(format!("{:.1}% of tokens priced · {} unpriced tokens", ratio(report.total.priced_tokens as f64, total.total_tokens() as f64) * 100.0, UsageFormat::tokens(total.total_tokens() - report.total.priced_tokens)), 11.0, colors.secondary))
                 .child(label("Uses Diri’s bundled model rates for Claude and Codex. Cursor costs come from billed dashboard events. Unpriced Claude/Codex usage is excluded from cost. Cache read savings compare cached reads with uncached input rates; cache write premiums are excluded.", 11.0, colors.tertiary))
-                .child(label("Updates automatically from local Claude Code and Codex transcripts, including sessions outside Diri, plus billed Cursor usage when signed in. Remote Claude/Codex usage is not included in this detailed view.", 11.0, colors.tertiary)));
+                .child(label("Includes local and remote Claude Code and Codex transcripts, including sessions outside Diri, plus billed Cursor usage on this Mac. Remote machines refresh every 5 minutes over SSH; unavailable machines keep their last saved totals.", 11.0, colors.tertiary)));
         settings_page("Usage", content, colors).into_any_element()
     }
 

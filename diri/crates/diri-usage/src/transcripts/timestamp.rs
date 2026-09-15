@@ -1,5 +1,5 @@
 /// Parse the ISO-8601 forms accepted by the Swift formatters, returning Unix seconds.
-pub(crate) fn parse_timestamp(value: &str) -> Option<i64> {
+pub fn parse_timestamp(value: &str) -> Option<i64> {
     let bytes = value.as_bytes();
     if bytes.len() < 20
         || bytes.get(4) != Some(&b'-')
