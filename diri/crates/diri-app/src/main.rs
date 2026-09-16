@@ -195,6 +195,13 @@ pub(crate) struct AppServices {
 }
 
 fn main() {
+    if cfg!(test) {
+        #[cfg(all(test, target_os = "macos"))]
+        if std::env::var_os("DIRI_TEST_NATIVE_FIND").is_some() {
+            terminal_pane::find_workflow_tests::run_native();
+        }
+        return;
+    }
     #[cfg(all(target_os = "macos", debug_assertions))]
     if std::env::var_os("DIRI_NATIVE_MENU_SMOKE").is_some() {
         macos::menu_bar::smoke_test();

@@ -14,6 +14,11 @@ name = "tab_gesture_appkit"
 path = "tests/tab_gesture_appkit.rs"
 harness = false
 
+[[test]]
+name = "find_native_appkit"
+path = "tests/find_native_appkit.rs"
+harness = false
+
 [features]
 default = ["audio-playback"]
 audio-playback = []

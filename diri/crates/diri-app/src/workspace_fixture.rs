@@ -29,13 +29,18 @@ struct ServerResources {
 }
 impl LiveWorkspace {
     pub(crate) fn start() -> Self {
+        Self::start_with_script(
+            r#"stty -echo; printf ready > ready; while IFS= read -r line; do printf '\033[2J\033[H'; stty size > geometry; printf 'Actual PTY rows / columns: '; stty size; printf 'Output update: %s\n' "$line"; printf '\nThis is ordinary shell output. The terminal wraps this complete sentence at the width owned by this pane, including words that cross the right edge. No fixed screenshot grid is used here.\n\n$ '; done"#,
+        )
+    }
+
+    pub(crate) fn start_with_script(script: &str) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("engine.sock");
         let state = directory.path().join("state.json");
         let (manifests, _) =
             ManifestEngine::load_dir(&diri_engine::detect::bundled_manifest_dir()).unwrap();
         let registry = Arc::new(Mutex::new(Registry::new(Arc::new(manifests), &state)));
-        let script = r#"stty -echo; printf ready > ready; while IFS= read -r line; do printf '\033[2J\033[H'; stty size > geometry; printf 'Actual PTY rows / columns: '; stty size; printf 'Output update: %s\n' "$line"; printf '\nThis is ordinary shell output. The terminal wraps this complete sentence at the width owned by this pane, including words that cross the right edge. No fixed screenshot grid is used here.\n\n$ '; done"#;
         for (id, title) in [("build", "Build frontend"), ("review", "Review API")] {
             let cwd = directory.path().join(id);
             std::fs::create_dir(&cwd).unwrap();
