@@ -72,6 +72,7 @@ impl SessionState {
             process_state: self.process_state.clone(),
             // Persisted origin alone is not a verified current-host fact.
             child_identity: None,
+            process_facts: None,
             cols: self.cols,
             rows: self.rows,
             output_offset: self.output_offset,

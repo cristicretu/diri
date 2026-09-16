@@ -26,6 +26,7 @@ impl Method {
     pub const SESSION_KILL: &'static str = "session.kill";
     pub const SESSION_REMOVE: &'static str = "session.remove";
     pub const SESSION_RENAME: &'static str = "session.rename";
+    pub const SESSION_PROCESS_INFO: &'static str = "session.process_info";
     pub const SESSION_RECONNECT: &'static str = "session.reconnect";
     pub const SESSION_RESUME: &'static str = "session.resume";
     pub const SESSION_FORK: &'static str = "session.fork";

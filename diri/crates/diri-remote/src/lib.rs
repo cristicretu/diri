@@ -100,6 +100,7 @@ enum Invocation {
         process_pid: u32,
     },
     HiddenDumpEnvironment,
+    HiddenAccountFacts(u32),
     HiddenEnvironmentTestShell(std::path::PathBuf),
     HiddenPersistenceWitness,
     HiddenPersistenceWitnessArg {
@@ -148,8 +149,7 @@ pub fn execute<W: Write + Send>(
         // side to a detached thread, so it takes the real stdin rather than
         // the injected reader the other subcommands are tested through.
         Invocation::Attach => bridge::run(io::stdin(), &mut *stdout),
-        Invocation::Inspect => read_selector(stdin)
-            .and_then(|selector| inspect(&selector))
+        Invocation::Inspect => inspect_request(stdin, executable)
             .and_then(|inspection| write_json(stdout, &inspection)),
         Invocation::List => list().and_then(|sessions| write_json(stdout, &sessions)),
         Invocation::Kill => read_selector(stdin)
@@ -204,6 +204,9 @@ pub fn execute<W: Write + Send>(
             holder::run_process_guard(stdin, process_pid)
         }
         Invocation::HiddenDumpEnvironment => environment::dump(stdout),
+        Invocation::HiddenAccountFacts(uid) => {
+            diri_pty::process_facts::account::run_worker(uid, stdout)
+        }
         Invocation::HiddenEnvironmentTestShell(shell) => {
             holder::read_limited_json::<_, EnvironmentCaptureRequest>(stdin, 64 * 1024)
                 .and_then(|request| environment::capture_with_shell(&request, executable, &shell))
@@ -284,6 +287,15 @@ fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Invocation, Stri
             Ok(Invocation::HiddenProcessGuard { process_pid })
         }
         "__dump-environment" => no_more(arguments, Invocation::HiddenDumpEnvironment),
+        diri_pty::process_facts::account::WORKER_FLAG => {
+            let values: Vec<_> = arguments.collect();
+            let [uid] = values.as_slice() else {
+                return Err("account worker expects one UID".into());
+            };
+            let uid = diri_pty::process_facts::account::parse_uid(uid)
+                .map_err(|error| error.to_string())?;
+            Ok(Invocation::HiddenAccountFacts(uid))
+        }
         "__environment-test-shell" if cfg!(debug_assertions) => {
             let remainder = arguments.collect::<Vec<_>>();
             let [shell] = remainder.as_slice() else {
@@ -342,14 +354,49 @@ fn read_selector(reader: &mut dyn Read) -> io::Result<SessionSelector> {
     Ok(selector)
 }
 
-fn inspect(selector: &SessionSelector) -> io::Result<SessionInspection> {
-    inspect_at(&paths::StatePaths::resolve()?, selector)
+fn inspect_request(reader: &mut dyn Read, executable: &Path) -> io::Result<SessionInspection> {
+    let request: diri_proto::remote_pty::ProcessInspectionRequest =
+        holder::read_limited_json(reader, 64 * 1024)?;
+    request
+        .selector
+        .validate()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let roots = paths::StatePaths::resolve()?;
+    if !request.include_process_facts {
+        return inspect_at(&roots, &request.selector);
+    }
+    if !(1..=1000).contains(&request.timeout_ms) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "process inspection timeout must be 1..1000 ms",
+        ));
+    }
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(u64::from(request.timeout_ms));
+    inspect_at_with_facts(&roots, &request.selector, Some((executable, deadline)))
 }
 
 fn inspect_at(
     roots: &paths::StatePaths,
     selector: &SessionSelector,
 ) -> io::Result<SessionInspection> {
+    inspect_at_with_facts(roots, selector, None)
+}
+
+fn check_facts_deadline(facts: Option<(&Path, std::time::Instant)>) -> io::Result<()> {
+    if facts.is_some_and(|(_, deadline)| std::time::Instant::now() >= deadline) {
+        Err(RemoteManagementFailure::ProcessFactsTimedOut.into_io_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn inspect_at_with_facts(
+    roots: &paths::StatePaths,
+    selector: &SessionSelector,
+    facts: Option<(&Path, std::time::Instant)>,
+) -> io::Result<SessionInspection> {
+    check_facts_deadline(facts)?;
     let paths = roots.session(&selector.session_id)?;
     if !state::authenticate(&paths, &selector.session_token)? {
         return Err(io::Error::new(
@@ -368,9 +415,15 @@ fn inspect_at(
     }
     let Some(identity) = state.child_identity else {
         // Old Holders remain inspectable, but cannot supply identity-bound facts.
+        if facts.is_some() {
+            return Err(RemoteManagementFailure::ProcessFactsUnsupported.into_io_error());
+        }
         return Ok(state.inspection());
     };
     if !matches!(state.process_state, RemoteProcessState::Running { .. }) {
+        if facts.is_some() {
+            return Err(RemoteManagementFailure::ProcessIdentityUnavailable.into_io_error());
+        }
         return Ok(state.inspection());
     }
     if !matches!(state.process_state, RemoteProcessState::Running { pid } if pid == identity.pid())
@@ -394,6 +447,39 @@ fn inspect_at(
         }
         let mut inspection = current.inspection();
         inspection.child_identity = Some(identity);
+        if let Some((executable, deadline)) = facts {
+            check_facts_deadline(facts)?;
+            let observed = diri_pty::process_facts::inspect(&identity, |uid| {
+                let account_deadline =
+                    deadline.min(std::time::Instant::now() + std::time::Duration::from_millis(250));
+                diri_pty::process_facts::account::lookup_until(executable, uid, account_deadline)
+            })?;
+            observed
+                .validate()
+                .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
+            // Native/account work may outlast an owner replacement. Recheck
+            // the authenticated durable binding and ownership after it too.
+            if !state::authenticate(&paths, &selector.session_token)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "session authentication changed",
+                ));
+            }
+            let latest = state::read_state(&paths.state)?;
+            validate_incarnation(selector, &latest)?;
+            validate_process_binding(&state, &latest)?;
+            if !state::holder_lock_held(&paths.lock)? {
+                return Err(RemoteManagementFailure::HolderUnavailable.into_io_error());
+            }
+            inspection = latest.inspection();
+            inspection.child_identity = Some(identity);
+            inspection.process_facts = Some(observed);
+        }
+        check_facts_deadline(facts)?;
+        Ok(inspection)
+    })
+    .and_then(|inspection| {
+        check_facts_deadline(facts)?;
         Ok(inspection)
     })
     .map_err(|error| {
@@ -846,6 +932,26 @@ mod tests {
         // Holder lock remains held. Old persisted records stay unsupported.
         let captured = diri_pty::process_identity::observe(child.0.id()).unwrap();
         assert_eq!(inspect_at(&roots, &selector).unwrap().child_identity, None);
+        let options = Some((
+            Path::new("/unused-account-worker"),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        ));
+        assert_eq!(
+            inspect_at_with_facts(&roots, &selector, options)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            inspect_at_with_facts(
+                &roots,
+                &selector,
+                Some((Path::new("/unused"), std::time::Instant::now()))
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::TimedOut
+        );
         stored.child_identity = Some(captured);
         state::write_state(&paths.state, &stored).unwrap();
         assert_eq!(

@@ -114,6 +114,7 @@ impl Fixture {
             holder_pid: pid,
             process_state: RemoteProcessState::Running { pid },
             child_identity: None,
+            process_facts: None,
             cols: 80,
             rows: 24,
             output_offset: 0,
@@ -481,4 +482,110 @@ fn reconnect_rejects_local_and_missing_remote_owners_without_relaunch() {
         "remote_owner_unavailable"
     );
     assert!(server.registry.lock().unwrap().get("fixture").is_none());
+}
+
+#[test]
+fn process_facts_are_remote_read_only_and_leave_registry_available() {
+    use diri_proto::process::{BootId, ProcessBirth, ProcessIdentity};
+    use diri_proto::process_facts::{ProcessFacts, ProcessValue as Value, UnavailableReason};
+    let mut fixture = Fixture::new();
+    // Foreign-platform birth deliberately cannot be verified by local proc APIs.
+    let identity = ProcessIdentity::new(
+        fixture.child.id(),
+        ProcessBirth::Linux {
+            boot_id: BootId::parse("01234567-89ab-cdef-0123-456789abcdef").unwrap(),
+            start_ticks: 77,
+            clock_ticks_per_second: 100,
+        },
+    )
+    .unwrap();
+    fixture.inspection.child_identity = Some(identity);
+    fixture.inspection.process_facts = Some(ProcessFacts {
+        identity,
+        executable: Value::available("/remote/bin/fixture".into()),
+        working_directory: Value::available("/remote/work".into()),
+        user_ids: Value::unavailable(UnavailableReason::PermissionDenied),
+        account: Value::unavailable(UnavailableReason::PermissionDenied),
+        process_group: Value::available(fixture.child.id()),
+        foreground_process_group: Value::available(Some(123)),
+    });
+    fixture.write_inspection(&fixture.inspection);
+    fixture.marker("hold-inspect");
+    let attaches = std::fs::read(fixture.temp.path().join("attaches")).unwrap();
+    let server = Arc::clone(&fixture.server);
+    let pending = std::thread::spawn(move || {
+        server.dispatch(
+            Method::SESSION_PROCESS_INFO,
+            Some(json!({"sessionID":"fixture"})),
+        )
+    });
+    wait_for(|| fixture.temp.path().join("inspect-started").exists());
+    assert!(
+        fixture.server.registry.try_lock().is_ok(),
+        "slow remote lookup held Registry"
+    );
+    fixture.marker("release-inspect");
+    let result = pending.join().unwrap().unwrap();
+    assert_eq!(
+        result["process"]["executable"]["value"],
+        "/remote/bin/fixture"
+    );
+    assert_eq!(result["process"]["foregroundProcessGroup"]["value"], 123);
+    assert_eq!(
+        std::fs::read(fixture.temp.path().join("attaches")).unwrap(),
+        attaches
+    );
+    assert_eq!(
+        fixture.state(),
+        State::Failed,
+        "inspection must not reconnect"
+    );
+    // A record moved to a different host while I/O is in flight cannot
+    // receive facts from the old captured session binding.
+    std::fs::remove_file(fixture.temp.path().join("inspect-started")).unwrap();
+    std::fs::remove_file(fixture.temp.path().join("release-inspect")).unwrap();
+    let server = Arc::clone(&fixture.server);
+    let pending = std::thread::spawn(move || {
+        server.dispatch(
+            Method::SESSION_PROCESS_INFO,
+            Some(json!({"sessionID":"fixture"})),
+        )
+    });
+    wait_for(|| fixture.temp.path().join("inspect-started").exists());
+    let original = fixture
+        .server
+        .registry
+        .lock()
+        .unwrap()
+        .record("fixture")
+        .unwrap();
+    let mut changed = original.clone();
+    changed.host = Some("replacement-host".into());
+    fixture
+        .server
+        .registry
+        .lock()
+        .unwrap()
+        .insert_record(changed);
+    fixture.marker("release-inspect");
+    assert_eq!(pending.join().unwrap().unwrap_err().code, "stale_session");
+    fixture
+        .server
+        .registry
+        .lock()
+        .unwrap()
+        .insert_record(original);
+    fixture.inspection.process_facts = None;
+    fixture.write_inspection(&fixture.inspection);
+    assert_eq!(
+        fixture
+            .server
+            .dispatch(
+                Method::SESSION_PROCESS_INFO,
+                Some(json!({"sessionID":"fixture"}))
+            )
+            .unwrap_err()
+            .code,
+        "process_facts_unsupported"
+    );
 }

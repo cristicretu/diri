@@ -778,6 +778,55 @@ impl RemoteManager {
         identity_from_inspection(&helper.build_id, selector, &inspection)
     }
 
+    /// On-demand observations on the actual host, without taking a controller lease.
+    pub fn inspect_process_facts(
+        &self,
+        helper: &InstalledHelper,
+        selector: &SessionSelector,
+        deadline: Instant,
+    ) -> io::Result<diri_proto::process_facts::ProcessFacts> {
+        if selector.expected_incarnation.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "process facts require a pinned incarnation",
+            ));
+        }
+        if helper.protocol.major != ProtocolVersion::CURRENT.major
+            || helper.protocol.minor < diri_proto::remote_pty::PROCESS_FACTS_PROTOCOL_MINOR
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "remote Helper does not support process facts",
+            ));
+        }
+        let timeout = diri_pty::unix_socket::remaining(deadline)?;
+        let request = diri_proto::remote_pty::ProcessInspectionRequest {
+            selector: selector.clone(),
+            include_process_facts: true,
+            timeout_ms: timeout.as_millis().clamp(1, 1000) as u32,
+        };
+        let inspection: SessionInspection =
+            self.rpc(helper, HelperCommand::Inspect, &request, timeout)?;
+        diri_pty::unix_socket::remaining(deadline)?;
+        let identity = identity_from_inspection(&helper.build_id, selector, &inspection)?;
+        let facts = inspection.process_facts.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "remote Helper omitted process facts",
+            )
+        })?;
+        if facts.identity != identity {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "process facts changed child identity",
+            ));
+        }
+        facts
+            .validate()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        Ok(facts)
+    }
+
     pub(crate) fn inspect_for_reconnect(
         &self,
         helper: &InstalledHelper,

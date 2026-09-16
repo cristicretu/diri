@@ -561,6 +561,7 @@ impl ControlServer {
                         | Method::SESSION_REMOVE
                         | Method::SESSION_ARCHIVE
                         | Method::SESSION_RESUME
+                        | Method::SESSION_PROCESS_INFO
                         | Method::SESSION_RECONNECT
                         | Method::SESSION_FORK
                         | Method::SESSION_MIGRATE
@@ -795,6 +796,7 @@ impl ControlServer {
             Method::HOST_LOCATE_REPO => self.host_locate_repo(params),
             Method::HOOK_REPORT => self.hook_report(params),
             Method::SESSION_RESUME => self.session_resume(params),
+            Method::SESSION_PROCESS_INFO => self.session_process_info(params),
             Method::SESSION_RECONNECT => self.session_reconnect(params),
             Method::SESSION_FORK => self.session_fork(params),
             Method::SESSION_RESUME_FROM_HISTORY => self.session_resume_from_history(params),
@@ -2246,6 +2248,63 @@ impl ControlServer {
         }
         self.publish_updated(&registry, &session_id.0);
         Ok(json!({}))
+    }
+
+    fn session_process_info(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::SessionIdParams = decode(params)?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let lock_registry = || {
+            self.registry.try_lock().map_err(|error| match error {
+                std::sync::TryLockError::WouldBlock => {
+                    ControlError::new("process_facts_busy", "Session registry is busy")
+                }
+                std::sync::TryLockError::Poisoned(error) => poisoned(error),
+            })
+        };
+        let (reader, host) = {
+            let registry = lock_registry()?;
+            let record = registry
+                .record(&p.session_id.0)
+                .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+            let session = registry.get(&p.session_id.0).ok_or_else(|| {
+                ControlError::new("process_unavailable", "Session has no live owner")
+            })?;
+            (session.process_facts_reader(), record.host)
+        };
+        let process = reader.read(deadline).map_err(|error| {
+            let code = match error.kind() {
+                std::io::ErrorKind::Unsupported => "process_facts_unsupported",
+                std::io::ErrorKind::TimedOut => "process_facts_timeout",
+                std::io::ErrorKind::WouldBlock => "process_facts_busy",
+                _ => "process_facts_unavailable",
+            };
+            ControlError::new(code, error.to_string())
+        })?;
+        let registry = lock_registry()?;
+        if !registry
+            .get(&p.session_id.0)
+            .is_some_and(|session| reader.matches(session))
+            || registry
+                .record(&p.session_id.0)
+                .is_none_or(|record| record.host != host)
+        {
+            return Err(ControlError::new(
+                "stale_session",
+                "Session changed during process inspection",
+            ));
+        }
+        diri_pty::unix_socket::remaining(deadline).map_err(|_| {
+            ControlError::new(
+                "process_facts_timeout",
+                "Process inspection deadline expired",
+            )
+        })?;
+        encode(&diri_proto::process_facts::SessionProcessInfo {
+            session_id: p.session_id,
+            host,
+            observed_at: diri_proto::DateMillis::from(std::time::SystemTime::now()),
+            process,
+        })
     }
 
     /// Revives an exited session's conversation under the SAME record id.
@@ -4062,6 +4121,20 @@ mod tests {
             crate::remote::client::RemoteTransportFailed,
         ));
         assert_eq!(error.code, "remote_transport_failed");
+    }
+
+    #[test]
+    fn process_facts_do_not_wait_for_registry_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = server(temp.path());
+        let _held = server.registry.lock().unwrap();
+        assert_eq!(
+            server
+                .session_process_info(Some(json!({"sessionID":"fixture"})))
+                .unwrap_err()
+                .code,
+            "process_facts_busy"
+        );
     }
 
     #[test]

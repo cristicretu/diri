@@ -18,7 +18,8 @@ use crate::grid::{GridCodecError, GridUpdate};
 use crate::terminal::MouseModes;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 12;
+pub const PROTOCOL_MINOR: u16 = 13;
+pub const PROCESS_FACTS_PROTOCOL_MINOR: u16 = 13;
 pub const STOP_SESSION_PROTOCOL_MINOR: u16 = 12;
 pub const PROCESS_IDENTITY_PROTOCOL_MINOR: u16 = 10;
 pub const INPUT_MODES_PROTOCOL_MINOR: u16 = 9;
@@ -87,6 +88,8 @@ pub enum RemoteCapability {
     InputModes,
     #[serde(rename = "process-identity-v1")]
     ProcessIdentity,
+    #[serde(rename = "process-facts-v1")]
+    ProcessFacts,
     #[serde(rename = "stop-session-v1")]
     StopSession,
     IncrementalGrid,
@@ -128,6 +131,7 @@ impl RemoteCapability {
             Self::TerminalAnnotations => "terminal-annotations-v1",
             Self::InputModes => "terminal-input-modes-v1",
             Self::ProcessIdentity => "process-identity-v1",
+            Self::ProcessFacts => "process-facts-v1",
             Self::StopSession => "stop-session-v1",
             Self::FullSnapshot => "full-snapshot",
             Self::IncrementalGrid => "incremental-grid",
@@ -196,6 +200,7 @@ pub const ANNOTATED_HOLDER_CAPABILITIES: &[RemoteCapability] = &[
     RemoteCapability::StopSession,
 ];
 pub const ANNOTATED_HELPER_CAPABILITIES: &[RemoteCapability] = &[
+    RemoteCapability::ProcessFacts,
     RemoteCapability::FullSnapshot,
     RemoteCapability::IncrementalGrid,
     RemoteCapability::ProcessExit,
@@ -707,6 +712,8 @@ pub struct SessionInspection {
     /// Present only after host-local verification of the still-running child.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child_identity: Option<crate::process::ProcessIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_facts: Option<crate::process_facts::ProcessFacts>,
     pub cols: u16,
     pub rows: u16,
     pub output_offset: u64,
@@ -738,6 +745,23 @@ pub struct SessionSelector {
     pub session_id: String,
     pub session_token: SessionToken,
     pub expected_incarnation: Option<String>,
+}
+
+/// Additive request shape on the existing authenticated `inspect` command.
+/// Older helpers omit facts, which stronger clients reject explicitly.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessInspectionRequest {
+    #[serde(flatten)]
+    pub selector: SessionSelector,
+    #[serde(default)]
+    pub include_process_facts: bool,
+    #[serde(default = "default_process_inspection_timeout")]
+    pub timeout_ms: u32,
+}
+
+fn default_process_inspection_timeout() -> u32 {
+    1000
 }
 
 impl SessionSelector {
@@ -819,6 +843,8 @@ pub struct RemoteError {
 pub enum RemoteManagementFailure {
     HolderUnavailable,
     ProcessIdentityUnavailable,
+    ProcessFactsUnsupported,
+    ProcessFactsTimedOut,
     StopUnsupported,
     StopPending,
     StopIdentityMismatch,
@@ -827,6 +853,12 @@ pub enum RemoteManagementFailure {
 impl std::fmt::Display for RemoteManagementFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ProcessFactsUnsupported => {
+                formatter.write_str("remote Holder cannot supply identity-bound process facts")
+            }
+            Self::ProcessFactsTimedOut => {
+                formatter.write_str("process inspection deadline expired")
+            }
             Self::StopUnsupported => {
                 formatter.write_str("remote Holder does not support identity-safe stop")
             }
@@ -852,6 +884,8 @@ impl RemoteManagementFailure {
         let kind = match self {
             Self::HolderUnavailable => std::io::ErrorKind::NotConnected,
             Self::ProcessIdentityUnavailable => std::io::ErrorKind::NotFound,
+            Self::ProcessFactsUnsupported => std::io::ErrorKind::Unsupported,
+            Self::ProcessFactsTimedOut => std::io::ErrorKind::TimedOut,
             Self::StopUnsupported => std::io::ErrorKind::Unsupported,
             Self::StopPending => std::io::ErrorKind::TimedOut,
             Self::StopIdentityMismatch => std::io::ErrorKind::InvalidData,
@@ -1379,6 +1413,26 @@ mod tests {
             last_acknowledged_output_offset: Some(6),
             last_acknowledged_grid_sequence: Some(7),
         }
+    }
+
+    #[test]
+    fn process_inspection_is_additive_and_never_a_holder_attach_capability() {
+        let selector = SessionSelector {
+            session_id: "fixture".into(),
+            session_token: SessionToken::new("0123456789abcdef0123456789abcdef").unwrap(),
+            expected_incarnation: Some("incarnation".into()),
+        };
+        let request: ProcessInspectionRequest =
+            serde_json::from_value(serde_json::to_value(&selector).unwrap()).unwrap();
+        assert!(!request.include_process_facts);
+        assert_eq!(request.timeout_ms, 1000);
+        assert_eq!(request.selector, selector);
+        assert!(ANNOTATED_HELPER_CAPABILITIES.contains(&RemoteCapability::ProcessFacts));
+        assert!(!PHASE_ONE_HOLDER_CAPABILITIES.contains(&RemoteCapability::ProcessFacts));
+        assert_eq!(
+            serde_json::to_string(&RemoteCapability::ProcessFacts).unwrap(),
+            "\"process-facts-v1\""
+        );
     }
 
     #[test]
