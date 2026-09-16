@@ -580,17 +580,7 @@ impl RemoteStop {
         // Preserve terminate's treatment of an already-ended session (its
         // Holder may also be gone). A failed stop of a live session must keep
         // the original tracked owner so another Agent cannot replace it.
-        if let Err(error) = self.client.kill()
-            && !self.shared.exited.load(Ordering::SeqCst)
-        {
-            return Err(error);
-        }
-        let exit = self
-            .shared
-            .exit
-            .lock()
-            .expect("exit")
-            .unwrap_or(Exit::Signal(libc::SIGKILL));
+        let exit = accept_remote_stop_result(&self.shared, self.client.kill())?;
         self.shared.stop.store(true, Ordering::SeqCst);
         self.client.close();
         Ok(exit)
@@ -598,6 +588,31 @@ impl RemoteStop {
 
     pub(crate) fn matches(&self, session: &Session) -> bool {
         Arc::ptr_eq(&self.shared, &session.shared)
+    }
+}
+
+/// The destructive stop channel revokes the prior controller. Its observed
+/// exit must reach the projection even when that controller never saw ProcessExit.
+fn accept_remote_stop_result(
+    shared: &Shared,
+    result: std::io::Result<ProcessExit>,
+) -> std::io::Result<Exit> {
+    match result {
+        Ok(exit) => {
+            let local = match (exit.code, exit.signal) {
+                (Some(code), None) => Exit::Code(code),
+                (None, Some(signal)) if signal > 0 => Exit::Signal(signal),
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "stop returned ambiguous exit facts",
+                    ));
+                }
+            };
+            record_remote_exit(shared, exit);
+            Ok(local)
+        }
+        Err(error) => shared.exit.lock().expect("exit").ok_or(error),
     }
 }
 
@@ -2048,16 +2063,7 @@ impl Session {
                 // `kill` also stops the per-session Holder. Do this even when
                 // the Agent already exited naturally; an explicit lifecycle
                 // termination must not leave an idle remote owner behind.
-                if let Err(error) = client.kill()
-                    && !self.shared.exited.load(Ordering::SeqCst)
-                {
-                    return Err(error);
-                }
-                self.shared
-                    .exit
-                    .lock()
-                    .expect("exit")
-                    .unwrap_or(Exit::Signal(libc::SIGKILL))
+                accept_remote_stop_result(&self.shared, client.kill())?
             }
         };
         self.shared.stop.store(true, Ordering::SeqCst);
@@ -4180,6 +4186,67 @@ mod notification_tests {
         apply_remote_output(&shared, &engine, "shell", &mut seq, end, bytes, false).unwrap();
         assert!(!shared.screen.lock().unwrap().has_notifications());
         assert_eq!(*shared.status.lock().unwrap(), SessionStatus::Idle);
+    }
+}
+
+#[cfg(test)]
+mod remote_stop_tests {
+    use super::*;
+    #[test]
+    fn remote_stop_failure_preserves_only_already_observed_exit() {
+        let temp = tempfile::tempdir().unwrap();
+        let spec = SessionSpec {
+            id: "stop-facts".into(),
+            pty: PtySpec::new(vec!["/bin/sh".into()], "/"),
+            manifest_id: "shell".into(),
+            authority: Authority::ProcessOnly,
+            logs_dir: temp.path().to_path_buf(),
+            holder: None,
+            remote: None,
+            defer_launch: false,
+        };
+        let shared = new_shared(
+            &spec,
+            OutputLog::writer(temp.path(), &spec.id).unwrap(),
+            &ManifestEngine::new(Vec::new()),
+            true,
+        );
+        let pending = || std::io::Error::new(std::io::ErrorKind::TimedOut, "stop pending");
+        assert_eq!(
+            accept_remote_stop_result(&shared, Err(pending()))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        assert!(!shared.exited.load(Ordering::SeqCst));
+        assert!(shared.exit.lock().unwrap().is_none());
+        assert!(
+            accept_remote_stop_result(
+                &shared,
+                Ok(ProcessExit {
+                    code: None,
+                    signal: None
+                })
+            )
+            .is_err()
+        );
+        assert!(!shared.exited.load(Ordering::SeqCst));
+        assert_eq!(
+            accept_remote_stop_result(
+                &shared,
+                Ok(ProcessExit {
+                    code: Some(42),
+                    signal: None
+                })
+            )
+            .unwrap(),
+            Exit::Code(42)
+        );
+        assert!(shared.exited.load(Ordering::SeqCst));
+        assert_eq!(
+            accept_remote_stop_result(&shared, Err(pending())).unwrap(),
+            Exit::Code(42)
+        );
     }
 }
 
